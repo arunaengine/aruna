@@ -6,7 +6,7 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -1061,9 +1061,14 @@ impl Operation for MutateRealmPlacementOperation {
                         }),
                         Err(error) => {
                             warn!(error = %error, "Realm placement authorization check failed");
-                            self.fail(MutateRealmPlacementError::Unauthorized {
-                                node_id: self.actor.node_id,
-                            })
+                            match error {
+                                AuthorizationError::StorageError(error) => {
+                                    self.fail(MutateRealmPlacementError::StorageError(error))
+                                }
+                                _ => self.fail(MutateRealmPlacementError::Unauthorized {
+                                    node_id: self.actor.node_id,
+                                }),
+                            }
                         }
                     }
                 }

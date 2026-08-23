@@ -7,7 +7,7 @@ use crate::driver::{DriverContext, drive};
 use crate::request_policy::{
     PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
 };
-use aruna_core::errors::AuthorizationError;
+use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{AuthContext, Permission, RealmId};
 use thiserror::Error;
 
@@ -17,6 +17,10 @@ pub enum AuthorizeError {
     PermissionDenied,
     #[error(transparent)]
     Policy(#[from] PolicyEnforcementError),
+    /// Storage failed while deciding the request: an infrastructure fault that
+    /// callers must not present as an authorization verdict.
+    #[error(transparent)]
+    Storage(StorageError),
     #[error("authorization check failed: {0}")]
     CheckFailed(String),
 }
@@ -48,6 +52,7 @@ pub async fn authorize(
         | AuthorizationError::InvalidGroupId
         | AuthorizationError::GroupNotFound
         | AuthorizationError::AuthDocNotFound => AuthorizeError::PermissionDenied,
+        AuthorizationError::StorageError(error) => AuthorizeError::Storage(error),
         other => AuthorizeError::CheckFailed(other.to_string()),
     })?;
     if !allowed {

@@ -308,6 +308,7 @@ impl ArunaS3Service {
             Err(AuthorizeError::CheckFailed(message)) => {
                 Err(s3_error!(InternalError, "{}", message))
             }
+            Err(error @ AuthorizeError::Storage(_)) => Err(map_authorize_error(error)),
             Err(_) => Ok(false),
         }
     }

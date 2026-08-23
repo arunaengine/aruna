@@ -4,7 +4,7 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -298,7 +298,12 @@ impl Operation for SetRealmPoliciesOperation {
                         Ok(false) => self.fail(SetRealmPoliciesError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Realm policy authorization check failed");
-                            self.fail(SetRealmPoliciesError::Unauthorized)
+                            match error {
+                                AuthorizationError::StorageError(error) => {
+                                    self.fail(SetRealmPoliciesError::StorageError(error))
+                                }
+                                _ => self.fail(SetRealmPoliciesError::Unauthorized),
+                            }
                         }
                     }
                 }

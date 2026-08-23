@@ -2401,6 +2401,9 @@ async fn authorize_write(
             Err(ForwardAuthError::Forbidden)
         }
         Err(AuthorizeError::CheckFailed(error)) => Err(ForwardAuthError::Unavailable(error)),
+        Err(AuthorizeError::Storage(error)) => {
+            Err(ForwardAuthError::Unavailable(error.to_string()))
+        }
     }
 }
 

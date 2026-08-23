@@ -377,6 +377,9 @@ async fn prepare_reference(
             AuthorizeError::CheckFailed(error) => {
                 return Err(NativeReferenceReject::Unavailable(error));
             }
+            AuthorizeError::Storage(error) => {
+                return Err(NativeReferenceReject::Unavailable(error.to_string()));
+            }
         }
     }
 

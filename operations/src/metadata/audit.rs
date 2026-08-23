@@ -880,7 +880,9 @@ async fn authorize_admin(
         Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
             Err(MetadataReadError::Forbidden)
         }
-        Err(AuthorizeError::CheckFailed(_)) => Err(MetadataReadError::Unavailable),
+        Err(AuthorizeError::CheckFailed(_) | AuthorizeError::Storage(_)) => {
+            Err(MetadataReadError::Unavailable)
+        }
     }
 }
 

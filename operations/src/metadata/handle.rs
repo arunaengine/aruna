@@ -2083,7 +2083,7 @@ impl MetadataHandle {
                     .await
                     {
                         Ok(()) => {}
-                        Err(AuthorizeError::CheckFailed(_)) => {
+                        Err(AuthorizeError::CheckFailed(_) | AuthorizeError::Storage(_)) => {
                             return MetadataTransportMessage::Reject("mirror_internal".to_string());
                         }
                         Err(_) => {
@@ -2151,7 +2151,7 @@ impl MetadataHandle {
         .await
         {
             Ok(()) => {}
-            Err(AuthorizeError::CheckFailed(_)) => {
+            Err(AuthorizeError::CheckFailed(_) | AuthorizeError::Storage(_)) => {
                 return MetadataTransportMessage::Reject("mirror_internal".to_string());
             }
             Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),

@@ -674,6 +674,7 @@ async fn joined_pid_job(
         }
         Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => Ok(None),
         Err(AuthorizeError::CheckFailed(error)) => Err(error),
+        Err(AuthorizeError::Storage(error)) => Err(error.to_string()),
     }
 }
 

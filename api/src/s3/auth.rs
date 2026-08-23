@@ -2,6 +2,7 @@ use super::s3_server::S3OpLabel;
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use aruna_core::credential_seal::{CredentialSealKey, SealedS3Secret};
+use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, S3Session, UserAccess,
     blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
@@ -199,10 +200,16 @@ impl S3Access for AuthProvider {
 }
 
 /// Maps an authorization failure to an S3 error, keeping RBAC and policy denials
-/// indistinguishable and control-plane failures fail-closed.
+/// indistinguishable and control-plane failures fail-closed. Exhausted
+/// transaction-cleanup capacity is retryable, so it stays a `SlowDown`.
 pub(super) fn map_authorize_error(error: AuthorizeError) -> s3s::S3Error {
     match error {
-        AuthorizeError::CheckFailed(_) => s3_error!(InternalError, "Failed to check permissions"),
+        AuthorizeError::Storage(StorageError::CleanupCapacity) => {
+            s3_error!(SlowDown, "Reduce your request rate")
+        }
+        AuthorizeError::CheckFailed(_) | AuthorizeError::Storage(_) => {
+            s3_error!(InternalError, "Failed to check permissions")
+        }
         _ => s3_error!(AccessDenied, "Permission denied"),
     }
 }
