@@ -1,5 +1,6 @@
 use super::S3SessionError;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_SESSION_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -8,6 +9,8 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::time::SystemTime;
 use ulid::Ulid;
+
+const TOUCH_ATTEMPTS: u8 = 4;
 
 #[derive(Debug, PartialEq)]
 pub struct TouchS3SessionConfig {
@@ -33,6 +36,7 @@ pub struct TouchS3SessionOperation {
     config: TouchS3SessionConfig,
     pending: Option<S3Session>,
     txn_id: Option<Ulid>,
+    attempts: u8,
     state: TouchSessionState,
     output: Result<S3Session, S3SessionError>,
 }
@@ -43,6 +47,7 @@ impl TouchS3SessionOperation {
             config,
             pending: None,
             txn_id: None,
+            attempts: 0,
             state: TouchSessionState::Init,
             output: Err(S3SessionError::NotFinished),
         }
@@ -152,6 +157,16 @@ impl TouchS3SessionOperation {
             received,
         })
     }
+
+    fn retry_touch(&mut self) -> Effects {
+        self.txn_id = None;
+        self.pending = None;
+        self.attempts += 1;
+        self.state = TouchSessionState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false,
+        })]
+    }
 }
 
 impl Operation for TouchS3SessionOperation {
@@ -164,6 +179,12 @@ impl Operation for TouchS3SessionOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = &event {
+            if self.state == TouchSessionState::CommitTransaction
+                && matches!(error, StorageError::TransactionConflict)
+                && self.attempts + 1 < TOUCH_ATTEMPTS
+            {
+                return self.retry_touch();
+            }
             return self.fail(error.clone().into());
         }
         match self.state {
@@ -198,5 +219,36 @@ impl Operation for TouchS3SessionOperation {
 
     fn expected_error(error: &Self::Error) -> bool {
         error.expected()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_touch_conflict() {
+        let mut operation = TouchS3SessionOperation::new(TouchS3SessionConfig {
+            access_key: S3Session::build_access_key("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            token_hash: "token".to_string(),
+            now: SystemTime::UNIX_EPOCH,
+            issued_by: [1; 32],
+        });
+        operation.state = TouchSessionState::CommitTransaction;
+        operation.txn_id = Some(Ulid::from_bytes([2; 16]));
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+        assert_eq!(operation.state, TouchSessionState::StartTransaction);
+        assert_eq!(operation.attempts, 1);
+        assert!(!operation.is_complete());
     }
 }

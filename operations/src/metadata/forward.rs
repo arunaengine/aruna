@@ -448,20 +448,20 @@ pub async fn profile_validation_status_routed(
     auth_token: Option<MetadataAuthToken>,
     revalidate: bool,
 ) -> Result<MetadataProfileValidationStatus, MetadataApiError> {
+    let registry = load_record_by_document(context.as_ref(), request.document_id).await?;
     if context.net_handle.is_none() {
-        let record = load_record_by_document(context.as_ref(), request.document_id).await?;
         ensure_record_readable(
             context.as_ref(),
             realm_id,
             request.auth.as_ref(),
-            &record,
+            &registry,
             None,
         )
         .await?;
         return if revalidate {
-            revalidate_current(context.as_ref(), &record).await
+            revalidate_current(context.as_ref(), &registry).await
         } else {
-            current_validation_status(context.as_ref(), &record).await
+            current_validation_status(context.as_ref(), &registry).await
         }
         .map_err(|_| MetadataApiError::ServiceUnavailable);
     }
@@ -537,7 +537,7 @@ pub async fn profile_validation_status_routed(
     for (_, response) in responses {
         match response {
             Ok(status) => {
-                success.get_or_insert(status);
+                keep_status(&mut success, status, registry.last_event_id);
             }
             Err(MetadataReadError::Unauthorized) => {
                 auth_error.get_or_insert(MetadataApiError::Unauthorized);
@@ -562,6 +562,20 @@ pub async fn profile_validation_status_routed(
         Err(MetadataApiError::NotFound)
     } else {
         Err(MetadataApiError::ServiceUnavailable)
+    }
+}
+
+fn keep_status(
+    current: &mut Option<MetadataProfileValidationStatus>,
+    incoming: MetadataProfileValidationStatus,
+    expected_revision: Ulid,
+) {
+    let incoming_exact = incoming.dataset_revision == expected_revision;
+    let current_exact = current
+        .as_ref()
+        .is_some_and(|status| status.dataset_revision == expected_revision);
+    if current.is_none() || incoming_exact && !current_exact {
+        *current = Some(incoming);
     }
 }
 
@@ -2604,12 +2618,44 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::metadata::{
+        MetadataProfileValidationCompleteness, MetadataProfileValidationState,
+    };
     use aruna_core::structs::{METADATA_HANDLE, PlacementStrategy, RealmNodeKind};
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn validation_status(revision: Ulid) -> MetadataProfileValidationStatus {
+        MetadataProfileValidationStatus {
+            document_id: Ulid::nil(),
+            dataset_revision: revision,
+            state: MetadataProfileValidationState::NotProfiled,
+            profile_id: None,
+            profile_iri: None,
+            profile_revision: None,
+            evaluator: "test".to_string(),
+            validated_at_ms: None,
+            findings: Vec::new(),
+            completeness: MetadataProfileValidationCompleteness::Complete,
+            stale_reason: None,
+        }
+    }
+
+    #[test]
+    fn prefers_exact_status() {
+        let expected = Ulid::from_bytes([1; 16]);
+        let stale = Ulid::from_bytes([2; 16]);
+        let mut selected = None;
+
+        keep_status(&mut selected, validation_status(stale), expected);
+        keep_status(&mut selected, validation_status(expected), expected);
+        keep_status(&mut selected, validation_status(stale), expected);
+
+        assert_eq!(selected.unwrap().dataset_revision, expected);
     }
 
     fn config_and_placement() -> (RealmConfigDocument, PlacementRef) {

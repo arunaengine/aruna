@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -22,6 +23,10 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::MetadataHandle;
+use crate::metadata::api::{
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
+};
+use crate::metadata::forward::export_rocrate_routed;
 use crate::metadata::profile_shacl::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
@@ -43,7 +48,6 @@ const SCHEMA_TEXT: &str = "http://schema.org/text";
 const SCHEMA_HTTPS_TEXT: &str = "https://schema.org/text";
 const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
 const PROFILE_PUBLIC_PREFIX: &str = "https://w3id.org/aruna/profile/";
-const LEGACY_GRAPH_PREFIX: &str = "https://w3id.org/aruna/";
 const EVALUATOR_NAME: &str = "craqle-shacl-core/0.2";
 
 /// Authoritative backend SHACL support for Profile validation.
@@ -126,12 +130,7 @@ pub fn profile_public_iri(profile_id: Ulid) -> String {
 pub fn equivalent_profile_iris(iri: &str) -> Vec<String> {
     profile_id_from_iri(iri).map_or_else(
         || vec![iri.to_string()],
-        |profile_id| {
-            vec![
-                profile_public_iri(profile_id),
-                MetadataRegistryRecord::graph_iri_for(profile_id),
-            ]
-        },
+        |profile_id| vec![profile_public_iri(profile_id)],
     )
 }
 
@@ -601,10 +600,23 @@ async fn resolve_registered_profile(
             ));
         }
     };
-    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id) {
+    if !record.public || record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id) {
         return Err(profile_not_registered(requested_iri));
     }
-    let raw = load_raw_revision(context, profile_id, None)
+    let exported = export_rocrate_routed(
+        &Arc::new(context.clone()),
+        record.realm_id,
+        ExportMetadataRoCrateRequest {
+            document_id: profile_id,
+            auth: None,
+            view: MetadataRoCrateExportView::Raw,
+            limit: None,
+            offset: None,
+            after: None,
+        },
+        None,
+        u64::MAX,
+    )
         .await
         .map_err(|_| {
             unavailable_error(
@@ -612,14 +624,30 @@ async fn resolve_registered_profile(
                 "the registered Profile revision is temporarily unavailable; retry or remove the Profile tag",
                 Some(record.last_event_id),
             )
-        })?
-        .ok_or_else(|| {
-            unavailable_error(
-                "profile_unavailable",
-                "the registered Profile revision is not materialized; retry or remove the Profile tag",
-                Some(record.last_event_id),
-            )
         })?;
+    let ExportMetadataRoCrateResult::Raw {
+        record: holder_record,
+        raw,
+        ..
+    } = exported
+    else {
+        return Err(unavailable_error(
+            "profile_unavailable",
+            "the registered Profile revision cannot be read; retry or remove the Profile tag",
+            Some(record.last_event_id),
+        ));
+    };
+    if !holder_record.public
+        || holder_record.document_id != record.document_id
+        || holder_record.last_event_id != record.last_event_id
+    {
+        return Err(unavailable_error(
+            "profile_unavailable",
+            "the registered Profile revision is changing; retry or remove the Profile tag",
+            Some(record.last_event_id),
+        ));
+    }
+    let raw = raw.revision;
     if raw.winning_event_id != record.last_event_id {
         return Err(unavailable_error(
             "profile_unavailable",
@@ -669,9 +697,7 @@ fn map_registry_error(error: StorageReadError) -> MetadataError {
 }
 
 fn profile_id_from_iri(iri: &str) -> Option<Ulid> {
-    let value = iri
-        .strip_prefix(PROFILE_PUBLIC_PREFIX)
-        .or_else(|| iri.strip_prefix(LEGACY_GRAPH_PREFIX))?;
+    let value = iri.strip_prefix(PROFILE_PUBLIC_PREFIX)?;
     if value.is_empty() || value.contains('/') {
         return None;
     }
@@ -971,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_and_legacy_profile_iris_parse_to_same_id() {
+    fn canonical_profile_iri() {
         let id = MetaResourceId::from_parts(
             1,
             PlacementHandle::new(1).unwrap(),
@@ -983,7 +1009,7 @@ mod tests {
         assert_eq!(profile_id_from_iri(&profile_public_iri(id)), Some(id));
         assert_eq!(
             profile_id_from_iri(&MetadataRegistryRecord::graph_iri_for(id)),
-            Some(id)
+            None
         );
     }
 

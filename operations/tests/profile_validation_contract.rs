@@ -5,13 +5,18 @@ use std::sync::{Arc, LazyLock};
 use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataProfileValidationSeverity,
     MetadataProfileValidationState,
 };
 use aruna_core::storage_entries::metadata_event_log_prefix;
-use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmId, RealmNodeKind,
+};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_local_document,
@@ -561,34 +566,64 @@ async fn invalid_replace_preserves_the_last_revision_and_is_retryable()
 }
 
 #[tokio::test]
-async fn public_and_legacy_profile_iris_pin_the_same_revision()
--> Result<(), Box<dyn std::error::Error>> {
+async fn rejects_graph_alias() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
-    let (profile_id, revision) = register_profile(&test, group_id, minimum_shape()).await?;
-    for (suffix, tag) in [
-        ("public", profile_public_iri(profile_id)),
-        (
-            "legacy",
-            aruna_core::structs::MetadataRegistryRecord::graph_iri_for(profile_id),
-        ),
-    ] {
-        let path = format!("datasets/{suffix}");
-        let document_id = mint(&test, group_id, &path)?;
-        create_crate(
-            &test,
+    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
+    let document_id = mint(&test, group_id, "datasets/graph-alias")?;
+    let tag = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(profile_id);
+    let error = create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/graph-alias",
+        crate_json(document_id, Some(&tag), true, true),
+    )
+    .await
+    .expect_err("the graph IRI is not a Profile PID");
+    assert_profile_code(error, "profile_not_registered");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_private_profile() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
+    update_metadata_document(
+        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            actor: test.actor.clone(),
             group_id,
+            document_id: profile_id,
+            public: false,
+            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: profile_json(profile_id, minimum_shape()),
+            },
+        }),
+        test.context.as_ref(),
+    )
+    .await?;
+    let document_id = mint(&test, group_id, "datasets/private-probe")?;
+
+    let error = preview_submission(
+        test.context.as_ref(),
+        &crate_json(
             document_id,
-            &path,
-            crate_json(document_id, Some(&tag), true, true),
-        )
-        .await?;
-        let status = load_validation_status(test.context.as_ref(), document_id, None)
-            .await?
-            .expect("status is durable");
-        assert_eq!(status.profile_id, Some(profile_id));
-        assert_eq!(status.profile_revision, Some(revision));
-    }
+            Some(&profile_public_iri(profile_id)),
+            true,
+            true,
+        ),
+    )
+    .await
+    .expect_err("a private Profile is not available to preview");
+    let MetadataError::ProfileValidation(findings) = error else {
+        panic!("expected structured Profile validation findings");
+    };
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.code == "profile_not_registered")
+    );
     Ok(())
 }
 
@@ -756,6 +791,7 @@ async fn register_profile(
     group_id: Ulid,
     shapes: &str,
 ) -> Result<(Ulid, Ulid), Box<dyn std::error::Error>> {
+    seed_group(test, group_id).await?;
     let path = format!("profiles/{}", Ulid::generate());
     let profile_id = mint(test, group_id, &path)?;
     let created = create_crate(
@@ -769,6 +805,51 @@ async fn register_profile(
     drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
     process_metadata_materialization_batch(test.context.as_ref()).await?;
     Ok((profile_id, created.event_id))
+}
+
+async fn seed_group(test: &TestContext, group_id: Ulid) -> Result<(), Box<dyn std::error::Error>> {
+    let realm = RealmAuthorizationDocument::new_default_realm_doc(test.actor.realm_id);
+    let auth = GroupAuthorizationDocument::new_default_group_doc(
+        test.actor.user_id,
+        test.actor.realm_id,
+        group_id,
+    );
+    let group = Group {
+        display_name: "profiles".to_string(),
+        group_id,
+        realm_id: test.actor.realm_id,
+        roles: auth.roles.keys().copied().collect(),
+        owner: test.actor.user_id,
+    };
+    let writes = vec![
+        (
+            AUTH_KEYSPACE.to_string(),
+            test.actor.realm_id.as_bytes().to_vec().into(),
+            realm.to_bytes(&test.actor)?.into(),
+        ),
+        (
+            AUTH_KEYSPACE.to_string(),
+            group_id.to_bytes().to_vec().into(),
+            auth.to_bytes(&test.actor)?.into(),
+        ),
+        (
+            GROUP_KEYSPACE.to_string(),
+            group_id.to_bytes().to_vec().into(),
+            group.to_bytes(&test.actor)?.into(),
+        ),
+    ];
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected authorization seed: {other:?}").into()),
+    }
 }
 
 fn profile_json(profile_id: Ulid, shapes: &str) -> String {

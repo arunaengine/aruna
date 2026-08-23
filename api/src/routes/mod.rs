@@ -268,7 +268,6 @@ mod tests {
         ("POST", "/notifications/watches"),
         ("POST", "/oai"),
         ("POST", "/onboarding/bootstrap"),
-        ("POST", "/pid/{document_id}"),
         ("POST", "/policies/dry-run"),
         ("POST", "/policies/validate"),
         ("POST", "/staging/"),

@@ -1,12 +1,16 @@
+use std::collections::BTreeSet;
+
 use aruna_core::structs::{
-    JobError, JobProgress, JobResultPayload, MultipartUpload, StoragePurgeCheckpoint,
-    StoragePurgeResult, StoragePurgeScope, StoragePurgeSpec,
+    JobError, JobProgress, JobResultPayload, MultipartUpload, Permission, StoragePurgeCheckpoint,
+    StoragePurgeResult, StoragePurgeScope, StoragePurgeSpec, blob_object_permission_path,
 };
 use aruna_core::util::unix_timestamp_millis;
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{flush_progress, put_purge_checkpoint, read_purge_checkpoint};
 use crate::driver::drive;
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::s3::abort_multipart_upload::{
     AbortMultipartUploadError, AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
@@ -181,6 +185,7 @@ async fn abort_uploads(
         let mut removed = 0u64;
         for upload in page {
             check_stop(ctx)?;
+            authorize_object(ctx, spec, &upload.key).await?;
             match drive(
                 AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
                     bucket: upload.bucket,
@@ -241,6 +246,13 @@ async fn delete_versions(
                 },
             })
             .collect::<Vec<_>>();
+        for key in entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<BTreeSet<_>>()
+        {
+            authorize_object(ctx, spec, key).await?;
+        }
         let batch_len = entries.len() as u64;
         let outcomes = delete_objects(
             &ctx.driver,
@@ -269,6 +281,40 @@ async fn delete_versions(
         checkpoint.batches_completed = checkpoint.batches_completed.saturating_add(1);
         persist_batch(ctx, checkpoint, batch_len).await?;
     }
+}
+
+async fn authorize_object(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    key: &str,
+) -> Result<(), PurgeRunError> {
+    let path = blob_object_permission_path(
+        spec.auth_context.realm_id,
+        spec.group_id,
+        spec.node_id,
+        spec.scope.bucket(),
+        key,
+    );
+    authorize(
+        &ctx.driver,
+        spec.auth_context.realm_id,
+        &spec.auth_context,
+        &path,
+        &Permission::WRITE,
+        PolicyRequestExtras::rest(),
+    )
+    .await
+    .map_err(|error| match error {
+        AuthorizeError::PermissionDenied
+        | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => {
+            JobError::permanent(format!("purge object authorization failed: {error}"))
+        }
+        AuthorizeError::CheckFailed(_)
+        | AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_)) => {
+            JobError::retryable(format!("purge object authorization failed: {error}"))
+        }
+    })?;
+    Ok(())
 }
 
 async fn final_relist(ctx: &JobContext, scope: &StoragePurgeScope) -> Result<(), PurgeRunError> {

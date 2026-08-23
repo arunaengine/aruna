@@ -346,6 +346,16 @@ impl TaskFilters {
     }
 
     fn matches(&self, record: &JobRecord) -> bool {
+        self.matches_base(record)
+    }
+
+    fn has_derived(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|(key, _)| DERIVED_TAG_KEYS.contains(&key.as_str()))
+    }
+
+    fn matches_base(&self, record: &JobRecord) -> bool {
         let JobPayload::Execution(spec) = &record.payload else {
             return false;
         };
@@ -356,7 +366,29 @@ impl TaskFilters {
                     .as_deref()
                     .is_some_and(|name| name.starts_with(prefix))
             })
-            && self.tags.iter().all(|(key, value)| {
+            && self
+                .tags
+                .iter()
+                .filter(|(key, _)| !DERIVED_TAG_KEYS.contains(&key.as_str()))
+                .all(|(key, value)| {
+                    tags.get(key)
+                        .is_some_and(|stored| value.is_empty() || stored == value)
+                })
+    }
+
+    fn matches_facts(&self, record: &JobRecord, facts: &TaskFacts) -> bool {
+        if !self.matches_base(record) {
+            return false;
+        }
+        let JobPayload::Execution(spec) = &record.payload else {
+            return false;
+        };
+        let mut tags = project_tags(spec);
+        facts.stamp(&record.job_id.to_string(), &mut tags);
+        self.tags
+            .iter()
+            .filter(|(key, _)| DERIVED_TAG_KEYS.contains(&key.as_str()))
+            .all(|(key, value)| {
                 tags.get(key)
                     .is_some_and(|stored| value.is_empty() || stored == value)
             })
@@ -720,6 +752,52 @@ pub async fn get_task(
     )
 }
 
+async fn task_record(
+    state: &ServerState,
+    auth: &AuthContext,
+    record: JobRecord,
+) -> Result<(JobRecord, TaskFacts), TesError> {
+    match family_report(&state.get_ctx(), auth, record.job_id).await {
+        Some(Ok(report)) => Ok((family_record(&report), TaskFacts::from_report(&report))),
+        Some(Err(error)) => Err(TesError::from_job_route(error)),
+        None => Ok((record, TaskFacts::default())),
+    }
+}
+
+async fn list_derived(
+    state: &ServerState,
+    caller: &TesCaller,
+    filters: &TaskFilters,
+    mut cursor: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<(JobRecord, TaskFacts)>, Option<Vec<u8>>), TesError> {
+    let mut selected = Vec::with_capacity(limit);
+    let mut page_cursor = None;
+    loop {
+        let (mut records, next_cursor) =
+            list_owned_jobs(&state.get_ctx(), caller.auth.user_id, cursor, 1, |record| {
+                filters.matches_base(record) && task_in_group(record, caller.credential_group)
+            })
+            .await
+            .map_err(TesError::internal)?;
+        let Some(record) = records.pop() else {
+            return Ok((selected, None));
+        };
+        let task = task_record(state, &caller.auth, record).await?;
+        if filters.matches_facts(&task.0, &task.1) {
+            if selected.len() == limit {
+                return Ok((selected, page_cursor));
+            }
+            page_cursor = next_cursor.clone();
+            selected.push(task);
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Ok((selected, None));
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/ga4gh/tes/v1/tasks",
@@ -783,30 +861,39 @@ pub async fn list_tasks(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .min(MAX_PAGE_SIZE);
 
-    let (records, next_cursor) = match list_owned_jobs(
-        &state.get_ctx(),
-        caller.auth.user_id,
-        cursor,
-        limit,
-        |record| filters.matches(record) && task_in_group(record, caller.credential_group),
-    )
-    .await
-    {
-        Ok(page) => page,
-        Err(error) => return TesError::internal(error).into_response(),
-    };
-
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
-    let mut tasks = Vec::with_capacity(records.len());
-    for record in records {
-        let (record, facts) =
-            match family_report(&state.get_ctx(), &caller.auth, record.job_id).await {
-                Some(Ok(report)) => (family_record(&report), TaskFacts::from_report(&report)),
-                Some(Err(error)) => return TesError::from_job_route(error).into_response(),
-                None => (record, TaskFacts::default()),
-            };
-        tasks.push(project_task(&record, &facts, view, &base_url));
-    }
+    let page = if filters.has_derived() {
+        list_derived(&state, &caller, &filters, cursor, limit).await
+    } else {
+        let (records, next_cursor) = match list_owned_jobs(
+            &state.get_ctx(),
+            caller.auth.user_id,
+            cursor,
+            limit,
+            |record| filters.matches(record) && task_in_group(record, caller.credential_group),
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => return TesError::internal(error).into_response(),
+        };
+        let mut tasks = Vec::with_capacity(records.len());
+        for record in records {
+            match task_record(&state, &caller.auth, record).await {
+                Ok(task) => tasks.push(task),
+                Err(error) => return error.into_response(),
+            }
+        }
+        Ok((tasks, next_cursor))
+    };
+    let (records, next_cursor) = match page {
+        Ok(page) => page,
+        Err(error) => return error.into_response(),
+    };
+    let tasks = records
+        .iter()
+        .map(|(record, facts)| project_task(record, facts, view, &base_url))
+        .collect();
 
     tes_json_response(
         StatusCode::OK,
@@ -2254,6 +2341,23 @@ mod tests {
         let filters = TaskFilters::from_query(&query, uri.query()).unwrap();
         assert!(filters.matches(&record));
 
+        let derived = TaskFilters::from_query(
+            &ListTasksQuery::default(),
+            Some(&format!(
+                "tag_key=aruna-engine.org%2Fjob-id&tag_value={}&tag_key=aruna-engine.org%2Flogical-state&tag_value=running&tag_key=aruna-engine.org%2Fexecutor-kind&tag_value=docker&tag_key=aruna-engine.org%2Festimated-transfer-bytes&tag_value=4096",
+                record.job_id
+            )),
+        )
+        .unwrap();
+        let facts = TaskFacts {
+            logical_state: Some("running".to_string()),
+            executor_kind: Some("docker".to_string()),
+            transfer_bytes: Some(4_096),
+        };
+        assert!(derived.has_derived());
+        assert!(derived.matches(&record));
+        assert!(derived.matches_facts(&record, &facts));
+
         let wrong_name = ListTasksQuery {
             name_prefix: Some("other".to_string()),
             ..Default::default()
@@ -3164,6 +3268,57 @@ mod tests {
             .unwrap();
         let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lists_derived_tags() {
+        let (_dir, state) = build_state(false).await;
+        let owner = user(2);
+        let group = Ulid::from_bytes([5u8; 16]);
+        let access = sealed(&state, group);
+        write_credential(&state, &access).await;
+        let headers = basic_headers(&access, TES_SECRET);
+        let target = JobId::from_bytes([9u8; 16]);
+        for job_id in [
+            JobId::from_bytes([8u8; 16]),
+            target,
+            JobId::from_bytes([10u8; 16]),
+        ] {
+            let (spec, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
+            insert_job(
+                &state.get_ctx().storage_handle,
+                &execution_record(job_id, owner, spec),
+            )
+            .await
+            .unwrap();
+        }
+
+        let raw_query = format!("tag_key=aruna-engine.org%2Fjob-id&tag_value={target}");
+        let listed = list_tasks(
+            State(state),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            headers,
+            RawQuery(Some(raw_query)),
+            Query(ListTasksQuery {
+                view: Some("BASIC".to_string()),
+                page_size: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.tasks.len(), 1);
+        assert_eq!(page.tasks[0].id, Some(target.to_string()));
+        assert_eq!(
+            page.tasks[0].tags.get(JOB_ID_TAG_KEY),
+            Some(&target.to_string())
+        );
+        assert!(page.next_page_token.is_none());
     }
 
     #[tokio::test]

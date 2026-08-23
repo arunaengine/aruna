@@ -398,7 +398,7 @@ impl ObjectSearchCursor {
     fn decode(
         raw: &str,
         fingerprint: [u8; 32],
-        authorized_signer: NodeId,
+        authorized_signers: &[NodeId],
     ) -> Result<Self, MetadataApiError> {
         if raw.len() > OBJECT_SEARCH_CURSOR_MAX_BYTES {
             return Err(MetadataApiError::InvalidCursor(
@@ -421,7 +421,7 @@ impl ObjectSearchCursor {
         let signer = NodeId::from_bytes(&cursor.signer).map_err(|_| {
             MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
         })?;
-        if signer != authorized_signer
+        if !authorized_signers.contains(&signer)
             || signer
                 .verify(&cursor.signing_bytes(), &cursor.signature)
                 .is_err()
@@ -4868,7 +4868,18 @@ pub async fn search_objects(
     let (as_of, mut partitions, mut failed_partitions, discovery_failed, omitted_partitions) =
         match request.cursor.as_deref() {
             Some(raw) => {
-                let cursor = ObjectSearchCursor::decode(raw, fingerprint, local_node_id)?;
+                let authorized_signers = match request.mode {
+                    ObjectSearchQueryMode::Local => vec![local_node_id],
+                    ObjectSearchQueryMode::DistributedBestEffort
+                    | ObjectSearchQueryMode::DistributedStrict => {
+                        load_realm_config(context, realm_id)
+                            .await
+                            .ok_or(MetadataApiError::ServiceUnavailable)?
+                            .node_ids()
+                            .map_err(|_| MetadataApiError::ServiceUnavailable)?
+                    }
+                };
+                let cursor = ObjectSearchCursor::decode(raw, fingerprint, &authorized_signers)?;
                 let partitions = cursor.partition_states()?;
                 if request.mode == ObjectSearchQueryMode::Local
                     && (partitions.len() != 1 || partitions[0].node_id != local_node_id)
@@ -7613,9 +7624,10 @@ mod tests {
     }
 
     #[test]
-    fn object_cursor_rejects_tampered_coverage_state() {
+    fn rejects_cursor_tampering() {
         let secret = iroh::SecretKey::from_bytes(&[34u8; 32]);
         let signer = secret.public();
+        let receiver = iroh::SecretKey::from_bytes(&[36u8; 32]).public();
         let fingerprint = [35u8; 32];
         let mut cursor = ObjectSearchCursor::new_signed(
             fingerprint,
@@ -7633,10 +7645,17 @@ mod tests {
             |bytes| secret.sign(bytes),
         );
 
-        assert!(ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, signer).is_ok());
+        assert!(
+            ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver, signer])
+                .is_ok()
+        );
+        assert!(matches!(
+            ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver]),
+            Err(MetadataApiError::InvalidCursor(_))
+        ));
         cursor.omitted_partitions = 1;
         assert!(matches!(
-            ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, signer),
+            ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[signer]),
             Err(MetadataApiError::InvalidCursor(_))
         ));
     }

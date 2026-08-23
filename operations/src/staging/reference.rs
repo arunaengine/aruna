@@ -4,6 +4,7 @@ use crate::blob::blob_keyspace_helper::{
 use crate::connectors::repository::{source_connector_key, source_connector_secret_key};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_version_source_binding;
 use crate::staging::head_source::{
     HeadStagingSourceError, HeadStagingSourceInput, HeadStagingSourceOperation,
@@ -63,6 +64,8 @@ pub enum MaterializeReferenceError {
     Usage(#[from] UsageUpdateError),
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
+    #[error(transparent)]
+    Purge(#[from] PurgeFenceError),
 }
 
 pub async fn materialize_reference(
@@ -101,6 +104,7 @@ pub async fn materialize_reference(
     };
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
+        guard_purge_fence(context, txn_id, &input.bucket, &input.key).await?;
         let bucket_policies = guard_expected_bucket(
             context,
             txn_id,
@@ -242,6 +246,20 @@ pub async fn materialize_reference(
         version_source,
         version_id,
     })
+}
+
+async fn guard_purge_fence(
+    context: &DriverContext,
+    txn_id: TxnId,
+    bucket: &str,
+    key: &str,
+) -> Result<(), MaterializeReferenceError> {
+    check_write_fence(
+        send_storage_effect(context, write_fence_read(bucket, Some(txn_id))).await?,
+        bucket,
+        key,
+    )?;
+    Ok(())
 }
 
 fn source_metadata_matches(left: &SourceMetadata, right: &SourceMetadata) -> bool {
@@ -482,13 +500,14 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-        SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, USAGE_STATS_KEYSPACE,
+        S3_PURGE_FENCE_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
+        USAGE_STATS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, RoutingSnapshot,
-        SourceConnectorKind, SourceConnectorSecret, UsageCounters, usage_global_key_for_group,
-        usage_group_key,
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, JobId, RoutingSnapshot,
+        SourceConnectorKind, SourceConnectorSecret, StoragePurgeFence, StoragePurgeScope,
+        UsageCounters, usage_global_key_for_group, usage_group_key,
     };
     use aruna_storage::storage;
     use axum::{Router, routing::get};
@@ -936,6 +955,39 @@ mod tests {
         let usage = read_usage_counters(context, usage_group_key(group_id)).await;
         assert_eq!(usage.logical_bytes, 0);
         assert_eq!(usage.referenced_bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn reference_obeys_fence() {
+        let (_tempdir, context) = test_context();
+        let fence = StoragePurgeFence {
+            job_id: JobId::from_bytes([11; 16]),
+            scope: StoragePurgeScope::File {
+                bucket: "bucket-a".to_string(),
+                key: "object.txt".to_string(),
+            },
+        };
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_PURGE_FENCE_KEYSPACE.to_string(),
+                key: b"bucket-a".to_vec().into(),
+                value: fence.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let txn_id = start_write_transaction(&context).await;
+        let result = guard_purge_fence(&context, txn_id, "bucket-a", "object.txt").await;
+
+        assert_eq!(
+            result,
+            Err(MaterializeReferenceError::Purge(PurgeFenceError::Suspended))
+        );
     }
 
     #[tokio::test]

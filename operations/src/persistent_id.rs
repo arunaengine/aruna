@@ -195,136 +195,6 @@ pub async fn fail_persistent_id(
     ))
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PersistentIdBackfillResult {
-    pub assigned: usize,
-    pub existing: usize,
-    /// Projection/classification or authority dependencies that should be
-    /// retried by the reconciliation task.
-    pub pending: usize,
-}
-
-/// Reconcile projected legacy documents on this node's PID authorities. Each
-/// document-only mapping key is compare-and-set, so overlapping sweeps assign
-/// exactly one general or Profile w3id and never create a second provider row.
-pub async fn backfill_persistent_ids(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-) -> Result<PersistentIdBackfillResult, PersistentIdError> {
-    let Some(metadata_handle) = ctx.metadata_handle.as_ref() else {
-        return Ok(PersistentIdBackfillResult::default());
-    };
-    let records = metadata_handle
-        .list_cached_registry_records()
-        .await
-        .map_err(|error| PersistentIdError::Unavailable(error.to_string()))?;
-    let records = crate::metadata::api::filter_live_records(&ctx.storage_handle, records.as_ref())
-        .await
-        .map_err(|error| PersistentIdError::Unavailable(error.to_string()))?;
-    let config = if ctx.net_handle.is_some() {
-        Some(load_realm_config(ctx, realm_id).await.ok_or_else(|| {
-            PersistentIdError::Unavailable("realm placement config is unavailable".to_string())
-        })?)
-    } else {
-        None
-    };
-    let mut result = PersistentIdBackfillResult::default();
-    for record in records
-        .into_iter()
-        .filter(|record| record.realm_id == realm_id)
-    {
-        if let (Some(config), Some(net_handle)) = (config.as_ref(), ctx.net_handle.as_ref())
-            && crate::metadata::forward::pid_authority_node(config, realm_id, record.document_id)
-                != Some(net_handle.node_id())
-        {
-            continue;
-        }
-        if read_mapping(ctx, record.document_id).await?.is_some() {
-            result.existing += 1;
-            continue;
-        }
-        let summary = match metadata_handle
-            .export_rocrate_summary_jsonld(record.graph_iri.clone())
-            .await
-        {
-            Ok(summary) => summary,
-            Err(_) => {
-                result.pending += 1;
-                continue;
-            }
-        };
-        let profile =
-            match crate::metadata::stats::classify_root_summary(&summary, &record.graph_iri) {
-                Ok(crate::metadata::stats::DocumentPurpose::Profile) => true,
-                Ok(_) => false,
-                Err(_) => {
-                    result.pending += 1;
-                    continue;
-                }
-            };
-        let backfill_user = UserId::local(Ulid::nil(), realm_id);
-        match backfill_one(ctx, realm_id, &record, profile, backfill_user).await? {
-            true => result.assigned += 1,
-            false => result.existing += 1,
-        }
-    }
-    Ok(result)
-}
-
-async fn backfill_one(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    record: &MetadataRegistryRecord,
-    profile: bool,
-    minted_by: UserId,
-) -> Result<bool, PersistentIdError> {
-    let route = mapping_route(ctx, realm_id, record.document_id).await?;
-    for attempt in 0..TRANSITION_ATTEMPTS {
-        let txn_id = start_transaction(ctx).await?;
-        if registry_missing_txn(ctx, record.document_id, txn_id).await? {
-            abort_transaction(ctx, txn_id).await;
-            return Ok(false);
-        }
-        if mapping_in_txn(ctx, record.document_id, txn_id)
-            .await?
-            .is_some()
-        {
-            abort_transaction(ctx, txn_id).await;
-            return Ok(false);
-        }
-        if !fence_admits(ctx, &route, txn_id).await? {
-            abort_transaction(ctx, txn_id).await;
-            return Err(PersistentIdError::PlacementFenced);
-        }
-        let now_ms = aruna_core::util::unix_timestamp_millis();
-        let mapping = PersistentIdMapping::active(
-            record.document_id,
-            profile,
-            minted_by,
-            record.public,
-            record.permission_path.clone(),
-            mapping_revision(&route, now_ms),
-        );
-        write_transition(ctx, &route, &mapping, txn_id).await?;
-        match commit_transaction(ctx, txn_id).await {
-            TransitionCommit::Committed => {
-                schedule_drain(ctx).await;
-                return Ok(true);
-            }
-            TransitionCommit::Conflict if attempt + 1 < TRANSITION_ATTEMPTS => continue,
-            TransitionCommit::Conflict => {
-                return Err(PersistentIdError::Storage(
-                    StorageError::TransactionConflict,
-                ));
-            }
-            TransitionCommit::Failed(error) => return Err(PersistentIdError::Unavailable(error)),
-        }
-    }
-    Err(PersistentIdError::Storage(
-        StorageError::TransactionConflict,
-    ))
-}
-
 /// Exceptional administrator-only withdrawal. Authorization is enforced at
 /// both routing hops; the transition stores the actor and required reason and
 /// writes the generic metadata audit row in the same transaction.
@@ -539,8 +409,7 @@ async fn admin_withdraw_in_txn(
 }
 
 /// Deletion transition shared with the document delete. It is composed into the
-/// transaction that removes the registry row; an absent legacy mapping stays
-/// absent because its Profile-vs-general identity cannot safely be guessed.
+/// transaction that removes the registry row; an absent mapping stays absent.
 pub fn tombstone_transition(
     existing: Option<&PersistentIdMapping>,
     route: &Option<MappingRoute>,
@@ -778,24 +647,6 @@ async fn schedule_drain(ctx: &DriverContext) {
     }
 }
 
-/// The automatic PID a legacy (pre-mapping) document would carry, derived from
-/// its materialized summary; `None` while the summary is not readable.
-pub async fn expected_legacy_pid(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Option<String> {
-    let handle = context.metadata_handle.as_ref()?;
-    let summary = handle
-        .export_rocrate_summary_jsonld(record.graph_iri.clone())
-        .await
-        .ok()?;
-    let profile = crate::metadata::stats::summary_is_profile(&summary, &record.graph_iri).ok()?;
-    Some(PersistentIdMapping::automatic_pid(
-        record.document_id,
-        profile,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,29 +760,6 @@ mod tests {
         assert!(!minted_second);
         assert_eq!(first.pid, second.pid);
         assert_eq!(second.minted_at_ms, Some(1));
-    }
-
-    #[tokio::test]
-    async fn backfill_assigns_one_w3id_per_legacy_document() {
-        let (ctx, _dir) = context();
-        let id = Ulid::from_bytes([14; 16]);
-        let legacy = record(id);
-        seed_record(&ctx, id).await;
-
-        assert!(
-            backfill_one(&ctx, realm(), &legacy, false, user())
-                .await
-                .unwrap()
-        );
-        assert!(
-            !backfill_one(&ctx, realm(), &legacy, false, user())
-                .await
-                .unwrap()
-        );
-        let mapping = read_mapping(&ctx, id).await.unwrap().unwrap();
-        assert_eq!(mapping.pid, MetadataRegistryRecord::graph_iri_for(id));
-        assert_eq!(mapping.status, PersistentIdStatus::Active);
-        assert_eq!(mapping.provider.name(), "w3id");
     }
 
     #[tokio::test]
@@ -1133,9 +961,13 @@ mod tests {
             mapping_route_for(&config, realm(), document_id, node()).expect("the route resolves");
         assert_eq!(route.generation, 1);
 
-        let mapping = PersistentIdMapping::conceptual(
+        let mapping = PersistentIdMapping::requested(
             document_id,
+            false,
             user(),
+            JobId::from_bytes([7; 16]),
+            true,
+            record(document_id).permission_path,
             mapping_revision(&Some(route.clone()), 1),
         );
         let writes = transition_entries(&Some(route.clone()), &mapping).expect("entries build");

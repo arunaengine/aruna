@@ -9459,11 +9459,6 @@ fn validate_pid_mapping(
                 return Err("active mapping has inconsistent transition fields".to_string());
             }
         }
-        PersistentIdStatus::Withdrawn => {
-            if mapping.withdrawn_at_ms.is_none() {
-                return Err("withdrawn mapping has no withdrawal timestamp".to_string());
-            }
-        }
         PersistentIdStatus::Requested | PersistentIdStatus::Processing => {
             if mapping.requested_at_ms.is_none()
                 || mapping.minted_at_ms.is_some()
@@ -10100,12 +10095,13 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, Group,
-        GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, HandleRange, METADATA_HANDLE,
-        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding,
-        SyncQuarantineFamily, SyncQuarantineRecord, UserGroupCapOverride, band_start,
+        GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, HandleRange, JobId,
+        METADATA_HANDLE, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
+        Permission, PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy,
+        QuotaConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RealmNodeKind, Role, SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint,
+        StrategyBinding, SyncQuarantineFamily, SyncQuarantineRecord, UserGroupCapOverride,
+        band_start,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId, UserId};
@@ -21169,15 +21165,22 @@ mod tests {
         };
         let placed = |shard: u32| PlacementRef { strategy_id, shard };
         let mapping = |document_id, actor, seed: u64| {
-            PersistentIdMapping::conceptual(
+            let revision = PersistentIdRevision {
+                event_id: Ulid::from_parts(seed, 1),
+                actor,
+                occurred_at_ms: 100 + seed,
+            };
+            let mut mapping = PersistentIdMapping::requested(
                 document_id,
+                false,
                 minted_by,
-                PersistentIdRevision {
-                    event_id: Ulid::from_parts(seed, 1),
-                    actor,
-                    occurred_at_ms: 100 + seed,
-                },
-            )
+                JobId::from_bytes([7; 16]),
+                true,
+                "/documents/test".to_string(),
+                revision,
+            );
+            assert!(mapping.activate(minted_by, revision));
+            mapping
         };
 
         let valid_document = document(4, 3_110);

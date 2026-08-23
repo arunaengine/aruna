@@ -140,7 +140,6 @@ pub struct ProfileValidationCapabilitiesResponse {
     pub supported_constraints: Vec<String>,
     pub unsupported_constraint_policy: String,
     pub public_profile_iri_template: String,
-    pub legacy_profile_iri_template: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1128,7 +1127,7 @@ pub async fn get_metadata_path(
     summary = "Get backend Profile validation capabilities",
     description = "Shapes registered as a Profile are compiled and executed by craqle's native SHACL Core Subset v1 engine, server side and authoritative. Supported targets are sh:targetClass, sh:targetNode, sh:targetSubjectsOf, sh:targetObjectsOf, and implicit class targets; a node shape that names no target at all is bound to the crate root, so a Profile can constrain the root entity without knowing its minted IRI. Supported paths are predicate, sh:inversePath, sequence, sh:alternativePath, sh:zeroOrOnePath, sh:zeroOrMorePath, and sh:oneOrMorePath. The supported constraint set is listed in supported_constraints. SHACL-SPARQL, SHACL-JS, SHACL-AF, custom components and targets, recursive shapes, RDF-star terms, and remote owl:imports fail closed with an unsupported_constraint finding that names the construct; the same finding is returned when the registered Turtle cannot be parsed. sh:class is exact rdf:type membership: no RDFS or OWL inference is applied, so a subclass instance does not satisfy a superclass constraint. Shapes may reference crate-local ids relative to the crate root, for example sh:hasValue <#person-1>. Evaluation is bounded: exceeding the result, path-edge, or path-depth budget returns a permanent validation_limit finding with incomplete completeness instead of a partial verdict, while a temporarily unavailable Profile or evaluator returns 503 with Retry-After.",
     responses((status = 200, description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms", body = ProfileValidationCapabilitiesResponse,
-        example = json!({"evaluator": "craqle-shacl-core/0.2", "supported_constraints": ["sh:targetClass", "sh:property", "sh:path", "sh:minCount", "sh:maxCount", "sh:datatype", "sh:class", "sh:nodeKind", "sh:pattern", "sh:in", "sh:hasValue", "sh:closed"], "unsupported_constraint_policy": "fail_closed", "public_profile_iri_template": "https://w3id.org/aruna/profile/{document_id}", "legacy_profile_iri_template": "https://w3id.org/aruna/{document_id}"})))
+        example = json!({"evaluator": "craqle-shacl-core/0.2", "supported_constraints": ["sh:targetClass", "sh:property", "sh:path", "sh:minCount", "sh:maxCount", "sh:datatype", "sh:class", "sh:nodeKind", "sh:pattern", "sh:in", "sh:hasValue", "sh:closed"], "unsupported_constraint_policy": "fail_closed", "public_profile_iri_template": "https://w3id.org/aruna/profile/{document_id}"})))
 )]
 pub async fn profile_validation_capabilities()
 -> (StatusCode, Json<ProfileValidationCapabilitiesResponse>) {
@@ -1142,7 +1141,6 @@ pub async fn profile_validation_capabilities()
                 .collect(),
             unsupported_constraint_policy: "fail_closed".to_string(),
             public_profile_iri_template: "https://w3id.org/aruna/profile/{id}".to_string(),
-            legacy_profile_iri_template: "https://w3id.org/aruna/{id}".to_string(),
         }),
     )
 }
@@ -2104,7 +2102,7 @@ pub async fn query_all_metadata(
     description = "Authentication is optional and changes the result: hits are restricted to metadata the caller may read, so an anonymous request returns fewer documents. Either q or conforms_to must be given. Distributed searches fan out to at most 32 realm node partitions, at most 8 of them concurrently, under an overall deadline of a few seconds; nodes_failed counts the partitions that failed, timed out or were dropped by that cap, and any non-zero value means the page is a partial view of the realm. Pagination is cursor-based and stops at a server-side depth of 1000 hits per node, which is reported as truncated. Hits come from each node's own index, so a document whose write was only just accepted may not be findable yet.",
     params(
         ("q" = Option<String>, Query, description = "Free-text search query, matched against indexed literals. Optional when conforms_to is set; a request with neither is rejected with 400"),
-        ("conforms_to" = Option<String>, Query, description = "RO-Crate conformsTo specification or Profile IRI. The 1.2 and 1.3 specification IRIs and the RO-Crate community profiles under https://w3id.org/ro/wfrun/ and https://w3id.org/workflowhub/workflow-ro-crate/ match exactly and are not treated as registered Profiles. Registered https://w3id.org/aruna/profile/{id} and legacy https://w3id.org/aruna/{id} forms resolve to the same exact registered Profile; other absolute IRIs are matched exactly, never as a prefix"),
+        ("conforms_to" = Option<String>, Query, description = "RO-Crate conformsTo specification or Profile IRI. The 1.2 and 1.3 specification IRIs and the RO-Crate community profiles under https://w3id.org/ro/wfrun/ and https://w3id.org/workflowhub/workflow-ro-crate/ match exactly and are not treated as registered Profiles. A registered Profile uses only https://w3id.org/aruna/profile/{id}; other absolute IRIs are matched exactly, never as a prefix"),
         ("group_id" = Option<String>, Query, description = "Restrict hits to a single group ULID"),
         ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100). Hits are ordered by descending score"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous response's next_cursor. Bound to the original query; replaying it with a changed query returns 400. Paging is best-effort: results may shift under concurrent metadata churn or node failures"),

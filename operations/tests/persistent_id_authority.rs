@@ -5,7 +5,7 @@
 //! The mapping keyspace is deliberately not the registry row: the row is deleted
 //! with the document while the mapping has to survive it to serve a permanent 410.
 //! These tests prove that every node answers the same way regardless of which one
-//! receives the request, that `Withdrawn` is terminal against a racing mint, and
+//! receives the request, that retirement is terminal against a racing mint, and
 //! that a node which cannot reach the authority reports unavailable rather than
 //! inventing a local 404.
 
@@ -18,7 +18,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_PENDING_PROJECTION_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
 use aruna_core::storage_entries::metadata_pending_projection_key;
 use aruna_core::structs::{
-    MetadataRegistryRecord, MintPersistentIdSpec, PersistentIdMapping, PersistentIdRevision,
+    JobId, MetadataRegistryRecord, MintPersistentIdSpec, PersistentIdMapping, PersistentIdRevision,
     PersistentIdStatus, PlacementRef, persistent_id_key, pid_dedup_key,
 };
 use aruna_operations::claim_initial_realm_admin::{
@@ -429,7 +429,11 @@ async fn replica_mapping_ignored() -> TestResult<()> {
     let authority = realm.holder(&minted_placement);
     assert!(mint_routed(&realm, authority, minted_id).await?.1);
     for node_id in realm.non_holder_ids(&minted_placement) {
-        write_mapping(realm.find(node_id), withdrawn_mapping(minted_id)).await?;
+        write_mapping(
+            realm.find(node_id),
+            withdrawn_mapping(minted_id, realm.user_id),
+        )
+        .await?;
     }
 
     for node in realm.nodes.iter() {
@@ -653,11 +657,31 @@ fn revision(occurred_at_ms: u64) -> PersistentIdRevision {
 }
 
 fn active_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
-    PersistentIdMapping::conceptual(document_id, minted_by, revision(1))
+    let mut mapping = PersistentIdMapping::requested(
+        document_id,
+        false,
+        minted_by,
+        JobId::from_bytes([7; 16]),
+        true,
+        "/documents/test".to_string(),
+        revision(1),
+    );
+    assert!(mapping.activate(minted_by, revision(1)));
+    mapping
 }
 
-fn withdrawn_mapping(document_id: Ulid) -> PersistentIdMapping {
-    PersistentIdMapping::tombstone(document_id, revision(2))
+fn withdrawn_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
+    let mut mapping = PersistentIdMapping::requested(
+        document_id,
+        false,
+        minted_by,
+        JobId::from_bytes([7; 16]),
+        true,
+        "/documents/test".to_string(),
+        revision(1),
+    );
+    assert!(mapping.mark_tombstoned(revision(2)));
+    mapping
 }
 
 /// Writes a mapping row straight into one node's store, which is what a delayed

@@ -17,14 +17,11 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_core::structs::{
-    AuthContext, DEFAULT_JOB_RETENTION_MS, MetadataRegistryRecord, MintPersistentIdSpec,
-    Permission, PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
-    PersistentIdStatus,
+    AuthContext, MetadataRegistryRecord, Permission, PersistentIdFailure, PersistentIdKind,
+    PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
-use aruna_operations::jobs::service::submit_mint_pid;
-use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
@@ -46,7 +43,7 @@ pub struct PidApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(PidApiDoc::openapi())
-        .routes(routes!(resolve_pid, mint_pid, withdraw_pid))
+        .routes(routes!(resolve_pid, withdraw_pid))
         .routes(routes!(resolve_profile_pid))
         .routes(routes!(list_persistent_ids))
 }
@@ -140,17 +137,6 @@ fn landing_response(
     }
 }
 
-/// The submission runs on the document's PID authority, so its failures are that
-/// node's answer about the document, not an internal fault of this one.
-fn mint_submit_error(error: SubmitJobError) -> ServerError {
-    match error {
-        SubmitJobError::DocumentMissing => ServerError::NotFound,
-        SubmitJobError::AuthorityDenied => ServerError::Forbidden,
-        SubmitJobError::PlacementUnavailable(_) => ServerError::ServiceUnavailable,
-        error => ServerError::InternalError(error.to_string()),
-    }
-}
-
 fn redirect(location: &str) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::FOUND;
@@ -177,7 +163,6 @@ enum PersistentIdStateView {
     Failed,
     AdminWithdrawn,
     Tombstoned,
-    LegacyUnminted,
     Unknown,
 }
 
@@ -210,7 +195,6 @@ fn status_view(mapping: &PersistentIdMapping) -> PersistentIdView {
         PersistentIdStatus::Failed => PersistentIdStateView::Failed,
         PersistentIdStatus::AdminWithdrawn => PersistentIdStateView::AdminWithdrawn,
         PersistentIdStatus::Tombstoned => PersistentIdStateView::Tombstoned,
-        PersistentIdStatus::Withdrawn => PersistentIdStateView::Unknown,
     };
     PersistentIdView {
         kind: match mapping.kind {
@@ -281,28 +265,19 @@ async fn require_status_visibility(
     ensure_permission(state, auth, path, Permission::READ).await
 }
 
-async fn expected_legacy_pid(
-    state: &ServerState,
-    record: &MetadataRegistryRecord,
-) -> Option<String> {
-    aruna_operations::persistent_id::expected_legacy_pid(&state.get_ctx(), record).await
-}
-
 /// Authenticated typed status is sourced only from the durable PID mapping.
 /// `requested`, `processing`, `active`, `failed`, `admin-withdrawn` and
 /// `tombstoned` are its stored lifecycle states; failure and job fields come
 /// from that same row, never from a possibly unreadable job endpoint.
-/// `legacy-unminted` means an authorized live registry row exists while the PID
-/// authority has no mapping and its projected root can be classified. `unknown`
-/// means the caller may read the document but the authority or classification
-/// cannot currently give a definitive record. Anonymous access to a private
+/// `unknown` means the caller may read the document but the authority cannot
+/// currently give a definitive record. Anonymous access to a private
 /// mapping or registry row remains 404 and is not an existence oracle.
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}/pids",
     tag = "pid",
     summary = "List a document's typed persistent identifiers",
-    description = "Returns the one stored automatic w3id record as a typed list while storage remains keyed 1:1 by document. Stored mapping state is authoritative for requested, processing, active, failed, admin-withdrawn and tombstoned, including its job reference and failure/retry data; job-read failure is never interpreted as unminted. An authorized live legacy document with no authority mapping is legacy-unminted only after its projected root identifies the exact general or Profile identity. Authority or classification ambiguity is unknown. Public records may be read anonymously; a private record returns 404 anonymously and requires READ on its frozen document permission path when authenticated.",
+    description = "Returns the one stored automatic w3id record as a typed list while storage remains keyed 1:1 by document. Stored mapping state is authoritative for requested, processing, active, failed, admin-withdrawn and tombstoned, including its job reference and failure/retry data; job-read failure is never interpreted as unminted. A missing or unavailable authority mapping is unknown. Public records may be read anonymously; a private record returns 404 anonymously and requires READ on its frozen document permission path when authenticated.",
     params(("document_id" = String, Path, description = "Metadata document ULID")),
     responses(
         (status = 200, description = "Typed list containing the automatic w3id status", body = [PersistentIdView], example = json!([{
@@ -343,16 +318,10 @@ async fn list_persistent_ids(
         Ok(None) => {
             let record = record.as_ref().ok_or(ServerError::NotFound)?;
             require_status_visibility(&state, auth.as_ref(), None, Some(record)).await?;
-            let value = expected_legacy_pid(&state, record).await;
-            let status = if value.is_some() {
-                PersistentIdStateView::LegacyUnminted
-            } else {
-                PersistentIdStateView::Unknown
-            };
             Ok(Json(vec![synthetic_status_view(
                 document_id,
-                value,
-                status,
+                None,
+                PersistentIdStateView::Unknown,
             )]))
         }
         Err(_) => {
@@ -365,93 +334,6 @@ async fn list_persistent_ids(
             )]))
         }
     }
-}
-
-/// Compatibility trigger for legacy documents. New creates already carry their
-/// typed intent and fenced job; this route returns that same intent and never
-/// submits a second mint.
-#[utoipa::path(
-    post,
-    path = "/pid/{document_id}",
-    tag = "pid",
-    summary = "Mint a w3id persistent identifier for a document",
-    description = "Compatibility route requiring an unrestricted realm bearer token and WRITE on the document. Metadata creation already records the automatic typed w3id intent and fenced job atomically. If that intent exists, this route returns its exact general-or-Profile value and stored job id with created=false without submitting another job. Only a live legacy document with no mapping submits the existing document-scoped deduplicated job; reconciliation supplies its typed mapping. If authority status is unavailable the route returns 503 instead of risking a duplicate.",
-    params(("document_id" = String, Path, description = "Document ULID to mint a PID for, for example 01JMETADATA0123456789ABCDE")),
-    responses(
-        (
-            status = 202,
-            description = "Mint job durably accepted on the document's PID authority; the identifier resolves once the job completes",
-            body = Object,
-            content_type = "application/json",
-            example = json!({"pid": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE", "job_id": "01JJOB0123456789ABCDEFGHJK", "created": true})
-        ),
-        (status = 400, description = "Malformed document id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Caller lacks WRITE on the document", body = ErrorResponse),
-        (status = 404, description = "Document not found", body = ErrorResponse),
-        (status = 503, description = "PID authority unreachable, retry later", body = ErrorResponse)
-    ),
-    security(("bearer_auth" = []))
-)]
-async fn mint_pid(
-    State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
-    Path(document_id): Path<String>,
-) -> ServerResult<(StatusCode, Json<serde_json::Value>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
-    let ctx = state.get_ctx();
-    let record = load_metadata_record_by_document(&ctx, document_id)
-        .await
-        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?
-        .ok_or(ServerError::NotFound)?;
-    ensure_permission(
-        &state,
-        &auth,
-        record.permission_path.clone(),
-        Permission::WRITE,
-    )
-    .await?;
-
-    match read_pid_routed(&ctx, state.get_realm_id(), document_id).await {
-        Ok(Some(mapping)) => {
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "pid": mapping.pid,
-                    "job_id": mapping.job_id.map(|job_id| job_id.to_string()),
-                    "created": false,
-                })),
-            ));
-        }
-        Ok(None) => {}
-        Err(_) => return Err(ServerError::ServiceUnavailable),
-    }
-
-    let result = submit_mint_pid(
-        &ctx,
-        MintPersistentIdSpec {
-            document_id,
-            minted_by: auth.user_id,
-        },
-        state.get_node_id(),
-        DEFAULT_JOB_RETENTION_MS,
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(mint_submit_error)?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "pid": expected_legacy_pid(&state, &record)
-                .await
-                .unwrap_or_else(|| MetadataRegistryRecord::graph_iri_for(document_id)),
-            "job_id": result.job_id.to_string(),
-            "created": result.created,
-        })),
-    ))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -585,28 +467,6 @@ mod tests {
             status(Err(MetadataApiError::ServiceUnavailable)),
             StatusCode::SERVICE_UNAVAILABLE
         );
-    }
-
-    // The mint job is queued on the document's authority, so that node's answer
-    // about the document is the client's answer, not a fault of this one.
-    #[test]
-    fn mint_maps_errors() {
-        assert!(matches!(
-            mint_submit_error(SubmitJobError::DocumentMissing),
-            ServerError::NotFound
-        ));
-        assert!(matches!(
-            mint_submit_error(SubmitJobError::AuthorityDenied),
-            ServerError::Forbidden
-        ));
-        assert!(matches!(
-            mint_submit_error(SubmitJobError::PlacementUnavailable("down".to_string())),
-            ServerError::ServiceUnavailable
-        ));
-        assert!(matches!(
-            mint_submit_error(SubmitJobError::InvalidWorkspace("bad".to_string())),
-            ServerError::InternalError(_)
-        ));
     }
 
     #[test]

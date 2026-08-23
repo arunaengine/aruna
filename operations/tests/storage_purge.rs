@@ -7,15 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_PURGE_CHECKPOINT_KEYSPACE, S3_PURGE_FENCE_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AuthContext, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, JobId,
-    JobPayload, JobRecord, JobResultPayload, MultipartChecksumType, MultipartUpload,
-    MultipartUploadStatus, RealmId, RoutingSnapshot, StoragePurgeCheckpoint, StoragePurgeScope,
-    StoragePurgeSpec, VersionKey,
+    Actor, AuthContext, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
+    Group, GroupAuthorizationDocument, JobId, JobPayload, JobRecord, JobResultPayload,
+    MultipartChecksumType, MultipartUpload, MultipartUploadStatus, PathRestriction, Permission,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, RoutingSnapshot,
+    StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec, VersionKey,
+    blob_bucket_permission_path,
 };
 use aruna_core::types::{GroupId, NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -79,6 +82,51 @@ async fn setup_context() -> TestContext {
         task_handle: None,
         compute_handle: None,
     });
+    let actor = Actor {
+        node_id,
+        user_id,
+        realm_id,
+    };
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.seed_default_placement();
+    config.ensure_node(node_id, RealmNodeKind::Server);
+    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+    let group = Group {
+        display_name: "purge".to_string(),
+        group_id,
+        realm_id,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner: user_id,
+    };
+    write_value(
+        &driver.storage_handle,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        config.to_bytes(&actor).unwrap(),
+    )
+    .await;
+    write_value(
+        &driver.storage_handle,
+        AUTH_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        realm_auth.to_bytes(&actor).unwrap(),
+    )
+    .await;
+    write_value(
+        &driver.storage_handle,
+        AUTH_KEYSPACE,
+        group_id.to_bytes().to_vec(),
+        group_auth.to_bytes(&actor).unwrap(),
+    )
+    .await;
+    write_value(
+        &driver.storage_handle,
+        GROUP_KEYSPACE,
+        group_id.to_bytes().to_vec(),
+        group.to_bytes(&actor).unwrap(),
+    )
+    .await;
     drive(
         CreateBucketOperation::new(
             "bucket".to_string(),
@@ -358,6 +406,64 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
             .unwrap()
             .status,
         MultipartUploadStatus::Open
+    );
+}
+
+#[tokio::test]
+async fn purge_checks_objects() {
+    let context = setup_context().await;
+    let version_id = Ulid::generate();
+    seed_deleted_version(
+        &context.driver.storage_handle,
+        "bucket",
+        "denied/file.txt",
+        version_id,
+        true,
+        context.user_id,
+    )
+    .await;
+    let mut auth_context = auth(&context);
+    auth_context.path_restrictions = Some(vec![PathRestriction {
+        pattern: blob_bucket_permission_path(
+            context.realm_id,
+            context.group_id,
+            context.node_id,
+            "bucket",
+        ),
+        permission: Permission::WRITE,
+    }]);
+    let spec = StoragePurgeSpec {
+        scope: StoragePurgeScope::Prefix {
+            bucket: "bucket".to_string(),
+            prefix: "denied/".to_string(),
+        },
+        group_id: context.group_id,
+        auth_context,
+        node_id: context.node_id,
+    };
+    let job = claimed_job(
+        context.driver.clone(),
+        JobId::from_bytes([0xD4; 16]),
+        spec.clone(),
+    )
+    .await;
+
+    let outcome = run_storage_purge(&job, &spec).await;
+
+    assert!(matches!(
+        outcome,
+        JobRunOutcome::Failed(error) if error.message.contains("authorization failed")
+    ));
+    assert!(
+        read_value(
+            &context.driver.storage_handle,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("bucket", "denied/file.txt", version_id)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .is_some()
     );
 }
 

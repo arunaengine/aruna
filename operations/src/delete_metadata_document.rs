@@ -928,7 +928,7 @@ mod tests {
     };
     use aruna_core::storage_entries::document_sync_revision_key;
     use aruna_core::structs::{
-        PersistentIdMapping, PersistentIdStatus, PlacementStrategy, RealmId, RealmNodeKind,
+        JobId, PersistentIdMapping, PersistentIdStatus, PlacementStrategy, RealmId, RealmNodeKind,
         persistent_id_key,
     };
 
@@ -1540,15 +1540,21 @@ mod tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::generate();
-        let minted = PersistentIdMapping::conceptual(
+        let revision = aruna_core::structs::PersistentIdRevision {
+            event_id: Ulid::generate(),
+            actor: actor.node_id,
+            occurred_at_ms: 1,
+        };
+        let mut minted = PersistentIdMapping::requested(
             record.document_id,
+            false,
             actor.user_id,
-            aruna_core::structs::PersistentIdRevision {
-                event_id: Ulid::generate(),
-                actor: actor.node_id,
-                occurred_at_ms: 1,
-            },
+            JobId::from_bytes([7; 16]),
+            record.public,
+            record.permission_path.clone(),
+            revision,
         );
+        assert!(minted.activate(actor.user_id, revision));
         let mut operation =
             DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
         operation.record = Some(record.clone());

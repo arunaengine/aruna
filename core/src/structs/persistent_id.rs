@@ -19,8 +19,7 @@ pub enum PersistentIdKind {
 
 /// Authority that owns the identifier namespace. Only w3id is configured in
 /// this release; the explicit field keeps the stored one-row model honest and
-/// lets a later provider migration distinguish records without inspecting the
-/// identifier string.
+/// distinguishes records without inspecting the identifier string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PersistentIdProvider {
     W3id,
@@ -36,10 +35,7 @@ impl PersistentIdProvider {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PersistentIdStatus {
-    /// Legacy pre-2A active row. Kept first so the v1 decoder remains explicit.
     Active,
-    /// Legacy pre-2A retirement whose cause was not recorded.
-    Withdrawn,
     Requested,
     Processing,
     Failed,
@@ -49,10 +45,7 @@ pub enum PersistentIdStatus {
 
 impl PersistentIdStatus {
     pub fn is_retired(self) -> bool {
-        matches!(
-            self,
-            Self::Withdrawn | Self::AdminWithdrawn | Self::Tombstoned
-        )
+        matches!(self, Self::AdminWithdrawn | Self::Tombstoned)
     }
 }
 
@@ -150,88 +143,6 @@ impl PersistentIdMapping {
             withdrawal_reason: None,
             revision,
         }
-    }
-
-    /// Compatibility constructor for an already-active ordinary-document PID.
-    pub fn conceptual(
-        document_id: Ulid,
-        minted_by: UserId,
-        revision: PersistentIdRevision,
-    ) -> Self {
-        Self {
-            pid: MetadataRegistryRecord::graph_iri_for(document_id),
-            target: document_id,
-            kind: PersistentIdKind::Conceptual,
-            provider: PersistentIdProvider::W3id,
-            status: PersistentIdStatus::Active,
-            requested_at_ms: Some(revision.occurred_at_ms),
-            requested_by: Some(minted_by),
-            job_id: None,
-            public: None,
-            permission_path: None,
-            minted_at_ms: Some(revision.occurred_at_ms),
-            minted_by: Some(minted_by),
-            failure: None,
-            withdrawn_at_ms: None,
-            withdrawn_by: None,
-            withdrawal_reason: None,
-            revision,
-        }
-    }
-
-    /// Reconciliation constructor for a projected legacy document. Unlike the
-    /// compatibility constructor, this preserves the document's exact automatic
-    /// identity and visibility for later authenticated status checks.
-    #[allow(clippy::too_many_arguments)]
-    pub fn active(
-        document_id: Ulid,
-        profile: bool,
-        minted_by: UserId,
-        public: bool,
-        permission_path: String,
-        revision: PersistentIdRevision,
-    ) -> Self {
-        let mut mapping = Self::conceptual(document_id, minted_by, revision);
-        mapping.pid = Self::automatic_pid(document_id, profile);
-        mapping.public = Some(public);
-        mapping.permission_path = Some(permission_path);
-        mapping
-    }
-
-    /// `Absent -> Tombstoned`: deletion evidence for a legacy document whose
-    /// automatic mapping had not yet been backfilled.
-    pub fn tombstone(document_id: Ulid, revision: PersistentIdRevision) -> Self {
-        Self {
-            pid: MetadataRegistryRecord::graph_iri_for(document_id),
-            target: document_id,
-            kind: PersistentIdKind::Conceptual,
-            provider: PersistentIdProvider::W3id,
-            status: PersistentIdStatus::Tombstoned,
-            requested_at_ms: None,
-            requested_by: None,
-            job_id: None,
-            public: None,
-            permission_path: None,
-            minted_at_ms: None,
-            minted_by: None,
-            failure: None,
-            withdrawn_at_ms: Some(revision.occurred_at_ms),
-            withdrawn_by: None,
-            withdrawal_reason: None,
-            revision,
-        }
-    }
-
-    pub fn tombstone_with_visibility(
-        document_id: Ulid,
-        public: bool,
-        permission_path: String,
-        revision: PersistentIdRevision,
-    ) -> Self {
-        let mut mapping = Self::tombstone(document_id, revision);
-        mapping.public = Some(public);
-        mapping.permission_path = Some(permission_path);
-        mapping
     }
 
     pub fn is_active(&self) -> bool {
@@ -366,17 +277,11 @@ impl PersistentIdMapping {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&PersistentIdMappingWire::V2(
-            self.clone(),
-        ))?)
+        Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        if let Ok(PersistentIdMappingWire::V2(mapping)) = postcard::from_bytes(bytes) {
-            return Ok(mapping);
-        }
-        let legacy: PersistentIdMappingV1 = postcard::from_bytes(bytes)?;
-        Ok(legacy.into())
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -398,66 +303,7 @@ fn revision_key(revision: PersistentIdRevision) -> (u64, Ulid) {
     (revision.occurred_at_ms, revision.event_id)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum PersistentIdMappingWire {
-    V2(PersistentIdMapping),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct PersistentIdMappingV1 {
-    pid: String,
-    target: Ulid,
-    kind: PersistentIdKind,
-    status: PersistentIdStatusV1,
-    minted_at_ms: Option<u64>,
-    minted_by: Option<UserId>,
-    withdrawn_at_ms: Option<u64>,
-    revision: PersistentIdRevision,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum PersistentIdStatusV1 {
-    Active,
-    Withdrawn,
-}
-
-impl From<PersistentIdMappingV1> for PersistentIdMapping {
-    fn from(legacy: PersistentIdMappingV1) -> Self {
-        Self {
-            pid: legacy.pid,
-            target: legacy.target,
-            kind: legacy.kind,
-            provider: PersistentIdProvider::W3id,
-            status: match legacy.status {
-                PersistentIdStatusV1::Active => PersistentIdStatus::Active,
-                PersistentIdStatusV1::Withdrawn => PersistentIdStatus::Withdrawn,
-            },
-            requested_at_ms: legacy.minted_at_ms,
-            requested_by: legacy.minted_by,
-            job_id: None,
-            public: None,
-            permission_path: None,
-            minted_at_ms: legacy.minted_at_ms,
-            minted_by: legacy.minted_by,
-            failure: None,
-            withdrawn_at_ms: legacy.withdrawn_at_ms,
-            withdrawn_by: None,
-            withdrawal_reason: None,
-            revision: legacy.revision,
-        }
-    }
-}
-
 /// Mapping key: the document id alone, so a re-mint resolves the same row.
-///
-/// Migration contract for the first real second provider: introduce a v2 key as
-/// `document_id || 0x00 || provider-name`, dual-read that key and this legacy
-/// document-only key, copy each existing row under `(document, w3id)` without
-/// deleting the legacy row, verify parity including terminal tombstones, then
-/// flip writes and finally retire the legacy read after every holder converges.
-/// The delimiter makes two provider names distinct while preserving the first
-/// 16 bytes as a document scan prefix. Until that migration, changing this key
-/// would break the deliberately retained 1:1 storage contract.
 pub fn persistent_id_key(document_id: Ulid) -> Vec<u8> {
     document_id.to_bytes().to_vec()
 }
@@ -514,11 +360,39 @@ mod tests {
         }
     }
 
+    fn active_mapping(id: Ulid, revision: PersistentIdRevision) -> PersistentIdMapping {
+        let mut mapping = PersistentIdMapping::requested(
+            id,
+            false,
+            user(),
+            JobId::from_bytes([4; 16]),
+            true,
+            "/documents/test".to_string(),
+            revision,
+        );
+        assert!(mapping.activate(user(), revision));
+        mapping
+    }
+
+    fn tombstone_mapping(id: Ulid, revision: PersistentIdRevision) -> PersistentIdMapping {
+        let mut mapping = PersistentIdMapping::requested(
+            id,
+            false,
+            user(),
+            JobId::from_bytes([4; 16]),
+            true,
+            "/documents/test".to_string(),
+            revision,
+        );
+        assert!(mapping.mark_tombstoned(revision));
+        mapping
+    }
+
     // the conceptual PID is the graph IRI
     #[test]
     fn pid_is_iri() {
         let id = Ulid::from_bytes([1; 16]);
-        let mapping = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
+        let mapping = active_mapping(id, revision(1, 5));
         assert_eq!(mapping.pid, MetadataRegistryRecord::graph_iri_for(id));
         assert!(mapping.is_active());
         assert_eq!(mapping.minted_at_ms, Some(5));
@@ -529,7 +403,7 @@ mod tests {
     #[test]
     fn admin_withdraw_is_permanent() {
         let id = Ulid::from_bytes([1; 16]);
-        let mut mapping = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
+        let mut mapping = active_mapping(id, revision(1, 5));
         assert!(mapping.admin_withdraw(user(), "invalid registration".into(), revision(2, 10)));
         assert_eq!(mapping.status, PersistentIdStatus::AdminWithdrawn);
         assert_eq!(mapping.withdrawn_at_ms, Some(10));
@@ -543,19 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_omits_mint() {
-        let id = Ulid::from_bytes([4; 16]);
-        let mapping = PersistentIdMapping::tombstone(id, revision(1, 12));
-        assert_eq!(mapping.status, PersistentIdStatus::Tombstoned);
-        assert_eq!(mapping.minted_at_ms, None);
-        assert_eq!(mapping.minted_by, None);
-        assert_eq!(mapping.withdrawn_at_ms, Some(12));
-    }
-
-    #[test]
     fn merge_converges_unordered() {
         let id = Ulid::from_bytes([1; 16]);
-        let active = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
+        let active = active_mapping(id, revision(1, 5));
         let mut withdrawn = active.clone();
         withdrawn.admin_withdraw(user(), "retired".into(), revision(2, 9));
 
@@ -573,8 +437,8 @@ mod tests {
     #[test]
     fn merge_keeps_tombstone() {
         let id = Ulid::from_bytes([1; 16]);
-        let mut tombstone = PersistentIdMapping::tombstone(id, revision(2, 3));
-        let active = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
+        let mut tombstone = tombstone_mapping(id, revision(2, 3));
+        let active = active_mapping(id, revision(1, 5));
 
         assert!(tombstone.merge(&active));
         assert_eq!(tombstone.status, PersistentIdStatus::Tombstoned);
@@ -584,9 +448,8 @@ mod tests {
 
     #[test]
     fn merge_ignores_others() {
-        let mut mapping =
-            PersistentIdMapping::conceptual(Ulid::from_bytes([1; 16]), user(), revision(1, 5));
-        let foreign = PersistentIdMapping::tombstone(Ulid::from_bytes([2; 16]), revision(2, 1));
+        let mut mapping = active_mapping(Ulid::from_bytes([1; 16]), revision(1, 5));
+        let foreign = tombstone_mapping(Ulid::from_bytes([2; 16]), revision(2, 1));
         assert!(!mapping.merge(&foreign));
         assert!(mapping.is_active());
     }
@@ -594,7 +457,7 @@ mod tests {
     #[test]
     fn change_follows_row() {
         let id = Ulid::from_bytes([9; 16]);
-        let mapping = PersistentIdMapping::conceptual(id, user(), revision(7, 42));
+        let mapping = active_mapping(id, revision(7, 42));
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([3; 16]),
             shard: 4,
@@ -610,8 +473,7 @@ mod tests {
 
     #[test]
     fn mapping_roundtrips() {
-        let mapping =
-            PersistentIdMapping::conceptual(Ulid::from_bytes([9; 16]), user(), revision(1, 7));
+        let mapping = active_mapping(Ulid::from_bytes([9; 16]), revision(1, 7));
         assert_eq!(
             PersistentIdMapping::from_bytes(&mapping.to_bytes().unwrap()).unwrap(),
             mapping
@@ -639,43 +501,36 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rows_decode_with_explicit_provider() {
+    fn rejects_legacy_rows() {
+        #[derive(Serialize)]
+        enum LegacyStatus {
+            Active,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyMapping {
+            pid: String,
+            target: Ulid,
+            kind: PersistentIdKind,
+            status: LegacyStatus,
+            minted_at_ms: Option<u64>,
+            minted_by: Option<UserId>,
+            withdrawn_at_ms: Option<u64>,
+            revision: PersistentIdRevision,
+        }
+
         let id = Ulid::from_bytes([6; 16]);
-        let legacy = PersistentIdMappingV1 {
+        let legacy = LegacyMapping {
             pid: MetadataRegistryRecord::graph_iri_for(id),
             target: id,
             kind: PersistentIdKind::Conceptual,
-            status: PersistentIdStatusV1::Active,
+            status: LegacyStatus::Active,
             minted_at_ms: Some(5),
             minted_by: Some(user()),
             withdrawn_at_ms: None,
             revision: revision(1, 5),
         };
 
-        let decoded =
-            PersistentIdMapping::from_bytes(&postcard::to_allocvec(&legacy).unwrap()).unwrap();
-        assert_eq!(decoded.provider, PersistentIdProvider::W3id);
-        assert_eq!(decoded.status, PersistentIdStatus::Active);
-        assert_eq!(decoded.target, id);
-    }
-
-    #[test]
-    fn future_composite_key_migration_preserves_document_prefix() {
-        fn future_key(document_id: Ulid, provider: &str) -> Vec<u8> {
-            let mut key = persistent_id_key(document_id);
-            key.push(0);
-            key.extend_from_slice(provider.as_bytes());
-            key
-        }
-
-        let id = Ulid::from_bytes([5; 16]);
-        let current = persistent_id_key(id);
-        let w3id = future_key(id, PersistentIdProvider::W3id.name());
-        let second_provider = future_key(id, "example-second-provider");
-
-        assert_eq!(current, id.to_bytes());
-        assert!(w3id.starts_with(&current));
-        assert!(second_provider.starts_with(&current));
-        assert_ne!(w3id, second_provider);
+        assert!(PersistentIdMapping::from_bytes(&postcard::to_allocvec(&legacy).unwrap()).is_err());
     }
 }

@@ -18,6 +18,7 @@ use crate::replication::queue::{
 };
 use crate::replication::util::dht_registration_effect;
 use crate::s3::create_bucket::CreateBucketOperation;
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
@@ -65,6 +66,7 @@ enum IncomingVersionReplicationState {
     SendNegotiation,
     ReceiveBlob,
     StartTransaction,
+    CheckPurgeFence,
     CheckDrift,
     VerifyReplaced,
     ReadReplacedMetadata,
@@ -112,6 +114,8 @@ pub enum IncomingVersionReplicationError {
     BackendFenceError(#[from] BackendFenceError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error(transparent)]
+    PurgeFence(#[from] PurgeFenceError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -343,6 +347,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::SendNegotiation => "SendNegotiation",
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
+            IncomingVersionReplicationState::CheckPurgeFence => "CheckPurgeFence",
             IncomingVersionReplicationState::CheckDrift => "CheckDrift",
             IncomingVersionReplicationState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
@@ -931,6 +936,11 @@ impl IncomingVersionReplicationOperation {
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
+    }
+
+    fn check_purge_fence(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::CheckPurgeFence;
+        smallvec![write_fence_read(&self.manifest.bucket, self.txn_id)]
     }
 
     fn read_replaced_metadata(&mut self) -> Effects {
@@ -2255,6 +2265,14 @@ impl Operation for IncomingVersionReplicationOperation {
                     txn_id = %txn_id,
                     "Started incoming replication transaction"
                 );
+                self.check_purge_fence()
+            }
+            IncomingVersionReplicationState::CheckPurgeFence => {
+                if let Err(error) =
+                    check_write_fence(event, &self.manifest.bucket, &self.manifest.key)
+                {
+                    return self.fail(error.into());
+                }
                 self.check_drift()
             }
             IncomingVersionReplicationState::CheckDrift => {
@@ -2721,6 +2739,7 @@ mod tests {
         VersionReplicationManifest, VersionReplicationMessage,
     };
     use crate::replication::queue::LiveReplicationObligationRecord;
+    use crate::s3::purge_fence::PurgeFenceError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -2733,10 +2752,10 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
         BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
-        MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
+        JobId, MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
         ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, StorageRoutingRule, UsageDelta,
-        VersionSourceBinding, WriteOwner,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, StoragePurgeFence, StoragePurgeScope,
+        StorageRoutingRule, UsageDelta, VersionSourceBinding, WriteOwner,
     };
     use aruna_core::{NodeId, UserId};
     use std::collections::{BTreeSet, HashMap};
@@ -3057,7 +3076,17 @@ mod tests {
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
         op.destination_group_id = Some(Ulid::generate());
 
-        let _effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CheckPurgeFence);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { txn_id: read_txn_id, .. })]
+                if *read_txn_id == Some(txn_id)
+        ));
+        let _effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
         assert_eq!(op.state, IncomingVersionReplicationState::CheckDrift);
         // The apply transaction re-reads the destination default and the local
         // subject before it exposes anything.
@@ -3085,6 +3114,42 @@ mod tests {
                 if key_space == BLOB_HEAD_KEYSPACE && *read_txn_id == Some(txn_id)
         ));
         txn_id
+    }
+
+    #[test]
+    fn purge_fence_rejects() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        op.state = IncomingVersionReplicationState::StartTransaction;
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+        op.destination_group_id = Some(Ulid::generate());
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+        let fence = StoragePurgeFence {
+            job_id: JobId::from_bytes([12; 16]),
+            scope: StoragePurgeScope::File {
+                bucket: manifest.bucket,
+                key: manifest.key,
+            },
+        };
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(fence.to_bytes().unwrap().into()),
+        }));
+
+        assert!(matches!(
+            op.output,
+            Some(Err(IncomingVersionReplicationError::PurgeFence(
+                PurgeFenceError::Suspended
+            )))
+        ));
     }
 
     #[test]
@@ -3702,6 +3767,10 @@ mod tests {
         op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
         }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
         let effects = op.step(no_drift());
         assert!(matches!(
             effects.as_slice(),
@@ -4135,6 +4204,10 @@ mod tests {
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
 
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
         let effects = op.step(no_drift());
         assert!(matches!(
             effects.as_slice(),
