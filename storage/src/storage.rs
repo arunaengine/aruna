@@ -214,6 +214,9 @@ struct StorageMetrics {
     requests_total: AtomicU64,
     errors_total: AtomicU64,
     conflicts_total: AtomicU64,
+    /// Errors that end the request. Conflicts are excluded: callers retry them,
+    /// and the retry is counted again under `requests_total`.
+    failed_total: AtomicU64,
     in_flight: AtomicU64,
     channel_closed: Arc<AtomicBool>,
     sealed: AtomicBool,
@@ -263,6 +266,7 @@ pub struct StorageMetricsSnapshot {
     pub requests_total: u64,
     pub errors_total: u64,
     pub conflicts_total: u64,
+    /// Errors that ended the request, excluding the conflicts callers retry.
     pub failed_total: u64,
     pub channel_closed: bool,
     pub sealed: bool,
@@ -506,12 +510,11 @@ impl StorageHandle {
     }
 
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
-        let errors_total = self.metrics.errors_total.load(Ordering::Relaxed);
         StorageMetricsSnapshot {
             requests_total: self.metrics.requests_total.load(Ordering::Relaxed),
-            errors_total,
+            errors_total: self.metrics.errors_total.load(Ordering::Relaxed),
             conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
-            failed_total: errors_total,
+            failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
             channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
             sealed: self.is_sealed(),
             rejected_writes: self.rejected_writes(),
@@ -905,6 +908,8 @@ impl StorageHandle {
 
         if matches!(error, StorageError::TransactionConflict) {
             self.metrics.conflicts_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
         }
 
         if matches!(error, StorageError::ChannelClosed) {
@@ -5372,7 +5377,8 @@ mod tests {
         assert_eq!(metrics_after_conflict.requests_total, 2);
         assert_eq!(metrics_after_conflict.errors_total, 2);
         assert_eq!(metrics_after_conflict.conflicts_total, 1);
-        assert_eq!(metrics_after_conflict.failed_total, 2);
+        // A retryable conflict is not a failed request.
+        assert_eq!(metrics_after_conflict.failed_total, 1);
         assert_eq!(
             metrics_after_conflict.last_error,
             Some("Transaction conflict".to_string())
