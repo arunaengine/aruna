@@ -44,13 +44,15 @@ pub struct RevokeTokenRequest {
     summary = "Revoke a bearer token of this realm",
     description = r#"Records a bearer token of this realm in the replicated revocation set.
 
-**Authentication**: bearer token of this realm. A caller may always retire its own token, but a
-path-restricted (delegated) token may only revoke the very token it presented; revoking any other
-user's token requires WRITE on that user's realm admin path.
+**Authentication**: bearer token of this realm. Retiring one's own token is self-service, except
+that a path-restricted (delegated) token is self-service only for the very token it presented. Every
+other revocation, another user's token included, needs WRITE on the token owner's
+`/{realm_id}/admin/u/{user_id}` path, so a delegated token holding that permission may still revoke.
 
 **Behavior**
 - On a user-kind node the revocation is forwarded to a ranked management or server peer under the
-  caller's own token, and 503 is returned when no eligible peer accepts it.
+  caller's own token, which is where the permission is then checked, and 503 is returned when no
+  eligible peer accepts it.
 - Otherwise the revocation is recorded in the replicated realm configuration: it takes effect on
   this node before the response and reaches the other realm nodes asynchronously with that
   configuration, so a 204 is not proof that every node already refuses the token.
