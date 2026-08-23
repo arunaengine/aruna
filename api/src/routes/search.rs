@@ -447,7 +447,7 @@ group READ, token path restrictions and request policies before it can be return
                     {
                         "kind": "object",
                         "mode": "distributed_best_effort",
-                        "issuer_node_id": "node-a",
+                        "issuer_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                         "group_id": "01JGROUP000000000000000000",
                         "bucket": "results",
                         "key": "run-42/output.csv",
@@ -465,7 +465,7 @@ group READ, token path restrictions and request policies before it can be return
                     "scope": "realm",
                     "mode": "distributed_best_effort",
                     "index_freshness": {
-                        "source": "inventory",
+                        "source": "live_heads",
                         "as_of": "2026-08-22T12:00:00Z",
                         "oldest_observed_at": "2026-08-22T11:59:00Z"
                     },
@@ -477,7 +477,7 @@ group READ, token path restrictions and request policies before it can be return
                     "truncated": false,
                     "partitions": [
                         {
-                            "node_id": "node-a",
+                            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                             "observed_at": "2026-08-22T12:00:00Z",
                             "truncated": false
                         }
@@ -684,7 +684,7 @@ than one type or with `types=buckets`, which has no continuation token."#,
                             "snippet": "reference run of the RNA-seq pipeline"
                         }
                     ],
-                    "next_cursor": "<opaque-documents-cursor>",
+                    "next_cursor": "eyJ3IjoiMDFKTUVUQURBVEEwMTIzNDU2Nzg5QUJDREUifQ",
                     "nodes_queried": 3,
                     "nodes_failed": 0,
                     "truncated": false
