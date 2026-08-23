@@ -967,7 +967,7 @@ fn apply_admin_reducer_updates(
     )?;
     admin_events.push(event);
 
-    for user_id in sorted_user_ids(&input.role.assigned_users) {
+    for user_id in crate::sorted_user_ids(&input.role.assigned_users) {
         let event = state.apply_operation(
             &input.actor,
             AdminDocumentOperation::GroupRoleUserAssignmentAdded {
@@ -1003,7 +1003,7 @@ fn materialize_group_role(
     let Some(auth_role) = auth_doc.roles.get_mut(&role.role_id) else {
         return;
     };
-    for user_id in sorted_user_ids(&role.assigned_users) {
+    for user_id in crate::sorted_user_ids(&role.assigned_users) {
         if materialized_assignments
             .get(&role.role_id)
             .is_some_and(|users| users.contains(&user_id))
@@ -1029,7 +1029,7 @@ fn newly_materialized_members(
     auth_doc: &GroupAuthorizationDocument,
     role: &Role,
 ) -> Vec<UserId> {
-    sorted_user_ids(&role.assigned_users)
+    crate::sorted_user_ids(&role.assigned_users)
         .into_iter()
         .filter(|user| {
             !user.is_nil()
@@ -1040,12 +1040,6 @@ fn newly_materialized_members(
                     .any(|role| role.assigned_users.contains(user))
         })
         .collect()
-}
-
-fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
-    let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
-    user_ids.sort();
-    user_ids
 }
 
 #[cfg(test)]

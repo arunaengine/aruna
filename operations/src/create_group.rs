@@ -21,10 +21,9 @@ use aruna_core::structs::{
     group_owner_index_key, group_owner_index_prefix,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, UserId, Value};
+use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::HashSet;
 use thiserror::Error;
 use tracing::{trace, warn};
 use ulid::Ulid;
@@ -225,7 +224,7 @@ impl CreateGroupOperation {
             .iter()
             .find(|role| role.name == "admin")
             .ok_or(CreateGroupError::AdminRoleNotFound)?;
-        for user_id in sorted_user_ids(&admin_role.assigned_users) {
+        for user_id in crate::sorted_user_ids(&admin_role.assigned_users) {
             admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::GroupRoleUserAssignmentAdded {
@@ -559,12 +558,6 @@ fn sorted_roles(auth_doc: &GroupAuthorizationDocument) -> Vec<&Role> {
             .then_with(|| left.role_id.cmp(&right.role_id))
     });
     roles
-}
-
-fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
-    let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
-    user_ids.sort();
-    user_ids
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

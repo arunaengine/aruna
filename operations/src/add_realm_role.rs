@@ -16,10 +16,9 @@ use aruna_core::structs::{
     Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId, Role,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -645,7 +644,7 @@ fn apply_admin_reducer_updates(
     )?;
     admin_events.push(event);
 
-    for user_id in sorted_user_ids(&input.role.assigned_users) {
+    for user_id in crate::sorted_user_ids(&input.role.assigned_users) {
         let event = state.apply_operation(
             &input.actor,
             AdminDocumentOperation::RealmRoleUserAssignmentAdded {
@@ -678,7 +677,7 @@ fn materialize_realm_role(
     let Some(auth_role) = auth_doc.roles.get_mut(&role.role_id) else {
         return;
     };
-    for user_id in sorted_user_ids(&role.assigned_users) {
+    for user_id in crate::sorted_user_ids(&role.assigned_users) {
         if materialized_assignments
             .get(&role.role_id)
             .is_some_and(|users| users.contains(&user_id))
@@ -688,12 +687,6 @@ fn materialize_realm_role(
             auth_role.assigned_users.remove(&user_id);
         }
     }
-}
-
-fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
-    let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
-    user_ids.sort();
-    user_ids
 }
 
 #[cfg(test)]
