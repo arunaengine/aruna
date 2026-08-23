@@ -185,7 +185,25 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
     path = "/admin/onboarding/secrets",
     tag = "onboarding",
     summary = "Mint a node enrollment secret",
-    description = "Requires a bearer token of this realm with WRITE on the realm's onboarding admin path, and only a management node serves it; any other node answers 403. The response carries the enrollment secret exactly once: the node stores only its hash, so a secret that is lost cannot be recovered and must be revoked and minted again. Treat the value like a credential, hand it to exactly one joining node, and expect it to be single-use. `mode` fixes what the joiner may become and is one of `Management`, `Server` or `Local`; a Management secret later lets the joiner receive the realm private key wrapped to its transport key, so it is the most sensitive of the three. `expires_in_seconds` defaults to 3600 and is clamped to 60..=86400, and `expires_at` is the resulting absolute expiry in Unix seconds. Every expired secret that is not already mid-enrollment is discarded before the new one is created.",
+    description = r#"Mints a single-use enrollment secret that a joining node redeems to enter the realm.
+
+**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path;
+only a management node serves it and any other node answers 403.
+
+**Behavior**
+- The response carries the enrollment secret exactly once: the node stores only its hash, so a
+  secret that is lost cannot be recovered and must be revoked and minted again.
+- Treat the value like a credential, hand it to exactly one joining node, and expect it to be
+  single-use.
+- `mode` fixes what the joiner may become and is one of `Management`, `Server` or `Local`; a
+  `Management` secret later lets the joiner receive the realm private key wrapped to its transport
+  key, so it is the most sensitive of the three.
+- Every expired secret that is not already mid-enrollment is discarded before the new one is
+  created.
+
+**Limits**
+- `expires_in_seconds` defaults to 3600 and is clamped to 60..=86400; `expires_at` is the resulting
+  absolute expiry in Unix seconds."#,
     request_body(
         content = CreateOnboardingSecretRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
@@ -270,7 +288,19 @@ pub async fn create_onboarding_secret(
     path = "/admin/onboarding/secrets",
     tag = "onboarding",
     summary = "List outstanding node enrollment secrets",
-    description = "Requires a bearer token of this realm with WRITE on the realm's onboarding admin path, and only a management node serves it; any other node answers 403. Returns bookkeeping only: the enrollment id, the mode, the absolute expiry in Unix seconds and, once a joiner has claimed the secret, the node id it was claimed by. The secret value itself is never returned here, because only its hash was kept when it was minted. Expired secrets that are not mid-enrollment are discarded before the list is built, so the list holds live and in-flight enrollments; entries are ordered by expiry, soonest first. The list is this management node's local state, not a realm-wide fan-out.",
+    description = r#"Lists this management node's live and in-flight enrollment secrets as bookkeeping only.
+
+**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path;
+only a management node serves it and any other node answers 403.
+
+**Behavior**
+- Each entry carries the enrollment id, the mode, the absolute expiry in Unix seconds and, once a
+  joiner has claimed the secret, the node id it was claimed by.
+- The secret value itself is never returned here, because only its hash was kept when it was
+  minted.
+- Expired secrets that are not mid-enrollment are discarded before the list is built, so the list
+  holds live and in-flight enrollments; entries are ordered by expiry, soonest first.
+- The list is this management node's local state, not a realm-wide fan-out."#,
     responses(
         (
             status = 200,
@@ -325,7 +355,19 @@ pub async fn list_onboarding_secrets(
     path = "/admin/onboarding/secrets/{id}",
     tag = "onboarding",
     summary = "Revoke a pending node enrollment secret",
-    description = "Requires a bearer token of this realm with WRITE on the realm's onboarding admin path, and only a management node serves it; any other node answers 403. Deletes the enrollment record on this node, which makes the secret unredeemable from here on. This is the remedy for a secret that leaked or was never used, and it is the only remedy, since the secret value itself was never stored. Revocation does not undo an enrollment that already completed: a node that finished bootstrapping stays a member of the realm and has to be removed through the realm configuration instead. A secret that is already gone, expired and pruned or revoked by an earlier call, answers 404.",
+    description = r#"Deletes the enrollment record on this node, making the secret unredeemable from here on.
+
+**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path;
+only a management node serves it and any other node answers 403.
+
+**Behavior**
+- This is the remedy for a secret that leaked or was never used, and it is the only remedy, since
+  the secret value itself was never stored.
+- Revocation does not undo an enrollment that already completed: a node that finished bootstrapping
+  stays a member of the realm and has to be removed through the realm configuration instead.
+
+**Errors**: a secret that is already gone, expired and pruned or revoked by an earlier call,
+answers 404."#,
     params(("id" = String, Path, description = "Enrollment id of the secret, the ULID reported when it was minted and by the list endpoint")),
     responses(
         (status = 204, description = "Secret deleted and no longer redeemable; no response body"),
@@ -358,7 +400,30 @@ pub async fn revoke_onboarding_secret(
     path = "/onboarding/bootstrap",
     tag = "onboarding",
     summary = "Redeem an enrollment secret and join the realm",
-    description = "Deliberately unauthenticated: a joining node has no realm token yet. The enrollment secret plus a signature by the joiner's own node key are the credentials, so an unknown, expired, already claimed or unmatched secret and any signature that does not verify are refused with 401, without saying which of the two failed. Only a management node serves this; any other node answers 403. The secret is single-use and is consumed when enrollment finalizes, which also adds the joiner to the realm configuration; a rejected attempt leaves the secret usable so an operator does not have to mint a new one after a typo. What must be sent depends on the mode the secret was minted for: a Server secret additionally requires `issuer_public_key` and a matching `issuer_proof` and returns a delegation signature; a Management secret requires `transport_public_key` and returns the realm private key encrypted to it, along with the nonce and the ephemeral public key needed to open it; a Local secret needs neither. The response always carries the realm id, the temporary endpoint to dial and a one-time sync ticket the joiner uses to fetch the realm's core documents. `node_location`, `node_weight` and `node_labels` seed the joiner's placement entry and are optional. Everything returned here is one-time joining material and must never be logged or reused.",
+    description = r#"Redeems an enrollment secret and returns the one-time material a joiner needs to enter the realm.
+
+**Authentication**: none; deliberately unauthenticated, because a joining node has no realm token
+yet. The enrollment secret plus a signature by the joiner's own node key are the credentials, and
+only a management node serves this route.
+
+**Behavior**
+- The secret is single-use and is consumed when enrollment finalizes, which also adds the joiner to
+  the realm configuration; a rejected attempt leaves the secret usable so an operator does not have
+  to mint a new one after a typo.
+- What must be sent depends on the mode the secret was minted for: a `Server` secret additionally
+  requires `issuer_public_key` and a matching `issuer_proof` and returns a delegation signature; a
+  `Management` secret requires `transport_public_key` and returns the realm private key encrypted
+  to it, along with the nonce and the ephemeral public key needed to open it; a `Local` secret
+  needs neither.
+- The response always carries the realm id, the temporary endpoint to dial and a one-time sync
+  ticket the joiner uses to fetch the realm's core documents.
+- `node_location`, `node_weight` and `node_labels` seed the joiner's placement entry and are
+  optional.
+- Everything returned here is one-time joining material and must never be logged or reused.
+
+**Errors**: an unknown, expired, already claimed or unmatched secret and a signature that does not
+verify are both refused with 401, without saying which of the two failed. A node that does not
+serve enrollment answers 403."#,
     request_body(
         content = BootstrapOnboardingRequestDoc,
         description = "The enrollment secret, the joiner's node id, its proof of possession of the node key, and any mode-specific key material",
@@ -370,7 +435,9 @@ pub async fn revoke_onboarding_secret(
             "issuer_proof": "<issuer-proof-signature>",
             "node_location": "dc-a",
             "node_weight": 100,
-            "node_labels": {"zone": "dc-a"}
+            "node_labels": {
+                "zone": "dc-a"
+            }
         })
     ),
     responses(
@@ -384,8 +451,12 @@ pub async fn revoke_onboarding_secret(
                 "temporary_bootstrap_endpoint": {
                     "id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
                     "addrs": [
-                        {"Ip": "192.0.2.10:4433"},
-                        {"Relay": "https://relay.example.test/"}
+                        {
+                            "Ip": "192.0.2.10:4433"
+                        },
+                        {
+                            "Relay": "https://relay.example.test/"
+                        }
                     ]
                 },
                 "wrapped_realm_private_key": null,
