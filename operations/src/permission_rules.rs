@@ -584,9 +584,6 @@ impl Operation for PermissionRulesOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        if self.is_complete() {
-            return smallvec![];
-        }
         let event = match self.fail_on_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -991,6 +988,38 @@ mod test {
             auth_context: AuthContext::anonymous(realm_id),
             path: format!("/{realm_id}/admin"),
         });
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AuthorizationError::UnexpectedEvent { .. })
+        ));
+    }
+
+    // A completed collection must reject a late event instead of ignoring it.
+    #[test]
+    fn finished_rejects_event() {
+        let realm_id = RealmId([16u8; 32]);
+        let txn_id = Ulid::from(17u128);
+        let mut operation = PermissionRulesOperation::new_with_txn(
+            PermissionRulesConfig {
+                auth_context: AuthContext::anonymous(realm_id),
+                path: format!("/{realm_id}/admin"),
+            },
+            txn_id,
+        );
+        operation.start();
+        let realm = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(postcard::to_allocvec(&realm).unwrap().into()),
+        }));
+        assert!(operation.is_complete());
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
