@@ -1353,6 +1353,40 @@ async fn range_passes_writes() {
 }
 
 #[tokio::test]
+async fn reports_range_size() {
+    // Range reads must announce the bytes they yield, not zero.
+    let context = setup_blob_handle(16).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "object.bin",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            stream_from_bytes(b"0123456789"),
+        )
+        .await
+    else {
+        panic!("blob write failed")
+    };
+
+    let BlobEvent::ReadFinished { blob, stream_size } =
+        handler.read_blob_range(location.clone(), 2..5).await
+    else {
+        panic!("range read failed")
+    };
+    assert_eq!(stream_size, 3);
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert_eq!(chunks.concat(), b"234");
+
+    let BlobEvent::ReadFinished { stream_size, .. } = handler.read_blob_range(location, ..).await
+    else {
+        panic!("open range read failed")
+    };
+    assert_eq!(stream_size, 10);
+}
+
+#[tokio::test]
 async fn interlocked_writes_complete() {
     // Each body yields only once both writes stream concurrently; the old
     // sequential effect loop deadlocked here.

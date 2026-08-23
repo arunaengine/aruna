@@ -23,7 +23,7 @@ use opendal::{EntryMode, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -45,6 +45,22 @@ enum HiddenCursor {
     Reservations {
         start_after: Option<Vec<u8>>,
     },
+}
+
+/// Resolves the requested bounds against the stored size so a range read can
+/// report how many bytes its stream yields.
+fn range_length(range: &impl RangeBounds<u64>, blob_size: u64) -> u64 {
+    let start = match range.start_bound() {
+        Bound::Included(start) => *start,
+        Bound::Excluded(start) => start.saturating_add(1),
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(end) => end.saturating_add(1),
+        Bound::Excluded(end) => *end,
+        Bound::Unbounded => blob_size,
+    };
+    end.min(blob_size).saturating_sub(start)
 }
 
 /// Tenant writers open with an explicit chunk so a small-chunk stream cannot
@@ -1152,6 +1168,7 @@ impl BlobHandler {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
+        let stream_size = range_length(&range, location.blob_size);
         let reader = match timeout(
             self.control_plane_io_timeout(),
             operator.reader(&storage_path),
@@ -1194,7 +1211,7 @@ impl BlobHandler {
                     }
                 },
             )),
-            stream_size: 0,
+            stream_size,
         }
     }
 
