@@ -4,6 +4,7 @@ use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::{RealmId, TokenClaims};
+use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, validate_aruna_bearer_token,
 };
@@ -17,11 +18,24 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use ulid::Ulid;
 
-#[derive(Default)]
 struct TestAuthState {
+    /// One clock reading per state: claim validation and the token the test
+    /// signs are judged against the same instant.
+    now: u64,
     revoked_hashes: HashSet<String>,
     trusted_realms: HashSet<RealmId>,
     revocation_reads: AtomicUsize,
+}
+
+impl Default for TestAuthState {
+    fn default() -> Self {
+        Self {
+            now: unix_timestamp_secs(),
+            revoked_hashes: HashSet::new(),
+            trusted_realms: HashSet::new(),
+            revocation_reads: AtomicUsize::new(0),
+        }
+    }
 }
 
 #[async_trait]
@@ -37,6 +51,10 @@ impl ArunaBearerTokenValidationState for TestAuthState {
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
         self.trusted_realms.contains(realm_id)
+    }
+
+    fn now_secs(&self) -> u64 {
+        self.now
     }
 }
 
@@ -94,12 +112,11 @@ async fn rejects_bad_signature() {
 #[tokio::test]
 async fn rejects_expired_token() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let mut claims = token_claims(realm_id, user_id);
-    claims.iat = now.saturating_sub(7200);
-    claims.exp = now.saturating_sub(3600);
-    let token = sign_token(&realm_signing_key, &claims);
     let state = trusted_state(realm_id);
+    let mut claims = token_claims(realm_id, user_id);
+    claims.iat = state.now.saturating_sub(7200);
+    claims.exp = state.now.saturating_sub(3600);
+    let token = sign_token(&realm_signing_key, &claims);
 
     let error = validate_aruna_bearer_token(&state, &token)
         .await
@@ -230,7 +247,7 @@ fn trusted_state(realm_id: RealmId) -> TestAuthState {
 }
 
 fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let now = unix_timestamp_secs();
     TokenClaims {
         sub: user_id.to_string(),
         iss: realm_id.to_string(),

@@ -335,11 +335,24 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
     path = "/groups",
     tag = "groups",
     summary = "Create a group in this realm",
-    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Group creation is self-service: any unrestricted realm member may create groups up to the realm's per-user group quota, and a caller holding WRITE on the realm group-admin path is exempt from that cap. The caller becomes the owner and the only member of the new group's admin role, next to the default user and viewer roles. The write commits on this node and replicates to the rest of the realm afterwards, so another node may not list the group immediately.",
+    description = r#"Creates a group in this realm and makes the caller its owner and sole administrator.
+
+**Authentication**: realm bearer token; a token confined to a path subset is refused.
+
+**Behavior**
+- Group creation is self-service: any unrestricted realm member may create groups up to the realm's
+  per-user group quota, and a caller holding WRITE on the realm group-admin path is exempt from that
+  cap.
+- The caller becomes the owner and the only member of the new group's admin role, next to the
+  default user and viewer roles.
+- The write commits on this node and replicates to the rest of the realm afterwards, so another node
+  may not list the group immediately."#,
     request_body(
         content = CreateGroupRequest,
         description = "Display name for the new group. It is stored as given and need not be unique.",
-        example = json!({"name": "Proteomics Lab"})
+        example = json!({
+            "name": "Proteomics Lab"
+        })
     ),
     responses(
         (
@@ -471,7 +484,19 @@ pub async fn create_group(
     path = "/groups",
     tag = "groups",
     summary = "List the groups of this realm",
-    description = "Requires a bearer token issued for this realm: an anonymous caller is rejected and a token from another realm is forbidden. Reads the group directory as replicated to this node, so a group created elsewhere can be missing until it arrives here. Every realm member sees each group's id, realm and display name. `include=roles` additionally returns each group's roles and their permission paths, but the users assigned to a role are only included for groups the caller is a member of; for every other group the `assigned_users` field is omitted and a role that applies to everyone is visible only through its `public` flag.",
+    description = r#"Lists this realm's groups, optionally with their roles and permission paths.
+
+**Authentication**: realm bearer token; an anonymous caller is rejected and a token from another
+realm is forbidden.
+
+**Behavior**
+- Reads the group directory as replicated to this node, so a group created elsewhere can be missing
+  until it arrives here.
+- Every realm member sees each group's id, realm and display name.
+- `include=roles` additionally returns each group's roles and their permission paths, but the users
+  assigned to a role are only included for groups the caller is a member of; for every other group
+  the `assigned_users` field is omitted and a role that applies to everyone is visible only through
+  its `public` flag."#,
     params(
         ("limit" = Option<u32>, Query, description = "Maximum number of groups to return; defaults to 100 and is clamped to the range 1-1000"),
         ("offset" = Option<u32>, Query, description = "Number of groups to skip from the start of the directory; defaults to 0"),
@@ -587,7 +612,17 @@ async fn build_api_groups(
     path = "/groups/{id}",
     tag = "groups",
     summary = "Read one group's directory entry",
-    description = "Requires a bearer token issued for this realm; no group membership is needed, because every realm member may look up any group in the realm. Reads the copy replicated to this node. Members receive the full role list including the users assigned to each role; a non-member receives the same roles and permission paths with the `assigned_users` field omitted, and learns only from the `public` flag that a role applies to everyone. A group whose record or authorization document is not present on this node reads as not found.",
+    description = r#"Returns one group's directory entry together with its roles.
+
+**Authentication**: realm bearer token; no group membership is needed, because every realm member
+may look up any group in the realm.
+
+**Behavior**
+- Reads the copy replicated to this node.
+- Members receive the full role list including the users assigned to each role.
+- A non-member receives the same roles and permission paths with the `assigned_users` field omitted,
+  and learns only from the `public` flag that a role applies to everyone.
+- A group whose record or authorization document is not present on this node reads as not found."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
@@ -684,7 +719,31 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
     path = "/groups/{id}/usage",
     tag = "groups",
     summary = "Read a group's storage usage",
-    description = "Requires a bearer token issued for this realm and membership in the group: membership is the only check, so a realm administrator who is not a member is forbidden. The flat counters report what this node stores for the group, while `realm` reports the realm-wide totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes. `dataset_count`, `profile_count` and `process_run_count` are exact lifecycle-live metadata-document counts for this group when this node's metadata subsystem can answer; all three are omitted together when it cannot. Classification reads each live registry record's root-only RO-Crate summary from the metadata graph store: a root whose `@type` contains `http://www.w3.org/ns/dx/prof/Profile` is a Profile; otherwise exact `conformsTo` `https://w3id.org/ro/wfrun/process/0.5` is a Process Run; every other root is a Dataset. Document storage paths never participate. The registry/lifecycle candidate set is bounded by the metadata registry limit and root-summary reads have at most eight in flight, so an over-limit or unreadable set is reported as unavailable rather than partially counted; full crates are never scanned and no result cache is added. `quota` restates the realm quota configuration for this group together with a warning flag evaluated against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be read, and the document count reported by the realm-wide usage endpoint is never included here.",
+    description = r#"Reports what this node stores for a group next to the realm-wide totals.
+
+**Authentication**: realm bearer token and membership in the group; membership is the only check, so
+a realm administrator who is not a member is forbidden.
+
+**Behavior**
+- The flat counters report what this node stores for the group, while `realm` reports the realm-wide
+  totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes.
+- `dataset_count`, `profile_count` and `process_run_count` are exact lifecycle-live
+  metadata-document counts for this group when this node's metadata subsystem can answer; all three
+  are omitted together when it cannot.
+- Classification reads each live registry record's root-only RO-Crate summary from the metadata
+  graph store: a root whose `@type` contains `http://www.w3.org/ns/dx/prof/Profile` is a Profile;
+  otherwise exact `conformsTo` `https://w3id.org/ro/wfrun/process/0.5` is a Process Run; every other
+  root is a Dataset. Document storage paths never participate.
+- `quota` restates the realm quota configuration for this group together with a warning flag
+  evaluated against the group's realm-wide logical bytes; it is omitted when the realm configuration
+  cannot be read, and the document count reported by the realm-wide usage endpoint is never included
+  here.
+
+**Limits**
+- The registry/lifecycle candidate set is bounded by the metadata registry limit and root-summary
+  reads have at most eight in flight, so an over-limit or unreadable set is reported as unavailable
+  rather than partially counted.
+- Full crates are never scanned and no result cache is added."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
@@ -780,7 +839,18 @@ pub async fn get_group_usage(
     path = "/groups/{id}/members",
     tag = "groups",
     summary = "List the members of a group",
-    description = "Requires a bearer token issued for this realm and membership in the group; the member list is never exposed to outsiders, so a non-member is forbidden. Returns every member in one response, sorted by user id, each with the roles that assign them, sorted by role name. A role that applies to everyone contributes no member here, since the principal standing for everyone is not a user. Display names are resolved from the realm's user directory as a best effort: a member without a resolvable record is returned with a null name instead of failing the listing.",
+    description = r#"Returns every member of a group with the roles that assign them.
+
+**Authentication**: realm bearer token and membership in the group; the member list is never exposed
+to outsiders, so a non-member is forbidden.
+
+**Behavior**
+- Every member is returned in one response, sorted by user id, each with the roles that assign them,
+  sorted by role name.
+- A role that applies to everyone contributes no member here, since the principal standing for
+  everyone is not a user.
+- Display names are resolved from the realm's user directory as a best effort: a member without a
+  resolvable record is returned with a null name instead of failing the listing."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
@@ -888,7 +958,18 @@ async fn resolve_member_names(
     path = "/groups/{id}/members",
     tag = "groups",
     summary = "Add a user to a group",
-    description = "Requires an unrestricted bearer token issued for this realm and WRITE on the group's administrative path for the user being added, so authority can be delegated per member. When `role_ids` is omitted or empty the user is assigned the group's role named user, and the request is rejected when that role is missing or ambiguous. Adding a user who already holds the roles is accepted and changes nothing. The response is the group's complete role list after the change, including the users assigned to each role. The change commits on this node and replicates to the rest of the realm afterwards.",
+    description = r#"Assigns a user one or more roles in a group.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the group's administrative path
+for the user being added, so authority can be delegated per member.
+
+**Behavior**
+- When `role_ids` is omitted or empty the user is assigned the group's role named user, and the
+  request is rejected when that role is missing or ambiguous.
+- Adding a user who already holds the roles is accepted and changes nothing.
+- The response is the group's complete role list after the change, including the users assigned to
+  each role.
+- The change commits on this node and replicates to the rest of the realm afterwards."#,
     request_body(
         content = AddGroupMemberRequest,
         description = "User to add, and optionally the exact roles to assign instead of the default user role.",
@@ -995,8 +1076,20 @@ pub async fn add_group_member(
     delete,
     path = "/groups/{id}/members/{user_id}",
     tag = "groups",
-    summary = "Remove a member from a group or revoke one of their roles",
-    description = "Requires an unrestricted bearer token issued for this realm. Removing yourself needs no group permission; removing anyone else requires WRITE on the group's administrative path for that user. Without `role_id` the user loses every role in the group, with it only that one assignment is revoked and the rest are kept. A group must keep at least one administrator, so the request is refused when it would strip the last one. The change commits on this node and replicates to the rest of the realm afterwards.",
+    summary = "Remove a group member or revoke one role",
+    description = r#"Revokes a user's roles in a group, or only the one named by `role_id`.
+
+**Authentication**: unrestricted realm bearer token. Removing yourself needs no group permission;
+removing anyone else requires WRITE on the group's administrative path for that user.
+
+**Behavior**
+- Without `role_id` the user loses every role in the group, with it only that one assignment is
+  revoked and the rest are kept.
+- The change commits on this node and replicates to the rest of the realm afterwards.
+
+**Limits**
+- A group must keep at least one administrator, so the request is refused when it would strip the
+  last one."#,
     params(
         ("id" = String, Path, description = "Group id as a 26-character ULID"),
         ("user_id" = String, Path, description = "Member to remove, in the realm-qualified user id form `<user ULID>@<realm id>`"),
@@ -1062,7 +1155,18 @@ pub async fn remove_group_member(
     path = "/groups/{id}/leave",
     tag = "groups",
     summary = "Leave a group",
-    description = "Self-scoped: the caller drops every role they hold in the group, and no group permission is required because the token's own subject is the only user affected. Requires an unrestricted bearer token issued for this realm; a token confined to a path subset is refused. A group must keep at least one administrator, so the last one cannot leave and must hand the role over first. Leaving a group the caller does not belong to changes nothing. The change commits on this node and replicates to the rest of the realm afterwards.",
+    description = r#"Drops every role the calling user holds in the group.
+
+**Authentication**: unrestricted realm bearer token; a token confined to a path subset is refused.
+No group permission is required, because the token's own subject is the only user affected.
+
+**Behavior**
+- Leaving a group the caller does not belong to changes nothing.
+- The change commits on this node and replicates to the rest of the realm afterwards.
+
+**Limits**
+- A group must keep at least one administrator, so the last one cannot leave and must hand the role
+  over first."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (status = 204, description = "The caller no longer holds any role in the group; no response body is returned"),
@@ -1099,7 +1203,22 @@ pub async fn leave_group(
     path = "/groups/{id}/roles",
     tag = "groups",
     summary = "Create a role in a group",
-    description = "Requires an unrestricted bearer token issued for this realm and WRITE on the group's administrative path. The name is trimmed, must not be empty and must not be admin or user, which are reserved for the built-in roles. Every permission path must lie inside the group's own path, so a group administrator cannot mint authority over anything else, and each is granted as read, write or deny (accepted case-insensitively, reported capitalised). A public role applies to every principal including anonymous callers and may therefore only carry read grants. The role commits on this node and replicates to the rest of the realm afterwards.",
+    description = r#"Creates a role in a group from permission paths confined to that group.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the group's administrative path.
+
+**Behavior**
+- Each permission path is granted as read, write or deny, accepted case-insensitively and reported
+  capitalised.
+- The role commits on this node and replicates to the rest of the realm afterwards.
+
+**Limits**
+- The name is trimmed, must not be empty and must not be admin or user, which are reserved for the
+  built-in roles.
+- Every permission path must lie inside the group's own path, so a group administrator cannot mint
+  authority over anything else.
+- A public role applies to every principal including anonymous callers and may therefore only carry
+  read grants."#,
     request_body(
         content = CreateGroupRoleRequest,
         description = "Role name, the permission paths it grants inside the group, and the users it is assigned to.",
@@ -1227,7 +1346,18 @@ pub async fn create_group_role(
     path = "/groups/{id}/roles/{role_id}",
     tag = "groups",
     summary = "Delete a role from a group",
-    description = "Requires an unrestricted bearer token issued for this realm and WRITE on the group's administrative path. Deleting a role revokes it from every user holding it, which can leave a user with no role in the group at all. The built-in admin role is permanent and cannot be deleted, so a group never loses its administrative path. The change commits on this node and replicates to the rest of the realm afterwards.",
+    description = r#"Deletes a role from a group and revokes it from everyone holding it.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the group's administrative path.
+
+**Behavior**
+- Deleting a role revokes it from every user holding it, which can leave a user with no role in the
+  group at all.
+- The change commits on this node and replicates to the rest of the realm afterwards.
+
+**Limits**
+- The built-in admin role is permanent and cannot be deleted, so a group never loses its
+  administrative path."#,
     params(
         ("id" = String, Path, description = "Group id as a 26-character ULID"),
         ("role_id" = String, Path, description = "Role to delete, as a 26-character ULID")
@@ -1325,7 +1455,20 @@ pub struct DataPathsQuery {
     path = "/groups/{id}/data-paths",
     tag = "groups",
     summary = "Browse the data permission paths of a group",
-    description = "Requires a bearer token issued for this realm and membership in the group, and every page is additionally authorized as a data read: browsing the bucket level needs READ on the group's data root, browsing inside a bucket needs READ on that bucket or on the prefix being listed, so a token confined to a narrower path sees only what it may read. The entries are the permission paths that role grants are written against, folders ending at the delimiter and objects as leaves, and they are scoped to this node, so a prefix belonging to another node is rejected. Bucket names are globally unique: naming a bucket owned by another group returns an empty page instead of an error. Paging is forward-only through an opaque token that must be echoed back unchanged; a response without one is the last page.",
+    description = r#"Returns one page of the data permission paths that a group's role grants are written against.
+
+**Authentication**: realm bearer token and membership in the group, and every page is additionally
+authorized as a data read: browsing the bucket level needs READ on the group's data root, browsing
+inside a bucket needs READ on that bucket or on the prefix being listed, so a token confined to a
+narrower path sees only what it may read.
+
+**Behavior**
+- Entries are folders ending at the delimiter and objects as leaves.
+- They are scoped to this node, so a prefix belonging to another node is rejected.
+- Bucket names are globally unique: naming a bucket owned by another group returns an empty page
+  instead of an error.
+- Paging is forward-only through an opaque token that must be echoed back unchanged; a response
+  without one is the last page."#,
     params(
         ("id" = String, Path, description = "Group id as a 26-character ULID"),
         ("prefix" = Option<String>, Query, description = "Data permission path to browse under; empty or the group data path lists buckets; a bucket path lists that bucket's contents; any other bare segment filters bucket names by that prefix"),

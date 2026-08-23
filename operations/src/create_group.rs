@@ -21,12 +21,11 @@ use aruna_core::structs::{
     group_owner_index_key, group_owner_index_prefix,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, UserId, Value};
+use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::HashSet;
 use thiserror::Error;
-use tracing::trace;
+use tracing::{trace, warn};
 use ulid::Ulid;
 
 use crate::placement::placement_ref_for_target;
@@ -225,7 +224,7 @@ impl CreateGroupOperation {
             .iter()
             .find(|role| role.name == "admin")
             .ok_or(CreateGroupError::AdminRoleNotFound)?;
-        for user_id in sorted_user_ids(&admin_role.assigned_users) {
+        for user_id in crate::sorted_user_ids(&admin_role.assigned_users) {
             admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::GroupRoleUserAssignmentAdded {
@@ -536,7 +535,12 @@ impl CreateGroupOperation {
     fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_outbox_schedule(),
-            Event::Task(TaskEvent::Error { .. }) => self.finish_after_outbox_schedule(),
+            // The group is committed either way; the outbox drains on its next
+            // wake, so a scheduling failure only delays replication.
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(%message, "Group document outbox drain was not scheduled");
+                self.finish_after_outbox_schedule()
+            }
             other => self.unexpected_event(
                 CreateGroupState::ScheduleDocumentSyncOutboxDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
@@ -554,12 +558,6 @@ fn sorted_roles(auth_doc: &GroupAuthorizationDocument) -> Vec<&Role> {
             .then_with(|| left.role_id.cmp(&right.role_id))
     });
     roles
-}
-
-fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
-    let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
-    user_ids.sort();
-    user_ids
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

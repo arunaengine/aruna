@@ -191,7 +191,7 @@ impl Store {
                     .or_insert_with(|| ks.clone())
                     .clone())
             }
-            Err(_) => Err(StorageError::KeyspaceError),
+            Err(error) => Err(StorageError::KeyspaceError(error.to_string())),
         }
     }
 }
@@ -214,6 +214,9 @@ struct StorageMetrics {
     requests_total: AtomicU64,
     errors_total: AtomicU64,
     conflicts_total: AtomicU64,
+    /// Errors that end the request. Conflicts are excluded: callers retry them,
+    /// and the retry is counted again under `requests_total`.
+    failed_total: AtomicU64,
     in_flight: AtomicU64,
     channel_closed: Arc<AtomicBool>,
     sealed: AtomicBool,
@@ -263,6 +266,7 @@ pub struct StorageMetricsSnapshot {
     pub requests_total: u64,
     pub errors_total: u64,
     pub conflicts_total: u64,
+    /// Errors that ended the request, excluding the conflicts callers retry.
     pub failed_total: u64,
     pub channel_closed: bool,
     pub sealed: bool,
@@ -506,12 +510,11 @@ impl StorageHandle {
     }
 
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
-        let errors_total = self.metrics.errors_total.load(Ordering::Relaxed);
         StorageMetricsSnapshot {
             requests_total: self.metrics.requests_total.load(Ordering::Relaxed),
-            errors_total,
+            errors_total: self.metrics.errors_total.load(Ordering::Relaxed),
             conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
-            failed_total: errors_total,
+            failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
             channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
             sealed: self.is_sealed(),
             rejected_writes: self.rejected_writes(),
@@ -905,6 +908,8 @@ impl StorageHandle {
 
         if matches!(error, StorageError::TransactionConflict) {
             self.metrics.conflicts_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
         }
 
         if matches!(error, StorageError::ChannelClosed) {
@@ -992,7 +997,7 @@ fn cleanup_effect(effect: &StorageEffect) -> Option<(Ulid, CleanupKind)> {
 fn is_cleanup_write(effect: &StorageEffect) -> bool {
     matches!(
         effect,
-        StorageEffect::Write { key_space, .. } if key_space == aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE
+        StorageEffect::Write { key_space, .. } if aruna_core::keyspaces::is_cleanup_keyspace(key_space)
     )
 }
 
@@ -1022,7 +1027,7 @@ fn reserve_cleanup(
 
     if previous.is_none() {
         if pending.len() >= MAX_TRANSACTION_CLEANUP {
-            return Err(StorageError::TransactionConflict);
+            return Err(StorageError::CleanupCapacity);
         }
         pending.insert(
             txn_id,
@@ -1917,7 +1922,7 @@ impl FjallStorage {
             .db
             .write_tx()
             .map(|tx| tx.durability(Some(self.persist_policy.as_fjall())))
-            .map_err(|_| StorageError::WriteError)
+            .map_err(|error| StorageError::WriteError(error.to_string()))
     }
 
     fn commit_buffered_write_tx(&self, tx: fjall::OptimisticWriteTx) -> Result<(), StorageError> {
@@ -1931,9 +1936,9 @@ impl FjallStorage {
                 Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
                 Err(StorageError::TransactionConflict)
             }
-            Err(_) => {
+            Err(error) => {
                 Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
-                Err(StorageError::WriteError)
+                Err(StorageError::WriteError(error.to_string()))
             }
         }
     }
@@ -1953,7 +1958,7 @@ impl FjallStorage {
                 .expect("transaction cleanup mutex poisoned");
             if pending.len() >= MAX_TRANSACTION_CLEANUP {
                 return StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
+                    error: StorageError::CleanupCapacity,
                 };
             }
             if pending.contains_key(&candidate) {
@@ -2047,8 +2052,8 @@ impl FjallStorage {
                         key,
                         value: value_opt.map(|v| v.into()),
                     },
-                    Err(_e) => StorageEvent::Error {
-                        error: StorageError::ReadError,
+                    Err(error) => StorageEvent::Error {
+                        error: StorageError::ReadError(error.to_string()),
                     },
                 },
                 Some(Txn::Write(txn)) => match txn.get(keyspace, &key) {
@@ -2056,8 +2061,8 @@ impl FjallStorage {
                         key,
                         value: value_opt.map(|v| v.into()),
                     },
-                    Err(_e) => StorageEvent::Error {
-                        error: StorageError::ReadError,
+                    Err(error) => StorageEvent::Error {
+                        error: StorageError::ReadError(error.to_string()),
                     },
                 },
                 None => StorageEvent::Error {
@@ -2417,8 +2422,8 @@ fn store_read(store: &Store, keyspace: OptimisticTxKeyspace, key: ByteView) -> S
             key,
             value: value_opt.map(|v| v.into()),
         },
-        Err(_e) => StorageEvent::Error {
-            error: StorageError::ReadError,
+        Err(error) => StorageEvent::Error {
+            error: StorageError::ReadError(error.to_string()),
         },
     }
 }
@@ -2436,9 +2441,9 @@ fn batch_read_with<R: Readable>(
         };
         match reader.get(&keyspace, &key) {
             Ok(value_opt) => values.push((key, value_opt.map(Into::into))),
-            Err(_e) => {
+            Err(error) => {
                 return StorageEvent::Error {
-                    error: StorageError::ReadError,
+                    error: StorageError::ReadError(error.to_string()),
                 };
             }
         }
@@ -2478,8 +2483,8 @@ fn read_last_with<R: Readable>(
             values: vec![(ByteView::from(key.as_ref()), ByteView::from(value.as_ref()))],
             next_start_after: None,
         },
-        Err(_) => StorageEvent::Error {
-            error: StorageError::ReadError,
+        Err(error) => StorageEvent::Error {
+            error: StorageError::ReadError(error.to_string()),
         },
     }
 }
@@ -3157,7 +3162,9 @@ fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageEr
     let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
 
     while let Some(guard) = iter.next() {
-        let (key, value) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
+        let (key, value) = guard
+            .into_inner()
+            .map_err(|error| StorageError::ReadError(error.to_string()))?;
         values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
 
         if values.len() == limit {
@@ -4363,6 +4370,31 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_cap_distinct() {
+        // Capacity exhaustion is not a conflict, so retry loops must not spin on it.
+        let mut pending = std::collections::BTreeMap::new();
+        for index in 0..super::MAX_TRANSACTION_CLEANUP {
+            pending.insert(
+                Ulid::from_parts(index as u64, 0),
+                super::CleanupEntry {
+                    kind: super::CleanupKind::Open,
+                    attempts: 0,
+                    queued: false,
+                },
+            );
+        }
+
+        assert!(matches!(
+            super::reserve_cleanup(
+                &mut pending,
+                Ulid::from_parts(u64::MAX, 0),
+                super::CleanupKind::Abort,
+            ),
+            Err(StorageError::CleanupCapacity)
+        ));
+    }
+
+    #[test]
     fn unknown_commit_runs() {
         let dir = tempdir().unwrap();
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
@@ -4637,7 +4669,7 @@ mod tests {
                 .send_storage_effect(StorageEffect::StartTransaction { read: true })
                 .await,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict
+                error: StorageError::CleanupCapacity
             })
         ));
 
@@ -5372,7 +5404,8 @@ mod tests {
         assert_eq!(metrics_after_conflict.requests_total, 2);
         assert_eq!(metrics_after_conflict.errors_total, 2);
         assert_eq!(metrics_after_conflict.conflicts_total, 1);
-        assert_eq!(metrics_after_conflict.failed_total, 2);
+        // A retryable conflict is not a failed request.
+        assert_eq!(metrics_after_conflict.failed_total, 1);
         assert_eq!(
             metrics_after_conflict.last_error,
             Some("Transaction conflict".to_string())

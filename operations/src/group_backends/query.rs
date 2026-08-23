@@ -44,6 +44,12 @@ impl GetGroupBackendOperation {
             output: None,
         }
     }
+
+    fn reject(&mut self) -> Effects {
+        self.state = QueryState::Error;
+        self.output = Some(Err(RecordReadError::Unexpected.into()));
+        smallvec![]
+    }
 }
 
 impl Operation for GetGroupBackendOperation {
@@ -75,7 +81,7 @@ impl Operation for GetGroupBackendOperation {
                 }
                 smallvec![]
             }
-            QueryState::Finish | QueryState::Error => smallvec![],
+            QueryState::Finish | QueryState::Error => self.reject(),
         }
     }
 
@@ -122,6 +128,12 @@ impl ListGroupBackendsOperation {
             txn_id: None,
         })
     }
+
+    fn reject(&mut self) -> Effects {
+        self.state = QueryState::Error;
+        self.output = Some(Err(RecordReadError::Unexpected.into()));
+        smallvec![]
+    }
 }
 
 impl Operation for ListGroupBackendsOperation {
@@ -156,7 +168,7 @@ impl Operation for ListGroupBackendsOperation {
                     smallvec![]
                 }
             },
-            QueryState::Finish | QueryState::Error => smallvec![],
+            QueryState::Finish | QueryState::Error => self.reject(),
         }
     }
 
@@ -176,8 +188,9 @@ impl Operation for ListGroupBackendsOperation {
 
 #[cfg(test)]
 mod tests {
+    use super::super::RecordReadError;
     use super::super::{index_key, index_prefix};
-    use super::{GetGroupBackendOperation, ListGroupBackendsOperation};
+    use super::{GetGroupBackendOperation, GroupBackendQueryError, ListGroupBackendsOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_INDEX_KEYSPACE;
@@ -245,5 +258,38 @@ mod tests {
         }));
 
         assert_eq!(operation.finalize().unwrap(), vec![mine]);
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let stray = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: b"x".to_vec().into(),
+                value: None,
+            })
+        };
+
+        let mut get = GetGroupBackendOperation::new(Ulid::from_bytes([9u8; 16]));
+        get.start();
+        get.step(stray());
+        get.step(stray());
+        assert!(matches!(
+            get.finalize(),
+            Err(GroupBackendQueryError::Read(RecordReadError::Unexpected))
+        ));
+
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let mut list = ListGroupBackendsOperation::new(group_id);
+        list.start();
+        list.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        list.step(stray());
+        assert!(matches!(
+            list.finalize(),
+            Err(GroupBackendQueryError::Read(RecordReadError::Unexpected))
+        ));
     }
 }

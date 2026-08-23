@@ -538,6 +538,9 @@ async fn authorize_repair(
             Err(SyncMirrorRepairError::Mirror("access_denied".to_string()))
         }
         Err(AuthorizeError::CheckFailed(error)) => Err(SyncMirrorRepairError::Mirror(error)),
+        Err(AuthorizeError::Storage(error)) => {
+            Err(SyncMirrorRepairError::Mirror(error.to_string()))
+        }
     }
 }
 

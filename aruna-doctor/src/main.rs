@@ -26,7 +26,7 @@ mod storage;
 mod test_support;
 mod tokens;
 
-/// Simple program to greet a person
+/// Operational CLI for inspecting, recovering and maintaining an Aruna node.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, name = "aruna-doctor")]
 struct Cli {
@@ -39,7 +39,9 @@ pub enum Commands {
     CreateToken {
         #[arg(long)]
         oidc_username: String,
-        #[arg(long)]
+        /// OIDC password. Prefer `ARUNA_OIDC_PASSWORD`: a value passed on the
+        /// command line is visible to every process on the host.
+        #[arg(long, env = "ARUNA_OIDC_PASSWORD", hide_env_values = true)]
         oidc_password: String,
         #[arg(long, default_value = "openid")]
         oidc_scope: String,

@@ -467,7 +467,9 @@ impl Operation for AdmitSubmissionOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("transaction abort", format!("{other:?}")),
             },
-            AdmitState::Init | AdmitState::Finish | AdmitState::Error => smallvec![],
+            AdmitState::Init | AdmitState::Finish | AdmitState::Error => {
+                self.unexpected("no event", format!("{event:?}"))
+            }
         }
     }
 
@@ -521,4 +523,46 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
         WorkspaceMode::None => None,
     };
     record
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::records::tests::fixture::{Family, REALM};
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let family = Family::new([1u8; 32]);
+        let spec = family.spec();
+        let job_id = spec.job_id;
+        let claim = family.claim(&spec);
+        let sign = |record| {
+            JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
+        };
+        let mut operation = AdmitSubmissionOperation::new(AdmitSubmissionConfig {
+            realm_id: REALM,
+            local_node_id: family.holder.public(),
+            submission_id: family.submission_id,
+            request_digest: family.request_digest,
+            candidate: Box::new(AdmissionCandidate {
+                job_id,
+                spec: sign(JobFamilyRecord::Spec(Box::new(spec))),
+                claim: sign(JobFamilyRecord::Claim(claim)),
+            }),
+            now_ms: 3_000,
+            quota_refusal: None,
+            quota_revision: None,
+        });
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::generate(),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
+    }
 }

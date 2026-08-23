@@ -201,7 +201,13 @@ impl Operation for SetDisabledOperation {
             DisableState::WriteRecord => self.handle_written(event),
             DisableState::CommitTransaction => self.handle_committed(event),
             DisableState::AbortTransaction => self.handle_aborted(event),
-            DisableState::Finish | DisableState::Error => smallvec![],
+            DisableState::Finish | DisableState::Error => {
+                self.fail(SetDisabledError::InvalidStateEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -397,6 +403,25 @@ mod tests {
             entries: Vec::new(),
         }));
 
+        assert!(matches!(
+            operation.finalize(),
+            Err(SetDisabledError::InvalidStateEvent { .. })
+        ));
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let mut operation = SetDisabledOperation::new(group_id, backend_id(), true);
+        reading(&mut operation);
+        operation.step(read_result(record(group_id, false)));
+        written(&mut operation);
+        committed(&mut operation);
+
+        let effects = written(&mut operation);
+
+        assert!(effects.is_empty());
         assert!(matches!(
             operation.finalize(),
             Err(SetDisabledError::InvalidStateEvent { .. })

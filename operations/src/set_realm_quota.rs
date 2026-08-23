@@ -6,29 +6,36 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, QuotaConfig, RealmConfigDocument};
+use aruna_core::structs::{
+    Actor, AuthContext, Permission, QuotaConfig, RealmConfigDocument, policy_admin_path,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::mutate_realm_placement::is_management;
 use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetRealmQuotaConfig {
     pub actor: Actor,
+    /// The caller's own token context, so a path-restricted credential stays
+    /// restricted; it is never derived from `actor`.
+    pub auth_context: AuthContext,
     pub quota: QuotaConfig,
 }
 
@@ -43,6 +50,7 @@ pub struct SetRealmQuotaOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum SetRealmQuotaState {
     Init,
+    Auth,
     StartTransaction,
     ReadCurrent,
     WriteDocumentAndAdminState {
@@ -72,6 +80,10 @@ pub enum SetRealmQuotaError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
+    #[error("caller may not write the realm configuration")]
+    Unauthorized,
+    #[error("this node is not a realm management node")]
+    NotManagementNode,
     #[error("invalid quota configuration: {reason}")]
     InvalidQuota { reason: String },
     #[error("missing active transaction")]
@@ -142,6 +154,9 @@ impl SetRealmQuotaOperation {
             return Err(SetRealmQuotaError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
+        if !is_management(&document, self.config.actor.node_id) {
+            return Err(SetRealmQuotaError::NotManagementNode);
+        }
 
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
@@ -245,14 +260,45 @@ impl Operation for SetRealmQuotaOperation {
     type Error = SetRealmQuotaError;
 
     fn start(&mut self) -> Effects {
-        self.state = SetRealmQuotaState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return self.fail(SetRealmQuotaError::Unauthorized);
+        }
+        self.state = SetRealmQuotaState::Auth;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            }),
+            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
+        ))]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
+            SetRealmQuotaState::Auth => match event {
+                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                    match allowed {
+                        Ok(true) => {
+                            self.state = SetRealmQuotaState::StartTransaction;
+                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                                read: false
+                            })]
+                        }
+                        Ok(false) => self.fail(SetRealmQuotaError::Unauthorized),
+                        Err(error) => {
+                            warn!(error = %error, "Realm quota authorization check failed");
+                            match error {
+                                AuthorizationError::StorageError(error) => {
+                                    self.fail(SetRealmQuotaError::StorageError(error))
+                                }
+                                _ => self.fail(SetRealmQuotaError::Unauthorized),
+                            }
+                        }
+                    }
+                }
+                other => self.unexpected_event("authorization result", format!("{other:?}")),
+            },
             SetRealmQuotaState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
@@ -443,8 +489,10 @@ mod tests {
     use crate::get_realm_config::GetRealmConfigOperation;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::{
-        GroupQuotaOverride, RealmConfigDocument, RealmId, UserGroupCapOverride,
+        GroupQuotaOverride, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        RealmNodeKind, UserGroupCapOverride,
     };
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -467,6 +515,50 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([seed; 16]), realm_id),
             realm_id,
         }
+    }
+
+    fn auth(actor: &Actor) -> AuthContext {
+        AuthContext {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    fn quota_config(actor: &Actor, quota: QuotaConfig) -> SetRealmQuotaConfig {
+        SetRealmQuotaConfig {
+            actor: actor.clone(),
+            auth_context: auth(actor),
+            quota,
+        }
+    }
+
+    /// The realm admin role only grants what the operation checks, so the
+    /// permission sub-operation decides on stored rules like production does.
+    async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
+        let mut document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        for role in document.roles.values_mut() {
+            role.assigned_users.insert(actor.user_id);
+        }
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: (*actor.realm_id.as_bytes()).into(),
+                value: document.to_bytes(actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    fn management_config(realm_id: RealmId, actor: &Actor) -> RealmConfigDocument {
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        document
     }
 
     async fn seed_config(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
@@ -513,15 +605,13 @@ mod tests {
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
-        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let document = management_config(realm_id, &actor);
         seed_config(&ctx, &actor, &document).await;
+        seed_realm_admin(&ctx, &actor).await;
 
         let quota = custom_quota();
         let stored = drive(
-            SetRealmQuotaOperation::new(SetRealmQuotaConfig {
-                actor: actor.clone(),
-                quota: quota.clone(),
-            }),
+            SetRealmQuotaOperation::new(quota_config(&actor, quota.clone())),
             &ctx,
         )
         .await
@@ -541,8 +631,9 @@ mod tests {
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
-        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let document = management_config(realm_id, &actor);
         seed_config(&ctx, &actor, &document).await;
+        seed_realm_admin(&ctx, &actor).await;
 
         let quota = QuotaConfig {
             max_devices_per_user: Some(4),
@@ -550,7 +641,7 @@ mod tests {
         };
 
         let error = drive(
-            SetRealmQuotaOperation::new(SetRealmQuotaConfig { actor, quota }),
+            SetRealmQuotaOperation::new(quota_config(&actor, quota)),
             &ctx,
         )
         .await
@@ -569,17 +660,113 @@ mod tests {
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(2, realm_id);
+        seed_realm_admin(&ctx, &actor).await;
 
         let error = drive(
-            SetRealmQuotaOperation::new(SetRealmQuotaConfig {
-                actor,
-                quota: QuotaConfig::default(),
-            }),
+            SetRealmQuotaOperation::new(quota_config(&actor, QuotaConfig::default())),
             &ctx,
         )
         .await
         .unwrap_err();
         assert_eq!(error, SetRealmQuotaError::RealmConfigNotFound);
+    }
+
+    #[tokio::test]
+    async fn refuses_server_node() {
+        // A realm admin token still may not write the config on a server node.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([5; 32]);
+        let actor = actor(5, realm_id);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Server);
+        seed_config(&ctx, &actor, &document).await;
+        seed_realm_admin(&ctx, &actor).await;
+
+        let error = drive(
+            SetRealmQuotaOperation::new(quota_config(&actor, custom_quota())),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, SetRealmQuotaError::NotManagementNode);
+    }
+
+    #[test]
+    fn start_checks_permission() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let mut operation = SetRealmQuotaOperation::new(quota_config(&actor, custom_quota()));
+        let effects = operation.start();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let emitted = format!("{effects:?}");
+        assert!(emitted.contains(&policy_admin_path(realm_id)));
+        assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn denied_is_terminal() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let mut operation = SetRealmQuotaOperation::new(quota_config(&actor, custom_quota()));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Err(SetRealmQuotaError::Unauthorized));
+    }
+
+    #[test]
+    fn capacity_not_denied() {
+        // Storage exhaustion inside the check is infrastructure, not a verdict.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let mut operation = SetRealmQuotaOperation::new(quota_config(&actor, custom_quota()));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::StorageError(
+                    StorageError::CleanupCapacity,
+                )),
+            },
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetRealmQuotaError::StorageError(
+                StorageError::CleanupCapacity
+            ))
+        );
+    }
+
+    #[test]
+    fn allowed_starts_transaction() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let mut operation = SetRealmQuotaOperation::new(quota_config(&actor, custom_quota()));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        );
+    }
+
+    #[test]
+    fn foreign_token_denied() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let mut config = quota_config(&actor, custom_quota());
+        config.auth_context.realm_id = RealmId::from_bytes([2; 32]);
+        let mut operation = SetRealmQuotaOperation::new(config);
+        assert!(operation.start().is_empty());
+        assert_eq!(operation.finalize(), Err(SetRealmQuotaError::Unauthorized));
     }
 
     #[test]

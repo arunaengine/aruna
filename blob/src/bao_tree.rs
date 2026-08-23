@@ -155,6 +155,7 @@ pub struct OpenDalWriter {
     pub hasher: Hasher,
     idle_timeout: Duration,
     control_timeout: Duration,
+    written: u64,
 }
 
 pub struct BaoReadWriter {
@@ -221,7 +222,7 @@ impl AsyncSliceWriter for BaoReadWriter {
 
 impl AsyncSliceWriter for OpenDalWriter {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        debug!("[OpenDalWriter] Try to write data with offset {}", offset);
+        self.check_offset(offset)?;
         with_transfer_idle_timeout(
             async {
                 self.writer
@@ -234,11 +235,12 @@ impl AsyncSliceWriter for OpenDalWriter {
         )
         .await?;
         self.hasher.update(data);
+        self.written += data.len() as u64;
         Ok(())
     }
 
     async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> std::io::Result<()> {
-        debug!("[OpenDalWriter] Try to write bytes with offset {}", offset);
+        self.check_offset(offset)?;
         with_transfer_idle_timeout(
             async {
                 self.writer
@@ -251,6 +253,7 @@ impl AsyncSliceWriter for OpenDalWriter {
         )
         .await?;
         self.hasher.update(&data);
+        self.written += data.len() as u64;
         Ok(())
     }
 
@@ -284,7 +287,23 @@ impl OpenDalWriter {
             hasher: Hasher::new(),
             idle_timeout,
             control_timeout,
+            written: 0,
         })
+    }
+
+    // The backend writer is append-only, so a non-sequential offset would
+    // silently reorder the replicated blob.
+    fn check_offset(&self, offset: u64) -> io::Result<()> {
+        if offset != self.written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bao write at offset {offset}, expected {} for append-only backend",
+                    self.written
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn finalize(mut self) -> Result<(), BlobError> {
@@ -322,24 +341,7 @@ pub struct OpenDalReader {
 
 impl AsyncSliceReader for OpenDalReader {
     async fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
-        // Jump to offset
-        with_transfer_idle_timeout(
-            self.stream.seek(std::io::SeekFrom::Start(offset)),
-            self.idle_timeout,
-            "seeking source blob for bao transfer",
-        )
-        .await?;
-
-        // Read bytes into buffer
-        let mut bs = vec![0u8; len];
-        with_transfer_idle_timeout(
-            self.stream.read_exact(&mut bs),
-            self.idle_timeout,
-            "reading source blob chunk for bao transfer",
-        )
-        .await?;
-
-        Ok(Bytes::from(bs))
+        self.read_exact_at(offset, len).await
     }
 
     async fn read_exact_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
@@ -389,7 +391,7 @@ impl OpenDalReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaoReadWriter, idle_timeout_error, with_transfer_idle_timeout};
+    use super::{BaoReadWriter, OpenDalWriter, idle_timeout_error, with_transfer_idle_timeout};
     use iroh_io::AsyncSliceWriter;
     use std::io;
     use std::time::Duration;
@@ -460,5 +462,30 @@ mod tests {
             .finish(6, *blake3::hash(b"short").as_bytes())
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_gap() {
+        // The opendal writer appends, so a skipped offset must not be accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let operator = opendal::Operator::from_iter::<opendal::services::Fs>(
+            [("root".to_string(), dir.path().to_str().unwrap().to_string())].into_iter(),
+        )
+        .unwrap()
+        .finish();
+        let mut writer = OpenDalWriter::new(
+            &operator,
+            "blob.bin",
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        writer.write_at(0, b"abc").await.unwrap();
+        let error = writer.write_at(7, b"d").await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        writer.write_at(3, b"d").await.unwrap();
     }
 }

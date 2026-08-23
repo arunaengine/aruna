@@ -636,7 +636,10 @@ impl Operation for UpdateUserOperation {
                 self.handle_schedule_admin_document_outbox_drain(event, user)
             }
             UpdateUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
-            UpdateUserState::Init | UpdateUserState::Finish | UpdateUserState::Error => smallvec![],
+            UpdateUserState::Init | UpdateUserState::Finish | UpdateUserState::Error => {
+                let got = format!("{event:?}");
+                self.unexpected_event("no event", got)
+            }
         }
     }
 
@@ -1374,5 +1377,23 @@ mod tests {
             operation.finalize().unwrap_err(),
             UpdateUserError::PlacementFenced
         );
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::generate(),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(UpdateUserError::UnexpectedEvent { .. })
+        ));
     }
 }

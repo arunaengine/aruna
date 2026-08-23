@@ -275,7 +275,17 @@ impl Operation for GetGroupOperation {
             GetGroupState::GetGroup => self.handle_get_group(event),
             GetGroupState::GetAuthDoc => self.handle_get_auth_doc(event),
             GetGroupState::CommitTransaction => self.handle_commit_transaction(event),
-            GetGroupState::Init | GetGroupState::Finish | GetGroupState::Error => smallvec![],
+            // A terminal state owns no transaction to clean up, so this fails
+            // without the abort effects `unexpected_event` would emit.
+            GetGroupState::Init | GetGroupState::Finish | GetGroupState::Error => {
+                let got = format!("{event:?}");
+                let state = self.state;
+                self.fail(GetGroupError::UnexpectedEvent {
+                    state,
+                    expected: "no event",
+                    got,
+                })
+            }
         }
     }
 
@@ -361,5 +371,26 @@ mod test {
         assert_eq!(create_result.0, get_result.0);
 
         net_handle.shutdown().await;
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        use aruna_core::events::{Event, StorageEvent};
+        use aruna_core::operation::Operation;
+
+        let mut operation = GetGroupOperation::new(GetGroupConfig {
+            group_id: Ulid::from_bytes([1u8; 16]),
+        });
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([3u8; 16]),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(crate::get_group::GetGroupError::UnexpectedEvent { .. })
+        ));
     }
 }

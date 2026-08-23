@@ -721,11 +721,32 @@ fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> 
     path = "/jobs/",
     tag = "jobs",
     summary = "List the caller's jobs on this node",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused even for its own jobs. The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs this node owns, ordered newest first. Jobs recorded on other nodes are never merged in, so a caller that submitted against another node pages that node's listing instead (submission answers with the `origin_node_url` it was accepted at). A distributed execution job is listed where it was admitted or is running; read one by id for the replicated family view, which any node holding its records can answer. Jobs the system creates for its own bookkeeping are never listed. `limit` defaults to 50 and is capped at 200, `cursor` continues a previous page, and a page without `next_cursor` is the last one.",
+    description = r#"Pages the jobs the caller submitted to this node, newest first.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused even for
+its own jobs.
+
+**Behavior**
+- The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs
+  this node owns.
+- Jobs recorded on other nodes are never merged in, so a caller that submitted against another
+  node pages that node's listing instead (submission answers with the `origin_node_url` it was
+  accepted at).
+- A distributed execution job is listed where it was admitted or is running; read one by id for
+  the replicated family view, which any node holding its records can answer.
+- Jobs the system creates for its own bookkeeping are never listed.
+- A page without `next_cursor` is the last one.
+
+**Limits**
+- `limit` defaults to 50 and is capped at 200; `0` is treated as unset.
+- `cursor` is a previous page's `next_cursor`: 24 bytes, base64url without padding, and anything
+  else is rejected with 400.
+- `state` selects one of `queued`, `claimed`, `preparing`, `ready`, `running`, `cancelling`,
+  `indeterminate`, `succeeded`, `failed` or `cancelled`; any other value is rejected with 400."#,
     params(
-        ("limit" = Option<usize>, Query, description = "Maximum jobs in one page. Default 50, clamped to at most 200; 0 is treated as unset"),
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous page's `next_cursor`: 24 bytes, base64url without padding. Anything else is rejected with 400. Absent starts at the newest job"),
-        ("state" = Option<String>, Query, description = "Restrict the page to one job state: `queued`, `claimed`, `preparing`, `ready`, `running`, `cancelling`, `indeterminate`, `succeeded`, `failed` or `cancelled`. Any other value is rejected with 400. Absent returns every state")
+        ("limit" = Option<usize>, Query, description = "Maximum jobs in one page; default 50, at most 200, and 0 is treated as unset"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from a previous page; absent starts at the newest job"),
+        ("state" = Option<String>, Query, description = "Restrict the page to one job state; absent returns every state")
     ),
     responses(
         (
@@ -742,7 +763,11 @@ fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> 
                         "cancel_requested": false,
                         "created_at": "2026-04-09T14:23:11.123+00:00",
                         "updated_at": "2026-04-09T14:24:02.481+00:00",
-                        "progress": {"current": 2, "total": 5, "unit": "phases"},
+                        "progress": {
+                            "current": 2,
+                            "total": 5,
+                            "unit": "phases"
+                        },
                         "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
                         "workspace_mode": "kept"
                     }
@@ -794,7 +819,50 @@ pub async fn list_jobs(
     path = "/jobs/",
     tag = "jobs",
     summary = "Submit a container execution job",
-    description = "Requires a realm bearer token with WRITE on the target group's data; a path-restricted (delegated) token is refused. Submission is asynchronous: a 2xx means the request is durably admitted into its replicated submission family and queued, never that it started, finished or produced outputs. The job is not anchored to one node: any node that reduced the family answers for it, and `origin_node_url` is a preferred route rather than an owner. The response carries the opaque `submission_id` of the request itself and the alias this responder currently reduces as canonical; `job_id` stays the caller's stable handle even when a later merge moves the canonical alias. Execution is at-least-once: a partition may admit and run duplicates, whose outputs stay retrievable and auditable while one canonical success supplies the result. `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200 with the job that already exists and `created` false, while the same key with a different plan is a 409 conflict. Set `workspace.mode` to `existing` to run in a bucket that already exists, which additionally requires WRITE on that bucket and that it belongs to the same group; omitting `workspace` keeps a per-job workspace bucket. Rejected with 400: an empty image, `cpu_cores` of 0, a `ram_bytes` of 0 or above 2^63-1, more than 512 inputs, more than 1024 outputs, more than 32 output prefixes, an empty `dest_key`, a container path that is not absolute and traversal-free, two inputs sharing a container path, or two outputs sharing a `dest_key` or container path. Two inputs sharing a `dest_key` are not a transport error: `mode` and `collision_policy` decide the staged result, and only `reject` refuses them, as a 409 from the composition. The group's standing quota is decided against a replicated demand view: a view that understates the group is a 409 quota denial like an exceeded cap, carrying the dimension with `observed` reported at the limit, because a cap that cannot be shown to hold is not evidence of room. A replay of an idempotency key this node already claimed is settled before any quota is read and is never quota-refused. A 503 is retryable: the caller may submit again. It means the demand view could not be read, it kept moving under three reads, or three admission transactions in a row lost to a concurrent submission of the same group.",
+    description = r#"Accepts a container execution job for asynchronous execution and returns the id to poll.
+
+**Authentication**: realm bearer token with WRITE on the target group's data; a path-restricted
+(delegated) token is refused. Running in a bucket that already exists additionally requires WRITE
+on that bucket and that it belongs to the same group.
+
+**Behavior**
+- A 2xx means the request is durably admitted into its replicated submission family and queued,
+  never that it started, finished or produced outputs.
+- The job is not anchored to one node: any node that reduced the family answers for it, and
+  `origin_node_url` is a preferred route rather than an owner.
+- The response carries the opaque `submission_id` of the request itself and the alias this
+  responder currently reduces as canonical; `job_id` stays the caller's stable handle even when a
+  later merge moves the canonical alias.
+- Execution is at-least-once: a partition may admit and run duplicates, whose outputs stay
+  retrievable and auditable while one canonical success supplies the result.
+- `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200
+  with the job that already exists and `created` false, while the same key with a different plan
+  is a 409 conflict.
+- On a replay `state` reports what the responder currently reduces for that family, so a running
+  or finished request reads `running`, `succeeded`, `failed`, `cancelled` or `indeterminate`
+  rather than `queued`.
+- Set `workspace.mode` to `existing` to run in a bucket that already exists; omitting `workspace`
+  keeps a per-job workspace bucket.
+- The group's standing quota is decided against a replicated demand view. A replay of an
+  idempotency key this node already claimed is settled before any quota is read and is never
+  quota-refused.
+
+**Limits** (all refused with 400)
+- An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
+- More than 512 inputs, more than 1024 outputs, or more than 32 output prefixes.
+- An empty `dest_key`, or a container path that is not absolute and traversal-free.
+- Two inputs sharing a container path, or two outputs sharing a `dest_key` or container path.
+
+**Errors**
+- Two inputs sharing a `dest_key` are not a transport error: `mode` and `collision_policy` decide
+  the staged result, and only `reject` refuses them, as a 409 from the composition.
+- A quota refusal is a 409 carrying the exact scope, dimension and numbers in `quota`; a demand
+  view that understates the group is refused like an exceeded cap, with `observed` reported at the
+  limit, because a cap that cannot be shown to hold is not evidence of room.
+- A 503 is retryable and the caller may submit again with the same idempotency key: no family
+  holder could admit the request, the demand view could not be read or kept moving under three
+  reads, three admission transactions in a row lost to a concurrent submission of the same group,
+  or the id clock is unhealthy."#,
     request_body(
         content = SubmitExecutionRequest,
         description = "Container image, command and the inputs and outputs to stage around it",
@@ -802,19 +870,30 @@ pub async fn list_jobs(
             "group_id": "01JABCDEF0123456789ABCDEFG",
             "image": "registry.example.test/tools/fastqc:0.12.1",
             "command": ["fastqc", "--outdir", "/outputs", "/inputs/reads.fastq"],
-            "env": {"FASTQC_THREADS": "2"},
+            "env": {
+                "FASTQC_THREADS": "2"
+            },
             "cpu_cores": 2,
             "ram_bytes": 4294967296_i64,
             "max_walltime_ms": 3600000,
             "inputs": [
-                {"bucket": "project-data", "key": "raw/reads.fastq", "dest_key": "reads.fastq"}
+                {
+                    "bucket": "project-data",
+                    "key": "raw/reads.fastq",
+                    "dest_key": "reads.fastq"
+                }
             ],
             "outputs": [
-                {"container_path": "/outputs/reads_fastqc.html", "dest_key": "reports/reads_fastqc.html"}
+                {
+                    "container_path": "/outputs/reads_fastqc.html",
+                    "dest_key": "reports/reads_fastqc.html"
+                }
             ],
             "output_prefixes": ["reports/"],
             "idempotency_key": "fastqc-reads-2026-04-09",
-            "workspace": {"mode": "kept"}
+            "workspace": {
+                "mode": "kept"
+            }
         })
     ),
     responses(
@@ -834,7 +913,7 @@ pub async fn list_jobs(
         ),
         (
             status = 200,
-            description = "The idempotency key already names a request with this exact plan; nothing new was admitted, and `state` reports what the responder currently reduces for that family, so a replay of a running or finished request reads `running`, `succeeded`, `failed`, `cancelled` or `indeterminate` rather than `queued`",
+            description = "Replay of an idempotency key naming this exact plan; nothing new was admitted and `state` reports what the responder currently reduces",
             body = SubmitJobResponse,
             example = json!({
                 "job_id": "01JJRSTVWXYZ0123456789ABCD",
@@ -847,10 +926,10 @@ pub async fn list_jobs(
             })
         ),
         (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, or a workspace request that names no usable bucket", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is already bound to a request with a different plan, the group's standing compute quota refuses this new admission, the composition conflicts on a staged key, or the active RO-Crate job limit is reached; a quota refusal carries the exact scope, dimension and numbers in `quota`, and a refusal decided on an understated demand view reports `observed` at the limit", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is bound to a different plan, the group's compute quota refuses the admission, the composition conflicts on a staged key, or the active RO-Crate job limit is reached", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, or the caller lacks WRITE on the group or on the named existing workspace bucket", body = ErrorResponse),
-        (status = 503, description = "No family holder could admit the request, the group's demand view could not be read or did not settle, admission lost three transactions in a row to concurrent submissions of the same group, or the id clock is unhealthy; retryable, the caller may submit again with the same idempotency key", body = ErrorResponse)
+        (status = 503, description = "No family holder could admit the request, an unreadable or unsettled demand view, three lost admission transactions, or an unhealthy id clock; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -976,8 +1055,38 @@ pub async fn submit_job(
     path = "/jobs/{job_id}",
     tag = "jobs",
     summary = "Read one job's status",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Reads are self-scoped: only the job's own submitter may read it, and a job belonging to somebody else answers 404 rather than 403, so the surface never confirms that an id exists. A distributed execution job carries a `family` block reduced from the replicated records: it names the request's `submission_id`, the currently canonical alias, the canonical execution and its exact output VersionIds, how many physical executions and duplicate successes are known, the projection `revision` and digest to detect that the view changed, and the responder that answered. `family.partial` means this responder could not reduce every record, and `family.locally_exhausted` is a responder-local diagnostic (outside the projection digest) meaning every known execution ended without success and no retry is armed here; it is not evidence of a permanent failure. Node identities of other nodes are never disclosed; only the responder names itself, and an output whose owning node's S3 endpoint is unknown here carries `endpoint_url: null` rather than failing the read. The one exception is a persistent-id minting job the caller joined, which stays readable while the caller holds WRITE on the document it mints for. The read is answered by the node that owns the job, derived from the id itself: when that is another node the request is forwarded under the caller's own bearer token, so a malformed token is 400 and an owner that cannot be reached is a retryable 503. `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or `cancelled`. `run_crate` appears only for jobs that owe a run crate and reports that side obligation, not the job itself.",
-    params(("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404")),
+    description = r#"Returns one job's current status, with the replicated family view for a distributed execution job.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused. Reads are
+self-scoped: only the job's own submitter may read it, and a job belonging to somebody else
+answers 404 rather than 403, so the surface never confirms that an id exists.
+
+**Behavior**
+- The one exception to self-scoping is a persistent-id minting job the caller joined, which stays
+  readable while the caller holds WRITE on the document it mints for.
+- `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or
+  `cancelled`.
+- A distributed execution job carries a `family` block reduced from the replicated records: it
+  names the request's `submission_id`, the currently canonical alias, the canonical execution and
+  its exact output VersionIds, how many physical executions and duplicate successes are known, the
+  projection `revision` and digest to detect that the view changed, and the responder that
+  answered.
+- `family.partial` means this responder could not reduce every record.
+- `family.locally_exhausted` is a responder-local diagnostic (outside the projection digest)
+  meaning every known execution ended without success and no retry is armed here; it is not
+  evidence of a permanent failure.
+- Node identities of other nodes are never disclosed; only the responder names itself, and an
+  output whose owning node's S3 endpoint is unknown here carries `endpoint_url: null` rather than
+  failing the read.
+- A distributed execution job is answered here from the replicated family projection, without
+  routing. Every other kind is answered by the node that owns the job, derived from the id itself:
+  when that is another node the request is forwarded under the caller's own bearer token.
+- `run_crate` appears only for jobs that owe a run crate and reports that side obligation, not the
+  job itself.
+
+**Errors**: a bearer token that cannot be forwarded to the owning node is a 400, and an owner that
+cannot be reached is a retryable 503."#,
+    params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404")),
     responses(
         (
             status = 200,
@@ -992,7 +1101,11 @@ pub async fn submit_job(
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "updated_at": "2026-04-09T14:31:47.902+00:00",
                 "finished_at": "2026-04-09T14:31:47.902+00:00",
-                "progress": {"current": 5, "total": 5, "unit": "phases"},
+                "progress": {
+                    "current": 5,
+                    "total": 5,
+                    "unit": "phases"
+                },
                 "result": {
                     "exit_code": 0,
                     "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
@@ -1013,7 +1126,10 @@ pub async fn submit_job(
                 },
                 "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
                 "workspace_mode": "kept",
-                "run_crate": {"status": "written", "resource": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#run/01JJRSTVWXYZ0123456789ABCD"},
+                "run_crate": {
+                    "status": "written",
+                    "resource": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#run/01JJRSTVWXYZ0123456789ABCD"
+                },
                 "family": {
                     "submission_id": "6b1f8c9d0e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
                     "request_digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
@@ -1025,16 +1141,18 @@ pub async fn submit_job(
                     "canonical_execution_id": "01JJRSEXEC0123456789ABCDEF",
                     "executions": 2,
                     "duplicate_successes": 1,
-                    "outputs": [{
-                        "bucket": "ws-01jjrstvwxyz0123456789abcd",
-                        "key": "reports/reads_fastqc.html",
-                        "version_id": "01JJRSVERSION0123456789ABC",
-                        "execution_id": "01JJRSEXEC0123456789ABCDEF",
-                        "endpoint_url": "https://s3.example",
-                        "container_path": "/outputs/reads_fastqc.html",
-                        "size": 20480,
-                        "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8"
-                    }],
+                    "outputs": [
+                        {
+                            "bucket": "ws-01jjrstvwxyz0123456789abcd",
+                            "key": "reports/reads_fastqc.html",
+                            "version_id": "01JJRSVERSION0123456789ABC",
+                            "execution_id": "01JJRSEXEC0123456789ABCDEF",
+                            "endpoint_url": "https://s3.example",
+                            "container_path": "/outputs/reads_fastqc.html",
+                            "size": 20480,
+                            "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8"
+                        }
+                    ],
                     "revision": 7,
                     "projection_digest": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f",
                     "eventually_consistent": true,
@@ -1135,11 +1253,32 @@ fn decode_report_row(
     path = "/jobs/{job_id}/report",
     tag = "jobs",
     summary = "Page a finished RO-Crate job's report",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403. Only RO-Crate import and export jobs keep a per-entry report; every other kind answers 404. The report exists only once the job is terminal, so while it is still running the answer is 404 carrying a pending marker with the job's current state, and the caller should poll. It is then frozen and immutable, and it disappears again once the job's retention window passes, which is a plain 404. Paging is stable against that frozen snapshot: `report_digest` names it, a cursor carries both the job and that digest, and a cursor from another job or another report is 409 rather than a silently different page. The read is answered by the node that owns the job, forwarded under the caller's own bearer token when this node is not the owner, so an unreachable owner is a retryable 503.",
+    description = r#"Pages the frozen per-entry report of a finished RO-Crate import or export job.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
+Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403.
+
+**Behavior**
+- Only RO-Crate import and export jobs keep a per-entry report; every other kind answers 404.
+- The report exists only once the job is terminal, so while it is still running the answer is 404
+  carrying a pending marker with the job's current state, and the caller should poll.
+- It is then frozen and immutable, and it disappears again once the job's retention window passes,
+  which is a plain 404.
+- Paging is stable against that frozen snapshot: `report_digest` names it and a cursor carries
+  both the job and that digest.
+- The read is answered by the node that owns the job, forwarded under the caller's own bearer
+  token when this node is not the owner.
+
+**Limits**
+- `limit` defaults to 200 and is capped at 1000; `0` is treated as unset.
+
+**Errors**: a cursor from another job or another report is a 409 rather than a silently different
+page, a malformed cursor or a token that cannot be forwarded is a 400, and an unreachable owner is
+a retryable 503."#,
     params(
-        ("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404"),
-        ("limit" = Option<usize>, Query, description = "Maximum report rows in one page. Default 200, clamped to at most 1000; 0 is treated as unset"),
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous page's `next_cursor`, bound to this job and to the frozen report it was issued against. Malformed values are 400 and mismatched ones 409. Absent starts at the first row")
+        ("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404"),
+        ("limit" = Option<usize>, Query, description = "Maximum report rows in one page; default 200, at most 1000, and 0 is treated as unset"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from a previous page, bound to this job and its frozen report; absent starts at the first row")
     ),
     responses(
         (
@@ -1173,12 +1312,15 @@ fn decode_report_row(
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (
             status = 404,
-            description = "Either the report is not available yet, answered as a pending marker naming the job's current state, or there is no readable report at all: unknown job, a job submitted by somebody else, a kind that keeps no report, or a report whose retention has passed, answered as the standard error body",
+            description = "A pending marker naming the job's current state, or the standard error body: unknown job, a foreign job, a kind that keeps no report, or retention passed",
             body = ReportUnavailableResponse,
             examples(
                 ("Report pending" = (
                     summary = "The job has not reached a terminal state, so no report is frozen yet",
-                    value = json!({"code": "report_pending", "state": "running"})
+                    value = json!({
+                        "code": "report_pending",
+                        "state": "running"
+                    })
                 ))
             )
         ),
@@ -1500,10 +1642,31 @@ async fn artifact_response(
     path = "/jobs/{job_id}/artifacts/rocrate",
     tag = "jobs",
     summary = "Download a finished export job's RO-Crate",
-    description = "Downloads the packaged RO-Crate produced by an export job as a binary `application/zip` body, not JSON. Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403, and a job kind that produces no crate answers 404 as well. A successful answer always carries `Content-Type: application/zip`, `Content-Length`, `Accept-Ranges: bytes`, an `ETag` that is the artifact's quoted hex BLAKE3 digest, and a `Content-Disposition: attachment` naming the crate file with both an ASCII fallback and a UTF-8 form; a partial answer adds `Content-Range`. While the export job has not finished the crate is not ready and the answer is 404 with the code `artifact_pending` and the job's current state in its details, so the caller should poll the status instead of retrying blindly; once the artifact's retention window passes it is 410 and never comes back. `Range` accepts one byte range only. Downloads are admission-limited, so a saturated node refuses rather than queueing.",
+    description = r#"Downloads the packaged RO-Crate an export job produced as a binary `application/zip` body, not JSON.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
+Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403, and
+a job kind that produces no crate answers 404 as well.
+
+**Behavior**
+- A successful answer always carries `Content-Type: application/zip`, `Content-Length`,
+  `Accept-Ranges: bytes`, an `ETag` that is the artifact's quoted hex BLAKE3 digest, and a
+  `Content-Disposition: attachment` naming the crate file with both an ASCII fallback and a UTF-8
+  form; a partial answer adds `Content-Range`.
+- While the export job has not finished the crate is not ready and the answer is 404 with the code
+  `artifact_pending` and the job's current state in its details, so the caller should poll the
+  status instead of retrying blindly.
+- Downloads are admission-limited, so a saturated node refuses rather than queueing.
+
+**Limits**
+- `Range` accepts one byte range only.
+
+**Errors**: once the artifact's retention window passes it is a 410 and never comes back, a range
+that is not a single satisfiable one is a 416, and a saturated or unreachable owner is a retryable
+503."#,
     params(
-        ("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404"),
-        ("Range" = Option<String>, Header, description = "One byte range over the crate: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`. Multiple ranges and unparseable or out-of-bounds values are refused with 416. Absent returns the whole crate")
+        ("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404"),
+        ("Range" = Option<String>, Header, description = "One byte range: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`; absent returns the whole crate")
     ),
     responses(
         (status = 200, description = "The complete RO-Crate as an `application/zip` byte stream, with `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`"),
@@ -1511,7 +1674,7 @@ async fn artifact_response(
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
-        (status = 404, description = "No downloadable crate: unknown job, a job submitted by somebody else, a kind that produces none, or the export has not finished yet, which is coded `artifact_pending` and carries the job's current state", body = ErrorResponse),
+        (status = 404, description = "No downloadable crate: unknown job, a foreign job, a kind that produces none, or an unfinished export, coded `artifact_pending` with the job's state", body = ErrorResponse),
         (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
         (status = 416, description = "The requested range is not a single satisfiable byte range; the answer repeats `Accept-Ranges` and reports the crate size in `Content-Range`", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached, or this node's download capacity is exhausted; retryable, the caller may repeat the download", body = ErrorResponse)
@@ -1533,10 +1696,28 @@ pub async fn get_job_artifact(
     path = "/jobs/{job_id}/artifacts/rocrate",
     tag = "jobs",
     summary = "Probe a finished export job's RO-Crate headers",
-    description = "Answers exactly what the download would answer, with the headers but no body, so a client can learn a crate's size, digest and filename before fetching it. Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403. The headers describe an `application/zip` crate: `Content-Type`, `Content-Length` for the whole crate or for the requested range, `Accept-Ranges: bytes`, an `ETag` that is the artifact's quoted hex BLAKE3 digest, an attachment `Content-Disposition`, and `Content-Range` when a range was asked for. Readiness behaves as it does for the download: a crate whose export has not finished is 404 coded `artifact_pending` with the job's current state, and one past its retention window is 410. Probing does not consume download capacity.",
+    description = r#"Answers exactly what the download would answer, with the headers but no body.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
+Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403.
+
+**Behavior**
+- A client can learn a crate's size, digest and filename before fetching it.
+- The headers describe an `application/zip` crate: `Content-Type`, `Content-Length` for the whole
+  crate or for the requested range, `Accept-Ranges: bytes`, an `ETag` that is the artifact's
+  quoted hex BLAKE3 digest, an attachment `Content-Disposition`, and `Content-Range` when a range
+  was asked for.
+- Readiness behaves as it does for the download: a crate whose export has not finished is a 404
+  coded `artifact_pending` with the job's current state, and one past its retention window is a
+  410.
+- Probing does not consume download capacity.
+
+**Limits**
+- `Range` accepts one byte range only; multiple ranges and unparseable or out-of-bounds values are
+  refused with 416."#,
     params(
-        ("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404"),
-        ("Range" = Option<String>, Header, description = "One byte range over the crate: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`. Multiple ranges and unparseable or out-of-bounds values are refused with 416. Absent describes the whole crate")
+        ("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404"),
+        ("Range" = Option<String>, Header, description = "One byte range: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`; absent describes the whole crate")
     ),
     responses(
         (status = 200, description = "Headers for the complete `application/zip` crate: `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`. No body is sent"),
@@ -1544,7 +1725,7 @@ pub async fn get_job_artifact(
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
-        (status = 404, description = "No crate to describe: unknown job, a job submitted by somebody else, a kind that produces none, or the export has not finished yet, which is coded `artifact_pending` and carries the job's current state", body = ErrorResponse),
+        (status = 404, description = "No crate to describe: unknown job, a foreign job, a kind that produces none, or an unfinished export, coded `artifact_pending` with the job's state", body = ErrorResponse),
         (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
         (status = 416, description = "The requested range is not a single satisfiable byte range; the answer repeats `Accept-Ranges` and reports the crate size in `Content-Range`", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the probe", body = ErrorResponse)
@@ -1566,8 +1747,31 @@ pub async fn head_job_artifact(
     path = "/jobs/{job_id}/cancel",
     tag = "jobs",
     summary = "Request cancellation of the caller's job",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: only the submitter may cancel, and a job belonging to somebody else answers 404 rather than 403. Cancellation is asynchronous: 202 means the request was durably recorded on the job, not that work has stopped. A job that never started is settled immediately, while one already running is asked to stop and reaches `cancelled` some time later, and may still finish on its own first, so the caller polls the status to learn the outcome. The call is idempotent: repeating it on a job that is still live keeps answering 202 with `cancel_requested` true, and a job that has already reached a terminal state answers 200 with that state unchanged. Cancelling a distributed execution job publishes an append-only cancellation intent into its replicated family, which every holder observes and which suppresses further launches; it never claims that a partitioned execution stopped. An execution that already holds a receipt may still finish, and that late success stays visible with `cancel_requested` true rather than being erased. Cancellation of any other job stays anchored to the node that owns it: when that node cannot be reached the answer is a retryable 503 and nothing was recorded anywhere else.",
-    params(("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404")),
+    description = r#"Records a cancellation request on the caller's job; it does not stop the work synchronously.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
+Self-scoped like the status read: only the submitter may cancel, and a job belonging to somebody
+else answers 404 rather than 403.
+
+**Behavior**
+- Cancellation is asynchronous: 202 means the request was durably recorded on the job, not that
+  work has stopped.
+- A job that never started is settled immediately, while one already running is asked to stop and
+  reaches `cancelled` some time later, and may still finish on its own first, so the caller polls
+  the status to learn the outcome.
+- The call is idempotent: repeating it on a job that is still live keeps answering 202 with
+  `cancel_requested` true, and a job that has already reached a terminal state answers 200 with
+  that state unchanged.
+- Cancelling a distributed execution job publishes an append-only cancellation intent into its
+  replicated family, which every holder observes and which suppresses further launches; it never
+  claims that a partitioned execution stopped.
+- An execution that already holds a receipt may still finish, and that late success stays visible
+  with `cancel_requested` true rather than being erased.
+- Cancellation of any other job stays anchored to the node that owns it.
+
+**Errors**: when the owning node cannot be reached the answer is a retryable 503 and nothing was
+recorded anywhere else."#,
+    params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404")),
     responses(
         (
             status = 202,
@@ -1581,7 +1785,11 @@ pub async fn head_job_artifact(
                 "cancel_requested": true,
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "updated_at": "2026-04-09T14:29:55.004+00:00",
-                "progress": {"current": 3, "total": 5, "unit": "phases"},
+                "progress": {
+                    "current": 3,
+                    "total": 5,
+                    "unit": "phases"
+                },
                 "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
                 "workspace_mode": "kept"
             })
@@ -1599,7 +1807,11 @@ pub async fn head_job_artifact(
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "updated_at": "2026-04-09T14:31:47.902+00:00",
                 "finished_at": "2026-04-09T14:31:47.902+00:00",
-                "progress": {"current": 5, "total": 5, "unit": "phases"},
+                "progress": {
+                    "current": 5,
+                    "total": 5,
+                    "unit": "phases"
+                },
                 "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
                 "workspace_mode": "kept"
             })

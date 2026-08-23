@@ -457,7 +457,17 @@ fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
     path = "/ga4gh/tes/v1/service-info",
     tag = "tes",
     summary = "Describe this GA4GH TES endpoint",
-    description = "Deliberately public: no credential is required and every caller sees the same document. It names the TES version spoken, the realm this endpoint serves, the running server version, and the deviations from full TES conformance a client must plan for: exactly one executor per task, and PAUSED is never entered. The organization url is the externally visible base url of the node that answered, taken from the forwarded headers only when the request arrived through a trusted proxy and from the Host header otherwise.",
+    description = r#"Describes this TES endpoint, the realm it serves and its conformance deviations.
+
+**Authentication**: none; the route is deliberately public and every caller sees the same document.
+
+**Behavior**
+- Names the TES version spoken, the realm this endpoint serves, the running server version, and the
+  deviations from full TES conformance a client must plan for: exactly one executor per task, and
+  `PAUSED` is never entered.
+- The organization url is the externally visible base url of the node that answered, taken from the
+  forwarded headers only when the request arrived through a trusted proxy and from the `Host` header
+  otherwise."#,
     responses((
         status = 200,
         description = "Description of this TES endpoint and its conformance deviations",
@@ -465,9 +475,16 @@ fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
         example = json!({
             "id": "org.aruna.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
             "name": "Aruna Realm AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
-            "type": {"group": "org.ga4gh", "artifact": "tes", "version": "1.1.0"},
+            "type": {
+                "group": "org.ga4gh",
+                "artifact": "tes",
+                "version": "1.1.0"
+            },
             "description": "Aruna TES facade over the internal execution job model.",
-            "organization": {"name": "Aruna", "url": "https://node.example.test"},
+            "organization": {
+                "name": "Aruna",
+                "url": "https://node.example.test"
+            },
             "documentation_url": "https://docs.aruna-engine.org",
             "environment": "dev",
             "version": "3.0.0-alpha.41",
@@ -511,32 +528,88 @@ pub async fn service_info(
     path = "/ga4gh/tes/v1/tasks",
     tag = "tes",
     summary = "Create a TES task",
-    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only, as are the derived tags `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind` and `aruna-engine.org/estimated-transfer-bytes`, which a task naming any of them is refused for with the error code `reserved_tag`; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound the immutable output record carries; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id. Admission refusals carry the same status semantics as the native submit surface: a quota or composition refusal is a 409, an unusable input or workspace a 400, a refused routed authority a 403, and the retryable 503 is reserved for an unreachable family holder, a demand view that could not be read or did not settle, admission losing three transactions in a row to concurrent submissions of the same group, and an unhealthy id clock. A standing quota decided on an understated demand view is a 409 like an exceeded cap, and a replay of a known idempotency key is settled before any quota is read and is never quota-refused.",
+    description = r#"Accepts a task for asynchronous execution and returns the id to poll.
+
+**Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by
+this node; a path-restricted credential is rejected. Basic authentication uses the credential's
+group and refuses an `aruna-engine.org/group` tag naming a different group; a bearer token requires
+that tag. The caller needs WRITE on the target group.
+
+**Behavior**
+- 200 means the task was durably accepted and queued, never that it started or finished.
+- State runs `QUEUED`, `INITIALIZING`, `RUNNING`, then `COMPLETE`, `EXECUTOR_ERROR`,
+  `SYSTEM_ERROR` or `CANCELED`; `CANCELING` shows while a cancellation is in flight and `UNKNOWN`
+  when the outcome cannot be determined. `PAUSED` and `PREEMPTED` are never emitted.
+- An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller; reusing a key
+  bound to a different task is a 409 carrying that task id. A replay is settled before any quota
+  is read and is never quota-refused.
+
+**Limits** (all refused with 400)
+- Exactly one executor whose `command` is the full argv.
+- `id`, `state`, `logs` and `creation_time` are read only, as are the derived tags
+  `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind`
+  and `aruna-engine.org/estimated-transfer-bytes`; naming one is refused with error code
+  `reserved_tag`.
+- Input and output urls must be `s3://bucket/key`; container paths must be absolute, canonical and
+  may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound
+  the immutable output record carries.
+- An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
+  stripped from each match before it is appended to the destination url.
+- Unsupported: directory entries, inline input content, wildcards in an input path, volumes,
+  executor stdin/stdout/stderr redirection and resource zones.
+
+**Errors**
+- Admission refusals carry the same status semantics as the native submit surface: a quota or
+  composition refusal is a 409, an unusable input or workspace a 400, a refused routed authority a
+  403.
+- 503 is reserved for an unreachable family holder, a demand view that could not be read or did not
+  settle, admission losing three transactions in a row to concurrent submissions of the same group,
+  and an unhealthy id clock.
+- A standing quota decided on an understated demand view is a 409 like an exceeded cap."#,
     request_body(
         content = TesTask,
         description = "Task definition: one executor, s3:// inputs and outputs, and optional resources and tags",
         example = json!({
             "name": "align-reads",
             "description": "align one fastq against the reference",
-            "executors": [{
-                "image": "ghcr.io/example/aligner:1.4.0",
-                "command": ["/usr/bin/align", "--in", "/data/input.fastq", "--out", "/data/out/aligned.bam"],
-                "workdir": "/data",
-                "env": {"THREADS": "4"}
-            }],
-            "inputs": [{
-                "name": "reads",
-                "url": "s3://example-bucket/reads/input.fastq",
-                "path": "/data/input.fastq",
-                "type": "FILE"
-            }],
-            "outputs": [{
-                "name": "aligned",
-                "url": "s3://example-bucket/results/aligned.bam",
-                "path": "/data/out/aligned.bam",
-                "type": "FILE"
-            }],
-            "resources": {"cpu_cores": 4, "ram_gb": 8.0, "disk_gb": 20.0, "preemptible": false},
+            "executors": [
+                {
+                    "image": "ghcr.io/example/aligner:1.4.0",
+                    "command": [
+                        "/usr/bin/align",
+                        "--in",
+                        "/data/input.fastq",
+                        "--out",
+                        "/data/out/aligned.bam"
+                    ],
+                    "workdir": "/data",
+                    "env": {
+                        "THREADS": "4"
+                    }
+                }
+            ],
+            "inputs": [
+                {
+                    "name": "reads",
+                    "url": "s3://example-bucket/reads/input.fastq",
+                    "path": "/data/input.fastq",
+                    "type": "FILE"
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "aligned",
+                    "url": "s3://example-bucket/results/aligned.bam",
+                    "path": "/data/out/aligned.bam",
+                    "type": "FILE"
+                }
+            ],
+            "resources": {
+                "cpu_cores": 4,
+                "ram_gb": 8.0,
+                "disk_gb": 20.0,
+                "preemptible": false
+            },
             "tags": {
                 "aruna-engine.org/group": "01JABCDEF0123456789ABCDEFG",
                 "aruna-engine.org/idempotency-key": "align-reads-2026-04-09-001"
@@ -548,13 +621,15 @@ pub async fn service_info(
             status = 200,
             description = "Task durably accepted and queued; the body carries the id to poll and cancel with",
             body = TesCreateTaskResponse,
-            example = json!({"id": "01JABCDEF0123456789ABCDEFG"})
+            example = json!({
+                "id": "01JABCDEF0123456789ABCDEFG"
+            })
         ),
-        (status = 400, description = "Malformed task, a TES feature this facade does not support, an input that is not a readable object, more outputs than a task may declare, or a tag claiming a derived read-only key, which carries the error code `reserved_tag`", body = TesErrorPayload),
+        (status = 400, description = "Malformed task, an unsupported TES feature, an input that is not a readable object, more outputs than a task may declare, or a reserved tag", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
         (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, a path restricted credential, or a routed authority refusing the submission", body = TesErrorPayload),
         (status = 409, description = "The idempotency key tag is already bound to a different task, the group's standing compute quota refuses this admission, or the composition conflicts on a staged key", body = TesErrorPayload),
-        (status = 503, description = "No family holder could admit the task, the group's demand view could not be read or did not settle, admission lost three transactions in a row to concurrent submissions, or the id clock is unhealthy; retryable, the caller may create the task again with the same idempotency key", body = TesErrorPayload)
+        (status = 503, description = "Retryable admission failure; the caller may create the task again with the same idempotency key", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
@@ -629,10 +704,42 @@ pub async fn create_task(
     path = "/ga4gh/tes/v1/tasks/{id}",
     tag = "tes",
     summary = "Get a single TES task",
-    description = "Returns one task of the calling user. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Tasks are self scoped: a task created by another user, a task outside the group of the basic credential, an id that is not a task of this facade and an id that does not parse are all answered with 404 rather than 403, so the existence of a task is never disclosed. A distributed execution task is reduced from its replicated records by whichever node answers, so it carries the same logical view as the native REST status; any other task is read from the node that owns it and only that node answers absence, and when it cannot be reached the call fails with a retryable 503 instead of reporting the task as missing. The state reported is the polling contract of task creation: QUEUED, INITIALIZING, RUNNING, then COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, with CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; UNKNOWN is also what a distributed task reports while no execution has succeeded, because realm-wide failure can never be inferred from silence. Output URLs in the task log name the exact `versionId` the canonical execution wrote, which is not necessarily the object's current version: a duplicate execution admitted during a partition, or any later write, may have made another version current. Executor logs, including the exit code, appear only once the task is terminal.",
+    description = r#"Returns one task of the calling user, projected to the requested view.
+
+**Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
+node; a path-restricted credential is rejected.
+
+**Behavior**
+- Tasks are self scoped: a task created by another user, a task outside the group of the basic
+  credential, an id that is not a task of this facade and an id that does not parse are all answered
+  with 404 rather than 403, so the existence of a task is never disclosed.
+- A distributed execution task is reduced from its replicated records by whichever node answers, so
+  it carries the same logical view as the native REST status; any other task is read from the node
+  that owns it and only that node answers absence.
+- The state reported is the polling contract of task creation: `QUEUED`, `INITIALIZING`, `RUNNING`,
+  then `COMPLETE`, `EXECUTOR_ERROR`, `SYSTEM_ERROR` or `CANCELED`, with `CANCELING` while a
+  cancellation is in flight and `UNKNOWN` when the outcome cannot be determined.
+- `UNKNOWN` is also what a distributed task reports while no execution has succeeded, because
+  realm-wide failure can never be inferred from silence.
+- `view` selects the projection: `MINIMAL` (the default) returns only `id` and `state`, `BASIC` adds
+  the task definition, tags, timing and captured output files, and `FULL` adds executor stdout and
+  stderr and the system logs.
+- `BASIC` and `FULL` also carry the derived read-only tags `aruna-engine.org/job-id` always,
+  `aruna-engine.org/logical-state` once a family is known, and `aruna-engine.org/executor-kind` plus
+  `aruna-engine.org/estimated-transfer-bytes` once this responder sealed a placement.
+- Output urls in the task log name the exact `versionId` the canonical execution wrote, which is not
+  necessarily the object's current version: a duplicate execution admitted during a partition, or
+  any later write, may have made another version current.
+- Executor logs, including the exit code, appear only once the task is terminal.
+
+**Limits**
+- `view` must be `MINIMAL`, `BASIC` or `FULL`; any other value is a 400.
+
+**Errors**: when the node owning the task cannot be reached the call fails with a retryable 503
+instead of reporting the task as missing."#,
     params(
-        ("id" = String, Path, description = "TES task id (the JobId): the 26 character ULID returned by task creation; an id that does not parse is answered with 404 like an unknown task"),
-        ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL projection: MINIMAL (the default) returns only `id` and `state`, BASIC adds the task definition, tags, timing and captured output files, FULL adds executor stdout and stderr and the system logs; any other value is a 400. BASIC and FULL also carry the derived read-only tags `aruna-engine.org/job-id` always, `aruna-engine.org/logical-state` once a family is known, and `aruna-engine.org/executor-kind` plus `aruna-engine.org/estimated-transfer-bytes` once this responder sealed a placement")
+        ("id" = String, Path, description = "TES task id (the JobId): the 26 character ULID returned by task creation"),
+        ("view" = Option<String>, Query, description = "Projection to apply: `MINIMAL` (the default), `BASIC` or `FULL`")
     ),
     responses(
         (
@@ -643,25 +750,44 @@ pub async fn create_task(
                 "id": "01JABCDEF0123456789ABCDEFG",
                 "state": "COMPLETE",
                 "name": "align-reads",
-                "inputs": [{
-                    "name": "reads",
-                    "url": "s3://example-bucket/reads/input.fastq",
-                    "path": "/data/input.fastq",
-                    "type": "FILE"
-                }],
-                "outputs": [{
-                    "name": "aligned",
-                    "url": "s3://example-bucket/results/aligned.bam",
-                    "path": "/data/out/aligned.bam",
-                    "type": "FILE"
-                }],
-                "resources": {"cpu_cores": 4, "ram_gb": 8.0, "disk_gb": 20.0, "preemptible": false},
-                "executors": [{
-                    "image": "ghcr.io/example/aligner:1.4.0",
-                    "command": ["/usr/bin/align", "--in", "/data/input.fastq", "--out", "/data/out/aligned.bam"],
-                    "workdir": "/data",
-                    "env": {"THREADS": "4"}
-                }],
+                "inputs": [
+                    {
+                        "name": "reads",
+                        "url": "s3://example-bucket/reads/input.fastq",
+                        "path": "/data/input.fastq",
+                        "type": "FILE"
+                    }
+                ],
+                "outputs": [
+                    {
+                        "name": "aligned",
+                        "url": "s3://example-bucket/results/aligned.bam",
+                        "path": "/data/out/aligned.bam",
+                        "type": "FILE"
+                    }
+                ],
+                "resources": {
+                    "cpu_cores": 4,
+                    "ram_gb": 8.0,
+                    "disk_gb": 20.0,
+                    "preemptible": false
+                },
+                "executors": [
+                    {
+                        "image": "ghcr.io/example/aligner:1.4.0",
+                        "command": [
+                            "/usr/bin/align",
+                            "--in",
+                            "/data/input.fastq",
+                            "--out",
+                            "/data/out/aligned.bam"
+                        ],
+                        "workdir": "/data",
+                        "env": {
+                            "THREADS": "4"
+                        }
+                    }
+                ],
                 "tags": {
                     "aruna-engine.org/group": "01JABCDEF0123456789ABCDEFG",
                     "aruna-engine.org/job-id": "01JABCDEF0123456789ABCDEFG",
@@ -669,21 +795,27 @@ pub async fn create_task(
                     "aruna-engine.org/executor-kind": "docker",
                     "aruna-engine.org/estimated-transfer-bytes": "4096"
                 },
-                "logs": [{
-                    "logs": [{
+                "logs": [
+                    {
+                        "logs": [
+                            {
+                                "start_time": "2026-04-09T14:23:11.123+00:00",
+                                "end_time": "2026-04-09T14:25:02.900+00:00",
+                                "stdout": "aligned 1200 reads",
+                                "exit_code": 0
+                            }
+                        ],
                         "start_time": "2026-04-09T14:23:11.123+00:00",
                         "end_time": "2026-04-09T14:25:02.900+00:00",
-                        "stdout": "aligned 1200 reads",
-                        "exit_code": 0
-                    }],
-                    "start_time": "2026-04-09T14:23:11.123+00:00",
-                    "end_time": "2026-04-09T14:25:02.900+00:00",
-                    "outputs": [{
-                        "url": "s3://example-bucket/results/aligned.bam",
-                        "path": "/data/out/aligned.bam",
-                        "size_bytes": "20480"
-                    }]
-                }],
+                        "outputs": [
+                            {
+                                "url": "s3://example-bucket/results/aligned.bam",
+                                "path": "/data/out/aligned.bam",
+                                "size_bytes": "20480"
+                            }
+                        ]
+                    }
+                ],
                 "creation_time": "2026-04-09T14:23:10.010+00:00"
             })
         ),
@@ -803,12 +935,39 @@ async fn list_derived(
     path = "/ga4gh/tes/v1/tasks",
     tag = "tes",
     summary = "List the caller's TES tasks",
-    description = "Lists the tasks the calling user created, newest first. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. The listing is keyed by the caller: another user's tasks are never returned, and a basic credential additionally sees only tasks of that credential's group. Only tasks owned by the node that answers are listed, so tasks submitted through another node of the realm are omitted rather than fetched from it. Paging is cursor based and forward only: read `next_page_token` from a page and send it back as `page_token`, and treat its absence as the end of the listing. State, name and tag filters are applied before a page is filled, so a short page means the listing is exhausted, not that everything was filtered away.",
+    description = r#"Lists the tasks the calling user created, newest first.
+
+**Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
+node; a path-restricted credential is rejected.
+
+**Behavior**
+- The listing is keyed by the caller: another user's tasks are never returned, and a basic
+  credential additionally sees only tasks of that credential's group.
+- Only tasks owned by the node that answers are listed, so tasks submitted through another node of
+  the realm are omitted rather than fetched from it.
+- Paging is cursor based and forward only: read `next_page_token` from a page and send it back as
+  `page_token`, and treat its absence as the end of the listing.
+- State, name and tag filters are applied before a page is filled, so a short page means the
+  listing is exhausted, not that everything was filtered away.
+- `view` projects every task in the page: `MINIMAL` (the default) returns only `id` and `state`,
+  `BASIC` adds the task definition, tags, timing and captured output files, and `FULL` adds executor
+  stdout and stderr and the system logs.
+- `BASIC` and `FULL` also carry the derived read-only tags `aruna-engine.org/job-id`,
+  `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind` and
+  `aruna-engine.org/estimated-transfer-bytes` wherever this responder knows them.
+- `tag_value` pairs by position with `tag_key`, and an empty or missing value matches any value of
+  that key.
+
+**Limits**
+- `page_size` defaults to 256, is capped at 512, and 0 is treated as unset.
+- An empty `name_prefix` is ignored.
+- An invalid `view`, an unknown `state` name, or a `page_token` that is not a token of this listing
+  is refused with 400."#,
     params(
-        ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL projection applied to every task in the page: MINIMAL (the default) returns only `id` and `state`, BASIC adds the task definition, tags, timing and captured output files, FULL adds executor stdout and stderr and the system logs; any other value is a 400. BASIC and FULL also carry the derived read-only tags `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind` and `aruna-engine.org/estimated-transfer-bytes` wherever this responder knows them"),
+        ("view" = Option<String>, Query, description = "Projection applied to every task in the page: `MINIMAL` (the default), `BASIC` or `FULL`"),
         ("page_size" = Option<usize>, Query, description = "Max tasks per page: default 256, capped at 512, and 0 is treated as unset"),
-        ("page_token" = Option<String>, Query, description = "Opaque page token: the `next_page_token` of the previous page; omit it to start at the newest task, and anything that is not a token of this listing is a 400"),
-        ("state" = Option<String>, Query, description = "TES task state to filter by, for example QUEUED, RUNNING or COMPLETE; an unknown state name is a 400"),
+        ("page_token" = Option<String>, Query, description = "Opaque page token: the `next_page_token` of the previous page; omit it to start at the newest task"),
+        ("state" = Option<String>, Query, description = "TES task state to filter by, for example `QUEUED`, `RUNNING` or `COMPLETE`"),
         ("name_prefix" = Option<String>, Query, description = "Task name prefix; only tasks whose name starts with it are returned, and an empty value is ignored"),
         ("tag_key" = Vec<String>, Query, description = "Repeated tag keys; a task matches only when it carries every key given"),
         ("tag_value" = Vec<String>, Query, description = "Repeated tag values, paired by position with `tag_key`; an empty or missing value matches any value of that key")
@@ -820,8 +979,14 @@ async fn list_derived(
             body = TesListTasksResponse,
             example = json!({
                 "tasks": [
-                    {"id": "01JABCDEF0123456789ABCDEFG", "state": "RUNNING"},
-                    {"id": "01JMETADATA0123456789ABCDE", "state": "COMPLETE"}
+                    {
+                        "id": "01JABCDEF0123456789ABCDEFG",
+                        "state": "RUNNING"
+                    },
+                    {
+                        "id": "01JMETADATA0123456789ABCDE",
+                        "state": "COMPLETE"
+                    }
                 ],
                 "next_page_token": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7"
             })
@@ -909,8 +1074,27 @@ pub async fn list_tasks(
     path = "/ga4gh/tes/v1/tasks/{id}:cancel",
     tag = "tes",
     summary = "Cancel a TES task",
-    description = "Requests cancellation of a task the calling user created. TES addresses this as a POST whose final path segment is the task id followed by the literal `:cancel` action suffix, and a POST that omits the suffix is a 400. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Cancellation is self scoped exactly like reads: another user's task, a task outside the group of the basic credential and an id that does not parse are all answered with 404 rather than 403. The request is carried out on the node that owns the task, and when that node is unreachable the call fails with a retryable 503. A 200 records only that cancellation was requested, or that the task had already reached a terminal state; the executor may still be winding down, so poll the task until it reports CANCELED.",
-    params(("id" = String, Path, description = "TES task id (the JobId) followed by the `:cancel` action suffix, for example `01JABCDEF0123456789ABCDEFG:cancel`; the id itself is the 26 character ULID returned by task creation")),
+    description = r#"Requests cancellation of a task the calling user created.
+
+**Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
+node; a path-restricted credential is rejected.
+
+**Behavior**
+- TES addresses this as a POST whose final path segment is the task id followed by the literal
+  `:cancel` action suffix.
+- Cancellation is self scoped exactly like reads: another user's task, a task outside the group of
+  the basic credential and an id that does not parse are all answered with 404 rather than 403.
+- The request is carried out on the node that owns the task.
+- A 200 records only that cancellation was requested, or that the task had already reached a
+  terminal state; the executor may still be winding down, so poll the task until it reports
+  `CANCELED`.
+
+**Limits**
+- A POST that omits the `:cancel` suffix is refused with 400.
+
+**Errors**: when the node owning the task is unreachable the cancellation was not delivered and the
+call fails with a retryable 503."#,
+    params(("id" = String, Path, description = "TES task id (the JobId) followed by the `:cancel` suffix, for example `01JABCDEF0123456789ABCDEFG:cancel`")),
     responses(
         (
             status = 200,

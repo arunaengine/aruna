@@ -62,7 +62,7 @@ pub enum MaterializeSnapshotError {
     Gate(#[from] GateContextError),
 }
 
-pub async fn materialize_snapshot(
+pub async fn stage_snapshot_blob(
     context: &DriverContext,
     input: MaterializeSnapshotInput,
 ) -> Result<MaterializeSnapshotResult, MaterializeSnapshotError> {
@@ -214,15 +214,8 @@ async fn read_value(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(StorageError::ReadError.into()),
+        _ => Err(StorageError::ReadError("unexpected event".to_string()).into()),
     }
-}
-
-pub async fn stage_snapshot_blob(
-    context: &DriverContext,
-    input: MaterializeSnapshotInput,
-) -> Result<MaterializeSnapshotResult, MaterializeSnapshotError> {
-    materialize_snapshot(context, input).await
 }
 
 #[cfg(test)]
@@ -274,11 +267,11 @@ mod tests {
             restrictions: None,
         };
 
-        let first = materialize_snapshot(context, input.clone()).await.unwrap();
-        let second = materialize_snapshot(context, input.clone()).await.unwrap();
+        let first = stage_snapshot_blob(context, input.clone()).await.unwrap();
+        let second = stage_snapshot_blob(context, input.clone()).await.unwrap();
         let mut manual = input;
         manual.retry_key = None;
-        let third = materialize_snapshot(context, manual).await.unwrap();
+        let third = stage_snapshot_blob(context, manual).await.unwrap();
         server.abort();
         let _ = server.await;
 

@@ -228,7 +228,17 @@ enum ResolveOutcome {
     path = "/ga4gh/drs/v1/service-info",
     tag = "drs",
     summary = "Describe this node's GA4GH DRS service",
-    description = "Deliberately public: the GA4GH service-info document is served without authentication and a bearer token changes nothing. Answered from this node alone, with no lookup and no network call, so it is always current for the node that received the request. `id` and `name` are derived from the realm this node serves, `type` reports the GA4GH `org.ga4gh`/`drs` service type with this node's software version, and `organization.url` is the externally visible base URL of the node, taken from the forwarded scheme and host when the request came through a trusted proxy and from the `Host` header otherwise.",
+    description = r#"Serves the GA4GH service-info document for this node.
+
+**Authentication**: none; the route is deliberately public and a bearer token changes nothing.
+
+**Behavior**
+- Answered from this node alone, with no lookup and no network call, so it is always current for
+  the node that received the request.
+- `id` and `name` are derived from the realm this node serves, and `type` reports the GA4GH
+  `org.ga4gh`/`drs` service type with this node's software version.
+- `organization.url` is the externally visible base URL of the node, taken from the forwarded scheme
+  and host when the request came through a trusted proxy and from the `Host` header otherwise."#,
     responses((
         status = 200,
         description = "GA4GH service-info document for this node",
@@ -236,8 +246,15 @@ enum ResolveOutcome {
         example = json!({
             "id": "org.aruna.9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
             "name": "Aruna Realm 9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
-            "type": {"group": "org.ga4gh", "artifact": "drs", "version": "3.0.0-alpha.41"},
-            "organization": {"name": "Aruna", "url": "https://node.example.test"},
+            "type": {
+                "group": "org.ga4gh",
+                "artifact": "drs",
+                "version": "3.0.0-alpha.41"
+            },
+            "organization": {
+                "name": "Aruna",
+                "url": "https://node.example.test"
+            },
             "environment": "dev",
             "documentation_url": "https://docs.aruna-engine.org"
         })
@@ -273,9 +290,21 @@ pub async fn get_service_info(
     options,
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
-    summary = "Report the authentication schemes accepted for a DRS object",
-    description = "Deliberately public and never resolves the object: the identifier is echoed back unparsed, so this operation can neither confirm nor deny that an object exists and answers the same for every caller. `supported_types` is always `[BearerAuth]`; GA4GH passports are not accepted, so `passport_auth_issuers` is always empty. `bearer_auth_issuers` lists the OIDC issuers this node currently trusts, and is empty when no OIDC validator is configured or it cannot be reached. A browser CORS preflight on this path is answered by the CORS layer, when one is configured, and never reaches this operation.",
-    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator, in the same three forms the object lookup accepts; it is echoed back verbatim and is not validated here")),
+    summary = "Report the authentication schemes for a DRS object",
+    description = r#"Reports the authentication schemes and bearer issuers this node accepts for DRS content.
+
+**Authentication**: none; the route is deliberately public and answers the same for every caller.
+
+**Behavior**
+- The object is never resolved: the identifier is echoed back unparsed, so this operation can
+  neither confirm nor deny that an object exists.
+- `supported_types` is always `[BearerAuth]`; GA4GH passports are not accepted, so
+  `passport_auth_issuers` is always empty.
+- `bearer_auth_issuers` lists the OIDC issuers this node currently trusts, and is empty when no
+  OIDC validator is configured or it cannot be reached.
+- A browser CORS preflight on this path is answered by the CORS layer, when one is configured, and
+  never reaches this operation."#,
+    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator; echoed back verbatim and not validated here")),
     responses(
         (status = 200, description = "Authentication schemes and bearer issuers this node accepts for DRS content", body = DrsAuthorizationsResponse, example = json!({
             "drs_object_id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
@@ -312,8 +341,43 @@ pub async fn get_authorizations(
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
     summary = "Resolve a DRS object by identifier",
-    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. A request without a bearer token, or with one this node cannot validate, is treated as anonymous rather than rejected, and READ is then evaluated for the Everyone principal. An identifier naming another realm answers 404 without any lookup. A versioned identifier naming another node of this realm is probed at that node, which alone establishes absence: within one bounded probe budget the answer is its own 404, 403 or the object's metadata, and anything short of an answer is a retryable 503 rather than a 404. Only the owning node serves the bytes, so a routed answer advertises no access method. A caller that presented a token but lacks READ gets 403, while an anonymous caller in the same position gets the same 404 as for a missing object, so existence is never revealed to an unauthenticated caller. A content-hash identifier is resolved against every object on this node carrying that content and the first one the caller may read is returned, so the same digest can resolve differently for different callers. The response carries the requested identifier in `id`, the canonical W3ID in `aliases` when the request used a different form, the stored checksums including the blake3 content digest in a stable order, and, for an object held here, a single `https` access method whose `access_url.url` is a direct download URL on this node; no redirect is issued and no signed or time-limited URL is minted, so the caller must send its own bearer token to that URL. `contents` is always null because bundles are not served.",
-    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator: `https://w3id.org/aruna/data/{blake3-hex}`, `https://w3id.org/aruna/data/{versioned-s3-arn}`, `arn:aruna:{realm_id}:{node_id}:ch/{blake3-hex}` with 64 lowercase hex characters, or `arn:aruna:{realm_id}:{node_id}:s3/{bucket}/{key}@{version-ulid}` whose key is percent-encoded except for the separating slashes. Identifiers contain slashes, so the whole remainder of the path is taken as the identifier")),
+    description = r#"Resolves one DRS identifier to the object's metadata and access method.
+
+**Authentication**: optional, and it changes the result: an anonymous caller only resolves objects
+readable by the public role. A request without a bearer token, or with one this node cannot
+validate, is treated as anonymous rather than rejected, and READ is then evaluated for the Everyone
+principal.
+
+**Behavior**
+- An identifier naming another realm answers 404 without any lookup.
+- A versioned identifier naming another node of this realm is probed at that node, which alone
+  establishes absence: within one bounded probe budget the answer is its own 404, 403 or the
+  object's metadata.
+- Only the owning node serves the bytes, so a routed answer advertises no access method.
+- A content-hash identifier is resolved against every object on this node carrying that content and
+  the first one the caller may read is returned, so the same digest can resolve differently for
+  different callers.
+- The response carries the requested identifier in `id`, the canonical W3ID in `aliases` when the
+  request used a different form, and the stored checksums including the blake3 content digest in a
+  stable order.
+- For an object held here it carries a single `https` access method whose `access_url.url` is a
+  direct download URL on this node; no redirect is issued and no signed or time-limited URL is
+  minted, so the caller must send its own bearer token to that URL.
+- `contents` is always null because bundles are not served.
+
+**Limits**
+- The identifier is an Aruna data W3ID, a content-hash `ch` ARN or a versioned `s3` ARN:
+  `https://w3id.org/aruna/data/{blake3-hex}`, `https://w3id.org/aruna/data/{versioned-s3-arn}`,
+  `arn:aruna:{realm_id}:{node_id}:ch/{blake3-hex}` with 64 lowercase hex characters, or
+  `arn:aruna:{realm_id}:{node_id}:s3/{bucket}/{key}@{version-ulid}` whose key is percent-encoded
+  except for the separating slashes.
+- Identifiers contain slashes, so the whole remainder of the path is taken as the identifier.
+
+**Errors**: a caller that presented a token but lacks READ gets 403, while an anonymous caller in
+the same position gets the same 404 as for a missing object, so existence is never revealed to an
+unauthenticated caller. A probed owner that answers nothing inside the budget is a retryable 503
+rather than a 404."#,
+    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator; the whole remainder of the path is taken as the identifier")),
     responses(
         (status = 200, description = "The resolved DRS object, as visible to this caller", body = DrsObjectResponse, example = json!({
             "id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
@@ -322,8 +386,14 @@ pub async fn get_authorizations(
             "description": null,
             "size": 10485760,
             "checksums": [
-                {"type": "blake3", "checksum": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"},
-                {"type": "sha256", "checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+                {
+                    "type": "blake3",
+                    "checksum": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+                },
+                {
+                    "type": "sha256",
+                    "checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                }
             ],
             "mime_type": "application/octet-stream",
             "aliases": [],
@@ -377,7 +447,33 @@ pub async fn get_object(
     path = "/ga4gh/drs/v1/objects",
     tag = "drs",
     summary = "Resolve several DRS objects in one request",
-    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. Each identifier is resolved and authorized exactly as the single-object lookup does, so a batch is a convenience and not a transaction. At most 100 identifiers may be named and a longer list is rejected with 400 before anything is resolved. Identifiers owned by other nodes are probed concurrently against one budget for the whole request, so a batch costs no more wall time than a single lookup; an identifier whose owner did not answer inside that budget appears as a per-item 503, never as an absence. The request itself succeeds with 200 whenever the body parses and stays inside the cap: per-identifier failures are reported inside the matching entry as `{status_code, msg}` instead of failing the batch, an unreadable object appears as 403 for a token-bearing caller and as 404 for an anonymous one, and an object that could not be serialized appears as 500. Entries are returned in the order the identifiers were given, one entry per identifier, including duplicates.",
+    description = r#"Resolves a list of DRS identifiers in one request, one entry per identifier.
+
+**Authentication**: optional, and it changes the result: an anonymous caller only resolves objects
+readable by the public role, exactly as in the single-object lookup.
+
+**Behavior**
+- Each identifier is resolved and authorized exactly as the single-object lookup does, so a batch
+  is a convenience and not a transaction.
+- Identifiers owned by other nodes are probed concurrently against one budget for the whole
+  request, so a batch costs no more wall time than a single lookup.
+- The request itself succeeds with 200 whenever the body parses and stays inside the cap:
+  per-identifier failures are reported inside the matching entry as `{status_code, msg}` instead of
+  failing the batch.
+- Entries are returned in the order the identifiers were given, one entry per identifier, including
+  duplicates.
+
+**Limits**
+- At most 100 identifiers may be named, and a longer list is rejected with 400 before anything is
+  resolved.
+
+**Errors**
+- An identifier whose owner did not answer inside the budget appears as a per-item 503, never as an
+  absence.
+- An unreadable object appears as 403 for a token-bearing caller and as 404 for an anonymous one,
+  and an object that could not be serialized appears as 500.
+- A body that is not valid JSON for a list of identifiers is rejected by the body extractor and
+  returned as plain text rather than the declared payload."#,
     request_body(
         content = DrsBulkObjectsRequestBody,
         description = "The DRS identifiers to resolve, in any of the forms the single-object lookup accepts",
@@ -399,7 +495,12 @@ pub async fn get_object(
                         "name": "content-000102030405",
                         "description": null,
                         "size": 10485760,
-                        "checksums": [{"type": "blake3", "checksum": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}],
+                        "checksums": [
+                            {
+                                "type": "blake3",
+                                "checksum": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+                            }
+                        ],
                         "mime_type": "application/octet-stream",
                         "aliases": [],
                         "access_methods": [
@@ -418,11 +519,14 @@ pub async fn get_object(
                 },
                 {
                     "object_id": "arn:aruna:9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/reads/run-42/sample.fastq.gz@01JABCDEF0123456789ABCDEFG",
-                    "result": {"status_code": 404, "msg": "DRS object not found"}
+                    "result": {
+                        "status_code": 404,
+                        "msg": "DRS object not found"
+                    }
                 }
             ]
         })),
-        (status = 400, description = "More than 100 identifiers were named, or the request body is not valid JSON for a list of identifiers; the malformed-body rejection comes from the body extractor and is returned as plain text rather than the declared payload", body = DrsErrorPayload)
+        (status = 400, description = "More than 100 identifiers were named, or the request body is not valid JSON for a list of identifiers", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -511,8 +615,34 @@ fn download_error(error: GetObjectError) -> Response {
     path = "/ga4gh/drs/v1/download",
     tag = "drs",
     summary = "Download the bytes of a DRS object",
-    description = "Authentication is optional and changes the result: an anonymous caller only downloads objects readable by the public role. This is the URL advertised as the object's `https` access method; it streams the bytes itself and never redirects, so a client follows no `Location` and needs no signed URL, only its own bearer token. The identifier is resolved and authorized exactly as the object lookup does, and every denial an anonymous caller could observe is reported as 404 so that existence stays hidden; an authenticated caller without READ gets 403. Only the owning node serves bytes: an identifier that resolves at another node of the realm is answered 501, because this node holds the metadata but not the object. On success the response is 200 with the raw bytes and a `Content-Length` taken from the stored object; no content type is asserted and range requests are not supported. Each transfer takes one node-wide download slot and one per-caller slot, keyed by user for an authenticated caller and by client address for an anonymous one; when a slot cannot be taken the download is refused rather than queued and the caller may retry later. A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut mid-body: the 200 has already been sent, so a client must treat a body shorter than `Content-Length` as a failed download and retry.",
-    params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator, in the same three forms the object lookup accepts, given as a single query parameter and URL-encoded because these identifiers contain `:` and `/`")),
+    description = r#"Streams the bytes of a DRS object from the node that owns it.
+
+**Authentication**: optional, and it changes the result: an anonymous caller only downloads objects
+readable by the public role. The identifier is resolved and authorized exactly as the object lookup
+does.
+
+**Behavior**
+- This is the URL advertised as the object's `https` access method; it streams the bytes itself and
+  never redirects, so a client follows no `Location` and needs no signed URL, only its own bearer
+  token.
+- Only the owning node serves bytes: an identifier that resolves at another node of the realm is
+  answered 501, because this node holds the metadata but not the object.
+- On success the response is 200 with the raw bytes and a `Content-Length` taken from the stored
+  object; no content type is asserted and range requests are not supported.
+- Each transfer takes one node-wide download slot and one per-caller slot, keyed by user for an
+  authenticated caller and by client address for an anonymous one; when a slot cannot be taken the
+  download is refused rather than queued and the caller may retry later.
+
+**Limits**
+- `object_id` takes the same three forms the object lookup accepts, given as a single query
+  parameter.
+- A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut
+  mid-body: the 200 has already been sent, so a client must treat a body shorter than
+  `Content-Length` as a failed download and retry.
+
+**Errors**: every denial an anonymous caller could observe is reported as 404 so that existence
+stays hidden, while an authenticated caller without READ gets 403."#,
+    params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator, URL-encoded because these identifiers contain `:` and `/`")),
     responses(
         (status = 200, description = "Object bytes, streamed inline with a `Content-Length` header and no content type"),
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),

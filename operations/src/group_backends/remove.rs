@@ -374,7 +374,13 @@ impl Operation for RemoveBackendOperation {
             RemoveState::DeleteRecords => self.handle_deleted(event),
             RemoveState::CommitTransaction => self.handle_committed(event),
             RemoveState::AbortTransaction => self.handle_aborted(event),
-            RemoveState::Finish | RemoveState::Error => smallvec![],
+            RemoveState::Finish | RemoveState::Error => {
+                self.fail(RemoveBackendError::InvalidStateEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -647,5 +653,33 @@ mod tests {
             txn_id: Ulid::from_bytes([9u8; 16]),
         }));
         assert_eq!(operation.finalize(), Err(RemoveBackendError::NotRemovable));
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let backend_id = Ulid::from_bytes([8u8; 16]);
+        let mut operation = RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(record(backend_id, false).to_bytes().unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(RemoveBackendError::InvalidStateEvent { .. })
+        ));
     }
 }

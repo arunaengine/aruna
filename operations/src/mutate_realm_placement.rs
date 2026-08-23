@@ -6,24 +6,25 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataCreateEventRecord;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, metadata_pending_projection_target,
     stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingError, BindingScope, BucketPlan, CandidatePlacementMap, CompletionProof,
-    DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord,
-    NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef, PlacementScope,
-    PlacementStrategy, RealmConfigDocument, RealmNodeKind, StrategyBinding, TransitionPlan,
+    Actor, AuthContext, BindingError, BindingScope, BucketPlan, CandidatePlacementMap,
+    CompletionProof, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord,
+    NodePlacementEntry, Permission, PlacementBinding, PlacementOverride, PlacementRef,
+    PlacementScope, PlacementStrategy, RealmConfigDocument, RealmNodeKind, StrategyBinding,
+    TransitionPlan, policy_admin_path,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -33,6 +34,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
@@ -629,6 +631,9 @@ pub struct MutateRealmPlacementConfig {
 #[derive(Debug, PartialEq)]
 pub struct MutateRealmPlacementOperation {
     actor: Actor,
+    /// Set when a caller's token has to be authorized: the node-internal
+    /// mutation paths originate their own changes and carry no token.
+    auth_context: Option<AuthContext>,
     mutations: Vec<RealmPlacementMutation>,
     txn_id: Option<TxnId>,
     state: MutateRealmPlacementState,
@@ -645,6 +650,7 @@ struct StrategyRemovalCheck {
 #[derive(Debug, Clone, PartialEq)]
 enum MutateRealmPlacementState {
     Init,
+    Auth,
     StartTransaction,
     ReadCurrent,
     ReadRegistryReferences {
@@ -714,8 +720,19 @@ pub enum MutateRealmPlacementError {
 }
 
 impl MutateRealmPlacementOperation {
+    /// Node-internal entry: the node originates the mutation itself, so only the
+    /// per-mutation node authorization applies.
     pub fn new(config: MutateRealmPlacementConfig) -> Self {
         Self::batch(config.actor, vec![config.mutation])
+    }
+
+    /// Caller-facing entry: the token must hold WRITE on the realm configuration
+    /// admin path and only a management node may serve it.
+    pub fn authorized(config: MutateRealmPlacementConfig, auth_context: AuthContext) -> Self {
+        Self {
+            auth_context: Some(auth_context),
+            ..Self::batch(config.actor, vec![config.mutation])
+        }
     }
 
     /// One transaction, one reduced event per mutation, applied in order
@@ -724,6 +741,7 @@ impl MutateRealmPlacementOperation {
     pub fn batch(actor: Actor, mutations: Vec<RealmPlacementMutation>) -> Self {
         Self {
             actor,
+            auth_context: None,
             mutations,
             txn_id: None,
             state: MutateRealmPlacementState::Init,
@@ -880,6 +898,18 @@ impl MutateRealmPlacementOperation {
         let Some(document_value) = document_value else {
             return Err(MutateRealmPlacementError::RealmConfigNotFound);
         };
+        // A caller's request is served by management nodes only; a node's own
+        // mutations stay governed by the per-mutation node authorization.
+        if self.auth_context.is_some()
+            && !is_management(
+                &RealmConfigDocument::from_bytes(&document_value)?,
+                self.actor.node_id,
+            )
+        {
+            return Err(MutateRealmPlacementError::Unauthorized {
+                node_id: self.actor.node_id,
+            });
+        }
         let strategy_id = match self.mutations.as_slice() {
             [RealmPlacementMutation::RemoveStrategy(strategy_id)] => {
                 let document = RealmConfigDocument::from_bytes(&document_value)?;
@@ -993,14 +1023,57 @@ impl Operation for MutateRealmPlacementOperation {
     type Error = MutateRealmPlacementError;
 
     fn start(&mut self) -> Effects {
-        self.state = MutateRealmPlacementState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+        let Some(auth_context) = self.auth_context.clone() else {
+            self.state = MutateRealmPlacementState::StartTransaction;
+            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })];
+        };
+        if auth_context.realm_id != self.actor.realm_id {
+            return self.fail(MutateRealmPlacementError::Unauthorized {
+                node_id: self.actor.node_id,
+            });
+        }
+        self.state = MutateRealmPlacementState::Auth;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context,
+                path: policy_admin_path(self.actor.realm_id),
+                required_permission: Permission::WRITE,
+            }),
+            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
+        ))]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
+            MutateRealmPlacementState::Auth => match event {
+                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                    match allowed {
+                        Ok(true) => {
+                            self.state = MutateRealmPlacementState::StartTransaction;
+                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                                read: false,
+                            })]
+                        }
+                        Ok(false) => self.fail(MutateRealmPlacementError::Unauthorized {
+                            node_id: self.actor.node_id,
+                        }),
+                        Err(error) => {
+                            warn!(error = %error, "Realm placement authorization check failed");
+                            match error {
+                                AuthorizationError::StorageError(error) => {
+                                    self.fail(MutateRealmPlacementError::StorageError(error))
+                                }
+                                _ => self.fail(MutateRealmPlacementError::Unauthorized {
+                                    node_id: self.actor.node_id,
+                                }),
+                            }
+                        }
+                    }
+                }
+                other => self.unexpected_event("authorization result", format!("{other:?}")),
+            },
             MutateRealmPlacementState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
@@ -1234,9 +1307,11 @@ impl Operation for MutateRealmPlacementOperation {
 /// Drives a realm placement mutation, then — when it drains the local node —
 /// kicks the installed outbox drain owner so records accepted before holdership
 /// loss are retried without creating a second concurrent drainer or replacing a
-/// persisted failure deadline.
+/// persisted failure deadline. `auth_context` carries the requesting caller's
+/// token, and is `None` for a mutation the node originates itself.
 pub async fn drive_realm_placement_mutation(
     config: MutateRealmPlacementConfig,
+    auth_context: Option<AuthContext>,
     context: &crate::driver::DriverContext,
 ) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
     let drains_node = matches!(
@@ -1245,7 +1320,11 @@ pub async fn drive_realm_placement_mutation(
             if entry.draining
                 && context.net_handle.as_ref().map(|net| net.node_id()) == Some(entry.node_id)
     );
-    let outcome = crate::driver::drive(MutateRealmPlacementOperation::new(config), context).await;
+    let operation = match auth_context {
+        Some(auth_context) => MutateRealmPlacementOperation::authorized(config, auth_context),
+        None => MutateRealmPlacementOperation::new(config),
+    };
+    let outcome = crate::driver::drive(operation, context).await;
     if outcome.is_ok() && drains_node && context.net_handle.is_some() {
         crate::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
             context.clone(),
@@ -2487,5 +2566,123 @@ mod tests {
             Err(MutateRealmPlacementError::InvalidInput(reason))
                 if reason.contains("does not cover bucket")
         ));
+    }
+
+    fn auth(actor: &Actor) -> AuthContext {
+        AuthContext {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    fn placement_config(actor: &Actor) -> MutateRealmPlacementConfig {
+        MutateRealmPlacementConfig {
+            actor: actor.clone(),
+            mutation: RealmPlacementMutation::SetDefaultStrategy(Ulid::from_bytes([2; 16])),
+        }
+    }
+
+    #[test]
+    fn authorized_checks_permission() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        let effects = operation.start();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let emitted = format!("{effects:?}");
+        assert!(emitted.contains(&policy_admin_path(realm_id)));
+        assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn denied_is_terminal() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(MutateRealmPlacementError::Unauthorized {
+                node_id: actor.node_id,
+            })
+        );
+    }
+
+    #[test]
+    fn capacity_not_denied() {
+        // Storage exhaustion inside the check is infrastructure, not a verdict.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::StorageError(
+                    StorageError::CleanupCapacity,
+                )),
+            },
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(MutateRealmPlacementError::StorageError(
+                StorageError::CleanupCapacity
+            ))
+        );
+    }
+
+    #[test]
+    fn internal_skips_authorization() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(realm_id);
+        let mut operation = MutateRealmPlacementOperation::new(placement_config(&actor));
+        assert_eq!(
+            operation.start().as_slice(),
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        );
+    }
+
+    #[test]
+    fn refuses_server_node() {
+        // An authorized caller still may not mutate placement on a server node.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(realm_id);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Server);
+        let mut operation =
+            MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7; 16]),
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    Key::from(vec![0u8]),
+                    Some(document.to_bytes(&actor).unwrap().into()),
+                ),
+                (Key::from(vec![1u8]), None),
+            ],
+        }));
+        assert_eq!(
+            operation.finalize(),
+            Err(MutateRealmPlacementError::Unauthorized {
+                node_id: actor.node_id,
+            })
+        );
     }
 }

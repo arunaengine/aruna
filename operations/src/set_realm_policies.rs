@@ -4,30 +4,35 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, RealmConfigDocument};
+use aruna_core::structs::{Actor, AuthContext, Permission, RealmConfigDocument, policy_admin_path};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::mutate_realm_placement::is_management;
 use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetRealmPoliciesConfig {
     pub actor: Actor,
+    /// The caller's own token context, so a path-restricted credential stays
+    /// restricted; it is never derived from `actor`.
+    pub auth_context: AuthContext,
     pub policies: Vec<RequestPolicy>,
     /// When set, the write applies only if the stored set still hashes to it,
     /// compared inside the write transaction to close the check/use window.
@@ -48,6 +53,7 @@ pub struct SetRealmPoliciesOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum SetRealmPoliciesState {
     Init,
+    Auth,
     StartTransaction,
     ReadCurrent,
     WriteDocumentAndAdminState {
@@ -77,6 +83,10 @@ pub enum SetRealmPoliciesError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
+    #[error("caller may not write the realm configuration")]
+    Unauthorized,
+    #[error("this node is not a realm management node")]
+    NotManagementNode,
     #[error("stored policy set changed")]
     StaleHash,
     #[error("invalid policy set: {reason}")]
@@ -150,6 +160,9 @@ impl SetRealmPoliciesOperation {
             return Err(SetRealmPoliciesError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
+        if !is_management(&document, self.config.actor.node_id) {
+            return Err(SetRealmPoliciesError::NotManagementNode);
+        }
 
         if let Some(expected) = self.config.expected_hash
             && policy_set_hash(&document.request_policies) != expected
@@ -257,14 +270,45 @@ impl Operation for SetRealmPoliciesOperation {
     type Error = SetRealmPoliciesError;
 
     fn start(&mut self) -> Effects {
-        self.state = SetRealmPoliciesState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return self.fail(SetRealmPoliciesError::Unauthorized);
+        }
+        self.state = SetRealmPoliciesState::Auth;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            }),
+            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
+        ))]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
+            SetRealmPoliciesState::Auth => match event {
+                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                    match allowed {
+                        Ok(true) => {
+                            self.state = SetRealmPoliciesState::StartTransaction;
+                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                                read: false
+                            })]
+                        }
+                        Ok(false) => self.fail(SetRealmPoliciesError::Unauthorized),
+                        Err(error) => {
+                            warn!(error = %error, "Realm policy authorization check failed");
+                            match error {
+                                AuthorizationError::StorageError(error) => {
+                                    self.fail(SetRealmPoliciesError::StorageError(error))
+                                }
+                                _ => self.fail(SetRealmPoliciesError::Unauthorized),
+                            }
+                        }
+                    }
+                }
+                other => self.unexpected_event("authorization result", format!("{other:?}")),
+            },
             SetRealmPoliciesState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
@@ -394,12 +438,72 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::get_realm_config::GetRealmConfigOperation;
     use aruna_core::UserId;
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::{AuthorizationError, StorageError};
+    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::request_policy::RequestPolicy;
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::{
+        Actor, AuthContext, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        RealmNodeKind, policy_admin_path,
+    };
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn actor(realm_id: RealmId) -> Actor {
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn auth(actor: &Actor) -> AuthContext {
+        AuthContext {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    fn policies_config(
+        actor: &Actor,
+        policies: Vec<RequestPolicy>,
+        expected_hash: Option<[u8; 32]>,
+    ) -> SetRealmPoliciesConfig {
+        SetRealmPoliciesConfig {
+            actor: actor.clone(),
+            auth_context: auth(actor),
+            policies,
+            expected_hash,
+        }
+    }
+
+    /// Realm creation leaves the admin role unassigned, so the fixture claims it
+    /// for the actor the permission sub-operation then decides on.
+    async fn seed_realm_admin(context: &DriverContext, actor: &Actor) {
+        let mut document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        for role in document.roles.values_mut() {
+            role.assigned_users.insert(actor.user_id);
+        }
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: (*actor.realm_id.as_bytes()).into(),
+                value: document.to_bytes(actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 
     fn policy(expression: &str) -> RequestPolicy {
         RequestPolicy {
@@ -424,11 +528,7 @@ mod tests {
             compute_handle: None,
         };
         let realm_id = RealmId([21u8; 32]);
-        let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-            user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
-            realm_id,
-        };
+        let actor = actor(realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: actor.clone(),
@@ -442,7 +542,56 @@ mod tests {
         )
         .await
         .unwrap();
+        seed_realm_admin(&context, &actor).await;
         (dir, context, actor)
+    }
+
+    /// Replaces the stored realm config with one that ranks the actor's node as
+    /// a plain server, which realm creation never produces.
+    async fn seed_server_config(context: &DriverContext, actor: &Actor) {
+        let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Server);
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: actor.realm_id,
+        };
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: document.to_bytes(actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_server_node() {
+        // A realm admin token still may not write the config on a server node:
+        // peers reject a realm-config event whose origin is not management.
+        let (_dir, context, actor) = setup_realm().await;
+        seed_server_config(&context, &actor).await;
+
+        let error = drive(
+            SetRealmPoliciesOperation::new(policies_config(
+                &actor,
+                vec![policy("permission == 'write'")],
+                None,
+            )),
+            &context,
+        )
+        .await
+        .expect_err("a server node is refused");
+        assert!(matches!(error, SetRealmPoliciesError::NotManagementNode));
+
+        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert!(read.request_policies.is_empty());
     }
 
     #[tokio::test]
@@ -451,11 +600,7 @@ mod tests {
         let (_dir, context, actor) = setup_realm().await;
         let policies = vec![policy("permission == 'write'")];
         let document = drive(
-            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
-                actor: actor.clone(),
-                policies: policies.clone(),
-                expected_hash: None,
-            }),
+            SetRealmPoliciesOperation::new(policies_config(&actor, policies.clone(), None)),
             &context,
         )
         .await
@@ -477,22 +622,22 @@ mod tests {
         let empty_hash = policy_set_hash(&[]);
         let first = vec![policy("permission == 'write'")];
         drive(
-            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
-                actor: actor.clone(),
-                policies: first.clone(),
-                expected_hash: Some(empty_hash),
-            }),
+            SetRealmPoliciesOperation::new(policies_config(
+                &actor,
+                first.clone(),
+                Some(empty_hash),
+            )),
             &context,
         )
         .await
         .unwrap();
 
         let stale = drive(
-            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
-                actor: actor.clone(),
-                policies: vec![policy("permission == 'read'")],
-                expected_hash: Some(empty_hash),
-            }),
+            SetRealmPoliciesOperation::new(policies_config(
+                &actor,
+                vec![policy("permission == 'read'")],
+                Some(empty_hash),
+            )),
             &context,
         )
         .await;
@@ -509,11 +654,11 @@ mod tests {
         // An uncompilable expression is refused at administration time.
         let (_dir, context, actor) = setup_realm().await;
         let result = drive(
-            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
-                actor,
-                policies: vec![policy("path.startsWith(")],
-                expected_hash: None,
-            }),
+            SetRealmPoliciesOperation::new(policies_config(
+                &actor,
+                vec![policy("path.startsWith(")],
+                None,
+            )),
             &context,
         )
         .await;
@@ -521,5 +666,104 @@ mod tests {
             result,
             Err(SetRealmPoliciesError::InvalidPolicies { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn refuses_unauthorized_caller() {
+        // A realm member without the admin role writes nothing.
+        let (_dir, context, actor) = setup_realm().await;
+        let outsider = Actor {
+            user_id: UserId::local(Ulid::from_bytes([9u8; 16]), actor.realm_id),
+            ..actor.clone()
+        };
+        let error = drive(
+            SetRealmPoliciesOperation::new(policies_config(
+                &outsider,
+                vec![policy("permission == 'write'")],
+                None,
+            )),
+            &context,
+        )
+        .await
+        .expect_err("an unauthorized caller is refused");
+        assert_eq!(error, SetRealmPoliciesError::Unauthorized);
+
+        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert!(read.request_policies.is_empty());
+    }
+
+    #[test]
+    fn start_checks_permission() {
+        let realm_id = RealmId([21u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        let effects = operation.start();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let emitted = format!("{effects:?}");
+        assert!(emitted.contains(&policy_admin_path(realm_id)));
+        assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn denied_is_terminal() {
+        let realm_id = RealmId([21u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetRealmPoliciesError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn capacity_not_denied() {
+        // Storage exhaustion inside the check is infrastructure, not a verdict.
+        let realm_id = RealmId([21u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::StorageError(
+                    StorageError::CleanupCapacity,
+                )),
+            },
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetRealmPoliciesError::StorageError(
+                StorageError::CleanupCapacity
+            ))
+        );
+    }
+
+    #[test]
+    fn allowed_starts_transaction() {
+        let realm_id = RealmId([21u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        );
     }
 }

@@ -33,6 +33,12 @@ pub trait ArunaBearerTokenValidationState: Sync {
     ) -> Result<bool, ArunaBearerTokenError>;
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool;
 
+    /// The wall clock claim validation judges against, injectable so a test can
+    /// decide expiry and issuance skew without waiting on real time.
+    fn now_secs(&self) -> u64 {
+        unix_timestamp_secs()
+    }
+
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
@@ -186,7 +192,7 @@ pub async fn validate_aruna_bearer_token_claims<S>(
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let now = chrono::Utc::now().timestamp() as u64;
+    let now = state.now_secs();
     if now > claims.exp {
         return Err(ArunaBearerTokenError::Expired);
     }
@@ -407,8 +413,13 @@ mod tests {
         ));
     }
 
-    #[derive(Default)]
-    struct SkewState;
+    /// Judges claims against a fixed instant, so lifetime and skew bounds are
+    /// decided by the fixture rather than by when the test happens to run.
+    struct SkewState {
+        now: u64,
+    }
+
+    const FIXED_NOW: u64 = 1_800_000_000;
 
     #[async_trait]
     impl ArunaBearerTokenValidationState for SkewState {
@@ -422,6 +433,10 @@ mod tests {
 
         async fn is_trusted_realm(&self, _realm_id: &RealmId) -> bool {
             true
+        }
+
+        fn now_secs(&self) -> u64 {
+            self.now
         }
     }
 
@@ -442,29 +457,41 @@ mod tests {
     async fn rejects_aged_token() {
         // An overlong token must stay rejected as it ages: the bound is the
         // signed lifetime, not the validity still remaining.
-        let now = unix_timestamp_secs();
+        let state = SkewState { now: FIXED_NOW };
         let max = aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
-        let claims = lifetime_claims(now - max, now + 600);
+        let claims = lifetime_claims(FIXED_NOW - max, FIXED_NOW + 600);
 
         assert!(matches!(
-            validate_aruna_bearer_token_claims(&SkewState, &claims).await,
+            validate_aruna_bearer_token_claims(&state, &claims).await,
             Err(ArunaBearerTokenError::LifetimeTooLong)
         ));
         // A token signed within the bound still validates.
-        validate_aruna_bearer_token_claims(&SkewState, &lifetime_claims(now, now + 600))
+        validate_aruna_bearer_token_claims(&state, &lifetime_claims(FIXED_NOW, FIXED_NOW + 600))
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn rejects_future_issuance() {
-        let now = unix_timestamp_secs();
-        let skewed = now + aruna_core::auth::REVOCATION_GRACE_SECS + 60;
+        let state = SkewState { now: FIXED_NOW };
+        let skewed = FIXED_NOW + aruna_core::auth::REVOCATION_GRACE_SECS + 60;
 
         assert!(matches!(
-            validate_aruna_bearer_token_claims(&SkewState, &lifetime_claims(skewed, skewed + 600))
+            validate_aruna_bearer_token_claims(&state, &lifetime_claims(skewed, skewed + 600))
                 .await,
             Err(ArunaBearerTokenError::LifetimeTooLong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_claims() {
+        // Expiry is decided by the injected clock, not by real time passing.
+        let state = SkewState { now: FIXED_NOW };
+        let claims = lifetime_claims(FIXED_NOW - 1200, FIXED_NOW - 600);
+
+        assert!(matches!(
+            validate_aruna_bearer_token_claims(&state, &claims).await,
+            Err(ArunaBearerTokenError::Expired)
         ));
     }
 

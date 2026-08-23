@@ -1,13 +1,14 @@
 use crate::error::{OidcError, ServerError, ServerResult, TokenError};
 use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::structs::{
     AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
 };
 use aruna_operations::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
 };
+use aruna_operations::request_authorization::AuthorizeError;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -559,12 +560,23 @@ pub(crate) async fn ensure_permission_with(
         ),
     )
     .await
-    .map_err(|error| match error {
-        aruna_operations::request_authorization::AuthorizeError::CheckFailed(message) => {
-            ServerError::InternalError(message)
+    .map_err(map_authorize_error)
+}
+
+/// An infrastructure fault inside the permission check is not a verdict:
+/// exhausted transaction-cleanup capacity stays retryable, every other storage
+/// fault stays internal, and only real denials become `Forbidden`.
+fn map_authorize_error(error: AuthorizeError) -> ServerError {
+    match error {
+        AuthorizeError::Storage(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
+            )
         }
-        _ => ServerError::Forbidden,
-    })
+        AuthorizeError::Storage(error) => ServerError::InternalError(error.to_string()),
+        AuthorizeError::CheckFailed(message) => ServerError::InternalError(message),
+        AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => ServerError::Forbidden,
+    }
 }
 
 /// Boolean form of [`ensure_permission`] for the routes that grade a caller
@@ -603,12 +615,14 @@ mod test {
     use crate::auth::{
         OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, bucket_blob_permission_path,
         extract_auth_context, extract_auth_context_and_bearer_token, handle_token,
+        map_authorize_error,
     };
-    use crate::error::TokenError;
+    use crate::error::{ServerError, TokenError};
     use crate::server::ServerState;
     use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
@@ -624,6 +638,7 @@ mod test {
     use aruna_operations::register_or_get_oidc_user::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
     };
+    use aruna_operations::request_authorization::AuthorizeError;
     use aruna_operations::revoke_token::{
         RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
     };
@@ -648,6 +663,23 @@ mod test {
     use tokio::net::TcpListener;
     use tokio::sync::RwLock;
     use ulid::Ulid;
+
+    #[test]
+    fn capacity_is_retryable() {
+        // The choke point must not hide a storage fault behind 403 or 500.
+        assert!(matches!(
+            map_authorize_error(AuthorizeError::Storage(StorageError::CleanupCapacity)),
+            ServerError::ServiceUnavailableReason(_)
+        ));
+        assert!(matches!(
+            map_authorize_error(AuthorizeError::Storage(StorageError::DeleteError)),
+            ServerError::InternalError(_)
+        ));
+        assert!(matches!(
+            map_authorize_error(AuthorizeError::PermissionDenied),
+            ServerError::Forbidden
+        ));
+    }
 
     #[tokio::test]
     async fn bucket_blob_permission_path_matches_canonical_blob_object_path() {

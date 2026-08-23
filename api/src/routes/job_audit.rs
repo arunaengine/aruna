@@ -228,12 +228,41 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
     path = "/jobs/{job_id}/audit",
     tag = "jobs",
     summary = "Page the immutable records of one external job",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Reads are self-scoped: only the submitter of the request may audit it, and any other id answers 404, so the surface never confirms that somebody else's job exists. The page is ordered by stable record key, never by arrival, and it exposes every alternative execution and every output that any partition produced, not only the canonical one: at-least-once execution means duplicates are normal and stay auditable forever. `scope=family` pages the request family the alias resolves to; `scope=submission` also pages the idempotency conflicts of the same submission, each record marked with `conflicting_family`. Records are projected, never returned raw: signatures, envelopes and the node identities of publishers, schedulers and executors are omitted. `conflicts` lists records refused under a key another record already held and is reported with the first page only. `partial` means this responder holds more records than one projection reduces, and the answer is this node's local view of a replicated log, so a later page may reveal records an earlier one could not. An output whose owning node's S3 endpoint is not known here carries `endpoint_url: null` instead of withholding the record.",
+    description = r#"Pages the immutable records of one external job, ordered by stable record key.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused. Reads are
+self-scoped: only the submitter of a request may audit it, and any other id answers 404, so the
+surface never confirms that somebody else's job exists.
+
+**Behavior**
+- The page is ordered by stable record key, never by arrival.
+- `scope=family` pages the request family the alias resolves to; `scope=submission` also pages the
+  idempotency conflicts of the same submission, each record marked with `conflicting_family`.
+- Every alternative execution and every output any partition produced is listed, not only the
+  canonical one: at-least-once execution means duplicates are normal and stay auditable forever.
+- Records are projected, never returned raw: signatures, envelopes and the node identities of
+  publishers, schedulers and executors are omitted.
+- `conflicts` lists records refused under a key another record already held and is reported with
+  the first page only.
+- `partial` means this responder holds more records than one projection reduces, and the answer is
+  this node's local view of a replicated log, so a later page may reveal records an earlier one
+  could not.
+- An output whose owning node's S3 endpoint is not known here carries `endpoint_url: null` instead
+  of withholding the record.
+
+**Limits** (all refused with 400)
+- `limit` is 1 to 64 records per page and defaults to 64.
+- `cursor` must be a `next_cursor` of this log, base64url without padding.
+- `scope` is `family` or `submission`.
+
+**Errors**: an unknown id, an unparseable id and a job submitted by somebody else are the same 404,
+as is a responder that never held the family, so page the node that accepted the submission. A 503
+means the log could not be reduced here and the caller may page again."#,
     params(
-        ("job_id" = String, Path, description = "Job identifier as returned by submission, or any accepted alias of the same request: a 26-character ULID-shaped id. An unparseable id is 404"),
-        ("scope" = Option<String>, Query, description = "`family` (the default) pages the request family only; `submission` also pages other request families of the same submission. Any other value is 400"),
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous page's `next_cursor`, base64url without padding. Anything that is not a record key of this log is rejected with 400"),
-        ("limit" = Option<usize>, Query, description = "Records per page, 1 to 64; the default is 64 and any other value is rejected with 400")
+        ("job_id" = String, Path, description = "Job id from submission, or any accepted alias of the same request: a 26-character ULID"),
+        ("scope" = Option<String>, Query, description = "`family` (the default) pages this request family only; `submission` also pages other families of the same submission"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from a previous page, base64url without padding"),
+        ("limit" = Option<usize>, Query, description = "Records per page, 1 to 64; the default is 64")
     ),
     responses(
         (
@@ -263,16 +292,18 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
                         "conflicting_family": false,
                         "job_id": "01JJRSTVWXYZ0123456789ABCD",
                         "execution_id": "01JJRSEXEC0123456789ABCDEF",
-                        "outputs": [{
-                            "bucket": "ws-01jjrstvwxyz0123456789abcd",
-                            "key": "reports/reads_fastqc.html",
-                            "version_id": "01JJRSVERSION0123456789ABC",
-                            "execution_id": "01JJRSEXEC0123456789ABCDEF",
-                            "container_path": "/outputs/reads_fastqc.html",
-                            "size": 20480,
-                            "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8",
-                            "endpoint_url": "https://s3.example"
-                        }],
+                        "outputs": [
+                            {
+                                "bucket": "ws-01jjrstvwxyz0123456789abcd",
+                                "key": "reports/reads_fastqc.html",
+                                "version_id": "01JJRSVERSION0123456789ABC",
+                                "execution_id": "01JJRSEXEC0123456789ABCDEF",
+                                "container_path": "/outputs/reads_fastqc.html",
+                                "size": 20480,
+                                "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8",
+                                "endpoint_url": "https://s3.example"
+                            }
+                        ],
                         "at_ms": 1755500009000u64
                     }
                 ],
@@ -286,7 +317,7 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
         (status = 400, description = "Unknown `scope`, a cursor that is not a record key of this log, or a `limit` outside 1..=64", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
-        (status = 404, description = "No external job with that id is known at this responder, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable, and a responder that never held the family answers the same way, so page the node that accepted the submission", body = ErrorResponse),
+        (status = 404, description = "Unknown, unparseable or foreign job id, or a responder that never held the family", body = ErrorResponse),
         (status = 503, description = "The log could not be reduced here; retryable, the caller may page again", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

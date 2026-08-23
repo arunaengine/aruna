@@ -11,7 +11,21 @@ use utoipa::{Modify, OpenApi};
     info(
         title = "Aruna Server API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "REST API for the Aruna federated data orchestration network",
+        description = r#"REST API for the Aruna federated data orchestration network.
+
+**Authentication**: most operations take a realm bearer token; the GA4GH TES facade also accepts
+HTTP Basic with an access key and secret issued by this node, and public routes carry an empty
+security requirement.
+
+**Conventions**
+- Errors answer `application/json` with `ErrorResponse` (`error` plus an optional `code`); the
+  GA4GH DRS and TES facades use their own error payloads.
+- Every operation may answer 429 with a `Retry-After` header.
+- An operation may answer 408 when the request exceeds the REST time limit; the streaming RO-Crate
+  upload does not.
+- An operation with a request body may answer 413 when the body exceeds the configured limit.
+- An operation that reports errors as a body may answer 500 on an unexpected internal failure.
+- Paths are relative to the `/api/v1` base path."#,
         license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0"),
         contact(name = "Aruna Team", url = "https://github.com/arunaengine/aruna")
     ),
@@ -192,6 +206,18 @@ mod tests {
     const METHODS: &[&str] = &[
         "get", "put", "post", "delete", "options", "head", "patch", "trace",
     ];
+
+    /// Section labels a description may carry, in their only allowed order.
+    const SECTIONS: &[&str] = &[
+        "**Authentication**",
+        "**Behavior**",
+        "**Limits**",
+        "**Errors**",
+    ];
+
+    const MAX_SUMMARY_WORDS: usize = 8;
+    const MAX_LEAD: usize = 200;
+    const MAX_PARAGRAPH: usize = 400;
 
     /// Example values that would mean a real credential leaked into the document.
     const FORBIDDEN: &[&str] = &[
@@ -438,7 +464,26 @@ mod tests {
             !value.is_null()
                 && !value.as_str().is_some_and(|text| text.is_empty())
                 && schema_matches(doc, schema, value)
+                && non_empty(doc, schema, value)
         })
+    }
+
+    /// An example that shows nothing: `{}` where the schema promises fields, `[]`
+    /// for an array. A free-form object body may legitimately carry `{}`.
+    fn non_empty(doc: &Value, schema: &Value, value: &Value) -> bool {
+        let Some(schema) = resolve(doc, schema) else {
+            return true;
+        };
+        let promises_fields = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| !properties.is_empty())
+            || schema.get("required").is_some();
+        if promises_fields && value.as_object().is_some_and(|fields| fields.is_empty()) {
+            return false;
+        }
+        schema.get("type") != Some(&json!("array"))
+            || !value.as_array().is_some_and(|items| items.is_empty())
     }
 
     /// Operations missing a summary, description, parameter or response text.
@@ -482,8 +527,160 @@ mod tests {
         gaps
     }
 
-    /// JSON bodies without an example. Exemptions follow from the status and the
-    /// media type, never from a list of endpoints.
+    /// Tag names the document describes, so an operation cannot reference a bare tag.
+    fn described_tags(doc: &Value) -> BTreeSet<&str> {
+        doc.get("tags")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|tag| filled(tag.get("description")))
+            .filter_map(|tag| tag.get("name").and_then(Value::as_str))
+            .collect()
+    }
+
+    /// Blank-line separated paragraphs, keeping each paragraph's own line breaks.
+    fn split_paragraphs(text: &str) -> Vec<String> {
+        let mut paragraphs = Vec::new();
+        let mut current: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                if !current.is_empty() {
+                    paragraphs.push(current.join("\n"));
+                    current.clear();
+                }
+            } else {
+                current.push(line);
+            }
+        }
+        if !current.is_empty() {
+            paragraphs.push(current.join("\n"));
+        }
+        paragraphs
+    }
+
+    fn snippet(text: &str) -> String {
+        text.chars().take(40).collect()
+    }
+
+    /// A long paragraph is only allowed as a bullet list under its label.
+    fn bulleted(paragraph: &str) -> bool {
+        paragraph.lines().all(|line| {
+            let body = line.trim_start();
+            body.starts_with("- ") || body.starts_with("**") || line.starts_with("  ")
+        })
+    }
+
+    fn prose_gaps(name: &str, field: &str, text: &str, gaps: &mut Vec<String>) {
+        if text.contains('\u{2014}') {
+            gaps.push(format!("{name}: {field} contains an em dash"));
+        }
+        if text.contains(['\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}']) {
+            gaps.push(format!("{name}: {field} contains curly quotes"));
+        }
+    }
+
+    fn summary_gaps(name: &str, summary: &str, gaps: &mut Vec<String>) {
+        let words = summary.split_whitespace().count();
+        if !(1..=MAX_SUMMARY_WORDS).contains(&words) {
+            gaps.push(format!(
+                "{name}: summary has {words} words (allowed 1 to {MAX_SUMMARY_WORDS})"
+            ));
+        }
+        if summary.trim_end().ends_with('.') {
+            gaps.push(format!("{name}: summary ends with a period"));
+        }
+        prose_gaps(name, "summary", summary, gaps);
+    }
+
+    fn section_gaps(name: &str, paragraphs: &[String], gaps: &mut Vec<String>) {
+        let mut found = Vec::new();
+        for paragraph in paragraphs {
+            let paragraph = paragraph.trim_start();
+            if !paragraph.starts_with("**") {
+                continue;
+            }
+            match SECTIONS
+                .iter()
+                .position(|label| paragraph.starts_with(*label))
+            {
+                Some(label) => found.push(label),
+                None => gaps.push(format!(
+                    "{name}: unknown section label: {}",
+                    snippet(paragraph)
+                )),
+            }
+        }
+        if !found.contains(&0) {
+            gaps.push(format!("{name}: missing **Authentication** section"));
+        }
+        if found.windows(2).any(|pair| pair[0] >= pair[1]) {
+            let labels: Vec<&str> = found.iter().map(|label| SECTIONS[*label]).collect();
+            gaps.push(format!(
+                "{name}: sections out of order or repeated: {}",
+                labels.join(" ")
+            ));
+        }
+    }
+
+    fn description_gaps(name: &str, description: &str, gaps: &mut Vec<String>) {
+        prose_gaps(name, "description", description, gaps);
+        let paragraphs = split_paragraphs(description);
+        let Some(lead) = paragraphs.first().map(|lead| lead.trim()) else {
+            gaps.push(format!("{name}: description is empty"));
+            return;
+        };
+        let length = lead.chars().count();
+        if lead.contains('\n')
+            || !lead.ends_with('.')
+            || length > MAX_LEAD
+            || lead.starts_with("**")
+        {
+            gaps.push(format!(
+                "{name}: lead must be one sentence of at most {MAX_LEAD} chars ending with '.' \
+                 ({length} chars)"
+            ));
+        }
+        for paragraph in &paragraphs {
+            if paragraph.chars().count() > MAX_PARAGRAPH && !bulleted(paragraph) {
+                gaps.push(format!(
+                    "{name}: paragraph over {MAX_PARAGRAPH} chars is not a bullet list: {}",
+                    snippet(paragraph)
+                ));
+            }
+        }
+        section_gaps(name, &paragraphs[1..], gaps);
+    }
+
+    /// Operation prose that does not follow the structured documentation convention.
+    fn structure_gaps(doc: &Value) -> Vec<String> {
+        let described = described_tags(doc);
+        let mut gaps = Vec::new();
+        for (name, operation) in operations(doc) {
+            if let Some(summary) = operation.get("summary").and_then(Value::as_str) {
+                summary_gaps(&name, summary, &mut gaps);
+            }
+            if let Some(description) = operation.get("description").and_then(Value::as_str) {
+                description_gaps(&name, description, &mut gaps);
+            }
+            for tag in operation
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(Value::as_str)
+            {
+                if !described.contains(tag) {
+                    gaps.push(format!("{name}: tag {tag} without description"));
+                }
+            }
+        }
+        gaps
+    }
+
+    /// JSON bodies without a usable example. Exemptions follow from the status and
+    /// the media type, never from a list of endpoints.
     fn example_gaps(doc: &Value) -> Vec<String> {
         let mut gaps = Vec::new();
         for (name, operation) in operations(doc) {
@@ -493,7 +690,9 @@ mod tests {
             {
                 for (media_type, media) in json_media(body) {
                     if !has_example(doc, media) {
-                        gaps.push(format!("{name}: request {media_type} without example"));
+                        gaps.push(format!(
+                            "{name}: request {media_type} without a usable example"
+                        ));
                     }
                 }
             }
@@ -511,7 +710,9 @@ mod tests {
                 };
                 for (media_type, media) in json_media(response) {
                     if !has_example(doc, media) {
-                        gaps.push(format!("{name}: {status} {media_type} without example"));
+                        gaps.push(format!(
+                            "{name}: {status} {media_type} without a usable example"
+                        ));
                     }
                 }
             }
@@ -587,6 +788,12 @@ mod tests {
             "undocumented operations:\n{}",
             gaps.join("\n")
         );
+        let gaps = structure_gaps(&doc);
+        assert!(
+            gaps.is_empty(),
+            "operation docs off the convention:\n{}",
+            gaps.join("\n")
+        );
     }
 
     #[test]
@@ -595,7 +802,7 @@ mod tests {
         let gaps = example_gaps(&doc);
         assert!(
             gaps.is_empty(),
-            "bodies without examples:\n{}",
+            "bodies without a usable example:\n{}",
             gaps.join("\n")
         );
     }
@@ -877,7 +1084,7 @@ mod tests {
         assert!(
             example_gaps(&doc)
                 .iter()
-                .any(|gap| gap.contains("without example"))
+                .any(|gap| gap.contains("without a usable example"))
         );
         let null_media = json!({"example": null});
         assert!(!has_example(&doc, &null_media));
@@ -916,7 +1123,7 @@ mod tests {
         assert!(
             example_gaps(&doc)
                 .iter()
-                .any(|gap| gap.contains("without example"))
+                .any(|gap| gap.contains("without a usable example"))
         );
 
         let cyclic = json!({
@@ -929,6 +1136,64 @@ mod tests {
                 .iter()
                 .any(|gap| gap.contains("response 200 without description")),
             "a $ref cycle must not count as documentation"
+        );
+    }
+
+    #[test]
+    fn rejects_flat_docs() {
+        // The structure gate must fail an unwrapped description, a mis-ordered
+        // section list, an overlong summary, a bare tag and an empty example.
+        let lead = "Creates a thing and inlines every rule, limit and status in one paragraph. "
+            .repeat(12);
+        let description = format!(
+            "{lead}Refusals are listed above \u{2014} not below.\n\n\
+             **Limits**: at most one thing.\n\n**Authentication**: bearer token."
+        );
+        let doc = json!({
+            "paths": {
+                "/thing": {
+                    "post": {
+                        "tags": ["thing"],
+                        "summary": "Create a thing and also explain the whole limit story in here.",
+                        "description": description,
+                        "responses": {
+                            "200": {
+                                "description": "Created",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {"id": {"type": "string"}}
+                                        },
+                                        "example": {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let gaps = structure_gaps(&doc);
+        assert!(gaps.iter().any(|gap| gap.contains("summary has 12 words")));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("summary ends with a period"))
+        );
+        assert!(gaps.iter().any(|gap| gap.contains("lead must be one")));
+        assert!(gaps.iter().any(|gap| gap.contains("not a bullet list")));
+        assert!(gaps.iter().any(|gap| gap.contains("out of order")));
+        assert!(gaps.iter().any(|gap| gap.contains("contains an em dash")));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("tag thing without description"))
+        );
+        assert!(
+            example_gaps(&doc)
+                .iter()
+                .any(|gap| gap.contains("without a usable example")),
+            "an empty object documents no body"
         );
     }
 

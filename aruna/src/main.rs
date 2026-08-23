@@ -1475,7 +1475,7 @@ mod tests {
                 .expect("usage counter ensure should probe storage");
             assert!(matches!(effect, StorageEffect::BatchRead { .. }));
             response_tx.send(StorageEvent::Error {
-                error: StorageError::ReadError,
+                error: StorageError::ReadError("boom".to_string()),
             });
         });
         let driver_ctx = test_driver_ctx(storage_handle);
@@ -1486,6 +1486,7 @@ mod tests {
             .to_string();
 
         assert!(error.contains("usage counter probe failed"));
+        assert!(error.contains("boom"), "storage cause missing: {error}");
         worker.join().expect("storage responder should finish");
     }
 

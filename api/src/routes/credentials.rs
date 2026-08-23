@@ -205,7 +205,23 @@ fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRes
     path = "/users/credentials",
     tag = "credentials",
     summary = "List the caller's S3 credentials",
-    description = "Requires a realm bearer token that carries no path restrictions; a delegated token is refused with 403. Self-scoped: the response only ever contains credentials issued to the calling identity, and only those held by the node that serves the request, so a credential issued on another node of the realm is not listed here. Secret access keys are never returned by this operation; every entry carries the access key id, the group the credential is bound to, expiry and revocation timestamps as RFC 3339 UTC with second precision, the id of the issuing node, the effective path restrictions and the derived status active, expired or revoked. The listing is not paginated and covers at most 16 active credentials per user, ordered by access key id.",
+    description = r#"Lists the S3 credentials of the calling identity held by the node serving the request.
+
+**Authentication**: realm bearer token that carries no path restrictions; a delegated token is
+refused with 403.
+
+**Behavior**
+- Self-scoped: the response only ever contains credentials issued to the calling identity.
+- Only credentials held by the serving node are listed, so a credential issued on another node of
+  the realm does not appear here.
+- Secret access keys are never returned by this operation.
+- Every entry carries the access key id, the group the credential is bound to, expiry and
+  revocation timestamps as RFC 3339 UTC with second precision, the id of the issuing node, the
+  effective path restrictions and the derived status `active`, `expired` or `revoked`.
+
+**Limits**
+- The listing is not paginated and covers at most 16 active credentials per user, ordered by access
+  key id."#,
     responses(
         (
             status = 200,
@@ -266,15 +282,40 @@ pub async fn list_s3_credentials(
     path = "/users/credentials",
     tag = "credentials",
     summary = "Create an S3 credential for a group",
-    description = "Requires a realm bearer token and write access to the group's data path. Self-scoped: the credential is always issued to the calling identity, so no caller can mint a credential for another user. A path-restricted (delegated) token may be used; the issued credential inherits the caller's restrictions narrowed to the group data root and can never widen them, and every requested allow scope is authorized against the caller's own grant before it is written. The secret access key is returned once, in this response only: it is stored sealed and is not retrievable afterwards, so a caller that loses it has to create a new credential, and later listings show only the access key id. The credential is stored on the node that served the request and is accepted by that node's S3 endpoint. A user holds at most 16 active credentials; a further request is refused with 409 until one is revoked or expires.",
+    description = r#"Issues an S3 access key and a one-time secret bound to a group, for the calling identity.
+
+**Authentication**: realm bearer token with write access to the group's data path. A
+path-restricted (delegated) token may be used; the issued credential inherits the caller's
+restrictions narrowed to the group data root and can never widen them, and every requested allow
+scope is authorized against the caller's own grant before it is written.
+
+**Behavior**
+- Self-scoped: the credential is always issued to the calling identity, so no caller can mint a
+  credential for another user.
+- The secret access key is returned once, in this response only: it is stored sealed and is not
+  retrievable afterwards, so a caller that loses it has to create a new credential, and later
+  listings show only the access key id.
+- The credential is stored on the node that served the request and is accepted by that node's S3
+  endpoint.
+
+**Limits**
+- The optional lifetime is given in seconds between 60 and 31536000 and defaults to 31536000.
+- A restriction pattern is relative to the group data root or an absolute path inside it, may name
+  an exact path or a subtree with a trailing `/**`, and takes the permission `READ`, `WRITE` or
+  `DENY` case insensitively; at most 50 restrictions are accepted.
+- A user holds at most 16 active credentials; a further request is refused with 409 until one is
+  revoked or expires."#,
     request_body(
         content = CreateS3CredentialsRequest,
-        description = "Group the credential is bound to, an optional lifetime in seconds between 60 and 31536000 that defaults to 31536000, and optional path restrictions. A restriction pattern is relative to the group data root or an absolute path inside it, may name an exact path or a subtree with a trailing /**, and takes the permission READ, WRITE or DENY case insensitively; at most 50 restrictions are accepted.",
+        description = "Group the credential is bound to, an optional lifetime in seconds, and optional path restrictions",
         example = json!({
             "group_id": "01JGRP00123456789ABCDEFGHJ",
             "expires_in_seconds": 86400,
             "path_restrictions": [
-                {"pattern": "shared/**", "permission": "READ"}
+                {
+                    "pattern": "shared/**",
+                    "permission": "READ"
+                }
             ]
         })
     ),
@@ -367,7 +408,19 @@ pub async fn create_s3_credentials(
     path = "/users/credentials/{access_key_id}",
     tag = "credentials",
     summary = "Revoke an S3 credential",
-    description = "Requires a realm bearer token that carries no path restrictions; a delegated token is refused with 403. A caller may always revoke a credential issued to their own identity; revoking another user's credential additionally requires write access on that user's realm administration path, so write access to the group the credential is bound to is deliberately not enough. Only credentials held by the node that serves the request can be revoked here, and an access key unknown to this node is answered with 404. The record is not deleted: it keeps appearing in the caller's listing with a revocation timestamp and the revoked status, and the node stops accepting the key for new S3 requests.",
+    description = r#"Revokes an S3 credential held by the node serving the request.
+
+**Authentication**: realm bearer token that carries no path restrictions; a delegated token is
+refused with 403. A caller may always revoke a credential issued to their own identity; revoking
+another user's credential additionally requires write access on that user's realm administration
+path, so write access to the group the credential is bound to is deliberately not enough.
+
+**Behavior**
+- Only credentials held by the node that serves the request can be revoked here, and an access key
+  unknown to this node is answered with 404.
+- The record is not deleted: it keeps appearing in the caller's listing with a revocation timestamp
+  and the `revoked` status.
+- The node stops accepting the key for new S3 requests."#,
     params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, a ULID as returned when the credential was created or listed")),
     responses(
         (status = 204, description = "Credential revoked; the response carries no body"),

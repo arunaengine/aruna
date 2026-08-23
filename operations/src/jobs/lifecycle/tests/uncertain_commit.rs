@@ -345,9 +345,19 @@ fn uncertain_never_drains() {
         (StorageError::TransactionConflict, CommitVerdict::Raced),
         (StorageError::CommitFailed, CommitVerdict::Uncertain),
         (StorageError::TransactionNotFound, CommitVerdict::Uncertain),
-        (StorageError::KeyspaceError, CommitVerdict::Uncertain),
-        (StorageError::ReadError, CommitVerdict::Uncertain),
-        (StorageError::WriteError, CommitVerdict::Uncertain),
+        (StorageError::CleanupCapacity, CommitVerdict::Retry),
+        (
+            StorageError::KeyspaceError("x".to_string()),
+            CommitVerdict::Uncertain,
+        ),
+        (
+            StorageError::ReadError("x".to_string()),
+            CommitVerdict::Uncertain,
+        ),
+        (
+            StorageError::WriteError("x".to_string()),
+            CommitVerdict::Uncertain,
+        ),
         (StorageError::DeleteError, CommitVerdict::Uncertain),
         (
             StorageError::PersistError("x".to_string()),

@@ -199,7 +199,9 @@ async fn read_index_datestamp(
             .transpose()
             .map_err(StorageReadError::Conversion),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
@@ -294,7 +296,9 @@ async fn read_state(context: &DriverContext) -> Result<Option<VisibilityState>, 
             value.and_then(|value| postcard::from_bytes::<VisibilityState>(value.as_ref()).ok())
         ),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
@@ -317,7 +321,9 @@ async fn write_state(
     match event {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::WriteError)),
+        _ => Err(StorageReadError::Storage(StorageError::WriteError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
@@ -341,7 +347,9 @@ fn parse_scan(event: Event) -> Result<IndexBatch, StorageReadError> {
             next_start_after,
         }) => Ok((values, next_start_after)),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
@@ -772,7 +780,9 @@ async fn write_index_keys(
     match event {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::WriteError)),
+        _ => Err(StorageReadError::Storage(StorageError::WriteError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 

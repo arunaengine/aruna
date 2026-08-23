@@ -436,6 +436,10 @@ impl RealmConfigDocument {
         // make every revocation reject forwarded requests until it replicated.
         canonical.revoked_tokens.clear();
         canonical.revocation_floor = 0;
+        // Request policies are excluded for the same reason: they never change
+        // where a request routes, the receiving node enforces its own set on
+        // arrival, and nodes that hold no realm-config bucket never see them.
+        canonical.request_policies.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -1091,6 +1095,7 @@ mod test {
     use crate::admin_document_reducer::AdminDocumentReducerState;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::auth::REVOCATION_GRACE_SECS;
+    use crate::request_policy::{PolicyKind, RequestPolicy};
     use crate::structs::{
         Actor, CandidatePlacementMap, DynamicDiscoveryMethod, KIND_LABEL_KEY,
         MetadataGroupReplicationOverride, MetadataPathReplicationOverride, OidcProviderConfig,
@@ -1288,6 +1293,24 @@ mod test {
 
         assert!(revoked.token_revoked(&crate::auth::bearer_token_hash("token"), 1_000));
         assert_eq!(config.digest().unwrap(), revoked.digest().unwrap());
+    }
+
+    #[test]
+    fn digest_ignores_policies() {
+        // A node holding no realm-config bucket never sees a policy set; if it
+        // moved the digest, that node could never forward a write again.
+        let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 3);
+        let mut denied = config.clone();
+        denied.request_policies.push(RequestPolicy {
+            policy_id: Ulid::from_bytes([9u8; 16]),
+            name: "deny-writes".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        });
+
+        assert_eq!(config.digest().unwrap(), denied.digest().unwrap());
     }
 
     #[test]

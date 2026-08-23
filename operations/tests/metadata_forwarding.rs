@@ -185,10 +185,13 @@ async fn forwarded_policy_denies() -> Result<(), Box<dyn std::error::Error>> {
     let error = drive_forwarded_create(&realm, user_node, group_id, document_id)
         .await
         .expect_err("a routed write denied by policy must not be accepted");
-    assert!(matches!(
-        error.downcast_ref::<MetadataWriteError>(),
-        Some(MetadataWriteError::Forbidden)
-    ));
+    assert!(
+        matches!(
+            error.downcast_ref::<MetadataWriteError>(),
+            Some(MetadataWriteError::Forbidden)
+        ),
+        "unexpected forwarded create error: {error}"
+    );
 
     shutdown(nodes).await;
     Ok(())
@@ -639,13 +642,20 @@ async fn set_write_policy(
         expression: "permission == 'write'".to_string(),
         enabled: true,
     };
-    for node in nodes {
+    // Only the sync-eligible nodes are management members, and a realm-config
+    // write on any other node is refused before it can diverge.
+    for node in nodes.iter().filter(|node| node.sync_eligible) {
         drive(
             SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
                 actor: Actor {
                     node_id: node.net.node_id(),
                     user_id: realm.user_id,
                     realm_id: realm.realm_id,
+                },
+                auth_context: AuthContext {
+                    user_id: realm.user_id,
+                    realm_id: realm.realm_id,
+                    path_restrictions: None,
                 },
                 policies: vec![policy.clone()],
                 expected_hash: None,
@@ -900,7 +910,11 @@ async fn install_realm_config(
         config.seed_job_control(node.net.node_id(), band as u32);
     }
 
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    // The realm user administers this realm, so the admin role names it.
+    let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    for role in realm_auth.roles.values_mut() {
+        role.assigned_users.insert(realm.user_id);
+    }
     let trusted = HashSet::from([realm_id]);
     for node in nodes {
         let actor = Actor {

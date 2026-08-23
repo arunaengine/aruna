@@ -173,43 +173,73 @@ pub struct SubmitPurgeResponse {
     post,
     path = "/storage/deletion-preflight",
     tag = "storage deletion",
-    summary = "Report what a permanent deletion of one scope would destroy",
-    description = "Requires a bearer token issued for this realm and READ on the selected scope; the reported `permissions.purge` says separately whether the same caller could actually run the purge. Nothing is deleted or reserved here. The inventory is one bounded page of this node's own rows: `counts.complete` false means every number counts that page rather than the scope, and `truncation` carries the markers a following request resumes from. Sync relationships that a bucket delete would act on are listed with the ones that block it. `reference_coverage` never implies that the scope is unreferenced: it reports how much of the backlink question this node could answer at all.",
+    summary = "Preview what a permanent deletion would destroy",
+    description = r#"Reports the bounded inventory and consequences of permanently deleting one storage scope.
+
+**Authentication**: bearer token issued for this realm and READ on the selected scope; the reported
+`permissions.purge` says separately whether the same caller could actually run the purge.
+
+**Behavior**
+- Nothing is deleted or reserved here.
+- The inventory is one bounded page of this node's own rows: `counts.complete` false means every
+  number counts that page rather than the scope, and `truncation` carries the markers a following
+  request resumes from.
+- Sync relationships that a bucket delete would act on are listed with the ones that block it.
+- `reference_coverage` never implies that the scope is unreferenced: it reports how much of the
+  backlink question this node could answer at all."#,
     request_body(
         content = DeletionPreflightRequest,
         description = "The scope to inspect plus optional page bound and resume markers",
         example = json!({
-            "scope": {"kind": "prefix", "bucket": "datasets", "prefix": "raw/"},
+            "scope": {
+                "kind": "prefix",
+                "bucket": "datasets",
+                "prefix": "raw/"
+            },
             "limit": 1000
         })
     ),
     responses(
-        (status = 200, description = "Bounded, scope-aware deletion inventory and consequences", body = DeletionPreflightResponse, example = json!({
-            "scope": {"kind": "prefix", "bucket": "datasets", "prefix": "raw/"},
-            "counts": {
-                "current_heads": 42,
-                "noncurrent_versions": 7,
-                "delete_markers": 1,
-                "open_multipart_uploads": 0,
-                "complete": true
-            },
-            "sync_relationships_apply_to_bucket_delete": false,
-            "sync_relationships": [],
-            "permissions": {"read": true, "purge": false},
-            "truncation": {
-                "truncated": false,
-                "versions_truncated": false,
-                "multipart_uploads_truncated": false
-            },
-            "reference_coverage": {
-                "complete": false,
-                "hidden_references_exist": null,
-                "queried_nodes": 1,
-                "failed_nodes": 0,
-                "index_freshness": "local",
-                "excluded": ["remote_nodes"]
-            }
-        })),
+        (
+            status = 200,
+            description = "Bounded, scope-aware deletion inventory and consequences",
+            body = DeletionPreflightResponse,
+            example = json!({
+                "scope": {
+                    "kind": "prefix",
+                    "bucket": "datasets",
+                    "prefix": "raw/"
+                },
+                "counts": {
+                    "current_heads": 42,
+                    "noncurrent_versions": 7,
+                    "delete_markers": 1,
+                    "open_multipart_uploads": 0,
+                    "complete": true
+                },
+                "sync_relationships_apply_to_bucket_delete": false,
+                "sync_relationships": [],
+                "permissions": {
+                    "read": true,
+                    "purge": false
+                },
+                "truncation": {
+                    "truncated": false,
+                    "versions_truncated": false,
+                    "multipart_uploads_truncated": false
+                },
+                "reference_coverage": {
+                    "complete": false,
+                    "hidden_references_exist": null,
+                    "queried_nodes": 1,
+                    "failed_nodes": 0,
+                    "index_freshness": "local",
+                    "excluded": [
+                        "remote_nodes"
+                    ]
+                }
+            })
+        ),
         (status = 400, description = "Invalid scope, marker, or limit", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the selected scope", body = ErrorResponse),
@@ -353,26 +383,52 @@ pub async fn deletion_preflight(
     path = "/storage/purge-jobs",
     tag = "storage deletion",
     summary = "Submit a permanent purge of one storage scope",
-    description = "Requires a bearer token issued for this realm and WRITE on the selected scope. The purge runs as a job: a 201 means it was durably queued, never that anything was deleted yet, so poll the returned `status_url`. Deletion is permanent and no version survives it, which is why the preflight surface exists to report the consequences first. An `idempotency_key` makes a retried submission return the retained job with a 200 instead of queuing a second purge; the same key naming a different scope is a 409.",
+    description = r#"Queues a permanent purge of one storage scope as a job.
+
+**Authentication**: bearer token issued for this realm and WRITE on the selected scope.
+
+**Behavior**
+- The purge runs as a job: a 201 means it was durably queued, never that anything was deleted yet,
+  so poll the returned `status_url`.
+- Deletion is permanent and no version survives it, which is why the preflight surface exists to
+  report the consequences first.
+- An `idempotency_key` makes a retried submission return the retained job with a 200 instead of
+  queuing a second purge.
+
+**Errors**: an `idempotency_key` that names a different scope than the retained job is a 409."#,
     request_body(
         content = SubmitPurgeRequest,
         description = "The scope to purge plus an optional idempotency key",
         example = json!({
-            "scope": {"kind": "prefix", "bucket": "datasets", "prefix": "raw/"},
+            "scope": {
+                "kind": "prefix",
+                "bucket": "datasets",
+                "prefix": "raw/"
+            },
             "idempotency_key": "purge-raw-2026-04-09-001"
         })
     ),
     responses(
-        (status = 201, description = "Purge job created", body = SubmitPurgeResponse, example = json!({
-            "job_id": "01JABCDEF0123456789ABCDEFG",
-            "created": true,
-            "status_url": "/api/v1/jobs/01JABCDEF0123456789ABCDEFG"
-        })),
-        (status = 200, description = "Idempotent replay returned the retained job", body = SubmitPurgeResponse, example = json!({
-            "job_id": "01JABCDEF0123456789ABCDEFG",
-            "created": false,
-            "status_url": "/api/v1/jobs/01JABCDEF0123456789ABCDEFG"
-        })),
+        (
+            status = 201,
+            description = "Purge job created",
+            body = SubmitPurgeResponse,
+            example = json!({
+                "job_id": "01JABCDEF0123456789ABCDEFG",
+                "created": true,
+                "status_url": "/api/v1/jobs/01JABCDEF0123456789ABCDEFG"
+            })
+        ),
+        (
+            status = 200,
+            description = "Idempotent replay returned the retained job",
+            body = SubmitPurgeResponse,
+            example = json!({
+                "job_id": "01JABCDEF0123456789ABCDEFG",
+                "created": false,
+                "status_url": "/api/v1/jobs/01JABCDEF0123456789ABCDEFG"
+            })
+        ),
         (status = 400, description = "Invalid scope or idempotency key", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot purge the selected scope", body = ErrorResponse),

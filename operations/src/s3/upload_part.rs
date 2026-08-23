@@ -1032,7 +1032,7 @@ mod test {
         op.txn_id = Some(txn_id);
 
         let effects = op.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         assert_eq!(
             effects.as_slice(),

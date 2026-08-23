@@ -49,7 +49,7 @@ pub fn parse_document_bytes(event: Event) -> Result<Option<Vec<u8>>, StorageErro
             Ok(value.map(|bytes| bytes.to_vec()))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error),
-        _ => Err(StorageError::ReadError),
+        _ => Err(StorageError::ReadError("unexpected event".to_string())),
     }
 }
 
@@ -109,7 +109,7 @@ pub fn event_to_iter_values(event: Event) -> Result<Vec<(Key, ByteView)>, Storag
     match event {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
         Event::Storage(StorageEvent::Error { error }) => Err(error),
-        _ => Err(StorageError::ReadError),
+        _ => Err(StorageError::ReadError("unexpected event".to_string())),
     }
 }
 

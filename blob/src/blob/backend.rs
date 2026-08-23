@@ -355,9 +355,15 @@ impl BlobHandler {
         marker: &ByteView,
         capacity: Option<u64>,
     ) -> Result<LoadUpdate, BlobError> {
-        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
-            BlobError::ReadError("failed to start hidden bucket transaction".to_string())
-        })?;
+        let mut owner = self
+            .storage
+            .start_transaction(false)
+            .await
+            .map_err(|error| {
+                BlobError::ReadError(format!(
+                    "failed to start hidden bucket transaction: {error}"
+                ))
+            })?;
         let Some(txn_id) = owner.id() else {
             return Err(BlobError::ReadError(
                 "hidden bucket transaction owner missing transaction".to_string(),
@@ -473,9 +479,13 @@ impl BlobHandler {
         key: &HiddenBlobKey,
         marker: &ByteView,
     ) -> Result<LoadUpdate, BlobError> {
-        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
-            BlobError::ReadError("failed to start hidden bucket release".to_string())
-        })?;
+        let mut owner = self
+            .storage
+            .start_transaction(false)
+            .await
+            .map_err(|error| {
+                BlobError::ReadError(format!("failed to start hidden bucket release: {error}"))
+            })?;
         let Some(txn_id) = owner.id() else {
             return Err(BlobError::ReadError(
                 "hidden bucket release owner missing transaction".to_string(),
@@ -711,9 +721,15 @@ impl BlobHandler {
     }
 
     pub(super) async fn clear_marker(&self, location: &BackendLocation) -> Result<(), BlobError> {
-        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
-            BlobError::ReadError("failed to start bucket reservation cleanup".to_string())
-        })?;
+        let mut owner = self
+            .storage
+            .start_transaction(false)
+            .await
+            .map_err(|error| {
+                BlobError::ReadError(format!(
+                    "failed to start bucket reservation cleanup: {error}"
+                ))
+            })?;
         let Some(txn_id) = owner.id() else {
             return Err(BlobError::ReadError(
                 "bucket reservation cleanup owner missing transaction".to_string(),
@@ -781,9 +797,15 @@ impl BlobHandler {
     }
 
     async fn release_marker(&self, location: &BackendLocation) -> Result<ReleaseUpdate, BlobError> {
-        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
-            BlobError::ReadError("failed to start bucket reservation release".to_string())
-        })?;
+        let mut owner = self
+            .storage
+            .start_transaction(false)
+            .await
+            .map_err(|error| {
+                BlobError::ReadError(format!(
+                    "failed to start bucket reservation release: {error}"
+                ))
+            })?;
         let Some(txn_id) = owner.id() else {
             return Err(BlobError::ReadError(
                 "bucket reservation release owner missing transaction".to_string(),
@@ -968,9 +990,13 @@ impl BlobHandler {
         capacity: Option<u64>,
         location: Option<&BackendLocation>,
     ) -> Result<LoadUpdate, BlobError> {
-        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
-            BlobError::ReadError("failed to start bucket stats transaction".to_string())
-        })?;
+        let mut owner = self
+            .storage
+            .start_transaction(false)
+            .await
+            .map_err(|error| {
+                BlobError::ReadError(format!("failed to start bucket stats transaction: {error}"))
+            })?;
         let Some(txn_id) = owner.id() else {
             return Err(BlobError::ReadError(
                 "bucket stats transaction owner missing transaction".to_string(),

@@ -175,7 +175,9 @@ impl Operation for RefreshBlobHoldersOperation {
                 }
                 other => self.unexpected("blob holder timer result", other),
             },
-            RefreshState::Init | RefreshState::Finish | RefreshState::Error => smallvec![],
+            RefreshState::Init | RefreshState::Finish | RefreshState::Error => {
+                self.unexpected("no event in a terminal state", event)
+            }
         }
     }
 
@@ -290,7 +292,9 @@ impl Operation for GetBlobHoldersOperation {
                 Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => self.fail(error.into()),
                 other => self.unexpected("DHT get result", other),
             },
-            GetState::Init | GetState::Finish | GetState::Error => smallvec![],
+            GetState::Init | GetState::Finish | GetState::Error => {
+                self.unexpected("no event in a terminal state", event)
+            }
         }
     }
 
@@ -475,5 +479,37 @@ mod tests {
         })));
 
         assert_eq!(operation.finalize(), Ok(vec![other]));
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut refresh =
+            RefreshBlobHoldersOperation::new(realm_id, node(2), RoCrateLimits::default());
+
+        let effects = refresh.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+            key: DhtKeyId::from_bytes([1; 32]),
+            remote_attempt_count: 1,
+            remote_store_count: 1,
+        })));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            refresh.finalize(),
+            Err(RefreshBlobHoldersError::UnexpectedEvent { .. })
+        ));
+
+        let mut get = GetBlobHoldersOperation::new([4; 32], realm_id, node(9));
+
+        let effects = get.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::Other("offline".to_string()),
+        })));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            get.finalize(),
+            Err(GetBlobHoldersError::UnexpectedEvent { .. })
+        ));
     }
 }

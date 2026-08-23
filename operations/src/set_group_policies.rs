@@ -4,16 +4,18 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument};
+use aruna_core::structs::{
+    Actor, AuthContext, GroupAuthorizationDocument, Permission, PlacementRef, RealmConfigDocument,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
@@ -21,6 +23,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
@@ -29,6 +32,9 @@ use crate::placement::placement_ref_for_target;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetGroupPoliciesConfig {
     pub actor: Actor,
+    /// The caller's own token context, so a path-restricted credential stays
+    /// restricted; it is never derived from `actor`.
+    pub auth_context: AuthContext,
     pub group_id: GroupId,
     pub policies: Vec<RequestPolicy>,
     /// When set, the write applies only if the stored set still hashes to it,
@@ -53,6 +59,7 @@ pub struct SetGroupPoliciesOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum SetGroupPoliciesState {
     Init,
+    Auth,
     StartTransaction,
     ReadCurrent,
     WriteDocumentAndAdminState {
@@ -85,6 +92,8 @@ pub enum SetGroupPoliciesError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("group authorization document missing")]
     GroupAuthDocNotFound,
+    #[error("caller may not write the group configuration")]
+    Unauthorized,
     #[error("stored policy set changed")]
     StaleHash,
     #[error("invalid policy set: {reason}")]
@@ -118,6 +127,13 @@ impl SetGroupPoliciesOperation {
         DocumentSyncTarget::GroupAuthorization {
             group_id: self.config.group_id,
         }
+    }
+
+    fn admin_config_path(&self) -> String {
+        format!(
+            "/{}/g/{}/admin/config",
+            self.config.actor.realm_id, self.config.group_id
+        )
     }
 
     fn admin_target(&self) -> AdminDocumentTarget {
@@ -299,14 +315,45 @@ impl Operation for SetGroupPoliciesOperation {
     type Error = SetGroupPoliciesError;
 
     fn start(&mut self) -> Effects {
-        self.state = SetGroupPoliciesState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return self.fail(SetGroupPoliciesError::Unauthorized);
+        }
+        self.state = SetGroupPoliciesState::Auth;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: self.admin_config_path(),
+                required_permission: Permission::WRITE,
+            }),
+            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
+        ))]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
+            SetGroupPoliciesState::Auth => match event {
+                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                    match allowed {
+                        Ok(true) => {
+                            self.state = SetGroupPoliciesState::StartTransaction;
+                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                                read: false
+                            })]
+                        }
+                        Ok(false) => self.fail(SetGroupPoliciesError::Unauthorized),
+                        Err(error) => {
+                            warn!(error = %error, "Group policy authorization check failed");
+                            match error {
+                                AuthorizationError::StorageError(error) => {
+                                    self.fail(SetGroupPoliciesError::StorageError(error))
+                                }
+                                _ => self.fail(SetGroupPoliciesError::Unauthorized),
+                            }
+                        }
+                    }
+                }
+                other => self.unexpected_event("authorization result", format!("{other:?}")),
+            },
             SetGroupPoliciesState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
@@ -453,12 +500,67 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::{AuthorizationError, StorageError};
+    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::request_policy::RequestPolicy;
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::{Actor, AuthContext, RealmAuthorizationDocument, RealmId};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn actor(realm_id: RealmId) -> Actor {
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn auth(actor: &Actor) -> AuthContext {
+        AuthContext {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    fn group_config(
+        actor: &Actor,
+        group_id: Ulid,
+        policies: Vec<RequestPolicy>,
+        expected_hash: Option<[u8; 32]>,
+    ) -> SetGroupPoliciesConfig {
+        SetGroupPoliciesConfig {
+            actor: actor.clone(),
+            auth_context: auth(actor),
+            group_id,
+            policies,
+            expected_hash,
+        }
+    }
+
+    /// The group creator holds the group admin role, but the permission
+    /// sub-operation also needs the realm authorization document to exist.
+    async fn seed_realm_doc(context: &DriverContext, actor: &Actor) {
+        let document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: (*actor.realm_id.as_bytes()).into(),
+                value: document.to_bytes(actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 
     fn policy(expression: &str) -> RequestPolicy {
         RequestPolicy {
@@ -483,11 +585,7 @@ mod tests {
             compute_handle: None,
         };
         let realm_id = RealmId([23u8; 32]);
-        let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-            user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
-            realm_id,
-        };
+        let actor = actor(realm_id);
         let (group, _) = drive(
             CreateGroupOperation::new(CreateGroupConfig {
                 actor: actor.clone(),
@@ -498,6 +596,7 @@ mod tests {
         )
         .await
         .unwrap();
+        seed_realm_doc(&context, &actor).await;
         (dir, context, actor, group.group_id)
     }
 
@@ -507,12 +606,7 @@ mod tests {
         let (_dir, context, actor, group_id) = setup_group().await;
         let policies = vec![policy("permission == 'write'")];
         let document = drive(
-            SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
-                actor: actor.clone(),
-                group_id,
-                policies: policies.clone(),
-                expected_hash: None,
-            }),
+            SetGroupPoliciesOperation::new(group_config(&actor, group_id, policies.clone(), None)),
             &context,
         )
         .await
@@ -537,24 +631,24 @@ mod tests {
         let empty_hash = policy_set_hash(&[]);
         let first = vec![policy("permission == 'write'")];
         drive(
-            SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
-                actor: actor.clone(),
+            SetGroupPoliciesOperation::new(group_config(
+                &actor,
                 group_id,
-                policies: first.clone(),
-                expected_hash: Some(empty_hash),
-            }),
+                first.clone(),
+                Some(empty_hash),
+            )),
             &context,
         )
         .await
         .unwrap();
 
         let stale = drive(
-            SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
-                actor: actor.clone(),
+            SetGroupPoliciesOperation::new(group_config(
+                &actor,
                 group_id,
-                policies: vec![policy("permission == 'read'")],
-                expected_hash: Some(empty_hash),
-            }),
+                vec![policy("permission == 'read'")],
+                Some(empty_hash),
+            )),
             &context,
         )
         .await;
@@ -574,12 +668,12 @@ mod tests {
         // An uncompilable expression is refused at administration time.
         let (_dir, context, actor, group_id) = setup_group().await;
         let result = drive(
-            SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
-                actor,
+            SetGroupPoliciesOperation::new(group_config(
+                &actor,
                 group_id,
-                policies: vec![policy("path.startsWith(")],
-                expected_hash: None,
-            }),
+                vec![policy("path.startsWith(")],
+                None,
+            )),
             &context,
         )
         .await;
@@ -587,5 +681,121 @@ mod tests {
             result,
             Err(SetGroupPoliciesError::InvalidPolicies { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn refuses_unauthorized_caller() {
+        // A realm member outside the group's admin role writes nothing.
+        let (_dir, context, actor, group_id) = setup_group().await;
+        let outsider = Actor {
+            user_id: UserId::local(Ulid::from_bytes([8u8; 16]), actor.realm_id),
+            ..actor.clone()
+        };
+        let error = drive(
+            SetGroupPoliciesOperation::new(group_config(
+                &outsider,
+                group_id,
+                vec![policy("permission == 'write'")],
+                None,
+            )),
+            &context,
+        )
+        .await
+        .expect_err("an unauthorized caller is refused");
+        assert_eq!(error, SetGroupPoliciesError::Unauthorized);
+
+        let (_, auth_doc) = drive(
+            GetGroupOperation::new(GetGroupConfig { group_id }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(auth_doc.policies.is_empty());
+    }
+
+    #[test]
+    fn start_checks_permission() {
+        let realm_id = RealmId([23u8; 32]);
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetGroupPoliciesOperation::new(group_config(&actor, group_id, Vec::new(), None));
+        let effects = operation.start();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let emitted = format!("{effects:?}");
+        assert!(emitted.contains(&format!("/{realm_id}/g/{group_id}/admin/config")));
+        assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn denied_is_terminal() {
+        let realm_id = RealmId([23u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation = SetGroupPoliciesOperation::new(group_config(
+            &actor,
+            Ulid::from_bytes([5u8; 16]),
+            Vec::new(),
+            None,
+        ));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetGroupPoliciesError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn capacity_not_denied() {
+        // Storage exhaustion inside the check is infrastructure, not a verdict.
+        let realm_id = RealmId([23u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation = SetGroupPoliciesOperation::new(group_config(
+            &actor,
+            Ulid::from_bytes([5u8; 16]),
+            Vec::new(),
+            None,
+        ));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::StorageError(
+                    StorageError::CleanupCapacity,
+                )),
+            },
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetGroupPoliciesError::StorageError(
+                StorageError::CleanupCapacity
+            ))
+        );
+    }
+
+    #[test]
+    fn allowed_starts_transaction() {
+        let realm_id = RealmId([23u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation = SetGroupPoliciesOperation::new(group_config(
+            &actor,
+            Ulid::from_bytes([5u8; 16]),
+            Vec::new(),
+            None,
+        ));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        );
     }
 }

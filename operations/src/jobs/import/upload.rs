@@ -767,7 +767,7 @@ mod tests {
         ));
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -789,7 +789,9 @@ mod tests {
         );
         assert_eq!(
             operation.finalize(),
-            Err(CreateRoCrateUploadError::Storage(StorageError::WriteError))
+            Err(CreateRoCrateUploadError::Storage(StorageError::WriteError(
+                "boom".to_string()
+            )))
         );
     }
 
@@ -803,7 +805,7 @@ mod tests {
             size: 7,
         }));
         let mut effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         for attempt in 0..3 {
             if attempt < 2 {
@@ -813,7 +815,7 @@ mod tests {
                 ));
             }
             effects = operation.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::WriteError,
+                error: StorageError::WriteError("boom".to_string()),
             }));
         }
         let [
@@ -860,7 +862,9 @@ mod tests {
         );
         assert_eq!(
             operation.finalize(),
-            Err(CreateRoCrateUploadError::Storage(StorageError::WriteError))
+            Err(CreateRoCrateUploadError::Storage(StorageError::WriteError(
+                "boom".to_string()
+            )))
         );
     }
 
@@ -875,7 +879,7 @@ mod tests {
             size: 7,
         }));
         operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         operation.step(Event::Storage(StorageEvent::DeleteResult {
             key: upload_key(Ulid::from_bytes([2u8; 16])),
@@ -945,14 +949,14 @@ mod tests {
             assert!(matches!(
                 operation
                     .step(Event::Storage(StorageEvent::Error {
-                        error: StorageError::WriteError,
+                        error: StorageError::WriteError("boom".to_string()),
                     }))
                     .as_slice(),
                 [Effect::Storage(StorageEffect::Write { .. })]
             ));
         }
         let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
 
         assert!(matches!(
@@ -989,7 +993,7 @@ mod tests {
             size: 7,
         }));
         operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         assert!(matches!(
             operation.abort().as_slice(),

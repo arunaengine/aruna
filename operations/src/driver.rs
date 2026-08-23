@@ -750,7 +750,7 @@ impl TransactionTracker {
             (
                 Some(TransactionEffect::Commit(txn_id)),
                 Event::Storage(StorageEvent::Error {
-                    error: StorageError::QueueFull,
+                    error: StorageError::QueueFull | StorageError::CleanupCapacity,
                 }),
             ) => {
                 if self.states.contains_key(&txn_id) {
@@ -2024,12 +2024,26 @@ mod test {
     }
 
     #[test]
+    fn commit_capacity_kept() {
+        // Cleanup capacity proves no commit, so the transaction stays open, not uncertain.
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        let exhausted = Event::Storage(StorageEvent::Error {
+            error: StorageError::CleanupCapacity,
+        });
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        tracker.observe(Some(TransactionEffect::Commit(id)), &exhausted);
+        assert_eq!(tracker.states.get(&id), Some(&TransactionState::Open));
+    }
+
+    #[test]
     fn abort_failure_kept() {
         let id = ulid::Ulid::generate();
         let mut tracker = TransactionTracker::default();
         let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
         let failed = Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         });
         tracker.observe(Some(TransactionEffect::Start), &started);
         tracker.observe(Some(TransactionEffect::Abort(id)), &failed);

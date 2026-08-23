@@ -4,6 +4,7 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::connectors::ApiSourceConnectorKind;
+use crate::routes::jobs::map_submit_error;
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
@@ -51,7 +52,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "staging", description = "Blob staging"))
+    tags((
+        name = "staging",
+        description = "Staging source objects into buckets, inline or as background jobs"
+    ))
 )]
 pub struct StagingApiDoc;
 
@@ -246,7 +250,30 @@ pub struct StagingJobListResponse {
     path = "/staging/",
     tag = "staging",
     summary = "Stage a single source object into a bucket",
-    description = "Requires a bearer token issued for this realm. The body is chosen by its `strategy` field. `snapshot` reads the object from the source connector and commits its bytes to this node's storage before answering, so it is as slow as the transfer; `reference` records the object as a pointer to its source and copies nothing, so the bytes are fetched on demand at read time; `sync` is accepted by the schema but not implemented and always fails. The caller needs WRITE on the target bucket key and READ on the connector's source path, and both are checked against the concrete path, not a prefix alone. The bucket must exist on this node and belong to the given group; a bucket owned by a different group is reported as not found rather than forbidden. Source paths must be relative and confined, so a leading slash or any `.` or `..` segment is rejected. A snapshot is also charged against the realm's quota ceiling for the group and is refused with 403 when it would exceed it. A 201 means the new object version is committed here and immediately readable through S3; propagating that version to any sync target is queued afterwards and is neither awaited nor reported by this response.",
+    description = r#"Stages one source object into a bucket, either by copying its bytes now or by recording a pointer.
+
+**Authentication**: realm bearer token; the caller needs WRITE on the target bucket key and READ on
+the connector's source path, and both are checked against the concrete path, not a prefix alone.
+
+**Behavior**
+- The body is chosen by its `strategy` field.
+- `snapshot` reads the object from the source connector and commits its bytes to this node's storage
+  before answering, so it is as slow as the transfer.
+- `reference` records the object as a pointer to its source and copies nothing, so the bytes are
+  fetched on demand at read time.
+- `sync` is accepted by the schema but not implemented and always fails.
+- A 201 means the new object version is committed here and immediately readable through S3;
+  propagating that version to any sync target is queued afterwards and is neither awaited nor
+  reported by this response.
+
+**Limits**
+- The bucket must exist on this node and belong to the given group.
+- Source paths must be relative and confined, so a leading slash or any `.` or `..` segment is
+  rejected with 400.
+- A snapshot is charged against the realm's quota ceiling for the group.
+
+**Errors**: a bucket owned by a different group is reported as not found rather than forbidden, and
+a snapshot that would exceed the group's quota ceiling is a 403."#,
     request_body(
         content = StageBlobRequest,
         description = "The staging strategy and the source and target it applies to. All five target fields are required, and `strategy` selects between copying the bytes now and recording a reference.",
@@ -303,7 +330,33 @@ pub async fn stage_blob(
     path = "/staging/batch",
     tag = "staging",
     summary = "Stage many source objects in one blocking request",
-    description = "Requires a bearer token issued for this realm. Every object is staged inside this request, one after another, so the call blocks for the whole transfer and a large batch is better submitted as a job instead. The outcome is per item and best effort: a 200 only means the batch ran, and each entry in `results` carries its own `ok` or `error` status, so a caller must inspect them rather than trust the status code. Objects can be named directly in `items` and expanded from `prefixes`, which lists the connector recursively and takes files only; using prefixes additionally requires READ on the group's data path, while individual items are authorized exactly as the single-object endpoint authorizes them. Named and expanded objects together may not exceed 1000, and a prefix that would expand past that limit fails the entire request rather than truncating. `node_id` is optional and, when given, must be this node: staging always runs where the request lands. The `sync` strategy is not implemented and fails the whole request. Error text on a result is deliberately coarse for server-side and upstream failures, which appear only as `Internal server error` and `Bad gateway`. A prefix that cannot be listed contributes one error entry naming that prefix instead of its objects. Items that succeeded are committed here and their propagation to sync targets is queued afterwards.",
+    description = r#"Stages many source objects inside one request, reporting the outcome of each separately.
+
+**Authentication**: realm bearer token; using prefixes additionally requires READ on the group's
+data path, while individual items are authorized exactly as the single-object endpoint authorizes
+them.
+
+**Behavior**
+- Every object is staged inside this request, one after another, so the call blocks for the whole
+  transfer and a large batch is better submitted as a job instead.
+- The outcome is per item and best effort: a 200 only means the batch ran, and each entry in
+  `results` carries its own `ok` or `error` status, so a caller must inspect them rather than trust
+  the status code.
+- Objects can be named directly in `items` and expanded from `prefixes`, which lists the connector
+  recursively and takes files only.
+- A prefix that cannot be listed contributes one error entry naming that prefix instead of its
+  objects.
+- Error text on a result is deliberately coarse for server-side and upstream failures, which appear
+  only as `Internal server error` and `Bad gateway`.
+- Items that succeeded are committed here and their propagation to sync targets is queued
+  afterwards.
+
+**Limits**
+- Named and expanded objects together may not exceed 1000, and a prefix that would expand past that
+  limit fails the entire request rather than truncating.
+- `node_id` is optional and, when given, must be this node: staging always runs where the request
+  lands.
+- The `sync` strategy is not implemented and fails the whole request."#,
     request_body(
         content = StageBatchRequest,
         description = "One connector and target bucket for the whole batch, plus explicit `items`, `prefixes` to expand, or both; leaving both out runs an empty batch. `node_id` defaults to this node.",
@@ -313,27 +366,43 @@ pub async fn stage_blob(
             "bucket": "research-raw",
             "strategy": "reference",
             "items": [
-                {"source_path": "refseq/2026/a.fna.gz", "target_key": "genomes/2026/a.fna.gz"}
+                {
+                    "source_path": "refseq/2026/a.fna.gz",
+                    "target_key": "genomes/2026/a.fna.gz"
+                }
             ],
             "prefixes": [
-                {"source_prefix": "refseq/2026/batch-7", "target_prefix": "genomes/2026/batch-7"}
+                {
+                    "source_prefix": "refseq/2026/batch-7",
+                    "target_prefix": "genomes/2026/batch-7"
+                }
             ]
         })
     ),
     responses(
         (
             status = 200,
-            description = "One result per staged object plus one per prefix that could not be expanded, in that order; individual failures are reported here rather than as a status code",
+            description = "One result per staged object plus one per prefix that could not be expanded, in that order",
             body = StageBatchResponse,
             example = json!({
                 "results": [
-                    {"source_path": "refseq/2026/a.fna.gz", "target_key": "genomes/2026/a.fna.gz", "status": "ok"},
-                    {"source_path": "refseq/2026/batch-7/b.fna.gz", "target_key": "genomes/2026/batch-7/b.fna.gz", "status": "error", "error": "Not found"}
+                    {
+                        "source_path": "refseq/2026/a.fna.gz",
+                        "target_key": "genomes/2026/a.fna.gz",
+                        "status": "ok"
+                    },
+                    {
+                        "source_path": "refseq/2026/batch-7/b.fna.gz",
+                        "target_key": "genomes/2026/batch-7/b.fna.gz",
+                        "status": "error",
+                        "error": "Not found"
+                    }
                 ]
             })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a prefix is not a confined relative path, or the batch would exceed 1000 objects", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or prefixes were given and the caller has no READ on the group's data path", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -450,8 +519,34 @@ pub async fn stage_batch(
     post,
     path = "/staging/jobs",
     tag = "staging",
-    summary = "Submit a staging job to run in the background",
-    description = "Requires a bearer token issued for this realm. Takes the same body as the blocking batch endpoint but returns as soon as the work is recorded: a 202 means the job is durable and queued on this node, and no object has been read, copied or referenced yet. Every named item and every prefix is authorized before the job is accepted, so acceptance already implies READ on each connector source path or prefix and WRITE on each target key or target prefix; nothing is authorized later while the job runs. The bucket must exist on this node and belong to the given group, otherwise the request is not found, and at least one item or prefix is required. Source paths must be relative and confined, target keys must not be blank, and `node_id`, when given, must be this node, because the job runs where it was submitted. The `sync` strategy is not implemented. Unlike the blocking endpoint there is no cap on the number of items, and no request-side prefix expansion happens: prefixes are stored and walked by the job. There is no idempotency key, so every call creates a new job, `created` is always true, and resubmitting the same body stages the same objects a second time. Progress and completion are observed by reading the job by its id.",
+    summary = "Submit a background staging job",
+    description = r#"Records a staging batch as a durable job on this node and returns before any object is read.
+
+**Authentication**: realm bearer token; every named item and every prefix is authorized before the
+job is accepted, so acceptance already implies READ on each connector source path or prefix and
+WRITE on each target key or target prefix. Nothing is authorized later while the job runs.
+
+**Behavior**
+- Takes the same body as the blocking batch endpoint but returns as soon as the work is recorded: a
+  202 means the job is durable and queued on this node, and no object has been read, copied or
+  referenced yet.
+- Unlike the blocking endpoint there is no cap on the number of items, and no request-side prefix
+  expansion happens: prefixes are stored and walked by the job.
+- There is no idempotency key, so every call creates a new job, `created` is always true, and
+  resubmitting the same body stages the same objects a second time.
+- Progress and completion are observed by reading the job by its id.
+
+**Limits**
+- The bucket must exist on this node and belong to the given group, otherwise the request is not
+  found.
+- At least one item or prefix is required.
+- Source paths must be relative and confined, and target keys must not be blank.
+- `node_id`, when given, must be this node, because the job runs where it was submitted.
+- The `sync` strategy is not implemented.
+
+**Errors**: a refusal from job admission keeps its own status instead of collapsing into a 500. An
+unavailable job placement binding or an unhealthy structured id clock is a 503 carrying
+`Retry-After`, so the identical body may be resubmitted; a storage failure stays a 500."#,
     request_body(
         content = StageBatchRequest,
         description = "One connector and target bucket for the job, plus the `items` and `prefixes` it should stage; at least one of the two must be non-empty. `node_id` defaults to this node.",
@@ -461,7 +556,10 @@ pub async fn stage_batch(
             "bucket": "research-raw",
             "strategy": "snapshot",
             "prefixes": [
-                {"source_prefix": "refseq/2026", "target_prefix": "genomes/2026"}
+                {
+                    "source_prefix": "refseq/2026",
+                    "target_prefix": "genomes/2026"
+                }
             ]
         })
     ),
@@ -470,12 +568,17 @@ pub async fn stage_batch(
             status = 202,
             description = "The job is durably queued on this node; `created` is always true because staging jobs are never deduplicated",
             body = SubmitStagingJobResponse,
-            example = json!({"job_id": "01JJOB0123456789ABCDEFGHJ", "created": true})
+            example = json!({
+                "job_id": "01JJOB0123456789ABCDEFGHJ",
+                "created": true
+            })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path or prefix is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller lacks READ on a source path or WRITE on a target key", body = ErrorResponse),
-        (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse)
+        (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse),
+        (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
+        (status = 503, description = "Job placement or the structured id clock is unavailable; retry the same body", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -581,7 +684,7 @@ pub async fn submit_staging(
         state.rocrate_limits().artifact_retention_ms,
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(map_submit_error)?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -596,8 +699,19 @@ pub async fn submit_staging(
     get,
     path = "/staging/jobs",
     tag = "staging",
-    summary = "List the staging jobs you submitted to this node",
-    description = "Requires a bearer token issued for this realm. Lists only the calling user's own staging jobs that are owned by this node, so a job submitted to another node is not visible here and must be listed there; other users' jobs and non-staging jobs never appear. A path-restricted token sees only the jobs submitted under exactly the same restrictions. Jobs come back oldest first by submission time. Each entry carries the job's own progress and per-object errors as last checkpointed by the runner, so a running job's counts trail the work slightly and a job that has not started yet reports the queued phase with zero progress.",
+    summary = "List your staging jobs on this node",
+    description = r#"Returns one page of the calling user's own staging jobs that this node owns, oldest first.
+
+**Authentication**: realm bearer token; a path-restricted token sees only the jobs submitted under
+exactly the same restrictions.
+
+**Behavior**
+- A job submitted to another node is not visible here and must be listed there; other users' jobs
+  and non-staging jobs never appear.
+- Jobs come back oldest first by submission time.
+- Each entry carries the job's own progress and per-object errors as last checkpointed by the
+  runner, so a running job's counts trail the work slightly and a job that has not started yet
+  reports the queued phase with zero progress."#,
     params(
         ("limit" = Option<usize>, Query, description = "Page size; defaults to 50 when absent or zero and is capped at 200"),
         ("cursor" = Option<String>, Query, description = "Opaque cursor returned as `next_cursor` by the previous page, passed back unchanged. Omit for the first page; a cursor that does not decode is rejected")
@@ -676,7 +790,24 @@ pub async fn list_staging_jobs(
     path = "/staging/jobs/{job_id}",
     tag = "staging",
     summary = "Read one staging job and its progress",
-    description = "Requires a bearer token issued for this realm. The job is always answered by the node that owns it: a request that lands anywhere else is forwarded to that owner with the caller's own token, so the same id can be read from any node in the realm and the answer is the owner's current record rather than a replica. Only the owner decides that a job does not exist, and a job created by another user, a non-staging job, and a job whose restrictions do not match the presenting token are all reported as not found rather than forbidden. `state` collapses the lifecycle into queued, running, done or failed, while `phase` names the stage the runner last checkpointed, so a job can read as running long before any bytes move. `progress` and `errors` come from that same checkpoint, so they trail the work slightly; per-object failures are listed in `errors` while the job as a whole may still succeed, and `finished_at` is set only once the job has stopped.",
+    description = r#"Returns one staging job as the node that owns it currently records it, with its progress.
+
+**Authentication**: realm bearer token, which is forwarded unchanged when the job belongs to another
+node.
+
+**Behavior**
+- The job is always answered by the node that owns it: a request that lands anywhere else is
+  forwarded to that owner with the caller's own token, so the same id can be read from any node in
+  the realm and the answer is the owner's current record rather than a replica.
+- `state` collapses the lifecycle into queued, running, done or failed, while `phase` names the
+  stage the runner last checkpointed, so a job can read as running long before any bytes move.
+- `progress` and `errors` come from that same checkpoint, so they trail the work slightly;
+  per-object failures are listed in `errors` while the job as a whole may still succeed, and
+  `finished_at` is set only once the job has stopped.
+
+**Errors**: only the owner decides that a job does not exist, and a job created by another user, a
+non-staging job, and a job whose restrictions do not match the presenting token are all reported as
+not found rather than forbidden."#,
     params(("job_id" = String, Path, description = "Staging job id as a 26-character ULID, as returned when the job was submitted")),
     responses(
         (
@@ -747,7 +878,23 @@ pub async fn get_staging_job(
     path = "/staging/references",
     tag = "staging",
     summary = "List a bucket's objects with their source bindings",
-    description = "Requires a bearer token issued for this realm and READ on the bucket; the bucket's owning group is resolved first, so a bucket unknown to this node is not found and the permission check always runs against the group that owns it. This is a node-local listing of the bucket as this node currently sees it, so objects written elsewhere appear once they have replicated here. Every live object is returned, materialized and referenced alike, which is what lets a caller total a bucket in one pass: `referenced` false means the bytes are stored here and `size` is the stored blob size, while `referenced` true means the object is still only a pointer, `size` is the length its source reported, and `kind` with `source_path` describe where it points, `connector_id` for an external source connector or `origin_node_id` for another Aruna node. Those four fields are omitted entirely for a materialized object. Objects are listed in key order and pagination is by opaque cursor.",
+    description = r#"Lists a bucket's live objects in key order, saying for each whether it is stored here or referenced.
+
+**Authentication**: realm bearer token with READ on the bucket; the bucket's owning group is
+resolved first, so a bucket unknown to this node is not found and the permission check always runs
+against the group that owns it.
+
+**Behavior**
+- This is a node-local listing of the bucket as this node currently sees it, so objects written
+  elsewhere appear once they have replicated here.
+- Every live object is returned, materialized and referenced alike, which is what lets a caller
+  total a bucket in one pass.
+- `referenced` false means the bytes are stored here and `size` is the stored blob size.
+- `referenced` true means the object is still only a pointer, `size` is the length its source
+  reported, and `kind` with `source_path` describe where it points, `connector_id` for an external
+  source connector or `origin_node_id` for another Aruna node.
+- Those four fields are omitted entirely for a materialized object.
+- Objects are listed in key order and pagination is by opaque cursor."#,
     params(
         ("bucket" = String, Query, description = "Bucket to list, as used by the S3 surface; required"),
         ("prefix" = Option<String>, Query, description = "Return only objects whose key starts with this prefix; an empty value is treated as no prefix"),
@@ -761,7 +908,11 @@ pub async fn get_staging_job(
             body = ReferenceListResponse,
             example = json!({
                 "entries": [
-                    {"key": "genomes/2026/a.fna.gz", "size": 1048576, "referenced": false},
+                    {
+                        "key": "genomes/2026/a.fna.gz",
+                        "size": 1048576,
+                        "referenced": false
+                    },
                     {
                         "key": "genomes/2026/b.fna.gz",
                         "size": 2097152,
@@ -1699,6 +1850,24 @@ mod tests {
             .await
             .is_some(),
             "durable obligation should remain repairable when staging queue kick fails"
+        );
+    }
+
+    #[test]
+    fn staging_submit_classifies() {
+        // Job admission refusals must keep their status instead of collapsing into 500.
+        use aruna_operations::jobs::submit::SubmitJobError;
+
+        assert_eq!(
+            map_submit_error(SubmitJobError::PlacementUnavailable(
+                "no binding".to_string()
+            ))
+            .status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            map_submit_error(SubmitJobError::InvalidWorkspace("bad".to_string())).status_code(),
+            StatusCode::BAD_REQUEST
         );
     }
 

@@ -372,6 +372,8 @@ impl PermissionRulesOperation {
         ) = (self.state, event)
         {
             if self.txn_id == Some(txn_id) {
+                // The transaction is committed, so no later failure may abort it.
+                self.txn_id = None;
                 match self.emit_rules() {
                     Ok(effects) => effects,
                     Err(err) => self.fail(err),
@@ -584,9 +586,6 @@ impl Operation for PermissionRulesOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        if self.is_complete() {
-            return smallvec![];
-        }
         let event = match self.fail_on_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -599,7 +598,9 @@ impl Operation for PermissionRulesOperation {
             PermissionRulesState::CollectRules => self.handle_commit(event),
             PermissionRulesState::Finish
             | PermissionRulesState::Init
-            | PermissionRulesState::Error => smallvec![],
+            | PermissionRulesState::Error => {
+                self.unexpected_event(self.state, "no event", format!("{event:?}"))
+            }
         }
     }
 
@@ -631,6 +632,7 @@ mod test {
 
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::AuthorizationError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::operation::Operation;
@@ -978,5 +980,66 @@ mod test {
         assert!(effects.is_empty());
         assert!(failed.is_complete());
         assert!(failed.finalize().is_err());
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let realm_id = RealmId([6u8; 32]);
+        let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
+            auth_context: AuthContext::anonymous(realm_id),
+            path: format!("/{realm_id}/admin"),
+        });
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AuthorizationError::UnexpectedEvent { .. })
+        ));
+    }
+
+    // A completed collection must reject a late event without aborting the
+    // transaction it already committed.
+    #[test]
+    fn finished_rejects_event() {
+        let realm_id = RealmId([16u8; 32]);
+        let txn_id = Ulid::from(17u128);
+        let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
+            auth_context: AuthContext::anonymous(realm_id),
+            path: format!("/{realm_id}/admin"),
+        });
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let realm = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(postcard::to_allocvec(&realm).unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: committed
+            })] if *committed == txn_id
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(operation.is_complete());
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AuthorizationError::UnexpectedEvent { .. })
+        ));
     }
 }

@@ -1227,7 +1227,7 @@ fn storage_proxy(
             while let Ok((effect, response, _span, _queued, _in_flight)) = receiver.recv() {
                 if thread_faulty.load(Ordering::Acquire) && bucket_read(&effect) {
                     response.send(StorageEvent::Error {
-                        error: StorageError::ReadError,
+                        error: StorageError::ReadError("boom".to_string()),
                     });
                     continue;
                 }

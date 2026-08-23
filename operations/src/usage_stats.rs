@@ -559,7 +559,7 @@ impl Operation for LoadUsageCountersOperation {
             LoadUsageCountersState::ReadGlobal => self.handle_global_read(event),
             LoadUsageCountersState::Init
             | LoadUsageCountersState::Finish
-            | LoadUsageCountersState::Error => smallvec![],
+            | LoadUsageCountersState::Error => self.unexpected_event("no event", event),
         }
     }
 
@@ -1011,7 +1011,13 @@ impl Operation for RebuildUsageStatsOperation {
                 self.handle_stale_counters_deleted(event)
             }
             RebuildUsageStatsState::CommitTransaction => self.handle_transaction_committed(event),
-            RebuildUsageStatsState::Finish | RebuildUsageStatsState::Error => smallvec![],
+            RebuildUsageStatsState::Finish | RebuildUsageStatsState::Error => {
+                self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -3142,5 +3148,34 @@ mod tests {
                 .map(|bytes| UsageCounters::from_bytes(&bytes).unwrap().logical_bytes),
             Some(15)
         );
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let stray = || {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: TxnId::generate(),
+            })
+        };
+
+        let mut load = LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+        load.step(stray());
+        assert!(matches!(
+            load.finalize(),
+            Err(LoadUsageCountersError::UnexpectedEvent { .. })
+        ));
+
+        let mut rebuild = RebuildUsageStatsOperation::new();
+        rebuild.start();
+        rebuild.step(stray());
+        rebuild.step(stray());
+        assert!(matches!(
+            rebuild.finalize(),
+            Err(RebuildUsageStatsError::InvalidStateEvent {
+                state: RebuildUsageStatsState::Error,
+                ..
+            })
+        ));
     }
 }

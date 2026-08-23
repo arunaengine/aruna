@@ -57,17 +57,32 @@ fn rocrate_location(document_id: Ulid) -> String {
     path = "/pid/{document_id}",
     tag = "pid",
     summary = "Resolve a w3id persistent identifier",
-    description = "Public landing route for the ordinary identity https://w3id.org/aruna/{document_id}; a Profile's mapping uses /profile/{document_id}, so this ordinary path returns 404 for a Profile and never acts as a duplicate PID. No bearer token is required or read. An active public identifier answers 302 to the document's RO-Crate read route, which applies its own authorization. A terminal tombstone answers 410. Unknown, malformed, private, requested, processing and failed identifiers answer 404. When the single PID authority is unreachable the answer is 503 rather than a false 404.",
+    description = r#"Public landing route for the ordinary identity `https://w3id.org/aruna/{document_id}`.
+
+**Authentication**: none; public route, no bearer token is required or read.
+
+**Behavior**
+- A Profile's mapping uses `/profile/{document_id}`, so this ordinary path returns 404 for a Profile
+  and never acts as a duplicate PID.
+- An active public identifier answers 302 to the document's RO-Crate read route, which applies its
+  own authorization.
+- A terminal tombstone answers 410.
+- Unknown, malformed, private, `requested`, `processing` and `failed` identifiers answer 404.
+
+**Errors**: when the single PID authority is unreachable the answer is 503 rather than a false 404."#,
     params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID, for example 01JMETADATA0123456789ABCDE")),
     responses(
-        (status = 302, description = "Registered identifier; the Location header points at /api/v1/metadata/{document_id}/rocrate and the body is empty"),
+        (status = 302, description = "Registered identifier; the Location header points at the RO-Crate read route and the body is empty"),
         (status = 404, description = "No identifier is registered for this document, or the identifier is malformed; the body is empty"),
         (
             status = 410,
             description = "The identifier was withdrawn and stays withdrawn",
             body = Object,
             content_type = "application/json",
-            example = json!({"pid": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE", "status": "withdrawn"})
+            example = json!({
+                "pid": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                "status": "withdrawn"
+            })
         ),
         (status = 503, description = "The PID authority is unreachable; retry the same request later")
     ),
@@ -96,7 +111,15 @@ async fn resolve_pid(
     path = "/profile/{document_id}",
     tag = "pid",
     summary = "Resolve a Profile w3id persistent identifier",
-    description = "Public landing route for the Profile identity https://w3id.org/aruna/profile/{document_id}. It resolves only when that exact value is the document's stored automatic primary PID; ordinary Datasets return 404 here. Response privacy, 302/410 lifecycle behavior and 503 authority handling are identical to GET /pid/{document_id}.",
+    description = r#"Public landing route for the Profile identity `https://w3id.org/aruna/profile/{document_id}`.
+
+**Authentication**: none; public route.
+
+**Behavior**
+- Resolves only when that exact value is the document's stored automatic primary PID; ordinary
+  Datasets return 404 here.
+- Response privacy, 302 and 410 lifecycle behavior and 503 authority handling are identical to
+  `GET /pid/{document_id}`."#,
     params(("document_id" = String, Path, description = "Profile document ULID")),
     responses(
         (status = 302, description = "Active public Profile identifier"),
@@ -277,21 +300,39 @@ async fn require_status_visibility(
     path = "/metadata/{document_id}/pids",
     tag = "pid",
     summary = "List a document's typed persistent identifiers",
-    description = "Returns the one stored automatic w3id record as a typed list while storage remains keyed 1:1 by document. Stored mapping state is authoritative for requested, processing, active, failed, admin-withdrawn and tombstoned, including its job reference and failure/retry data; job-read failure is never interpreted as unminted. A missing or unavailable authority mapping is unknown. Public records may be read anonymously; a private record returns 404 anonymously and requires READ on its frozen document permission path when authenticated.",
+    description = r#"Returns the one stored automatic w3id record for a document as a typed list.
+
+**Authentication**: optional bearer token; public records may be read anonymously, while a private
+record returns 404 anonymously and requires READ on its frozen document permission path when
+authenticated.
+
+**Behavior**
+- Storage remains keyed 1:1 by document, so the list carries the single automatic w3id record.
+- Stored mapping state is authoritative for `requested`, `processing`, `active`, `failed`,
+  `admin-withdrawn` and `tombstoned`, including its job reference and failure/retry data.
+- A job-read failure is never interpreted as unminted.
+- A missing or unavailable authority mapping is reported as `unknown`."#,
     params(("document_id" = String, Path, description = "Metadata document ULID")),
     responses(
-        (status = 200, description = "Typed list containing the automatic w3id status", body = [PersistentIdView], example = json!([{
-            "kind": "conceptual",
-            "provider": "w3id",
-            "value": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
-            "state": "active",
-            "document_id": "01JMETADATA0123456789ABCDE",
-            "job_id": "01JABCDEF0123456789ABCDEFG",
-            "failure": null,
-            "requested_at_ms": 1755500000000u64,
-            "minted_at_ms": 1755500001000u64,
-            "withdrawn_at_ms": null
-        }])),
+        (
+            status = 200,
+            description = "Typed list containing the automatic w3id status",
+            body = [PersistentIdView],
+            example = json!([
+                {
+                    "kind": "conceptual",
+                    "provider": "w3id",
+                    "value": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                    "state": "active",
+                    "document_id": "01JMETADATA0123456789ABCDE",
+                    "job_id": "01JABCDEF0123456789ABCDEFG",
+                    "failure": null,
+                    "requested_at_ms": 1755500000000u64,
+                    "minted_at_ms": 1755500001000u64,
+                    "withdrawn_at_ms": null
+                }
+            ])
+        ),
         (status = 400, description = "Malformed document id", body = ErrorResponse),
         (status = 403, description = "Authenticated caller lacks READ", body = ErrorResponse),
         (status = 404, description = "Unknown document or anonymous private status", body = ErrorResponse)
@@ -362,7 +403,21 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerR
     path = "/pid/{document_id}",
     tag = "pid",
     summary = "Withdraw a document's w3id persistent identifier",
-    description = "Exceptional administration route. It requires an unrestricted realm bearer token and WRITE on /{realm}/admin/pids/{document_id}; document WRITE alone is deliberately insufficient. The JSON body must name provider w3id, confirm the exact stored PID value and contain a non-empty reason. The authority stores admin-withdrawn, actor and reason and writes a WithdrawPersistentId metadata audit row in the same transaction. Normal document deletion instead stores tombstoned. The transition is terminal and idempotent.",
+    description = r#"Exceptional administration route that terminally withdraws a document's w3id identifier.
+
+**Authentication**: unrestricted realm bearer token with WRITE on
+`/{realm}/admin/pids/{document_id}`; document WRITE alone is deliberately insufficient.
+
+**Behavior**
+- The authority stores `admin-withdrawn`, the actor and the reason, and writes a
+  `WithdrawPersistentId` metadata audit row in the same transaction.
+- Normal document deletion instead stores `tombstoned`.
+- The transition is terminal and idempotent.
+
+**Limits** (all refused with 400)
+- `provider` must be `w3id`; no other provider is accepted.
+- `confirm_pid` must equal the stored PID value exactly.
+- `reason` is trimmed first and must then be 1 to 1024 bytes long and free of control characters."#,
     params(("document_id" = String, Path, description = "Document ULID whose PID is withdrawn, for example 01JMETADATA0123456789ABCDE")),
     request_body(
         content = WithdrawPersistentIdRequest,

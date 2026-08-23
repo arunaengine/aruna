@@ -1923,7 +1923,7 @@ mod tests {
         assert_create_event_append(append.as_slice(), document_id, &actor);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::WriteError,
+            error: aruna_core::errors::StorageError::WriteError("boom".to_string()),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -1933,7 +1933,7 @@ mod tests {
         assert_eq!(
             operation.finalize(),
             Err(CreateMetadataDocumentError::StorageError(
-                aruna_core::errors::StorageError::WriteError,
+                aruna_core::errors::StorageError::WriteError("boom".to_string()),
             ))
         );
     }

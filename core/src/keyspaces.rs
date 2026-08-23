@@ -196,3 +196,20 @@ pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";
 pub const CRAQLE_QUADS_KEYSPACE: &str = "quads";
 pub const CRAQLE_GRAPHS_KEYSPACE: &str = "graphs";
 pub const CRAQLE_LOG_KEYSPACE: &str = "log";
+
+/// Cleanup keyspaces record the work a finished transaction still owes, so
+/// storage must admit their writes ahead of the ordinary write queue.
+pub fn is_cleanup_keyspace(key_space: &str) -> bool {
+    key_space == BLOB_CLEANUP_KEYSPACE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, is_cleanup_keyspace};
+
+    #[test]
+    fn classifies_cleanup_keyspace() {
+        assert!(is_cleanup_keyspace(BLOB_CLEANUP_KEYSPACE));
+        assert!(!is_cleanup_keyspace(BLOB_LOCATIONS_KEYSPACE));
+    }
+}

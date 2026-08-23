@@ -100,3 +100,12 @@ pub mod update_metadata_document;
 pub mod update_user;
 pub mod usage_stats;
 pub mod user_subject_index;
+
+/// Deterministic member order for records that several nodes must byte-match.
+pub(crate) fn sorted_user_ids(
+    user_ids: &std::collections::HashSet<aruna_core::types::UserId>,
+) -> Vec<aruna_core::types::UserId> {
+    let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
+    user_ids.sort();
+    user_ids
+}

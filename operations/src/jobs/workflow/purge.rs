@@ -310,6 +310,7 @@ async fn authorize_object(
             JobError::permanent(format!("purge object authorization failed: {error}"))
         }
         AuthorizeError::CheckFailed(_)
+        | AuthorizeError::Storage(_)
         | AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_)) => {
             JobError::retryable(format!("purge object authorization failed: {error}"))
         }

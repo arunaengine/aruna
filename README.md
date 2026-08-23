@@ -1,9 +1,9 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-APACHE)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT)
-![CI](https://github.com/arunaengine/aruna/actions/workflows/test.yml/badge.svg)
-[![Codecov](https://codecov.io/github/arunaengine/aruna/coverage.svg?branch=main)](https://codecov.io/gh/ArunaStorage/aruna)
-[![dependency status](https://deps.rs/repo/github/ArunaStorage/aruna/status.svg?path=components%2Fserver)](https://deps.rs/repo/github/ArunaStorage/aruna?path=components%2Fserver)
+![CI](https://github.com/arunaengine/aruna/actions/workflows/ci.yml/badge.svg)
+[![Codecov](https://codecov.io/github/arunaengine/aruna/coverage.svg?branch=main)](https://codecov.io/gh/arunaengine/aruna)
+[![dependency status](https://deps.rs/repo/github/arunaengine/aruna/status.svg)](https://deps.rs/repo/github/arunaengine/aruna)
 ___
 
 <p align="center">
@@ -72,7 +72,7 @@ The quickest way to try Aruna is a local 3-node demo deployment.
 
 #### For local builds:
 
-- Rust `1.95.0+` (for source builds)
+- Rust `1.97.1` (see [rust-toolchain.toml](rust-toolchain.toml), for source builds)
 - OpenSSL development headers
 - `mold` linker
 
@@ -150,7 +150,7 @@ Additional nodes join an existing realm by setting `ONBOARDING_SECRET` on their 
 
 Onboarding only takes effect on a fresh data directory. Once a node has persisted state, later `.env` changes — including a new `ONBOARDING_SECRET` — do not re-bootstrap or re-onboard it. To repeat an onboarding or bootstrap flow, point the node at a fresh `STORAGE_PATH`.
 
-For a ready-made multi-node onboarding flow, use `just test-deploy` instead of walking through the onboarding APIs manually.
+For a ready-made multi-node onboarding flow, use `just local-cluster` instead of walking through the onboarding APIs manually.
 
 ## Durability Configuration
 
