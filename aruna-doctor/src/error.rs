@@ -73,10 +73,6 @@ pub enum CliError {
     },
     #[error("OIDC provider '{0}' is not configured")]
     OidcProviderNotFound(String),
-    #[error("OIDC flow requires both --oidc-username and --oidc-password")]
-    MissingOidcCredentials,
-    #[error("OIDC flow cannot be combined with positional user_id or expiry")]
-    InvalidOidcCreateTokenArgs,
     #[error("OIDC flow requires local Aruna HTTP address to be configured")]
     MissingArunaHttpAddress,
     #[error("Local bootstrap flow requires --name")]
