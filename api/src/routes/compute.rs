@@ -285,18 +285,48 @@ async fn require_config_admin(
     path = "/admin/compute/config",
     tag = "compute",
     summary = "Read the realm compute configuration",
-    description = "Requires a bearer token issued for this realm and READ on the realm configuration path. This is the operator knowledge no node can measure for itself: the directed bandwidth between placement locations the planner estimates transfers with, the bandwidth to assume for a link nobody configured, how long an availability sample still counts for ranking, the per-rank delay of the leaderless witness schedule, and the standing compute quotas new admissions are decided against. It is a node-local read of the replicated realm configuration, so a change written on another node can be missing here until it arrives. A quota dimension that is absent is unbounded, never zero, and a group entry replaces the realm default wholesale rather than merging with it.",
+    description = r#"Returns the realm compute configuration this node currently holds.
+
+**Authentication**: bearer token issued for this realm, with READ on the realm configuration path.
+
+**Behavior**
+- Reports the operator knowledge no node can measure for itself: the directed bandwidth between
+  placement locations the planner estimates transfers with, the bandwidth to assume for a link
+  nobody configured, how long an availability sample still counts for ranking, the per-rank delay
+  of the leaderless witness schedule, and the standing compute quotas new admissions are decided
+  against.
+- A node-local read of the replicated realm configuration, so a change written on another node can
+  be missing here until it arrives.
+- A quota dimension that is absent is unbounded, never zero, and a group entry replaces the realm
+  default wholesale rather than merging with it.
+
+**Errors**: only a genuinely absent document is a 404; a read or decode failure is a 500, because
+absence was never established."#,
     responses(
         (status = 200, description = "The compute configuration this node currently holds", body = ComputeConfigBody, example = json!({
-            "links": [{"from": "eu-west", "to": "us-east", "bandwidth_bytes_per_sec": 125000000_i64}],
+            "links": [
+                {
+                    "from": "eu-west",
+                    "to": "us-east",
+                    "bandwidth_bytes_per_sec": 125000000_i64
+                }
+            ],
             "pessimistic_bandwidth_bytes_per_sec": 12500000_i64,
             "availability_stale_after_ms": 300000,
             "witness_base_delay_ms": 30000,
-            "default_group_quota": {"max_jobs": 32, "max_cpu_cores": 128},
-            "group_quotas": [{
-                "group_id": "01JABCDEF0123456789ABCDEFG",
-                "quota": {"max_jobs": 8, "max_job_walltime_ms": 3600000}
-            }]
+            "default_group_quota": {
+                "max_jobs": 32,
+                "max_cpu_cores": 128
+            },
+            "group_quotas": [
+                {
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "quota": {
+                        "max_jobs": 8,
+                        "max_job_walltime_ms": 3600000
+                    }
+                }
+            ]
         })),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
@@ -324,39 +354,91 @@ pub async fn get_compute_config(
     path = "/admin/compute/config",
     tag = "compute",
     summary = "Replace the realm compute configuration",
-    description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path. The body replaces the stored configuration wholesale rather than patching it: links and group quotas absent from it are dropped, so send the complete intended configuration. Link direction matters, because asymmetric uplinks between sites are the normal case, and both a duplicate directed pair and a zero bandwidth are refused with 400 instead of being clamped, since a zero would make one transfer estimate infinite. `witness_base_delay_ms` must be greater than zero: it is the per-rank fallback delay of the leaderless schedule, and zero would let every witness plan at once. Quotas bound NEW logical admissions only. Lowering one never cancels, pauses or reclaims work that is already admitted, queued, preparing or running, and because the demand view is replicated a concurrent partition may overshoot a cap before it converges; the only consequence of an observed overshoot is that further admissions are refused. The change is published through the shared realm-configuration path, so a concurrent update converges instead of one writer silently winning, and it takes effect on other nodes as the configuration propagates.",
+    description = r#"Replaces the stored realm compute configuration with the submitted one.
+
+**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path.
+
+**Behavior**
+- The body replaces the stored configuration wholesale rather than patching it: links and group
+  quotas absent from it are dropped, so send the complete intended configuration.
+- Link direction matters, because asymmetric uplinks between sites are the normal case.
+- Quotas bound new logical admissions only. Lowering one never cancels, pauses or reclaims work
+  that is already admitted, queued, preparing or running.
+- The demand view is replicated, so a concurrent partition may overshoot a cap before it converges;
+  the only consequence of an observed overshoot is that further admissions are refused.
+- The change is published through the shared realm-configuration path, so a concurrent update
+  converges instead of one writer silently winning, and it takes effect on other nodes as the
+  configuration propagates.
+
+**Limits** (all refused with 400)
+- A duplicate directed link pair and a zero bandwidth are refused instead of clamped, since a zero
+  would make one transfer estimate infinite.
+- `witness_base_delay_ms` must be greater than zero: it is the per-rank fallback delay of the
+  leaderless schedule, and zero would let every witness plan at once."#,
     request_body(
         content = ComputeConfigBody,
         description = "The complete compute configuration to store",
         example = json!({
             "links": [
-                {"from": "eu-west", "to": "us-east", "bandwidth_bytes_per_sec": 125000000_i64},
-                {"from": "us-east", "to": "eu-west", "bandwidth_bytes_per_sec": 62500000_i64}
+                {
+                    "from": "eu-west",
+                    "to": "us-east",
+                    "bandwidth_bytes_per_sec": 125000000_i64
+                },
+                {
+                    "from": "us-east",
+                    "to": "eu-west",
+                    "bandwidth_bytes_per_sec": 62500000_i64
+                }
             ],
             "pessimistic_bandwidth_bytes_per_sec": 12500000_i64,
             "availability_stale_after_ms": 300000,
             "witness_base_delay_ms": 30000,
-            "default_group_quota": {"max_jobs": 32, "max_cpu_cores": 128},
-            "group_quotas": [{
-                "group_id": "01JABCDEF0123456789ABCDEFG",
-                "quota": {"max_jobs": 8, "max_job_walltime_ms": 3600000}
-            }]
+            "default_group_quota": {
+                "max_jobs": 32,
+                "max_cpu_cores": 128
+            },
+            "group_quotas": [
+                {
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "quota": {
+                        "max_jobs": 8,
+                        "max_job_walltime_ms": 3600000
+                    }
+                }
+            ]
         })
     ),
     responses(
         (status = 200, description = "The compute configuration now stored in the realm configuration", body = ComputeConfigBody, example = json!({
             "links": [
-                {"from": "eu-west", "to": "us-east", "bandwidth_bytes_per_sec": 125000000_i64},
-                {"from": "us-east", "to": "eu-west", "bandwidth_bytes_per_sec": 62500000_i64}
+                {
+                    "from": "eu-west",
+                    "to": "us-east",
+                    "bandwidth_bytes_per_sec": 125000000_i64
+                },
+                {
+                    "from": "us-east",
+                    "to": "eu-west",
+                    "bandwidth_bytes_per_sec": 62500000_i64
+                }
             ],
             "pessimistic_bandwidth_bytes_per_sec": 12500000_i64,
             "availability_stale_after_ms": 300000,
             "witness_base_delay_ms": 30000,
-            "default_group_quota": {"max_jobs": 32, "max_cpu_cores": 128},
-            "group_quotas": [{
-                "group_id": "01JABCDEF0123456789ABCDEFG",
-                "quota": {"max_jobs": 8, "max_job_walltime_ms": 3600000}
-            }]
+            "default_group_quota": {
+                "max_jobs": 32,
+                "max_cpu_cores": 128
+            },
+            "group_quotas": [
+                {
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "quota": {
+                        "max_jobs": 8,
+                        "max_job_walltime_ms": 3600000
+                    }
+                }
+            ]
         })),
         (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, or a zero witness delay", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
@@ -408,30 +490,69 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
     path = "/admin/compute/snapshots",
     tag = "compute",
     summary = "Read the observed compute demand and reservation snapshots",
-    description = "Requires a bearer token issued for this realm and READ on the realm configuration path. Two different controls are reported side by side and are never summed: logical admitted demand, which is what the standing group quota is decided against, and exact physical reservations, which is capacity a target actually holds for accepted executions. Every publisher stamps its snapshot with its membership and publisher generations plus the time it observed them, so a stale or superseded advertisement is recognisable rather than silently averaged in. All totals are approximate: they merge what this node has replicated, so a partition may overshoot a cap before convergence, and `demand_truncated` marks a publisher whose snapshot understates it, either because a group holds more nonterminal families than the snapshot names or because whole groups could not be named at all. Passing `group_id` adds that group's merged demand next to the standing quota it is judged against; a family that several holders admitted still counts once. `departure` is present only when this node itself departed and reports the executions it could not resolve, which are unresolved rather than finished: a departing node never declares a remotely observed execution terminal, and removal is never blocked because those copies or executions exist.",
+    description = r#"Reports the compute demand and reservation snapshots this node has replicated.
+
+**Authentication**: bearer token issued for this realm, with READ on the realm configuration path.
+
+**Behavior**
+- Two different controls are reported side by side and are never summed: logical admitted demand,
+  which is what the standing group quota is decided against, and exact physical reservations, which
+  is capacity a target actually holds for accepted executions.
+- Every publisher stamps its snapshot with its membership and publisher generations plus the time
+  it observed them, so a stale or superseded advertisement is recognizable rather than silently
+  averaged in.
+- Passing `group_id` adds that group's merged demand next to the standing quota it is judged
+  against; a family that several holders admitted still counts once.
+- `departure` is present only when this node itself departed and reports the executions it could
+  not resolve, which are unresolved rather than finished: a departing node never declares a
+  remotely observed execution terminal, and removal is never blocked because those copies or
+  executions exist.
+
+**Limits**
+- All totals are approximate: they merge what this node has replicated, so a partition may overshoot
+  a cap before convergence.
+- `demand_truncated` marks a publisher whose snapshot understates it, either because a group holds
+  more nonterminal families than the snapshot names or because whole groups could not be named at
+  all.
+- `group_id` must be a ULID; any other value is refused with 400."#,
     params(
-        ("group_id" = Option<String>, Query, description = "Merge the demand of one group and report the standing quota it is judged against; a value that is not a ULID is 400")
+        ("group_id" = Option<String>, Query, description = "Merge one group's demand and report the standing quota it is judged against")
     ),
     responses(
         (status = 200, description = "The snapshots this node has replicated, all approximate", body = ComputeSnapshotsResponse, example = json!({
             "approximate": true,
             "operator_draining": false,
-            "nodes": [{
-                "node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
-                "membership_generation": 4,
-                "publisher_generation": 118,
-                "observed_at_ms": 1755500000000u64,
-                "compute_draining": false,
-                "leaving": false,
-                "reserved": {"count": 2, "cpu_cores": 6, "ram_bytes": 12884901888_i64, "disk_bytes": 0},
-                "demand_groups": 1,
-                "demand_truncated": false
-            }],
+            "nodes": [
+                {
+                    "node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                    "membership_generation": 4,
+                    "publisher_generation": 118,
+                    "observed_at_ms": 1755500000000u64,
+                    "compute_draining": false,
+                    "leaving": false,
+                    "reserved": {
+                        "count": 2,
+                        "cpu_cores": 6,
+                        "ram_bytes": 12884901888_i64,
+                        "disk_bytes": 0
+                    },
+                    "demand_groups": 1,
+                    "demand_truncated": false
+                }
+            ],
             "group": {
                 "group_id": "01JABCDEF0123456789ABCDEFG",
-                "demand": {"count": 3, "cpu_cores": 10, "ram_bytes": 21474836480_i64, "disk_bytes": 0},
+                "demand": {
+                    "count": 3,
+                    "cpu_cores": 10,
+                    "ram_bytes": 21474836480_i64,
+                    "disk_bytes": 0
+                },
                 "truncated": false,
-                "quota": {"max_jobs": 8, "max_job_walltime_ms": 3600000}
+                "quota": {
+                    "max_jobs": 8,
+                    "max_job_walltime_ms": 3600000
+                }
             }
         })),
         (status = 400, description = "`group_id` is not a ULID", body = ErrorResponse),
@@ -531,14 +652,32 @@ pub async fn get_compute_snapshots(
     path = "/admin/compute/drain",
     tag = "compute",
     summary = "Drain or undrain this node's compute plane",
-    description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path. A drained node advertises itself as draining, so no planner selects it for new executions and it declines launch offers, while everything that already holds a receipt keeps running: draining never cancels admitted, queued, preparing or running work, and it never revokes a reservation. The flag is this node's own operator decision and is stored separately from the departure state a placement change causes, so returning to the placement map cannot silently undrain a node an operator drained; undrain it explicitly with `draining` false. A node that is leaving the realm stays draining regardless. The change is republished in this node's advertisement, so other nodes stop planning here as it propagates, and `changed` is false when the node already had that state.",
+    description = r#"Sets whether this node advertises its compute plane as draining.
+
+**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path.
+
+**Behavior**
+- A drained node advertises itself as draining, so no planner selects it for new executions and it
+  declines launch offers, while everything that already holds a receipt keeps running: draining
+  never cancels admitted, queued, preparing or running work, and it never revokes a reservation.
+- The flag is this node's own operator decision and is stored separately from the departure state a
+  placement change causes, so returning to the placement map cannot silently undrain a node an
+  operator drained; undrain it explicitly with `draining` false.
+- A node that is leaving the realm stays draining regardless.
+- The change is republished in this node's advertisement, so other nodes stop planning here as it
+  propagates, and `changed` is false when the node already had that state."#,
     request_body(
         content = DrainRequest,
         description = "Whether this node's compute plane should be drained",
-        example = json!({"draining": true})
+        example = json!({
+            "draining": true
+        })
     ),
     responses(
-        (status = 200, description = "The drain state now advertised by this node", body = DrainResponse, example = json!({"draining": true, "changed": true})),
+        (status = 200, description = "The drain state now advertised by this node", body = DrainResponse, example = json!({
+            "draining": true,
+            "changed": true
+        })),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
         (status = 503, description = "The advertisement could not be republished; retryable", body = ErrorResponse)
