@@ -271,7 +271,13 @@ impl Operation for ReplaceGroupBackendOperation {
             ReplaceState::WriteRecords => self.handle_written(event),
             ReplaceState::CommitTransaction => self.handle_committed(event),
             ReplaceState::AbortTransaction => self.handle_aborted(event),
-            ReplaceState::Finish | ReplaceState::Error => smallvec![],
+            ReplaceState::Finish | ReplaceState::Error => {
+                self.fail(CreateGroupBackendError::InvalidStateEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -489,6 +495,32 @@ mod tests {
         assert!(matches!(
             operation.finalize(),
             Err(CreateGroupBackendError::NotFound)
+        ));
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let mut operation =
+            ReplaceGroupBackendOperation::new(backend_id, input(Ulid::from_bytes([1u8; 16])));
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(
+                existing(Ulid::from_bytes([2u8; 16]), backend_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+
+        let effects = operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateGroupBackendError::InvalidStateEvent { .. })
         ));
     }
 }

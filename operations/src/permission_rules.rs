@@ -599,7 +599,9 @@ impl Operation for PermissionRulesOperation {
             PermissionRulesState::CollectRules => self.handle_commit(event),
             PermissionRulesState::Finish
             | PermissionRulesState::Init
-            | PermissionRulesState::Error => smallvec![],
+            | PermissionRulesState::Error => {
+                self.unexpected_event(self.state, "no event", format!("{event:?}"))
+            }
         }
     }
 
@@ -631,6 +633,7 @@ mod test {
 
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::AuthorizationError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::operation::Operation;
@@ -978,5 +981,26 @@ mod test {
         assert!(effects.is_empty());
         assert!(failed.is_complete());
         assert!(failed.finalize().is_err());
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let realm_id = RealmId([6u8; 32]);
+        let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
+            auth_context: AuthContext::anonymous(realm_id),
+            path: format!("/{realm_id}/admin"),
+        });
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AuthorizationError::UnexpectedEvent { .. })
+        ));
     }
 }

@@ -419,7 +419,9 @@ impl Operation for SubmitJobOperation {
                     self.finish_created()
                 }
             },
-            SubmitState::Finish | SubmitState::Error => smallvec![],
+            SubmitState::Finish | SubmitState::Error => {
+                self.fail(SubmitJobError::UnexpectedEvent(format!("{event:?}")))
+            }
         }
     }
 
@@ -980,5 +982,25 @@ mod tests {
             .unwrap();
         assert!(second.created);
         assert_ne!(second.job_id, first.job_id);
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let mut operation = operation(spec(None));
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::generate(),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TxnId::generate(),
+        }));
+
+        assert!(effects.is_empty());
+        let Err(SubmitJobError::UnexpectedEvent(got)) = operation.finalize() else {
+            panic!("a terminal state must reject a stray event");
+        };
+        assert!(got.contains("TransactionAborted"), "{got}");
     }
 }

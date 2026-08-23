@@ -217,7 +217,10 @@ impl Operation for ListUsersOperation {
         match self.state {
             ListUsersState::Auth => self.handle_auth_result(event),
             ListUsersState::ListUsers => self.handle_list_users(event),
-            ListUsersState::Init | ListUsersState::Finish | ListUsersState::Error => smallvec![],
+            ListUsersState::Init | ListUsersState::Finish | ListUsersState::Error => {
+                let got = format!("{event:?}");
+                self.unexpected_event("no event in a terminal state", got)
+            }
         }
     }
 
@@ -236,7 +239,7 @@ impl Operation for ListUsersOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListUsersInput, ListUsersOperation, ListUsersOutput};
+    use super::{ListUsersError, ListUsersInput, ListUsersOperation, ListUsersOutput};
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
@@ -400,5 +403,23 @@ mod tests {
 
         assert!(effects.is_empty());
         assert!(operation.finalize().is_err());
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let mut operation = ListUsersOperation::new(input(realm_id, 10, None));
+
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(ListUsersError::UnexpectedEvent { .. })
+        ));
     }
 }

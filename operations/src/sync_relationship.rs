@@ -360,7 +360,13 @@ impl Operation for StoreSyncRelationshipOperation {
                 expected: "operation start",
                 received: event,
             }),
-            StoreState::Finish | StoreState::Error => smallvec![],
+            StoreState::Finish | StoreState::Error => {
+                self.fail(SyncRelationshipError::UnexpectedEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -463,7 +469,13 @@ impl Operation for ListSyncRelationshipsOperation {
                 expected: "operation start",
                 received: event,
             }),
-            ListState::Finish | ListState::Error => smallvec![],
+            ListState::Finish | ListState::Error => {
+                self.fail(SyncRelationshipError::UnexpectedEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -565,7 +577,13 @@ impl Operation for GetSyncRelationshipOperation {
                 expected: "operation start",
                 received: event,
             }),
-            GetState::Finish | GetState::Error => smallvec![],
+            GetState::Finish | GetState::Error => {
+                self.fail(SyncRelationshipError::UnexpectedEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -659,7 +677,13 @@ impl Operation for DeleteSyncRelationshipOperation {
                 expected: "operation start",
                 received: event,
             }),
-            DeleteState::Finish | DeleteState::Error => smallvec![],
+            DeleteState::Finish | DeleteState::Error => {
+                self.fail(SyncRelationshipError::UnexpectedEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -885,5 +909,66 @@ mod tests {
             .unwrap();
             assert_eq!(stored.len(), 1);
         }
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let stray = || {
+            Event::Storage(StorageEvent::DeleteResult {
+                key: Vec::<u8>::new().into(),
+            })
+        };
+        let page = || {
+            Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            })
+        };
+        let record = relationship(1, "source-a", "target-a");
+
+        let mut store = StoreSyncRelationshipOperation::new(
+            record.clone(),
+            SyncRelationshipDirection::Outgoing,
+        );
+        store.start();
+        store.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::<u8>::new().into(),
+        }));
+        store.step(stray());
+        assert!(matches!(
+            store.finalize(),
+            Err(SyncRelationshipError::UnexpectedEvent { .. })
+        ));
+
+        let mut list =
+            ListSyncRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
+        list.start();
+        list.step(page());
+        list.step(stray());
+        assert!(matches!(
+            list.finalize(),
+            Err(SyncRelationshipError::UnexpectedEvent { .. })
+        ));
+
+        let mut get =
+            GetSyncRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
+        get.start();
+        get.step(page());
+        get.step(stray());
+        assert!(matches!(
+            get.finalize(),
+            Err(SyncRelationshipError::UnexpectedEvent { .. })
+        ));
+
+        let mut delete =
+            DeleteSyncRelationshipOperation::new(record, SyncRelationshipDirection::Outgoing);
+        delete.start();
+        delete.step(stray());
+        delete.step(stray());
+        assert!(matches!(
+            delete.finalize(),
+            Err(SyncRelationshipError::UnexpectedEvent { .. })
+        ));
     }
 }

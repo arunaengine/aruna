@@ -123,7 +123,9 @@ impl Operation for GroupRoutingInputsOperation {
                     Err(error) => self.fail(error.into()),
                 }
             }
-            LoadInputsState::Finish | LoadInputsState::Error => smallvec![],
+            LoadInputsState::Finish | LoadInputsState::Error => {
+                self.fail(RecordReadError::Unexpected.into())
+            }
         }
     }
 
@@ -274,7 +276,13 @@ impl Operation for PutGroupRoutingOperation {
                 self.output = Some(Ok(self.record.clone()));
                 smallvec![]
             }
-            PutGroupRoutingState::Finish | PutGroupRoutingState::Error => smallvec![],
+            PutGroupRoutingState::Finish | PutGroupRoutingState::Error => {
+                self.fail(PutGroupRoutingError::InvalidStateEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -381,7 +389,13 @@ impl Operation for GetGroupRoutingOperation {
                 self.output = Some(Ok(record));
                 smallvec![]
             }
-            GetGroupRoutingState::Finish | GetGroupRoutingState::Error => smallvec![],
+            GetGroupRoutingState::Finish | GetGroupRoutingState::Error => {
+                self.fail(GetGroupRoutingError::InvalidStateEvent {
+                    state: "terminal",
+                    expected: "no event",
+                    received: event,
+                })
+            }
         }
     }
 
@@ -409,8 +423,9 @@ impl Operation for GetGroupRoutingOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        GetGroupRoutingOperation, GroupRoutingInputsOperation, PutGroupRoutingError,
-        PutGroupRoutingOperation, routing_key,
+        GetGroupRoutingError, GetGroupRoutingOperation, GroupRoutingInputsError,
+        GroupRoutingInputsOperation, PutGroupRoutingError, PutGroupRoutingOperation,
+        RecordReadError, routing_key,
     };
     use crate::group_backends::{index_key, index_prefix};
     use aruna_core::effects::{Effect, StorageEffect};
@@ -645,5 +660,59 @@ mod tests {
         }));
 
         assert_eq!(operation.finalize().unwrap(), Some(Ok(Some(stored))));
+    }
+
+    // A state that expects no event must reject one instead of ignoring it.
+    #[test]
+    fn terminal_rejects_event() {
+        let stray = || {
+            Event::Storage(StorageEvent::DeleteResult {
+                key: routing_key(group()),
+            })
+        };
+
+        let mut inputs = GroupRoutingInputsOperation::new(group());
+        inputs.start();
+        inputs.step(Event::Storage(StorageEvent::ReadResult {
+            key: routing_key(group()),
+            value: None,
+        }));
+        inputs.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        inputs.step(stray());
+        assert!(matches!(
+            inputs.finalize(),
+            Err(GroupRoutingInputsError::Read(RecordReadError::Unexpected))
+        ));
+
+        let mut put = PutGroupRoutingOperation::new(
+            group(),
+            None,
+            aruna_core::UserId::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        loaded(&mut put, BTreeSet::new());
+        put.step(Event::Storage(StorageEvent::WriteResult {
+            key: routing_key(group()),
+        }));
+        put.step(stray());
+        assert!(matches!(
+            put.finalize(),
+            Err(PutGroupRoutingError::InvalidStateEvent { .. })
+        ));
+
+        let mut get = GetGroupRoutingOperation::new(group());
+        get.start();
+        get.step(Event::Storage(StorageEvent::ReadResult {
+            key: routing_key(group()),
+            value: None,
+        }));
+        get.step(stray());
+        assert!(matches!(
+            get.finalize(),
+            Err(GetGroupRoutingError::InvalidStateEvent { .. })
+        ));
     }
 }
