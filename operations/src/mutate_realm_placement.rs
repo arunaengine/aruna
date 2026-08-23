@@ -2625,7 +2625,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_non_management_node() {
+    fn refuses_server_node() {
         // An authorized caller still may not mutate placement on a server node.
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(realm_id);

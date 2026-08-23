@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_non_management_node() {
+    async fn refuses_server_node() {
         // A realm admin token still may not write the config on a server node.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_realm_token_denied() {
+    fn foreign_token_denied() {
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let mut config = quota_config(&actor, custom_quota());
