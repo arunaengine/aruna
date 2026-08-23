@@ -123,7 +123,34 @@ pub struct SubmitImportResponse {
     path = "/metadata/rocrate/uploads",
     tag = "rocrate-import",
     summary = "Upload an RO-Crate archive for a later import",
-    description = "Requires a bearer token issued by this realm; a token from another realm and a path-restricted delegated token are both refused with 403. The body is the archive itself, streamed as application/zip or application/vnd.eln+zip, with media-type parameters such as a version allowed after a semicolon; any other Content-Type is rejected with 400 before the body is read. Bytes are hashed and spooled while they arrive, so the whole archive never has to fit in memory, and the upload is private to the caller: only the same user can later reference it, and only on this node, whose base URL is returned as owner_node_url. Uploading only stores the archive; nothing is unpacked, validated or imported until the import endpoint is called with the returned upload_id, and the upload is single-use so a second import of the same upload_id is refused. The upload expires at expires_at, one day after creation by default, after which it is swept and an import naming it fails. The size cap is the node's configured direct-upload limit, 8 GiB by default: a Content-Length above it is refused with 413 before any body byte is read, and without a Content-Length the stream is read until the cap is passed and then refused with 413 as well, with the partial spool discarded either way. A body that delivers nothing for 30 seconds, or a transfer still running after 30 minutes, is aborted and its partial spool discarded as well, but as a failed transfer rather than a 413. The node also bounds concurrent uploads and answers 503 with a Retry-After header when its upload capacity is exhausted or blob storage is unavailable, which the caller may retry.",
+    description = r#"Stores an RO-Crate archive privately on this node so a later import can claim it.
+
+**Authentication**: bearer token issued by this realm; a token from another realm and a
+path-restricted delegated token are both refused with 403.
+
+**Behavior**
+- Bytes are hashed and spooled while they arrive, so the whole archive never has to fit in memory.
+- The upload is private to the caller: only the same user can later reference it, and only on this
+  node, whose base URL is returned as `owner_node_url`.
+- Uploading only stores the archive; nothing is unpacked, validated or imported until the import
+  endpoint is called with the returned `upload_id`.
+- The upload is single-use, so a second import of the same `upload_id` is refused.
+- The upload expires at `expires_at`, one day after creation by default, after which it is swept
+  and an import naming it fails.
+
+**Limits**
+- The body is the archive itself, streamed as `application/zip` or `application/vnd.eln+zip`, with
+  media-type parameters such as a version allowed after a semicolon; any other `Content-Type` is
+  rejected with 400 before the body is read.
+- The size cap is the node's configured direct-upload limit, 8 GiB by default: a `Content-Length`
+  above it is refused with 413 before any body byte is read, and without a `Content-Length` the
+  stream is read until the cap is passed and then refused with 413 as well, with the partial spool
+  discarded either way.
+- A body that delivers nothing for 30 seconds, or a transfer still running after 30 minutes, is
+  aborted and its partial spool discarded as well, but as a failed transfer rather than a 413.
+
+**Errors**: the node bounds concurrent uploads and answers 503 with a `Retry-After` header when its
+upload capacity is exhausted or blob storage is unavailable, which the caller may retry."#,
     request_body(
         content(
             (String = "application/zip"),
@@ -222,13 +249,53 @@ pub async fn upload_rocrate(
     path = "/metadata/rocrate/imports",
     tag = "rocrate-import",
     summary = "Submit an RO-Crate import job",
-    description = "Requires a bearer token issued by this realm; a token from another realm and a path-restricted delegated token are both refused with 403. RO-Crate 1.2 and 1.3 contexts and specification IRIs are accepted, structurally validated, and retained in the published metadata and later exports. The caller is checked against all three parts of the plan before the job is taken: the source must be readable, which for an upload means it is the caller's own, unclaimed, unexpired and within the import-source cap and for an object or connector source means READ on it, the target bucket needs WRITE, and the metadata document path needs WRITE in its group. The 202 means the plan passed those checks and the job was durably recorded, nothing more: no archive has been unpacked, no object written and no metadata document published yet. Progress is followed at status_url and the per-entry outcome at report_url, both on owner_node_url, which is the node that owns the job. Send idempotency_key to make retries safe: a repeat with the same key and the same plan replays the original job and returns created false, while the same key with a different plan is refused with 409, as is exceeding the per-user active-job cap of 4. An upload source is single-use, so a second import of an upload already claimed by another job is refused with 409 too. A connector source whose staging backend cannot be reached answers 502, which the caller may retry. A 503 carries a Retry-After header and means the node could not place the job right now, which the caller may retry unchanged.",
+    description = r#"Accepts an RO-Crate import plan and durably records it as a job on this node.
+
+**Authentication**: bearer token issued by this realm; a token from another realm and a
+path-restricted delegated token are both refused with 403. The plan is authorized in all three
+parts before the job is taken: READ on the source, WRITE on the target bucket, and WRITE on the
+metadata document path in its group.
+
+**Behavior**
+- For an upload source, readable means the upload is the caller's own, unclaimed, unexpired and
+  within the import-source cap; an object or connector source needs READ on it.
+- RO-Crate 1.2 and 1.3 contexts and specification IRIs are accepted, structurally validated, and
+  retained in the published metadata and later exports.
+- The 202 means the plan passed those checks and the job was durably recorded, nothing more: no
+  archive has been unpacked, no object written and no metadata document published yet.
+- Progress is followed at `status_url` and the per-entry outcome at `report_url`, both on
+  `owner_node_url`, which is the node that owns the job.
+- Send `idempotency_key` to make retries safe: a repeat with the same key and the same plan replays
+  the original job and returns `created` false.
+
+**Limits**
+- An upload source is single-use, so a second import of an upload already claimed by another job is
+  refused.
+- A caller holds at most 4 active import jobs.
+- Bucket, prefix and metadata paths must be non-empty and within the configured key size, and a
+  prefix or connector path may not contain dot segments, backslashes or control characters.
+
+**Errors**
+- The same `idempotency_key` bound to a different plan, an upload already claimed by another job,
+  and a reached active-job cap are each a 409.
+- The group's standing compute quota refusing this admission is a 409 as well, carrying the exact
+  scope, dimension and numbers in `quota`.
+- A connector source whose staging backend cannot be reached answers 502, which the caller may
+  retry.
+- A 503 carries a `Retry-After` header and means the node could not place the job right now, which
+  the caller may retry unchanged."#,
     request_body(
         content = SubmitImportRequest,
         description = "The import plan: where the archive comes from, which bucket and prefix its payload lands in, and which metadata document the crate is published as",
         example = json!({
-            "source": {"kind": "upload", "upload_id": "01JABCDEF0123456789ABCDEFG"},
-            "target": {"bucket": "lab-raw", "prefix": "imports/rna-seq"},
+            "source": {
+                "kind": "upload",
+                "upload_id": "01JABCDEF0123456789ABCDEFG"
+            },
+            "target": {
+                "bucket": "lab-raw",
+                "prefix": "imports/rna-seq"
+            },
             "metadata": {
                 "group_id": "01JGROUP0123456789ABCDEFGH",
                 "path": "datasets/rna-seq",
@@ -250,11 +317,11 @@ pub async fn upload_rocrate(
                 "report_url": "https://node.example.test/api/v1/jobs/01JJOB0123456789ABCDEFGHIJ/report"
             })
         ),
-        (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, a prefix or connector path containing dot segments, backslashes or control characters, or a source that expired or exceeds the import-source cap", body = ErrorResponse),
+        (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, or an expired or oversized source", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is a path-restricted delegated token, names another user's upload, or lacks READ on the source or WRITE on the target bucket or metadata path", body = ErrorResponse),
         (status = 404, description = "The upload, source object or version, connector source, or target bucket does not exist", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is already bound to a different plan, the upload is already claimed by another job, the caller's active-job cap is reached, or the group's standing compute quota refuses this admission; a quota refusal carries the exact scope, dimension and numbers in `quota`", body = ErrorResponse),
+        (status = 409, description = "Idempotency key bound to a different plan, an already claimed upload, a reached active-job cap, or a standing compute quota refusal", body = ErrorResponse),
         (status = 503, description = "The job could not be placed right now; the response carries Retry-After and the caller may retry the unchanged request", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
