@@ -992,7 +992,7 @@ fn cleanup_effect(effect: &StorageEffect) -> Option<(Ulid, CleanupKind)> {
 fn is_cleanup_write(effect: &StorageEffect) -> bool {
     matches!(
         effect,
-        StorageEffect::Write { key_space, .. } if key_space == aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE
+        StorageEffect::Write { key_space, .. } if aruna_core::keyspaces::is_cleanup_keyspace(key_space)
     )
 }
 
