@@ -1389,7 +1389,8 @@ response."#,
         (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "The strategy is still referenced by a binding or override, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
-        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
+        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1469,6 +1470,11 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
         }
+        HandleAllocationError::Storage(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
+            )
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1495,6 +1501,11 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         }
         MutateRealmPlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
+        }
+        MutateRealmPlacementError::StorageError(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
+            )
         }
         other => ServerError::InternalError(other.to_string()),
     }
@@ -1566,7 +1577,8 @@ a management node serves it; an anonymous caller is rejected and every other nod
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a value for max_devices_per_user", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
-        (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse)
+        (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1612,6 +1624,11 @@ fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
         SetRealmQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
         SetRealmQuotaError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
+        }
+        SetRealmQuotaError::StorageError(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
+            )
         }
         other => ServerError::InternalError(other.to_string()),
     }
@@ -2825,6 +2842,16 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn quota_capacity_unavailable() {
+        // Cleanup capacity is transient, so it must not read as an internal error.
+        let error = map_set_realm_quota_error(SetRealmQuotaError::StorageError(
+            StorageError::CleanupCapacity,
+        ));
+
+        assert!(matches!(error, ServerError::ServiceUnavailableReason(_)));
+    }
+
     async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir) {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
@@ -3377,6 +3404,23 @@ mod tests {
         assert!(matches!(
             map_mutate_realm_placement_error(MutateRealmPlacementError::RealmConfigNotFound),
             ServerError::NotFound
+        ));
+    }
+
+    #[test]
+    fn placement_capacity_unavailable() {
+        // Cleanup capacity is transient on both placement paths.
+        assert!(matches!(
+            map_mutate_realm_placement_error(MutateRealmPlacementError::StorageError(
+                StorageError::CleanupCapacity
+            )),
+            ServerError::ServiceUnavailableReason(_)
+        ));
+        assert!(matches!(
+            map_handle_error(HandleAllocationError::Storage(
+                StorageError::CleanupCapacity
+            )),
+            ServerError::ServiceUnavailableReason(_)
         ));
     }
 

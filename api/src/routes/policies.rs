@@ -1,6 +1,7 @@
 use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
+use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyDecision, PolicyFunctions, PolicyKind, PolicyRequest,
     PolicyTraceEntry, RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
@@ -465,7 +466,9 @@ management node serves it; every other node answers 403.
         (status = 400, description = "Unknown policy kind, malformed policy or hash, or a set that breaks the size or compile limits", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, the caller may not write the realm configuration, or this is not a management node", body = ErrorResponse),
-        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse)
+        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
+        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -515,8 +518,14 @@ pub async fn set_realm_policies(
         SetRealmPoliciesError::Unauthorized | SetRealmPoliciesError::NotManagementNode => {
             ServerError::Forbidden
         }
+        SetRealmPoliciesError::RealmConfigNotFound => ServerError::NotFound,
         SetRealmPoliciesError::StaleHash => {
             ServerError::Conflict("stored realm policy set changed".to_string())
+        }
+        SetRealmPoliciesError::StorageError(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
+            )
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
@@ -639,7 +648,9 @@ pub async fn get_group_policies(
         (status = 400, description = "Malformed group id, unknown policy kind, malformed hash, or a set that breaks the size or compile limits", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not write this group's configuration", body = ErrorResponse),
-        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse)
+        (status = 404, description = "This node holds no authorization document for the group", body = ErrorResponse),
+        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -687,6 +698,11 @@ pub async fn set_group_policies(
         SetGroupPoliciesError::GroupAuthDocNotFound => ServerError::NotFound,
         SetGroupPoliciesError::StaleHash => {
             ServerError::Conflict("stored group policy set changed".to_string())
+        }
+        SetGroupPoliciesError::StorageError(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
+            )
         }
         other => ServerError::InternalError(other.to_string()),
     })?;

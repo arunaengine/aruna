@@ -445,7 +445,8 @@ and only a management node serves it; every other node answers 403.
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, the caller may not administer the realm configuration, or this is not a management node", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
-        (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse)
+        (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -485,6 +486,11 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
         SetRealmComputeError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict(
                 "concurrent realm configuration update conflict; retry".to_string(),
+            )
+        }
+        SetRealmComputeError::StorageError(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
         other => ServerError::InternalError(other.to_string()),
@@ -762,6 +768,19 @@ mod tests {
                 reason: "zero bandwidth".to_string()
             }),
             ServerError::BadRequestReason(_)
+        ));
+    }
+
+    #[test]
+    fn capacity_is_unavailable() {
+        // Cleanup capacity is transient, so it must not read as an internal error.
+        use aruna_core::errors::StorageError;
+
+        assert!(matches!(
+            map_compute_error(SetRealmComputeError::StorageError(
+                StorageError::CleanupCapacity
+            )),
+            ServerError::ServiceUnavailableReason(_)
         ));
     }
 
