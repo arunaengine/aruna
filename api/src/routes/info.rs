@@ -1398,26 +1398,30 @@ pub async fn mutate_realm_placement(
     Extension(auth): Extension<Option<AuthContext>>,
     request: Result<Json<RealmPlacementMutationRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<RealmPlacementConfigResponse>)> {
-    let auth = authorize_realm_config_admin(&state, auth).await?;
+    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let action = request.into_core()?;
     let actor = Actor {
         node_id: state.get_node_id(),
         user_id: auth.user_id,
-        realm_id: auth.realm_id,
+        realm_id: state.get_realm_id(),
     };
     let context = state.get_ctx();
     let document = match action {
-        RealmPlacementAction::Mutation(mutation) => {
-            drive_realm_placement_mutation(MutateRealmPlacementConfig { actor, mutation }, &context)
-                .await
-                .map_err(map_mutate_realm_placement_error)?
-        }
+        RealmPlacementAction::Mutation(mutation) => drive_realm_placement_mutation(
+            MutateRealmPlacementConfig { actor, mutation },
+            Some(auth),
+            &context,
+        )
+        .await
+        .map_err(map_mutate_realm_placement_error)?,
         RealmPlacementAction::Provision {
             strategy_id,
             group_id,
         } => {
+            // Handle allocation carries no authorization of its own.
+            authorize_realm_config_admin(&state, Some(auth)).await?;
             let scope = group_id
                 .map(PlacementScope::Group)
                 .unwrap_or(PlacementScope::Realm(actor.realm_id));
@@ -1561,15 +1565,19 @@ pub async fn set_realm_quota(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<RealmQuotaConfig>,
 ) -> ServerResult<(StatusCode, Json<RealmQuotaConfig>)> {
-    let auth = authorize_realm_config_admin(&state, auth).await?;
+    let auth = require_realm_auth(&state, auth)?;
     let quota = request.into_quota_config()?;
     let actor = Actor {
         node_id: state.get_node_id(),
         user_id: auth.user_id,
-        realm_id: auth.realm_id,
+        realm_id: state.get_realm_id(),
     };
     let stored = drive(
-        SetRealmQuotaOperation::new(SetRealmQuotaConfig { actor, quota }),
+        SetRealmQuotaOperation::new(SetRealmQuotaConfig {
+            actor,
+            auth_context: auth,
+            quota,
+        }),
         &state.get_ctx(),
     )
     .await
@@ -1580,6 +1588,9 @@ pub async fn set_realm_quota(
 fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
     match error {
         SetRealmQuotaError::RealmConfigNotFound => ServerError::NotFound,
+        SetRealmQuotaError::Unauthorized | SetRealmQuotaError::NotManagementNode => {
+            ServerError::Forbidden
+        }
         SetRealmQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
         SetRealmQuotaError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())

@@ -68,6 +68,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "realm-wide counters intentionally open to every realm member",
     ),
     (
+        "info.rs",
+        "set_realm_quota",
+        "realm-config WRITE and the management-node guard checked inside \
+         SetRealmQuotaOperation",
+    ),
+    (
         "job_audit.rs",
         "get_job_audit",
         "self-scoped: family_report and family_audit answer NotFound unless the \
