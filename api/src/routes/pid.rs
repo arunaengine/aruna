@@ -414,9 +414,10 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerR
 - Normal document deletion instead stores `tombstoned`.
 - The transition is terminal and idempotent.
 
-**Limits**
-- The JSON body must name provider `w3id`, confirm the exact stored PID value and carry a non-empty
-  reason."#,
+**Limits** (all refused with 400)
+- `provider` must be `w3id`; no other provider is accepted.
+- `confirm_pid` must equal the stored PID value exactly.
+- `reason` is trimmed first and must then be 1 to 1024 bytes long and free of control characters."#,
     params(("document_id" = String, Path, description = "Document ULID whose PID is withdrawn, for example 01JMETADATA0123456789ABCDE")),
     request_body(
         content = WithdrawPersistentIdRequest,
