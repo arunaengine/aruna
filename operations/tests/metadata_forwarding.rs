@@ -185,10 +185,13 @@ async fn forwarded_policy_denies() -> Result<(), Box<dyn std::error::Error>> {
     let error = drive_forwarded_create(&realm, user_node, group_id, document_id)
         .await
         .expect_err("a routed write denied by policy must not be accepted");
-    assert!(matches!(
-        error.downcast_ref::<MetadataWriteError>(),
-        Some(MetadataWriteError::Forbidden)
-    ));
+    assert!(
+        matches!(
+            error.downcast_ref::<MetadataWriteError>(),
+            Some(MetadataWriteError::Forbidden)
+        ),
+        "unexpected forwarded create error: {error}"
+    );
 
     shutdown(nodes).await;
     Ok(())
