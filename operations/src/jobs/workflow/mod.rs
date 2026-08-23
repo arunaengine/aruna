@@ -1378,16 +1378,12 @@ async fn finalize_cancel(
                     .await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
+                // Infrastructure evidence is no verdict on the job, so a confirmed
+                // stop terminalizes as the requested cancellation, never as Failed.
                 AttemptPhase::SystemError { reason } => {
+                    warn!(job_id = %job_id, %reason, "Cancelled attempt lost backend evidence");
                     let result = execution_result_for(bucket, None, Vec::new(), logs);
-                    let record = Box::pin(terminal_fail(
-                        storage,
-                        job_id,
-                        token,
-                        JobError::retryable(format!("backend infrastructure failure: {reason}")),
-                        result,
-                    ))
-                    .await;
+                    let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Cancelled | AttemptPhase::Submitted | AttemptPhase::Running => {
@@ -1954,6 +1950,7 @@ mod tests {
         logs_started: Notify,
         logs_release: Notify,
         logs_fail: AtomicBool,
+        cancel_lost: AtomicBool,
         cancels: AtomicUsize,
     }
 
@@ -1965,6 +1962,7 @@ mod tests {
                 logs_started: Notify::new(),
                 logs_release: Notify::new(),
                 logs_fail: AtomicBool::new(false),
+                cancel_lost: AtomicBool::new(false),
                 cancels: AtomicUsize::new(0),
             })
         }
@@ -2026,6 +2024,16 @@ mod tests {
         }
         async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
             self.cancels.fetch_add(1, Ordering::Relaxed);
+            if self.cancel_lost.load(Ordering::Relaxed) {
+                return Ok(CancelEvidence::Stopped(AttemptStatus {
+                    phase: AttemptPhase::SystemError {
+                        reason: "node evicted".to_string(),
+                    },
+                    backend_ref: "c1".to_string(),
+                    started_at_ms: Some(1),
+                    finished_at_ms: Some(2),
+                }));
+            }
             Ok(CancelEvidence::AlreadyGone)
         }
         async fn fetch_logs(
@@ -2360,6 +2368,43 @@ mod tests {
             stored.last_error.as_ref().map(|error| error.kind),
             Some(JobErrorKind::Retryable)
         );
+    }
+
+    // A stopped cancellation whose only evidence is infrastructure must terminalize
+    // as Cancelled: a Failed row would read as a job-specific verdict.
+    #[tokio::test]
+    async fn cancel_lost_evidence() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+            .await
+            .unwrap();
+        let stub = StubBackend::new(StubReconcile::NotFound);
+        stub.cancel_lost.store(true, Ordering::Relaxed);
+        stub.logs_release.notify_one();
+        let backend: Arc<dyn ExecutorBackend> = stub;
+
+        Box::pin(finalize_cancel(
+            &ctx,
+            job_id,
+            token,
+            &backend,
+            &fence(&attempt),
+            &execution_spec(),
+            "ws-test",
+        ))
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
+        assert!(stored.finished_at_ms.is_some());
     }
 
     // A capture failing retryably on every pass must terminalize at the attempt cap.
