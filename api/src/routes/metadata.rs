@@ -1206,9 +1206,7 @@ with the same capability report.
   terms and remote `owl:imports` fail closed with an `unsupported_constraint` finding that names
   the construct; the same finding is returned when the registered Turtle cannot be parsed.
 - Evaluation is bounded: exceeding the result, path-edge or path-depth budget returns a permanent
-  `validation_limit` finding with incomplete completeness instead of a partial verdict.
-
-**Errors**: a temporarily unavailable Profile or evaluator answers 503 with `Retry-After`."#,
+  `validation_limit` finding with incomplete completeness instead of a partial verdict."#,
     responses((
         status = 200,
         description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms",
@@ -1230,7 +1228,7 @@ with the same capability report.
                 "sh:closed"
             ],
             "unsupported_constraint_policy": "fail_closed",
-            "public_profile_iri_template": "https://w3id.org/aruna/profile/{document_id}"
+            "public_profile_iri_template": "https://w3id.org/aruna/profile/{id}"
         })
     ))
 )]
@@ -1317,7 +1315,7 @@ the realm-public registered Profile is read.
             })),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
         (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
-        (status = 503, description = "The Profile or the evaluator is temporarily unavailable", body = ErrorResponse)
+        (status = 503, description = "The Profile or the evaluator is temporarily unavailable; the response carries Retry-After", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2728,8 +2726,9 @@ fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
     summary = "Preflight destructive content operations against metadata backlinks",
     description = r#"Reports the metadata backlinks a destructive content operation would break.
 
-**Authentication**: realm bearer token for the serving realm with WRITE on the targeted bucket
-and prefix.
+**Authentication**: realm bearer token for the serving realm. A `bucket_prefix` target additionally
+requires WRITE on the bucket, on the prefix when one is given, and on every key the prefix resolves
+to; a `content_w3ids` target names content identities directly and checks no storage permission.
 
 **Behavior**
 - Maps a bounded exact content-W3ID set or an authorized bucket/prefix inventory to canonical
