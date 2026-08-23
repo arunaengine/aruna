@@ -325,7 +325,27 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
     path = "/search/buckets",
     tag = "search",
     summary = "Search buckets across the realm",
-    description = "Requires a bearer token issued by this realm; a token from another realm is refused with 403. The query is trimmed and must keep at least 2 characters, otherwise the request is rejected with 400. The search fans out over the realm's serving nodes, at most 32 nodes per request and under one shared deadline of about 12 seconds, and every node applies its own authorization and deny policies to its own buckets, so a bucket the caller may not read never appears. Answers are merged and cut to the page size; there is no continuation token, so a broader result set is reached by narrowing the query rather than by paging. A node that fails, is omitted by the node cap or times out does not fail the request: the answer is partial and says so through nodes_queried, nodes_failed and failed_nodes, which names the nodes that did not answer and carries the entry partition-discovery when node discovery itself failed. A partial answer means matching buckets may be missing rather than absent, and the caller may repeat the request.",
+    description = r#"Searches bucket names across the realm's serving nodes and merges the authorized matches.
+
+**Authentication**: bearer token issued by this realm; a token from another realm is refused with
+403. Every node applies its own authorization and deny policies to its own buckets, so a bucket the
+caller may not read never appears.
+
+**Behavior**
+- The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
+- Answers are merged and cut to the page size; there is no continuation token, so a broader result
+  set is reached by narrowing the query rather than by paging.
+- A node that fails, is omitted by the node cap or times out does not fail the request: the answer
+  is partial and says so through `nodes_queried`, `nodes_failed` and `failed_nodes`, which names
+  the nodes that did not answer and carries the entry `partition-discovery` when node discovery
+  itself failed.
+- A partial answer means matching buckets may be missing rather than absent, and the caller may
+  repeat the request.
+
+**Limits**
+- The query is trimmed and must keep at least 2 characters, otherwise the request is rejected with
+  400.
+- At most 32 nodes are queried per request."#,
     params(
         ("q" = String, Query, description = "Case-insensitive bucket-name substring; trimmed, minimum 2 characters, no wildcards"),
         ("limit" = Option<usize>, Query, description = "Maximum number of merged hits (default 10, clamped to 1..=50)")
@@ -336,17 +356,21 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
             description = "Authorized federated bucket matches, possibly partial when nodes_failed is non-zero",
             body = BucketsSection,
             example = json!({
-                "hits": [{
-                    "arn": "arn:aruna:cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/lab-raw",
-                    "bucket": "lab-raw",
-                    "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
-                    "group_id": "01JABCDEF0123456789ABCDEFG",
-                    "group_name": "Lab A",
-                    "created_at": "2026-04-09T14:23:11.123+00:00"
-                }],
+                "hits": [
+                    {
+                        "arn": "arn:aruna:cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/lab-raw",
+                        "bucket": "lab-raw",
+                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "group_name": "Lab A",
+                        "created_at": "2026-04-09T14:23:11.123+00:00"
+                    }
+                ],
                 "nodes_queried": 3,
                 "nodes_failed": 1,
-                "failed_nodes": ["2a3b4c5d6e7f89900a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f6789"]
+                "failed_nodes": [
+                    "2a3b4c5d6e7f89900a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f6789"
+                ]
             })
         ),
         (status = 400, description = "Query shorter than 2 characters or otherwise malformed", body = ErrorResponse),
@@ -390,8 +414,21 @@ pub async fn bucket_search(
     get,
     path = "/search/objects",
     tag = "search",
-    summary = "Search current object heads locally or across the realm",
-    description = "Requires a bearer token issued by this realm. Keys are matched case-sensitively by substring or prefix, optionally inside one exact bucket. Every current live head is checked against group READ, token path restrictions, and request policies before it can be returned; delete markers and historical versions are excluded, and no total is exposed. local searches this node, distributed_best_effort returns reachable node pages with explicit failed coverage, and distributed_strict returns 503 rather than a partial page. The opaque cursor is bound to the query, bucket, match type, and mode; it composes per-node keyset positions and an as-of watermark so newly created versions do not enter a cursor chain. Coverage names the live-head source, observation times, failed partitions, completeness, and truncation.",
+    summary = "Search current object heads",
+    description = r#"Searches current live object heads by key, on this node or across the realm.
+
+**Authentication**: bearer token issued by this realm. Every current live head is checked against
+group READ, token path restrictions and request policies before it can be returned.
+
+**Behavior**
+- Keys are matched case-sensitively by substring or prefix, optionally inside one exact bucket.
+- Delete markers and historical versions are excluded, and no total is exposed.
+- `local` searches this node, `distributed_best_effort` returns reachable node pages with explicit
+  failed coverage, and `distributed_strict` returns 503 rather than a partial page.
+- The opaque cursor is bound to the query, bucket, match type and mode; it composes per-node keyset
+  positions and an as-of watermark so newly created versions do not enter a cursor chain.
+- `coverage` names the live-head source, observation times, failed partitions, completeness and
+  truncation."#,
     params(
         ("q" = String, Query, description = "Case-sensitive key substring or prefix; trimmed, minimum 2 characters"),
         ("bucket" = Option<String>, Query, description = "Optional exact bucket name"),
@@ -401,8 +438,53 @@ pub async fn bucket_search(
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode")
     ),
     responses(
-        (status = 200, description = "Authorized live object heads with explicit coverage", body = ObjectSearchResponse,
-            example = json!({"hits": [{"kind": "object", "mode": "distributed_best_effort", "issuer_node_id": "node-a", "group_id": "01JGROUP000000000000000000", "bucket": "results", "key": "run-42/output.csv", "content_w3id": "https://w3id.org/aruna/data/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "checksum": {"algorithm": "blake3", "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, "size": 4096, "updated_at": "2026-08-22T12:00:00Z"}], "next_cursor": null, "coverage": {"scope": "realm", "mode": "distributed_best_effort", "index_freshness": {"source": "inventory", "as_of": "2026-08-22T12:00:00Z", "oldest_observed_at": "2026-08-22T11:59:00Z"}, "nodes_queried": 3, "nodes_failed": 0, "failed_partitions": [], "omitted_partitions": 0, "complete": true, "truncated": false, "partitions": [{"node_id": "node-a", "observed_at": "2026-08-22T12:00:00Z", "truncated": false}]}})),
+        (
+            status = 200,
+            description = "Authorized live object heads with explicit coverage",
+            body = ObjectSearchResponse,
+            example = json!({
+                "hits": [
+                    {
+                        "kind": "object",
+                        "mode": "distributed_best_effort",
+                        "issuer_node_id": "node-a",
+                        "group_id": "01JGROUP000000000000000000",
+                        "bucket": "results",
+                        "key": "run-42/output.csv",
+                        "content_w3id": "https://w3id.org/aruna/data/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "checksum": {
+                            "algorithm": "blake3",
+                            "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        },
+                        "size": 4096,
+                        "updated_at": "2026-08-22T12:00:00Z"
+                    }
+                ],
+                "next_cursor": null,
+                "coverage": {
+                    "scope": "realm",
+                    "mode": "distributed_best_effort",
+                    "index_freshness": {
+                        "source": "inventory",
+                        "as_of": "2026-08-22T12:00:00Z",
+                        "oldest_observed_at": "2026-08-22T11:59:00Z"
+                    },
+                    "nodes_queried": 3,
+                    "nodes_failed": 0,
+                    "failed_partitions": [],
+                    "omitted_partitions": 0,
+                    "complete": true,
+                    "truncated": false,
+                    "partitions": [
+                        {
+                            "node_id": "node-a",
+                            "observed_at": "2026-08-22T12:00:00Z",
+                            "truncated": false
+                        }
+                    ]
+                }
+            })
+        ),
         (status = 400, description = "Malformed query or cursor", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
@@ -547,13 +629,38 @@ fn format_system_time(time: std::time::SystemTime) -> String {
     get,
     path = "/search",
     tag = "search",
-    summary = "Search documents, buckets, groups and users in one request",
-    description = "Requires a bearer token issued by this realm; a token from another realm is refused with 403. The four sections are searched concurrently and each one is authorized on its own terms: documents and buckets fan out over the realm's serving nodes, at most 32 nodes under one shared deadline of about 12 seconds, and each node filters its own results; groups are matched locally and then filtered per hit against READ on the group's data, so a caller who may not read a group never learns it exists; the user directory is an admin-scoped read, and a caller without it simply gets no users section instead of an error. A section that was not requested is omitted from the response. Answers can be partial: for documents and buckets, nodes_queried and nodes_failed count the fan-out and a non-zero nodes_failed (a node that failed, timed out or was dropped by the node cap) means hits may be missing rather than absent; documents also set truncated when paging stopped at the server-side depth cap, and groups set truncated when the per-hit visibility scan hit its round cap with matches still pending. A partial answer is still 200 and the caller may repeat the request. Paging is per section and only for a single-type request: pass the section's next_cursor back as cursor. A missing next_cursor means that section is exhausted; a cursor sent with more than one type, or with types=buckets, which has no continuation token, is rejected with 400.",
+    summary = "Search documents, buckets, groups and users",
+    description = r#"Searches documents, buckets, groups and users concurrently and returns one sectioned answer.
+
+**Authentication**: bearer token issued by this realm; a token from another realm is refused with
+403. Each section is authorized on its own terms: every node filters its own document and bucket
+results, group hits are filtered per hit against READ on the group's data so a caller who may not
+read a group never learns it exists, and the user directory is an admin-scoped read.
+
+**Behavior**
+- Documents and buckets fan out over the realm's serving nodes, at most 32 nodes under one shared
+  deadline of about 12 seconds; groups are matched locally.
+- A caller without the admin-scoped directory read simply gets no `users` section instead of an
+  error, and a section that was not requested is omitted from the response.
+- Answers can be partial: for documents and buckets, `nodes_queried` and `nodes_failed` count the
+  fan-out and a non-zero `nodes_failed` (a node that failed, timed out or was dropped by the node
+  cap) means hits may be missing rather than absent.
+- Documents also set `truncated` when paging stopped at the server-side depth cap, and groups set
+  `truncated` when the per-hit visibility scan hit its round cap with matches still pending.
+- A partial answer is still 200 and the caller may repeat the request.
+- Paging is per section and only for a single-type request: pass the section's `next_cursor` back
+  as `cursor`, and a missing `next_cursor` means that section is exhausted.
+- A document cursor is a signed token bound to the exact query and filters, a group cursor is the
+  last returned group id as a ULID, and a user cursor is the last returned user id in its
+  `ulid@realm` form.
+
+**Errors**: a malformed or unsupported cursor is rejected with 400, as is a cursor sent with more
+than one type or with `types=buckets`, which has no continuation token."#,
     params(
         ("q" = String, Query, description = "Search query; trimmed, minimum 2 characters, matched as a substring for buckets, groups and users and as a full-text query for documents"),
         ("types" = Option<String>, Query, description = "Comma-separated subset of documents,buckets,groups,users. Defaults to all four; empty entries are ignored and an unknown type returns 400"),
         ("limit" = Option<usize>, Query, description = "Per-section page size (default 10, clamped to 1..=100, and additionally capped at 50 for the buckets section)"),
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same section's next_cursor. Only accepted when exactly one type is requested; for documents it is a signed token bound to the exact query and filters, for groups the last returned group id as a ULID and for users the last returned user id in its ulid@realm form, and a malformed or unsupported cursor returns 400"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same section's next_cursor; only accepted when exactly one type is requested"),
         ("group_id" = Option<String>, Query, description = "Documents-only: restrict metadata hits to a single group id, given as a ULID; a malformed id returns 400"),
         ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo specification or Profile IRI, such as the https://w3id.org/ro/crate/1.3 specification or an https://w3id.org/aruna/profile/{id} Profile"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Documents-only: local restricts the document search to this node, distributed fans out over the realm; defaults to distributed")
@@ -561,47 +668,58 @@ fn format_system_time(time: std::time::SystemTime) -> String {
     responses(
         (
             status = 200,
-            description = "Sectioned search results; a section is omitted when it was not requested and the users section is also omitted when the caller may not read the user directory, and a section is authoritative only when its failure counters are zero",
+            description = "Sectioned search results; a section is omitted when it was not requested and is authoritative only when its failure counters are zero",
             body = SearchResponse,
             example = json!({
                 "documents": {
-                    "hits": [{
-                        "document_id": "01JMETADATA0123456789ABCDE",
-                        "group_id": "01JABCDEF0123456789ABCDEFG",
-                        "document_path": "datasets/rna-seq",
-                        "graph_iri": "https://node.example.test/api/v1/metadata/01JMETADATA0123456789ABCDE",
-                        "subject_iri": "https://node.example.test/api/v1/metadata/01JMETADATA0123456789ABCDE#root",
-                        "score": 4.5,
-                        "title": "RNA-seq reference run",
-                        "snippet": "reference run of the RNA-seq pipeline"
-                    }],
-                    "next_cursor": "eyJ3IjoiMDFKTUVUQURBVEEwMTIzNDU2Nzg5QUJDREUifQ",
+                    "hits": [
+                        {
+                            "document_id": "01JMETADATA0123456789ABCDE",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "document_path": "datasets/rna-seq",
+                            "graph_iri": "https://node.example.test/api/v1/metadata/01JMETADATA0123456789ABCDE",
+                            "subject_iri": "https://node.example.test/api/v1/metadata/01JMETADATA0123456789ABCDE#root",
+                            "score": 4.5,
+                            "title": "RNA-seq reference run",
+                            "snippet": "reference run of the RNA-seq pipeline"
+                        }
+                    ],
+                    "next_cursor": "<opaque-documents-cursor>",
                     "nodes_queried": 3,
                     "nodes_failed": 0,
                     "truncated": false
                 },
                 "buckets": {
-                    "hits": [{
-                        "arn": "arn:aruna:cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/lab-raw",
-                        "bucket": "lab-raw",
-                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
-                        "group_id": "01JABCDEF0123456789ABCDEFG",
-                        "group_name": "Lab A",
-                        "created_at": "2026-04-09T14:23:11.123+00:00"
-                    }],
+                    "hits": [
+                        {
+                            "arn": "arn:aruna:cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/lab-raw",
+                            "bucket": "lab-raw",
+                            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "group_name": "Lab A",
+                            "created_at": "2026-04-09T14:23:11.123+00:00"
+                        }
+                    ],
                     "nodes_queried": 3,
                     "nodes_failed": 0,
                     "failed_nodes": []
                 },
                 "groups": {
-                    "hits": [{"group_id": "01JABCDEF0123456789ABCDEFG", "display_name": "Lab A"}],
+                    "hits": [
+                        {
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "display_name": "Lab A"
+                        }
+                    ],
                     "truncated": false
                 },
                 "users": {
-                    "hits": [{
-                        "user_id": "01JUSER0123456789ABCDEFGHI@cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g",
-                        "name": "example-user"
-                    }]
+                    "hits": [
+                        {
+                            "user_id": "01JUSER0123456789ABCDEFGHI@cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g",
+                            "name": "example-user"
+                        }
+                    ]
                 }
             })
         ),
