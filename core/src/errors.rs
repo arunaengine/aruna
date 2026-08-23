@@ -144,6 +144,10 @@ pub enum StorageError {
     CommitFailed,
     #[error("Transaction not found")]
     TransactionNotFound,
+    /// Transaction-cleanup tracking is full, so the effect was never enqueued.
+    /// Distinct from a conflict: re-running the same effect only spins.
+    #[error("Transaction cleanup capacity exhausted")]
+    CleanupCapacity,
     #[error("Keyspace error")]
     KeyspaceError,
     #[error("Read error")]
@@ -172,7 +176,10 @@ impl StorageError {
     /// storage actor at all. Every other failure leaves the commit either
     /// already applied or unknown, so its records may exist.
     pub fn proves_no_commit(&self) -> bool {
-        matches!(self, Self::TransactionConflict | Self::QueueFull)
+        matches!(
+            self,
+            Self::TransactionConflict | Self::QueueFull | Self::CleanupCapacity
+        )
     }
 }
 

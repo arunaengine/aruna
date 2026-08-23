@@ -4391,4 +4391,22 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, JobState::Running);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_not_conflict() {
+        // Cleanup-capacity exhaustion must fail fast, never feed the OCC retry.
+        let (storage, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
+        let actor = std::thread::spawn(move || {
+            let (_effect, response_tx, ..) = receiver.recv().expect("commit effect arrives");
+            assert!(response_tx.send(StorageEvent::Error {
+                error: StorageError::CleanupCapacity,
+            }));
+        });
+
+        let result = commit_txn(&storage, Ulid::generate()).await;
+        actor.join().expect("storage actor finishes");
+
+        assert!(matches!(result, CommitResult::Failed(_)));
+    }
 }

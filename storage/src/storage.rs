@@ -1027,7 +1027,7 @@ fn reserve_cleanup(
 
     if previous.is_none() {
         if pending.len() >= MAX_TRANSACTION_CLEANUP {
-            return Err(StorageError::TransactionConflict);
+            return Err(StorageError::CleanupCapacity);
         }
         pending.insert(
             txn_id,
@@ -1958,7 +1958,7 @@ impl FjallStorage {
                 .expect("transaction cleanup mutex poisoned");
             if pending.len() >= MAX_TRANSACTION_CLEANUP {
                 return StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
+                    error: StorageError::CleanupCapacity,
                 };
             }
             if pending.contains_key(&candidate) {
@@ -4368,6 +4368,31 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_cap_distinct() {
+        // Capacity exhaustion is not a conflict, so retry loops must not spin on it.
+        let mut pending = std::collections::BTreeMap::new();
+        for index in 0..super::MAX_TRANSACTION_CLEANUP {
+            pending.insert(
+                Ulid::from_parts(index as u64, 0),
+                super::CleanupEntry {
+                    kind: super::CleanupKind::Open,
+                    attempts: 0,
+                    queued: false,
+                },
+            );
+        }
+
+        assert!(matches!(
+            super::reserve_cleanup(
+                &mut pending,
+                Ulid::from_parts(u64::MAX, 0),
+                super::CleanupKind::Abort,
+            ),
+            Err(StorageError::CleanupCapacity)
+        ));
+    }
+
+    #[test]
     fn unknown_commit_runs() {
         let dir = tempdir().unwrap();
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
@@ -4642,7 +4667,7 @@ mod tests {
                 .send_storage_effect(StorageEffect::StartTransaction { read: true })
                 .await,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict
+                error: StorageError::CleanupCapacity
             })
         ));
 
