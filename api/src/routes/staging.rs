@@ -4,6 +4,7 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::connectors::ApiSourceConnectorKind;
+use crate::routes::jobs::map_submit_error;
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
@@ -540,7 +541,11 @@ WRITE on each target key or target prefix. Nothing is authorized later while the
 - At least one item or prefix is required.
 - Source paths must be relative and confined, and target keys must not be blank.
 - `node_id`, when given, must be this node, because the job runs where it was submitted.
-- The `sync` strategy is not implemented."#,
+- The `sync` strategy is not implemented.
+
+**Errors**: a refusal from job admission keeps its own status instead of collapsing into a 500. An
+unavailable job placement binding or an unhealthy structured id clock is a 503 carrying
+`Retry-After`, so the identical body may be resubmitted; a storage failure stays a 500."#,
     request_body(
         content = StageBatchRequest,
         description = "One connector and target bucket for the job, plus the `items` and `prefixes` it should stage; at least one of the two must be non-empty. `node_id` defaults to this node.",
@@ -570,7 +575,8 @@ WRITE on each target key or target prefix. Nothing is authorized later while the
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path or prefix is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller lacks READ on a source path or WRITE on a target key", body = ErrorResponse),
-        (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse)
+        (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse),
+        (status = 503, description = "Job placement or the structured id clock is unavailable; retry the same body", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -676,7 +682,7 @@ pub async fn submit_staging(
         state.rocrate_limits().artifact_retention_ms,
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(map_submit_error)?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1842,6 +1848,24 @@ mod tests {
             .await
             .is_some(),
             "durable obligation should remain repairable when staging queue kick fails"
+        );
+    }
+
+    #[test]
+    fn staging_submit_classifies() {
+        // Job admission refusals must keep their status instead of collapsing into 500.
+        use aruna_operations::jobs::submit::SubmitJobError;
+
+        assert_eq!(
+            map_submit_error(SubmitJobError::PlacementUnavailable(
+                "no binding".to_string()
+            ))
+            .status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            map_submit_error(SubmitJobError::InvalidWorkspace("bad".to_string())).status_code(),
+            StatusCode::BAD_REQUEST
         );
     }
 
