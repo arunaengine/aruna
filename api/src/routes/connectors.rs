@@ -514,8 +514,8 @@ pub async fn get_source_connector(
   a reference can always be resolved with the credentials it was created against.
 
 **Errors**: the 400 body again states only that the request was bad, without the reason. The refusal
-to change referenced credentials is currently reported as an internal error rather than as a
-conflict."#,
+to change referenced credentials is a 409 and stays one until the referencing versions are gone, so
+it is not worth retrying unchanged."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to replace, as a 26-character ULID")
@@ -572,6 +572,11 @@ conflict."#,
         (
             status = 404,
             description = "No connector with that id is registered for this group on this node",
+            body = ErrorResponse
+        ),
+        (
+            status = 409,
+            description = "The credentials are still referenced by a stored object version",
             body = ErrorResponse
         )
     ),
@@ -630,8 +635,8 @@ pub async fn replace_source_connector(
 - The deletion is refused while any stored object version still references the connector's
   credentials, so a referenced connector must be detached before it can be removed.
 
-**Errors**: the refusal to delete a referenced connector is currently reported as an internal error
-rather than as a conflict."#,
+**Errors**: the refusal to delete a referenced connector is a 409 and stays one until the
+referencing versions are gone, so it is not worth retrying unchanged."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to delete, as a 26-character ULID")
@@ -655,6 +660,11 @@ rather than as a conflict."#,
         (
             status = 404,
             description = "No connector with that id is registered for this group on this node",
+            body = ErrorResponse
+        ),
+        (
+            status = 409,
+            description = "The credentials are still referenced by a stored object version",
             body = ErrorResponse
         )
     ),
@@ -1166,6 +1176,9 @@ fn map_replace_connector_error(error: ReplaceSourceConnectorError) -> ServerErro
     match error {
         ReplaceSourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         ReplaceSourceConnectorError::NotFound => ServerError::NotFound,
+        ReplaceSourceConnectorError::ReferencedByObjectVersion => {
+            ServerError::Conflict(error.to_string())
+        }
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1173,6 +1186,9 @@ fn map_replace_connector_error(error: ReplaceSourceConnectorError) -> ServerErro
 fn map_delete_connector_error(error: DeleteSourceConnectorError) -> ServerError {
     match error {
         DeleteSourceConnectorError::NotFound => ServerError::NotFound,
+        DeleteSourceConnectorError::ReferencedByObjectVersion => {
+            ServerError::Conflict(error.to_string())
+        }
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1498,6 +1514,19 @@ mod tests {
         assert!(matches!(
             error,
             ServerError::BadGatewayReason(message) if message == "List error: not an index"
+        ));
+    }
+
+    #[test]
+    fn referenced_connector_conflicts() {
+        // A still-referenced credential is a policy refusal, not an internal error.
+        assert!(matches!(
+            map_replace_connector_error(ReplaceSourceConnectorError::ReferencedByObjectVersion),
+            ServerError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_delete_connector_error(DeleteSourceConnectorError::ReferencedByObjectVersion),
+            ServerError::Conflict(_)
         ));
     }
 
