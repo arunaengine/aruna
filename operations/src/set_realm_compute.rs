@@ -12,20 +12,23 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, RealmComputeConfig, RealmConfigDocument};
+use aruna_core::structs::{
+    Actor, AuthContext, Permission, RealmComputeConfig, RealmConfigDocument, policy_admin_path,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
@@ -34,6 +37,9 @@ use crate::placement::placement_ref_for_target;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetRealmComputeConfig {
     pub actor: Actor,
+    /// The caller's own token context, so a path-restricted credential stays
+    /// restricted; it is never derived from `actor`.
+    pub auth_context: AuthContext,
     /// The complete compute configuration; it replaces the stored one.
     pub compute: RealmComputeConfig,
 }
@@ -49,6 +55,7 @@ pub struct SetRealmComputeOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum SetRealmComputeState {
     Init,
+    Auth,
     StartTransaction,
     ReadCurrent,
     WriteDocumentAndAdminState {
@@ -78,6 +85,8 @@ pub enum SetRealmComputeError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
+    #[error("caller may not write the realm configuration")]
+    Unauthorized,
     #[error("invalid compute configuration: {reason}")]
     InvalidCompute { reason: String },
     #[error("missing active transaction")]
@@ -255,14 +264,40 @@ impl Operation for SetRealmComputeOperation {
     type Error = SetRealmComputeError;
 
     fn start(&mut self) -> Effects {
-        self.state = SetRealmComputeState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return self.fail(SetRealmComputeError::Unauthorized);
+        }
+        self.state = SetRealmComputeState::Auth;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            }),
+            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
+        ))]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
+            SetRealmComputeState::Auth => match event {
+                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                    match allowed {
+                        Ok(true) => {
+                            self.state = SetRealmComputeState::StartTransaction;
+                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                                read: false
+                            })]
+                        }
+                        Ok(false) => self.fail(SetRealmComputeError::Unauthorized),
+                        Err(error) => {
+                            warn!(error = %error, "Realm compute authorization check failed");
+                            self.fail(SetRealmComputeError::Unauthorized)
+                        }
+                    }
+                }
+                other => self.unexpected_event("authorization result", format!("{other:?}")),
+            },
             SetRealmComputeState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
@@ -394,7 +429,10 @@ mod tests {
     use aruna_core::compute_quota::ComputeQuota;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::{GroupComputeQuota, LocationLink, RealmId};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::{
+        GroupComputeQuota, LocationLink, RealmAuthorizationDocument, RealmId,
+    };
     use aruna_core::types::UserId;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -415,6 +453,44 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
             user_id: UserId::local(Ulid::from_bytes([1u8; 16]), realm_id),
             realm_id,
+        }
+    }
+
+    fn auth(actor: &Actor) -> AuthContext {
+        AuthContext {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    fn compute_config(actor: &Actor, compute: RealmComputeConfig) -> SetRealmComputeConfig {
+        SetRealmComputeConfig {
+            actor: actor.clone(),
+            auth_context: auth(actor),
+            compute,
+        }
+    }
+
+    /// The realm admin role only grants what the operation checks, so the
+    /// permission sub-operation decides on stored rules like production does.
+    async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
+        let mut document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        for role in document.roles.values_mut() {
+            role.assigned_users.insert(actor.user_id);
+        }
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: (*actor.realm_id.as_bytes()).into(),
+                value: document.to_bytes(actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 
@@ -469,12 +545,10 @@ mod tests {
             &RealmConfigDocument::new(realm_id, Vec::new(), 3),
         )
         .await;
+        seed_realm_admin(&ctx, &actor).await;
 
         let stored = drive(
-            SetRealmComputeOperation::new(SetRealmComputeConfig {
-                actor: actor.clone(),
-                compute: configured(),
-            }),
+            SetRealmComputeOperation::new(compute_config(&actor, configured())),
             &ctx,
         )
         .await
@@ -508,23 +582,114 @@ mod tests {
             &RealmConfigDocument::new(realm_id, Vec::new(), 3),
         )
         .await;
+        seed_realm_admin(&ctx, &actor).await;
 
+        let invalid = RealmComputeConfig {
+            links: vec![LocationLink {
+                from: "eu-west".to_string(),
+                to: "us-east".to_string(),
+                bandwidth_bytes_per_sec: 0,
+            }],
+            ..RealmComputeConfig::default()
+        };
         let error = drive(
-            SetRealmComputeOperation::new(SetRealmComputeConfig {
-                actor,
-                compute: RealmComputeConfig {
-                    links: vec![LocationLink {
-                        from: "eu-west".to_string(),
-                        to: "us-east".to_string(),
-                        bandwidth_bytes_per_sec: 0,
-                    }],
-                    ..RealmComputeConfig::default()
-                },
-            }),
+            SetRealmComputeOperation::new(compute_config(&actor, invalid)),
             &ctx,
         )
         .await
         .expect_err("a zero bandwidth link is refused");
         assert!(matches!(error, SetRealmComputeError::InvalidCompute { .. }));
+    }
+
+    #[tokio::test]
+    async fn refuses_unauthorized_caller() {
+        // Nothing is written when the caller holds no realm-config write.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let actor = actor(realm_id);
+        seed(
+            &ctx,
+            &actor,
+            &RealmConfigDocument::new(realm_id, Vec::new(), 3),
+        )
+        .await;
+        let mut document = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        document.roles.clear();
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: document.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let error = drive(
+            SetRealmComputeOperation::new(compute_config(&actor, configured())),
+            &ctx,
+        )
+        .await
+        .expect_err("an unauthorized caller is refused");
+        assert_eq!(error, SetRealmComputeError::Unauthorized);
+
+        let reread = drive(GetRealmConfigOperation::new(realm_id), &ctx)
+            .await
+            .expect("config reads");
+        assert_eq!(reread.compute, RealmComputeConfig::default());
+    }
+
+    #[test]
+    fn start_checks_permission() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
+        let effects = operation.start();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let emitted = format!("{effects:?}");
+        assert!(emitted.contains(&policy_admin_path(realm_id)));
+        assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn denied_is_terminal() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetRealmComputeError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn allowed_starts_transaction() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        );
     }
 }

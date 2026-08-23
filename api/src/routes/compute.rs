@@ -453,15 +453,16 @@ pub async fn put_compute_config(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<ComputeConfigBody>,
 ) -> ServerResult<Json<ComputeConfigBody>> {
-    let auth = require_config_admin(&state, auth, Permission::WRITE).await?;
+    let auth = require_realm_auth(&state, auth)?;
     let compute = compute_config(request)?;
     let stored = drive(
         SetRealmComputeOperation::new(SetRealmComputeConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
-                realm_id: auth.realm_id,
+                realm_id: state.get_realm_id(),
             },
+            auth_context: auth,
             compute,
         }),
         &state.get_ctx(),
@@ -475,6 +476,7 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
     use aruna_core::errors::StorageError;
     match error {
         SetRealmComputeError::RealmConfigNotFound => ServerError::NotFound,
+        SetRealmComputeError::Unauthorized => ServerError::Forbidden,
         SetRealmComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
         SetRealmComputeError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict(

@@ -18,6 +18,11 @@ const BOUNDARY: &[&str] = &[
 /// is still authorized. A new route must gain a check or a reviewed entry here.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
+        "compute.rs",
+        "put_compute_config",
+        "realm-config WRITE checked inside SetRealmComputeOperation",
+    ),
+    (
         "credentials.rs",
         "list_s3_credentials",
         "self-scoped: only credentials whose identity is the caller",
