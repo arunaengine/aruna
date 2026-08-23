@@ -12,7 +12,7 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::errors::{BlobError, ConversionError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, GROUP_STORAGE_BACKEND_KEYSPACE,
@@ -1384,6 +1384,27 @@ async fn reports_range_size() {
         panic!("open range read failed")
     };
     assert_eq!(stream_size, 10);
+}
+
+#[tokio::test]
+async fn keeps_storage_cause() {
+    // The storage reason must reach the blob error, not be flattened into a
+    // fixed message that hides why the transaction never started.
+    let context = setup_blob_handle(4).await;
+    context.storage_handle.seal();
+    let handler = context.blob_handle.handler.clone();
+
+    let error = handler
+        .clear_marker(&make_test_location())
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains(&StorageError::Sealed.to_string()),
+        "storage cause missing: {error}"
+    );
 }
 
 #[tokio::test]
