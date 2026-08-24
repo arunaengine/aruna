@@ -125,6 +125,11 @@ pub const GROUP_STORAGE_BACKEND_SECRET_KEYSPACE: &str = "group_storage_backend_s
 /// transaction as the id-keyed record it mirrors.
 pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_index";
 
+/// Device-local registrations of the directories this node offers as read-only
+/// buckets, keyed by bucket name. Never replicated: the root path is the one
+/// fact about the owner's machine that must not leave it.
+pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
+
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 

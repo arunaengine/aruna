@@ -112,6 +112,10 @@ pub enum StagingSourceError {
     ListError(String),
     #[error("Read error: {0}")]
     ReadError(String),
+    /// The source changed while it was being read, so the bytes are not one
+    /// representation. Retryable, and never an identity.
+    #[error("Source changed during the read")]
+    SourceUnstable,
     #[error(transparent)]
     EgressDenied(#[from] crate::egress::EgressError),
 }

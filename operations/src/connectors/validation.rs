@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::endpoint;
-use aruna_core::structs::SourceConnectorKind;
+use aruna_core::structs::{OFFERED_DIRECTORY_BUCKET, SourceConnectorKind};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,10 +62,13 @@ pub fn validate_connector_input(
         return Err(ValidationError::EmptyName);
     }
 
-    // ftp is refused because opendal cannot constrain its passive data address.
+    // ftp is refused because opendal cannot constrain its passive data address;
+    // a local directory is registered on its own device, not as a realm connector.
     if matches!(
         kind,
-        SourceConnectorKind::Ftp | SourceConnectorKind::ArunaNative
+        SourceConnectorKind::Ftp
+            | SourceConnectorKind::ArunaNative
+            | SourceConnectorKind::LocalDirectory
     ) {
         return Err(ValidationError::UnsupportedConnectorKind { kind });
     }
@@ -176,6 +179,11 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidat
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "realm_id", "default_node_id"],
             allowed_secret_keys: &["bearer_token", "access_key", "secret_key"],
+        },
+        SourceConnectorKind::LocalDirectory => SourceConnectorValidationRules {
+            required_public_keys: &[OFFERED_DIRECTORY_BUCKET],
+            allowed_public_keys: &[OFFERED_DIRECTORY_BUCKET],
+            allowed_secret_keys: &[],
         },
     }
 }
