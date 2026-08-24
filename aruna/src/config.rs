@@ -95,7 +95,7 @@ pub struct Config {
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
-    /// Absent together with `s3_address` when no S3 listener is configured.
+    /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
     pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
@@ -376,7 +376,7 @@ pub struct Settings {
     pub max_concurrent_bidi_streams: Option<u64>,
     pub document_sync_runtime: IrohRuntimeConfig,
     pub default_metadata_replication_factor: u32,
-    /// Absent together with `s3_address` when no S3 listener is configured.
+    /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
     pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
@@ -509,8 +509,9 @@ pub fn read_settings() -> Result<Settings, SetupError> {
     let trusted_proxies = trusted_proxies_env()?;
     let rocrate_limits = rocrate_limits_env()?;
     let rate_limits = rate_limits_env()?;
-    // A device profile runs without an S3 listener. Both variables describe the
-    // same endpoint, so half a pair is a misconfiguration rather than a profile.
+    // A device profile runs without an S3 listener: unset or empty disables it,
+    // so a supervisor can force it off over a .env that defines one. Both name
+    // the same endpoint, so half a pair is a misconfiguration, not a profile.
     let (s3_host, s3_address) = match (
         optional_nonempty_env("S3_HOST")?,
         optional_nonempty_env("S3_ADDRESS")?,
@@ -2047,7 +2048,8 @@ mod tests {
 
     #[tokio::test]
     async fn s3_listener_optional() {
-        // A device profile configures no S3 endpoint; half a pair stays an error.
+        // Empty disables the listener; half a pair stays an error. Removal would
+        // prove nothing: `dotenvy::var` refills a removed key from the .env file.
         let _guard = env_lock().lock().await;
         let dir = tempdir().unwrap();
         let vars = ["STORAGE_PATH", "SOCKET_ADDRESS", "S3_HOST", "S3_ADDRESS"];
@@ -2058,8 +2060,8 @@ mod tests {
         unsafe {
             std::env::set_var("STORAGE_PATH", dir.path().to_str().unwrap());
             std::env::set_var("SOCKET_ADDRESS", "127.0.0.1:0");
-            std::env::remove_var("S3_HOST");
-            std::env::remove_var("S3_ADDRESS");
+            std::env::set_var("S3_HOST", "");
+            std::env::set_var("S3_ADDRESS", "");
         }
 
         let settings = read_settings().unwrap();
@@ -2072,7 +2074,16 @@ mod tests {
             Err(SetupError::MissingConfigValue("S3_ADDRESS"))
         ));
 
-        unsafe { std::env::set_var("S3_ADDRESS", "127.0.0.1:0") };
+        unsafe {
+            std::env::set_var("S3_HOST", "");
+            std::env::set_var("S3_ADDRESS", "127.0.0.1:0");
+        }
+        assert!(matches!(
+            read_settings(),
+            Err(SetupError::MissingConfigValue("S3_HOST"))
+        ));
+
+        unsafe { std::env::set_var("S3_HOST", "127.0.0.1:0") };
         let settings = read_settings().unwrap();
         assert_eq!(settings.s3_host.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(settings.s3_address.as_deref(), Some("127.0.0.1:0"));
