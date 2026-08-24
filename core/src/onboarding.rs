@@ -1,7 +1,7 @@
 use crate::NodeId;
 use crate::auth::credential_hash;
 use crate::document::DocumentSyncTarget;
-use crate::structs::RealmId;
+use crate::structs::{RealmId, StaticRealmEndpoint};
 use crate::types::UserId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -113,6 +113,9 @@ pub struct BootstrapOnboardingResponse {
     pub wrapping_public_key: Option<String>,
     pub delegation_signature: Option<String>,
     pub onboarding_sync_ticket: String,
+    /// Sync-eligible realm endpoints the joiner may dial straight away, so a
+    /// device with no DHT read of its own still reaches the realm.
+    pub realm_endpoints: Vec<StaticRealmEndpoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

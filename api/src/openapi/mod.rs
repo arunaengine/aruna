@@ -1030,6 +1030,10 @@ mod tests {
                 wrapping_public_key: None,
                 delegation_signature: Some("<realm-delegation-signature>".to_string()),
                 onboarding_sync_ticket: "<one-time-onboarding-sync-ticket>".to_string(),
+                realm_endpoints: vec![aruna_core::structs::StaticRealmEndpoint {
+                    node_id: endpoint_addr().id.to_string(),
+                    endpoint_addr: format!("{};ip:192.0.2.10:4433", endpoint_addr().id),
+                }],
             })
             .unwrap();
         let onboarding_media = &doc["paths"]["/onboarding/bootstrap"]["post"]["responses"]["200"]["content"]

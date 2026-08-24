@@ -7,7 +7,10 @@ use aruna_core::onboarding::{
     OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode,
     bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
-use aruna_core::structs::{AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::{
+    AuthContext, NodeCapabilities, Permission, RealmConfigDocument, RealmDiscoveryConfig,
+    StaticRealmEndpoint,
+};
 use aruna_operations::bootstrap_onboarding_finalize::{
     BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
     bootstrap_onboarding_finalize,
@@ -21,6 +24,7 @@ use aruna_operations::delete_onboarding_secret::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::ensure_realm_config::EnsureRealmConfigError;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
@@ -107,6 +111,13 @@ pub struct BootstrapOnboardingResponseDoc {
     pub wrapping_public_key: Option<String>,
     pub delegation_signature: Option<String>,
     pub onboarding_sync_ticket: String,
+    pub realm_endpoints: Vec<RealmEndpointDoc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct RealmEndpointDoc {
+    pub node_id: String,
+    pub endpoint_addr: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -460,8 +471,12 @@ only a management node serves this route.
 - A `User` secret needs neither: a device holds no realm key and no issuer delegation, and joins as
   an owner-bound member that never becomes a sync, holder or placement target. Its `mode` echoes
   the owner the secret was bound to at mint time.
-- The response always carries the realm id, the temporary endpoint to dial and a one-time sync
-  ticket the joiner uses to fetch the realm's core documents.
+- The response always carries the realm id, the temporary endpoint to dial, a one-time sync ticket
+  the joiner uses to fetch the realm's core documents, and `realm_endpoints`.
+- `realm_endpoints` carries the realm's declared static discovery endpoints, kept only for nodes
+  that are configured, sync-eligible members. A joiner that cannot read the DHT, a device in
+  particular, dials them to reach the realm without discovery. It is a starting point, not the
+  realm membership, and a realm on dynamic discovery declares none, leaving the list empty.
 - `node_location`, `node_weight` and `node_labels` seed the joiner's placement entry and are
   optional.
 - Everything returned here is one-time joining material and must never be logged or reused.
@@ -508,7 +523,13 @@ serve enrollment answers 403."#,
                 "wrapped_realm_private_key_nonce": null,
                 "wrapping_public_key": null,
                 "delegation_signature": "<realm-delegation-signature>",
-                "onboarding_sync_ticket": "<one-time-onboarding-sync-ticket>"
+                "onboarding_sync_ticket": "<one-time-onboarding-sync-ticket>",
+                "realm_endpoints": [
+                    {
+                        "node_id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+                        "endpoint_addr": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a;ip:192.0.2.10:4433"
+                    }
+                ]
             })
         ),
         (status = 400, description = "Malformed node id, key material or proof, or key material missing for the mode the secret was minted for", body = crate::error::ErrorResponse),
@@ -611,6 +632,8 @@ pub async fn bootstrap_onboarding(
     .await
     .map_err(map_finalize_error)?;
 
+    let realm_endpoints = realm_endpoints(&state, node_id).await?;
+
     let response = match finalized.mode {
         OnboardingMode::Management => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
@@ -623,6 +646,7 @@ pub async fn bootstrap_onboarding(
             wrapping_public_key: wrapped_management_key.as_ref().map(|value| value.2.clone()),
             delegation_signature: None,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,
+            realm_endpoints,
         },
         OnboardingMode::Server => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
@@ -633,6 +657,7 @@ pub async fn bootstrap_onboarding(
             wrapping_public_key: None,
             delegation_signature,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,
+            realm_endpoints,
         },
         // A device receives no realm key and no issuer delegation.
         mode @ OnboardingMode::User { .. } => BootstrapOnboardingResponse {
@@ -644,10 +669,48 @@ pub async fn bootstrap_onboarding(
             wrapping_public_key: None,
             delegation_signature: None,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,
+            realm_endpoints,
         },
     };
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// Realm endpoints a joiner may dial straight away: the discovery
+/// configuration's declared ones, kept only for nodes that are configured,
+/// sync-eligible members and not the joiner itself. The node serving this call
+/// is handed over separately as the temporary bootstrap endpoint.
+async fn realm_endpoints(
+    state: &Arc<ServerState>,
+    joiner: NodeId,
+) -> ServerResult<Vec<StaticRealmEndpoint>> {
+    let config = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    Ok(declared_endpoints(&config, &joiner.to_string()))
+}
+
+fn declared_endpoints(config: &RealmConfigDocument, joiner: &str) -> Vec<StaticRealmEndpoint> {
+    let RealmDiscoveryConfig::Static { endpoints } = &config.discovery else {
+        return Vec::new();
+    };
+    let sync_eligible = config
+        .nodes
+        .iter()
+        .filter(|node| node.kind.is_sync_eligible())
+        .map(|node| node.node_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.node_id != joiner && sync_eligible.contains(endpoint.node_id.as_str())
+        })
+        .cloned()
+        .collect()
 }
 
 fn now_timestamp() -> u64 {
@@ -816,7 +879,8 @@ mod tests {
     };
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{
-        Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
+        Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind, StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::bootstrap_onboarding_finalize::BootstrapOnboardingFinalizeError;
@@ -927,6 +991,37 @@ mod tests {
         );
 
         (state, realm_id, node_id, user_id, net_handle, tempdir)
+    }
+
+    #[test]
+    fn declares_dialable_members() {
+        // Only configured, sync-eligible members other than the joiner.
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let server = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let device = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let stranger = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(server, RealmNodeKind::Server);
+        config.ensure_node(
+            device,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+        let endpoint = |node: iroh::PublicKey| StaticRealmEndpoint {
+            node_id: node.to_string(),
+            endpoint_addr: format!("{node};ip:192.0.2.10:4433"),
+        };
+        config.discovery = RealmDiscoveryConfig::Static {
+            endpoints: vec![endpoint(server), endpoint(device), endpoint(stranger)],
+        };
+
+        let declared = super::declared_endpoints(&config, &stranger.to_string());
+        assert_eq!(declared, vec![endpoint(server)]);
+        assert!(super::declared_endpoints(&config, &server.to_string()).is_empty());
+
+        config.discovery = aruna_core::structs::default_realm_discovery_config();
+        assert!(super::declared_endpoints(&config, &stranger.to_string()).is_empty());
     }
 
     #[test]
