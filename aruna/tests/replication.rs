@@ -1067,6 +1067,8 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             max_groups_per_user: Some(3),
             user_group_cap_overrides: Vec::new(),
             max_devices_per_user: None,
+            device_requests_per_minute: None,
+            device_concurrent_pulls: None,
         };
         let quota_response = reqwest::Client::new()
             .put(format!("{}/api/v1/info/realm/quota", harness.seed.base_url))
