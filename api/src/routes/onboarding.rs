@@ -291,8 +291,9 @@ any other node answers 403.
 - Every expired secret that is not already mid-enrollment is discarded before the new one is
   created.
 
-- `seed_url` is the base URL the joiner calls back. Leave it empty to have this node fill in its
-  own published REST base URL, which is what a device mint from the portal does.
+- `seed_url` is the origin the joiner calls back, without any path: the joiner appends
+  `/api/v1/onboarding/bootstrap` to it itself. Leave it empty to have this node fill in its own
+  published REST origin, which is what a device mint from the portal does.
 - A `User` mint also returns `enroll_url`, the deep link a device app opens to claim the secret
   without a copy and paste. Its shape is a contract both the desktop app and the portal wizard
   parse: scheme `aruna`, host `enroll`, and the query keys `secret` (this very secret), `seed`
@@ -318,7 +319,7 @@ interface answers 400. A realm policy that forbids enrollment answers 403."#,
         content = CreateOnboardingSecretRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
         example = json!({
-            "seed_url": "https://node.example.test/api/v1",
+            "seed_url": "https://node.example.test",
             "mode": "Server",
             "expires_in_seconds": 3600
         })
