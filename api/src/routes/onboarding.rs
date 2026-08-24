@@ -1,6 +1,7 @@
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
+use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
     CreateOnboardingSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
@@ -306,8 +307,9 @@ answers 403.
   the replicated realm configuration, so concurrent redemptions on different nodes remain
   best-effort.
 
-**Errors**: an owner at the device cap answers 409. An empty `seed_url` on a node that publishes no
-REST interface answers 400. A realm policy that forbids enrollment answers 403."#,
+**Errors**: an owner at the device cap answers 409, and so does a mint that lost its transaction to
+a concurrent one, which is safe to retry. An empty `seed_url` on a node that publishes no REST
+interface answers 400. A realm policy that forbids enrollment answers 403."#,
     request_body(
         content = CreateOnboardingSecretRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
@@ -332,7 +334,8 @@ REST interface answers 400. A realm policy that forbids enrollment answers 403."
         (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is path-restricted, this is not a management node, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
-        (status = 409, description = "The owner already holds the realm's maximum number of devices", body = crate::error::ErrorResponse)
+        (status = 409, description = "The owner already holds the realm's maximum number of devices, or a concurrent mint won the transaction; retry", body = crate::error::ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity is exhausted; retry", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -978,6 +981,14 @@ fn map_create_error(error: CreateOnboardingSecretError) -> ServerError {
     match error {
         CreateOnboardingSecretError::DeviceCapExceeded { .. } => {
             ServerError::Conflict(error.to_string())
+        }
+        CreateOnboardingSecretError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent enrollment secret conflict; retry".to_string())
+        }
+        CreateOnboardingSecretError::StorageError(StorageError::CleanupCapacity) => {
+            ServerError::ServiceUnavailableReason(
+                "storage cleanup capacity exhausted; retry".to_string(),
+            )
         }
         other => ServerError::InternalError(other.to_string()),
     }
