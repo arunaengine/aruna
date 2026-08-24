@@ -2015,8 +2015,9 @@ pub async fn forward_group_create(
         auth_token: Some(auth_token),
         display_name,
     };
-    // Retrying a create on another ingress could mint a second group, so a
-    // reachable ingress owns the outcome and only transport failures move on.
+    // Retrying a create on another ingress could mint a second group, so only a
+    // request that never left this node moves on. A timeout cannot tell a hung
+    // dial from a slow-but-applied create, so it stops here as well.
     for peer in peers {
         match timeout(
             ADMIN_RELAY_ATTEMPT_TIMEOUT,
@@ -2041,7 +2042,22 @@ pub async fn forward_group_create(
                 warn!(%peer, %error, "Ingress rejected a forwarded group create");
                 return Err(MetadataApiError::ServiceUnavailable.into());
             }
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => continue,
+            Ok(Ok(_)) => {
+                warn!(%peer, "Ingress answered a forwarded group create unexpectedly");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
+            Ok(Err(error)) if retry_disposition(error.delivery()) == RetryDisposition::TryNext => {
+                warn!(%peer, %error, "Failed to reach an ingress for a forwarded group create");
+                continue;
+            }
+            Ok(Err(error)) => {
+                warn!(%peer, %error, "Forwarded group create may have been applied");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
+            Err(_) => {
+                warn!(%peer, "Forwarded group create timed out on a reached ingress");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
         }
     }
     Err(MetadataApiError::ServiceUnavailable.into())
