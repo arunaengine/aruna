@@ -70,6 +70,9 @@ use crate::blob::reclaim::{
 };
 use crate::blob_holders::RefreshBlobHoldersOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::device::drain::{
+    DrainOutcome, INTAKE_CONTINUE_AFTER, INTAKE_DEFER_RETRY_AFTER, restore_intake_timer,
+};
 use crate::document_sync_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
     restore_document_sync_outbox_timers,
@@ -2510,6 +2513,7 @@ async fn durable_rearm_loop(
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_intake_timer(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2636,6 +2640,7 @@ impl TaskQueues {
         spawn_queue_rearm(&context, &task_handle, shutdown);
         restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_intake_timer(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2825,6 +2830,17 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainJobWitnessQueue => {
                 self.drain_job_witness_queue().await;
+            }
+            TaskKey::DrainDeviceIntake => {
+                let after = match crate::device::drain::drain_intake(&self.context).await {
+                    DrainOutcome::Deferred => Some(INTAKE_DEFER_RETRY_AFTER),
+                    DrainOutcome::More => Some(INTAKE_CONTINUE_AFTER),
+                    DrainOutcome::Idle => None,
+                };
+                if let Some(after) = after {
+                    self.reschedule_timer(TaskKey::DrainDeviceIntake, after)
+                        .await;
+                }
             }
         }
     }

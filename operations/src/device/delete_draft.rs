@@ -287,6 +287,7 @@ mod tests {
         let mut entry = entry();
         entry.state = IntakeState::Publishing {
             document_id: Ulid::generate(),
+            due_at_ms: 0,
             attempts: 1,
         };
         store(&context, &entry).await;

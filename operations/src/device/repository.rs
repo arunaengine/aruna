@@ -51,6 +51,7 @@ pub enum IntakeState {
     /// fence answers with the original record instead of a second document.
     Publishing {
         document_id: Ulid,
+        due_at_ms: u64,
         attempts: u32,
     },
     Published {
@@ -99,8 +100,9 @@ impl IntakeEntry {
     /// Whether the drain may pick this entry up now.
     pub fn is_due(&self, now_ms: u64) -> bool {
         match &self.state {
-            IntakeState::Pending { due_at_ms, .. } => *due_at_ms <= now_ms,
-            IntakeState::Publishing { .. } => true,
+            IntakeState::Pending { due_at_ms, .. } | IntakeState::Publishing { due_at_ms, .. } => {
+                *due_at_ms <= now_ms
+            }
             IntakeState::Published { .. } | IntakeState::Failed { .. } => false,
         }
     }
@@ -114,6 +116,15 @@ impl IntakeEntry {
             }
             IntakeState::Published { .. } | IntakeState::Failed { .. } => 0,
         }
+    }
+}
+
+/// The same entry under a new lifecycle state; everything the owner authored
+/// stays frozen so a retry forwards the identical create.
+pub fn entry_with_state(entry: &IntakeEntry, state: IntakeState) -> IntakeEntry {
+    IntakeEntry {
+        state,
+        ..entry.clone()
     }
 }
 
@@ -168,11 +179,13 @@ mod tests {
     }
 
     #[test]
-    fn orders_keys_by_draft() {
-        let older = entry();
-        let newer = entry();
-        assert!(intake_key(older.draft_id) < intake_key(newer.draft_id));
-        assert_eq!(intake_key(older.draft_id).len(), 16);
+    fn keys_the_raw_draft_id() {
+        // The raw ULID is the key, so a forward scan is creation order.
+        let entry = entry();
+        assert_eq!(
+            intake_key(entry.draft_id).as_ref(),
+            entry.draft_id.to_bytes().as_slice()
+        );
     }
 
     #[test]

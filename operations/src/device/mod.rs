@@ -3,6 +3,7 @@
 //! becomes realm state only when the drain forwards it as an ordinary create.
 
 pub mod delete_draft;
+pub mod drain;
 pub mod enqueue_draft;
 pub mod inspect_draft;
 pub mod list_drafts;
