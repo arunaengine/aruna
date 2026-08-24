@@ -98,7 +98,7 @@ pub struct NodeStatus {
 pub enum NodeCapabilityKind {
     Management,
     Server,
-    Local,
+    User,
 }
 
 impl From<&aruna_core::structs::NodeCapabilities> for NodeCapabilityKind {
@@ -106,7 +106,7 @@ impl From<&aruna_core::structs::NodeCapabilities> for NodeCapabilityKind {
         match capabilities {
             aruna_core::structs::NodeCapabilities::Management { .. } => Self::Management,
             aruna_core::structs::NodeCapabilities::Server { .. } => Self::Server,
-            aruna_core::structs::NodeCapabilities::Local { .. } => Self::Local,
+            aruna_core::structs::NodeCapabilities::User { .. } => Self::User,
         }
     }
 }
@@ -863,7 +863,6 @@ pub struct RealmNodeUtilizationResponse {
 pub enum RealmNodeKindInfo {
     Management,
     Server,
-    Local,
     User,
 }
 
@@ -879,7 +878,6 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
         match value {
             RealmNodeKind::Management => Self::Management,
             RealmNodeKind::Server => Self::Server,
-            RealmNodeKind::Local => Self::Local,
             RealmNodeKind::User => Self::User,
         }
     }
@@ -2355,7 +2353,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -2458,7 +2456,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.node.peer_id, Some(state.get_node_id().to_string()));
-        assert_eq!(response.node.capabilities, Some(NodeCapabilityKind::Local));
+        assert_eq!(response.node.capabilities, Some(NodeCapabilityKind::User));
         let network = response.services.network.expect("realm token sees network");
         assert_eq!(network.status, ServiceStatus::Unavailable);
         assert!(
@@ -2710,7 +2708,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),

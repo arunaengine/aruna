@@ -195,9 +195,9 @@ only a management node serves it and any other node answers 403.
   secret that is lost cannot be recovered and must be revoked and minted again.
 - Treat the value like a credential, hand it to exactly one joining node, and expect it to be
   single-use.
-- `mode` fixes what the joiner may become and is one of `Management`, `Server` or `Local`; a
-  `Management` secret later lets the joiner receive the realm private key wrapped to its transport
-  key, so it is the most sensitive of the three.
+- `mode` fixes what the joiner may become and is one of `Management` or `Server`; a `Management`
+  secret later lets the joiner receive the realm private key wrapped to its transport key, so it is
+  the more sensitive of the two.
 - Every expired secret that is not already mid-enrollment is discarded before the new one is
   created.
 
@@ -413,8 +413,7 @@ only a management node serves this route.
 - What must be sent depends on the mode the secret was minted for: a `Server` secret additionally
   requires `issuer_public_key` and a matching `issuer_proof` and returns a delegation signature; a
   `Management` secret requires `transport_public_key` and returns the realm private key encrypted
-  to it, along with the nonce and the ephemeral public key needed to open it; a `Local` secret
-  needs neither.
+  to it, along with the nonce and the ephemeral public key needed to open it.
 - The response always carries the realm id, the temporary endpoint to dial and a one-time sync
   ticket the joiner uses to fetch the realm's core documents.
 - `node_location`, `node_weight` and `node_labels` seed the joiner's placement entry and are
@@ -510,7 +509,7 @@ pub async fn bootstrap_onboarding(
                 .ok_or(ServerError::BadRequest)?;
             verify_issuer_proof(&request, issuer_public_key)?;
         }
-        OnboardingMode::Management | OnboardingMode::Local => {}
+        OnboardingMode::Management => {}
     }
 
     let bootstrap_endpoint = state
@@ -586,16 +585,6 @@ pub async fn bootstrap_onboarding(
             wrapped_realm_private_key_nonce: None,
             wrapping_public_key: None,
             delegation_signature,
-            onboarding_sync_ticket: finalized.onboarding_sync_ticket,
-        },
-        OnboardingMode::Local => BootstrapOnboardingResponse {
-            realm_id: state.get_realm_id().to_string(),
-            mode: OnboardingMode::Local,
-            temporary_bootstrap_endpoint: bootstrap_endpoint,
-            wrapped_realm_private_key: None,
-            wrapped_realm_private_key_nonce: None,
-            wrapping_public_key: None,
-            delegation_signature: None,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,
         },
     };
@@ -1008,7 +997,7 @@ mod tests {
             seed_url: "http://127.0.0.1:3000".to_string(),
             enrollment_id,
             secret: [11u8; 32],
-            mode: OnboardingMode::Local,
+            mode: OnboardingMode::Server,
             realm_id,
             purpose: OnboardingPurpose::InitialAdministrator,
         };
@@ -1017,7 +1006,7 @@ mod tests {
                 record: OnboardingSecretRecord {
                     enrollment_id,
                     secret_hash: secret.secret_hash(),
-                    mode: OnboardingMode::Local,
+                    mode: OnboardingMode::Server,
                     purpose: OnboardingPurpose::InitialAdministrator,
                     expires_at: u64::MAX,
                     claimed_node_id: None,
@@ -1080,7 +1069,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Json(CreateOnboardingSecretRequest {
                 seed_url: "http://127.0.0.1:3000".to_string(),
-                mode: OnboardingMode::Local,
+                mode: OnboardingMode::Server,
                 expires_in_seconds: Some(600),
             }),
         )
@@ -1165,7 +1154,7 @@ mod tests {
                 record: OnboardingSecretRecord {
                     enrollment_id: stale_id,
                     secret_hash: "stale".to_string(),
-                    mode: OnboardingMode::Local,
+                    mode: OnboardingMode::Server,
                     purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: 1,
                     claimed_node_id: None,

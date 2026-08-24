@@ -55,7 +55,7 @@ pub(crate) const DOWNLOAD_SLOTS: usize = 256;
 pub struct ServerState {
     // Contains neccessary drivers for request handling
     driver_ctx: Arc<DriverContext>,
-    // Capabilities defined as in spec: Membership, Server and Local node capabilities
+    // Capabilities defined as in spec: Management, Server and User node capabilities
     node_capabilities: NodeCapabilities,
     // Bounded TTL + LRU cache of trusted issuer decoding keys
     issuer_keys: Arc<IssuerKeyCache>,
@@ -284,7 +284,7 @@ impl ServerState {
                 realm_verifying_key,
                 ..
             } => realm_verifying_key,
-            NodeCapabilities::Local {
+            NodeCapabilities::User {
                 realm_verifying_key,
             } => realm_verifying_key,
         }

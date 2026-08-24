@@ -24,8 +24,8 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, AuthContext, BlobHeadKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
-    RealmConfigDocument, RealmId, RealmNodeKind, VersionKey, W3idDataIdentifier,
-    blob_bucket_permission_path, blob_object_permission_path,
+    RealmConfigDocument, RealmId, VersionKey, W3idDataIdentifier, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -1023,10 +1023,10 @@ pub async fn lookup_metadata_path(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let trusted_origin = config.nodes.iter().any(|node| {
-        node.node_id == local_node.to_string()
-            && matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server)
-    });
+    let trusted_origin = config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == local_node.to_string() && node.kind.is_sync_eligible());
     if !trusted_origin {
         let config_digest = config
             .digest()
@@ -1312,7 +1312,7 @@ fn select_forward_peers(
     for node in config
         .nodes
         .iter()
-        .filter(|node| matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server))
+        .filter(|node| node.kind.is_sync_eligible())
     {
         let Ok(peer) = node.node_id.parse::<NodeId>() else {
             continue;
@@ -5668,7 +5668,8 @@ mod tests {
         metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_write_entry,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
+        Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument,
+        RealmNodeKind, Role,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{Key, RoleId};

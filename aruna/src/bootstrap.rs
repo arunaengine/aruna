@@ -379,14 +379,14 @@ pub async fn ensure_initial_local_onboarding_secret(
         seed_url,
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
-        mode: OnboardingMode::Local,
+        mode: OnboardingMode::Server,
         realm_id,
         purpose: OnboardingPurpose::InitialAdministrator,
     };
     let record = aruna_core::onboarding::OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
-        mode: OnboardingMode::Local,
+        mode: OnboardingMode::Server,
         purpose: OnboardingPurpose::InitialAdministrator,
         expires_at: u64::MAX,
         claimed_node_id: None,

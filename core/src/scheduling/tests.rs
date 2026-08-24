@@ -514,12 +514,10 @@ fn drops_draining_targets() {
 }
 
 #[test]
-fn excludes_local_nodes() {
-    // Local and User nodes never take cross-node work, and a departed or
-    // unauthorized controller is out regardless of what it advertises.
+fn excludes_user_nodes() {
+    // User nodes never take cross-node work, and a departed or unauthorized
+    // controller is out regardless of what it advertises.
     let plan_request = request(Vec::new());
-    let mut local = candidate(node(2), "docker");
-    local.node_kind = RealmNodeKind::Local;
     let mut user = candidate(node(3), "docker");
     user.node_kind = RealmNodeKind::User;
     let mut inactive = candidate(node(4), "docker");
@@ -529,12 +527,11 @@ fn excludes_local_nodes() {
 
     let outcome = plan(
         &plan_request,
-        vec![local, user, inactive, unauthorized],
+        vec![user, inactive, unauthorized],
         &config(Vec::new()),
     );
 
     assert!(outcome.selected.is_none() && !outcome.retryable);
-    assert_eq!(verdict(&outcome, node(2)), RejectionVerdict::NodeKind);
     assert_eq!(verdict(&outcome, node(3)), RejectionVerdict::NodeKind);
     assert_eq!(verdict(&outcome, node(4)), RejectionVerdict::Inactive);
     assert_eq!(verdict(&outcome, node(5)), RejectionVerdict::NotAuthorized);

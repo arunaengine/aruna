@@ -3243,7 +3243,6 @@ fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
     match kind {
         RealmNodeKind::Management => "management",
         RealmNodeKind::Server => "server",
-        RealmNodeKind::Local => "local",
         RealmNodeKind::User => "user",
     }
     .to_string()
@@ -3459,7 +3458,6 @@ fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
     match value {
         "management" => Some(RealmNodeKind::Management),
         "server" => Some(RealmNodeKind::Server),
-        "local" => Some(RealmNodeKind::Local),
         "user" => Some(RealmNodeKind::User),
         _ => None,
     }
@@ -5057,7 +5055,7 @@ mod tests {
                 .with_observed(second_origin, 1),
             AdminDocumentOperation::RealmConfigNodeEnsured {
                 node_id: config_node,
-                kind: RealmNodeKind::Local,
+                kind: RealmNodeKind::User,
             },
         );
 
@@ -5067,7 +5065,7 @@ mod tests {
 
         assert_eq!(
             state.materialized_realm_config_nodes(),
-            BTreeMap::from([(config_node, RealmNodeKind::Local)])
+            BTreeMap::from([(config_node, RealmNodeKind::User)])
         );
         assert!(state.conflicts.is_empty());
     }

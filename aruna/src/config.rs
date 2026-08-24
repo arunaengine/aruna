@@ -185,7 +185,7 @@ pub enum PersistedNodeIdentity {
         issuer_private_key_pem: String,
         delegation_signature: String,
     },
-    Local,
+    User,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1210,9 +1210,9 @@ fn node_capabilities_from_state(
                 delegation_signature.clone(),
             )?,
         )),
-        PersistedNodeIdentity::Local => Ok((
+        PersistedNodeIdentity::User => Ok((
             node_state.realm_id,
-            NodeCapabilities::local_node(node_state.realm_id)?,
+            NodeCapabilities::user_node(node_state.realm_id)?,
         )),
     }
 }
@@ -1381,7 +1381,6 @@ async fn bootstrap_onboarded_node_state(
                     SetupError::MissingOnboardingMaterial(OnboardingMode::Server),
                 )?,
             },
-            OnboardingMode::Local => PersistedNodeIdentity::Local,
         };
 
     Ok(BootstrappedNodeState {
@@ -2604,7 +2603,7 @@ mod tests {
             net_secret_key: net_signing_key.to_bytes(),
             onboarding_phase: None,
             onboarding_sync_ticket: None,
-            identity: PersistedNodeIdentity::Local,
+            identity: PersistedNodeIdentity::User,
         };
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);
@@ -2669,7 +2668,7 @@ mod tests {
             net_secret_key: net_signing_key.to_bytes(),
             onboarding_phase: Some(aruna_core::onboarding::OnboardingPhase::CoreDocumentsFetched),
             onboarding_sync_ticket: Some("already-fetched".to_string()),
-            identity: PersistedNodeIdentity::Local,
+            identity: PersistedNodeIdentity::User,
         };
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);

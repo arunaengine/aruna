@@ -22,7 +22,7 @@ use aruna_core::structs::{
     AuthContext, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
     JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, Permission,
     PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument,
-    RealmNodeKind, WorkspaceMode, blob_group_permission_path, evaluate_placement,
+    WorkspaceMode, blob_group_permission_path, evaluate_placement,
 };
 use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
@@ -547,7 +547,7 @@ pub(crate) async fn local_capability(
         .find(|node| node.node_id == local.to_string())
         .map(|node| &node.kind)
         .ok_or(LaunchDecline::Unauthorized)?;
-    if matches!(kind, RealmNodeKind::Local | RealmNodeKind::User) {
+    if !kind.is_sync_eligible() {
         return Err(LaunchDecline::Unauthorized);
     }
     // The durable operator flag is checked directly: a stale heartbeat document

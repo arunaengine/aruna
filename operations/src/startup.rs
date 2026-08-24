@@ -2558,7 +2558,6 @@ mod tests {
         let self_id = node(1);
         let management = node(2);
         let server = node(3);
-        let local = node(4);
         let user = node(5);
         let mut config = RealmConfigDocument::default_for_realm(RealmId([9; 32]), Vec::new());
         config.nodes = vec![
@@ -2582,15 +2581,11 @@ mod tests {
                 node_id: server.to_string(),
                 kind: RealmNodeKind::Server,
             },
-            RealmNode {
-                node_id: local.to_string(),
-                kind: RealmNodeKind::Local,
-            },
         ];
 
         assert_eq!(
             shared_topic_peers(&config, self_id),
-            vec![management, server, local]
+            vec![management, server]
         );
     }
 }

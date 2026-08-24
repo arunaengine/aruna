@@ -885,7 +885,7 @@ mod tests {
             Arc::clone(&ctx),
             realm_id,
             node_id,
-            aruna_core::structs::NodeCapabilities::local_node(realm_id).unwrap(),
+            aruna_core::structs::NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
             aruna_operations::jobs::runtime::JobsRuntime::new(),

@@ -1829,7 +1829,7 @@ mod tests {
             seed_url: node.base_url.clone(),
             enrollment_id: Ulid::generate(),
             secret: [7u8; 32],
-            mode: OnboardingMode::Local,
+            mode: OnboardingMode::Server,
             realm_id: node.realm_id,
             purpose: OnboardingPurpose::InitialAdministrator,
         };
@@ -1838,7 +1838,7 @@ mod tests {
                 record: OnboardingSecretRecord {
                     enrollment_id: onboarding_secret.enrollment_id,
                     secret_hash: onboarding_secret.secret_hash(),
-                    mode: OnboardingMode::Local,
+                    mode: OnboardingMode::Server,
                     purpose: OnboardingPurpose::InitialAdministrator,
                     expires_at: u64::MAX,
                     claimed_node_id: None,
@@ -2466,7 +2466,7 @@ mod resolve_tests {
                 driver_ctx,
                 realm_id,
                 iroh::SecretKey::generate().public(),
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),

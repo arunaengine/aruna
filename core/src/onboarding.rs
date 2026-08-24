@@ -14,7 +14,6 @@ use ulid::Ulid;
 pub enum OnboardingMode {
     Management,
     Server,
-    Local,
 }
 
 /// Distinguishes what a secret may be redeemed for. An initial-administrator

@@ -127,7 +127,7 @@ async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> Test
 async fn drs_historical_materialized_hash_resolves_non_current_version() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let onboarding_secret =
-        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Local)
+        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Server)
             .await?;
     let joiner = spawn_full_joiner_node(&seed, onboarding_secret).await?;
 

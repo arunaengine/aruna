@@ -109,10 +109,9 @@ pub enum NodeCapabilities {
         /// Realm signature over issuer_pubkey
         delegation_signature: String,
     },
-    Local {
-        //realm_pubkey: [u8; 32],
-        realm_verifying_key: [u8; 113],
-    },
+    /// Owner-bound device: it verifies realm signatures but holds no realm
+    /// signing key and no issuer delegation.
+    User { realm_verifying_key: [u8; 113] },
 }
 
 impl NodeCapabilities {
@@ -149,9 +148,9 @@ impl NodeCapabilities {
             realm_verifying_key,
         })
     }
-    pub fn local_node(realm_id: RealmId) -> Result<Self, ConversionError> {
+    pub fn user_node(realm_id: RealmId) -> Result<Self, ConversionError> {
         let realm_verifying_key = realm_id.to_pkcs8_pem_bytes()?;
-        Ok(NodeCapabilities::Local {
+        Ok(NodeCapabilities::User {
             realm_verifying_key,
         })
     }

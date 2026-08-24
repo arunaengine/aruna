@@ -170,12 +170,7 @@ pub async fn forward_token_revoke(
         config
             .nodes
             .iter()
-            .filter(|node| {
-                matches!(
-                    &node.kind,
-                    RealmNodeKind::Management | RealmNodeKind::Server
-                )
-            })
+            .filter(|node| node.kind.is_sync_eligible())
             .filter_map(|node| NodeId::from_str(&node.node_id).ok())
             .filter(|peer| Some(*peer) != local_node_id),
         &subject,
@@ -2024,12 +2019,7 @@ pub(crate) async fn apply_token_revoke(
         .nodes
         .iter()
         .find(|node| node.node_id == net_handle.node_id().to_string());
-    if !local_node.is_some_and(|node| {
-        matches!(
-            &node.kind,
-            RealmNodeKind::Management | RealmNodeKind::Server
-        )
-    }) {
+    if !local_node.is_some_and(|node| node.kind.is_sync_eligible()) {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     }
     let Some(metadata) = context.metadata_handle.as_ref() else {

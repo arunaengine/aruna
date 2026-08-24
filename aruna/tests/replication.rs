@@ -111,9 +111,11 @@ struct ReplicationHarness {
 impl ReplicationHarness {
     async fn new(group_name: &str) -> TestResult<Self> {
         let seed = spawn_full_seed_node().await?;
-        let onboarding_secret =
-            create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Local)
-                .await?;
+        let onboarding_secret = create_onboarding_secret_via_http(
+            &seed,
+            aruna_core::onboarding::OnboardingMode::Server,
+        )
+        .await?;
         let joiner = spawn_full_joiner_node(&seed, onboarding_secret).await?;
 
         let seed_s3 = seed

@@ -1294,7 +1294,7 @@ mod tests {
             ctx,
             test_realm_id(),
             test_node_id(),
-            NodeCapabilities::local_node(test_realm_id()).expect("capabilities"),
+            NodeCapabilities::user_node(test_realm_id()).expect("capabilities"),
             false,
             None,
             aruna_operations::jobs::runtime::JobsRuntime::new(),

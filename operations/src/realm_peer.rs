@@ -1,5 +1,5 @@
 use aruna_core::NodeId;
-use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{RealmConfigDocument, RealmId};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -32,12 +32,7 @@ pub fn ensure_realm_peer(
         .iter()
         .find(|node| node.node_id == peer.to_string())
         .ok_or(RealmPeerError::NotConfigured { peer, realm_id })?;
-    if require_internal_trust
-        && !matches!(
-            &node.kind,
-            RealmNodeKind::Management | RealmNodeKind::Server
-        )
-    {
+    if require_internal_trust && !node.kind.is_sync_eligible() {
         return Err(RealmPeerError::NotTrusted { peer, realm_id });
     }
     Ok(())

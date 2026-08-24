@@ -1222,7 +1222,7 @@ mod tests {
                 driver_ctx,
                 realm,
                 node_id,
-                NodeCapabilities::local_node(realm).unwrap(),
+                NodeCapabilities::user_node(realm).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),

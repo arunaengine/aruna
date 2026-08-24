@@ -2844,7 +2844,7 @@ mod tests {
             net_secret_key: [11_u8; 32],
             onboarding_phase: None,
             onboarding_sync_ticket: Some("ticket".to_string()),
-            identity: PersistedNodeIdentity::Local,
+            identity: PersistedNodeIdentity::User,
         };
         let value = postcard::to_allocvec(&state).unwrap();
 

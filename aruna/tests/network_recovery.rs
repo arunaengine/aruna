@@ -233,7 +233,7 @@ async fn check_recovery(
 async fn realm_outage_recovers() -> TestResult<()> {
     let seed = spawn_full_seed_node().await?;
     let onboarding =
-        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Local)
+        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Server)
             .await?;
     let joiner = spawn_full_joiner_node(&seed, onboarding).await?;
     let result = async {

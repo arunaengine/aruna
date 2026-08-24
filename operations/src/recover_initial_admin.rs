@@ -319,7 +319,7 @@ mod tests {
             OnboardingSecretRecord {
                 enrollment_id: old_id,
                 secret_hash: "old".to_string(),
-                mode: OnboardingMode::Local,
+                mode: OnboardingMode::Server,
                 purpose: OnboardingPurpose::InitialAdministrator,
                 expires_at: u64::MAX,
                 claimed_node_id: None,
@@ -327,7 +327,7 @@ mod tests {
             OnboardingSecretRecord {
                 enrollment_id: other_old_id,
                 secret_hash: "other-old".to_string(),
-                mode: OnboardingMode::Local,
+                mode: OnboardingMode::Server,
                 purpose: OnboardingPurpose::InitialAdministrator,
                 expires_at: u64::MAX,
                 claimed_node_id: None,
@@ -335,7 +335,7 @@ mod tests {
             OnboardingSecretRecord {
                 enrollment_id: claimed_id,
                 secret_hash: "claimed".to_string(),
-                mode: OnboardingMode::Local,
+                mode: OnboardingMode::Server,
                 purpose: OnboardingPurpose::InitialAdministrator,
                 expires_at: u64::MAX,
                 claimed_node_id: None,
@@ -371,7 +371,7 @@ mod tests {
         let replacement = OnboardingSecretRecord {
             enrollment_id: Ulid::generate(),
             secret_hash: "replacement".to_string(),
-            mode: OnboardingMode::Local,
+            mode: OnboardingMode::Server,
             purpose: OnboardingPurpose::InitialAdministrator,
             expires_at: u64::MAX,
             claimed_node_id: None,

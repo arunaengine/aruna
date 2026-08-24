@@ -48,7 +48,7 @@ pub enum CreateTokenError {
 
 impl CreateTokenOperation {
     pub fn new(config: CreateTokenConfig) -> Result<Self, CreateTokenError> {
-        if matches!(config.node_capabilities, NodeCapabilities::Local { .. }) {
+        if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
             Err(CreateTokenError::NotEnoughCapabilities)
         } else {
             Ok(CreateTokenOperation {
@@ -133,7 +133,7 @@ impl CreateTokenOperation {
                 )?;
                 self.output = Some(Ok(token));
             }
-            NodeCapabilities::Local { .. } => return Err(CreateTokenError::NotEnoughCapabilities),
+            NodeCapabilities::User { .. } => return Err(CreateTokenError::NotEnoughCapabilities),
         };
 
         Ok(())

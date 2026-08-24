@@ -244,7 +244,6 @@ async fn ensure_realm_node_once(
     let kind = match mode {
         OnboardingMode::Management => RealmNodeKind::Management,
         OnboardingMode::Server => RealmNodeKind::Server,
-        OnboardingMode::Local => RealmNodeKind::Local,
     };
 
     drive(

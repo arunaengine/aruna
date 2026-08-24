@@ -335,13 +335,15 @@ pub struct RealmNode {
 pub enum RealmNodeKind {
     Management,
     Server,
-    Local,
     /// Owner-bound user device (laptop). Never a sync/holder target.
     User,
 }
 
 impl RealmNodeKind {
-    /// User nodes must never become document holders or sync targets.
+    /// Whether nodes of this kind carry shared realm responsibilities: holder
+    /// and placement membership, sync publication and relay, administrative
+    /// event origination, routing and distributed-query targeting. A User node
+    /// has none of them.
     pub fn is_sync_eligible(&self) -> bool {
         !matches!(self, RealmNodeKind::User)
     }
@@ -351,7 +353,6 @@ impl RealmNodeKind {
         match self {
             RealmNodeKind::Management => "management",
             RealmNodeKind::Server => "server",
-            RealmNodeKind::Local => "local",
             RealmNodeKind::User => "user",
         }
     }

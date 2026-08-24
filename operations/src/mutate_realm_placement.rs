@@ -2288,14 +2288,14 @@ mod tests {
 
     #[test]
     fn authority_needs_management() {
-        // Server, Local, and unknown issuers must be rejected before any
+        // Server, User, and unknown issuers must be rejected before any
         // reducer state is touched; Management keeps working.
         let (mut document, strategy_id) = transition_document();
         let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
         document
             .placement_transitions
             .push(PlacementTransition::new(plan.clone()));
-        document.ensure_node(node(5), RealmNodeKind::Local);
+        document.ensure_node(node(5), RealmNodeKind::User);
         document.ensure_node(node(6), RealmNodeKind::Management);
         let realm_id = document.realm_id;
 

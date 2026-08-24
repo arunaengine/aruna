@@ -76,7 +76,7 @@ async fn setup() -> Fixture {
             }),
             realm_id,
             node_id,
-            NodeCapabilities::local_node(realm_id).unwrap(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
             JobsRuntime::new(),

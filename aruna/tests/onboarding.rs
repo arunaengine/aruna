@@ -61,7 +61,8 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
         seed.context.as_ref(),
     )
     .await?;
-    let onboarding_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Local).await?;
+    let onboarding_secret =
+        create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
     let expected_user = read_user(seed.context.as_ref(), seed.user_id)
         .await
         .expect("seed user should exist");

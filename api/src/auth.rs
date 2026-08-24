@@ -703,7 +703,7 @@ mod test {
             }),
             realm_id,
             node_id,
-            NodeCapabilities::local_node(realm_id).unwrap(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
             aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -1497,7 +1497,7 @@ mod test {
         //
         // Test Local Nodes
         //
-        let capabilities = NodeCapabilities::local_node(realm_id).unwrap();
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id,

@@ -525,7 +525,7 @@ mod tests {
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.ensure_node(mapped, RealmNodeKind::Server);
-        config.ensure_node(unmapped, RealmNodeKind::Local);
+        config.ensure_node(unmapped, RealmNodeKind::Server);
         config.nodes.push(RealmNode {
             node_id: "not-a-valid-key".to_string(),
             kind: RealmNodeKind::Server,
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(b.weight, DEFAULT_NODE_WEIGHT);
         assert!(!b.full);
         assert!(!b.draining);
-        assert_eq!(b.labels.get(KIND_LABEL_KEY), Some(&"local".to_string()));
+        assert_eq!(b.labels.get(KIND_LABEL_KEY), Some(&"server".to_string()));
     }
 
     #[test]

@@ -2108,7 +2108,7 @@ mod tests {
             ctx,
             realm(),
             node_id(),
-            NodeCapabilities::local_node(realm()).unwrap(),
+            NodeCapabilities::user_node(realm()).unwrap(),
             false,
             None,
             JobsRuntime::new(),
