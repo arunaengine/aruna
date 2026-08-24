@@ -8,7 +8,7 @@ use aruna_core::onboarding::{
     bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
 use aruna_core::structs::{
-    AuthContext, NodeCapabilities, Permission, RealmConfigDocument, RealmDiscoveryConfig,
+    AuthContext, NodeCapabilities, Permission, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
     StaticRealmEndpoint,
 };
 use aruna_operations::bootstrap_onboarding_finalize::{
@@ -43,6 +43,7 @@ use rand::Rng;
 use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
+use url::Url;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -87,6 +88,7 @@ pub struct CreateOnboardingSecretResponseDoc {
     pub onboarding_secret: String,
     pub mode: String,
     pub expires_at: u64,
+    pub enroll_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -247,6 +249,13 @@ answers 403.
 - Every expired secret that is not already mid-enrollment is discarded before the new one is
   created.
 
+- `seed_url` is the base URL the joiner calls back. Leave it empty to have this node fill in its
+  own published REST base URL, which is what a device mint from the portal does.
+- A `User` mint also returns `enroll_url`, the deep link a device app opens to claim the secret
+  without a copy and paste. Its shape is a contract both the desktop app and the portal wizard
+  parse: scheme `aruna`, host `enroll`, and the query keys `secret` (this very secret), `seed`
+  (the seed URL above) and `realm` (this realm's id). It is null for the other modes.
+
 **Limits**
 - `expires_in_seconds` defaults to 3600 and is clamped to 60..=86400; `expires_at` is the resulting
   absolute expiry in Unix seconds.
@@ -254,7 +263,8 @@ answers 403.
   Enrolled devices and unclaimed device secrets both occupy a slot, so two mints cannot race past
   the cap. A realm without that quota set caps nothing.
 
-**Errors**: an owner at the device cap answers 409."#,
+**Errors**: an owner at the device cap answers 409. An empty `seed_url` on a node that publishes no
+REST interface answers 400."#,
     request_body(
         content = CreateOnboardingSecretRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
@@ -272,9 +282,11 @@ answers 403.
             example = json!({
                 "onboarding_secret": "<enrollment-secret-shown-once>",
                 "mode": "Server",
-                "expires_at": 1775748191
+                "expires_at": 1775748191,
+                "enroll_url": null
             })
         ),
+        (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
         (status = 409, description = "The owner already holds the realm's maximum number of devices", body = crate::error::ErrorResponse)
@@ -311,8 +323,9 @@ pub async fn create_onboarding_secret(
     let mut secret_bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut secret_bytes);
 
+    let seed_url = seed_url(&state, request.seed_url).await?;
     let onboarding_secret = OnboardingSecret {
-        seed_url: request.seed_url,
+        seed_url,
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
         mode,
@@ -338,14 +351,56 @@ pub async fn create_onboarding_secret(
     .await
     .map_err(map_create_error)?;
 
+    let enroll_url = match request.mode {
+        RequestedOnboardingMode::User => Some(enroll_url(
+            &encoded_secret,
+            &onboarding_secret.seed_url,
+            state.get_realm_id(),
+        )?),
+        RequestedOnboardingMode::Management | RequestedOnboardingMode::Server => None,
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(CreateOnboardingSecretResponse {
             onboarding_secret: encoded_secret,
             mode: request.mode,
             expires_at,
+            enroll_url,
         }),
     ))
+}
+
+/// The URL a joiner calls back. An empty request field means "this node", which
+/// is what a self-service device mint sends, so the wizard needs no knowledge
+/// of how the node is published.
+async fn seed_url(state: &Arc<ServerState>, requested: String) -> ServerResult<String> {
+    if !requested.trim().is_empty() {
+        return Ok(requested);
+    }
+    state
+        .interface_state()
+        .await
+        .rest
+        .map(|rest| rest.base_url)
+        .ok_or_else(|| {
+            ServerError::BadRequestReason(
+                "seed_url is required: this node serves no published REST interface".to_string(),
+            )
+        })
+}
+
+/// The `aruna://enroll` deep link a device app opens. The contract the desktop
+/// app and the portal wizard both parse: scheme `aruna`, host `enroll`, and the
+/// query keys `secret`, `seed` and `realm`.
+fn enroll_url(secret: &str, seed_url: &str, realm_id: RealmId) -> ServerResult<String> {
+    let mut url =
+        Url::parse("aruna://enroll").map_err(|err| ServerError::InternalError(err.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("secret", secret)
+        .append_pair("seed", seed_url)
+        .append_pair("realm", &realm_id.to_string());
+    Ok(url.to_string())
 }
 
 #[utoipa::path(
@@ -1280,6 +1335,69 @@ mod tests {
         let owner = user_id.to_string();
         assert_eq!(listed.secrets[0].mode, "User");
         assert_eq!(listed.secrets[0].owner.as_deref(), Some(owner.as_str()));
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builds_enroll_url() {
+        // The deep link is a contract: aruna://enroll?secret=&seed=&realm=.
+        let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        state
+            .register_rest_interface_with_public_url(
+                "0.0.0.0:3000".parse().unwrap(),
+                Some("https://node.example.test"),
+            )
+            .await;
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let (_, Json(created)) = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(CreateOnboardingSecretRequest {
+                seed_url: String::new(),
+                mode: RequestedOnboardingMode::User,
+                expires_in_seconds: Some(600),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let enroll =
+            url::Url::parse(&created.enroll_url.expect("device mint carries a deep link")).unwrap();
+        assert_eq!(enroll.scheme(), "aruna");
+        assert_eq!(enroll.host_str(), Some("enroll"));
+        let query = enroll
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(query["secret"], created.onboarding_secret);
+        assert_eq!(query["seed"], "https://node.example.test");
+        assert_eq!(query["realm"], realm_id.to_string());
+
+        let secret = OnboardingSecret::decode(&created.onboarding_secret).unwrap();
+        assert_eq!(
+            secret.seed_url, query["seed"],
+            "the link names the callback"
+        );
+
+        let (_, Json(server)) = create_onboarding_secret(
+            State(state),
+            Extension(Some(auth)),
+            Json(CreateOnboardingSecretRequest {
+                seed_url: "http://127.0.0.1:3000".to_string(),
+                mode: RequestedOnboardingMode::Server,
+                expires_in_seconds: Some(600),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(server.enroll_url.is_none());
 
         net_handle.shutdown().await;
     }

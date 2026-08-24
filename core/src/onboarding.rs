@@ -169,6 +169,9 @@ pub struct CreateOnboardingSecretResponse {
     pub onboarding_secret: String,
     pub mode: RequestedOnboardingMode,
     pub expires_at: u64,
+    /// `aruna://enroll` deep link a device app opens to claim this secret;
+    /// `None` for infrastructure modes, which have no device app.
+    pub enroll_url: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
