@@ -1,5 +1,5 @@
 use aruna_core::NodeId;
-use aruna_core::alpn::Alpn;
+use aruna_core::alpn::{Alpn, AlpnRole};
 use aruna_core::structs::RealmNodeKind;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
@@ -98,18 +98,23 @@ impl InboundAdmission {
             && self.bootstrap_peers.read().contains(&peer)
     }
 
-    /// Both endpoints must be allowed to speak `alpn`: a device refuses realm
-    /// protocols it never runs, and a realm node refuses them from a device.
+    /// Both endpoints must be allowed to speak `alpn`: this node must serve it
+    /// and the dialing key's kind must be allowed to open it here.
     fn allows_alpn(&self, peer: NodeId, alpn: Alpn) -> bool {
-        if !self.local_allows(alpn) {
+        if !self.local_serves(alpn) {
             return false;
         }
-        alpn.allowed_for(self.peer_kinds.read().get(&peer))
+        alpn.permits(self.peer_kinds.read().get(&peer), AlpnRole::PeerInbound)
+    }
+
+    /// What this node's own kind accepts for itself.
+    fn local_serves(&self, alpn: Alpn) -> bool {
+        alpn.permits(self.local_kind.read().as_ref(), AlpnRole::LocalServe)
     }
 
     /// The outbound half of the matrix: what this node's own kind may dial.
-    pub(crate) fn local_allows(&self, alpn: Alpn) -> bool {
-        alpn.allowed_for(self.local_kind.read().as_ref())
+    pub(crate) fn local_dials(&self, alpn: Alpn) -> bool {
+        alpn.permits(self.local_kind.read().as_ref(), AlpnRole::LocalDial)
     }
 
     fn admits(&self, peer: NodeId, alpn: Alpn) -> bool {
@@ -883,21 +888,34 @@ mod tests {
 
     #[test]
     fn kind_matrix() {
-        // Contract: the full ALPN x kind matrix in `Alpn::ALL` order. Flipping a
-        // row changes a protocol boundary and must be a deliberate decision.
+        // Contract: the full ALPN x kind x role matrix in `Alpn::ALL` order.
+        // Flipping a cell changes a protocol boundary and must be deliberate.
         let user = user_kind();
-        let cases: [(Option<&RealmNodeKind>, [bool; 8]); 4] = [
-            (None, [true; 8]),
-            (Some(&RealmNodeKind::Management), [true; 8]),
-            (Some(&RealmNodeKind::Server), [true; 8]),
+        let cases: [(Option<&RealmNodeKind>, [[bool; 8]; 3]); 4] = [
+            (None, [[true; 8]; 3]),
+            (Some(&RealmNodeKind::Management), [[true; 8]; 3]),
+            (Some(&RealmNodeKind::Server), [[true; 8]; 3]),
             (
                 Some(&user),
-                [true, true, false, true, true, true, false, false],
+                [
+                    // PeerInbound: a realm node accepts a device's job control.
+                    [true, true, false, true, true, true, false, true],
+                    // LocalServe: a device never serves job control.
+                    [true, true, false, true, true, true, false, false],
+                    // LocalDial: the device's submission facade dials it.
+                    [true, true, false, true, true, true, false, true],
+                ],
             ),
         ];
-        for (kind, expected) in cases {
-            for (alpn, allowed) in Alpn::ALL.into_iter().zip(expected) {
-                assert_eq!(alpn.allowed_for(kind), allowed, "{alpn} for {kind:?}");
+        for (kind, roles) in cases {
+            for (role, expected) in AlpnRole::ALL.into_iter().zip(roles) {
+                for (alpn, allowed) in Alpn::ALL.into_iter().zip(expected) {
+                    assert_eq!(
+                        alpn.permits(kind, role),
+                        allowed,
+                        "{alpn} for {kind:?} as {role:?}"
+                    );
+                }
             }
         }
     }
@@ -917,15 +935,17 @@ mod tests {
         );
         assert!(admission.admits(peer(1), Alpn::Metadata));
         assert!(admission.admits(peer(1), Alpn::Bao));
+        // A realm node accepts a device's routed job control.
+        assert!(admission.admits(peer(1), Alpn::JobControl));
         assert!(!admission.admits(peer(1), Alpn::DocumentSync));
         assert!(!admission.admits(peer(1), Alpn::Shard));
-        assert!(!admission.admits(peer(1), Alpn::JobControl));
         assert!(!admission.admits(peer(2), Alpn::Metadata));
     }
 
     #[test]
     fn local_kind_gate() {
-        // A device refuses realm protocols on both directions of a connection.
+        // A device dials job control but never serves it, and stays out of the
+        // realm protocols in both directions.
         let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
         let admission = InboundAdmission::new(realm_peers, []);
         admission.mark_materialized();
@@ -934,8 +954,10 @@ mod tests {
             BTreeMap::from([(peer(1), RealmNodeKind::Server)]),
         );
 
-        assert!(admission.local_allows(Alpn::Bao));
-        assert!(!admission.local_allows(Alpn::DocumentSync));
+        assert!(admission.local_dials(Alpn::Bao));
+        assert!(admission.local_dials(Alpn::JobControl));
+        assert!(!admission.local_dials(Alpn::DocumentSync));
+        assert!(!admission.admits(peer(1), Alpn::JobControl));
         assert!(admission.admits(peer(1), Alpn::Bao));
         assert!(!admission.admits(peer(1), Alpn::DocumentSync));
     }

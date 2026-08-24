@@ -1369,7 +1369,7 @@ impl NetHandle {
         }
         // Outbound half of the accept matrix: a device must not even dial a
         // protocol its own node kind is refused on.
-        if !self.inner.inbound_admission.local_allows(alpn) {
+        if !self.inner.inbound_admission.local_dials(alpn) {
             return Err(NetError::Stream(format!(
                 "{alpn} is not permitted for this node kind"
             )));

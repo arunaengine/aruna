@@ -120,8 +120,8 @@ async fn refuses_user_sync() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn device_refuses_sync() -> Result<(), Box<dyn std::error::Error>> {
-    // The outbound half: a device never dials a protocol its own kind is
-    // refused on, while its read and forward surface still opens.
+    // Direction matters: a device never dials sync or shard exchange, dials job
+    // control for its owner's submissions, and never serves job control.
     let realm_id = RealmId::from_bytes([93u8; 32]);
     let temp_device = tempdir()?;
     let temp_realm = tempdir()?;
@@ -150,13 +150,29 @@ async fn device_refuses_sync() -> Result<(), Box<dyn std::error::Error>> {
     device.add_peer_addr(realm.endpoint_addr()).await;
     realm.add_peer_addr(device.endpoint_addr()).await;
 
-    for alpn in [Alpn::DocumentSync, Alpn::Shard, Alpn::JobControl] {
+    for alpn in [Alpn::DocumentSync, Alpn::Shard] {
         device
             .open_stream(realm.node_id(), alpn)
             .await
             .expect_err("a user device must not dial realm infrastructure protocols");
     }
     device.open_stream(realm.node_id(), Alpn::Metadata).await?;
+    device
+        .open_stream(realm.node_id(), Alpn::JobControl)
+        .await?;
+
+    let refused = tokio::time::timeout(NETWORK_HANG_CAP, async {
+        let Ok(mut stream) = realm.open_stream(device.node_id(), Alpn::JobControl).await else {
+            return true;
+        };
+        if stream.0.write_all(b"job probe").await.is_err() {
+            return true;
+        }
+        let _ = stream.0.finish();
+        stream.1.read_to_end(1024).await.is_err()
+    })
+    .await?;
+    assert!(refused, "a user device must not serve job control");
 
     device.shutdown().await;
     realm.shutdown().await;

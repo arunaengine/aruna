@@ -6,6 +6,28 @@
 
 use crate::structs::RealmNodeKind;
 
+/// Which side of a connection is being judged. The same table answers all
+/// three, so a protocol that is one-directional for a node kind says so in one
+/// place instead of in three checks that can drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlpnRole {
+    /// A remote key dialing this node.
+    PeerInbound,
+    /// This node accepting the protocol for itself.
+    LocalServe,
+    /// This node dialing the protocol at someone else.
+    LocalDial,
+}
+
+impl AlpnRole {
+    /// Every role, so the matrix contract test covers all of them.
+    pub const ALL: [AlpnRole; 3] = [
+        AlpnRole::PeerInbound,
+        AlpnRole::LocalServe,
+        AlpnRole::LocalDial,
+    ];
+}
+
 /// Application Layer Protocol Negotiation identifiers for Aruna streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Alpn {
@@ -44,10 +66,11 @@ impl Alpn {
     /// connection. `None` is a key the realm config does not name: it keeps the
     /// pre-matrix provisional behaviour and is bounded by admission instead.
     ///
-    /// A `User` device speaks the read and forward surface only. Document sync,
-    /// shard exchange and job control are realm infrastructure: a device is
-    /// never a holder, a sync publisher, or a job target.
-    pub const fn allowed_for(&self, kind: Option<&RealmNodeKind>) -> bool {
+    /// A `User` device speaks the read and forward surface only. Document sync
+    /// and shard exchange are realm infrastructure a device never touches. Job
+    /// control is directional: a device dials it for its owner's submissions
+    /// and routed job reads, but never serves it.
+    pub const fn permits(&self, kind: Option<&RealmNodeKind>, role: AlpnRole) -> bool {
         match kind {
             None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,
             Some(RealmNodeKind::User { .. }) => match self {
@@ -56,7 +79,11 @@ impl Alpn {
                 | Alpn::Metadata
                 | Alpn::NativeReference
                 | Alpn::Notification => true,
-                Alpn::DocumentSync | Alpn::Shard | Alpn::JobControl => false,
+                Alpn::DocumentSync | Alpn::Shard => false,
+                Alpn::JobControl => match role {
+                    AlpnRole::PeerInbound | AlpnRole::LocalDial => true,
+                    AlpnRole::LocalServe => false,
+                },
             },
         }
     }
