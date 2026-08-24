@@ -10,6 +10,7 @@ use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -46,7 +47,8 @@ pub enum DrainOutcome {
     Idle,
 }
 
-/// Forwards every due entry of one page, oldest first.
+/// Forwards every due entry of the whole queue, oldest first. The scan pages
+/// past entries it skips, so published and parked ones cannot starve the tail.
 pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return DrainOutcome::Deferred;
@@ -57,19 +59,25 @@ pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
         return DrainOutcome::Deferred;
     };
 
-    let entries = match read_page(context).await {
-        Some(entries) => entries,
-        None => return DrainOutcome::Deferred,
-    };
     let now = unix_timestamp_millis();
+    let mut cursor = None;
     let mut due = false;
-    for entry in entries {
-        if !entry.is_due(now) {
-            continue;
+    loop {
+        let Some((entries, next_cursor)) = read_page(context, cursor).await else {
+            return DrainOutcome::Deferred;
+        };
+        for entry in entries {
+            if !entry.is_due(now) {
+                continue;
+            }
+            due = true;
+            let next = publish_entry(context, &config, realm_id, node_id, &entry).await;
+            store_entry(context, &entry_with_state(&entry, next)).await;
         }
-        due = true;
-        let next = publish_entry(context, &config, realm_id, node_id, &entry).await;
-        store_entry(context, &entry_with_state(&entry, next)).await;
+        match next_cursor {
+            Some(next_cursor) => cursor = Some(next_cursor),
+            None => break,
+        }
     }
     if due {
         DrainOutcome::More
@@ -78,18 +86,26 @@ pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
     }
 }
 
-/// The oldest page of the queue. `None` means the scan itself failed.
-async fn read_page(context: &Arc<DriverContext>) -> Option<Vec<IntakeEntry>> {
-    let Effect::Storage(effect) = scan_intake(None, None) else {
+/// One page of the queue and the cursor of the next one. `None` means the scan
+/// itself failed.
+async fn read_page(
+    context: &Arc<DriverContext>,
+    cursor: Option<Key>,
+) -> Option<(Vec<IntakeEntry>, Option<Key>)> {
+    let Effect::Storage(effect) = scan_intake(cursor, None) else {
         return None;
     };
     match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Some(
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => Some((
             values
                 .into_iter()
                 .filter_map(|(_, bytes)| IntakeEntry::from_bytes(&bytes).ok())
                 .collect(),
-        ),
+            next_start_after,
+        )),
         Event::Storage(StorageEvent::Error { error }) => {
             warn!(error = %error, "Failed to scan the device authoring intake");
             None

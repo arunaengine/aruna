@@ -37,7 +37,9 @@ use aruna_operations::create_metadata_document::{
 use aruna_operations::device::drain::{DrainOutcome, drain_intake};
 use aruna_operations::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
 use aruna_operations::device::inspect_draft::InspectDraftOperation;
-use aruna_operations::device::repository::{IntakeEntry, IntakeState};
+use aruna_operations::device::repository::{
+    INTAKE_PAGE_SIZE, IntakeEntry, IntakeState, intake_entry,
+};
 use aruna_operations::document_sync_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
@@ -185,6 +187,58 @@ async fn device_drain_publishes() -> Result<(), Box<dyn std::error::Error>> {
     let holders = resolve_shard_holders(&config, &record.placement);
     assert!(!holders.contains(&user_node.net.node_id()));
     wait_for_record_on_holders(&nodes, &holders, document_id).await?;
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+/// Terminal entries at the head of the queue must not starve the pending tail.
+///
+/// The scan pages, so a queue whose whole first page is published or parked
+/// still reaches the drafts behind it.
+#[tokio::test]
+async fn drains_past_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let group_id = seed_group(&realm, &nodes).await?;
+
+    let mut pending = Vec::new();
+    for index in 0..(INTAKE_PAGE_SIZE + 6) {
+        let mut entry = IntakeEntry::new(
+            Ulid::generate(),
+            realm.user_id,
+            group_id,
+            format!("datasets/queued-{index}"),
+            true,
+            draft_crate(),
+        );
+        if index <= INTAKE_PAGE_SIZE {
+            entry.state = IntakeState::Published {
+                document_id: Ulid::generate(),
+            };
+        } else {
+            pending.push(entry.draft_id);
+        }
+        let (key_space, key, value) = intake_entry(&entry)?;
+        write(user_node, &key_space, key.to_vec(), value.to_vec()).await?;
+    }
+    assert_eq!(pending.len(), 5);
+
+    assert_eq!(drain_intake(&user_node.context).await, DrainOutcome::More);
+
+    for draft_id in pending {
+        let drained = drive(
+            InspectDraftOperation::new(draft_id),
+            user_node.context.as_ref(),
+        )
+        .await?;
+        assert!(
+            matches!(drained.state, IntakeState::Published { .. }),
+            "a draft behind the first page did not publish: {:?}",
+            drained.state
+        );
+    }
 
     shutdown(nodes).await;
     Ok(())
