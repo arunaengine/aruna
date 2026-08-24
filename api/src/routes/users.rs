@@ -2815,23 +2815,22 @@ mod device_tests {
     use crate::error::ServerError;
     use crate::server_state::ServerState;
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::structs::{
-        Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
-    };
+    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId, RealmNodeKind};
     use aruna_operations::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
+    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::ensure_realm_config::{
+        EnsureRealmConfigConfig, EnsureRealmConfigOperation,
+    };
     use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
-    use byteview::ByteView;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -2848,7 +2847,8 @@ mod device_tests {
     }
 
     /// One device and one outstanding enrollment per owner, plus a management
-    /// node, so every filter the routes apply has something to reject.
+    /// node, so every filter the routes apply has something to reject. The realm
+    /// and its members are produced by the operations enrollment uses.
     async fn setup_devices() -> Fixture {
         let dir = tempdir().unwrap();
         let storage_handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
@@ -2857,32 +2857,50 @@ mod device_tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
-            task_handle: None,
+            task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         });
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let owner = UserId::local(Ulid::generate(), realm_id);
         let other = UserId::local(Ulid::generate(), realm_id);
-
-        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        config.ensure_node(node(1), RealmNodeKind::Management);
-        config.ensure_node(node(2), RealmNodeKind::User { owner });
-        config.ensure_node(node(3), RealmNodeKind::User { owner: other });
         let actor = Actor {
             node_id: node(1),
             user_id: UserId::nil(realm_id),
             realm_id,
         };
-        driver_ctx
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: ByteView::from(realm_id.as_bytes().to_vec()),
-                value: ByteView::from(config.to_bytes(&actor).unwrap()),
-                txn_id: None,
-            }))
-            .await;
+
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "devices".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+        for (device, device_owner) in [(node(2), owner), (node(3), other)] {
+            drive(
+                EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+                    actor: actor.clone(),
+                    target_node_id: device,
+                    target_node_kind: RealmNodeKind::User {
+                        owner: device_owner,
+                    },
+                    default_metadata_replication_factor: 3,
+                    realm_description: String::new(),
+                    create_if_missing: false,
+                    reject_kind_mismatch: true,
+                }),
+                driver_ctx.as_ref(),
+            )
+            .await
+            .unwrap();
+        }
 
         for secret_owner in [owner, other] {
             drive(
