@@ -75,7 +75,7 @@ use crate::auth::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::permission_rules::GroupPermissionRules;
-use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
+use crate::realm_peer::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
@@ -2238,7 +2238,7 @@ impl MetadataHandle {
                 &self.inner.storage_handle,
                 peer,
                 realm_id,
-                true,
+                PeerTrust::Vouched(None),
             )
             .await
             .map_err(|_| MetadataReadError::Unavailable)?;
@@ -2279,7 +2279,7 @@ impl MetadataHandle {
                 &self.inner.storage_handle,
                 peer,
                 auth.realm_id,
-                false,
+                PeerTrust::Member,
             )
             .await
             .map_err(MetadataWritePeerError::Unavailable)?;
@@ -2885,9 +2885,14 @@ where
     if auth.realm_id != local_realm_id {
         return Err(MetadataReadError::Forbidden);
     }
-    ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, auth.realm_id, false)
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?;
+    ensure_remote_metadata_peer_is_configured_for_realm(
+        storage_handle,
+        peer,
+        auth.realm_id,
+        PeerTrust::Member,
+    )
+    .await
+    .map_err(|_| MetadataReadError::Unavailable)?;
     Ok(auth)
 }
 
@@ -2942,13 +2947,14 @@ where
             )
         })?,
     };
-    ensure_remote_metadata_peer_is_configured_for_realm(
-        storage_handle,
-        peer,
-        peer_realm_id,
-        internal_auth,
-    )
-    .await?;
+    // Internal auth is node-vouched, so the gate is told which user the peer
+    // vouches for: an owner-bound device passes only for its own owner.
+    let trust = match internal_auth {
+        true => PeerTrust::Vouched(auth_context.as_ref().map(|auth| auth.user_id)),
+        false => PeerTrust::Member,
+    };
+    ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, peer_realm_id, trust)
+        .await?;
     Ok(auth_context)
 }
 
@@ -2956,7 +2962,7 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
     storage_handle: &StorageHandle,
     peer: NodeId,
     realm_id: RealmId,
-    require_internal_trust: bool,
+    trust: PeerTrust,
 ) -> Result<(), MetadataError> {
     match storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -2971,7 +2977,7 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
         }) => {
             let document = RealmConfigDocument::from_bytes(&bytes)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            ensure_realm_peer(&document, peer, realm_id, require_internal_trust)
+            ensure_peer_trust(&document, peer, realm_id, trust)
                 .map_err(|error| {
                     MetadataError::InvalidInput(match error {
                         RealmPeerError::RealmMismatch { configured, .. } => format!(
