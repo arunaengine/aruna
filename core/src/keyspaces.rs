@@ -130,6 +130,11 @@ pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_in
 /// fact about the owner's machine that must not leave it.
 pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
 
+/// Authoring intents the owner queued on the device while the realm was
+/// unreachable, keyed by local draft id. Never replicated: an entry becomes
+/// realm state only when the drain forwards it as an ordinary create.
+pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
+
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 
