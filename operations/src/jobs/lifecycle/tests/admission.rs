@@ -370,7 +370,7 @@ async fn device_skips_materialization() {
         Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
     )
     .await
-    .expect_err("no holder is reachable");
+    .expect_err("a device admits nothing locally");
 
     assert!(matches!(error, SubmitJobError::PlacementUnavailable(_)));
     let (queued, _) = iter_prefix_page(
@@ -399,7 +399,12 @@ async fn device_skips_materialization() {
     .await
     .expect_err("the input is not materialized here");
 
-    assert!(matches!(refused, SubmitJobError::InvalidWorkspace(_)));
+    // The realm node resolves the input against its own objects, so it stops at
+    // the absent one instead of reaching forwarding.
+    let SubmitJobError::PlacementUnavailable(reason) = refused else {
+        panic!("a realm node must refuse an input it does not hold");
+    };
+    assert!(reason.contains("does not exist"));
 }
 
 #[tokio::test]
