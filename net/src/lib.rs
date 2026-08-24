@@ -1151,17 +1151,10 @@ impl NetHandle {
                 document.realm_id, self.inner.realm_id
             )));
         }
-        // Connection admission covers every registered realm node, User kind
-        // included: user nodes forward metadata and job-control requests.
-        let admitted = unique_peer_nodes(
-            document
-                .node_ids()
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-            self.inner.node_id,
-        );
-        self.inner.inbound_admission.set_admitted(admitted);
         // Node kind decides which protocols each side of a connection may
-        // speak; the accept loop and the DHT read the same table.
+        // speak; the accept loop and the DHT read the same table. Kinds are
+        // published first: a peer admitted before its kind is known would pass
+        // the ALPN matrix as an unconfigured node.
         let mut peer_kinds = BTreeMap::new();
         let mut local_kind = None;
         for node in &document.nodes {
@@ -1177,6 +1170,15 @@ impl NetHandle {
         self.inner
             .inbound_admission
             .set_kinds(local_kind, peer_kinds);
+        // Connection admission covers every registered realm node, User kind
+        // included: user nodes forward metadata and job-control requests.
+        let admitted = unique_peer_nodes(
+            document
+                .node_ids()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            self.inner.node_id,
+        );
+        self.inner.inbound_admission.set_admitted(admitted);
         // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
         let peers = unique_peer_nodes(
             document
@@ -3422,6 +3424,16 @@ mod tests {
         assert_eq!(peers, expected);
         assert_eq!(handle.realm_peers().await, expected);
         assert_eq!(*handle.inner.dht_signed_authorized_nodes.read(), expected);
+        // The same refresh that admits a node publishes its kind, so an
+        // admitted peer is never briefly ungated.
+        assert!(
+            handle
+                .inner
+                .inbound_admission
+                .peer_kinds()
+                .read()
+                .contains_key(&user_node)
+        );
 
         let mut replacement =
             RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
