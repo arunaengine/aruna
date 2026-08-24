@@ -1,5 +1,8 @@
-use crate::auth::{ensure_permission, permission_granted, require_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, ensure_permission, permission_granted, require_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::metadata::map_metadata_api_error;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
@@ -20,6 +23,10 @@ use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::metadata::api::forwarded_bearer;
+use aruna_operations::metadata::forward::{
+    ForwardGroupError, forward_group_create, is_user_origin,
+};
 use aruna_operations::metadata::stats::count_group_documents_by_purpose;
 use aruna_operations::remove_group_role::{
     RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
@@ -345,6 +352,9 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
   cap.
 - The caller becomes the owner and the only member of the new group's admin role, next to the
   default user and viewer roles.
+- On a user-kind node the create is forwarded to a ranked management or server peer under the
+  caller's own token, which is where the quota and the permission are then checked, and 503 is
+  returned when no eligible peer accepts it.
 - The write commits on this node and replicates to the rest of the realm afterwards, so another node
   may not list the group immediately."#,
     request_body(
@@ -390,13 +400,15 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
         (status = 400, description = "Request body is not a valid create-group document", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is confined to a path subset", body = ErrorResponse),
-        (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter may be retried unchanged", body = ErrorResponse)
+        (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter may be retried unchanged", body = ErrorResponse),
+        (status = 503, description = "No eligible realm peer accepted the create forwarded from a user-kind node; retryable, the response carries a Retry-After header", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn create_group(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateGroupRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
     let auth = require_unrestricted(auth)?;
@@ -405,6 +417,27 @@ pub async fn create_group(
     request_span.record("group_name", field::display(&request.name));
     if auth.realm_id != realm_id {
         return Err(ServerError::Forbidden);
+    }
+
+    let ctx = state.get_ctx();
+    // A device holds no authorization bucket, so quota and permission are the
+    // receiving ingress's decision, taken under the caller's own token.
+    if is_user_origin(&ctx, realm_id, state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?
+    {
+        let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
+        let auth_token = forwarded_bearer(Some(caller_token.as_str()))
+            .map_err(map_metadata_api_error)?
+            .ok_or(ServerError::Unauthorized)?;
+        let forwarded = forward_group_create(&ctx, realm_id, auth_token, request.name)
+            .await
+            .map_err(|err| match err {
+                ForwardGroupError::Conflict(reason) => ServerError::Conflict(reason),
+                ForwardGroupError::Api(err) => map_metadata_api_error(err),
+            })?;
+        request_span.record("group_id", field::display(forwarded.0.group_id));
+        return Ok((StatusCode::CREATED, Json(forwarded.into())));
     }
 
     let is_realm_admin = permission_granted(
@@ -1758,6 +1791,7 @@ mod tests {
         CreateGroupRequest, DataPathKind, DataPathsQuery, ListGroupsQuery, create_group, get_group,
         get_group_usage, list_data_paths, list_group_members, list_groups,
     };
+    use crate::auth::ValidatedArunaBearerTokenCarrier;
     use crate::error::{ServerError, ServerResult};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
@@ -1772,11 +1806,12 @@ mod tests {
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmAuthorizationDocument, RealmId, Role, User, VersionKey, blob_bucket_permission_path,
-        blob_object_permission_path,
+        RealmAuthorizationDocument, RealmId, RealmNodeKind, Role, User, VersionKey,
+        blob_bucket_permission_path, blob_object_permission_path,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::driver::drive;
+    use aruna_operations::list_groups::ListGroupOperation;
     use aruna_storage::storage;
     use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
@@ -2023,12 +2058,66 @@ mod tests {
         create_group(
             State(state.clone()),
             Extension(Some(member_auth(user_id))),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "token",
+            ))),
             Json(CreateGroupRequest {
                 name: name.to_string(),
             }),
         )
         .await
         .map(|(status, _)| assert_eq!(status, StatusCode::CREATED))
+    }
+
+    #[tokio::test]
+    async fn device_forwards_create() {
+        // A user-kind node never creates locally: without a reachable ingress
+        // the create fails as unavailable and no group is stored.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        let error = new_group(&state, admin, "device").await.unwrap_err();
+        assert!(matches!(error, ServerError::ServiceUnavailable));
+        let groups = drive(ListGroupOperation::new(), &state.get_ctx())
+            .await
+            .unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_create_needs_token() {
+        // Forwarding carries the caller's own token; without one the device
+        // must refuse rather than act under its node identity.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        let error = create_group(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Extension(None),
+            Json(CreateGroupRequest {
+                name: "device".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Unauthorized));
     }
 
     #[tokio::test]
