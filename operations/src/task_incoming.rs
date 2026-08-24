@@ -665,6 +665,19 @@ impl OperationsTaskHandler {
             .await;
             return;
         };
+        // A User-kind device registers no holdership: the realm refuses its DHT
+        // puts. An unreadable config is bootstrap, which registers.
+        if matches!(
+            crate::metadata::forward::is_user_origin(
+                &self.context,
+                *net_handle.realm_id(),
+                net_handle.node_id()
+            )
+            .await,
+            Ok(true)
+        ) {
+            return;
+        }
         let operation = RefreshBlobHoldersOperation::new(
             *net_handle.realm_id(),
             net_handle.node_id(),
@@ -5823,5 +5836,81 @@ mod tests {
             .await
             .expect("outbox read");
         assert!(remaining.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_skips_holders() {
+        // A device publishes no holder record, so the refresh does not even arm
+        // its own timer.
+        let realm_id = RealmId::from_bytes([57u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(
+            net.node_id(),
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+        let actor = Actor {
+            node_id: net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: config.to_bytes(&actor).expect("config bytes").into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write: {other:?}"),
+        }
+
+        OperationsTaskHandler::new(context, JobsRuntime::new())
+            .refresh_blob_holders()
+            .await;
+
+        let timer = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                key: ByteView::from(
+                    postcard::to_allocvec(&TaskKey::RefreshBlobHolders).expect("timer key"),
+                ),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            timer,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+
+        net.shutdown().await;
     }
 }
