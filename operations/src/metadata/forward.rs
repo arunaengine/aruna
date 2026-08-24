@@ -2085,7 +2085,7 @@ pub(crate) async fn apply_group_create(
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
     };
-    if auth.path_restrictions.is_some() || !peer_may_act_for(&config, peer, auth.user_id) {
+    if auth.path_restrictions.is_some() {
         return MetadataTransportMessage::ForwardedWriteDenied {
             error: MetadataWriteAuthError::Forbidden,
         };
@@ -2723,6 +2723,16 @@ pub(crate) async fn authorize_forwarded_caller(
             }
         })?;
     if auth.realm_id != realm_id {
+        return Err(ForwardAuthError::Forbidden);
+    }
+    // A User peer is owner-bound: whatever token it presents, the write it
+    // forwards must be its owner's own (D12).
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return Err(ForwardAuthError::Unavailable(
+            "forwarded metadata write needs the realm configuration".to_string(),
+        ));
+    };
+    if !peer_may_act_for(&config, peer, auth.user_id) {
         return Err(ForwardAuthError::Forbidden);
     }
     Ok(auth)

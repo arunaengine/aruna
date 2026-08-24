@@ -41,8 +41,9 @@ use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, forward_group_create,
+    ForwardGroupError, MetadataWriteError, create_metadata_document_routed, forward_group_create,
     forward_token_revoke, update_metadata_document_routed,
 };
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
@@ -211,6 +212,32 @@ async fn user_forwards_group_create() -> Result<(), Box<dyn std::error::Error>> 
         Ok::<usize, Box<dyn std::error::Error>>(pending)
     })
     .await?;
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn foreign_token_refused() -> Result<(), Box<dyn std::error::Error>> {
+    // A device is owner-bound: a valid token for somebody else buys it nothing,
+    // while the same forward with its owner's token succeeds.
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let stranger = UserId::local(Ulid::generate(), realm.realm_id);
+
+    let error = forward_group_create(
+        &user_node.context,
+        realm.realm_id,
+        realm.token_for(stranger),
+        "Stranger Group".to_string(),
+    )
+    .await
+    .expect_err("a device must not forward another user's write");
+    assert!(
+        matches!(error, ForwardGroupError::Api(MetadataApiError::Forbidden)),
+        "unexpected forwarded group create error: {error}"
+    );
 
     shutdown(nodes).await;
     Ok(())
@@ -619,9 +646,15 @@ impl Realm {
     }
 
     fn bearer_token(&self) -> MetadataAuthToken {
+        self.token_for(self.user_id)
+    }
+
+    /// A valid realm token for any subject, which is what a stolen or borrowed
+    /// credential looks like to an ingress.
+    fn token_for(&self, user_id: UserId) -> MetadataAuthToken {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let claims = TokenClaims {
-            sub: self.user_id.to_string(),
+            sub: user_id.to_string(),
             iss: self.realm_id.to_string(),
             iat: now,
             exp: now + 600,
