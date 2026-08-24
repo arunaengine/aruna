@@ -696,7 +696,8 @@ only a management node serves this route.
 
 **Errors**: an unknown, expired, already claimed or unmatched secret and a signature that does not
 verify are both refused with 401, without saying which of the two failed. A node that does not
-serve enrollment answers 403, and an owner already at the device cap answers 409."#,
+serve enrollment answers 403, and an owner already at the device cap answers 409, as does a
+redemption that lost its transaction to a concurrent one, which is safe to retry."#,
     request_body(
         content = BootstrapOnboardingRequestDoc,
         description = "The enrollment secret, the joiner's node id, its proof of possession of the node key, and any mode-specific key material",
@@ -748,7 +749,8 @@ serve enrollment answers 403, and an owner already at the device cap answers 409
         (status = 400, description = "Malformed node id, key material or proof, or key material missing for the mode the secret was minted for", body = crate::error::ErrorResponse),
         (status = 401, description = "Unknown, expired, already claimed or non-matching enrollment secret, or a proof that does not verify", body = crate::error::ErrorResponse),
         (status = 403, description = "This node does not serve enrollment, or the secret was not minted for node enrollment", body = crate::error::ErrorResponse),
-        (status = 409, description = "The device's owner already holds the realm's maximum number of devices", body = crate::error::ErrorResponse)
+        (status = 409, description = "The device's owner already holds the realm's maximum number of devices, or a concurrent enrollment won the transaction; retry", body = crate::error::ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity is exhausted; retry", body = crate::error::ErrorResponse)
     )
 )]
 pub async fn bootstrap_onboarding(
@@ -952,6 +954,16 @@ fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
         BootstrapOnboardingFinalizeError::Reserve(
             ReserveOnboardingSecretError::DeviceCapExceeded { .. },
         ) => ServerError::Conflict(error.to_string()),
+        // The cap re-check reads a range, so a concurrent mint or redemption on
+        // this node can lose the transaction; the joiner may simply retry.
+        BootstrapOnboardingFinalizeError::Reserve(ReserveOnboardingSecretError::StorageError(
+            StorageError::TransactionConflict,
+        )) => ServerError::Conflict("concurrent enrollment conflict; retry".to_string()),
+        BootstrapOnboardingFinalizeError::Reserve(ReserveOnboardingSecretError::StorageError(
+            StorageError::CleanupCapacity,
+        )) => ServerError::ServiceUnavailableReason(
+            "storage cleanup capacity exhausted; retry".to_string(),
+        ),
         BootstrapOnboardingFinalizeError::Consume(error) => map_consume_error(error),
         BootstrapOnboardingFinalizeError::EnsureRealmConfig(
             EnsureRealmConfigError::NodeKindMismatch { .. },
