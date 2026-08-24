@@ -866,7 +866,12 @@ on that bucket and that it belongs to the same group.
 - A 503 is retryable and the caller may submit again with the same idempotency key: no family
   holder could admit the request, the demand view could not be read or kept moving under three
   reads, three admission transactions in a row lost to a concurrent submission of the same group,
-  or the id clock is unhealthy."#,
+  or the id clock is unhealthy.
+- A device submission whose inputs sit on no holder of its family answers that same 503, and it is
+  the one case retrying does not clear. The family is picked by hashing the request, the holder
+  resolves the referenced inputs against its own objects only, and a holder that cannot read one
+  refuses without naming it, so an unstaged input is indistinguishable here from an unreachable
+  realm. Submit from a node that holds the inputs, or replicate them first."#,
     request_body(
         content = SubmitExecutionRequest,
         description = "Container image, command and the inputs and outputs to stage around it",

@@ -569,6 +569,11 @@ that tag. The caller needs WRITE on the target group.
 - 503 is reserved for an unreachable family holder, a demand view that could not be read or did not
   settle, admission losing three transactions in a row to concurrent submissions of the same group,
   and an unhealthy id clock.
+- A task forwarded from a device whose inputs sit on no holder of its family answers that same 503
+  and retrying does not clear it. The family is picked by hashing the request, the holder resolves
+  the referenced inputs against its own objects only, and a holder that cannot read one refuses
+  without naming it, so an unstaged input is indistinguishable here from an unreachable realm.
+  Submit from a node that holds the inputs, or replicate them first.
 - A standing quota decided on an understated demand view is a 409 like an exceeded cap."#,
     request_body(
         content = TesTask,
