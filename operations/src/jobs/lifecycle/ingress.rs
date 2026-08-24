@@ -6,6 +6,10 @@
 //! complete request one hop to a holder it observes. A non-holder never accepts
 //! a job it could not deliver: it writes nothing and returns an availability
 //! error instead.
+//!
+//! A user device is never an authority: it resolves nothing node-local and
+//! always forwards, and the admitting holder pins the outputs to itself and
+//! resolves the inputs the device only referenced.
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::errors::StorageError;
@@ -40,6 +44,7 @@ use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperatio
 use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
+use crate::metadata::forward::{is_sync_eligible, peer_acts_for};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
 use crate::request_authorization::{AuthorizeError, authorize};
@@ -107,20 +112,24 @@ pub async fn submit_external_job(
     ids::required_labels(&spec)
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     let (config, local) = local_view(context).await?;
-    for output in &mut spec.file_outputs {
-        output.destination_node_id = Some(local);
-    }
-    if workspace_mode == WorkspaceMode::Existing {
-        let bucket = workspace_bucket.as_deref().ok_or_else(|| {
-            SubmitJobError::InvalidWorkspace("existing workspace requires a bucket".to_string())
-        })?;
-        spec.resolve_outputs(bucket, local);
-    }
-    let (input_facts, output_policies) = resolve_facts(context, &spec, local).await?;
     let scope = match idempotency_key {
         Some(key) => SubmissionScope::Keyed(key),
         None => SubmissionScope::Unkeyed(Ulid::generate()),
     };
+    if is_device(&config, local) {
+        let request = SubmissionRequest {
+            created_by,
+            spec,
+            scope,
+            retention_ms,
+            ingress_node_id: local,
+            input_facts: Vec::new(),
+            output_policies: Vec::new(),
+        };
+        return forward_device(context, request, &config, local, auth_token).await;
+    }
+    pin_outputs(&mut spec, local);
+    let (input_facts, output_policies) = resolve_facts(context, &spec, local).await?;
     let request = SubmissionRequest {
         created_by,
         spec,
@@ -136,6 +145,70 @@ pub async fn submit_external_job(
         return admit_here(context, &request, &identity, &config, local).await;
     }
     forward_once(context, &request, &identity, &view, local, auth_token).await
+}
+
+/// Whether `node_id` is a user device: it carries no shared realm
+/// responsibility, holds nothing, and therefore admits nothing.
+fn is_device(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    !is_sync_eligible(config, node_id)
+}
+
+/// Pins every declared output to the node that will admit the request and write
+/// its results.
+fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
+    for output in &mut spec.file_outputs {
+        output.destination_node_id = Some(node_id);
+    }
+    let (mode, bucket) = ids::workspace_of(spec);
+    if mode == WorkspaceMode::Existing
+        && let Some(bucket) = bucket
+    {
+        spec.resolve_outputs(&bucket, node_id);
+    }
+}
+
+/// A device forwards without resolving anything: it holds none of the objects it
+/// names, so only the reference shape is its to check and the holder resolves
+/// the rest. Holders follow the submission id alone, so the device selects the
+/// same holder set as the node that recomputes the digest after normalizing.
+async fn forward_device(
+    context: &DriverContext,
+    request: SubmissionRequest,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<AcceptedSubmission, SubmitJobError> {
+    reference_shape(&request.spec)?;
+    // A device may not assert an auth context for the realm, so the caller's own
+    // bearer token is the only credential a holder accepts from it.
+    if !matches!(auth_token, Some(MetadataAuthToken::Bearer(_))) {
+        return Err(SubmitJobError::AuthorityDenied);
+    }
+    let identity = request.identity().map_err(SubmitJobError::Conversion)?;
+    let view = family_view(config, &identity)?;
+    forward_once(context, &request, &identity, &view, local, auth_token).await
+}
+
+/// Validates the shape of every input reference without requiring the object to
+/// be present here. Local presence is the admitting holder's check.
+fn reference_shape(spec: &ExecutionSpec) -> Result<(), SubmitJobError> {
+    for input in &spec.inputs {
+        let aruna_core::structs::InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } = &input.source;
+        if bucket.trim().is_empty() || key.trim().is_empty() {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "input reference needs a bucket and a key".to_string(),
+            ));
+        }
+        if let Some(version) = version_id {
+            Ulid::from_string(version)
+                .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve node-local names once at ingress. The resulting facts are sealed in
@@ -612,7 +685,7 @@ async fn admit_forwarded(
     peer: NodeId,
     auth_token: MetadataAuthToken,
     submission_id: SubmissionId,
-    request: SubmissionRequest,
+    mut request: SubmissionRequest,
 ) -> Result<SubmissionAck, SubmissionRefusal> {
     let Some(metadata) = context.metadata_handle.as_ref() else {
         return Err(SubmissionRefusal::Unavailable);
@@ -629,6 +702,26 @@ async fn admit_forwarded(
     if auth.user_id != request.created_by || auth.realm_id != request.created_by.realm_id {
         return Err(SubmissionRefusal::Unauthorized);
     }
+    let (config, local) = local_view(context)
+        .await
+        .map_err(|_| SubmissionRefusal::Unavailable)?;
+    // A user device is owner-bound: whatever token it presents, the submission it
+    // forwards must be its owner's own.
+    if !peer_acts_for(&config, peer, auth.user_id) {
+        return Err(SubmissionRefusal::Unauthorized);
+    }
+    authorize_group(context, &auth, &request, local)
+        .await
+        .map_err(|_| SubmissionRefusal::Unauthorized)?;
+    // The holder owns what it writes and reads, so a device submission is
+    // normalized here rather than trusted from a node that holds none of it.
+    let ingress = match is_device(&config, peer) {
+        true => {
+            pin_device_request(context, &mut request, local).await?;
+            local
+        }
+        false => peer,
+    };
     if request.input_facts.len() != request.spec.inputs.len()
         || request.input_facts.iter().any(|fact| {
             !request
@@ -637,7 +730,7 @@ async fn admit_forwarded(
                 .iter()
                 .any(|input| input.dest_key == fact.destination_key)
         })
-        || request.ingress_node_id != peer
+        || request.ingress_node_id != ingress
         || request
             .input_facts
             .iter()
@@ -656,12 +749,6 @@ async fn admit_forwarded(
     if identity.submission_id != submission_id {
         return Err(SubmissionRefusal::IdentityMismatch);
     }
-    let (config, local) = local_view(context)
-        .await
-        .map_err(|_| SubmissionRefusal::Unavailable)?;
-    authorize_group(context, &auth, &request, local)
-        .await
-        .map_err(|_| SubmissionRefusal::Unauthorized)?;
     let view = FamilyView::resolve(&config, config.realm_id, identity.family())
         .ok_or(SubmissionRefusal::Unavailable)?;
     if !view.holds(local) {
@@ -680,6 +767,33 @@ async fn admit_forwarded(
             warn!(error = %error, "Forwarded submission could not be admitted");
             Err(SubmissionRefusal::Unavailable)
         }
+    }
+}
+
+/// Normalizes a device submission at the holder: the outputs are pinned here and
+/// the referenced inputs are resolved against this node's own objects, so the
+/// recomputed identity covers names only this node assigned.
+async fn pin_device_request(
+    context: &Arc<DriverContext>,
+    request: &mut SubmissionRequest,
+    local: NodeId,
+) -> Result<(), SubmissionRefusal> {
+    pin_outputs(&mut request.spec, local);
+    let (input_facts, output_policies) = resolve_facts(context, &request.spec, local)
+        .await
+        .map_err(refusal_of)?;
+    request.input_facts = input_facts;
+    request.output_policies = output_policies;
+    request.ingress_node_id = local;
+    Ok(())
+}
+
+/// A request this holder could not read is unavailable, so the device tries the
+/// next holder; one it read and must refuse is definitively invalid.
+fn refusal_of(error: SubmitJobError) -> SubmissionRefusal {
+    match error {
+        SubmitJobError::PlacementUnavailable(_) => SubmissionRefusal::Unavailable,
+        _ => SubmissionRefusal::Invalid,
     }
 }
 
@@ -705,10 +819,14 @@ mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{
+        InputMode, InputSelection, InputSource, OutputSelection, RealmId, WorkspaceOutput,
+    };
     use aruna_core::types::Key;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
+
+    use crate::jobs::records::tests::fixture::{node, payload};
 
     fn family(seed: u8) -> JobFamilyId {
         JobFamilyId {
@@ -842,6 +960,105 @@ mod tests {
         assert_eq!(
             observed_state(&context, family(2)).await,
             LogicalJobState::Indeterminate
+        );
+    }
+
+    fn s3_input(bucket: &str, key: &str, version: Option<&str>) -> InputSelection {
+        InputSelection {
+            source: InputSource::S3 {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version.map(str::to_string),
+            },
+            source_node_id: None,
+            dest_key: "in.txt".to_string(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn pins_holder_outputs() {
+        // The admitting holder owns every destination: a device-supplied node id
+        // is overwritten and the workspace outputs resolve to the holder.
+        let mut spec = payload();
+        spec.file_outputs.push(OutputSelection {
+            container_path: "/out/result.txt".to_string(),
+            path_prefix: None,
+            destination_node_id: Some(node(2)),
+            destination: OutputDestination::S3 {
+                bucket: "results".to_string(),
+                key: "result.txt".to_string(),
+            },
+            name: None,
+            description: None,
+        });
+        spec.workspace_outputs.push(WorkspaceOutput {
+            container_path: "/out/extra.txt".to_string(),
+            dest_key: "extra.txt".to_string(),
+        });
+        seal_workspace(
+            &mut spec,
+            WorkspaceMode::Existing,
+            Some("results".to_string()),
+        )
+        .expect("workspace seals");
+
+        pin_outputs(&mut spec, node(1));
+
+        assert!(spec.workspace_outputs.is_empty());
+        assert_eq!(spec.file_outputs.len(), 2);
+        for output in &spec.file_outputs {
+            assert_eq!(output.destination_node_id, Some(node(1)));
+        }
+    }
+
+    #[test]
+    fn keeps_reference_shape() {
+        // A device holds none of the objects it names, so a well-formed absent
+        // reference passes while a malformed one is still refused here.
+        let mut spec = payload();
+        spec.inputs.push(s3_input("bucket", "key", None));
+        assert!(reference_shape(&spec).is_ok());
+
+        let mut versioned = payload();
+        versioned.inputs.push(s3_input(
+            "bucket",
+            "key",
+            Some(&Ulid::generate().to_string()),
+        ));
+        assert!(reference_shape(&versioned).is_ok());
+
+        let mut empty_key = payload();
+        empty_key.inputs.push(s3_input("bucket", "  ", None));
+        assert!(matches!(
+            reference_shape(&empty_key),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+
+        let mut bad_version = payload();
+        bad_version
+            .inputs
+            .push(s3_input("bucket", "key", Some("not-a-ulid")));
+        assert!(matches!(
+            reference_shape(&bad_version),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+    }
+
+    #[test]
+    fn maps_holder_refusal() {
+        // A holder that could not read is retried at the next holder; one that
+        // read the request and refused it ends the ingress definitively.
+        assert_eq!(
+            refusal_of(SubmitJobError::PlacementUnavailable("offline".to_string())),
+            SubmissionRefusal::Unavailable
+        );
+        assert_eq!(
+            refusal_of(SubmitJobError::InvalidWorkspace("absent".to_string())),
+            SubmissionRefusal::Invalid
         );
     }
 }

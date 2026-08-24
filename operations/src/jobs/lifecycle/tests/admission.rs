@@ -6,9 +6,11 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE};
 use aruna_core::structs::{
-    AuthContext, JobFamilyRecord, JobId, JobInputFact, JobState, LogicalJobSpec, SubmissionClaim,
-    WorkspaceMode,
+    AuthContext, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId, JobInputFact,
+    JobState, LogicalJobSpec, RealmConfigDocument, RealmNodeKind, SubmissionClaim, WorkspaceMode,
 };
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -18,8 +20,10 @@ use crate::jobs::lifecycle::admit::{
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, seal_workspace};
 use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::records::tests::fixture::{Family, REALM, context, payload, user};
+use crate::jobs::records::tests::fixture::{Family, REALM, context, node, payload, secret, user};
 use crate::jobs::store::iter_prefix_page;
+use crate::jobs::submit::SubmitJobError;
+use crate::metadata::MetadataAuthToken;
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
@@ -295,6 +299,129 @@ fn identity_is_deterministic() {
         policies: Vec::new(),
     });
     assert_ne!(pinned.identity().expect("identity derives"), identity);
+}
+
+/// One local node of `kind` in a five node realm, with a live net handle so the
+/// ingress can read its own identity and kind.
+async fn kind_context(seed: u8, kind: RealmNodeKind) -> (TempDir, DriverContext) {
+    let mut config = RealmConfigDocument::new(REALM, Vec::new(), 5);
+    for server in 1..=4u8 {
+        config.ensure_node(node(server), RealmNodeKind::Server);
+    }
+    config.ensure_node(node(seed), kind);
+    config.seed_default_placement();
+    config.snapshot_candidate_map();
+    let (dir, ctx) = context(&config, node(1)).await;
+    let net_handle = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback address"),
+            secret_key: Some(secret(seed)),
+            realm_id: REALM,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        ctx.storage_handle.clone(),
+    )
+    .await
+    .expect("net handle starts");
+    (
+        dir,
+        DriverContext {
+            net_handle: Some(net_handle),
+            ..ctx
+        },
+    )
+}
+
+fn absent_input() -> InputSelection {
+    InputSelection {
+        source: InputSource::S3 {
+            bucket: "reads".to_string(),
+            key: "input.fastq".to_string(),
+            version_id: None,
+        },
+        source_node_id: None,
+        dest_key: "input.fastq".to_string(),
+        mode: InputMode::Snapshot,
+        container_path: None,
+        name: None,
+        description: None,
+    }
+}
+
+#[tokio::test]
+async fn device_skips_materialization() {
+    // A device references its inputs instead of resolving them: an object absent
+    // here still reaches forwarding, and nothing is admitted locally. The same
+    // request on a realm node is refused because that node must hold the input.
+    let mut spec = payload();
+    spec.inputs.push(absent_input());
+
+    let (_device_dir, device) = kind_context(9, RealmNodeKind::User { owner: user() }).await;
+    let error = submit_external_job(
+        &device,
+        spec.clone(),
+        user(),
+        Some("device".to_string()),
+        WorkspaceMode::Kept,
+        None,
+        60_000,
+        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+    )
+    .await
+    .expect_err("no holder is reachable");
+
+    assert!(matches!(error, SubmitJobError::PlacementUnavailable(_)));
+    let (queued, _) = iter_prefix_page(
+        &device.storage_handle,
+        JOB_FAMILY_OUTBOX_KEYSPACE,
+        None,
+        None,
+        8,
+        None,
+    )
+    .await
+    .expect("outbox scan");
+    assert!(queued.is_empty());
+
+    let (_server_dir, server) = kind_context(8, RealmNodeKind::Server).await;
+    let refused = submit_external_job(
+        &server,
+        spec,
+        user(),
+        Some("server".to_string()),
+        WorkspaceMode::Kept,
+        None,
+        60_000,
+        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+    )
+    .await
+    .expect_err("the input is not materialized here");
+
+    assert!(matches!(refused, SubmitJobError::InvalidWorkspace(_)));
+}
+
+#[tokio::test]
+async fn device_needs_bearer() {
+    // A device may not assert an auth context for the realm, so a submission it
+    // cannot back with the caller's own bearer token is refused, not forwarded.
+    let (_dir, device) = kind_context(7, RealmNodeKind::User { owner: user() }).await;
+
+    let error = submit_external_job(
+        &device,
+        payload(),
+        user(),
+        Some("device".to_string()),
+        WorkspaceMode::Kept,
+        None,
+        60_000,
+        None,
+    )
+    .await
+    .expect_err("an asserted context is not forwardable");
+
+    assert!(matches!(error, SubmitJobError::AuthorityDenied));
 }
 
 #[test]

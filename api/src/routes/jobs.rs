@@ -846,6 +846,10 @@ on that bucket and that it belongs to the same group.
 - The group's standing quota is decided against a replicated demand view. A replay of an
   idempotency key this node already claimed is settled before any quota is read and is never
   quota-refused.
+- On a user device the request is always forwarded: the inputs are referenced rather than resolved
+  here, the outputs land on the admitting realm holder, and the device itself never executes,
+  admits or stores any part of the job. A device forwards the caller's own bearer token, so a
+  submission it cannot back with one is a 403 rather than a forwarded request.
 
 **Limits** (all refused with 400)
 - An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.

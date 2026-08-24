@@ -2293,14 +2293,14 @@ pub(crate) async fn apply_admin_relay(
     MetadataTransportMessage::ForwardedAdminEventQueued
 }
 
-fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
     configured_kind(config, node_id).is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
 /// A User peer is owner-bound: it may forward only for the owner its realm
 /// config names, whatever token it managed to present. Other kinds are not
 /// owner-bound, so any authenticated caller may travel through them (D12).
-fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
+pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
     match configured_kind(config, peer).and_then(RealmNodeKind::owner) {
         Some(owner) => owner == user_id,
         None => true,

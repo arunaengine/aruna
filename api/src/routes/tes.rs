@@ -543,6 +543,10 @@ that tag. The caller needs WRITE on the target group.
 - An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller; reusing a key
   bound to a different task is a 409 carrying that task id. A replay is settled before any quota
   is read and is never quota-refused.
+- On a user device this facade only proxies: the task is forwarded to a realm holder that pins the
+  outputs to itself and resolves the referenced inputs, and the device never executes a task. The
+  device forwards the caller's own bearer token, so basic authentication is refused with a 403
+  here even though it is accepted on a realm node.
 
 **Limits** (all refused with 400)
 - Exactly one executor whose `command` is the full argv.
