@@ -34,6 +34,10 @@ use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_forward_document, mint_local_document,
 };
+use aruna_operations::device::drain::{DrainOutcome, drain_intake};
+use aruna_operations::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
+use aruna_operations::device::inspect_draft::InspectDraftOperation;
+use aruna_operations::device::repository::{IntakeEntry, IntakeState};
 use aruna_operations::document_sync_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
@@ -133,6 +137,100 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
 
     shutdown(nodes).await;
     Ok(())
+}
+
+/// A draft queued on a device publishes when the drain runs.
+///
+/// The drain forwards with an internal token: the device vouches for its own
+/// owner instead of holding the owner's bearer credential. The holder admits
+/// that token only from an owner-bound peer whose configured owner is the user
+/// it vouches for, so this is the end-to-end proof of that gate as well as of
+/// the intake lifecycle.
+#[tokio::test]
+async fn device_drain_publishes() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let group_id = seed_group(&realm, &nodes).await?;
+
+    let entry = IntakeEntry::new(
+        Ulid::generate(),
+        realm.user_id,
+        group_id,
+        "datasets/forwarded".to_string(),
+        true,
+        draft_crate(),
+    );
+    drive(
+        EnqueueDraftOperation::new(EnqueueDraftInput {
+            entry: entry.clone(),
+        }),
+        user_node.context.as_ref(),
+    )
+    .await?;
+
+    assert_eq!(drain_intake(&user_node.context).await, DrainOutcome::More);
+
+    let drained = drive(
+        InspectDraftOperation::new(entry.draft_id),
+        user_node.context.as_ref(),
+    )
+    .await?;
+    let IntakeState::Published { document_id } = drained.state else {
+        return Err(format!("the queued draft did not publish: {:?}", drained.state).into());
+    };
+
+    let record = first_record(&nodes, document_id).await?;
+    assert_eq!(record.group_id, group_id);
+    let holders = resolve_shard_holders(&config, &record.placement);
+    assert!(!holders.contains(&user_node.net.node_id()));
+    wait_for_record_on_holders(&nodes, &holders, document_id).await?;
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+/// The smallest RO-Crate a create accepts, as the desktop would author it: the
+/// realm document id is minted at drain time, so the root is a local urn.
+fn draft_crate() -> String {
+    serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "urn:dataset:draft"}
+            },
+            {
+                "@id": "urn:dataset:draft",
+                "@type": "Dataset",
+                "name": "Queued Draft",
+                "description": "Authored while the realm was unreachable",
+                "datePublished": "2026-01-01",
+                "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+            }
+        ]
+    })
+    .to_string()
+}
+
+async fn first_record(
+    nodes: &[TestNode],
+    document_id: Ulid,
+) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        for node in nodes.iter().filter(|node| node.sync_eligible) {
+            if let Some(record) = registry_record(node, document_id).await? {
+                return Ok(record);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("the drained create never reached a holder".into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
