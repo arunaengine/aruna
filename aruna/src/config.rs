@@ -15,7 +15,7 @@ use aruna_core::structs::{
     Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, DynamicDiscoveryMethod,
     KIND_LABEL_KEY, LOCATION_LABEL_KEY, NodeBackendsConfig, NodeCapabilities, OidcProviderConfig,
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits,
-    STORAGE_CLASS_LABEL_PREFIX,
+    STORAGE_CLASS_LABEL_PREFIX, StaticRealmEndpoint,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
@@ -647,6 +647,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     let storage_handle =
         FjallStorage::open_with_persist_policy(&storage_path, fjall_persist_policy)?;
     let mut temporary_bootstrap_endpoint = None;
+    let mut enrollment_endpoints = Vec::new();
     let node_state = match load_persisted_node_state(&storage_handle).await? {
         Some(state) => state,
         None => {
@@ -661,6 +662,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
                     )
                     .await?;
                     temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
+                    enrollment_endpoints = bootstrapped.realm_endpoints;
                     bootstrapped.node_state
                 }
                 None => generate_initialized_node_state()?,
@@ -699,6 +701,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
             )
             .await?;
             temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
+            enrollment_endpoints = onboarding_realm_endpoints(&response.realm_endpoints);
             node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
             persist_node_state(&storage_handle, &node_state).await?;
         }
@@ -724,6 +727,10 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     if let Some(endpoint) = temporary_bootstrap_endpoint {
         peer_endpoints.push(endpoint);
     }
+    // Appended after the bootstrap endpoint: the onboarding fetch keeps dialing
+    // the node that finalized the join, while the realm stays reachable without
+    // a discovery read once that endpoint goes away.
+    peer_endpoints.extend(enrollment_endpoints);
 
     Ok((
         Config {
@@ -1252,6 +1259,38 @@ fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
 struct BootstrappedNodeState {
     node_state: PersistedNodeState,
     temporary_bootstrap_endpoint: EndpointAddr,
+    realm_endpoints: Vec<EndpointAddr>,
+}
+
+/// Realm endpoints handed over at enrollment, so a joiner dials the realm
+/// without a discovery read of its own. An entry that does not parse, or whose
+/// address names another node, is dropped instead of failing the join.
+fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<EndpointAddr> {
+    endpoints
+        .iter()
+        .filter_map(
+            |endpoint| match endpoint_addr_from_config_string(&endpoint.endpoint_addr) {
+                Ok(endpoint_addr) if endpoint_addr.id.to_string() == endpoint.node_id => {
+                    Some(endpoint_addr)
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        node_id = %endpoint.node_id,
+                        "Enrollment endpoint address names a different node; ignoring it"
+                    );
+                    None
+                }
+                Err(message) => {
+                    tracing::warn!(
+                        node_id = %endpoint.node_id,
+                        %message,
+                        "Enrollment handed over an unusable realm endpoint; ignoring it"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 async fn bootstrap_onboarded_node_state(
@@ -1338,6 +1377,7 @@ async fn bootstrap_onboarded_node_state(
     let realm_id = response.realm_id()?;
     validate_bootstrap_response(&response, decoded_secret.mode, realm_id, node_id)?;
     let temporary_bootstrap_endpoint = response.temporary_bootstrap_endpoint.clone();
+    let realm_endpoints = onboarding_realm_endpoints(&response.realm_endpoints);
     let identity =
         match response.mode {
             OnboardingMode::Management => {
@@ -1401,6 +1441,7 @@ async fn bootstrap_onboarded_node_state(
 
     Ok(BootstrappedNodeState {
         temporary_bootstrap_endpoint,
+        realm_endpoints,
         node_state: PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::PendingOnboarding,
@@ -2586,6 +2627,34 @@ mod tests {
         };
 
         assert!(super::realm_network_config(Some(&realm_config), local_node_id).is_err());
+    }
+
+    #[test]
+    fn filters_enrollment_endpoints() {
+        // A malformed or mismatched hand-over entry is dropped, never fatal:
+        // the joiner still dials the endpoints that do parse.
+        let endpoint_node = iroh::SecretKey::from_bytes(&[51u8; 32]).public();
+        let other_node = iroh::SecretKey::from_bytes(&[52u8; 32]).public();
+        let endpoint_addr =
+            iroh::EndpointAddr::new(endpoint_node).with_ip_addr("127.0.0.1:3001".parse().unwrap());
+        let endpoints = vec![
+            StaticRealmEndpoint {
+                node_id: endpoint_node.to_string(),
+                endpoint_addr: endpoint_addr_to_config_string(&endpoint_addr),
+            },
+            StaticRealmEndpoint {
+                node_id: other_node.to_string(),
+                endpoint_addr: endpoint_addr_to_config_string(&endpoint_addr),
+            },
+            StaticRealmEndpoint {
+                node_id: endpoint_node.to_string(),
+                endpoint_addr: "not-an-endpoint".to_string(),
+            },
+        ];
+
+        let parsed = super::onboarding_realm_endpoints(&endpoints);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, endpoint_node);
     }
 
     #[tokio::test]
