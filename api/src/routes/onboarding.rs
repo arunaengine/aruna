@@ -29,6 +29,9 @@ use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
 use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
+use aruna_operations::request_policy::{
+    PolicyRequestExtras, enforce_policies, policy_request_with,
+};
 use aruna_operations::reserve_onboarding_secret::ReserveOnboardingSecretError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -49,6 +52,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 const DEFAULT_ONBOARDING_SECRET_TTL_SECS: u64 = 3600;
+/// Policy operation name device enrollment is evaluated under.
+const ENROLL_DEVICE_OPERATION: &str = "onboarding.enroll_device";
 
 #[derive(OpenApi)]
 #[openapi(
@@ -201,6 +206,26 @@ fn authorize_device_enrollment(
     Ok(auth)
 }
 
+/// Device enrollment grants no role, so the realm's request policies are the
+/// only place an administrator can forbid it. They run under their own
+/// operation name, which lets a policy target enrollment and nothing else.
+async fn enforce_enrollment_policies(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+) -> ServerResult<()> {
+    let realm_id = state.get_realm_id();
+    let request = policy_request_with(
+        &format!("/{realm_id}/onboarding/devices"),
+        &Permission::WRITE,
+        Some(&auth.user_id),
+        PolicyRequestExtras::operation(ENROLL_DEVICE_OPERATION),
+    );
+    // Fail closed: a denial and unreadable policy state both refuse.
+    enforce_policies(&state.get_ctx(), realm_id, &request)
+        .await
+        .map_err(|_| ServerError::Forbidden)
+}
+
 async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
     let now = now_timestamp();
     let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
@@ -246,6 +271,11 @@ answers 403.
   key, so it is the most sensitive of the three.
 - A `User` secret enrolls an owner-bound device. Its owner is always the calling credential: the
   request body cannot name one, so a device secret can never enroll a node for somebody else.
+- Because self-service enrollment rests on no role grant, the realm's request policies are what an
+  administrator gates it with. A `User` mint is evaluated against them under the operation name
+  `onboarding.enroll_device` and the path `/{realm}/onboarding/devices`, so a realm deny policy on
+  that operation forbids device enrollment without touching any other route. Policy state that
+  cannot be read refuses the mint.
 - Every expired secret that is not already mid-enrollment is discarded before the new one is
   created.
 
@@ -264,7 +294,7 @@ answers 403.
   the cap. A realm without that quota set caps nothing.
 
 **Errors**: an owner at the device cap answers 409. An empty `seed_url` on a node that publishes no
-REST interface answers 400."#,
+REST interface answers 400. A realm policy that forbids enrollment answers 403."#,
     request_body(
         content = CreateOnboardingSecretRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
@@ -288,7 +318,7 @@ REST interface answers 400."#,
         ),
         (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, this is not a management node, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The owner already holds the realm's maximum number of devices", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -299,7 +329,11 @@ pub async fn create_onboarding_secret(
     Json(request): Json<CreateOnboardingSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateOnboardingSecretResponse>)> {
     let auth = match request.mode {
-        RequestedOnboardingMode::User => authorize_device_enrollment(&state, auth)?,
+        RequestedOnboardingMode::User => {
+            let auth = authorize_device_enrollment(&state, auth)?;
+            enforce_enrollment_policies(&state, &auth).await?;
+            auth
+        }
         RequestedOnboardingMode::Management | RequestedOnboardingMode::Server => {
             authorize_onboarding_admin(&state, auth).await?
         }
@@ -1031,6 +1065,7 @@ mod tests {
         OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord, OnboardingSecretState,
         RequestedOnboardingMode, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{
         Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
@@ -1337,6 +1372,93 @@ mod tests {
         assert_eq!(listed.secrets[0].owner.as_deref(), Some(owner.as_str()));
 
         net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn policy_denies_enrollment() {
+        // A realm deny policy on the enrollment operation stops a device mint
+        // without touching the infrastructure modes.
+        let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        let deny = RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "no-devices".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: format!("operation == '{}'", super::ENROLL_DEVICE_OPERATION),
+            enabled: true,
+        };
+        let mut config = read_realm_config(&state, realm_id).await;
+        config.request_policies.push(deny);
+        write_realm_config(&state, realm_id, &config).await;
+
+        let request = |mode| CreateOnboardingSecretRequest {
+            seed_url: "http://127.0.0.1:3000".to_string(),
+            mode,
+            expires_in_seconds: Some(600),
+        };
+        let denied = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(request(RequestedOnboardingMode::User)),
+        )
+        .await;
+        assert!(matches!(denied, Err(ServerError::Forbidden)));
+
+        let (_, Json(_)) = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Json(request(RequestedOnboardingMode::Server)),
+        )
+        .await
+        .expect("an infrastructure mint is untouched");
+
+        net_handle.shutdown().await;
+    }
+
+    async fn read_realm_config(state: &Arc<ServerState>, realm_id: RealmId) -> RealmConfigDocument {
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: byteview::ByteView::from(*realm_id.as_bytes()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => RealmConfigDocument::from_bytes(&bytes).unwrap(),
+            other => panic!("unexpected realm config read result: {other:?}"),
+        }
+    }
+
+    async fn write_realm_config(
+        state: &Arc<ServerState>,
+        realm_id: RealmId,
+        config: &RealmConfigDocument,
+    ) {
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: byteview::ByteView::from(*realm_id.as_bytes()),
+                value: byteview::ByteView::from(config.to_bytes(&actor).unwrap()),
+                txn_id: None,
+            }))
+            .await;
     }
 
     #[tokio::test]
