@@ -5261,6 +5261,8 @@ mod tests {
             )),
         )
         .await;
+        // A device forwards only for the owner its realm config names, so
+        // another user's token is refused before any group check.
         assert!(matches!(denied, Err(ServerError::Forbidden)));
 
         let bearer = || {
@@ -5268,6 +5270,35 @@ mod tests {
                 test.valid_bearer_token.clone(),
             )))
         };
+
+        // The owner binding does not replace the group check: a group the owner
+        // holds no role in is still refused at the ingress.
+        let foreign_group = Ulid::generate();
+        install_group_documents(
+            &test.remote,
+            test.auth.realm_id,
+            test.denied_auth.user_id,
+            foreign_group,
+        )
+        .await;
+        let unpermitted = create_metadata_document(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            bearer(),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: foreign_group.to_string(),
+                    path: "datasets/user-unpermitted".to_string(),
+                    name: "User Unpermitted".to_string(),
+                    description: "Forwarded write into a foreign group".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: None,
+                    public: false,
+                },
+            )),
+        )
+        .await;
+        assert!(matches!(unpermitted, Err(ServerError::Forbidden)));
         let missing = MetaResourceId::from_parts(
             1,
             PlacementHandle::new(METADATA_HANDLE).unwrap(),
@@ -6303,7 +6334,14 @@ mod tests {
             .net
             .add_peer_addr(coordinator.net.endpoint_addr())
             .await;
-        install_distributed_realm_config(&nodes, realm_id, Some(coordinator.net.node_id())).await;
+        // The device forwards for the owner its realm config names, so the
+        // fixture binds it to the user whose token the writes carry.
+        install_distributed_realm_config(
+            &nodes,
+            realm_id,
+            Some((coordinator.net.node_id(), user_id)),
+        )
+        .await;
         install_metadata_auth_documents(&remote, realm_id, user_id, group_id).await;
 
         let auth = AuthContext {
@@ -6411,17 +6449,16 @@ mod tests {
     async fn install_distributed_realm_config(
         nodes: &[&DistributedMetadataNode],
         realm_id: RealmId,
-        user_node: Option<aruna_core::NodeId>,
+        user_node: Option<(aruna_core::NodeId, aruna_core::UserId)>,
     ) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         for (band, node) in nodes.iter().enumerate() {
-            let kind = if Some(node.net.node_id()) == user_node {
-                RealmNodeKind::User {
-                    owner: aruna_core::types::UserId::nil(realm_id),
+            let kind = match user_node {
+                Some((node_id, owner)) if node_id == node.net.node_id() => {
+                    RealmNodeKind::User { owner }
                 }
-            } else {
-                RealmNodeKind::Server
+                _ => RealmNodeKind::Server,
             };
             config.ensure_node(node.net.node_id(), kind);
             config.seed_job_control(node.net.node_id(), band as u32);
@@ -6458,25 +6495,41 @@ mod tests {
             user_id,
             realm_id,
         };
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "distributed-metadata-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: user_id,
-        };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let context = node.state.get_ctx();
-
         write_doc(
-            &context,
+            &node.state.get_ctx(),
             AUTH_KEYSPACE,
             (*realm_id.as_bytes()).into(),
             realm_auth.to_bytes(&actor).unwrap().into(),
         )
         .await;
+        install_group_documents(node, realm_id, user_id, group_id).await;
+    }
+
+    /// A group owned by `owner`, with its authorization document, so a caller
+    /// outside it is refused by the group check rather than by its absence.
+    async fn install_group_documents(
+        node: &DistributedMetadataNode,
+        realm_id: RealmId,
+        owner: aruna_core::UserId,
+        group_id: Ulid,
+    ) {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "distributed-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let context = node.state.get_ctx();
+
         write_doc(
             &context,
             AUTH_KEYSPACE,
