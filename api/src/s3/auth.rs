@@ -17,6 +17,7 @@ use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOpe
 use aruna_operations::s3::session::{
     GetS3SessionOperation, S3SessionError, TouchS3SessionConfig, TouchS3SessionOperation,
 };
+use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use http::{HeaderMap, Uri};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
@@ -158,6 +159,16 @@ impl S3Access for AuthProvider {
             .build_authorization_path(cx, &user_access, &action)
             .await?;
 
+        // An offered directory is an observation of the owner's own files: it is
+        // served read-only, so no write may claim to change it.
+        if matches!(action, Action::Write)
+            && let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned)
+        {
+            guard_bucket_write(self.driver_ctx.as_ref(), &bucket)
+                .await
+                .map_err(map_offered_directory_error)?;
+        }
+
         // The policy request context is built once: ordinary authorization uses a
         // clone and the original is stashed so per-object and secondary-resource
         // handlers evaluate against the real query and allowlisted headers.
@@ -283,6 +294,16 @@ fn map_session_error(error: S3SessionError) -> s3s::S3Error {
         S3SessionError::InvalidToken => s3_error!(InvalidToken, "Invalid session token"),
         S3SessionError::Expired => s3_error!(ExpiredToken, "Session token has expired"),
         _ => s3_error!(InternalError, "Failed to update session activity"),
+    }
+}
+
+fn map_offered_directory_error(error: OfferedDirectoryError) -> s3s::S3Error {
+    match error {
+        OfferedDirectoryError::ReadOnly(bucket) => s3_error!(
+            AccessDenied,
+            "Bucket {bucket} is an offered directory and is read-only"
+        ),
+        error => s3_error!(InternalError, "{}", error),
     }
 }
 

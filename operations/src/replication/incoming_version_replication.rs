@@ -140,6 +140,10 @@ pub enum IncomingVersionReplicationError {
     MissingReferenceSource,
     #[error("Reference replication manifest is missing its advance count")]
     MissingReferenceAdvanceCount,
+    /// An offered directory resolves against the registration of the device that
+    /// offers it, so a binding naming one is never valid on another node.
+    #[error("Reference replication manifest names a device-local source")]
+    LocalReferenceSource,
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
     #[error(transparent)]
@@ -572,6 +576,9 @@ impl IncomingVersionReplicationOperation {
             .source
             .clone()
             .ok_or(IncomingVersionReplicationError::MissingReferenceSource)?;
+        if source.descriptor.kind == aruna_core::structs::SourceConnectorKind::LocalDirectory {
+            return Err(IncomingVersionReplicationError::LocalReferenceSource);
+        }
         let metadata = self
             .manifest
             .reference_metadata
