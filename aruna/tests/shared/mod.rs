@@ -585,7 +585,7 @@ pub(crate) async fn create_onboarding_secret_via_http(
         .bearer_auth(token)
         .json(&CreateOnboardingSecretRequest {
             seed_url: seed.base_url.clone(),
-            mode,
+            mode: mode.into(),
             expires_in_seconds: Some(600),
         })
         .send()

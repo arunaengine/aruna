@@ -2,6 +2,7 @@ use crate::NodeId;
 use crate::auth::credential_hash;
 use crate::document::DocumentSyncTarget;
 use crate::structs::RealmId;
+use crate::types::UserId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointAddr;
@@ -14,6 +15,22 @@ use ulid::Ulid;
 pub enum OnboardingMode {
     Management,
     Server,
+    /// Owner-bound device enrollment. The owner is fixed when the secret is
+    /// minted and copied into the membership record at finalize, so a device
+    /// secret can never enroll a node for anybody else.
+    User {
+        owner: UserId,
+    },
+}
+
+impl OnboardingMode {
+    /// Owner a device secret is bound to; `None` for infrastructure modes.
+    pub fn owner(&self) -> Option<UserId> {
+        match self {
+            Self::User { owner } => Some(*owner),
+            Self::Management | Self::Server => None,
+        }
+    }
 }
 
 /// Distinguishes what a secret may be redeemed for. An initial-administrator
@@ -118,17 +135,36 @@ pub struct OnboardingSyncTicket {
     pub signature: String,
 }
 
+/// Mode a mint request asks for. A device secret carries no owner here: the
+/// owner is taken from the caller's credential, so the body cannot name one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestedOnboardingMode {
+    Management,
+    Server,
+    User,
+}
+
+impl From<OnboardingMode> for RequestedOnboardingMode {
+    fn from(mode: OnboardingMode) -> Self {
+        match mode {
+            OnboardingMode::Management => Self::Management,
+            OnboardingMode::Server => Self::Server,
+            OnboardingMode::User { .. } => Self::User,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateOnboardingSecretRequest {
     pub seed_url: String,
-    pub mode: OnboardingMode,
+    pub mode: RequestedOnboardingMode,
     pub expires_in_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateOnboardingSecretResponse {
     pub onboarding_secret: String,
-    pub mode: OnboardingMode,
+    pub mode: RequestedOnboardingMode,
     pub expires_at: u64,
 }
 

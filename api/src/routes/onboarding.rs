@@ -4,8 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
     CreateOnboardingSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
-    OnboardingSecretRecord, OnboardingSecretState, bootstrap_issuer_proof_message,
-    bootstrap_node_proof_message,
+    OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode,
+    bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
 use aruna_core::structs::{AuthContext, NodeCapabilities, Permission};
 use aruna_operations::bootstrap_onboarding_finalize::{
@@ -14,7 +14,7 @@ use aruna_operations::bootstrap_onboarding_finalize::{
 };
 use aruna_operations::consume_onboarding_secret::ConsumeOnboardingSecretError;
 use aruna_operations::create_onboarding_secret::{
-    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+    CreateOnboardingSecretError, CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::delete_onboarding_secret::{
     DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
@@ -118,6 +118,8 @@ pub struct ListOnboardingSecretsResponse {
 pub struct OnboardingSecretSummary {
     pub enrollment_id: String,
     pub mode: String,
+    /// Owner a `User` secret is bound to; null for infrastructure modes.
+    pub owner: Option<String>,
     pub expires_at: u64,
     pub claimed_node_id: Option<String>,
 }
@@ -126,7 +128,8 @@ impl From<OnboardingSecretRecord> for OnboardingSecretSummary {
     fn from(record: OnboardingSecretRecord) -> Self {
         Self {
             enrollment_id: record.enrollment_id.to_string(),
-            mode: format!("{:?}", record.mode),
+            mode: format!("{:?}", RequestedOnboardingMode::from(record.mode)),
+            owner: record.mode.owner().map(|owner| owner.to_string()),
             expires_at: record.expires_at,
             claimed_node_id: record.claimed_node_id,
         }
@@ -153,6 +156,21 @@ async fn authorize_onboarding_admin(
     )
     .await?;
 
+    Ok(auth)
+}
+
+/// Device enrollment is self-service: any authenticated member of this realm
+/// may mint a User-mode secret, and it is always bound to the caller.
+fn authorize_device_enrollment(
+    state: &Arc<ServerState>,
+    auth: Option<AuthContext>,
+) -> ServerResult<AuthContext> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    // Only a management node redeems enrollment, so only it may mint.
+    if auth.realm_id != state.get_realm_id() || auth.user_id.is_nil() || !state.is_management_node()
+    {
+        return Err(ServerError::Forbidden);
+    }
     Ok(auth)
 }
 
@@ -185,25 +203,33 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
     path = "/admin/onboarding/secrets",
     tag = "onboarding",
     summary = "Mint a node enrollment secret",
-    description = r#"Mints a single-use enrollment secret that a joining node redeems to enter the realm.
+    description = r#"Mints a single-use enrollment secret that a joining node or device redeems to enter the realm.
 
-**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path;
-only a management node serves it and any other node answers 403.
+**Authentication**: `Management` and `Server` secrets need a bearer token of this realm with WRITE
+on the realm's onboarding admin path. A `User` secret is self-service: any authenticated member of
+this realm may mint one for itself. Only a management node serves the route and any other node
+answers 403.
 
 **Behavior**
 - The response carries the enrollment secret exactly once: the node stores only its hash, so a
   secret that is lost cannot be recovered and must be revoked and minted again.
-- Treat the value like a credential, hand it to exactly one joining node, and expect it to be
-  single-use.
-- `mode` fixes what the joiner may become and is one of `Management` or `Server`; a `Management`
-  secret later lets the joiner receive the realm private key wrapped to its transport key, so it is
-  the more sensitive of the two.
+- Treat the value like a credential, hand it to exactly one joiner, and expect it to be single-use.
+- `mode` fixes what the joiner may become and is one of `Management`, `Server` or `User`. A
+  `Management` secret later lets the joiner receive the realm private key wrapped to its transport
+  key, so it is the most sensitive of the three.
+- A `User` secret enrolls an owner-bound device. Its owner is always the calling credential: the
+  request body cannot name one, so a device secret can never enroll a node for somebody else.
 - Every expired secret that is not already mid-enrollment is discarded before the new one is
   created.
 
 **Limits**
 - `expires_in_seconds` defaults to 3600 and is clamped to 60..=86400; `expires_at` is the resulting
-  absolute expiry in Unix seconds."#,
+  absolute expiry in Unix seconds.
+- A `User` mint is refused once the owner holds the realm's `max_devices_per_user` devices.
+  Enrolled devices and unclaimed device secrets both occupy a slot, so two mints cannot race past
+  the cap. A realm without that quota set caps nothing.
+
+**Errors**: an owner at the device cap answers 409."#,
     request_body(
         content = CreateOnboardingSecretRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
@@ -219,13 +245,14 @@ only a management node serves it and any other node answers 403.
             description = "Secret created; `onboarding_secret` is shown here and never again",
             body = CreateOnboardingSecretResponseDoc,
             example = json!({
-                "onboarding_secret": "<onboarding-secret-shown-once>",
+                "onboarding_secret": "<enrollment-secret-shown-once>",
                 "mode": "Server",
                 "expires_at": 1775748191
             })
         ),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse)
+        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
+        (status = 409, description = "The owner already holds the realm's maximum number of devices", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -234,7 +261,20 @@ pub async fn create_onboarding_secret(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<CreateOnboardingSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateOnboardingSecretResponse>)> {
-    let _auth = authorize_onboarding_admin(&state, auth).await?;
+    let auth = match request.mode {
+        RequestedOnboardingMode::User => authorize_device_enrollment(&state, auth)?,
+        RequestedOnboardingMode::Management | RequestedOnboardingMode::Server => {
+            authorize_onboarding_admin(&state, auth).await?
+        }
+    };
+    // The owner binding comes from the caller's credential, never the body.
+    let mode = match request.mode {
+        RequestedOnboardingMode::Management => OnboardingMode::Management,
+        RequestedOnboardingMode::Server => OnboardingMode::Server,
+        RequestedOnboardingMode::User => OnboardingMode::User {
+            owner: auth.user_id,
+        },
+    };
     prune_stale_onboarding_secrets(&state).await?;
 
     let ttl = request
@@ -250,7 +290,7 @@ pub async fn create_onboarding_secret(
         seed_url: request.seed_url,
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
-        mode: request.mode,
+        mode,
         realm_id: state.get_realm_id(),
         purpose: OnboardingPurpose::NodeEnrollment,
     };
@@ -271,13 +311,13 @@ pub async fn create_onboarding_secret(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(map_create_error)?;
 
     Ok((
         StatusCode::CREATED,
         Json(CreateOnboardingSecretResponse {
             onboarding_secret: encoded_secret,
-            mode: onboarding_secret.mode,
+            mode: request.mode,
             expires_at,
         }),
     ))
@@ -294,8 +334,9 @@ pub async fn create_onboarding_secret(
 only a management node serves it and any other node answers 403.
 
 **Behavior**
-- Each entry carries the enrollment id, the mode, the absolute expiry in Unix seconds and, once a
-  joiner has claimed the secret, the node id it was claimed by.
+- Each entry carries the enrollment id, the mode, the owner a `User` secret is bound to, the
+  absolute expiry in Unix seconds and, once a joiner has claimed the secret, the node id it was
+  claimed by.
 - The secret value itself is never returned here, because only its hash was kept when it was
   minted.
 - Expired secrets that are not mid-enrollment are discarded before the list is built, so the list
@@ -311,12 +352,14 @@ only a management node serves it and any other node answers 403.
                     {
                         "enrollment_id": "01JABCDEF0123456789ABCDEFG",
                         "mode": "Server",
+                        "owner": null,
                         "expires_at": 1775748191,
                         "claimed_node_id": null
                     },
                     {
                         "enrollment_id": "01JMETADATA0123456789ABCDE",
-                        "mode": "Local",
+                        "mode": "User",
+                        "owner": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                         "expires_at": 1775751791,
                         "claimed_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
                     }
@@ -414,6 +457,9 @@ only a management node serves this route.
   requires `issuer_public_key` and a matching `issuer_proof` and returns a delegation signature; a
   `Management` secret requires `transport_public_key` and returns the realm private key encrypted
   to it, along with the nonce and the ephemeral public key needed to open it.
+- A `User` secret needs neither: a device holds no realm key and no issuer delegation, and joins as
+  an owner-bound member that never becomes a sync, holder or placement target. Its `mode` echoes
+  the owner the secret was bound to at mint time.
 - The response always carries the realm id, the temporary endpoint to dial and a one-time sync
   ticket the joiner uses to fetch the realm's core documents.
 - `node_location`, `node_weight` and `node_labels` seed the joiner's placement entry and are
@@ -509,7 +555,8 @@ pub async fn bootstrap_onboarding(
                 .ok_or(ServerError::BadRequest)?;
             verify_issuer_proof(&request, issuer_public_key)?;
         }
-        OnboardingMode::Management => {}
+        // A device enrolls with no issuer key and no realm key.
+        OnboardingMode::Management | OnboardingMode::User { .. } => {}
     }
 
     let bootstrap_endpoint = state
@@ -587,6 +634,17 @@ pub async fn bootstrap_onboarding(
             delegation_signature,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,
         },
+        // A device receives no realm key and no issuer delegation.
+        mode @ OnboardingMode::User { .. } => BootstrapOnboardingResponse {
+            realm_id: state.get_realm_id().to_string(),
+            mode,
+            temporary_bootstrap_endpoint: bootstrap_endpoint,
+            wrapped_realm_private_key: None,
+            wrapped_realm_private_key_nonce: None,
+            wrapping_public_key: None,
+            delegation_signature: None,
+            onboarding_sync_ticket: finalized.onboarding_sync_ticket,
+        },
     };
 
     Ok((StatusCode::OK, Json(response)))
@@ -635,6 +693,15 @@ fn map_inspect_error(error: InspectOnboardingSecretError) -> ServerError {
         | InspectOnboardingSecretError::Expired
         | InspectOnboardingSecretError::AlreadyClaimed
         | InspectOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+fn map_create_error(error: CreateOnboardingSecretError) -> ServerError {
+    match error {
+        CreateOnboardingSecretError::DeviceCapExceeded { .. } => {
+            ServerError::Conflict(error.to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -745,7 +812,7 @@ mod tests {
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
         OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord, OnboardingSecretState,
-        bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+        RequestedOnboardingMode, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{
@@ -891,7 +958,7 @@ mod tests {
             Extension(Some(auth)),
             Json(CreateOnboardingSecretRequest {
                 seed_url: "http://127.0.0.1:3000".to_string(),
-                mode: OnboardingMode::Server,
+                mode: RequestedOnboardingMode::Server,
                 expires_in_seconds: Some(600),
             }),
         )
@@ -987,6 +1054,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_binds_owner() {
+        // A device secret takes its owner from the credential, not the body.
+        let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let (_, Json(created)) = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(CreateOnboardingSecretRequest {
+                seed_url: "http://127.0.0.1:3000".to_string(),
+                mode: RequestedOnboardingMode::User,
+                expires_in_seconds: Some(600),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(created.mode, RequestedOnboardingMode::User);
+        let secret = OnboardingSecret::decode(&created.onboarding_secret).unwrap();
+        assert_eq!(secret.mode, OnboardingMode::User { owner: user_id });
+
+        let (_, Json(listed)) = list_onboarding_secrets(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        let owner = user_id.to_string();
+        assert_eq!(listed.secrets[0].mode, "User");
+        assert_eq!(listed.secrets[0].owner.as_deref(), Some(owner.as_str()));
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn enrolls_user_device() {
+        // A device joins with no issuer key and lands as an owner-bound member.
+        let (state, realm_id, _seed, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let (_, Json(created)) = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Json(CreateOnboardingSecretRequest {
+                seed_url: "http://127.0.0.1:3000".to_string(),
+                mode: RequestedOnboardingMode::User,
+                expires_in_seconds: Some(600),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let device_key = SigningKey::from_bytes(&[23u8; 32]);
+        let device_node_id = iroh::SecretKey::from_bytes(&device_key.to_bytes()).public();
+        let node_id = device_node_id.to_string();
+        let node_proof = device_key
+            .sign(&bootstrap_node_proof_message(
+                &created.onboarding_secret,
+                &node_id,
+                None,
+            ))
+            .to_string();
+
+        let (_, Json(bootstrap)) = bootstrap_onboarding(
+            State(state.clone()),
+            Json(BootstrapOnboardingRequest {
+                onboarding_secret: created.onboarding_secret,
+                node_id,
+                node_proof,
+                transport_public_key: None,
+                issuer_public_key: None,
+                issuer_proof: None,
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bootstrap.mode, OnboardingMode::User { owner: user_id });
+        assert!(bootstrap.wrapped_realm_private_key.is_none());
+        assert!(bootstrap.delegation_signature.is_none());
+
+        let config = match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: byteview::ByteView::from(*realm_id.as_bytes()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => RealmConfigDocument::from_bytes(&bytes).unwrap(),
+            other => panic!("unexpected realm config read result: {other:?}"),
+        };
+        let device = config
+            .nodes
+            .iter()
+            .find(|node| node.node_id == device_node_id.to_string())
+            .expect("device joined the realm configuration");
+        assert_eq!(device.kind, RealmNodeKind::User { owner: user_id });
+        assert!(!device.kind.is_sync_eligible());
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_stranger() {
+        // Self-service enrollment is still realm-scoped and never anonymous.
+        let (state, _realm_id, _node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        let request = || CreateOnboardingSecretRequest {
+            seed_url: "http://127.0.0.1:3000".to_string(),
+            mode: RequestedOnboardingMode::User,
+            expires_in_seconds: Some(600),
+        };
+
+        let anonymous =
+            create_onboarding_secret(State(state.clone()), Extension(None), Json(request())).await;
+        assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+
+        let foreign = create_onboarding_secret(
+            State(state),
+            Extension(Some(AuthContext {
+                user_id,
+                realm_id: RealmId::from_bytes([31u8; 32]),
+                path_restrictions: None,
+            })),
+            Json(request()),
+        )
+        .await;
+        assert!(matches!(foreign, Err(ServerError::Forbidden)));
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn bootstrap_rejects_secret() {
         // An initial-administrator secret must not onboard a node or be consumed.
         let (state, realm_id, _seed, _user_id, net_handle, _tempdir) =
@@ -1069,7 +1284,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Json(CreateOnboardingSecretRequest {
                 seed_url: "http://127.0.0.1:3000".to_string(),
-                mode: OnboardingMode::Server,
+                mode: RequestedOnboardingMode::Server,
                 expires_in_seconds: Some(600),
             }),
         )
@@ -1197,7 +1412,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Json(CreateOnboardingSecretRequest {
                 seed_url: "http://127.0.0.1:3000".to_string(),
-                mode: OnboardingMode::Server,
+                mode: RequestedOnboardingMode::Server,
                 expires_in_seconds: Some(600),
             }),
         )
@@ -1285,7 +1500,7 @@ mod tests {
             Extension(Some(auth)),
             Json(CreateOnboardingSecretRequest {
                 seed_url: "http://127.0.0.1:3000".to_string(),
-                mode: OnboardingMode::Management,
+                mode: RequestedOnboardingMode::Management,
                 expires_in_seconds: Some(600),
             }),
         )

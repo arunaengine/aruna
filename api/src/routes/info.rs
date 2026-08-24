@@ -983,7 +983,7 @@ token of another realm or one this node cannot validate, the response is the pub
                             },
                             {
                                 "node_id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
-                                "kind": "local",
+                                "kind": "user",
                                 "configured": true,
                                 "present": false,
                                 "connection_status": "configured",
@@ -998,7 +998,7 @@ token of another realm or one this node cannot validate, the response is the pub
                             "group_overrides": [],
                             "max_groups_per_user": 10,
                             "user_group_cap_overrides": [],
-                            "max_devices_per_user": null
+                            "max_devices_per_user": 5
                         },
                         "interfaces": {
                             "rest": {"status": "available", "bind": "0.0.0.0:3000", "url": "https://node.example.test/api/v1"},
@@ -1527,6 +1527,8 @@ a management node serves it; an anonymous caller is rejected and every other nod
   `warn_threshold_percent` only decides when a group is reported as warning.
 - Per-group overrides replace both values for one group, and per-user overrides cap how many groups
   a user may hold.
+- `max_devices_per_user` caps how many devices one user may enroll; null leaves device enrollment
+  uncapped. Enrolled devices and unclaimed device enrollment secrets both occupy a slot.
 - Quota is evaluated against a group's realm-wide logical bytes, which are aggregated from counters
   that replicate between nodes, so enforcement follows a policy change as those counters and the
   realm configuration propagate.
@@ -1534,8 +1536,8 @@ a management node serves it; an anonymous caller is rejected and every other nod
 **Limits**
 - `grace_factor_percent` must be at least 100.
 - `warn_threshold_percent` must be between 1 and 100.
-- `max_devices_per_user` must be null, since device ownership is not enforced yet and any other
-  value is refused."#,
+- `max_devices_per_user` must be null or greater than zero; zero is refused rather than read as a
+  ban on device enrollment."#,
     request_body(
         content = RealmQuotaConfig,
         description = "The complete quota policy to store; it replaces the current one, including all override lists",
@@ -1550,7 +1552,7 @@ a management node serves it; an anonymous caller is rejected and every other nod
             "user_group_cap_overrides": [
                 {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
             ],
-            "max_devices_per_user": null
+            "max_devices_per_user": 5
         })
     ),
     responses(
@@ -1569,7 +1571,7 @@ a management node serves it; an anonymous caller is rejected and every other nod
                 "user_group_cap_overrides": [
                     {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
                 ],
-                "max_devices_per_user": null
+                "max_devices_per_user": 5
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a value for max_devices_per_user", body = crate::error::ErrorResponse),
@@ -3462,6 +3464,7 @@ mod tests {
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.default_group_quota_bytes = Some(4096);
+        body.max_devices_per_user = Some(3);
 
         let (status, Json(stored)) = set_realm_quota(
             State(state.clone()),
@@ -3472,7 +3475,7 @@ mod tests {
         .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(stored.default_group_quota_bytes, Some(4096));
-        assert_eq!(stored.max_devices_per_user, None);
+        assert_eq!(stored.max_devices_per_user, Some(3));
 
         let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
             .await
@@ -3480,7 +3483,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let quota = info.quota.expect("realm token sees quota");
         assert_eq!(quota.default_group_quota_bytes, Some(4096));
-        assert_eq!(quota.max_devices_per_user, None);
+        assert_eq!(quota.max_devices_per_user, Some(3));
     }
 
     /// Anonymous callers keep what they need to authenticate; realm topology,
@@ -3750,7 +3753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_realm_quota_rejects_unsupported_device_cap() {
+    async fn quota_rejects_zero_cap() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = AuthContext {
             user_id: admin,
@@ -3758,7 +3761,7 @@ mod tests {
             path_restrictions: None,
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
-        body.max_devices_per_user = Some(2);
+        body.max_devices_per_user = Some(0);
 
         let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
             .await

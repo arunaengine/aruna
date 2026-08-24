@@ -3168,7 +3168,6 @@ fn quota_value(quota: &QuotaConfig) -> String {
 
 fn supported_quota(quota: &QuotaConfig) -> QuotaConfig {
     let mut quota = quota.clone();
-    quota.max_devices_per_user = None;
     quota.group_overrides.sort_by_key(|over| over.group_id);
     quota
         .user_group_cap_overrides
@@ -5281,17 +5280,15 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_quota_materialization_drops_unsupported_max_devices_per_user() {
+    fn keeps_device_cap() {
+        // The device cap materializes like any other quota field.
         let mut state = realm_config_state();
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(1_000),
             max_devices_per_user: Some(6),
             ..QuotaConfig::default()
         };
-        let expected = QuotaConfig {
-            max_devices_per_user: None,
-            ..quota.clone()
-        };
+        let expected = quota.clone();
 
         state
             .apply(&realm_config_event(
@@ -5360,7 +5357,7 @@ mod tests {
                     max_groups: Some(3),
                 },
             ],
-            max_devices_per_user: None,
+            max_devices_per_user: Some(6),
         };
         let reordered = QuotaConfig {
             group_overrides: expected.group_overrides.iter().cloned().rev().collect(),
