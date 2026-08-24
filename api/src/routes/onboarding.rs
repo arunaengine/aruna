@@ -193,7 +193,9 @@ async fn authorize_onboarding_admin(
 }
 
 /// Device enrollment is self-service: any authenticated member of this realm
-/// may mint a User-mode secret, and it is always bound to the caller.
+/// may mint a User-mode secret, and it is always bound to the caller. A
+/// path-restricted token may not: enrolling a device grants its holder the
+/// caller's whole identity, which no restriction could then narrow.
 fn authorize_device_enrollment(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
@@ -202,6 +204,9 @@ fn authorize_device_enrollment(
     // Only a management node redeems enrollment, so only it may mint.
     if auth.realm_id != state.get_realm_id() || auth.user_id.is_nil() || !state.is_management_node()
     {
+        return Err(ServerError::Forbidden);
+    }
+    if auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
     }
     Ok(auth)
@@ -260,7 +265,8 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
 
 **Authentication**: `Management` and `Server` secrets need a bearer token of this realm with WRITE
 on the realm's onboarding admin path. A `User` secret is self-service: any authenticated member of
-this realm may mint one for itself. Only a management node serves the route and any other node
+this realm may mint one for itself, from an unrestricted token only, because the device it enrolls
+carries the caller's whole identity. Only a management node serves the route and any other node
 answers 403.
 
 **Behavior**
@@ -325,7 +331,7 @@ REST interface answers 400. A realm policy that forbids enrollment answers 403."
         ),
         (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, this is not a management node, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or is path-restricted, this is not a management node, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The owner already holds the realm's maximum number of devices", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1735,6 +1741,32 @@ mod tests {
         )
         .await;
         assert!(matches!(foreign, Err(ServerError::Forbidden)));
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_restricted() {
+        // A device carries its owner's whole identity, so a path-restricted
+        // token may not enroll one.
+        let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+
+        let restricted = create_onboarding_secret(
+            State(state),
+            Extension(Some(AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: Some(Vec::new()),
+            })),
+            Json(CreateOnboardingSecretRequest {
+                seed_url: "http://127.0.0.1:3000".to_string(),
+                mode: RequestedOnboardingMode::User,
+                expires_in_seconds: Some(600),
+            }),
+        )
+        .await;
+        assert!(matches!(restricted, Err(ServerError::Forbidden)));
 
         net_handle.shutdown().await;
     }
