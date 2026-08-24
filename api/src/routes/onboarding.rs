@@ -92,6 +92,7 @@ pub struct CreateOnboardingSecretRequestDoc {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct CreateOnboardingSecretResponseDoc {
     pub onboarding_secret: String,
+    pub enrollment_id: String,
     pub mode: String,
     pub expires_at: u64,
     pub enroll_url: Option<String>,
@@ -273,6 +274,9 @@ any other node answers 403.
 - The response carries the enrollment secret exactly once: the node stores only its hash, so a
   secret that is lost cannot be recovered and must be revoked and minted again.
 - Treat the value like a credential, hand it to exactly one joiner, and expect it to be single-use.
+- `enrollment_id` names the enrollment this mint created and is the handle the status and revoke
+  routes take. It is not secret and the admin listing shows the same value, so a caller tracking
+  its own mint reads it here instead of diffing the listing against a concurrent one.
 - `mode` fixes what the joiner may become and is one of `Management`, `Server` or `User`. A
   `Management` secret later lets the joiner receive the realm private key wrapped to its transport
   key, so it is the most sensitive of the three.
@@ -326,6 +330,7 @@ interface answers 400. A realm policy that forbids enrollment answers 403."#,
             body = CreateOnboardingSecretResponseDoc,
             example = json!({
                 "onboarding_secret": "<enrollment-secret-shown-once>",
+                "enrollment_id": "01JABCDEF0123456789ABCDEFG",
                 "mode": "Server",
                 "expires_at": 1775748191,
                 "enroll_url": null
@@ -414,6 +419,7 @@ pub async fn create_onboarding_secret(
         StatusCode::CREATED,
         Json(CreateOnboardingSecretResponse {
             onboarding_secret: encoded_secret,
+            enrollment_id: onboarding_secret.enrollment_id.to_string(),
             mode: request.mode,
             expires_at,
             enroll_url,
@@ -1412,6 +1418,7 @@ mod tests {
         assert_eq!(created.mode, RequestedOnboardingMode::User);
         let secret = OnboardingSecret::decode(&created.onboarding_secret).unwrap();
         assert_eq!(secret.mode, OnboardingMode::User { owner: user_id });
+        assert_eq!(created.enrollment_id, secret.enrollment_id.to_string());
 
         let (_, Json(listed)) = list_onboarding_secrets(State(state), Extension(Some(auth)))
             .await
@@ -1419,6 +1426,7 @@ mod tests {
         let owner = user_id.to_string();
         assert_eq!(listed.secrets[0].mode, "User");
         assert_eq!(listed.secrets[0].owner.as_deref(), Some(owner.as_str()));
+        assert_eq!(listed.secrets[0].enrollment_id, created.enrollment_id);
 
         net_handle.shutdown().await;
     }
@@ -1596,7 +1604,9 @@ mod tests {
         .await
         .unwrap();
         let secret = OnboardingSecret::decode(&created.onboarding_secret).unwrap();
-        let enrollment_id = secret.enrollment_id.to_string();
+        // The id the mint returned is the handle the status route takes.
+        let enrollment_id = created.enrollment_id.clone();
+        assert_eq!(enrollment_id, secret.enrollment_id.to_string());
 
         let (_, Json(status)) = get_onboarding_secret_status(
             State(state.clone()),
@@ -1895,12 +1905,11 @@ mod tests {
                 .unwrap();
         assert_eq!(listed.secrets.len(), 1);
 
-        let secret =
-            aruna_core::onboarding::OnboardingSecret::decode(&created.onboarding_secret).unwrap();
+        assert_eq!(listed.secrets[0].enrollment_id, created.enrollment_id);
         let status = revoke_onboarding_secret(
             State(state.clone()),
             Extension(Some(auth)),
-            Path(secret.enrollment_id.to_string()),
+            Path(created.enrollment_id),
         )
         .await
         .unwrap();

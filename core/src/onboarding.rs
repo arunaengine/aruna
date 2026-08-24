@@ -167,6 +167,9 @@ pub struct CreateOnboardingSecretRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateOnboardingSecretResponse {
     pub onboarding_secret: String,
+    /// Identifier of the minted enrollment, the handle the status and revoke
+    /// routes take. Not secret: the admin listing exposes the same value.
+    pub enrollment_id: String,
     pub mode: RequestedOnboardingMode,
     pub expires_at: u64,
     /// `aruna://enroll` deep link a device app opens to claim this secret;
