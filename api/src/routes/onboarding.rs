@@ -170,7 +170,7 @@ impl From<OnboardingSecretRecord> for OnboardingSecretSummary {
     }
 }
 
-async fn authorize_onboarding_admin(
+pub(crate) async fn authorize_onboarding_admin(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
 ) -> ServerResult<AuthContext> {

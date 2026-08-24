@@ -1,5 +1,6 @@
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
@@ -36,7 +37,7 @@ use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
 use aruna_operations::remove_device_node::{
-    RemoveDeviceNodeConfig, RemoveDeviceNodeError, RemoveDeviceNodeOperation,
+    DeviceEvictionScope, RemoveDeviceNodeConfig, RemoveDeviceNodeError, RemoveDeviceNodeOperation,
 };
 use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
@@ -71,6 +72,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_user, update_user))
         .routes(routes!(list_user_devices))
         .routes(routes!(revoke_user_device))
+        .routes(routes!(evict_device))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1621,12 +1623,70 @@ async fn revoke_user_device(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    // The redeemed secret goes first: it would otherwise resurface as an
-    // in-flight enrollment once the device is no longer listed as a member.
-    if let Some(enrollment_id) = claimed_enrollment(&state, &device.id).await? {
-        delete_enrollment(&state, enrollment_id).await?;
-    }
     let node_id = aruna_core::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    evict_node(&state, &auth, node_id, DeviceEvictionScope::Owner).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/devices/{node_id}",
+    tag = "users",
+    summary = "Evict any enrolled device as a realm admin",
+    description = r#"Evicts one enrolled user device from the realm on behalf of the realm's administration.
+
+**Authentication**: realm bearer token with WRITE on the realm's onboarding administration path,
+and only a management node serves it; every other node answers 403. This is the same authorization
+the onboarding administration routes carry, so the realm request policies constrain it too.
+
+**Behavior**
+- `node_id` is the device's node id, which `GET /users/me/devices` reports to its owner and the
+  realm configuration lists as a node of kind `User`.
+- The device is dropped from the realm configuration and the enrollment secret it redeemed is
+  retired, so the eviction cannot be undone by replaying that secret.
+- The eviction replicates like any other configuration change, and each node closes the device's
+  open connections when it applies the new membership.
+- Only an enrolled device is reachable here: a management or server node is not a device and
+  answers 404, so this route can never remove realm infrastructure.
+- The owner's own `DELETE /users/me/devices/{id}` is unchanged and stays self-scoped; this route
+  neither replaces nor requires it.
+
+**Errors**: a node id that names no enrolled device answers 404, which is also what a caller sees
+after an earlier eviction."#,
+    params(("node_id" = String, Path, description = "Node id of the enrolled device to evict")),
+    responses(
+        (status = 204, description = "Device evicted from the realm; no response body"),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The caller is not a realm onboarding admin, or this node is not a management node", body = ErrorResponse),
+        (status = 404, description = "No enrolled device carries this node id", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn evict_device(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(node_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = authorize_onboarding_admin(&state, auth).await?;
+    let node_id = aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
+    evict_node(&state, &auth, node_id, DeviceEvictionScope::RealmAdmin).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Retires the redeemed secret and drops the device from the membership. The
+/// secret goes first: it would otherwise resurface as an in-flight enrollment
+/// once the device is no longer listed as a member.
+async fn evict_node(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    node_id: aruna_core::NodeId,
+    scope: DeviceEvictionScope,
+) -> ServerResult<()> {
+    if let Some(enrollment_id) = claimed_enrollment(state, &node_id.to_string()).await? {
+        delete_enrollment(state, enrollment_id).await?;
+    }
     drive(
         RemoveDeviceNodeOperation::new(RemoveDeviceNodeConfig {
             actor: Actor {
@@ -1635,6 +1695,7 @@ async fn revoke_user_device(
                 realm_id: auth.realm_id,
             },
             node_id,
+            scope,
         }),
         &state.get_ctx(),
     )
@@ -1645,8 +1706,7 @@ async fn revoke_user_device(
         RemoveDeviceNodeError::NotManagementNode => ServerError::Forbidden,
         other => ServerError::InternalError(other.to_string()),
     })?;
-
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// Enrollment whose secret this node claimed, so an eviction can retire it.
@@ -2811,7 +2871,7 @@ mod resolve_tests {
 
 #[cfg(test)]
 mod device_tests {
-    use super::{UserDeviceResponse, list_user_devices, revoke_user_device};
+    use super::{UserDeviceResponse, evict_device, list_user_devices, revoke_user_device};
     use crate::error::ServerError;
     use crate::server_state::ServerState;
     use aruna_core::UserId;
@@ -2839,6 +2899,7 @@ mod device_tests {
         state: Arc<ServerState>,
         owner: UserId,
         other: UserId,
+        admin: UserId,
         _dir: TempDir,
     }
 
@@ -2864,6 +2925,7 @@ mod device_tests {
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let owner = UserId::local(Ulid::generate(), realm_id);
         let other = UserId::local(Ulid::generate(), realm_id);
+        let admin = UserId::local(Ulid::generate(), realm_id);
         let actor = Actor {
             node_id: node(1),
             user_id: UserId::nil(realm_id),
@@ -2922,6 +2984,19 @@ mod device_tests {
             .unwrap();
         }
 
+        drive(
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                actor: Actor {
+                    node_id: node(1),
+                    user_id: admin,
+                    realm_id,
+                },
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+
         let state = Arc::new(
             ServerState::new(
                 driver_ctx,
@@ -2938,6 +3013,7 @@ mod device_tests {
             state,
             owner,
             other,
+            admin,
             _dir: dir,
         }
     }
@@ -3074,5 +3150,85 @@ mod device_tests {
                 .iter()
                 .any(|device| device.id == node(3).to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn admin_evicts_device() {
+        // A realm admin reaches a device it does not own, and the owner path is
+        // left as it was for every other device.
+        let fixture = setup_devices().await;
+
+        let status = evict_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.admin))),
+            Path(node(2).to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            devices(&fixture.state, fixture.owner)
+                .await
+                .iter()
+                .all(|device| device.id != node(2).to_string())
+        );
+
+        let status = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.other))),
+            Path(node(3).to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn refuses_non_admin() {
+        // Owning a device is not administering the realm: the admin route
+        // refuses a plain member and an anonymous caller, and the device stays.
+        let fixture = setup_devices().await;
+
+        assert!(matches!(
+            evict_device(
+                State(fixture.state.clone()),
+                Extension(Some(auth(fixture.owner))),
+                Path(node(2).to_string()),
+            )
+            .await,
+            Err(ServerError::Forbidden)
+        ));
+        assert!(matches!(
+            evict_device(
+                State(fixture.state.clone()),
+                Extension(None),
+                Path(node(2).to_string()),
+            )
+            .await,
+            Err(ServerError::Unauthorized)
+        ));
+        assert!(
+            devices(&fixture.state, fixture.owner)
+                .await
+                .iter()
+                .any(|device| device.id == node(2).to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_spares_management() {
+        // The route reaches enrolled devices only, so the realm's own management
+        // node is not removable through it.
+        let fixture = setup_devices().await;
+
+        assert!(matches!(
+            evict_device(
+                State(fixture.state.clone()),
+                Extension(Some(auth(fixture.admin))),
+                Path(node(1).to_string()),
+            )
+            .await,
+            Err(ServerError::NotFound)
+        ));
     }
 }

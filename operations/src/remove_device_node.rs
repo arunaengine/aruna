@@ -1,8 +1,10 @@
-//! Owner-driven eviction of an enrolled device.
+//! Eviction of an enrolled device.
 //!
 //! Membership is replicated realm state, so the eviction travels as an ordinary
-//! realm-config administrative event: only a management node may originate one,
-//! and only the owner the configuration binds the device to may ask for it.
+//! realm-config administrative event: only a management node may originate one.
+//! Who may ask is the scope: an owner reaches only the devices the configuration
+//! binds to them, a realm admin reaches every enrolled device but never an
+//! infrastructure node.
 
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
@@ -32,11 +34,21 @@ use crate::ensure_realm_config::overlay_realm_config_reducer_materialization;
 use crate::mutate_realm_placement::is_management;
 use crate::placement::placement_ref_for_target;
 
+/// Which devices the caller may reach. The admin path is authorized on the
+/// realm's onboarding admin path before the operation runs, so here it only
+/// widens the ownership test; it never reaches an infrastructure node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceEvictionScope {
+    Owner,
+    RealmAdmin,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoveDeviceNodeConfig {
-    /// Acting node and the calling user; the user must own the device.
+    /// Acting node and the calling user.
     pub actor: Actor,
     pub node_id: NodeId,
+    pub scope: DeviceEvictionScope,
 }
 
 #[derive(Debug, PartialEq)]
@@ -155,10 +167,16 @@ impl RemoveDeviceNodeOperation {
             return Err(RemoveDeviceNodeError::NotManagementNode);
         }
         // Ownership is realm state: an infrastructure node is never a device,
-        // and another user's device is not this caller's to evict.
+        // and another user's device is not an owner's to evict.
         let node_id = self.config.node_id.to_string();
         if !document.nodes.iter().any(|node| {
-            node.node_id == node_id && node.kind.owner() == Some(self.config.actor.user_id)
+            node.node_id == node_id
+                && match self.config.scope {
+                    DeviceEvictionScope::Owner => {
+                        node.kind.owner() == Some(self.config.actor.user_id)
+                    }
+                    DeviceEvictionScope::RealmAdmin => node.kind.owner().is_some(),
+                }
         }) {
             return Err(RemoveDeviceNodeError::DeviceNotFound {
                 node_id: self.config.node_id,
@@ -445,10 +463,11 @@ mod tests {
         document
     }
 
-    fn removal(actor: &Actor) -> RemoveDeviceNodeConfig {
+    fn removal(actor: &Actor, scope: DeviceEvictionScope) -> RemoveDeviceNodeConfig {
         RemoveDeviceNodeConfig {
             actor: actor.clone(),
             node_id: node(2),
+            scope,
         }
     }
 
@@ -467,9 +486,12 @@ mod tests {
         )
         .await;
 
-        let stored = drive(RemoveDeviceNodeOperation::new(removal(&actor)), &ctx)
-            .await
-            .expect("device removal applies");
+        let stored = drive(
+            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            &ctx,
+        )
+        .await
+        .expect("device removal applies");
         let device = node(2).to_string();
         assert!(stored.nodes.iter().all(|node| node.node_id != device));
 
@@ -489,9 +511,73 @@ mod tests {
         let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
         seed(&ctx, &actor, &realm_with_device(realm_id, &actor, other)).await;
 
-        let error = drive(RemoveDeviceNodeOperation::new(removal(&actor)), &ctx)
+        let error = drive(
+            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            &ctx,
+        )
+        .await
+        .expect_err("a foreign device is refused");
+        assert!(matches!(
+            error,
+            RemoveDeviceNodeError::DeviceNotFound { .. }
+        ));
+
+        let reread = drive(GetRealmConfigOperation::new(realm_id), &ctx)
             .await
-            .expect_err("a foreign device is refused");
+            .expect("config reads");
+        assert_eq!(reread.nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn admin_evicts_foreign() {
+        // A realm admin reaches a device it does not own, and the owner path is
+        // still refused for the same device.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let actor = actor(realm_id);
+        let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        seed(&ctx, &actor, &realm_with_device(realm_id, &actor, other)).await;
+
+        assert!(matches!(
+            drive(
+                RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+                &ctx,
+            )
+            .await,
+            Err(RemoveDeviceNodeError::DeviceNotFound { .. })
+        ));
+
+        let stored = drive(
+            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::RealmAdmin)),
+            &ctx,
+        )
+        .await
+        .expect("an admin evicts any device");
+        let device = node(2).to_string();
+        assert!(stored.nodes.iter().all(|node| node.node_id != device));
+    }
+
+    #[tokio::test]
+    async fn admin_spares_infrastructure() {
+        // The admin scope widens ownership, not membership: a server node is not
+        // a device and stays in the configuration.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let actor = actor(realm_id);
+        let mut document = realm_with_device(realm_id, &actor, actor.user_id);
+        document.nodes.clear();
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        document.ensure_node(node(2), RealmNodeKind::Server);
+        seed(&ctx, &actor, &document).await;
+
+        let error = drive(
+            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::RealmAdmin)),
+            &ctx,
+        )
+        .await
+        .expect_err("a server node is not a device");
         assert!(matches!(
             error,
             RemoveDeviceNodeError::DeviceNotFound { .. }
@@ -522,9 +608,12 @@ mod tests {
         );
         seed(&ctx, &actor, &document).await;
 
-        let error = drive(RemoveDeviceNodeOperation::new(removal(&actor)), &ctx)
-            .await
-            .expect_err("a server node is refused");
+        let error = drive(
+            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            &ctx,
+        )
+        .await
+        .expect_err("a server node is refused");
         assert_eq!(error, RemoveDeviceNodeError::NotManagementNode);
     }
 }

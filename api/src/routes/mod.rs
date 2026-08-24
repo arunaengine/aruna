@@ -125,6 +125,7 @@ mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("DELETE", "/admin/devices/{node_id}"),
         ("DELETE", "/admin/onboarding/secrets/{id}"),
         ("DELETE", "/admin/sync-quarantine"),
         ("DELETE", "/data/sync-relationships/{id}"),
