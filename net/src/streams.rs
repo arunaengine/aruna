@@ -84,6 +84,12 @@ impl InboundAdmission {
         *self.local_kind.write() = local;
     }
 
+    /// Shared handle for subsystems outside the accept loop that apply the same
+    /// node-kind boundary.
+    pub(crate) fn peer_kinds(&self) -> PeerKinds {
+        self.peer_kinds.clone()
+    }
+
     fn allows_peer(&self, peer: NodeId) -> bool {
         if self.realm_peers.read().contains(&peer) || self.admitted_peers.read().contains(&peer) {
             return true;

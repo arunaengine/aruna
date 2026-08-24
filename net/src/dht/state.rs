@@ -27,6 +27,7 @@ use super::storage::{
     DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, entry_is_fresh, merge_entry,
     retained_entries, retention_deadline,
 };
+use crate::streams::PeerKinds;
 
 const MIN_TTL_SECS: u64 = 1;
 
@@ -58,6 +59,7 @@ pub struct DhtStateMachine {
     peer_epoch: u64,
     current_tick: u64,
     now_secs: u64,
+    peer_kinds: PeerKinds,
 }
 
 impl std::fmt::Debug for DhtStateMachine {
@@ -293,7 +295,24 @@ impl DhtStateMachine {
             peer_epoch: 0,
             current_tick: 0,
             now_secs: start_unix_secs,
+            peer_kinds: PeerKinds::default(),
         }
+    }
+
+    /// Shares the realm-config kind table so the DHT applies the same node-kind
+    /// boundary as the accept loop.
+    pub(crate) fn set_peer_kinds(&mut self, peer_kinds: PeerKinds) {
+        self.peer_kinds = peer_kinds;
+    }
+
+    /// Whether a peer may hold realm state: user devices read the DHT but never
+    /// enter a routing table and never store a value. An unregistered key keeps
+    /// today's behaviour; connection admission bounds it.
+    fn peer_is_eligible(&self, node_id: NodeId) -> bool {
+        self.peer_kinds
+            .read()
+            .get(&node_id)
+            .is_none_or(|kind| kind.is_sync_eligible())
     }
 
     #[tracing::instrument(
@@ -1553,6 +1572,19 @@ impl DhtStateMachine {
                 publisher,
                 signature,
             } => {
+                // A user device is DHT read-only: it never publishes presence
+                // and never stores realm state on anyone's behalf.
+                if !self.peer_is_eligible(peer) || !self.peer_is_eligible(publisher) {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "Node kind may not store DHT values".to_string(),
+                        },
+                    })));
+                    return;
+                }
+
                 let Some(signature) = signature else {
                     out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                         inbound_id,
@@ -1946,7 +1978,7 @@ impl DhtStateMachine {
         fields(node_id = %node_id)
     )]
     fn insert_peer(&mut self, node_id: NodeId, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if node_id == self.local_id {
+        if node_id == self.local_id || !self.peer_is_eligible(node_id) {
             return;
         }
 
@@ -2465,9 +2497,22 @@ fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::RealmNodeKind;
+    use aruna_core::types::UserId;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn make_node(seed: u8) -> NodeId {
         make_secret(seed).public()
+    }
+
+    fn user_kinds(peer: NodeId) -> PeerKinds {
+        Arc::new(parking_lot::RwLock::new(BTreeMap::from([(
+            peer,
+            RealmNodeKind::User {
+                owner: UserId::nil(make_realm(1)),
+            },
+        )])))
     }
 
     fn make_secret(seed: u8) -> iroh::SecretKey {
@@ -5276,6 +5321,124 @@ mod tests {
                 } if req_key == key),
                 _ => false,
             }
+        }));
+        assert_eq!(state.routing_table.all_peers().len(), 1);
+    }
+
+    #[test]
+    fn refuses_user_put() {
+        // A user device is DHT read-only: its own signed record is refused and
+        // the attempt never puts it in the routing table.
+        let local_secret = make_secret(58);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 0);
+        let device_secret = make_secret(59);
+        let device = device_secret.public();
+        state.set_peer_kinds(user_kinds(device));
+
+        let key = DhtKeyId::from_data(b"refuses-user-put");
+        let realm_id = make_realm(1);
+        let value = b"presence".to_vec();
+        let expires_at: u64 = 45;
+        let revision = 1;
+        let signed_data =
+            signed_record_bytes(&key, &device, &realm_id, &value, expires_at, revision);
+        let signature = device_secret.sign(&signed_data);
+
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 41,
+            peer: device,
+            request: DhtRequest::PutValue {
+                key,
+                realm_id,
+                value,
+                expires_at,
+                revision,
+                publisher: device,
+                signature: Some(signature),
+            },
+            trace_context: None,
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcResponse {
+                        inbound_id: 41,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            ..
+                        }
+                    }
+                ),
+                _ => false,
+            }
+        }));
+        assert!(!effects.iter().any(|effect| {
+            match effect {
+                DhtEffect::IoRequest(inner) => {
+                    matches!(**inner, DhtIoRequest::StorageMerge { .. })
+                }
+                _ => false,
+            }
+        }));
+        assert!(state.routing_table.all_peers().is_empty());
+    }
+
+    #[test]
+    fn user_reads_unrouted() {
+        // Discovery reads stay open for a device; only routing membership and
+        // publication are closed.
+        let local_secret = make_secret(60);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 0);
+        let device = make_node(61);
+        state.set_peer_kinds(user_kinds(device));
+
+        let pong = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 42,
+            peer: device,
+            request: DhtRequest::Ping,
+            trace_context: None,
+        }));
+        assert!(pong.iter().any(|effect| {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcResponse {
+                        inbound_id: 42,
+                        response: DhtResponse::Pong
+                    }
+                ),
+                _ => false,
+            }
+        }));
+
+        let read = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 43,
+            peer: device,
+            request: DhtRequest::GetValue {
+                key: DhtKeyId::from_data(b"user-reads-unrouted"),
+                realm_filter: None,
+            },
+            trace_context: None,
+        }));
+        assert!(read.iter().any(|effect| {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::StorageRead {
+                        stage: StorageStage::InboundGetRead,
+                        ..
+                    }
+                ),
+                _ => false,
+            }
+        }));
+        assert!(state.routing_table.all_peers().is_empty());
+
+        // A sync-eligible peer still joins through the same path.
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: make_node(62),
         }));
         assert_eq!(state.routing_table.all_peers().len(), 1);
     }

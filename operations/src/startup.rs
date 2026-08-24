@@ -721,6 +721,17 @@ async fn presence_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
+    // A user device reads the DHT to locate realm nodes but never announces
+    // itself as one; without a presence record nothing routes work to it.
+    if let RealmConfigLoad::Found(realm_config) = load_realm_config(context, config.realm_id).await
+        && !sync_eligible_node(&realm_config, config.node_id)
+    {
+        *pending = false;
+        return PhaseOutcome {
+            progress: true,
+            error: None,
+        };
+    }
     let result = crate::driver::drive(
         crate::announce_realm_presence::AnnounceRealmPresenceOperation::new(
             crate::announce_realm_presence::AnnounceRealmPresenceConfig {
@@ -1627,6 +1638,8 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
+    use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
     use aruna_core::structs::{
         Actor, PlacementOverride, PlacementStrategy, RealmNode, RealmNodeKind,
     };
@@ -2114,6 +2127,62 @@ mod tests {
     async fn stop_node(node: RecoveryNode) {
         let _ = node.task_handle.shutdown(RECOVERY_RETRY_MAX).await;
         node.net.shutdown().await;
+    }
+
+    async fn presence_values(node: &RecoveryNode, realm_id: RealmId) -> Vec<DhtEntry> {
+        let event = node
+            .net
+            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+                key: aruna_core::keys::realm_presence_key(&realm_id),
+                realm_filter: Some(realm_id),
+                options: DhtGetOptions::exhaustive(RECOVERY_TEST_GUARD),
+            })))
+            .await;
+        match event {
+            Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => values,
+            _ => Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_skips_presence() {
+        // A User-kind node completes the presence phase without publishing; the
+        // same node publishes once the realm config makes it a Server.
+        let realm_id = RealmId([31u8; 32]);
+        let device = make_node(realm_id, 31).await;
+        let recovery = RecoveryConfig {
+            realm_id,
+            node_id: device.net.node_id(),
+            publish_full_usage: false,
+        };
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        config.ensure_node(
+            device.net.node_id(),
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+        save_config(&device, &config).await;
+
+        let mut pending = true;
+        let outcome = presence_phase(&device.context, &recovery, &mut pending).await;
+        assert!(outcome.progress);
+        assert!(outcome.error.is_none());
+        assert!(!pending);
+        assert!(presence_values(&device, realm_id).await.is_empty());
+
+        let mut promoted = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        promoted.ensure_node(device.net.node_id(), RealmNodeKind::Server);
+        save_config(&device, &promoted).await;
+
+        let mut pending = true;
+        let outcome = presence_phase(&device.context, &recovery, &mut pending).await;
+        assert!(outcome.progress);
+        assert!(!pending);
+        assert!(!presence_values(&device, realm_id).await.is_empty());
+
+        stop_node(device).await;
     }
 
     #[tokio::test]

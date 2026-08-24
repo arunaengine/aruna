@@ -19,6 +19,7 @@ use super::state::DhtStateMachine;
 use super::storage::DhtClock;
 use crate::connection_pool::ConnectionPool;
 use crate::error::{NetError, Result};
+use crate::streams::PeerKinds;
 use crate::telemetry::{current_trace_context, duration_ms};
 
 #[derive(Debug)]
@@ -52,6 +53,7 @@ impl DhtHandle {
         endpoint: Endpoint,
         storage: StorageHandle,
         connection_pool: ConnectionPool,
+        peer_kinds: PeerKinds,
         shutdown: CancellationToken,
     ) -> Result<(Self, DhtSpawnResources)> {
         let local_id = endpoint.id();
@@ -62,7 +64,8 @@ impl DhtHandle {
             mpsc::bounded_blocking_async(INBOUND_STREAM_CAPACITY);
 
         let clock = DhtClock::new();
-        let state = DhtStateMachine::new(local_id, secret_key, clock.current_secs());
+        let mut state = DhtStateMachine::new(local_id, secret_key, clock.current_secs());
+        state.set_peer_kinds(peer_kinds);
         let driver = DhtDriver::with_clock(
             state,
             clock,

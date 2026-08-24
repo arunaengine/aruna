@@ -610,6 +610,7 @@ impl NetHandle {
             endpoint.clone(),
             storage.clone(),
             connection_pool.clone(),
+            inbound_admission.peer_kinds(),
             shutdown.child_token(),
         )?;
         let dht = Arc::new(dht_handle);
