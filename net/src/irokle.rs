@@ -17939,6 +17939,9 @@ mod tests {
                     name: name.to_string(),
                 },
             );
+            // Neither service is the origin here, so each relays the origin's
+            // own signature instead of substituting its own.
+            let origin_signature = sign_as_origin(&event, &placement);
             assert!(matches!(
                 service
                     .publish_documents(
@@ -17947,7 +17950,7 @@ mod tests {
                             event: Box::new(event),
                             placement,
                             allow_genesis: true,
-                            origin_signature: None,
+                            origin_signature: Some(origin_signature),
                         }],
                         Vec::new(),
                     )
@@ -20441,11 +20444,14 @@ mod tests {
             )],
         );
         let digest_bytes = digest.to_bytes().expect("digest serializes");
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(1_560, 1), realm_id),
+        // The local node originates the hostile op, so it clears the origin
+        // binding and is skipped for the reason under test: a realm-config
+        // operation has no business on a watch-interest target.
+        let actor = Actor {
+            node_id: local_node,
+            user_id: UserId::local(Ulid::from_parts(1_560, 1), realm_id),
             realm_id,
-        );
+        };
         let admin_event = test_admin_event(
             Ulid::from_parts(1_561, 1),
             AdminDocumentTarget::RealmConfig { realm_id },

@@ -3685,7 +3685,8 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        let origin = node(4);
+        // The local node is the origin: it can only publish envelopes it signs.
+        let origin = net.node_id();
         let blocked_target = DocumentSyncTarget::Group {
             group_id: Ulid::from_parts(11, 1),
         };
