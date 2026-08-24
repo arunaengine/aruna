@@ -31,7 +31,7 @@ use aruna_operations::device::wipe::{
     WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_operations::metadata::profile_validation::preview_submission;
 
 #[derive(OpenApi)]
@@ -157,7 +157,14 @@ async fn require_owner(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| match error {
+        // A device that enrolled but has not received the configuration yet
+        // cannot resolve its owner; that resolves on its own.
+        GetRealmConfigError::DocumentNotFound => ServerError::ServiceUnavailableReason(
+            "the realm configuration has not reached this device yet".to_string(),
+        ),
+        other => ServerError::InternalError(other.to_string()),
+    })?;
     let node_id = state.get_node_id().to_string();
     let owner = config
         .nodes
@@ -230,7 +237,8 @@ fn rocrate_jsonld(rocrate: &Value) -> ServerResult<String> {
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 409, description = "The device already holds the maximum number of queued drafts", body = ErrorResponse)
+        (status = 409, description = "The device already holds the maximum number of queued drafts", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -294,7 +302,8 @@ async fn queue_draft(
             })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
-        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse)
+        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -338,7 +347,8 @@ async fn list_drafts(
         (status = 400, description = "The draft id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
-        (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse)
+        (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -380,7 +390,8 @@ async fn get_draft(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
-        (status = 409, description = "A forward for this draft is in flight", body = ErrorResponse)
+        (status = 409, description = "A forward for this draft is in flight", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -431,7 +442,8 @@ async fn delete_draft(
         (status = 400, description = "The payload is not a JSON-LD object", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
-        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse)
+        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -496,7 +508,8 @@ pub struct WipeDeviceResponse {
         (status = 400, description = "The confirmation does not name this node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
-        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse)
+        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
