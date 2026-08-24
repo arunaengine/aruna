@@ -3758,7 +3758,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_rejects_zero_cap() {
+    async fn rejects_zero_cap() {
+        // A zero device quota is refused by the route, not silently stored.
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = AuthContext {
             user_id: admin,

@@ -5122,7 +5122,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_node_kinds_round_trip() {
+    fn node_kinds_roundtrip() {
         // The materialized attribute value is the only carrier of the owner a
         // User node is bound to, so decode must return it unchanged.
         let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id());

@@ -486,7 +486,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cap_is_per_owner() {
+    async fn cap_per_owner() {
+        // Another owner's enrolled device does not charge this owner's cap.
         let owner = UserId::local(Ulid::generate(), realm());
         let other = UserId::local(Ulid::generate(), realm());
         let (_dir, context) = context_with_cap(Some(1), &[other]).await;
@@ -565,7 +566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_secret_skips_cap() {
+    async fn server_skips_cap() {
         // An infrastructure secret is never charged against a device cap.
         let owner = UserId::local(Ulid::generate(), realm());
         let (_dir, context) = context_with_cap(Some(1), &[owner]).await;

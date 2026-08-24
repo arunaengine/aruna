@@ -1349,7 +1349,7 @@ impl DocumentSyncService {
                 } => {
                     let origin_signature = match origin_signature {
                         Some(signature) => signature,
-                        None => match self.sign_own_admin_event(&event, &placement) {
+                        None => match self.sign_admin_event(&event, &placement) {
                             Ok(signature) => signature,
                             Err(error) => {
                                 // Retained, never counted as published: deleting
@@ -1439,7 +1439,7 @@ impl DocumentSyncService {
     /// Signs an admin envelope this node originated. A record carrying another
     /// origin must arrive already signed: re-signing here would substitute the
     /// relay's identity for the origin's.
-    fn sign_own_admin_event(
+    fn sign_admin_event(
         &self,
         event: &AdminDocumentEvent,
         placement: &PlacementRef,

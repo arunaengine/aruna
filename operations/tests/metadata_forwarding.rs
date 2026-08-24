@@ -176,7 +176,7 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn user_forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
+async fn forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
     // A device never originates a realm administrative event: the ingress it
     // forwards to creates the group as itself, with the device owner as actor,
     // and the group converges to every sync-eligible node.

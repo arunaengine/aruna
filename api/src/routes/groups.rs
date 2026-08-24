@@ -2093,7 +2093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_create_needs_token() {
+    async fn create_needs_token() {
         // Forwarding carries the caller's own token; without one the device
         // must refuse rather than act under its node identity.
         let (state, admin, _tempdir) = setup_admin_state().await;

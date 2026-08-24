@@ -2078,7 +2078,7 @@ pub(crate) async fn apply_group_create(
     let Some(config) = load_realm_config(context, realm_id).await else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
-    if !node_is_sync_eligible(&config, net_handle.node_id()) {
+    if !is_sync_eligible(&config, net_handle.node_id()) {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     }
     let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
@@ -2203,10 +2203,10 @@ pub(crate) fn admit_relayed_admin(
     placement: &PlacementRef,
     origin_signature: &iroh::Signature,
 ) -> RelayAdmission {
-    if !node_is_sync_eligible(config, peer) {
+    if !is_sync_eligible(config, peer) {
         return RelayAdmission::Forbidden;
     }
-    if !node_is_sync_eligible(config, event.origin_node_id) {
+    if !is_sync_eligible(config, event.origin_node_id) {
         return RelayAdmission::Reject("relayed admin event origin may not publish".to_string());
     }
     if event.actor.realm_id != config.realm_id || event.origin_node_id != event.actor.node_id {
@@ -2293,14 +2293,14 @@ pub(crate) async fn apply_admin_relay(
     MetadataTransportMessage::ForwardedAdminEventQueued
 }
 
-fn node_is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
     configured_kind(config, node_id).is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
 /// A User peer is owner-bound: it may forward only for the owner its realm
 /// config names, whatever token it managed to present. Other kinds are not
 /// owner-bound, so any authenticated caller may travel through them (D12).
-fn peer_may_act_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
+fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
     match configured_kind(config, peer).and_then(RealmNodeKind::owner) {
         Some(owner) => owner == user_id,
         None => true,
@@ -2732,7 +2732,7 @@ pub(crate) async fn authorize_forwarded_caller(
             "forwarded metadata write needs the realm configuration".to_string(),
         ));
     };
-    if !peer_may_act_for(&config, peer, auth.user_id) {
+    if !peer_acts_for(&config, peer, auth.user_id) {
         return Err(ForwardAuthError::Forbidden);
     }
     Ok(auth)
@@ -3111,7 +3111,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_rejects_device_origin() {
+    fn rejects_device_origin() {
+        // A relayed admin event originated by a device may never be published.
         let (config, placement, holder) = relay_fixture();
         let (event, signature) = signed_event(&config, &placement, 9);
 
@@ -3123,7 +3124,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_rejects_device_peer() {
+    fn rejects_device_peer() {
+        // A device is not a relay: it may not hand an admin event to a holder.
         let (config, placement, holder) = relay_fixture();
         let (event, signature) = signed_event(&config, &placement, 1);
 
@@ -3134,7 +3136,7 @@ mod tests {
     }
 
     #[test]
-    fn non_holder_defers_relay() {
+    fn nonholder_defers_relay() {
         // Another holder can still take it, so this is unavailable, not a reject.
         let (config, placement, holder) = relay_fixture();
         let (event, signature) = signed_event(&config, &placement, 1);
@@ -3153,15 +3155,15 @@ mod tests {
     }
 
     #[test]
-    fn device_peer_binds_owner() {
+    fn peer_binds_owner() {
         // A device may forward only for the owner its realm config names.
         let (config, _, _) = relay_fixture();
         let owner = UserId::nil(config.realm_id);
         let other = UserId::local(Ulid::from_bytes([8u8; 16]), config.realm_id);
 
-        assert!(peer_may_act_for(&config, node(9), owner));
-        assert!(!peer_may_act_for(&config, node(9), other));
-        assert!(peer_may_act_for(&config, node(1), other));
+        assert!(peer_acts_for(&config, node(9), owner));
+        assert!(!peer_acts_for(&config, node(9), other));
+        assert!(peer_acts_for(&config, node(1), other));
     }
 
     #[test]

@@ -622,7 +622,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_zero_device_cap() {
+    async fn rejects_zero_cap() {
+        // A zero `max_devices_per_user` would enroll nobody; unset means no cap.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);

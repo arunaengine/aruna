@@ -567,7 +567,9 @@ mod tests {
     }
 
     #[test]
-    fn origin_signature_binds_envelope() {
+    fn signature_binds_envelope() {
+        // The origin's signature covers the placement, actor and origin, so a
+        // relay cannot move or rewrite the envelope it republishes.
         use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
         use crate::structs::{Actor, PlacementRef};
 
