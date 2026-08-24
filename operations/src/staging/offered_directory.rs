@@ -510,7 +510,7 @@ mod tests {
     use super::*;
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
     use crate::staging::test_utils::setup_driver_context;
-    use futures::StreamExt;
+    use futures_util::StreamExt;
 
     fn input(bucket: &str, root: &str) -> OfferDirectoryInput {
         let realm_id = RealmId::from_bytes([7u8; 32]);

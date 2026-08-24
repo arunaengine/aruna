@@ -48,7 +48,7 @@ pub fn weak_fingerprint(size: u64, modified: Option<SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RealmId;
+    use crate::structs::RealmId;
     use std::time::Duration;
 
     fn record() -> OfferedDirectory {
@@ -57,7 +57,7 @@ mod tests {
             group_id: Ulid::from_bytes([3u8; 16]),
             root: "/home/owner/photos".to_string(),
             created_at: UNIX_EPOCH + Duration::from_secs(10),
-            created_by: UserId::new(Ulid::from_bytes([4u8; 16]), RealmId::from_bytes([5u8; 16])),
+            created_by: UserId::new(Ulid::from_bytes([4u8; 16]), RealmId::from_bytes([5u8; 32])),
         }
     }
 
