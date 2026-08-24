@@ -4960,6 +4960,10 @@ fn overlay_realm_config_reducer_materialization(
         }
     }
 
+    for node_id in reducer_state.removed_config_nodes() {
+        remove_realm_config_node(config, &node_id);
+    }
+
     for (node_id, kind) in reducer_state.materialized_realm_config_nodes() {
         let path = realm_config_node_path(&node_id);
         if reducer_state.conflicts.contains_key(&path) {
@@ -6389,6 +6393,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     if !matches!(
         &event.op,
         AdminDocumentOperation::RealmConfigNodeEnsured { .. }
+            | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
             | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
             | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
             | AdminDocumentOperation::RealmConfigSettingsSet { .. }
@@ -6420,7 +6425,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, and token revocations"
+            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, and token revocations"
                 .to_string(),
         ));
     }
@@ -8271,6 +8276,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::UserSubjectIdAdded { .. }
         | AdminDocumentOperation::UserSubjectIdRemoved { .. } => AdminOperationFamily::User,
         AdminDocumentOperation::RealmConfigNodeEnsured { .. }
+        | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
         | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
         | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
         | AdminDocumentOperation::RealmConfigSettingsSet { .. }
@@ -8404,6 +8410,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::UserSubjectIdAdded { .. }
         | AdminDocumentOperation::UserSubjectIdRemoved { .. }
         | AdminDocumentOperation::RealmConfigNodeEnsured { .. }
+        | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
         | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
         | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
         | AdminDocumentOperation::RealmConfigSettingsSet { .. }
@@ -11132,6 +11139,45 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn removal_needs_management() {
+        // Eviction is an ordinary realm-config admin event, so admission keeps
+        // it to Management origins whoever relayed it.
+        let realm_id = RealmId::from_bytes([62u8; 32]);
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(node(1), RealmNodeKind::Management);
+        config.ensure_node(node(2), RealmNodeKind::Server);
+        let device = node(3);
+        config.ensure_node(
+            device,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+
+        let removal = |seed: u8| {
+            let actor = test_actor(seed, UserId::nil(realm_id), realm_id);
+            test_admin_event(
+                Ulid::from_parts(1_710, seed as u128),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigNodeRemoved { node_id: device },
+            )
+        };
+
+        assert!(matches!(
+            validate_config_authority(Some(&config), &removal(1), None),
+            Ok(AdminEventValidation::Accepted)
+        ));
+        for origin in [2, 3] {
+            assert!(matches!(
+                validate_config_authority(Some(&config), &removal(origin), None),
+                Ok(AdminEventValidation::Rejected(_))
+            ));
+        }
+    }
+
     async fn apply_conflicting_user_name_and_attribute(
         storage: &StorageHandle,
         user_id: UserId,
@@ -13213,6 +13259,75 @@ mod tests {
             realm_config_oidc_providers(&config),
             BTreeMap::from([("default".to_string(), provider)])
         );
+    }
+
+    #[tokio::test]
+    async fn drops_evicted_node() {
+        // Removal must reach the stored document: an evicted device otherwise
+        // stays an admitted peer wherever that document is read.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([53; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_460, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let device = node(31);
+
+        for (seq, op) in [
+            (
+                1,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: device,
+                    kind: RealmNodeKind::User {
+                        owner: actor.user_id,
+                    },
+                },
+            ),
+            (
+                2,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(31, "https://eviction.example:443"),
+                },
+            ),
+        ] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(1_460 + seq, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    op,
+                ),
+            )
+            .await
+            .expect("device enrollment applies");
+        }
+        assert!(
+            realm_config_nodes(&read_realm_config_doc(&storage, realm_id).await)
+                .contains_key(&device.to_string())
+        );
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(1_463, 1),
+                target,
+                &actor,
+                3,
+                AdminDocumentOperation::RealmConfigNodeRemoved { node_id: device },
+            ),
+        )
+        .await
+        .expect("device removal applies");
+
+        assert!(realm_config_nodes(&read_realm_config_doc(&storage, realm_id).await).is_empty());
     }
 
     #[tokio::test]

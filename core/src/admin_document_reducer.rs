@@ -986,6 +986,9 @@ impl AdminDocumentReducerState {
         if event.target != self.target {
             return Err(AdminDocumentReducerError::TargetMismatch);
         }
+        // Dropped by event id alone: a second event reusing an applied id never
+        // overwrites the first, so an equivocating origin gains nothing here.
+        // Keeping the evidence is admission's job, not the reducer's.
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminDocumentApplyStatus::Duplicate);
         }
@@ -1124,7 +1127,13 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
             ) => {
-                self.apply_realm_config_node(event, node_id, kind);
+                self.apply_realm_config_node(event, node_id, Some(realm_node_kind_value(kind)));
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigNodeRemoved { node_id },
+            ) => {
+                self.apply_realm_config_node(event, node_id, None);
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
@@ -1718,6 +1727,20 @@ impl AdminDocumentReducerState {
                     .and_then(realm_node_kind_from_value)?;
                 Some((node_id, kind))
             })
+            .collect()
+    }
+
+    /// Nodes whose membership path reduced to no value. The overlays need them
+    /// because a stored configuration still carries the earlier membership.
+    pub fn removed_config_nodes(&self) -> BTreeSet<NodeId> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeSet::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter(|(_, version)| version.value.is_none())
+            .filter_map(|(path, _)| realm_config_node_id_from_path(path))
             .collect()
     }
 
@@ -2480,12 +2503,12 @@ impl AdminDocumentReducerState {
         &mut self,
         event: &AdminDocumentEvent,
         node_id: &NodeId,
-        kind: &RealmNodeKind,
+        value: Option<String>,
     ) {
         let path = realm_config_node_path(node_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
-        match self.reduce_value(event, &path, current, Some(realm_node_kind_value(kind))) {
+        match self.reduce_value(event, &path, current, value) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -2841,7 +2864,8 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
             vec![realm_role_user_assignment_path(role_id, user_id)]
         }
-        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, .. } => {
+        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, .. }
+        | AdminDocumentOperation::RealmConfigNodeRemoved { node_id } => {
             vec![realm_config_node_path(node_id)]
         }
         AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
@@ -5005,6 +5029,39 @@ mod tests {
                     .any(|value| value.value.as_deref() == Some(encoded.as_str()))
             );
         }
+    }
+
+    #[test]
+    fn removes_config_node() {
+        // Ensured then removed: the node leaves the materialization and is
+        // reported as removed, which is what the overlays subtract.
+        let mut state = realm_config_state();
+        let config_node = node(11);
+        let origin = node(1);
+        let ensured = ensure_realm_config_node(
+            1,
+            1,
+            config_node,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id()),
+            },
+        );
+        let removed = realm_config_event(
+            2,
+            origin,
+            2,
+            AdminDocumentClock::default().with_observed(origin, 1),
+            AdminDocumentOperation::RealmConfigNodeRemoved {
+                node_id: config_node,
+            },
+        );
+
+        state.apply(&ensured).unwrap();
+        state.apply(&removed).unwrap();
+
+        assert!(state.materialized_realm_config_nodes().is_empty());
+        assert_eq!(state.removed_config_nodes(), BTreeSet::from([config_node]));
+        assert!(state.conflicts.is_empty());
     }
 
     #[test]

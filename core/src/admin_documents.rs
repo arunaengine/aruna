@@ -282,6 +282,12 @@ pub enum AdminDocumentOperation {
     RealmConfigComputeSet {
         compute: RealmComputeConfig,
     },
+    /// Drops a node from realm membership. The node keeps its keys but stops
+    /// being an admitted peer wherever the configuration replicates, so an
+    /// evicted device loses its connections at the next membership refresh.
+    RealmConfigNodeRemoved {
+        node_id: NodeId,
+    },
 }
 
 #[cfg(test)]
@@ -402,6 +408,7 @@ mod tests {
                 node_id: node(1),
                 kind: RealmNodeKind::Management,
             },
+            AdminDocumentOperation::RealmConfigNodeRemoved { node_id: node(1) },
             AdminDocumentOperation::RealmConfigOidcProviderUpserted {
                 provider: oidc_provider("default"),
             },

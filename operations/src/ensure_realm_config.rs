@@ -661,6 +661,10 @@ pub(crate) fn overlay_realm_config_reducer_materialization(
         }
     }
 
+    for node_id in reducer_state.removed_config_nodes() {
+        remove_realm_config_node(config, &node_id);
+    }
+
     for (node_id, kind) in reducer_state.materialized_realm_config_nodes() {
         let path = realm_config_node_path(&node_id);
         if reducer_state.conflicts.contains_key(&path) {
@@ -1286,6 +1290,51 @@ mod tests {
         assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
         assert_eq!(config.strategy_bindings, vec![binding]);
         assert_eq!(config.placement_overrides, vec![record]);
+    }
+
+    #[test]
+    fn drops_removed_node() {
+        // The stored document still carries a membership the reducer dropped,
+        // so the overlay has to subtract it again.
+        let realm_id = RealmId::from_bytes([24; 32]);
+        let actor = actor(24, realm_id);
+        let device = node(9);
+        let mut state =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        state
+            .apply_operation(
+                &actor,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: device,
+                    kind: RealmNodeKind::User {
+                        owner: UserId::nil(realm_id),
+                    },
+                },
+            )
+            .unwrap();
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
+        assert!(
+            config
+                .nodes
+                .iter()
+                .any(|node| node.node_id == device.to_string())
+        );
+
+        state
+            .apply_operation(
+                &actor,
+                AdminDocumentOperation::RealmConfigNodeRemoved { node_id: device },
+            )
+            .unwrap();
+        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
+        assert!(
+            config
+                .nodes
+                .iter()
+                .all(|node| node.node_id != device.to_string())
+        );
     }
 
     #[test]
