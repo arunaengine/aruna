@@ -112,7 +112,8 @@ pub struct BootstrapOnboardingRequestDoc {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct BootstrapOnboardingResponseDoc {
     pub realm_id: String,
-    pub mode: String,
+    /// `"Management"`, `"Server"`, or the device form that carries its owner.
+    pub mode: serde_json::Value,
     pub temporary_bootstrap_endpoint: BootstrapEndpointDoc,
     pub wrapped_realm_private_key: Option<String>,
     pub wrapped_realm_private_key_nonce: Option<String>,
@@ -657,8 +658,10 @@ only a management node serves this route.
   `Management` secret requires `transport_public_key` and returns the realm private key encrypted
   to it, along with the nonce and the ephemeral public key needed to open it.
 - A `User` secret needs neither: a device holds no realm key and no issuer delegation, and joins as
-  an owner-bound member that never becomes a sync, holder or placement target. Its `mode` echoes
-  the owner the secret was bound to at mint time.
+  an owner-bound member that never becomes a sync, holder or placement target.
+- `mode` echoes what the secret was minted for, so a joiner can cross-check it against its own
+  copy. It reads `"Management"` or `"Server"` for the infrastructure modes, and for a device it is
+  the object `{"User": {"owner": ...}}` carrying the owner the secret was bound to.
 - The response always carries the realm id, the temporary endpoint to dial, a one-time sync ticket
   the joiner uses to fetch the realm's core documents, and `realm_endpoints`.
 - `realm_endpoints` carries the realm's declared static discovery endpoints, kept only for nodes
