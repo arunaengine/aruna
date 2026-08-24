@@ -80,6 +80,7 @@ pub struct Config {
     pub ops_socket_addr: SocketAddr,
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
+    pub desktop_cors: bool,
     pub portal_csp_extra_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
     pub max_concurrent_uni_streams: Option<u64>,
@@ -369,6 +370,7 @@ pub struct Settings {
     pub ops_socket_addr: SocketAddr,
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
+    pub desktop_cors: bool,
     pub portal_csp_extra_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
     pub additional_relay_urls: Vec<String>,
@@ -492,6 +494,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .transpose()?
         .unwrap_or(aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE);
     let cors_allowed_origins = parse_list_env("CORS_ALLOWED_ORIGINS");
+    let desktop_cors = desktop_cors_env();
     let portal_csp_extra_origins = parse_list_env("PORTAL_CSP_EXTRA_ORIGINS");
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
@@ -572,6 +575,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         ops_socket_addr,
         max_http_body_size,
         cors_allowed_origins,
+        desktop_cors,
         portal_csp_extra_origins,
         p2p_socket_addr,
         additional_relay_urls,
@@ -622,6 +626,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         ops_socket_addr,
         max_http_body_size,
         cors_allowed_origins,
+        desktop_cors,
         portal_csp_extra_origins,
         p2p_socket_addr,
         additional_relay_urls,
@@ -757,6 +762,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
             ops_socket_addr,
             max_http_body_size,
             cors_allowed_origins,
+            desktop_cors,
             portal_csp_extra_origins,
             p2p_socket_addr,
             max_concurrent_uni_streams,
@@ -1054,6 +1060,18 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+/// `DESKTOP_CORS` opts out of the always-on desktop origin admission.
+fn desktop_cors_env() -> bool {
+    !matches!(
+        dotenvy::var("DESKTOP_CORS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "false" | "0" | "no"
+    )
 }
 
 /// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`

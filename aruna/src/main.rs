@@ -624,7 +624,8 @@ async fn bind_servers(
     let state = Arc::new(state);
     portal::initialize(config.portal.clone(), state.clone()).await;
 
-    let cors = CorsConfig::new(config.cors_allowed_origins.clone());
+    let cors =
+        CorsConfig::new(config.cors_allowed_origins.clone()).with_desktop(config.desktop_cors);
     let server_config = ServerConfig {
         http_addr: config.http_socket_addr,
         max_http_body_size: config.max_http_body_size,
