@@ -1175,7 +1175,12 @@ mod tests {
         let mut config =
             aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
-        config.ensure_node(user, aruna_core::structs::RealmNodeKind::User);
+        config.ensure_node(
+            user,
+            aruna_core::structs::RealmNodeKind::User {
+                owner: aruna_core::UserId::nil(realm_id),
+            },
+        );
         let actor = aruna_core::structs::Actor {
             node_id: server,
             user_id: aruna_core::UserId::nil(realm_id),

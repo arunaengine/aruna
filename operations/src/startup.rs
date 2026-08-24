@@ -1670,7 +1670,12 @@ mod tests {
         ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         let (user, minter, follower) = (ids[0], ids[1], ids[2]);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
-        config.ensure_node(user, RealmNodeKind::User);
+        config.ensure_node(
+            user,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
         config.ensure_node(minter, RealmNodeKind::Server);
         config.ensure_node(follower, RealmNodeKind::Server);
 
@@ -1870,7 +1875,12 @@ mod tests {
         assert_rebind(&base, &rename, false);
 
         let mut add_user = base.clone();
-        add_user.ensure_node(node(4), RealmNodeKind::User);
+        add_user.ensure_node(
+            node(4),
+            RealmNodeKind::User {
+                owner: UserId::nil(RealmId([7; 32])),
+            },
+        );
         assert_rebind(&base, &add_user, false);
     }
 
@@ -2559,7 +2569,8 @@ mod tests {
         let management = node(2);
         let server = node(3);
         let user = node(5);
-        let mut config = RealmConfigDocument::default_for_realm(RealmId([9; 32]), Vec::new());
+        let realm_id = RealmId([9; 32]);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.nodes = vec![
             RealmNode {
                 node_id: self_id.to_string(),
@@ -2571,7 +2582,9 @@ mod tests {
             },
             RealmNode {
                 node_id: user.to_string(),
-                kind: RealmNodeKind::User,
+                kind: RealmNodeKind::User {
+                    owner: UserId::nil(realm_id),
+                },
             },
             RealmNode {
                 node_id: "malformed-eligible-id".to_string(),

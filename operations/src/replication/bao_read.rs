@@ -1608,7 +1608,12 @@ mod tests {
         let local_node = node_from_seed(1);
         let peer = node_from_seed(2);
         let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
-        config.ensure_node(peer, RealmNodeKind::User);
+        config.ensure_node(
+            peer,
+            RealmNodeKind::User {
+                owner: UserId::nil(test_realm()),
+            },
+        );
         let mut operation = IncomingBaoReadOperation::new(
             peer,
             local_node,

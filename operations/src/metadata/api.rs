@@ -7602,9 +7602,15 @@ mod tests {
         let server = iroh::SecretKey::from_bytes(&[24u8; 32]).public();
         let user = iroh::SecretKey::from_bytes(&[25u8; 32]).public();
         let unknown = iroh::SecretKey::from_bytes(&[26u8; 32]).public();
-        let mut config = RealmConfigDocument::new(RealmId([4u8; 32]), Vec::new(), 2);
-        config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
-        config.ensure_node(user, aruna_core::structs::RealmNodeKind::User);
+        let realm_id = RealmId([4u8; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.ensure_node(server, RealmNodeKind::Server);
+        config.ensure_node(
+            user,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
 
         let nodes = authorized_realm_nodes(&config, HashSet::from([server, user, unknown]))
             .expect("valid node ids");

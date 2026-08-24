@@ -878,7 +878,7 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
         match value {
             RealmNodeKind::Management => Self::Management,
             RealmNodeKind::Server => Self::Server,
-            RealmNodeKind::User => Self::User,
+            RealmNodeKind::User { .. } => Self::User,
         }
     }
 }

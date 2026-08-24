@@ -444,6 +444,12 @@ mod tests {
         iroh::SecretKey::from_bytes(&bytes).public()
     }
 
+    fn device() -> RealmNodeKind {
+        RealmNodeKind::User {
+            owner: UserId::nil(RealmId::from_bytes([1u8; 32])),
+        }
+    }
+
     fn resolved(seed: u8, kind: RealmNodeKind, location: &str, weight: u32) -> ResolvedNode {
         ResolvedNode {
             node_id: node_id(seed),
@@ -711,7 +717,7 @@ mod tests {
     fn zero_weight_and_user_kind_never_selected() {
         let nodes = vec![
             resolved(1, RealmNodeKind::Server, "x", 0),
-            resolved(2, RealmNodeKind::User, "x", 100),
+            resolved(2, device(), "x", 100),
             resolved(3, RealmNodeKind::Server, "x", 100),
         ];
         let view = PlacementView { nodes };
@@ -849,7 +855,7 @@ mod tests {
         let view = PlacementView {
             nodes: vec![
                 resolved(1, RealmNodeKind::Server, "a", 100),
-                resolved(2, RealmNodeKind::User, "a", 100),
+                resolved(2, device(), "a", 100),
                 resolved(3, RealmNodeKind::Server, "b", 100),
                 full,
                 resolved(5, RealmNodeKind::Server, "c", 100),
@@ -1323,7 +1329,7 @@ mod tests {
                 .map(|(index, &(location, weight, is_user))| ResolvedNode {
                     node_id: node_id((index as u8) + 1),
                     kind: if is_user {
-                        RealmNodeKind::User
+                        device()
                     } else {
                         RealmNodeKind::Server
                     },

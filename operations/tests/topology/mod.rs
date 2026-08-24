@@ -161,7 +161,7 @@ impl Topology {
             let kind = if index < management {
                 RealmNodeKind::Management
             } else {
-                RealmNodeKind::User
+                RealmNodeKind::User { owner: user_id }
             };
             nodes.push(spawn_node(realm_id, kind).await?);
         }

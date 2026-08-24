@@ -2295,9 +2295,14 @@ mod tests {
         document
             .placement_transitions
             .push(PlacementTransition::new(plan.clone()));
-        document.ensure_node(node(5), RealmNodeKind::User);
-        document.ensure_node(node(6), RealmNodeKind::Management);
         let realm_id = document.realm_id;
+        document.ensure_node(
+            node(5),
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+        document.ensure_node(node(6), RealmNodeKind::Management);
 
         for mutation in [
             RealmPlacementMutation::PublishCandidateMap(document.freeze_map(3)),

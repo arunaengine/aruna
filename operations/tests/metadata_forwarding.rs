@@ -904,7 +904,9 @@ async fn install_realm_config(
         let kind = if node.sync_eligible {
             RealmNodeKind::Management
         } else {
-            RealmNodeKind::User
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            }
         };
         config.ensure_node(node.net.node_id(), kind);
         config.seed_job_control(node.net.node_id(), band as u32);

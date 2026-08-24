@@ -335,17 +335,29 @@ pub struct RealmNode {
 pub enum RealmNodeKind {
     Management,
     Server,
-    /// Owner-bound user device (laptop). Never a sync/holder target.
-    User,
+    /// Owner-bound user device (laptop). Never a sync/holder target. The owner
+    /// is fixed at enrollment and is a security input: every User-node decision
+    /// reads it from here, never from a label or a self-authored descriptor.
+    User {
+        owner: UserId,
+    },
 }
 
 impl RealmNodeKind {
     /// Whether nodes of this kind carry shared realm responsibilities: holder
     /// and placement membership, sync publication and relay, administrative
     /// event origination, routing and distributed-query targeting. A User node
-    /// has none of them.
+    /// has none of them, whoever owns it.
     pub fn is_sync_eligible(&self) -> bool {
-        !matches!(self, RealmNodeKind::User)
+        !matches!(self, RealmNodeKind::User { .. })
+    }
+
+    /// Owner of a User-kind device; `None` for infrastructure nodes.
+    pub fn owner(&self) -> Option<UserId> {
+        match self {
+            RealmNodeKind::User { owner } => Some(*owner),
+            RealmNodeKind::Management | RealmNodeKind::Server => None,
+        }
     }
 
     /// Value of the derived, read-only kind label placement views carry.
@@ -353,7 +365,7 @@ impl RealmNodeKind {
         match self {
             RealmNodeKind::Management => "management",
             RealmNodeKind::Server => "server",
-            RealmNodeKind::User => "user",
+            RealmNodeKind::User { .. } => "user",
         }
     }
 }
@@ -1103,6 +1115,7 @@ mod test {
         RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
         RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
     };
+    use crate::types::UserId;
     use ulid::Ulid;
 
     use super::JobFamilyError;
@@ -1807,12 +1820,15 @@ mod test {
 
         let server = node_id(1);
         let user_device = node_id(2);
-        let mut document = RealmConfigDocument::new(RealmId::from_bytes([9u8; 32]), Vec::new(), 3);
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let owner = UserId::nil(realm_id);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.ensure_node(server, RealmNodeKind::Server);
-        document.ensure_node(user_device, RealmNodeKind::User);
+        document.ensure_node(user_device, RealmNodeKind::User { owner });
 
         assert_eq!(document.node_ids().unwrap(), vec![server, user_device]);
         assert_eq!(document.sync_eligible_node_ids().unwrap(), vec![server]);
+        assert_eq!(document.nodes[1].kind.owner(), Some(owner));
     }
 
     #[test]

@@ -3240,12 +3240,7 @@ fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
 }
 
 fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
-    match kind {
-        RealmNodeKind::Management => "management",
-        RealmNodeKind::Server => "server",
-        RealmNodeKind::User => "user",
-    }
-    .to_string()
+    serde_json::to_string(kind).expect("realm node kind serializes")
 }
 
 pub fn group_role_id_from_path(path: &str) -> Option<RoleId> {
@@ -3455,12 +3450,7 @@ fn parse_band_pool(value: &str) -> Option<BandPool> {
 }
 
 fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
-    match value {
-        "management" => Some(RealmNodeKind::Management),
-        "server" => Some(RealmNodeKind::Server),
-        "user" => Some(RealmNodeKind::User),
-        _ => None,
-    }
+    serde_json::from_str(value).ok()
 }
 
 #[cfg(test)]
@@ -3480,9 +3470,10 @@ mod tests {
         realm_config_placement_node_id_from_path, realm_config_placement_node_path,
         realm_config_placement_strategy_id_from_path, realm_config_placement_strategy_path,
         realm_config_strategy_binding_path, realm_config_strategy_binding_scope_key_from_path,
-        realm_discovery_value, realm_role_id_from_path, realm_role_path,
-        realm_role_user_assignment_from_path, realm_role_user_assignment_path,
-        role_definition_value, user_attribute_path, user_subject_id_path,
+        realm_discovery_value, realm_node_kind_from_value, realm_node_kind_value,
+        realm_role_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
+        realm_role_user_assignment_path, role_definition_value, user_attribute_path,
+        user_subject_id_path,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
@@ -5006,18 +4997,15 @@ mod tests {
             .get(&format!("realm_config.nodes.{config_node}"))
             .expect("conflict is recorded");
         assert_eq!(conflict.values.len(), 2);
-        assert!(
-            conflict
-                .values
-                .iter()
-                .any(|value| value.value.as_deref() == Some("management"))
-        );
-        assert!(
-            conflict
-                .values
-                .iter()
-                .any(|value| value.value.as_deref() == Some("server"))
-        );
+        for kind in [RealmNodeKind::Management, RealmNodeKind::Server] {
+            let encoded = realm_node_kind_value(&kind);
+            assert!(
+                conflict
+                    .values
+                    .iter()
+                    .any(|value| value.value.as_deref() == Some(encoded.as_str()))
+            );
+        }
     }
 
     #[test]
@@ -5055,7 +5043,9 @@ mod tests {
                 .with_observed(second_origin, 1),
             AdminDocumentOperation::RealmConfigNodeEnsured {
                 node_id: config_node,
-                kind: RealmNodeKind::User,
+                kind: RealmNodeKind::User {
+                    owner: UserId::nil(realm_id()),
+                },
             },
         );
 
@@ -5065,9 +5055,33 @@ mod tests {
 
         assert_eq!(
             state.materialized_realm_config_nodes(),
-            BTreeMap::from([(config_node, RealmNodeKind::User)])
+            BTreeMap::from([(
+                config_node,
+                RealmNodeKind::User {
+                    owner: UserId::nil(realm_id()),
+                }
+            )])
         );
         assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn realm_node_kinds_round_trip() {
+        // The materialized attribute value is the only carrier of the owner a
+        // User node is bound to, so decode must return it unchanged.
+        let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id());
+        for kind in [
+            RealmNodeKind::Management,
+            RealmNodeKind::Server,
+            RealmNodeKind::User { owner },
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id()),
+            },
+        ] {
+            let encoded = realm_node_kind_value(&kind);
+            assert_eq!(realm_node_kind_from_value(&encoded), Some(kind));
+        }
+        assert_eq!(realm_node_kind_from_value("not-a-kind"), None);
     }
 
     #[test]

@@ -17,7 +17,6 @@ use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
     Actor, AuthContext, JobId, MetadataRegistryRecord, MintPersistentIdSpec, Permission,
     PersistentIdFailure, PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId,
-    RealmNodeKind,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -148,7 +147,7 @@ pub async fn is_user_origin(
         .into_iter()
         .find(|node| node.node_id == local_node_id.to_string())
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    Ok(node.kind == RealmNodeKind::User)
+    Ok(!node.kind.is_sync_eligible())
 }
 
 pub async fn forward_token_revoke(
@@ -2712,7 +2711,8 @@ mod tests {
         // `metadata_forwarding::user_node_forwards_create`, which needs a real
         // node and a real token and so cannot live here.
         let (mut config, placement) = config_and_placement();
-        config.ensure_node(node(9), RealmNodeKind::User);
+        let owner = UserId::nil(config.realm_id);
+        config.ensure_node(node(9), RealmNodeKind::User { owner });
 
         assert!(matches!(
             write_route(Some(&config), &placement, node(9)),

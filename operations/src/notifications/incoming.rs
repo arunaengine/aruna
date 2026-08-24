@@ -1385,7 +1385,12 @@ mod tests {
             realm_id,
             &[
                 (b.net.node_id(), RealmNodeKind::Server),
-                (c.net.node_id(), RealmNodeKind::User),
+                (
+                    c.net.node_id(),
+                    RealmNodeKind::User {
+                        owner: UserId::nil(realm_id),
+                    },
+                ),
             ],
         )
         .await;
@@ -2502,7 +2507,12 @@ mod tests {
             realm_id,
             &[
                 (b.net.node_id(), RealmNodeKind::Server),
-                (c.net.node_id(), RealmNodeKind::User),
+                (
+                    c.net.node_id(),
+                    RealmNodeKind::User {
+                        owner: UserId::nil(realm_id),
+                    },
+                ),
             ],
         )
         .await;
@@ -2590,7 +2600,12 @@ mod tests {
             realm_id,
             &[
                 (b.net.node_id(), RealmNodeKind::Server),
-                (c.net.node_id(), RealmNodeKind::User),
+                (
+                    c.net.node_id(),
+                    RealmNodeKind::User {
+                        owner: UserId::nil(realm_id),
+                    },
+                ),
             ],
         )
         .await;

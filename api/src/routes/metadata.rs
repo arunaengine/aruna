@@ -6417,7 +6417,9 @@ mod tests {
         config.seed_default_placement();
         for (band, node) in nodes.iter().enumerate() {
             let kind = if Some(node.net.node_id()) == user_node {
-                RealmNodeKind::User
+                RealmNodeKind::User {
+                    owner: aruna_core::types::UserId::nil(realm_id),
+                }
             } else {
                 RealmNodeKind::Server
             };

@@ -519,7 +519,9 @@ fn excludes_user_nodes() {
     // controller is out regardless of what it advertises.
     let plan_request = request(Vec::new());
     let mut user = candidate(node(3), "docker");
-    user.node_kind = RealmNodeKind::User;
+    user.node_kind = RealmNodeKind::User {
+        owner: crate::UserId::nil(crate::structs::RealmId::from_bytes([1u8; 32])),
+    };
     let mut inactive = candidate(node(4), "docker");
     inactive.active = false;
     let mut unauthorized = candidate(node(5), "docker");

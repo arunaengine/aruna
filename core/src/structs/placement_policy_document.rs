@@ -393,7 +393,12 @@ mod tests {
         config.seed_default_placement();
         config.ensure_node(node(1), RealmNodeKind::Server);
         config.ensure_node(node(2), RealmNodeKind::Server);
-        config.ensure_node(node(3), RealmNodeKind::User);
+        config.ensure_node(
+            node(3),
+            RealmNodeKind::User {
+                owner: UserId::nil(realm()),
+            },
+        );
         config
     }
 

@@ -10894,7 +10894,12 @@ mod tests {
         for (seed, kind) in [
             (1u8, RealmNodeKind::Server),
             (2, RealmNodeKind::Server),
-            (3, RealmNodeKind::User),
+            (
+                3,
+                RealmNodeKind::User {
+                    owner: UserId::nil(realm_id),
+                },
+            ),
             (4, RealmNodeKind::Server),
         ] {
             config.ensure_node(node(seed), kind);
@@ -12091,7 +12096,12 @@ mod tests {
             } if id == realm_id
         ));
 
-        config.ensure_node(attacker.node_id, RealmNodeKind::User);
+        config.ensure_node(
+            attacker.node_id,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
         let long_event = test_admin_event(
             Ulid::from_parts(1_654, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
@@ -12313,7 +12323,9 @@ mod tests {
             1,
             AdminDocumentOperation::RealmConfigNodeEnsured {
                 node_id: origin.node_id,
-                kind: RealmNodeKind::User,
+                kind: RealmNodeKind::User {
+                    owner: UserId::nil(realm_id),
+                },
             },
         );
         let mut state = AdminDocumentReducerState::new(target.clone());
