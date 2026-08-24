@@ -76,6 +76,10 @@ pub enum BaoReadError {
     /// transition, so nothing governed may land here.
     #[error("this node is not a legal destination for governed data")]
     NoDestination,
+    /// A User node is never a governed destination, so policy-covered content
+    /// cannot be read here at all. Terminal and honest: retrying cannot help.
+    #[error("governed content is not available on a user node")]
+    GovernedUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,6 +315,9 @@ pub async fn managed_read(
     node_id: NodeId,
     mut request: BaoReadRequest,
 ) -> Result<BaoReadOutput, BaoReadError> {
+    if local_is_user(context, request.realm_id).await {
+        return device_read(context, node_id, request).await;
+    }
     // An admission stop is not decided here: `write_gate` below refuses once
     // the source has taught the refs that make this read a governed one.
     let destination = match gate_context(context, request.realm_id, now_ms()).await {
@@ -339,6 +346,56 @@ pub async fn managed_read(
         taught = refs;
     }
     Err(BaoReadError::PolicyRequired { refs: taught })
+}
+
+/// One attempt with no destination at all. A device never admits governed data,
+/// so the challenge has no answer it could give: teaching it rules would only
+/// dress a refusal up as a negotiation.
+async fn device_read(
+    context: &DriverContext,
+    node_id: NodeId,
+    mut request: BaoReadRequest,
+) -> Result<BaoReadOutput, BaoReadError> {
+    request.destination = None;
+    device_answer(drive(BaoReadOperation::new(node_id, request), context).await)
+}
+
+/// Every placement answer is terminal here: a device can neither resolve a rule
+/// nor become a destination, so a retry would only repeat the same refusal.
+fn device_answer(
+    result: Result<BaoReadOutput, BaoReadError>,
+) -> Result<BaoReadOutput, BaoReadError> {
+    match result {
+        Err(BaoReadError::PolicyRequired { .. })
+        | Err(BaoReadError::PolicyDenied { .. })
+        | Err(BaoReadError::NoDestination)
+        | Err(BaoReadError::Gate(_)) => Err(BaoReadError::GovernedUnavailable),
+        other => other,
+    }
+}
+
+/// Whether this realm records the local node as an owner-bound User node.
+pub(crate) async fn local_is_user(context: &DriverContext, realm_id: RealmId) -> bool {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return false;
+    };
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = event
+    else {
+        return false;
+    };
+    RealmConfigDocument::from_bytes(&value).is_ok_and(|document| {
+        node_kind(&document, net_handle.node_id()).is_some_and(|kind| kind.owner().is_some())
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1653,6 +1710,34 @@ mod tests {
             VersionReplicationMessage::from_bytes(payload).unwrap(),
             VersionReplicationMessage::PlacementPolicyDenied { .. }
         ));
+    }
+
+    // A device gets one honest, terminal answer for governed content instead of
+    // a negotiation it can never finish.
+    #[test]
+    fn device_answer_is_terminal() {
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(31u128),
+            digest: [5u8; 32],
+        };
+        for error in [
+            BaoReadError::PolicyRequired {
+                refs: vec![policy_ref],
+            },
+            BaoReadError::PolicyDenied {
+                policy_ids: vec![policy_ref.policy_id],
+            },
+            BaoReadError::NoDestination,
+        ] {
+            assert_eq!(
+                super::device_answer(Err(error)),
+                Err(BaoReadError::GovernedUnavailable)
+            );
+        }
+        assert_eq!(
+            super::device_answer(Err(BaoReadError::Refused(BaoReadRefusal::NotFound))),
+            Err(BaoReadError::Refused(BaoReadRefusal::NotFound))
+        );
     }
 
     #[test]

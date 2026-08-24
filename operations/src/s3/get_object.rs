@@ -2,10 +2,13 @@ use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::blob::managed_copy::{
     CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
 };
+use crate::blob_holders::GetBlobHoldersOperation;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
-use crate::replication::protocol::ReferenceAdvance;
+use crate::driver::{DriverContext, drive};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
+use crate::replication::protocol::{BaoReadRequest, BaoReadTarget, ReferenceAdvance};
 use crate::replication::queue::{
     LiveReplicationObligationRecord, QueueLiveVersionReplicationInput,
     QueueLiveVersionReplicationOperation, live_obligation_entry,
@@ -119,6 +122,17 @@ pub enum GetObjectError {
     ManagedCopyError(#[from] ManagedCopyError),
     #[error(transparent)]
     PolicyError(#[from] PlacementPolicyError),
+    /// The version is known here but its bytes are not. On an infrastructure
+    /// node that is a fault; on a device it is the ordinary case, and the read
+    /// continues against the realm's holders.
+    #[error("The object bytes are not stored on this node.")]
+    BlobNotLocal {
+        blake3: [u8; 32],
+        version_id: Option<Ulid>,
+        metadata: HashMap<String, String>,
+    },
+    #[error("Governed content is not available on a user node.")]
+    GovernedUnavailable,
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
 }
@@ -244,6 +258,9 @@ pub struct GetObjectOperation {
     composite_hashes: HashMap<String, Vec<u8>>,
     part_count: Option<usize>,
     resolved_range: Option<ResolvedObjectRange>,
+    /// Hash of the location this read is waiting on, so a local miss can name
+    /// the blob a routed read would have to fetch.
+    missing_blake3: Option<[u8; 32]>,
     /// Held while a governed version's local registration is verified.
     pending_location: Option<BlobLocationKey>,
     pending_copy: Option<ManagedCopyKey>,
@@ -282,6 +299,7 @@ impl GetObjectOperation {
             composite_hashes: HashMap::new(),
             part_count: None,
             resolved_range: None,
+            missing_blake3: None,
             pending_location: None,
             pending_copy: None,
             source_policies: Vec::new(),
@@ -491,6 +509,7 @@ impl GetObjectOperation {
     }
 
     fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
+        self.missing_blake3 = Some(key.blake3_hash);
         self.state = GetObjectState::GetBlobLocation;
         smallvec![blob_location_read(&key, self.txn_id)]
     }
@@ -558,7 +577,14 @@ impl GetObjectOperation {
         };
 
         let Some(value) = value else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
+            return match self.missing_blake3 {
+                Some(blake3) => self.emit_error(GetObjectError::BlobNotLocal {
+                    blake3,
+                    version_id: self.resolved_version_id,
+                    metadata: self.metadata.clone(),
+                }),
+                None => self.emit_error(GetObjectError::GetObjectFailed),
+            };
         };
 
         let location = match BackendLocation::from_bytes(value.as_ref()) {
@@ -1263,6 +1289,107 @@ impl Operation for GetObjectOperation {
     }
 }
 
+/// Reads an object, continuing against the realm's holders when this node holds
+/// the version record but not its bytes. Only a User node routes: on an
+/// infrastructure node a missing local blob is a fault, not a miss. A ranged
+/// request is not routed, because a bao read serves whole blobs.
+pub async fn get_object_routed(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+) -> Result<Option<Result<GetObjectResult, GetObjectError>>, GetObjectError> {
+    let ranged = input.range.is_some();
+    let user_id = input.user_identity;
+    let operation = GetObjectOperation::new(input).with_restrictions(restrictions);
+    let result = drive(operation, context).await;
+    let Ok(Some(Err(GetObjectError::BlobNotLocal {
+        blake3,
+        version_id,
+        metadata,
+    }))) = result
+    else {
+        return result;
+    };
+    if ranged || !local_is_user(context, user_id.realm_id).await {
+        return Ok(Some(Err(GetObjectError::GetObjectFailed)));
+    }
+    Ok(Some(
+        routed_blob(context, user_id, blake3, version_id, metadata).await,
+    ))
+}
+
+async fn routed_blob(
+    context: &DriverContext,
+    user_id: UserId,
+    blake3: [u8; 32],
+    version_id: Option<Ulid>,
+    metadata: HashMap<String, String>,
+) -> Result<GetObjectResult, GetObjectError> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(GetObjectError::GetObjectFailed)?;
+    let realm_id = user_id.realm_id;
+    let holders = drive(
+        GetBlobHoldersOperation::new(blake3, realm_id, net_handle.node_id()),
+        context,
+    )
+    .await
+    .map_err(|_| GetObjectError::GetObjectFailed)?;
+
+    let mut governed = false;
+    for holder in holders {
+        let request = BaoReadRequest {
+            auth_context: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            realm_id,
+            target: BaoReadTarget::Blake3(blake3),
+            expected_blake3: Some(blake3),
+            metadata_only: false,
+            destination: None,
+            known_refs: Vec::new(),
+        };
+        match managed_read(context, holder, request).await {
+            Ok(BaoReadOutput::Stream { blob, .. }) => {
+                return Ok(routed_result(blob, version_id, metadata));
+            }
+            Ok(BaoReadOutput::Metadata { .. }) => continue,
+            Err(BaoReadError::GovernedUnavailable) => governed = true,
+            Err(_) => continue,
+        }
+    }
+    Err(match governed {
+        true => GetObjectError::GovernedUnavailable,
+        false => GetObjectError::NoSuchKey,
+    })
+}
+
+fn routed_result(
+    blob: BackendStream<Result<Bytes, StreamError>>,
+    version_id: Option<Ulid>,
+    metadata: HashMap<String, String>,
+) -> GetObjectResult {
+    GetObjectResult {
+        blob,
+        location: None,
+        metadata,
+        source_metadata: None,
+        source_binding: None,
+        last_refresh: None,
+        version_created_at: None,
+        version_id,
+        resolved_version_id: version_id,
+        checksum_type: MultipartChecksumType::FullObject,
+        composite_hashes: HashMap::new(),
+        part_count: None,
+        resolved_range: None,
+        source_policies: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
@@ -1322,6 +1449,47 @@ mod test {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}", addr)
+    }
+
+    // A version this node knows without its bytes must name the blob a routed
+    // read would fetch, not read as a corrupt local record.
+    #[test]
+    fn reports_missing_blob() {
+        let blake3 = [9u8; 32];
+        let version_id = Ulid::generate();
+        let mut operation = GetObjectOperation::new(GetObjectInput {
+            bucket: "bucket".to_string(),
+            key: "file.txt".to_string(),
+            version_id: Some(version_id),
+            range: None,
+            group_id: Ulid::generate(),
+            user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            node_id: test_node_id(),
+        });
+        operation.txn_id = Some(Ulid::generate());
+        let version = BlobVersion::materialized(
+            blake3,
+            BackendRef::node_default(),
+            SystemTime::UNIX_EPOCH,
+            operation.input.user_identity,
+            None,
+        )
+        .with_metadata(HashMap::from([("k".to_string(), "v".to_string())]));
+        operation.read_version(version_id, version, true);
+
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: None,
+        }));
+
+        assert!(matches!(
+            operation.output,
+            Some(Err(GetObjectError::BlobNotLocal {
+                blake3: hash,
+                version_id: Some(seen),
+                ..
+            })) if hash == blake3 && seen == version_id
+        ));
     }
 
     #[test]

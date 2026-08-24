@@ -67,7 +67,7 @@ use aruna_operations::s3::delete_objects::{
 };
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{
-    GetObjectInput as GOI, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
+    GetObjectInput as GOI, GetObjectResult, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::get_object_attributes::{
     GetObjectAttributesInput as GOAI, GetObjectAttributesOperation,
@@ -2292,7 +2292,7 @@ impl S3 for ArunaS3Service {
 
         let range_request = requested_range.map(object_range_request);
 
-        let operation = GetObjectOperation::new(GOI {
+        let input = GOI {
             bucket,
             key,
             version_id,
@@ -2303,10 +2303,11 @@ impl S3 for ArunaS3Service {
                 .unwrap_or(user_access.group_id),
             user_identity: user_access.user_identity,
             node_id: self.node_id,
-        })
-        .with_restrictions(user_access.path_restrictions.clone());
+        };
 
-        let result = drive(operation, &self.state)
+        // A device holds version records without their bytes, so a local miss
+        // continues against the realm's holders instead of failing here.
+        let result = get_object_routed(&self.state, input, user_access.path_restrictions.clone())
             .await
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
