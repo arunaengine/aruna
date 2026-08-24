@@ -340,6 +340,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "users.rs",
+        "list_user_devices",
+        "self-scoped: realm-config nodes and enrollments filtered to the owner \
+         carried by the caller's credential",
+    ),
+    (
+        "users.rs",
         "patch_user_info",
         "self-scoped: updates only the caller's own user record",
     ),
@@ -347,6 +353,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "users.rs",
         "register_user",
         "public OIDC registration, the admin variant needs an onboarding secret",
+    ),
+    (
+        "users.rs",
+        "revoke_user_device",
+        "self-scoped: RemoveDeviceNodeOperation re-checks that the node is a \
+         User device owned by the caller",
     ),
 ];
 
