@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod connection_pool;
+pub mod device_limits;
 pub mod dht;
 #[path = "irokle.rs"]
 pub mod document_sync;
@@ -702,6 +703,7 @@ impl NetHandle {
         let inbound_handler_for_streams = inbound_handler.clone();
         let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
         let inbound_tasks_for_streams = inbound_tasks.clone();
+        let admission_for_streams = inbound_admission.clone();
         let stream_task = tokio::spawn(async move {
             while let Some((alpn, stream, peer_id)) = stream_rx.recv().await {
                 if let Err(err) = dht_for_streams.add_peer(peer_id) {
@@ -721,8 +723,24 @@ impl NetHandle {
                         );
                         continue;
                     };
+                    // A user device is bounded by the realm's published limits
+                    // rather than by responsibilities it does not carry; the
+                    // slot it takes is held for the whole handler.
+                    let device_permit = match admission_for_streams.admit_stream(peer_id) {
+                        Ok(permit) => permit,
+                        Err(refusal) => {
+                            warn!(
+                                node_id = %peer_id,
+                                alpn = %alpn,
+                                refusal = ?refusal,
+                                "Dropping inbound stream: device is over its realm limit"
+                            );
+                            continue;
+                        }
+                    };
                     inbound_tasks_for_streams.spawn(async move {
                         let _permit = permit;
+                        let _device_permit = device_permit;
                         handler.handle_incoming_stream(alpn, stream, peer_id).await;
                     });
                 } else {
@@ -1170,6 +1188,14 @@ impl NetHandle {
         self.inner
             .inbound_admission
             .set_kinds(local_kind, peer_kinds);
+        // Device limits are keyed by the kinds just published, so they follow the
+        // same refresh rather than a second source of truth.
+        self.inner
+            .inbound_admission
+            .set_device_limits(device_limits::DeviceLimits {
+                requests_per_minute: document.quota.device_requests_per_minute,
+                concurrent: document.quota.device_concurrent_pulls,
+            });
         // Connection admission covers every registered realm node, User kind
         // included: user nodes forward metadata and job-control requests.
         let admitted = unique_peer_nodes(

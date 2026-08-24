@@ -5338,11 +5338,14 @@ mod tests {
 
     #[test]
     fn keeps_device_cap() {
-        // The device cap materializes like any other quota field.
+        // The device cap and the per-device limits materialize like any other
+        // quota field.
         let mut state = realm_config_state();
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(1_000),
             max_devices_per_user: Some(6),
+            device_requests_per_minute: Some(120),
+            device_concurrent_pulls: Some(4),
             ..QuotaConfig::default()
         };
         let expected = quota.clone();
@@ -5415,6 +5418,7 @@ mod tests {
                 },
             ],
             max_devices_per_user: Some(6),
+            ..QuotaConfig::default()
         };
         let reordered = QuotaConfig {
             group_overrides: expected.group_overrides.iter().cloned().rev().collect(),

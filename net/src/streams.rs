@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 
 use crate::connection_pool::{ConnectionLease, ConnectionPool};
+use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
 use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
 use crate::telemetry::{
@@ -42,6 +43,7 @@ pub struct InboundAdmission {
     bootstrap_peers: Arc<RwLock<BTreeSet<NodeId>>>,
     peer_kinds: PeerKinds,
     local_kind: Arc<RwLock<Option<RealmNodeKind>>>,
+    device_limiter: Arc<DeviceLimiter>,
     realm_config_materialized: Arc<AtomicBool>,
     materialized_signal: watch::Sender<bool>,
     membership_signal: watch::Sender<u64>,
@@ -60,6 +62,7 @@ impl InboundAdmission {
             bootstrap_peers: Arc::new(RwLock::new(bootstrap_peers.into_iter().collect())),
             peer_kinds: Arc::new(RwLock::new(BTreeMap::new())),
             local_kind: Arc::new(RwLock::new(None)),
+            device_limiter: Arc::new(DeviceLimiter::default()),
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
             materialized_signal,
             membership_signal,
@@ -88,6 +91,30 @@ impl InboundAdmission {
     /// node-kind boundary.
     pub(crate) fn peer_kinds(&self) -> PeerKinds {
         self.peer_kinds.clone()
+    }
+
+    /// Publishes the realm's per-device limits, which come from the same config
+    /// refresh as the kinds they are keyed by.
+    pub(crate) fn set_device_limits(&self, limits: DeviceLimits) {
+        self.device_limiter.configure(limits);
+    }
+
+    /// Charges one inbound stream from a user device against its configured
+    /// budget. A realm node is never charged: its volume is bounded by the
+    /// responsibilities its kind carries.
+    pub(crate) fn admit_stream(
+        &self,
+        peer: NodeId,
+    ) -> std::result::Result<Option<DevicePermit>, DeviceRefusal> {
+        if self
+            .peer_kinds
+            .read()
+            .get(&peer)
+            .is_none_or(RealmNodeKind::is_sync_eligible)
+        {
+            return Ok(None);
+        }
+        self.device_limiter.admit(peer).map(Some)
     }
 
     fn allows_peer(&self, peer: NodeId) -> bool {

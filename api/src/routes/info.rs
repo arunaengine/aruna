@@ -320,6 +320,8 @@ pub struct RealmQuotaConfig {
     pub max_groups_per_user: Option<u32>,
     pub user_group_cap_overrides: Vec<RealmUserGroupCapOverride>,
     pub max_devices_per_user: Option<u32>,
+    pub device_requests_per_minute: Option<u32>,
+    pub device_concurrent_pulls: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -360,6 +362,8 @@ impl From<QuotaConfig> for RealmQuotaConfig {
                 })
                 .collect(),
             max_devices_per_user: quota.max_devices_per_user,
+            device_requests_per_minute: quota.device_requests_per_minute,
+            device_concurrent_pulls: quota.device_concurrent_pulls,
         }
     }
 }
@@ -405,6 +409,8 @@ impl RealmQuotaConfig {
             max_groups_per_user: self.max_groups_per_user,
             user_group_cap_overrides,
             max_devices_per_user: self.max_devices_per_user,
+            device_requests_per_minute: self.device_requests_per_minute,
+            device_concurrent_pulls: self.device_concurrent_pulls,
         })
     }
 }
@@ -1002,7 +1008,9 @@ token of another realm or one this node cannot validate, the response is the pub
                             "group_overrides": [],
                             "max_groups_per_user": 10,
                             "user_group_cap_overrides": [],
-                            "max_devices_per_user": 5
+                            "max_devices_per_user": 5,
+                            "device_requests_per_minute": 600,
+                            "device_concurrent_pulls": 8
                         },
                         "interfaces": {
                             "rest": {"status": "available", "bind": "0.0.0.0:3000", "url": "https://node.example.test/api/v1"},
@@ -1533,6 +1541,14 @@ a management node serves it; an anonymous caller is rejected and every other nod
   a user may hold.
 - `max_devices_per_user` caps how many devices one user may enroll; null leaves device enrollment
   uncapped. Enrolled devices and unclaimed device enrollment secrets both occupy a slot.
+- `device_requests_per_minute` and `device_concurrent_pulls` bound what one enrolled device may ask
+  of each realm node: how many requests it may send per minute and how many it may keep in flight,
+  which is what bounds long blob pulls. Both are per device and per node, and null leaves that
+  dimension uncapped.
+- Device limits are enforced where a device's requests actually arrive, at the node's inbound
+  network admission, not at REST: an over-budget request is dropped there, so the device sees a
+  transport failure and reports the retryable 503 class to its owner rather than a 429. The 429
+  with `Retry-After` stays the answer of the per-address and per-principal REST limiters.
 - Quota is evaluated against a group's realm-wide logical bytes, which are aggregated from counters
   that replicate between nodes, so enforcement follows a policy change as those counters and the
   realm configuration propagate.
@@ -1541,7 +1557,9 @@ a management node serves it; an anonymous caller is rejected and every other nod
 - `grace_factor_percent` must be at least 100.
 - `warn_threshold_percent` must be between 1 and 100.
 - `max_devices_per_user` must be null or greater than zero; zero is refused rather than read as a
-  ban on device enrollment."#,
+  ban on device enrollment.
+- `device_requests_per_minute` and `device_concurrent_pulls` must be null or greater than zero;
+  zero would silence every enrolled device and is refused."#,
     request_body(
         content = RealmQuotaConfig,
         description = "The complete quota policy to store; it replaces the current one, including all override lists",
@@ -1556,7 +1574,9 @@ a management node serves it; an anonymous caller is rejected and every other nod
             "user_group_cap_overrides": [
                 {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
             ],
-            "max_devices_per_user": 5
+            "max_devices_per_user": 5,
+            "device_requests_per_minute": 600,
+            "device_concurrent_pulls": 8
         })
     ),
     responses(
@@ -1575,10 +1595,12 @@ a management node serves it; an anonymous caller is rejected and every other nod
                 "user_group_cap_overrides": [
                     {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
                 ],
-                "max_devices_per_user": 5
+                "max_devices_per_user": 5,
+                "device_requests_per_minute": 600,
+                "device_concurrent_pulls": 8
             })
         ),
-        (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a value for max_devices_per_user", body = crate::error::ErrorResponse),
+        (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
@@ -3470,6 +3492,8 @@ mod tests {
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.default_group_quota_bytes = Some(4096);
         body.max_devices_per_user = Some(3);
+        body.device_requests_per_minute = Some(600);
+        body.device_concurrent_pulls = Some(8);
 
         let (status, Json(stored)) = set_realm_quota(
             State(state.clone()),
@@ -3481,6 +3505,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(stored.default_group_quota_bytes, Some(4096));
         assert_eq!(stored.max_devices_per_user, Some(3));
+        assert_eq!(stored.device_requests_per_minute, Some(600));
+        assert_eq!(stored.device_concurrent_pulls, Some(8));
 
         let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
             .await
@@ -3777,6 +3803,40 @@ mod tests {
             error,
             ServerError::BadRequestReason(reason) if reason.contains("max_devices_per_user")
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_limits() {
+        // Zero would silence an enrolled device; only null is uncapped.
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        for body in [
+            RealmQuotaConfig {
+                device_requests_per_minute: Some(0),
+                ..RealmQuotaConfig::from(QuotaConfig::default())
+            },
+            RealmQuotaConfig {
+                device_concurrent_pulls: Some(0),
+                ..RealmQuotaConfig::from(QuotaConfig::default())
+            },
+        ] {
+            let error = set_realm_quota(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Json(body),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                ServerError::BadRequestReason(reason) if reason.starts_with("device_")
+            ));
+        }
     }
 
     #[test]

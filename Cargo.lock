@@ -501,6 +501,7 @@ dependencies = [
  "fjall",
  "futures",
  "globset",
+ "governor",
  "hex",
  "iroh",
  "irokle",

@@ -221,6 +221,12 @@ pub struct QuotaConfig {
     pub max_groups_per_user: Option<u32>,
     pub user_group_cap_overrides: Vec<UserGroupCapOverride>,
     pub max_devices_per_user: Option<u32>,
+    /// Inbound requests one user device may send a realm node per minute.
+    /// `None` leaves devices uncapped.
+    pub device_requests_per_minute: Option<u32>,
+    /// Inbound requests one user device may keep in flight at a realm node at
+    /// once, which is what bounds long blob pulls. `None` leaves them uncapped.
+    pub device_concurrent_pulls: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -246,6 +252,8 @@ impl Default for QuotaConfig {
             max_groups_per_user: Some(3),
             user_group_cap_overrides: Vec::new(),
             max_devices_per_user: None,
+            device_requests_per_minute: None,
+            device_concurrent_pulls: None,
         }
     }
 }

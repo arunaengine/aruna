@@ -24,6 +24,7 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
 globset = { workspace = true }
+governor = { workspace = true }
 rand = { workspace = true }
 byteview = { workspace = true }
 futures = { workspace = true }

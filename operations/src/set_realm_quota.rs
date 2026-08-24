@@ -442,6 +442,18 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
             reason: "max_devices_per_user must be greater than zero".to_string(),
         });
     }
+    // Zero would silence every enrolled device; unset is how a realm stays
+    // uncapped, exactly as for the device cap itself.
+    if quota.device_requests_per_minute == Some(0) {
+        return Err(SetRealmQuotaError::InvalidQuota {
+            reason: "device_requests_per_minute must be greater than zero".to_string(),
+        });
+    }
+    if quota.device_concurrent_pulls == Some(0) {
+        return Err(SetRealmQuotaError::InvalidQuota {
+            reason: "device_concurrent_pulls must be greater than zero".to_string(),
+        });
+    }
     let mut seen_groups = BTreeSet::new();
     for over in &quota.group_overrides {
         if !seen_groups.insert(over.group_id) {
@@ -592,6 +604,8 @@ mod tests {
                 max_groups: Some(10),
             }],
             max_devices_per_user: Some(4),
+            device_requests_per_minute: Some(600),
+            device_concurrent_pulls: Some(8),
         }
     }
 
@@ -619,6 +633,44 @@ mod tests {
             .unwrap();
         assert_eq!(reread.quota, quota);
         assert_eq!(reread.quota.max_devices_per_user, Some(4));
+        assert_eq!(reread.quota.device_requests_per_minute, Some(600));
+        assert_eq!(reread.quota.device_concurrent_pulls, Some(8));
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_limits() {
+        // Zero would silence every enrolled device; unset is the uncapped value.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let document = management_config(realm_id, &actor);
+        seed_config(&ctx, &actor, &document).await;
+        seed_realm_admin(&ctx, &actor).await;
+
+        for quota in [
+            QuotaConfig {
+                device_requests_per_minute: Some(0),
+                ..Default::default()
+            },
+            QuotaConfig {
+                device_concurrent_pulls: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let error = drive(
+                SetRealmQuotaOperation::new(quota_config(&actor, quota)),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                SetRealmQuotaError::InvalidQuota { reason }
+                    if reason.starts_with("device_")
+            ));
+        }
     }
 
     #[tokio::test]

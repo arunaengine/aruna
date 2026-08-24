@@ -13129,6 +13129,7 @@ mod tests {
                 max_groups: Some(2),
             }],
             max_devices_per_user: Some(6),
+            ..QuotaConfig::default()
         };
 
         // Quota lands before any config doc exists; it must be recorded in the
