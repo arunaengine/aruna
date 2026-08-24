@@ -211,6 +211,15 @@ fn reference_shape(spec: &ExecutionSpec) -> Result<(), SubmitJobError> {
     Ok(())
 }
 
+/// How a refusal names the input it is about. Only the object reference is
+/// named; a credential never reaches a reason string.
+fn input_reference(bucket: &str, key: &str, version_id: Option<&str>) -> String {
+    match version_id {
+        Some(version) => format!("s3://{bucket}/{key}?versionId={version}"),
+        None => format!("s3://{bucket}/{key}"),
+    }
+}
+
 /// Resolve node-local names once at ingress. The resulting facts are sealed in
 /// the family spec and remain valid when admission or planning is forwarded.
 async fn resolve_facts(
@@ -231,11 +240,14 @@ async fn resolve_facts(
             key,
             version_id,
         } = &input.source;
+        // Every refusal names the input it is about: the object store's own
+        // message says only that some key is missing.
+        let reference = input_reference(bucket, key, version_id.as_deref());
         let requested = version_id
             .as_deref()
             .map(Ulid::from_string)
             .transpose()
-            .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+            .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
         let head = drive(
             HeadObjectOperation::new(HeadObjectInput {
                 bucket: bucket.clone(),
@@ -245,14 +257,18 @@ async fn resolve_facts(
             context,
         )
         .await
-        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?
+        .map_err(|error| SubmitJobError::PlacementUnavailable(format!("{reference}: {error}")))?
         .transpose()
-        .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?
-        .ok_or_else(|| SubmitJobError::InvalidWorkspace("input object not found".to_string()))?;
+        .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?
+        .ok_or_else(|| {
+            SubmitJobError::InvalidWorkspace(format!("{reference}: input object not found"))
+        })?;
         let version = head
             .resolved_version_id
             .or(head.version_id)
-            .ok_or_else(|| SubmitJobError::InvalidWorkspace("input has no version".to_string()))?;
+            .ok_or_else(|| {
+                SubmitJobError::InvalidWorkspace(format!("{reference}: input has no version"))
+            })?;
         let blake3 = head
             .location
             .as_ref()
@@ -263,7 +279,9 @@ async fn resolve_facts(
             None => crate::jobs::lifecycle::plan::version_hash(context, bucket, key, version)
                 .await
                 .ok_or_else(|| {
-                    SubmitJobError::InvalidWorkspace("input is not materialized".to_string())
+                    SubmitJobError::InvalidWorkspace(format!(
+                        "{reference}: input is not materialized"
+                    ))
                 })?,
         };
         let bytes = head
@@ -276,9 +294,10 @@ async fn resolve_facts(
                     .map(|metadata| metadata.content_length)
             })
             .unwrap_or_default();
-        let policies =
-            aruna_core::structs::PlacementPolicyRef::canonical_set(&head.source_policies)
-                .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+        let policies = aruna_core::structs::PlacementPolicyRef::canonical_set(
+            &head.source_policies,
+        )
+        .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
         input_facts.push(JobInputFact {
             destination_key: input.dest_key.clone(),
             source_node_id: local,
@@ -306,18 +325,20 @@ async fn resolve_facts(
     }
     let mut output_policies = Vec::new();
     for bucket in buckets {
-        let info = drive(GetBucketInfoOperation::new(bucket), context)
+        let info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
             .await
-            .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?
+            .map_err(|error| {
+                SubmitJobError::PlacementUnavailable(format!("s3://{bucket}: {error}"))
+            })?
             .transpose()
-            .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?
+            .map_err(|error| SubmitJobError::InvalidWorkspace(format!("s3://{bucket}: {error}")))?
             .ok_or_else(|| {
-                SubmitJobError::InvalidWorkspace("output bucket not found".to_string())
+                SubmitJobError::InvalidWorkspace(format!("s3://{bucket}: output bucket not found"))
             })?;
         if info.group_id != spec.group_id {
-            return Err(SubmitJobError::InvalidWorkspace(
-                "output bucket is outside the execution group".to_string(),
-            ));
+            return Err(SubmitJobError::InvalidWorkspace(format!(
+                "s3://{bucket}: output bucket is outside the execution group"
+            )));
         }
         output_policies.extend(info.placement_policies);
     }
