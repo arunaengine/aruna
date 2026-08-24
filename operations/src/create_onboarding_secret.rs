@@ -348,9 +348,11 @@ mod tests {
         CreateOnboardingSecretError, CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
     use crate::driver::{DriverContext, drive};
-    use aruna_core::effects::StorageEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::types::UserId;
     use aruna_storage::storage;
@@ -410,6 +412,23 @@ mod tests {
                 compute_handle: None,
             },
         )
+    }
+
+    /// Runs a mint's effects against storage up to its commit and hands that
+    /// commit back, so two mints can be interleaved deliberately.
+    async fn run_to_commit(
+        operation: &mut CreateOnboardingSecretOperation,
+        context: &DriverContext,
+    ) -> StorageEffect {
+        let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
+        while let Some(Effect::Storage(effect)) = queue.pop_front() {
+            if matches!(effect, StorageEffect::CommitTransaction { .. }) {
+                return effect;
+            }
+            let event = context.storage_handle.send_storage_effect(effect).await;
+            queue.extend(operation.step(event));
+        }
+        panic!("the mint never reached its commit");
     }
 
     async fn write_claimed(context: &DriverContext, owner: UserId, node_id: &str) {
@@ -475,6 +494,42 @@ mod tests {
         mint(&context, owner)
             .await
             .expect("another owner's device does not count");
+    }
+
+    #[tokio::test]
+    async fn mints_conflict_locally() {
+        // Two mints on one node under cap 1: the loser's pending-secret range
+        // read conflicts with the winner's insert, so only one commits.
+        let owner = UserId::local(Ulid::generate(), realm());
+        let (_dir, context) = context_with_cap(Some(1), &[]).await;
+        let mut first = CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+            record: device_record(owner),
+        });
+        let mut second = CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+            record: device_record(owner),
+        });
+
+        let first_commit = run_to_commit(&mut first, &context).await;
+        let second_commit = run_to_commit(&mut second, &context).await;
+
+        let event = context
+            .storage_handle
+            .send_storage_effect(first_commit)
+            .await;
+        first.step(event);
+        first.finalize().expect("the first mint commits");
+
+        let event = context
+            .storage_handle
+            .send_storage_effect(second_commit)
+            .await;
+        second.step(event);
+        assert!(matches!(
+            second.finalize(),
+            Err(CreateOnboardingSecretError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        ));
     }
 
     #[tokio::test]

@@ -294,6 +294,11 @@ answers 403.
   Enrolled devices and outstanding device secrets both occupy a slot, and a secret already claimed
   by an enrolled device is charged once, through the realm configuration. A realm without that
   quota set caps nothing.
+- The count is transactional per node, so two mints on this node cannot both pass it, and the cap
+  is checked again when the secret is redeemed. Two management nodes minting at the same time each
+  see only their own outstanding secrets: the redemption catches that once the first device is in
+  the replicated realm configuration, so concurrent redemptions on different nodes remain
+  best-effort.
 
 **Errors**: an owner at the device cap answers 409. An empty `seed_url` on a node that publishes no
 REST interface answers 400. A realm policy that forbids enrollment answers 403."#,
@@ -660,6 +665,9 @@ only a management node serves this route.
   to it, along with the nonce and the ephemeral public key needed to open it.
 - A `User` secret needs neither: a device holds no realm key and no issuer delegation, and joins as
   an owner-bound member that never becomes a sync, holder or placement target.
+- Redeeming a `User` secret re-checks the owner's device cap against the realm configuration this
+  node has replicated, because the node that minted the secret only saw its own outstanding ones.
+  An owner already at the cap is refused with 409 and the secret stays unclaimed.
 - `mode` echoes what the secret was minted for, so a joiner can cross-check it against its own
   copy. It reads `"Management"` or `"Server"` for the infrastructure modes, and for a device it is
   the object `{"User": {"owner": ...}}` carrying the owner the secret was bound to.
@@ -675,7 +683,7 @@ only a management node serves this route.
 
 **Errors**: an unknown, expired, already claimed or unmatched secret and a signature that does not
 verify are both refused with 401, without saying which of the two failed. A node that does not
-serve enrollment answers 403."#,
+serve enrollment answers 403, and an owner already at the device cap answers 409."#,
     request_body(
         content = BootstrapOnboardingRequestDoc,
         description = "The enrollment secret, the joiner's node id, its proof of possession of the node key, and any mode-specific key material",
@@ -726,7 +734,8 @@ serve enrollment answers 403."#,
         ),
         (status = 400, description = "Malformed node id, key material or proof, or key material missing for the mode the secret was minted for", body = crate::error::ErrorResponse),
         (status = 401, description = "Unknown, expired, already claimed or non-matching enrollment secret, or a proof that does not verify", body = crate::error::ErrorResponse),
-        (status = 403, description = "This node does not serve enrollment, or the secret was not minted for node enrollment", body = crate::error::ErrorResponse)
+        (status = 403, description = "This node does not serve enrollment, or the secret was not minted for node enrollment", body = crate::error::ErrorResponse),
+        (status = 409, description = "The device's owner already holds the realm's maximum number of devices", body = crate::error::ErrorResponse)
     )
 )]
 pub async fn bootstrap_onboarding(
@@ -927,6 +936,9 @@ fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
             | ReserveOnboardingSecretError::AlreadyClaimed
             | ReserveOnboardingSecretError::InvalidSecret,
         ) => ServerError::Unauthorized,
+        BootstrapOnboardingFinalizeError::Reserve(
+            ReserveOnboardingSecretError::DeviceCapExceeded { .. },
+        ) => ServerError::Conflict(error.to_string()),
         BootstrapOnboardingFinalizeError::Consume(error) => map_consume_error(error),
         BootstrapOnboardingFinalizeError::EnsureRealmConfig(
             EnsureRealmConfigError::NodeKindMismatch { .. },
