@@ -37,12 +37,13 @@ use aruna_operations::document_sync_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, forward_token_revoke,
-    update_metadata_document_routed,
+    MetadataWriteError, create_metadata_document_routed, forward_group_create,
+    forward_token_revoke, update_metadata_document_routed,
 };
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
@@ -168,6 +169,48 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert!(!user_config.token_revoked(&hash, unix_timestamp_secs()));
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
+    // A device never originates a realm administrative event: the ingress it
+    // forwards to creates the group as itself, with the device owner as actor,
+    // and the group converges to every sync-eligible node.
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+
+    let (group, authorization) = forward_group_create(
+        &user_node.context,
+        realm.realm_id,
+        realm.bearer_token(),
+        "Device Group".to_string(),
+    )
+    .await?;
+    assert_eq!(group.owner, realm.user_id);
+    assert_eq!(group.realm_id, realm.realm_id);
+    assert_eq!(authorization.group_id, group.group_id);
+    wait_for_convergence("the forwarded group create did not converge", || async {
+        let mut pending = 0;
+        for node in nodes.iter().filter(|node| node.sync_eligible) {
+            if drive(
+                GetGroupOperation::new(GetGroupConfig {
+                    group_id: group.group_id,
+                }),
+                node.context.as_ref(),
+            )
+            .await
+            .is_err()
+            {
+                pending += 1;
+            }
+        }
+        Ok::<usize, Box<dyn std::error::Error>>(pending)
+    })
+    .await?;
 
     shutdown(nodes).await;
     Ok(())
@@ -905,7 +948,7 @@ async fn install_realm_config(
             RealmNodeKind::Management
         } else {
             RealmNodeKind::User {
-                owner: UserId::nil(realm_id),
+                owner: realm.user_id,
             }
         };
         config.ensure_node(node.net.node_id(), kind);

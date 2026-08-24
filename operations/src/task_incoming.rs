@@ -680,25 +680,35 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Surfaces records this node can never publish, loudly, and leaves them in
-    /// the outbox.
+    /// Handles records this node cannot publish itself.
     ///
     /// This node holds none of the record's bucket, so it may neither mint that
-    /// bucket's topic genesis nor join the topic: it can never publish the record
-    /// from here. The record is never relayed to a holder — a peer-relayed
-    /// upsert/delete would publish under the holder's signature with no proof it
-    /// was permission-checked — and never deleted, since the caller already holds
-    /// a 200 and there is no replay source. It stays in the outbox, error-logged
-    /// on every drain, until a config change makes this node a holder or an
-    /// operator intervenes. In practice the only record that lands here is the
-    /// rare rebalance race: a node that held the bucket when it accepted the
-    /// write and lost holdership before draining.
-    fn report_undeliverable_records(&self, undeliverable: &[DrainRecord]) {
+    /// bucket's topic genesis nor join the topic. An administrative record is
+    /// relayed: its envelope is signed by this node as origin, so a holder can
+    /// republish the exact bytes while every receiver still authorizes the
+    /// origin, and the local copy is deleted once a holder takes custody. An
+    /// upsert or delete carries no origin signature, so relaying it would
+    /// publish under the holder's identity with no proof it was
+    /// permission-checked: those stay in the outbox, error-logged on every
+    /// drain, until a config change makes this node a holder or an operator
+    /// intervenes. Returns the keys whose custody moved to a holder.
+    async fn relay_undeliverable_records(
+        &self,
+        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        undeliverable: &[DrainRecord],
+    ) -> Vec<Vec<u8>> {
         UNDELIVERABLE_RECORD_COUNT.fetch_add(
             undeliverable.len() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        for (_, record, topic) in undeliverable {
+        let mut relayed = Vec::new();
+        for (record_key, record, topic) in undeliverable {
+            if let Some(config) = config
+                && self.relay_admin_record(config, record).await
+            {
+                relayed.push(record_key.clone());
+                continue;
+            }
             error!(
                 event = "pipeline.drain.undeliverable",
                 target = ?record.target,
@@ -708,6 +718,72 @@ impl OperationsTaskHandler {
                 age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
                 "Cannot publish a document sync outbox record from this node and it is not relayable; leaving it in the outbox"
             );
+        }
+        relayed
+    }
+
+    /// Signs one locally originated administrative envelope and hands it to a
+    /// holder. Returns whether a holder took custody.
+    async fn relay_admin_record(
+        &self,
+        config: &aruna_core::structs::RealmConfigDocument,
+        record: &DocumentSyncOutboxRecord,
+    ) -> bool {
+        let DocumentSyncOutboxEvent::AdminOperation {
+            event,
+            origin_signature,
+        } = &record.event
+        else {
+            return false;
+        };
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            return false;
+        };
+        let origin_signature = match origin_signature {
+            Some(signature) => *signature,
+            None if event.origin_node_id == net_handle.node_id() => {
+                match event.signing_bytes(&record.placement) {
+                    Ok(bytes) => net_handle.sign(&bytes),
+                    Err(error) => {
+                        warn!(%error, "Cannot sign an admin event for relay");
+                        return false;
+                    }
+                }
+            }
+            None => return false,
+        };
+        let holders = crate::placement::resolve_shard_holders(config, &record.placement);
+        if holders.is_empty() {
+            return false;
+        }
+        match crate::metadata::forward::relay_admin_event(
+            &self.context,
+            &holders,
+            record.target.clone(),
+            event.clone(),
+            record.placement,
+            origin_signature,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(
+                    event = "pipeline.drain.relayed",
+                    target = ?record.target,
+                    origin = %event.origin_node_id,
+                    "Relayed an admin outbox record to a holder"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    event = "pipeline.drain.relay_failed",
+                    target = ?record.target,
+                    %error,
+                    "No holder accepted a relayed admin outbox record"
+                );
+                false
+            }
         }
     }
 
@@ -1204,7 +1280,14 @@ impl OperationsTaskHandler {
             }
         }
         invocation.undeliverable += undeliverable.len();
-        self.report_undeliverable_records(&undeliverable);
+        let relayed = self
+            .relay_undeliverable_records(config, &undeliverable)
+            .await;
+        if !relayed.is_empty()
+            && let Err(error) = delete_outbox_records(&self.context.storage_handle, relayed).await
+        {
+            warn!(%error, "Failed to delete relayed admin outbox records");
+        }
 
         let (groups, subbatches) = Self::build_drain_batches(to_publish);
         invocation.groups += groups;

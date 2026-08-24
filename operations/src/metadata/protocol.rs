@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
@@ -9,9 +11,9 @@ use aruna_core::metadata::{
     MetadataSearchHit,
 };
 use aruna_core::structs::{
-    MetadataRegistryRecord, PathClaimRecord, PersistentIdFailure, PersistentIdMapping,
-    PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId,
-    SyncRelationship,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, PathClaimRecord,
+    PersistentIdFailure, PersistentIdMapping, PlacementPolicy, PlacementPolicyDocument,
+    PlacementPolicyRef, PlacementRef, SubmissionId, SyncRelationship,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -345,6 +347,33 @@ pub enum MetadataTransportMessage {
     },
     ReferencePreflightResults {
         result: Result<Box<MetadataReferencePreflightNodeExecution>, MetadataReadError>,
+    },
+    /// An administrative event whose origin holds none of the target's shard,
+    /// handed to a holder that relays the exact origin-signed envelope. It
+    /// deliberately carries no caller token: the envelope's origin signature is
+    /// the authority, and every receiver re-authorizes against the origin.
+    /// Appended after the preflight variants so all prior postcard discriminants
+    /// remain stable.
+    ForwardAdminEvent {
+        target: DocumentSyncTarget,
+        event: Box<AdminDocumentEvent>,
+        placement: PlacementRef,
+        origin_signature: iroh::Signature,
+    },
+    ForwardedAdminEventQueued,
+    /// A User node cannot originate a realm administrative event, so its local
+    /// group create travels to a sync-eligible ingress under the caller's own
+    /// token. That ingress authorizes the caller and originates the event.
+    ForwardGroupCreate {
+        auth_token: Option<MetadataAuthToken>,
+        display_name: String,
+    },
+    ForwardedGroupCreated {
+        group: Box<Group>,
+        authorization: Box<GroupAuthorizationDocument>,
+    },
+    ForwardedGroupCreateConflict {
+        reason: String,
     },
 }
 

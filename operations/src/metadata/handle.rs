@@ -1898,6 +1898,14 @@ impl MetadataHandle {
                 })
                 .await
             }
+            forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
+                Box::pin(async { super::forward::apply_admin_relay(context, peer, forward).await })
+                    .await
+            }
+            forward @ MetadataTransportMessage::ForwardGroupCreate { .. } => {
+                Box::pin(async { super::forward::apply_group_create(context, peer, forward).await })
+                    .await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
@@ -1929,6 +1937,9 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedProfileValidation { .. }
             | MetadataTransportMessage::ForwardedProfileValidationStatus { .. }
             | MetadataTransportMessage::ReferencePreflightResults { .. }
+            | MetadataTransportMessage::ForwardedAdminEventQueued
+            | MetadataTransportMessage::ForwardedGroupCreated { .. }
+            | MetadataTransportMessage::ForwardedGroupCreateConflict { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4745,6 +4756,13 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         }
         MetadataTransportMessage::ReferencePreflight { .. } => "reference_preflight",
         MetadataTransportMessage::ReferencePreflightResults { .. } => "reference_preflight_results",
+        MetadataTransportMessage::ForwardAdminEvent { .. } => "forward_admin_event",
+        MetadataTransportMessage::ForwardedAdminEventQueued => "forwarded_admin_event_queued",
+        MetadataTransportMessage::ForwardGroupCreate { .. } => "forward_group_create",
+        MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
+        MetadataTransportMessage::ForwardedGroupCreateConflict { .. } => {
+            "forwarded_group_create_conflict"
+        }
     }
 }
 

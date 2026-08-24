@@ -4,9 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
 };
@@ -15,8 +19,9 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
-    Actor, AuthContext, JobId, MetadataRegistryRecord, MintPersistentIdSpec, Permission,
-    PersistentIdFailure, PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, JobId, MetadataRegistryRecord,
+    MintPersistentIdSpec, Permission, PersistentIdFailure, PersistentIdMapping, PlacementRef,
+    RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -28,6 +33,7 @@ use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 use ulid::Ulid;
 
+use crate::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentResult, accepted_create_matches, create_metadata_document,
@@ -35,6 +41,9 @@ use crate::create_metadata_document::{
 };
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
+};
+use crate::document_sync_outbox::{
+    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
 };
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
@@ -99,6 +108,8 @@ pub enum MetadataWriteError {
 }
 
 const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
+const ADMIN_RELAY_PEER_LIMIT: usize = 3;
+const ADMIN_RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 const METADATA_READ_FANOUT_LIMIT: usize = 8;
@@ -1959,6 +1970,336 @@ pub(crate) async fn apply_forwarded_pid(
     }
 }
 
+/// Why a forwarded group create did not produce a group. `Conflict` is the
+/// caller's problem (quota or a racing create) and must not be retried on
+/// another ingress; everything else maps to the usual transport response.
+#[derive(Debug, Error)]
+pub enum ForwardGroupError {
+    #[error(transparent)]
+    Api(#[from] MetadataApiError),
+    #[error("{0}")]
+    Conflict(String),
+}
+
+/// Sends a User node's group create to a sync-eligible ingress. The device
+/// never originates a realm administrative event: the ingress authorizes the
+/// caller's own token and originates the event with the caller as actor.
+pub async fn forward_group_create(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    auth_token: MetadataAuthToken,
+    display_name: String,
+) -> Result<(Group, GroupAuthorizationDocument), ForwardGroupError> {
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return Err(MetadataApiError::ServiceUnavailable.into());
+    };
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return Err(MetadataApiError::ServiceUnavailable.into());
+    };
+    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut subject = display_name.clone().into_bytes();
+    subject.extend_from_slice(&Ulid::generate().to_bytes());
+    let peers = rank_revoke_peers(
+        config
+            .nodes
+            .iter()
+            .filter(|node| node.kind.is_sync_eligible())
+            .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+            .filter(|peer| Some(*peer) != local_node_id),
+        &subject,
+    );
+    if peers.is_empty() {
+        return Err(MetadataApiError::ServiceUnavailable.into());
+    }
+    let message = MetadataTransportMessage::ForwardGroupCreate {
+        auth_token: Some(auth_token),
+        display_name,
+    };
+    // Retrying a create on another ingress could mint a second group, so a
+    // reachable ingress owns the outcome and only transport failures move on.
+    for peer in peers {
+        match timeout(
+            ADMIN_RELAY_ATTEMPT_TIMEOUT,
+            metadata.request_forwarded_write(peer, message.clone()),
+        )
+        .await
+        {
+            Ok(Ok(MetadataTransportMessage::ForwardedGroupCreated {
+                group,
+                authorization,
+            })) => return Ok((*group, *authorization)),
+            Ok(Ok(MetadataTransportMessage::ForwardedGroupCreateConflict { reason })) => {
+                return Err(ForwardGroupError::Conflict(reason));
+            }
+            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Unauthorized,
+            })) => return Err(MetadataApiError::Unauthorized.into()),
+            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Forbidden,
+            })) => return Err(MetadataApiError::Forbidden.into()),
+            Ok(Ok(MetadataTransportMessage::Reject(error))) => {
+                warn!(%peer, %error, "Ingress rejected a forwarded group create");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable.into())
+}
+
+/// Originates a group create requested by a device. Authority is the caller's
+/// forwarded token, checked exactly as the local HTTP handler would; a User
+/// peer may only ever act for the owner its realm config binds it to.
+pub(crate) async fn apply_group_create(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let realm_id = *net_handle.realm_id();
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    if !node_is_sync_eligible(&config, net_handle.node_id()) {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    }
+    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
+        Ok(auth) => auth,
+        Err(error) => return forward_auth_error(error),
+    };
+    if auth.path_restrictions.is_some() || !peer_may_act_for(&config, peer, auth.user_id) {
+        return MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Forbidden,
+        };
+    }
+    let MetadataTransportMessage::ForwardGroupCreate { display_name, .. } = message else {
+        return reject("unexpected group create message");
+    };
+    let realm_admin = authorize_write(context, auth.clone(), format!("/{realm_id}/admin/groups"))
+        .await
+        .is_ok();
+    let owner_cap = if realm_admin {
+        None
+    } else {
+        config.quota.max_groups_for(&auth.user_id)
+    };
+    match drive(
+        CreateGroupOperation::new(CreateGroupConfig {
+            actor: Actor {
+                node_id: net_handle.node_id(),
+                user_id: auth.user_id,
+                realm_id,
+            },
+            display_name,
+            owner_cap,
+        }),
+        context.as_ref(),
+    )
+    .await
+    {
+        Ok((group, authorization)) => MetadataTransportMessage::ForwardedGroupCreated {
+            group: Box::new(group),
+            authorization: Box::new(authorization),
+        },
+        Err(CreateGroupError::OwnedGroupLimitReached { limit }) => {
+            MetadataTransportMessage::ForwardedGroupCreateConflict {
+                reason: format!("owned group limit reached ({limit})"),
+            }
+        }
+        Err(
+            CreateGroupError::StorageError(StorageError::TransactionConflict)
+            | CreateGroupError::PlacementFenced,
+        ) => MetadataTransportMessage::ForwardedGroupCreateConflict {
+            reason: "concurrent group creation conflict; retry".to_string(),
+        },
+        Err(error) => reject(format!("group create failed: {error}")),
+    }
+}
+
+/// Hands an origin-signed administrative envelope to a holder of its shard.
+/// The origin holds none of that shard, so it cannot publish onto the topic
+/// itself; the holder republishes the exact envelope, and receivers still
+/// authorize the origin, never the relay.
+pub async fn relay_admin_event(
+    context: &Arc<DriverContext>,
+    holders: &[NodeId],
+    target: DocumentSyncTarget,
+    event: Box<AdminDocumentEvent>,
+    placement: PlacementRef,
+    origin_signature: iroh::Signature,
+) -> Result<(), MetadataApiError> {
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return Err(MetadataApiError::ServiceUnavailable);
+    };
+    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let message = MetadataTransportMessage::ForwardAdminEvent {
+        target,
+        event,
+        placement,
+        origin_signature,
+    };
+    for peer in holders
+        .iter()
+        .copied()
+        .filter(|peer| Some(*peer) != local_node_id)
+        .take(ADMIN_RELAY_PEER_LIMIT)
+    {
+        match timeout(
+            ADMIN_RELAY_ATTEMPT_TIMEOUT,
+            metadata.request_forwarded_write(peer, message.clone()),
+        )
+        .await
+        {
+            Ok(Ok(MetadataTransportMessage::ForwardedAdminEventQueued)) => return Ok(()),
+            Ok(Ok(MetadataTransportMessage::Reject(error))) => {
+                // A rejection is a verdict on the envelope, not on this peer.
+                warn!(%peer, %error, "Holder rejected a relayed admin event");
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable)
+}
+
+/// Whether this node may take custody of a relayed administrative envelope.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RelayAdmission {
+    Accept,
+    /// The sending peer has no business relaying realm administration.
+    Forbidden,
+    /// The envelope itself is invalid; no other holder would accept it either.
+    Reject(String),
+    /// This node cannot publish the record, but another holder can.
+    Unavailable,
+}
+
+/// Admission decision for a relayed envelope. Authority is the origin
+/// signature, never the relaying peer and never a caller token; this node only
+/// proves the envelope is sound and that it can publish it at all.
+pub(crate) fn admit_relayed_admin(
+    config: &RealmConfigDocument,
+    local_node_id: NodeId,
+    peer: NodeId,
+    event: &AdminDocumentEvent,
+    placement: &PlacementRef,
+    origin_signature: &iroh::Signature,
+) -> RelayAdmission {
+    if !node_is_sync_eligible(config, peer) {
+        return RelayAdmission::Forbidden;
+    }
+    if !node_is_sync_eligible(config, event.origin_node_id) {
+        return RelayAdmission::Reject("relayed admin event origin may not publish".to_string());
+    }
+    if event.actor.realm_id != config.realm_id || event.origin_node_id != event.actor.node_id {
+        return RelayAdmission::Reject("relayed admin event identity does not match".to_string());
+    }
+    if !event.origin_signed(placement, origin_signature) {
+        return RelayAdmission::Reject(
+            "relayed admin event is not signed by its origin".to_string(),
+        );
+    }
+    if !holds_placement(config, placement, local_node_id) {
+        return RelayAdmission::Unavailable;
+    }
+    RelayAdmission::Accept
+}
+
+/// Accepts a relayed administrative envelope and takes custody of publishing it.
+pub(crate) async fn apply_admin_relay(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::ForwardAdminEvent {
+        target,
+        event,
+        placement,
+        origin_signature,
+    } = message
+    else {
+        return reject("unexpected admin relay message");
+    };
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let Some(config) = load_realm_config(context, *net_handle.realm_id()).await else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    match admit_relayed_admin(
+        &config,
+        net_handle.node_id(),
+        peer,
+        &event,
+        &placement,
+        &origin_signature,
+    ) {
+        RelayAdmission::Accept => {}
+        RelayAdmission::Forbidden => {
+            return MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Forbidden,
+            };
+        }
+        RelayAdmission::Reject(reason) => return reject(reason),
+        RelayAdmission::Unavailable => {
+            return MetadataTransportMessage::ForwardedWriteUnavailable;
+        }
+    }
+    // The relay never mints a genesis for another origin's document.
+    let record = new_outbox_record(
+        net_handle.node_id(),
+        target,
+        Vec::new(),
+        DocumentSyncOutboxEvent::relayed_admin(*event, origin_signature),
+        placement,
+        false,
+    );
+    let effect = match write_outbox_effect(&record) {
+        Ok(effect) => effect,
+        Err(error) => return reject(format!("relayed admin event does not encode: {error}")),
+    };
+    match context.storage_handle.send_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => {
+            warn!(event = ?other, "Failed to persist a relayed admin event");
+            return MetadataTransportMessage::ForwardedWriteUnavailable;
+        }
+    }
+    if let Some(task_handle) = context.task_handle.as_ref()
+        && let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
+            .send_effect(schedule_outbox_drain_effect())
+            .await
+    {
+        warn!(%message, "Failed to schedule the drain for a relayed admin event");
+    }
+    MetadataTransportMessage::ForwardedAdminEventQueued
+}
+
+fn node_is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    configured_kind(config, node_id).is_some_and(RealmNodeKind::is_sync_eligible)
+}
+
+/// A User peer is owner-bound: it may forward only for the owner its realm
+/// config names, whatever token it managed to present. Other kinds are not
+/// owner-bound, so any authenticated caller may travel through them (D12).
+fn peer_may_act_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
+    match configured_kind(config, peer).and_then(RealmNodeKind::owner) {
+        Some(owner) => owner == user_id,
+        None => true,
+    }
+}
+
+fn configured_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<&RealmNodeKind> {
+    let node_id = node_id.to_string();
+    config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| &node.kind)
+}
+
 async fn authorize_forwarded_pid(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -2353,6 +2694,7 @@ pub(crate) async fn authorize_forwarded_caller(
         MetadataTransportMessage::ForwardCreatePlacementPolicy { auth_token, .. } => {
             auth_token.clone()
         }
+        MetadataTransportMessage::ForwardGroupCreate { auth_token, .. } => auth_token.clone(),
         _ => None,
     };
     let auth = metadata_handle
@@ -2672,6 +3014,128 @@ mod tests {
                 shard: 9,
             },
         )
+    }
+
+    fn relay_fixture() -> (RealmConfigDocument, PlacementRef, NodeId) {
+        let (mut config, placement) = config_and_placement();
+        let device = node(9);
+        let owner = UserId::nil(config.realm_id);
+        config.ensure_node(device, RealmNodeKind::User { owner });
+        let holder = resolve_shard_holders(&config, &placement)
+            .into_iter()
+            .next()
+            .expect("fixture has holders");
+        (config, placement, holder)
+    }
+
+    fn signed_event(
+        config: &RealmConfigDocument,
+        placement: &PlacementRef,
+        origin_seed: u8,
+    ) -> (AdminDocumentEvent, iroh::Signature) {
+        let secret = iroh::SecretKey::from_bytes(&[origin_seed; 32]);
+        let user_id = UserId::nil(config.realm_id);
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_bytes([5u8; 16]),
+            target: aruna_core::admin_documents::AdminDocumentTarget::Group {
+                group_id: Ulid::from_bytes([6u8; 16]),
+            },
+            origin_node_id: secret.public(),
+            origin_seq: 1,
+            observed: Default::default(),
+            actor: Actor {
+                node_id: secret.public(),
+                user_id,
+                realm_id: config.realm_id,
+            },
+            op: aruna_core::admin_documents::AdminDocumentOperation::GroupCreated {
+                realm_id: config.realm_id,
+                display_name: "Engineering".to_string(),
+                owner: user_id,
+            },
+        };
+        let signature = secret.sign(&event.signing_bytes(placement).expect("event signs"));
+        (event, signature)
+    }
+
+    #[test]
+    fn holder_accepts_relay() {
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+
+        assert_eq!(
+            admit_relayed_admin(&config, holder, node(2), &event, &placement, &signature),
+            RelayAdmission::Accept
+        );
+    }
+
+    #[test]
+    fn relay_rejects_forged() {
+        // A relay that rewrites the actor invalidates the origin signature.
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+        let mut forged = event;
+        forged.actor.user_id = UserId::local(Ulid::from_bytes([8u8; 16]), config.realm_id);
+
+        assert!(matches!(
+            admit_relayed_admin(&config, holder, node(2), &forged, &placement, &signature),
+            RelayAdmission::Reject(reason)
+                if reason == "relayed admin event is not signed by its origin"
+        ));
+    }
+
+    #[test]
+    fn relay_rejects_device_origin() {
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 9);
+
+        assert!(matches!(
+            admit_relayed_admin(&config, holder, node(2), &event, &placement, &signature),
+            RelayAdmission::Reject(reason)
+                if reason == "relayed admin event origin may not publish"
+        ));
+    }
+
+    #[test]
+    fn relay_rejects_device_peer() {
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+
+        assert_eq!(
+            admit_relayed_admin(&config, holder, node(9), &event, &placement, &signature),
+            RelayAdmission::Forbidden
+        );
+    }
+
+    #[test]
+    fn non_holder_defers_relay() {
+        // Another holder can still take it, so this is unavailable, not a reject.
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+        let non_holder = (1..=4u8)
+            .map(node)
+            .find(|candidate| {
+                *candidate != holder
+                    && !resolve_shard_holders(&config, &placement).contains(candidate)
+            })
+            .expect("fixture has a non-holder");
+
+        assert_eq!(
+            admit_relayed_admin(&config, non_holder, node(2), &event, &placement, &signature),
+            RelayAdmission::Unavailable
+        );
+    }
+
+    #[test]
+    fn device_peer_binds_owner() {
+        // A device may forward only for the owner its realm config names.
+        let (config, _, _) = relay_fixture();
+        let owner = UserId::nil(config.realm_id);
+        let other = UserId::local(Ulid::from_bytes([8u8; 16]), config.realm_id);
+
+        assert!(peer_may_act_for(&config, node(9), owner));
+        assert!(!peer_may_act_for(&config, node(9), other));
+        assert!(peer_may_act_for(&config, node(1), other));
     }
 
     #[test]
