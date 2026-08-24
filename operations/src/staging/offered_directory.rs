@@ -528,7 +528,8 @@ mod tests {
     // ever being copied into the node's own blob store.
     #[tokio::test]
     async fn serves_offered_file() {
-        let context = setup_driver_context().await.driver_context;
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         std::fs::write(root.path().join("note.txt"), b"offered").expect("file must be written");
         let offer = input("offered", root.path().to_str().expect("utf-8 root"));
@@ -565,7 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_writes() {
-        let context = setup_driver_context().await.driver_context;
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("locked", root.path().to_str().expect("utf-8 root"));
         offer_directory(&context, offer)
@@ -582,7 +584,8 @@ mod tests {
     // A bucket that is not this offer's must keep its ordinary write semantics.
     #[tokio::test]
     async fn refuses_taken_bucket() {
-        let context = setup_driver_context().await.driver_context;
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("taken", root.path().to_str().expect("utf-8 root"));
         crate::staging::test_utils::create_test_bucket(
@@ -603,7 +606,8 @@ mod tests {
     // already reference; a rewritten file mints a successor.
     #[tokio::test]
     async fn reoffer_tracks_changes() {
-        let context = setup_driver_context().await.driver_context;
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let file = root.path().join("data.bin");
         std::fs::write(&file, b"one").expect("file must be written");
