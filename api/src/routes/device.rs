@@ -748,7 +748,8 @@ pub struct WipeDeviceRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct WipeDeviceResponse {
     pub node_id: String,
-    /// Process exit status the supervisor sees once the wipe completes.
+    /// Process exit status the supervisor sees once the wipe completes. A wipe
+    /// that leaves paths behind exits with 80 instead.
     pub exit_code: i32,
 }
 
@@ -764,6 +765,7 @@ pub struct WipeDeviceResponse {
 **Behavior**
 - Realm-side eviction is a separate, earlier step. The desktop calls `DELETE /users/me/devices/{id}` on a management node first, so the realm drops the membership; this route only erases what the device holds.
 - The node accepts the wipe, answers, then runs its ordinary shutdown, erases the contents of its storage roots including the persisted identity, and exits with status 79 so a supervisor can tell an erased device from a crash or an ordinary stop.
+- Status 79 is claimed only when every root was emptied. A wipe that left paths behind logs them and exits with status 80: data may still be on disk, so the device must not be treated as erased.
 - The storage roots themselves are kept, so a mounted volume stays mounted.
 - Everything local is lost: queued drafts, blobs, credentials and the node identity. Re-enrolling mints a new node id.
 

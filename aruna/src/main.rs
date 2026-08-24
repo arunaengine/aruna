@@ -968,13 +968,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the owner's wipe erases the roots here and exits with its own status.
     if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
         let failed = device_wipe::purge(wipe.roots());
-        if failed.is_empty() {
+        // Only a complete erasure may claim the wiped status; anything left
+        // behind exits with its own code so a supervisor does not read the
+        // device as erased.
+        let code = if failed.is_empty() {
             info!("Wiped this device on its owner's request");
+            device_wipe::WIPED_EXIT_CODE
         } else {
             error!(paths = failed.len(), "The device wipe left paths behind");
-        }
+            device_wipe::WIPE_INCOMPLETE_EXIT_CODE
+        };
         shutdown_tracing();
-        std::process::exit(device_wipe::WIPED_EXIT_CODE);
+        std::process::exit(code);
     }
 
     match failure {

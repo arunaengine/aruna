@@ -19,8 +19,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 /// Exit status of a wiped node, so a supervisor tells an erased device apart
-/// from a crash (1) and from an ordinary stop (0, 130, 143).
+/// from a crash (1) and from an ordinary stop (0, 130, 143). It claims a
+/// complete erasure and is used only when every root was emptied.
 pub const WIPED_EXIT_CODE: i32 = 79;
+
+/// Exit status when the wipe left paths behind. Data may still be on disk, so
+/// this must never be reported as an erased device.
+pub const WIPE_INCOMPLETE_EXIT_CODE: i32 = 80;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WipeDeviceConfig {
