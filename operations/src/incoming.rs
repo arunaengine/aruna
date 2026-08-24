@@ -89,10 +89,10 @@ impl OperationsInboundHandler {
     }
 
     /// Blob replication is trusted only from realm nodes eligible to hold and
-    /// sync data; unknown or user-kind peers are rejected. On a user device the
-    /// realm nodes are the ones that pull its offered content, so there the
-    /// boundary is realm membership. Fails closed when the config is unreadable.
-    async fn bao_peer_admitted(&self, realm_id: RealmId, local: NodeId, peer: NodeId) -> bool {
+    /// sync data; unknown or user-kind peers are rejected. A device serves the
+    /// same set: the realm nodes pull its offered content, and device-to-device
+    /// transfer is not a path. Fails closed when the config is unreadable.
+    async fn bao_peer_admitted(&self, realm_id: RealmId, peer: NodeId) -> bool {
         let config = match drive(
             GetRealmConfigOperation::new(realm_id),
             self.context.as_ref(),
@@ -105,18 +105,7 @@ impl OperationsInboundHandler {
                 return false;
             }
         };
-        let local = local.to_string();
-        let device = config
-            .nodes
-            .iter()
-            .find(|node| node.node_id == local)
-            .is_some_and(|node| !node.kind.is_sync_eligible());
-        let admitted = if device {
-            config.node_ids()
-        } else {
-            config.sync_eligible_node_ids()
-        };
-        match admitted {
+        match config.sync_eligible_node_ids() {
             Ok(ids) => ids.contains(&peer),
             Err(error) => {
                 warn!(peer = %peer, error = %error, "Failed to resolve replication peers");
@@ -612,11 +601,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                             // may open the blob replication plane at all.
                             let eligible = timeout(
                                 INBOUND_BAO_TIMEOUT,
-                                self.bao_peer_admitted(
-                                    *net_handle.realm_id(),
-                                    net_handle.node_id(),
-                                    node_id,
-                                ),
+                                self.bao_peer_admitted(*net_handle.realm_id(), node_id),
                             )
                             .await
                             .unwrap_or(false);
@@ -643,11 +628,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                             };
                             let eligible = timeout(
                                 INBOUND_BAO_TIMEOUT,
-                                self.bao_peer_admitted(
-                                    *net_handle.realm_id(),
-                                    net_handle.node_id(),
-                                    node_id,
-                                ),
+                                self.bao_peer_admitted(*net_handle.realm_id(), node_id),
                             )
                             .await
                             .unwrap_or(false);
@@ -1232,17 +1213,11 @@ mod tests {
         );
 
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        assert!(handler.bao_peer_admitted(realm_id, server, server).await);
-        assert!(!handler.bao_peer_admitted(realm_id, server, user).await);
-        assert!(!handler.bao_peer_admitted(realm_id, server, unknown).await);
-
-        // On a device the realm nodes pull offered content, so membership is
-        // the boundary; a key outside the realm is still refused.
-        assert!(handler.bao_peer_admitted(realm_id, user, server).await);
-        assert!(!handler.bao_peer_admitted(realm_id, user, unknown).await);
-
-        // An unregistered local node keeps the sync-eligible gate.
-        assert!(!handler.bao_peer_admitted(realm_id, unknown, user).await);
+        assert!(handler.bao_peer_admitted(realm_id, server).await);
+        // A device is never a replication source, and a device serving its own
+        // content admits the realm's infrastructure only.
+        assert!(!handler.bao_peer_admitted(realm_id, user).await);
+        assert!(!handler.bao_peer_admitted(realm_id, unknown).await);
     }
 
     #[tokio::test]
