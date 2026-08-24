@@ -180,6 +180,18 @@ async fn recover_child(
     run_recovery(context, config, status, cancelled).await;
 }
 
+/// A device is started by its desktop app with the environment already set, so
+/// a missing `.env` is a valid profile. A malformed one is still an error.
+fn dotenv_optional(
+    loaded: Result<std::path::PathBuf, dotenvy::Error>,
+) -> Result<(), dotenvy::Error> {
+    match loaded {
+        Ok(_) => Ok(()),
+        Err(error) if error.not_found() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn main() {
     // Both ring and aws-lc-rs are in the graph; rustls needs one picked before any TLS init.
     rustls::crypto::ring::default_provider()
@@ -193,7 +205,7 @@ fn main() {
 
 #[tokio::main]
 async fn async_main() {
-    dotenvy::dotenv().expect("Failed to load .env file");
+    dotenv_optional(dotenvy::dotenv()).expect("Failed to load .env file");
     init_tracing();
 
     let result = run().await;
@@ -541,7 +553,7 @@ async fn provision_realm(
 
 struct ServerBindings {
     rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
-    s3_handle: tokio::task::JoinHandle<()>,
+    s3_handle: Option<tokio::task::JoinHandle<()>>,
     portal_handle: Option<tokio::task::JoinHandle<()>>,
     realm_id: aruna_core::structs::RealmId,
     node_id: iroh::PublicKey,
@@ -602,44 +614,54 @@ async fn bind_servers(
     )
     .await?;
 
-    let s3_server = S3Server::new(
-        &config.s3_address,
-        &config.s3_host,
-        driver_ctx,
-        config.realm_id,
-        config.node_id,
-        aruna_core::credential_seal::CredentialSealKey::derive(&config.node_state.net_secret_key),
-        config.rocrate_limits.clone(),
-        cors,
-        metrics,
-    )
-    .await
-    .unwrap()
-    .with_concurrency_limits(
-        config.rate_limits.s3_max_connections as usize,
-        config.rate_limits.s3_max_requests as usize,
-    )
-    .with_timeouts(s3_timeouts)
-    .with_trusted_proxies(config.trusted_proxies.clone())
-    .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
-        config.rate_limits.ip_per_minute,
-        config.rate_limits.ip_burst,
-        config.rate_limits.principal_per_minute,
-        config.rate_limits.principal_burst,
-    ))
-    .unwrap();
+    // A device profile leaves S3_HOST and S3_ADDRESS unset and serves no S3
+    // endpoint; the config layer keeps the pair whole.
+    let s3_handle = match (config.s3_address.as_deref(), config.s3_host.as_deref()) {
+        (Some(s3_address), Some(s3_host)) => {
+            let s3_server = S3Server::new(
+                s3_address,
+                s3_host,
+                driver_ctx,
+                config.realm_id,
+                config.node_id,
+                aruna_core::credential_seal::CredentialSealKey::derive(
+                    &config.node_state.net_secret_key,
+                ),
+                config.rocrate_limits.clone(),
+                cors,
+                metrics,
+            )
+            .await
+            .unwrap()
+            .with_concurrency_limits(
+                config.rate_limits.s3_max_connections as usize,
+                config.rate_limits.s3_max_requests as usize,
+            )
+            .with_timeouts(s3_timeouts)
+            .with_trusted_proxies(config.trusted_proxies.clone())
+            .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+                config.rate_limits.ip_per_minute,
+                config.rate_limits.ip_burst,
+                config.rate_limits.principal_per_minute,
+                config.rate_limits.principal_burst,
+            ))
+            .unwrap();
 
-    let s3_listener = TcpListener::bind(&config.s3_address).await.unwrap();
-    let s3_bound_addr = s3_listener.local_addr().unwrap();
-    state
-        .register_s3_interface(
-            s3_bound_addr,
-            config.s3_public_url.as_deref().unwrap_or(&config.s3_host),
-        )
-        .await;
-    let (_s3_addr, s3_handle) = s3_server
-        .run_with_listener(s3_listener, shutdown.token())
-        .unwrap();
+            let s3_listener = TcpListener::bind(s3_address).await.unwrap();
+            let s3_bound_addr = s3_listener.local_addr().unwrap();
+            state
+                .register_s3_interface(
+                    s3_bound_addr,
+                    config.s3_public_url.as_deref().unwrap_or(s3_host),
+                )
+                .await;
+            let (_s3_addr, s3_handle) = s3_server
+                .run_with_listener(s3_listener, shutdown.token())
+                .unwrap();
+            Some(s3_handle)
+        }
+        _ => None,
+    };
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
     let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
@@ -695,6 +717,16 @@ async fn portal_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String
         Some(handle) => match handle.await {
             Ok(()) => "Portal server stopped unexpectedly".to_string(),
             Err(error) => format!("Portal server panicked: {error}"),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn s3_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+    match handle {
+        Some(handle) => match handle.await {
+            Ok(()) => "S3 server stopped unexpectedly".to_string(),
+            Err(error) => format!("S3 server panicked: {error}"),
         },
         None => std::future::pending().await,
     }
@@ -843,18 +875,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     let mut rest_handle = Some(rest_handle);
-    let mut s3_handle = Some(s3_handle);
+    let mut s3_handle = s3_handle;
 
     // A server that returns before shutdown was requested has failed: the node
     // is no longer serving, so it must not exit as success.
     let mut failure: Option<String> = None;
     tokio::select! {
-        result = s3_handle.as_mut().expect("s3 server handle is present") => {
+        message = s3_exit(s3_handle.as_mut()) => {
             s3_handle = None;
-            failure = Some(match result {
-                Ok(()) => "S3 server stopped unexpectedly".to_string(),
-                Err(error) => format!("S3 server panicked: {error}"),
-            });
+            failure = Some(message);
         }
         result = rest_handle.as_mut().expect("rest server handle is present") => {
             rest_handle = None;
@@ -983,8 +1012,9 @@ async fn build_docker(
     }
     if !config
         .s3_address
-        .parse::<std::net::SocketAddr>()
-        .is_ok_and(|address| !address.ip().is_loopback())
+        .as_deref()
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| !address.ip().is_loopback())
     {
         return Err("Docker executor requires a non-loopback S3_ADDRESS"
             .to_string()
@@ -1402,6 +1432,29 @@ mod tests {
 
         let mut panicked = tokio::spawn(async { panic!("portal panicked") });
         assert!(portal_exit(Some(&mut panicked)).await.contains("panicked"));
+    }
+
+    #[test]
+    fn dotenv_allows_missing() {
+        // No .env is a device profile; a malformed one must still fail startup.
+        assert!(dotenv_optional(Ok(std::path::PathBuf::from(".env"))).is_ok());
+        assert!(
+            dotenv_optional(Err(dotenvy::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound
+            ))))
+            .is_ok()
+        );
+        assert!(dotenv_optional(Err(dotenvy::Error::LineParse("KEY".into(), 1))).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_exit_pends() {
+        // Without an S3 listener the failure select must never fire for it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), s3_exit(None))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]

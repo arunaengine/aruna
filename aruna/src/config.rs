@@ -95,13 +95,14 @@ pub struct Config {
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
-    pub s3_host: String,
+    /// Absent together with `s3_address` when no S3 listener is configured.
+    pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
     pub rate_limits: RateLimitSettings,
-    pub s3_address: String,
+    pub s3_address: Option<String>,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub realm_description: String,
@@ -375,13 +376,14 @@ pub struct Settings {
     pub max_concurrent_bidi_streams: Option<u64>,
     pub document_sync_runtime: IrohRuntimeConfig,
     pub default_metadata_replication_factor: u32,
-    pub s3_host: String,
+    /// Absent together with `s3_address` when no S3 listener is configured.
+    pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
     pub rate_limits: RateLimitSettings,
-    pub s3_address: String,
+    pub s3_address: Option<String>,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub realm_description: String,
@@ -502,14 +504,25 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .transpose()?
         .unwrap_or(3)
         .max(1);
-    let s3_host = dotenvy::var("S3_HOST")?;
     let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
     let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
     let trusted_proxies = trusted_proxies_env()?;
     let rocrate_limits = rocrate_limits_env()?;
     let rate_limits = rate_limits_env()?;
-    let s3_address = dotenvy::var("S3_ADDRESS")?;
-    SocketAddr::from_str(&s3_address)?;
+    // A device profile runs without an S3 listener. Both variables describe the
+    // same endpoint, so half a pair is a misconfiguration rather than a profile.
+    let (s3_host, s3_address) = match (
+        optional_nonempty_env("S3_HOST")?,
+        optional_nonempty_env("S3_ADDRESS")?,
+    ) {
+        (Some(host), Some(address)) => {
+            SocketAddr::from_str(&address)?;
+            (Some(host), Some(address))
+        }
+        (None, None) => (None, None),
+        (Some(_), None) => return Err(SetupError::MissingConfigValue("S3_ADDRESS")),
+        (None, Some(_)) => return Err(SetupError::MissingConfigValue("S3_HOST")),
+    };
     let node_labels = parse_node_labels_env()?;
     let node_location = dotenvy::var("ARUNA_NODE_LOCATION")
         .ok()
@@ -1381,6 +1394,9 @@ async fn bootstrap_onboarded_node_state(
                     SetupError::MissingOnboardingMaterial(OnboardingMode::Server),
                 )?,
             },
+            // A device holds no realm or issuer key material: its authority is
+            // its owner's, carried by the membership record written at finalize.
+            OnboardingMode::User { .. } => PersistedNodeIdentity::User,
         };
 
     Ok(BootstrappedNodeState {
@@ -1773,7 +1789,7 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        S3ServerTimeouts, fjall_persist_policy_env, load, load_oidc_providers_from_env,
+        S3ServerTimeouts, SetupError, fjall_persist_policy_env, load, load_oidc_providers_from_env,
         parse_node_labels_env, persist_node_state, portal_config_env, read_settings,
         rocrate_limits_env, validate_public_url,
     };
@@ -1984,6 +2000,41 @@ mod tests {
             settings.s3_stream_lifetime_timeout_secs,
             defaults.stream_lifetime.as_secs()
         );
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn s3_listener_optional() {
+        // A device profile configures no S3 endpoint; half a pair stays an error.
+        let _guard = env_lock().lock().await;
+        let dir = tempdir().unwrap();
+        let vars = ["STORAGE_PATH", "SOCKET_ADDRESS", "S3_HOST", "S3_ADDRESS"];
+        let previous = vars
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        unsafe {
+            std::env::set_var("STORAGE_PATH", dir.path().to_str().unwrap());
+            std::env::set_var("SOCKET_ADDRESS", "127.0.0.1:0");
+            std::env::remove_var("S3_HOST");
+            std::env::remove_var("S3_ADDRESS");
+        }
+
+        let settings = read_settings().unwrap();
+        assert!(settings.s3_host.is_none());
+        assert!(settings.s3_address.is_none());
+
+        unsafe { std::env::set_var("S3_HOST", "127.0.0.1:0") };
+        assert!(matches!(
+            read_settings(),
+            Err(SetupError::MissingConfigValue("S3_ADDRESS"))
+        ));
+
+        unsafe { std::env::set_var("S3_ADDRESS", "127.0.0.1:0") };
+        let settings = read_settings().unwrap();
+        assert_eq!(settings.s3_host.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(settings.s3_address.as_deref(), Some("127.0.0.1:0"));
 
         restore_env(previous);
     }
