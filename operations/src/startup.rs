@@ -1650,6 +1650,8 @@ mod tests {
     use tempfile::tempdir;
 
     const RECOVERY_TEST_GUARD: Duration = Duration::from_secs(5 * 60);
+    /// Real-time grace before a pass that published nothing counts as stuck.
+    const RECOVERY_PASS_GRACE: Duration = Duration::from_secs(5);
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -2050,22 +2052,39 @@ mod tests {
         (status, cancelled, driver)
     }
 
-    /// Advances virtual time only while the driver sleeps between passes, so
-    /// deadlines guarding real work inside a pass can never fire spuriously.
-    async fn advance_quiet(status: &RecoveryStatus, step: Duration) {
-        tokio::task::yield_now().await;
-        if status.snapshot().state == RecoveryState::Degraded {
-            tokio::time::advance(step).await;
+    /// Holds virtual time still while a pass runs, so deadlines guarding real
+    /// work inside it cannot fire spuriously. A pass may itself wait on a
+    /// deadline, so the clock resumes once one has stalled for real seconds.
+    #[derive(Default)]
+    struct PassClock {
+        running_since: Option<std::time::Instant>,
+    }
+
+    impl PassClock {
+        async fn tick(&mut self, status: &RecoveryStatus, step: Duration) {
+            tokio::task::yield_now().await;
+            if status.snapshot().state == RecoveryState::Degraded {
+                self.running_since = None;
+                tokio::time::advance(step).await;
+                return;
+            }
+            let since = *self
+                .running_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= RECOVERY_PASS_GRACE {
+                tokio::time::advance(step).await;
+            }
         }
     }
 
     async fn wait_state(status: &RecoveryStatus, expected: RecoveryState) {
         let wait = async {
+            let mut clock = PassClock::default();
             loop {
                 if status.snapshot().state == expected {
                     return;
                 }
-                advance_quiet(status, Duration::from_millis(100)).await;
+                clock.tick(status, Duration::from_millis(100)).await;
             }
         };
         tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
@@ -2075,11 +2094,12 @@ mod tests {
 
     async fn wait_partial(status: &RecoveryStatus, target: u64) {
         let wait = async {
+            let mut clock = PassClock::default();
             loop {
                 if status.pass_total(RecoveryOutcome::Partial) >= target {
                     return;
                 }
-                advance_quiet(status, Duration::from_millis(100)).await;
+                clock.tick(status, Duration::from_millis(100)).await;
             }
         };
         tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
@@ -2091,13 +2111,14 @@ mod tests {
         let wait = async {
             let mut observed = 0;
             let mut previous = None;
+            let mut clock = PassClock::default();
             loop {
                 let partial = status.pass_total(RecoveryOutcome::Partial);
                 if partial <= observed || status.snapshot().state != RecoveryState::Degraded {
-                    advance_quiet(status, Duration::from_millis(100)).await;
+                    clock.tick(status, Duration::from_millis(100)).await;
                     continue;
                 }
-                advance_quiet(status, RECOVERY_RETRY_BASE / 2).await;
+                clock.tick(status, RECOVERY_RETRY_BASE / 2).await;
                 if status.snapshot().state == RecoveryState::Degraded
                     && status.pass_total(RecoveryOutcome::Partial) == partial
                 {
