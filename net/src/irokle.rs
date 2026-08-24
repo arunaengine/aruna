@@ -6422,10 +6422,11 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
             | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
             | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+            | AdminDocumentOperation::RealmConfigComputeSet { .. }
             | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, and token revocations"
+            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, and token revocations"
                 .to_string(),
         ));
     }
@@ -13328,6 +13329,77 @@ mod tests {
         .expect("device removal applies");
 
         assert!(realm_config_nodes(&read_realm_config_doc(&storage, realm_id).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn replicates_compute_config() {
+        // Planners on receiving nodes only see operator compute knowledge if
+        // the realm config apply path admits the replicated operation.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([54; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_470, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let compute = aruna_core::structs::RealmComputeConfig {
+            witness_base_delay_ms: 4_200,
+            ..Default::default()
+        };
+
+        for (seq, op) in [
+            (
+                1,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: node(8),
+                    kind: RealmNodeKind::Management,
+                },
+            ),
+            (
+                2,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(32, "https://compute.example:443"),
+                },
+            ),
+        ] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(1_470 + seq, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    op,
+                ),
+            )
+            .await
+            .expect("realm config bootstrap applies");
+        }
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(1_473, 1),
+                target,
+                &actor,
+                3,
+                AdminDocumentOperation::RealmConfigComputeSet {
+                    compute: compute.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("replicated compute config applies");
+
+        assert_eq!(
+            read_realm_config_doc(&storage, realm_id).await.compute,
+            compute
+        );
     }
 
     #[tokio::test]
