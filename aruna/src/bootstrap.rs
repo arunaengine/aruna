@@ -32,7 +32,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 const ONBOARDING_PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -243,6 +243,12 @@ pub async fn wait_for_onboarding_placement(
         loop {
             let config = drive(GetRealmConfigOperation::new(realm_id), driver_ctx).await?;
             if node_is_ready(&config, node_id) {
+                info!(
+                    realm_id = %realm_id,
+                    node_id = %node_id,
+                    kind = kind_label(&config, node_id),
+                    "Onboarding complete: the node joined its realm"
+                );
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
 
@@ -264,6 +270,22 @@ pub async fn wait_for_onboarding_placement(
     .map_err(|_| {
         format!("timed out after {timeout:?} waiting for onboarding placement for node {node_id}")
     })?
+}
+
+/// Node-kind label for the completion log; the owner of a device stays out of it.
+fn kind_label(config: &aruna_core::structs::RealmConfigDocument, node_id: NodeId) -> &'static str {
+    let node_id = node_id.to_string();
+    match config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| &node.kind)
+    {
+        Some(aruna_core::structs::RealmNodeKind::Management) => "management",
+        Some(aruna_core::structs::RealmNodeKind::Server) => "server",
+        Some(aruna_core::structs::RealmNodeKind::User { .. }) => "user",
+        None => "unknown",
+    }
 }
 
 fn node_is_ready(config: &aruna_core::structs::RealmConfigDocument, node_id: NodeId) -> bool {
