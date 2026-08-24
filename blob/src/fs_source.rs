@@ -6,8 +6,7 @@
 //! it stays inside the offered directory; a link, or a link component, leaving
 //! it is refused. The check is not atomic with the open that follows it, so
 //! this is a resolve-and-verify guarantee, not a kernel-enforced no-follow
-//! open: only regular files are opened, and every complete read revalidates the
-//! file's fingerprint before its bytes are accepted as one representation.
+//! open: only regular files are opened.
 
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -16,7 +15,7 @@ use aruna_core::structs::{
     SourceEntryKind, SourceMetadata, weak_fingerprint,
 };
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use tokio::io::AsyncSeekExt;
@@ -58,6 +57,9 @@ pub(crate) async fn list_local(
     let (root, path) = access_parts(access)?;
     let resolved_root = canonical_root(&root).await?;
     let start = jailed_entry(&resolved_root, &path).await?;
+    // Resolved directories already queued. A link to an ancestor inside the
+    // offered root would otherwise walk in circles forever.
+    let mut visited = HashSet::from([start.clone()]);
     let mut queue = VecDeque::from([(start, path)]);
     let mut entries = Vec::new();
     let mut skipped = 0usize;
@@ -84,7 +86,7 @@ pub(crate) async fn list_local(
                 continue;
             };
             let kind = if metadata.is_dir() {
-                if recursive {
+                if recursive && visited.insert(resolved.clone()) {
                     queue.push_back((resolved, relative.clone()));
                 }
                 if files_only {
@@ -342,6 +344,27 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, vec!["nested/inner.txt", "top.txt"]);
         assert_eq!(entries[0].size, Some(2));
+    }
+
+    // A link back to an ancestor inside the offered root must not make the walk
+    // circle forever.
+    #[tokio::test]
+    async fn bounds_linked_cycle() {
+        let root = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(root.path().join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("nested/inner.txt"), b"in")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(root.path(), root.path().join("nested/loop")).unwrap();
+
+        let (entries, truncated) = list_local(&access(root.path(), ""), 0, 100, true, true)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, vec!["nested/inner.txt"]);
     }
 
     // A rewrite during a complete read must fail the stream: those bytes are
