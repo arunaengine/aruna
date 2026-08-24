@@ -807,6 +807,8 @@ pub struct RealmOidcProviderResponse {
 pub struct RealmNodeInfoResponse {
     pub node_id: String,
     pub kind: RealmNodeKindInfo,
+    /// Owner of a `user` node; null for infrastructure nodes.
+    pub owner: Option<String>,
     pub configured: bool,
     pub present: bool,
     pub connection_status: RealmNodeConnectionStatus,
@@ -964,6 +966,7 @@ token of another realm or one this node cannot validate, the response is the pub
                             {
                                 "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                                 "kind": "server",
+                                "owner": null,
                                 "configured": true,
                                 "present": true,
                                 "connection_status": "connected",
@@ -984,6 +987,7 @@ token of another realm or one this node cannot validate, the response is the pub
                             {
                                 "node_id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
                                 "kind": "user",
+                                "owner": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                                 "configured": true,
                                 "present": false,
                                 "connection_status": "configured",
@@ -1866,6 +1870,7 @@ fn map_realm_nodes(
             RealmNodeInfoResponse {
                 node_id: node.node_id.clone(),
                 kind: RealmNodeKindInfo::from(&node.kind),
+                owner: node.kind.owner().map(|owner| owner.to_string()),
                 configured: true,
                 present,
                 connection_status: if present {

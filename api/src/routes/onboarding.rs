@@ -60,6 +60,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(bootstrap_onboarding))
         .routes(routes!(create_onboarding_secret, list_onboarding_secrets))
         .routes(routes!(revoke_onboarding_secret))
+        .routes(routes!(get_onboarding_secret_status))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -123,6 +124,19 @@ pub struct RealmEndpointDoc {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct ListOnboardingSecretsResponse {
     pub secrets: Vec<OnboardingSecretSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct OnboardingSecretStatusResponse {
+    pub enrollment_id: String,
+    pub mode: String,
+    /// Owner a `User` secret is bound to; null for infrastructure modes.
+    pub owner: Option<String>,
+    /// `pending`, `claimed` or `expired`.
+    pub status: String,
+    /// Node that claimed the secret, once one has.
+    pub claimed_node_id: Option<String>,
+    pub expires_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -447,6 +461,91 @@ pub async fn revoke_onboarding_secret(
     .map_err(map_delete_error)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/onboarding/secrets/{id}/status",
+    tag = "onboarding",
+    summary = "Poll an enrollment secret's claim state",
+    description = r#"Reports whether an outstanding enrollment secret is still pending, already claimed or expired.
+
+**Authentication**: bearer token of this realm. The owner a `User` secret is bound to may poll its
+own secret; every other caller needs WRITE on the realm's onboarding admin path. Only a management
+node serves the route.
+
+**Behavior**
+- This is the wizard's progress poll: mint a secret, hand it to the joiner, then watch this route
+  until `status` turns `claimed` and `claimed_node_id` names the node that redeemed it.
+- `pending` means the secret is live and unclaimed, `claimed` means a joiner has reserved,
+  finalized or consumed it, and `expired` means its lifetime ran out before any joiner claimed it.
+- A claim outlives the secret's expiry: a secret claimed before it expired keeps reading `claimed`.
+- The secret value itself is never returned, because only its hash was kept when it was minted.
+- Nothing here is realm-wide: it is the claim state this management node recorded.
+
+**Errors**: an unknown, revoked or already pruned enrollment id answers 404, which is also what a
+caller sees after the enrollment finished and the record was cleaned up."#,
+    params(("id" = String, Path, description = "Enrollment id of the secret, the ULID reported when it was minted")),
+    responses(
+        (
+            status = 200,
+            description = "The claim state this node recorded for the secret",
+            body = OnboardingSecretStatusResponse,
+            example = json!({
+                "enrollment_id": "01JABCDEF0123456789ABCDEFG",
+                "mode": "User",
+                "owner": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "status": "claimed",
+                "claimed_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                "expires_at": 1775748191
+            })
+        ),
+        (status = 400, description = "The enrollment id is not a ULID", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is neither the secret's owner nor an onboarding administrator, or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 404, description = "No enrollment secret with this id on this node", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_onboarding_secret_status(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(enrollment_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<OnboardingSecretStatusResponse>)> {
+    let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::BadRequest)?;
+    let caller = auth.clone().ok_or(ServerError::Unauthorized)?;
+    let entry = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?
+        .into_iter()
+        .find(|entry| entry.record.enrollment_id == enrollment_id)
+        .ok_or(ServerError::NotFound)?;
+
+    // The owner polls its own device; anybody else needs the admin path.
+    let owns = caller.realm_id == state.get_realm_id()
+        && entry.record.mode.owner() == Some(caller.user_id);
+    if !owns {
+        authorize_onboarding_admin(&state, auth).await?;
+    }
+
+    let claimed_node_id = entry.state.claimed_node_id().map(str::to_string);
+    let status = match (&claimed_node_id, entry.record.expires_at < now_timestamp()) {
+        (Some(_), _) => "claimed",
+        (None, true) => "expired",
+        (None, false) => "pending",
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(OnboardingSecretStatusResponse {
+            enrollment_id: entry.record.enrollment_id.to_string(),
+            mode: format!("{:?}", RequestedOnboardingMode::from(entry.record.mode)),
+            owner: entry.record.mode.owner().map(|owner| owner.to_string()),
+            status: status.to_string(),
+            claimed_node_id,
+            expires_at: entry.record.expires_at,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -860,8 +959,8 @@ fn wrap_realm_private_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerError, bootstrap_onboarding, create_onboarding_secret, list_onboarding_secrets,
-        map_finalize_error, revoke_onboarding_secret,
+        ServerError, bootstrap_onboarding, create_onboarding_secret, get_onboarding_secret_status,
+        list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,
     };
     use crate::server_state::ServerState;
     use aruna_core::UserId;
@@ -1181,6 +1280,94 @@ mod tests {
         let owner = user_id.to_string();
         assert_eq!(listed.secrets[0].mode, "User");
         assert_eq!(listed.secrets[0].owner.as_deref(), Some(owner.as_str()));
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn polls_secret_status() {
+        // The owner may watch its own secret; a stranger may not.
+        let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let (_, Json(created)) = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(CreateOnboardingSecretRequest {
+                seed_url: "http://127.0.0.1:3000".to_string(),
+                mode: RequestedOnboardingMode::User,
+                expires_in_seconds: Some(600),
+            }),
+        )
+        .await
+        .unwrap();
+        let secret = OnboardingSecret::decode(&created.onboarding_secret).unwrap();
+        let enrollment_id = secret.enrollment_id.to_string();
+
+        let (_, Json(status)) = get_onboarding_secret_status(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(enrollment_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.status, "pending");
+        assert_eq!(status.mode, "User");
+        assert_eq!(status.owner.as_deref(), Some(user_id.to_string().as_str()));
+        assert!(status.claimed_node_id.is_none());
+
+        let stranger = get_onboarding_secret_status(
+            State(state.clone()),
+            Extension(Some(AuthContext {
+                user_id: UserId::local(Ulid::generate(), realm_id),
+                realm_id,
+                path_restrictions: None,
+            })),
+            Path(enrollment_id.clone()),
+        )
+        .await;
+        assert!(matches!(stranger, Err(ServerError::Forbidden)));
+
+        drive(
+            ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
+                enrollment_id: secret.enrollment_id,
+                secret_hash: secret.secret_hash(),
+                node_id: "device-a".to_string(),
+                now: 1,
+                reservation_expires_at: u64::MAX,
+                finalizing: true,
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let (_, Json(status)) = get_onboarding_secret_status(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Path(enrollment_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.status, "claimed");
+        assert_eq!(status.claimed_node_id.as_deref(), Some("device-a"));
+
+        let missing = get_onboarding_secret_status(
+            State(state),
+            Extension(Some(AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            })),
+            Path(Ulid::generate().to_string()),
+        )
+        .await;
+        assert!(matches!(missing, Err(ServerError::NotFound)));
 
         net_handle.shutdown().await;
     }

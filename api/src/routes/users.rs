@@ -1,4 +1,4 @@
-use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
@@ -11,17 +11,22 @@ use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::delete_onboarding_secret::{
+    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::ensure_canonical_user_token_subject::{
     EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
 };
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
+use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_operations::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
 use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
 use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
 use aruna_operations::read_realm_authorization::{
     ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
@@ -60,6 +65,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(search_users))
         .routes(routes!(resolve_users))
         .routes(routes!(get_user, update_user))
+        .routes(routes!(list_user_devices))
+        .routes(routes!(revoke_user_device))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -166,6 +173,26 @@ pub struct GetUserInfoResponse {
     pub realm: UserInfoRealmResponse,
     pub groups: Vec<UserInfoGroupResponse>,
     pub preferences: UserInfoPreferencesResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserDevicesResponse {
+    pub devices: Vec<UserDeviceResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserDeviceResponse {
+    /// Identifier this device is addressed by: its node id once enrolled, its
+    /// enrollment id while the secret is still outstanding.
+    pub id: String,
+    /// Node id, set once the device has joined the realm configuration.
+    pub node_id: Option<String>,
+    /// Enrollment id, set while an enrollment secret is still outstanding.
+    pub enrollment_id: Option<String>,
+    /// `enrolled`, `claimed` or `pending`.
+    pub status: String,
+    /// Expiry of an outstanding enrollment secret, in Unix seconds.
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1419,6 +1446,188 @@ async fn update_user(
     Ok((StatusCode::OK, Json(user.into())))
 }
 
+/// The caller's devices, enrolled and still enrolling. A device's owner lives
+/// in its membership kind, so the realm configuration is the authority here and
+/// an outstanding enrollment secret only shows what has not landed yet.
+async fn owned_devices(
+    state: &Arc<ServerState>,
+    owner: aruna_core::UserId,
+) -> ServerResult<Vec<UserDeviceResponse>> {
+    let config = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        GetRealmConfigError::DocumentNotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    let mut devices = config
+        .nodes
+        .iter()
+        .filter(|node| node.kind.owner() == Some(owner))
+        .map(|node| UserDeviceResponse {
+            id: node.node_id.clone(),
+            node_id: Some(node.node_id.clone()),
+            enrollment_id: None,
+            status: "enrolled".to_string(),
+            expires_at: None,
+        })
+        .collect::<Vec<_>>();
+
+    let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    for entry in secrets {
+        if entry.record.mode.owner() != Some(owner) {
+            continue;
+        }
+        let claimed = entry.state.claimed_node_id().map(str::to_string);
+        if claimed
+            .as_ref()
+            .is_some_and(|node_id| devices.iter().any(|device| &device.id == node_id))
+        {
+            continue;
+        }
+        devices.push(UserDeviceResponse {
+            id: entry.record.enrollment_id.to_string(),
+            node_id: claimed.clone(),
+            enrollment_id: Some(entry.record.enrollment_id.to_string()),
+            status: if claimed.is_some() {
+                "claimed"
+            } else {
+                "pending"
+            }
+            .to_string(),
+            expires_at: Some(entry.record.expires_at),
+        });
+    }
+
+    Ok(devices)
+}
+
+#[utoipa::path(
+    get,
+    path = "/users/me/devices",
+    tag = "users",
+    summary = "List the calling user's devices",
+    description = r#"Lists the devices this user has enrolled, plus the device enrollments still in flight.
+
+**Authentication**: realm bearer token. Self-scoped: it always lists the caller's own devices and
+takes no user id, so it grants no view of anybody else's.
+
+**Behavior**
+- An enrolled device is a realm member of kind `User` whose owner is the caller; it reads
+  `enrolled` and is addressed by its node id.
+- An enrollment whose secret is still outstanding reads `pending`, or `claimed` once a device has
+  redeemed the secret but the realm configuration has not caught up; it is addressed by its
+  enrollment id and carries the secret's expiry.
+- An enrollment is dropped from the list as soon as the device it claimed appears as a member, so
+  one device is listed once.
+- The realm configuration is the authority on ownership, and the outstanding secrets are this
+  node's local state, so a device enrolled elsewhere appears once that configuration replicates
+  here.
+
+**Errors**: 404 means this node holds no configuration document for its realm yet."#,
+    responses(
+        (
+            status = 200,
+            description = "The caller's enrolled devices and in-flight device enrollments",
+            body = UserDevicesResponse,
+            example = json!({
+                "devices": [
+                    {
+                        "id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "enrollment_id": null,
+                        "status": "enrolled",
+                        "expires_at": null
+                    },
+                    {
+                        "id": "01JABCDEF0123456789ABCDEFG",
+                        "node_id": null,
+                        "enrollment_id": "01JABCDEF0123456789ABCDEFG",
+                        "status": "pending",
+                        "expires_at": 1775748191
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
+        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_user_devices(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<UserDevicesResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let devices = owned_devices(&state, auth.user_id).await?;
+    Ok((StatusCode::OK, Json(UserDevicesResponse { devices })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/users/me/devices/{id}",
+    tag = "users",
+    summary = "Revoke one of the calling user's devices",
+    description = r#"Revokes a device enrollment of the calling user, making its secret unredeemable from here on.
+
+**Authentication**: realm bearer token. Self-scoped: only a device owned by the caller can be
+revoked, and a device owned by anybody else answers 404 rather than admitting it exists.
+
+**Behavior**
+- `id` is what `GET /users/me/devices` reported: an enrollment id while the enrollment is still in
+  flight, or a node id once the device has joined.
+- Revoking an in-flight enrollment deletes the enrollment record on this node, so the secret can
+  no longer be redeemed. It does not reach back into an enrollment that already completed.
+- Evicting a device that already joined the realm is not implemented yet: removing a member from
+  the realm configuration has no administrative event, so such a request answers 501 and the
+  device stays a member.
+
+**Errors**: an id that is neither an enrollment id nor a node id of a device owned by the caller
+answers 404, which is also what a caller sees after an earlier revoke."#,
+    params(("id" = String, Path, description = "Enrollment id or node id of the device, as reported by GET /users/me/devices")),
+    responses(
+        (status = 204, description = "Device enrollment revoked and no longer redeemable; no response body"),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
+        (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse),
+        (status = 501, description = "The device already joined the realm and member eviction is not implemented yet", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn revoke_user_device(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(device_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_realm_auth(&state, auth)?;
+    let device = owned_devices(&state, auth.user_id)
+        .await?
+        .into_iter()
+        .find(|device| device.id == device_id)
+        .ok_or(ServerError::NotFound)?;
+    let Some(enrollment_id) = device.enrollment_id else {
+        return Err(ServerError::Unimplemented);
+    };
+    let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::NotFound)?;
+
+    drive(
+        DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput { enrollment_id }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        DeleteOnboardingSecretError::NotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
@@ -2552,5 +2761,229 @@ mod resolve_tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::BadRequest)));
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::{UserDeviceResponse, list_user_devices, revoke_user_device};
+    use crate::error::ServerError;
+    use crate::server_state::ServerState;
+    use aruna_core::UserId;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::handle::Handle;
+    use aruna_core::keys::generate_signing_key;
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_core::structs::{
+        Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
+    use aruna_operations::create_onboarding_secret::{
+        CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+    };
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_storage::FjallStorage;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::{Extension, Json};
+    use byteview::ByteView;
+    use std::sync::Arc;
+    use tempfile::{TempDir, tempdir};
+    use ulid::Ulid;
+
+    struct Fixture {
+        state: Arc<ServerState>,
+        owner: UserId,
+        other: UserId,
+        _dir: TempDir,
+    }
+
+    fn node(seed: u8) -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// One device and one outstanding enrollment per owner, plus a management
+    /// node, so every filter the routes apply has something to reject.
+    async fn setup_devices() -> Fixture {
+        let dir = tempdir().unwrap();
+        let storage_handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let realm_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let owner = UserId::local(Ulid::generate(), realm_id);
+        let other = UserId::local(Ulid::generate(), realm_id);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(node(1), RealmNodeKind::Management);
+        config.ensure_node(node(2), RealmNodeKind::User { owner });
+        config.ensure_node(node(3), RealmNodeKind::User { owner: other });
+        let actor = Actor {
+            node_id: node(1),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        driver_ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(realm_id.as_bytes().to_vec()),
+                value: ByteView::from(config.to_bytes(&actor).unwrap()),
+                txn_id: None,
+            }))
+            .await;
+
+        for secret_owner in [owner, other] {
+            drive(
+                CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+                    record: OnboardingSecretRecord {
+                        enrollment_id: Ulid::generate(),
+                        secret_hash: Ulid::generate().to_string(),
+                        mode: OnboardingMode::User {
+                            owner: secret_owner,
+                        },
+                        purpose: OnboardingPurpose::NodeEnrollment,
+                        expires_at: u64::MAX,
+                        claimed_node_id: None,
+                    },
+                }),
+                driver_ctx.as_ref(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node(1),
+                NodeCapabilities::management_node(realm_signing_key).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+        Fixture {
+            state,
+            owner,
+            other,
+            _dir: dir,
+        }
+    }
+
+    fn auth(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: user_id.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    async fn devices(state: &Arc<ServerState>, owner: UserId) -> Vec<UserDeviceResponse> {
+        let (_, Json(listed)) =
+            list_user_devices(State(state.clone()), Extension(Some(auth(owner))))
+                .await
+                .unwrap();
+        listed.devices
+    }
+
+    #[tokio::test]
+    async fn lists_owned_devices() {
+        let fixture = setup_devices().await;
+        let listed = devices(&fixture.state, fixture.owner).await;
+
+        assert_eq!(listed.len(), 2);
+        let enrolled = listed
+            .iter()
+            .find(|device| device.status == "enrolled")
+            .expect("the enrolled device");
+        assert_eq!(
+            enrolled.node_id.as_deref(),
+            Some(node(2).to_string()).as_deref()
+        );
+        assert!(enrolled.enrollment_id.is_none());
+        let pending = listed
+            .iter()
+            .find(|device| device.status == "pending")
+            .expect("the outstanding enrollment");
+        assert_eq!(pending.enrollment_id.as_deref(), Some(pending.id.as_str()));
+        assert!(pending.expires_at.is_some());
+
+        let foreign = devices(&fixture.state, fixture.other).await;
+        assert!(
+            foreign
+                .iter()
+                .all(|device| device.id != node(2).to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn revokes_pending_device() {
+        let fixture = setup_devices().await;
+        let pending = devices(&fixture.state, fixture.owner)
+            .await
+            .into_iter()
+            .find(|device| device.status == "pending")
+            .expect("the outstanding enrollment");
+
+        let status = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(pending.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let listed = devices(&fixture.state, fixture.owner).await;
+        assert!(listed.iter().all(|device| device.status == "enrolled"));
+
+        let repeated = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(pending.id),
+        )
+        .await;
+        assert!(matches!(repeated, Err(ServerError::NotFound)));
+
+        // Another owner's outstanding enrollment stays untouched.
+        assert!(
+            devices(&fixture.state, fixture.other)
+                .await
+                .iter()
+                .any(|device| device.status == "pending")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_stranger_device() {
+        let fixture = setup_devices().await;
+
+        let foreign = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(node(3).to_string()),
+        )
+        .await;
+        assert!(matches!(foreign, Err(ServerError::NotFound)));
+
+        // Evicting an enrolled member has no administrative event yet.
+        let enrolled = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(node(2).to_string()),
+        )
+        .await;
+        assert!(matches!(enrolled, Err(ServerError::Unimplemented)));
+
+        let anonymous = list_user_devices(State(fixture.state), Extension(None)).await;
+        assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
     }
 }
