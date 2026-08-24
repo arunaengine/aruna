@@ -35,6 +35,9 @@ use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocume
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
+use aruna_operations::remove_device_node::{
+    RemoveDeviceNodeConfig, RemoveDeviceNodeError, RemoveDeviceNodeOperation,
+};
 use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
@@ -43,6 +46,7 @@ use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::error;
 use ulid::Ulid;
@@ -1583,19 +1587,20 @@ revoked, and a device owned by anybody else answers 404 rather than admitting it
   flight, or a node id once the device has joined.
 - Revoking an in-flight enrollment deletes the enrollment record on this node, so the secret can
   no longer be redeemed. It does not reach back into an enrollment that already completed.
-- Evicting a device that already joined the realm is not implemented yet: removing a member from
-  the realm configuration has no administrative event, so such a request answers 501 and the
-  device stays a member.
+- Evicting a device that already joined drops it from the realm configuration and retires the
+  secret it redeemed. The eviction replicates like any other configuration change, and each node
+  closes the device's open connections when it applies the new membership.
+- The eviction is a realm configuration change, so it must be sent to a management node; another
+  node answers 403 because its peers would refuse the event.
 
 **Errors**: an id that is neither an enrollment id nor a node id of a device owned by the caller
 answers 404, which is also what a caller sees after an earlier revoke."#,
     params(("id" = String, Path, description = "Enrollment id or node id of the device, as reported by GET /users/me/devices")),
     responses(
-        (status = 204, description = "Device enrollment revoked and no longer redeemable; no response body"),
+        (status = 204, description = "Device enrollment revoked, or the device evicted from the realm; no response body"),
         (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
-        (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse),
-        (status = 501, description = "The device already joined the realm and member eviction is not implemented yet", body = ErrorResponse)
+        (status = 403, description = "The token was issued by another realm, or this node is not a management node", body = ErrorResponse),
+        (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1610,11 +1615,52 @@ async fn revoke_user_device(
         .into_iter()
         .find(|device| device.id == device_id)
         .ok_or(ServerError::NotFound)?;
-    let Some(enrollment_id) = device.enrollment_id else {
-        return Err(ServerError::Unimplemented);
-    };
-    let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::NotFound)?;
+    if let Some(enrollment_id) = device.enrollment_id {
+        let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::NotFound)?;
+        delete_enrollment(&state, enrollment_id).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
 
+    // The redeemed secret goes first: it would otherwise resurface as an
+    // in-flight enrollment once the device is no longer listed as a member.
+    if let Some(enrollment_id) = claimed_enrollment(&state, &device.id).await? {
+        delete_enrollment(&state, enrollment_id).await?;
+    }
+    let node_id = aruna_core::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    drive(
+        RemoveDeviceNodeOperation::new(RemoveDeviceNodeConfig {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id: auth.realm_id,
+            },
+            node_id,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        RemoveDeviceNodeError::DeviceNotFound { .. }
+        | RemoveDeviceNodeError::RealmConfigNotFound => ServerError::NotFound,
+        RemoveDeviceNodeError::NotManagementNode => ServerError::Forbidden,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Enrollment whose secret this node claimed, so an eviction can retire it.
+async fn claimed_enrollment(state: &Arc<ServerState>, node_id: &str) -> ServerResult<Option<Ulid>> {
+    let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    Ok(secrets
+        .into_iter()
+        .find(|entry| entry.state.claimed_node_id() == Some(node_id))
+        .map(|entry| entry.record.enrollment_id))
+}
+
+async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> ServerResult<()> {
     drive(
         DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput { enrollment_id }),
         &state.get_ctx(),
@@ -1624,8 +1670,7 @@ async fn revoke_user_device(
         DeleteOnboardingSecretError::NotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     })?;
-
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2974,16 +3019,42 @@ mod device_tests {
         .await;
         assert!(matches!(foreign, Err(ServerError::NotFound)));
 
-        // Evicting an enrolled member has no administrative event yet.
-        let enrolled = revoke_user_device(
+        let anonymous = list_user_devices(State(fixture.state), Extension(None)).await;
+        assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn evicts_enrolled_device() {
+        // Eviction drops the membership itself, so the device stops being a
+        // realm peer instead of merely losing an unredeemed secret.
+        let fixture = setup_devices().await;
+
+        let status = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(node(2).to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let listed = devices(&fixture.state, fixture.owner).await;
+        assert!(listed.iter().all(|device| device.id != node(2).to_string()));
+
+        let repeated = revoke_user_device(
             State(fixture.state.clone()),
             Extension(Some(auth(fixture.owner))),
             Path(node(2).to_string()),
         )
         .await;
-        assert!(matches!(enrolled, Err(ServerError::Unimplemented)));
+        assert!(matches!(repeated, Err(ServerError::NotFound)));
 
-        let anonymous = list_user_devices(State(fixture.state), Extension(None)).await;
-        assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+        // Another owner's device keeps its membership.
+        assert!(
+            devices(&fixture.state, fixture.other)
+                .await
+                .iter()
+                .any(|device| device.id == node(3).to_string())
+        );
     }
 }
