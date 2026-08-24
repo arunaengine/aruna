@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_the_raw_draft_id() {
+    fn keys_draft_id() {
         // The raw ULID is the key, so a forward scan is creation order.
         let entry = entry();
         assert_eq!(
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn holds_back_future_entries() {
+    fn holds_future_entries() {
         let mut entry = entry();
         entry.state = IntakeState::Pending {
             due_at_ms: 1_000,

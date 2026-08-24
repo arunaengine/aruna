@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_keeps_own_slot() {
+    async fn retry_keeps_slot() {
         // Once the joiner itself is in the config, its own retry must not be
         // charged a second device.
         let tempdir = tempdir().unwrap();

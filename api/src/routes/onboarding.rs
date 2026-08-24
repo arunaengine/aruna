@@ -67,7 +67,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(bootstrap_onboarding))
         .routes(routes!(create_onboarding_secret, list_onboarding_secrets))
         .routes(routes!(revoke_onboarding_secret))
-        .routes(routes!(get_onboarding_secret_status))
+        .routes(routes!(get_secret_status))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -620,7 +620,7 @@ discover that somebody else's enrollment exists."#,
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn get_onboarding_secret_status(
+pub async fn get_secret_status(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(enrollment_id): Path<String>,
@@ -1104,7 +1104,7 @@ fn wrap_realm_private_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerError, bootstrap_onboarding, create_onboarding_secret, get_onboarding_secret_status,
+        ServerError, bootstrap_onboarding, create_onboarding_secret, get_secret_status,
         list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,
     };
     use crate::server_state::ServerState;
@@ -1609,7 +1609,7 @@ mod tests {
         let enrollment_id = created.enrollment_id.clone();
         assert_eq!(enrollment_id, secret.enrollment_id.to_string());
 
-        let (_, Json(status)) = get_onboarding_secret_status(
+        let (_, Json(status)) = get_secret_status(
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path(enrollment_id.clone()),
@@ -1621,7 +1621,7 @@ mod tests {
         assert_eq!(status.owner.as_deref(), Some(user_id.to_string().as_str()));
         assert!(status.claimed_node_id.is_none());
 
-        let stranger = get_onboarding_secret_status(
+        let stranger = get_secret_status(
             State(state.clone()),
             Extension(Some(AuthContext {
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -1648,7 +1648,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (_, Json(status)) = get_onboarding_secret_status(
+        let (_, Json(status)) = get_secret_status(
             State(state.clone()),
             Extension(Some(auth)),
             Path(enrollment_id),
@@ -1658,7 +1658,7 @@ mod tests {
         assert_eq!(status.status, "claimed");
         assert_eq!(status.claimed_node_id.as_deref(), Some("device-a"));
 
-        let missing = get_onboarding_secret_status(
+        let missing = get_secret_status(
             State(state),
             Extension(Some(AuthContext {
                 user_id,

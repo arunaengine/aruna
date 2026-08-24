@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn device_vouches_for_owner() {
+    fn vouches_for_owner() {
         // A device's own owner is the one identity it may speak for.
         let owner = UserId::local(Ulid::generate(), realm());
         let config = config(RealmNodeKind::User { owner });
@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn device_vouches_for_nobody() {
+    fn vouches_for_nobody() {
         let owner = UserId::local(Ulid::generate(), realm());
         let stranger = UserId::local(Ulid::generate(), realm());
         let config = config(RealmNodeKind::User { owner });
@@ -120,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn infra_keeps_internal_gate() {
+    fn keeps_internal_gate() {
         // Vouching changes nothing for an infrastructure peer, and an unknown
         // peer is still refused before any trust question.
         let owner = UserId::local(Ulid::generate(), realm());

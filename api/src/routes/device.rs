@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_lists_device_routes() {
+    fn lists_device_routes() {
         let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
         assert!(openapi["paths"]["/device/drafts"]["post"].is_object());
         assert!(openapi["paths"]["/device/drafts"]["get"].is_object());

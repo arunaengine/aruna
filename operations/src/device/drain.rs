@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_minted_id_on_retry() {
+    fn keeps_minted_id() {
         // A forward with an unknown outcome must never mint a second id.
         let document_id = Ulid::generate();
         let IntakeState::Publishing {
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn backs_off_before_minting() {
+    fn backs_off_unminted() {
         let IntakeState::Pending {
             attempts,
             last_error,

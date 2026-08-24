@@ -180,7 +180,7 @@ impl ResolveVersionSourceBindingOperation {
         }
 
         if self.input.source.descriptor.kind == SourceConnectorKind::LocalDirectory {
-            let effect = match read_offered_directory_effect(&self.input.source) {
+            let effect = match read_offered_effect(&self.input.source) {
                 Ok(effect) => effect,
                 Err(error) => return self.emit_error(error),
             };
@@ -209,7 +209,7 @@ impl ResolveVersionSourceBindingOperation {
     }
 
     fn handle_offered_read(&mut self, event: Event) -> Effects {
-        let access = match resolve_offered_directory_access(&self.input.source, event) {
+        let access = match resolve_offered_access(&self.input.source, event) {
             Ok(access) => access,
             Err(error) => return self.emit_error(error),
         };
@@ -460,7 +460,7 @@ fn build_native_access(
 
 /// Reads the device-local registration a local-directory binding names. The
 /// binding carries the offered bucket, never a path: the root exists only here.
-pub(crate) fn read_offered_directory_effect(
+pub(crate) fn read_offered_effect(
     source: &VersionSourceBinding,
 ) -> Result<Effect, SourceConnectorResolutionError> {
     if source.strategy != StagingStrategy::Reference || source.connector_id.is_some() {
@@ -480,7 +480,7 @@ pub(crate) fn read_offered_directory_effect(
     }))
 }
 
-fn resolve_offered_directory_access(
+fn resolve_offered_access(
     source: &VersionSourceBinding,
     event: Event,
 ) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
@@ -987,20 +987,17 @@ mod tests {
     }
 
     #[test]
-    fn offered_read_rejects_connector() {
-        assert!(
-            read_offered_directory_effect(&offered_binding("photos", Some(Ulid::generate())))
-                .is_err()
-        );
-        assert!(read_offered_directory_effect(&offered_binding("", None)).is_err());
-        assert!(read_offered_directory_effect(&offered_binding("photos", None)).is_ok());
+    fn offered_read_rejects() {
+        assert!(read_offered_effect(&offered_binding("photos", Some(Ulid::generate()))).is_err());
+        assert!(read_offered_effect(&offered_binding("", None)).is_err());
+        assert!(read_offered_effect(&offered_binding("photos", None)).is_ok());
     }
 
     // A registration that is not there must not resolve to some other root.
     #[test]
     fn offered_missing_registration() {
         assert_eq!(
-            resolve_offered_directory_access(
+            resolve_offered_access(
                 &offered_binding("photos", None),
                 Event::Storage(StorageEvent::ReadResult {
                     key: Vec::<u8>::new().into(),

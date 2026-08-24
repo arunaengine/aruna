@@ -166,7 +166,7 @@ impl S3Access for AuthProvider {
         {
             guard_bucket_write(self.driver_ctx.as_ref(), &bucket)
                 .await
-                .map_err(map_offered_directory_error)?;
+                .map_err(map_offered_error)?;
         }
 
         // The policy request context is built once: ordinary authorization uses a
@@ -297,7 +297,7 @@ fn map_session_error(error: S3SessionError) -> s3s::S3Error {
     }
 }
 
-fn map_offered_directory_error(error: OfferedDirectoryError) -> s3s::S3Error {
+fn map_offered_error(error: OfferedDirectoryError) -> s3s::S3Error {
     match error {
         OfferedDirectoryError::ReadOnly(bucket) => s3_error!(
             AccessDenied,

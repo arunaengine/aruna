@@ -1646,7 +1646,7 @@ mod tests {
     // A device is a realm member without internal trust: it is admitted, and the
     // serve is authorized as the owner its realm config names.
     #[test]
-    fn serves_device_as_owner() {
+    fn serves_device_owner() {
         let local_node = node_from_seed(1);
         let peer = node_from_seed(2);
         let owner = UserId::new(Ulid::from(11u128), test_realm());
@@ -1687,7 +1687,7 @@ mod tests {
     // Governed content stays out of reach: the device claims no subject, so the
     // destination challenge denies before a byte is offered.
     #[test]
-    fn refuses_governed_to_device() {
+    fn refuses_governed_device() {
         let local_node = node_from_seed(1);
         let peer = node_from_seed(2);
         let owner = UserId::new(Ulid::from(11u128), test_realm());
@@ -1715,7 +1715,7 @@ mod tests {
     // A device gets one honest, terminal answer for governed content instead of
     // a negotiation it can never finish.
     #[test]
-    fn device_answer_is_terminal() {
+    fn device_answer_terminal() {
         let policy_ref = PlacementPolicyRef {
             policy_id: Ulid::from(31u128),
             digest: [5u8; 32],
