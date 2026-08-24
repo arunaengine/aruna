@@ -202,7 +202,7 @@ pub async fn fetch_core_onboarding_documents(
             continue;
         }
         let topic = document.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
-        sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await?;
+        sync_with_retry(net_handle, topic, bootstrap_peer, &document, timeout).await?;
     }
 
     if !user_documents.is_empty() {
@@ -259,7 +259,7 @@ pub async fn wait_for_onboarding_placement(
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
 
-            sync_topic_from_peer(
+            if let Err(error) = sync_topic_from_peer(
                 driver_ctx
                     .net_handle
                     .as_ref()
@@ -269,7 +269,10 @@ pub async fn wait_for_onboarding_placement(
                 &target,
                 timeout,
             )
-            .await?;
+            .await
+            {
+                warn!(error = %error, "Retrying onboarding placement sync");
+            }
             tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
         }
     })
@@ -370,6 +373,28 @@ async fn sync_topic_from_peer(
     }
 }
 
+/// The bootstrap peer may refuse a fresh joiner until the config update that
+/// admits it reaches the peer, so failures retry within the same time budget.
+async fn sync_with_retry(
+    net_handle: &aruna_net::NetHandle,
+    topic: ::irokle::TopicId,
+    bootstrap_peer: NodeId,
+    document: &DocumentSyncTarget,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match sync_topic_from_peer(net_handle, topic, bootstrap_peer, document, timeout).await {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                warn!(error = %error, document = ?document, "Retrying onboarding document sync");
+                tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Persisted onboarding secret, encrypted at rest under the node key.
 #[derive(Serialize, Deserialize)]
 struct SealedOnboardingSecret {
@@ -450,7 +475,7 @@ pub async fn ensure_initial_local_onboarding_secret(
 mod tests {
     use super::{
         node_is_ready, prepare_core_documents, publish_core_documents, sync_topic_from_peer,
-        unique_user_topic, watch_target_needed,
+        sync_with_retry, unique_user_topic, watch_target_needed,
     };
     use aruna_core::NodeId;
     use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
@@ -872,6 +897,69 @@ mod tests {
         assert_eq!(batch.records.len(), 1);
         assert!(!batch.records[0].1.allow_genesis);
         OutboxDrainer::new(joiner_context.clone()).run_once().await;
+        assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
+        bootstrap_net.shutdown().await;
+        joiner_net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retries_until_seeded() {
+        // Onboarding must survive the window before the peer serves the topic.
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        let (_bootstrap_dir, bootstrap_context, bootstrap_net) = net_context(realm_id, 12).await;
+        let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 13).await;
+        let bootstrap_context = Arc::new(bootstrap_context);
+        let joiner_context = Arc::new(joiner_context);
+        initialize_net_incoming(bootstrap_context.clone());
+        initialize_net_incoming(joiner_context.clone());
+        let bootstrap_id = bootstrap_net.node_id();
+        let joiner_id = joiner_net.node_id();
+        write_config_nodes(
+            &bootstrap_context,
+            realm_id,
+            bootstrap_id,
+            &[bootstrap_id, joiner_id],
+        )
+        .await;
+        write_config_nodes(
+            &joiner_context,
+            realm_id,
+            joiner_id,
+            &[bootstrap_id, joiner_id],
+        )
+        .await;
+        bootstrap_net.reload_realm_peers().await.unwrap();
+        joiner_net.reload_realm_peers().await.unwrap();
+        bootstrap_net
+            .add_peer_addr(joiner_net.endpoint_addr())
+            .await;
+        joiner_net
+            .add_peer_addr(bootstrap_net.endpoint_addr())
+            .await;
+
+        let target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: bootstrap_id,
+        };
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let (sync, seeded) = tokio::join!(
+            sync_with_retry(
+                &joiner_net,
+                topic,
+                bootstrap_id,
+                &target,
+                Duration::from_secs(60),
+            ),
+            seed_topic(
+                &bootstrap_context,
+                &bootstrap_net,
+                realm_id,
+                bootstrap_id,
+                joiner_id,
+            ),
+        );
+        assert_eq!(seeded, topic);
+        sync.unwrap();
         assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
         bootstrap_net.shutdown().await;
         joiner_net.shutdown().await;
