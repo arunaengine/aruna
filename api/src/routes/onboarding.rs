@@ -291,8 +291,9 @@ answers 403.
 - `expires_in_seconds` defaults to 3600 and is clamped to 60..=86400; `expires_at` is the resulting
   absolute expiry in Unix seconds.
 - A `User` mint is refused once the owner holds the realm's `max_devices_per_user` devices.
-  Enrolled devices and unclaimed device secrets both occupy a slot, so two mints cannot race past
-  the cap. A realm without that quota set caps nothing.
+  Enrolled devices and outstanding device secrets both occupy a slot, and a secret already claimed
+  by an enrolled device is charged once, through the realm configuration. A realm without that
+  quota set caps nothing.
 
 **Errors**: an owner at the device cap answers 409. An empty `seed_url` on a node that publishes no
 REST interface answers 400. A realm policy that forbids enrollment answers 403."#,

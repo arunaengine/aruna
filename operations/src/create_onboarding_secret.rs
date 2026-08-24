@@ -5,7 +5,7 @@ use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmConfigDocument;
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::types::{Effects, Key, TxnId, UserId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -13,10 +13,10 @@ use ulid::Ulid;
 
 use crate::onboarding_secret_state::secret_state_write_entry;
 
-const SECRET_RECORD_PREFIX: &str = "secret:";
+pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
 /// Caps the outstanding-secret scan: expired secrets are pruned on every mint,
 /// so a realm never carries anywhere near this many live enrollments.
-const MAX_SCANNED_SECRETS: usize = 1024;
+pub(crate) const MAX_SCANNED_SECRETS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateOnboardingSecretInput {
@@ -34,9 +34,17 @@ pub struct CreateOnboardingSecretOperation {
 enum CreateOnboardingSecretState {
     Init,
     StartTransaction,
-    ReadRealmConfig { txn_id: TxnId },
-    CountPending { txn_id: TxnId, cap: u32, free: u32 },
-    WriteRecord { txn_id: TxnId },
+    ReadRealmConfig {
+        txn_id: TxnId,
+    },
+    CountPending {
+        txn_id: TxnId,
+        cap: u32,
+        enrolled: Vec<String>,
+    },
+    WriteRecord {
+        txn_id: TxnId,
+    },
     CommitTransaction,
     Finish,
     Error,
@@ -98,18 +106,41 @@ impl CreateOnboardingSecretOperation {
     }
 }
 
-/// Devices already enrolled for `owner`, read from the signed realm config: a
+/// Node ids already enrolled for `owner`, read from the signed realm config: a
 /// device's owner is part of its membership kind, never a label.
-fn enrolled_devices(config: Option<&RealmConfigDocument>, owner: UserId) -> u32 {
+pub(crate) fn enrolled_devices(config: Option<&RealmConfigDocument>, owner: UserId) -> Vec<String> {
     config
         .map(|config| {
             config
                 .nodes
                 .iter()
                 .filter(|node| node.kind.owner() == Some(owner))
-                .count() as u32
+                .map(|node| node.node_id.clone())
+                .collect()
         })
         .unwrap_or_default()
+}
+
+/// Secrets that still occupy a device slot for `owner`, skipping `skip` and any
+/// secret whose claiming node already joined: those are counted through the
+/// realm config instead of a second time here.
+pub(crate) fn pending_devices(
+    values: &[(Key, Value)],
+    owner: Option<UserId>,
+    skip: Ulid,
+    enrolled: &[String],
+) -> u32 {
+    values
+        .iter()
+        .filter_map(|(_, bytes)| postcard::from_bytes::<OnboardingSecretRecord>(bytes).ok())
+        .filter(|record| record.enrollment_id != skip && record.mode.owner() == owner)
+        .filter(|record| {
+            !record
+                .claimed_node_id
+                .as_ref()
+                .is_some_and(|node_id| enrolled.iter().any(|enrolled| enrolled == node_id))
+        })
+        .count() as u32
 }
 
 impl Operation for CreateOnboardingSecretOperation {
@@ -131,7 +162,7 @@ impl Operation for CreateOnboardingSecretOperation {
             other => other,
         };
 
-        match self.state {
+        match self.state.clone() {
             CreateOnboardingSecretState::StartTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -185,7 +216,7 @@ impl Operation for CreateOnboardingSecretOperation {
                     return self.emit_write_record(txn_id);
                 };
                 let enrolled = enrolled_devices(config.as_ref(), owner);
-                if enrolled >= cap {
+                if enrolled.len() as u32 >= cap {
                     return fail(
                         self,
                         CreateOnboardingSecretError::DeviceCapExceeded { limit: cap },
@@ -196,7 +227,7 @@ impl Operation for CreateOnboardingSecretOperation {
                 self.state = CreateOnboardingSecretState::CountPending {
                     txn_id,
                     cap,
-                    free: cap - enrolled,
+                    enrolled,
                 };
                 smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: ONBOARDING_KEYSPACE.to_string(),
@@ -206,7 +237,11 @@ impl Operation for CreateOnboardingSecretOperation {
                     txn_id: Some(txn_id),
                 })]
             }
-            CreateOnboardingSecretState::CountPending { txn_id, cap, free } => {
+            CreateOnboardingSecretState::CountPending {
+                txn_id,
+                cap,
+                enrolled,
+            } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
                     return fail(
@@ -218,18 +253,13 @@ impl Operation for CreateOnboardingSecretOperation {
                         },
                     );
                 };
-                let owner = self.input.record.mode.owner();
-                let pending = values
-                    .iter()
-                    .filter_map(|(_, bytes)| {
-                        postcard::from_bytes::<OnboardingSecretRecord>(bytes).ok()
-                    })
-                    .filter(|record| {
-                        record.enrollment_id != self.input.record.enrollment_id
-                            && record.mode.owner() == owner
-                    })
-                    .count() as u32;
-                if pending >= free {
+                let pending = pending_devices(
+                    &values,
+                    self.input.record.mode.owner(),
+                    self.input.record.enrollment_id,
+                    &enrolled,
+                );
+                if enrolled.len() as u32 + pending >= cap {
                     return fail(
                         self,
                         CreateOnboardingSecretError::DeviceCapExceeded { limit: cap },
@@ -319,7 +349,7 @@ mod tests {
     };
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::types::UserId;
@@ -330,6 +360,10 @@ mod tests {
 
     fn realm() -> RealmId {
         RealmId::from_bytes([4u8; 32])
+    }
+
+    fn device_node(index: usize) -> iroh::PublicKey {
+        iroh::SecretKey::from_bytes(&[index as u8 + 1; 32]).public()
     }
 
     fn device_record(owner: UserId) -> OnboardingSecretRecord {
@@ -355,8 +389,7 @@ mod tests {
             ..QuotaConfig::default()
         };
         for (index, owner) in enrolled.iter().enumerate() {
-            let node_id = iroh::SecretKey::from_bytes(&[index as u8 + 1; 32]).public();
-            config.ensure_node(node_id, RealmNodeKind::User { owner: *owner });
+            config.ensure_node(device_node(index), RealmNodeKind::User { owner: *owner });
         }
         storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -377,6 +410,22 @@ mod tests {
                 compute_handle: None,
             },
         )
+    }
+
+    async fn write_claimed(context: &DriverContext, owner: UserId, node_id: &str) {
+        let record = OnboardingSecretRecord {
+            claimed_node_id: Some(node_id.to_string()),
+            ..device_record(owner)
+        };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: ONBOARDING_KEYSPACE.to_string(),
+                key: super::secret_record_key(record.enrollment_id),
+                value: ByteView::from(postcard::to_allocvec(&record).unwrap()),
+                txn_id: None,
+            })
+            .await;
     }
 
     async fn mint(
@@ -426,6 +475,30 @@ mod tests {
         mint(&context, owner)
             .await
             .expect("another owner's device does not count");
+    }
+
+    #[tokio::test]
+    async fn claimed_member_uncounted() {
+        // The device this secret was claimed by already joined, so the realm
+        // config alone charges its slot.
+        let owner = UserId::local(Ulid::generate(), realm());
+        let (_dir, context) = context_with_cap(Some(2), &[owner]).await;
+        write_claimed(&context, owner, &device_node(0).to_string()).await;
+
+        mint(&context, owner).await.expect("one slot is still free");
+    }
+
+    #[tokio::test]
+    async fn claimed_stranger_counts() {
+        // A claim by a node that never joined still occupies its slot.
+        let owner = UserId::local(Ulid::generate(), realm());
+        let (_dir, context) = context_with_cap(Some(2), &[owner]).await;
+        write_claimed(&context, owner, &device_node(7).to_string()).await;
+
+        assert!(matches!(
+            mint(&context, owner).await,
+            Err(CreateOnboardingSecretError::DeviceCapExceeded { limit: 2 })
+        ));
     }
 
     #[tokio::test]
