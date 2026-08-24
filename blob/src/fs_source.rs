@@ -107,7 +107,7 @@ pub(crate) async fn list_local(
                 name,
                 path: relative,
                 kind,
-                size: (kind == SourceEntryKind::File).then(|| metadata.len()),
+                size: (kind == SourceEntryKind::File).then_some(metadata.len()),
                 modified: metadata.modified().ok(),
             });
         }
