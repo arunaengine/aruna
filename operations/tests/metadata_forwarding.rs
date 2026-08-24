@@ -16,6 +16,7 @@ use aruna_core::document::{
     DocumentSyncTarget,
 };
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -48,7 +49,9 @@ use aruna_operations::metadata::forward::{
 };
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
-use aruna_operations::set_realm_policies::{SetRealmPoliciesConfig, SetRealmPoliciesOperation};
+use aruna_operations::set_realm_policies::{
+    SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
+};
 use aruna_operations::task_incoming::{OutboxDrainer, initialize_task_incoming};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -706,6 +709,9 @@ async fn seed_group(realm: &Realm, nodes: &[TestNode]) -> Result<Ulid, Box<dyn s
     Ok(group.group_id)
 }
 
+/// Bounded retries for a realm-config write that lost its transaction.
+const POLICY_WRITE_ATTEMPTS: usize = 16;
+
 async fn set_write_policy(
     realm: &Realm,
     nodes: &[TestNode],
@@ -721,24 +727,40 @@ async fn set_write_policy(
     // Only the sync-eligible nodes are management members, and a realm-config
     // write on any other node is refused before it can diverge.
     for node in nodes.iter().filter(|node| node.sync_eligible) {
-        drive(
-            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
-                actor: Actor {
-                    node_id: node.net.node_id(),
-                    user_id: realm.user_id,
-                    realm_id: realm.realm_id,
-                },
-                auth_context: AuthContext {
-                    user_id: realm.user_id,
-                    realm_id: realm.realm_id,
-                    path_restrictions: None,
-                },
-                policies: vec![policy.clone()],
-                expected_hash: None,
-            }),
-            node.context.as_ref(),
-        )
-        .await?;
+        // Replication writes the same document, and losing that transaction is
+        // the retryable conflict the route reports as 409; the fixture retries
+        // it exactly as a caller would.
+        let mut attempts = 0;
+        loop {
+            let outcome = drive(
+                SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
+                    actor: Actor {
+                        node_id: node.net.node_id(),
+                        user_id: realm.user_id,
+                        realm_id: realm.realm_id,
+                    },
+                    auth_context: AuthContext {
+                        user_id: realm.user_id,
+                        realm_id: realm.realm_id,
+                        path_restrictions: None,
+                    },
+                    policies: vec![policy.clone()],
+                    expected_hash: None,
+                }),
+                node.context.as_ref(),
+            )
+            .await;
+            match outcome {
+                Ok(_) => break,
+                Err(SetRealmPoliciesError::StorageError(StorageError::TransactionConflict))
+                    if attempts < POLICY_WRITE_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     Ok(())
 }
