@@ -534,7 +534,7 @@ mod tests {
         std::fs::write(root.path().join("note.txt"), b"offered").expect("file must be written");
         let offer = input("offered", root.path().to_str().expect("utf-8 root"));
 
-        let result = offer_directory(&context, offer.clone())
+        let result = offer_directory(context, offer.clone())
             .await
             .expect("offer must succeed");
         assert_eq!(result.files, 1);
@@ -549,7 +549,7 @@ mod tests {
                 user_identity: offer.user_id,
                 node_id: offer.node_id,
             }),
-            &context,
+            context,
         )
         .await
         .expect("get must run")
@@ -570,15 +570,15 @@ mod tests {
         let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("locked", root.path().to_str().expect("utf-8 root"));
-        offer_directory(&context, offer)
+        offer_directory(context, offer)
             .await
             .expect("offer must succeed");
 
         assert_eq!(
-            guard_bucket_write(&context, "locked").await,
+            guard_bucket_write(context, "locked").await,
             Err(OfferedDirectoryError::ReadOnly("locked".to_string()))
         );
-        assert_eq!(guard_bucket_write(&context, "other").await, Ok(()));
+        assert_eq!(guard_bucket_write(context, "other").await, Ok(()));
     }
 
     // A bucket that is not this offer's must keep its ordinary write semantics.
@@ -589,7 +589,7 @@ mod tests {
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("taken", root.path().to_str().expect("utf-8 root"));
         crate::staging::test_utils::create_test_bucket(
-            &context,
+            context,
             offer.group_id,
             offer.user_id,
             "taken",
@@ -597,7 +597,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            offer_directory(&context, offer).await,
+            offer_directory(context, offer).await,
             Err(OfferedDirectoryError::BucketTaken("taken".to_string()))
         );
     }
@@ -613,26 +613,20 @@ mod tests {
         std::fs::write(&file, b"one").expect("file must be written");
         let offer = input("refresh", root.path().to_str().expect("utf-8 root"));
 
-        offer_directory(&context, offer.clone())
+        offer_directory(context, offer.clone())
             .await
             .expect("first offer must succeed");
-        let first = current_version(&context, "refresh", "data.bin").await;
-        offer_directory(&context, offer.clone())
+        let first = current_version(context, "refresh", "data.bin").await;
+        offer_directory(context, offer.clone())
             .await
             .expect("second offer must succeed");
-        assert_eq!(
-            current_version(&context, "refresh", "data.bin").await,
-            first
-        );
+        assert_eq!(current_version(context, "refresh", "data.bin").await, first);
 
         std::fs::write(&file, b"one-changed").expect("file must be rewritten");
-        offer_directory(&context, offer)
+        offer_directory(context, offer)
             .await
             .expect("third offer must succeed");
-        assert_ne!(
-            current_version(&context, "refresh", "data.bin").await,
-            first
-        );
+        assert_ne!(current_version(context, "refresh", "data.bin").await, first);
     }
 
     async fn current_version(context: &DriverContext, bucket: &str, key: &str) -> Ulid {
