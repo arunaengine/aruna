@@ -19272,6 +19272,18 @@ mod tests {
                 description: "unrelated operation applied".to_string(),
             },
         );
+        // Impersonation is now a relay signing another origin's envelope with
+        // its own key: the local node may carry the bytes but never authorize
+        // them.
+        let forge = |event: &AdminDocumentEvent| {
+            iroh::SecretKey::from_bytes(&[63; 32]).sign(
+                &event
+                    .signing_bytes(&PlacementRef::NIL)
+                    .expect("event serializes"),
+            )
+        };
+        let impersonated_signature = forge(&impersonated_event);
+        let unrelated_signature = forge(&unrelated_event);
 
         let published = service
             .publish_documents(
@@ -19288,7 +19300,7 @@ mod tests {
                         event: Box::new(impersonated_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
-                        origin_signature: None,
+                        origin_signature: Some(impersonated_signature),
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
@@ -19309,7 +19321,7 @@ mod tests {
                         event: Box::new(unrelated_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
-                        origin_signature: None,
+                        origin_signature: Some(unrelated_signature),
                     },
                 ],
                 Vec::new(),
