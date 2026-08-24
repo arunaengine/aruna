@@ -2706,6 +2706,15 @@ impl InboundTaskHandler for OperationsTaskHandler {
         delete_persisted_timer(&self.context.storage_handle, &key).await;
         match key {
             TaskKey::RealmPresence { realm_id, node_id } => {
+                // A User-kind device is DHT read-only and never publishes
+                // presence. An unreadable config is bootstrap, which announces.
+                if matches!(
+                    crate::metadata::forward::is_user_origin(&self.context, realm_id, node_id)
+                        .await,
+                    Ok(true)
+                ) {
+                    return;
+                }
                 let op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
                     realm_id,
                     node_id,
