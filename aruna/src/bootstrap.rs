@@ -222,7 +222,14 @@ pub async fn fetch_core_onboarding_documents(
             else {
                 continue;
             };
-            sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await?;
+            // Best effort: the bootstrap peer serves a shard topic only to its
+            // members, and the joiner is admitted once its placement expansion
+            // runs, which waits behind any transition already in flight.
+            if let Err(error) =
+                sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await
+            {
+                warn!(error = %error, document = ?document, "Leaving an onboarding user document to placement sync");
+            }
         }
     }
 
