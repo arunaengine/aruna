@@ -69,17 +69,6 @@ fn allowed_publish_use(publish_use: &PublishUse) -> bool {
                 )
             )
         }
-        "operations/src/incoming.rs" => {
-            publish_use.function.as_deref() == Some("reemit_evicted_documents")
-                && matches!(
-                    publish_use.text.as_str(),
-                    "DocumentSyncPublish::Upsert {"
-                        | "DocumentSyncPublish::Delete { target, change, .. } => {"
-                        | "DocumentSyncPublish::AdminOperation { target, event, .. } => {"
-                        | "DocumentSyncPublish::Delete {"
-                        | "DocumentSyncPublish::AdminOperation {"
-                )
-        }
         _ => false,
     }
 }
