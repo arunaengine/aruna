@@ -54,6 +54,14 @@ pub struct OfferDirectoryResult {
     pub removed: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawOfferInput {
+    pub bucket: String,
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
+    pub user_id: UserId,
+}
+
 /// The parts of an offer every observation write needs. The root is absent on
 /// purpose: an observation is bound to the registration, never to a path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +91,8 @@ pub enum OfferedDirectoryError {
     BucketTaken(String),
     #[error("bucket `{0}` is an offered directory and is read-only")]
     ReadOnly(String),
+    #[error("bucket `{0}` is not an offered directory")]
+    NotOffered(String),
     #[error("the offered directory holds more than {0} files")]
     TooManyFiles(usize),
     #[error("this node cannot read local directories")]
@@ -141,6 +151,73 @@ pub async fn offer_directory(
         files: entries.len(),
         removed,
     })
+}
+
+/// Every directory this device currently offers, in bucket order.
+pub async fn list_offers(
+    context: &DriverContext,
+) -> Result<Vec<OfferedDirectory>, OfferedDirectoryError> {
+    let mut offers = Vec::new();
+    let mut start: Option<Key> = None;
+    loop {
+        let (values, next) = match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: OFFERED_DIRECTORY_KEYSPACE.to_string(),
+                prefix: None,
+                start: start.map(IterStart::After),
+                limit: LIST_PAGE,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            _ => return Err(StorageError::ReadError("unexpected event".to_string()).into()),
+        };
+        for (_, value) in values {
+            offers.push(OfferedDirectory::from_bytes(&value)?);
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => return Ok(offers),
+        }
+    }
+}
+
+/// Withdraws one offer: the registration goes first, then every observation it
+/// made becomes a delete marker. Answers how many live objects it removed.
+///
+/// The registration is what a read resolves the root through, so an interrupted
+/// sweep still leaves the bucket unservable rather than half-offered. A realm
+/// node that references an offered version can no longer resolve it.
+pub async fn withdraw_offer(
+    context: &DriverContext,
+    input: WithdrawOfferInput,
+) -> Result<usize, OfferedDirectoryError> {
+    let record = read_offered(context, &input.bucket, None)
+        .await?
+        .ok_or_else(|| OfferedDirectoryError::NotOffered(input.bucket.clone()))?;
+    apply(
+        context,
+        Effect::Storage(StorageEffect::Delete {
+            key_space: OFFERED_DIRECTORY_KEYSPACE.to_string(),
+            key: input.bucket.as_bytes().into(),
+            txn_id: None,
+        }),
+    )
+    .await?;
+    let scope = ObservationScope {
+        bucket: input.bucket,
+        group_id: record.group_id,
+        realm_id: input.realm_id,
+        node_id: input.node_id,
+        user_id: input.user_id,
+    };
+    sweep_observations(context, &scope, &BTreeSet::new()).await
 }
 
 /// Every file under the offered root, refusing a root beyond the cap before a
@@ -899,6 +976,77 @@ mod tests {
             head_version(context, "sweep", "gone.txt")
                 .await
                 .is_deleted()
+        );
+    }
+
+    // Withdrawing an offer stops it resolving and empties the bucket, so what
+    // the device still lists is only what it still offers.
+    #[tokio::test]
+    async fn withdraws_offer() {
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
+        let root = tempfile::tempdir().expect("root must be created");
+        std::fs::write(root.path().join("note.txt"), b"note").expect("file must be written");
+        let offer = input("withdrawn", root.path().to_str().expect("utf-8 root"));
+        offer_directory(context, offer.clone())
+            .await
+            .expect("offer must succeed");
+        assert_eq!(list_offers(context).await.expect("list must run").len(), 1);
+
+        let removed = withdraw_offer(
+            context,
+            WithdrawOfferInput {
+                bucket: offer.bucket.clone(),
+                realm_id: offer.realm_id,
+                node_id: offer.node_id,
+                user_id: offer.user_id,
+            },
+        )
+        .await
+        .expect("withdraw must succeed");
+
+        assert_eq!(removed, 1);
+        assert!(
+            list_offers(context)
+                .await
+                .expect("list must run")
+                .is_empty()
+        );
+        assert!(
+            head_version(context, "withdrawn", "note.txt")
+                .await
+                .is_deleted()
+        );
+        assert_eq!(guard_bucket_write(context, "withdrawn").await, Ok(()));
+        let usage = group_usage(context, offer.group_id).await;
+        assert_eq!((usage.objects, usage.referenced_bytes), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn refuses_unknown_offer() {
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
+        assert_eq!(
+            withdraw_offer(
+                &fixture.driver_context,
+                WithdrawOfferInput {
+                    bucket: "absent".to_string(),
+                    realm_id: RealmId::from_bytes([7u8; 32]),
+                    node_id: NodeId::from_bytes(&[3u8; 32]).expect("node id must parse"),
+                    user_id: UserId::new(
+                        Ulid::from_bytes([4u8; 16]),
+                        RealmId::from_bytes([7u8; 32])
+                    ),
+                },
+            )
+            .await,
+            Err(OfferedDirectoryError::NotOffered("absent".to_string()))
+        );
+        assert!(
+            list_offers(context)
+                .await
+                .expect("list must run")
+                .is_empty()
         );
     }
 

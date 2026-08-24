@@ -39,6 +39,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "device.rs",
+        "list_offers",
+        "device plane: require_owner binds the caller to this node's enrolled owner",
+    ),
+    (
+        "device.rs",
         "preview_draft",
         "device plane: nothing stored is read beyond the realm-public Profile",
     ),

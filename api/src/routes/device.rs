@@ -15,11 +15,15 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{parse_group_id, require_unrestricted_realm_auth};
+use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::metadata::{ProfileValidationPreviewRequest, ProfileValidationPreviewResponse};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, NodeCapabilities};
+use aruna_core::errors::StagingSourceError;
+use aruna_core::structs::{
+    AuthContext, NodeCapabilities, OfferedDirectory, Permission, blob_bucket_permission_path,
+};
+use aruna_core::types::GroupId;
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
 use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
@@ -33,6 +37,11 @@ use aruna_operations::device::wipe::{
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_operations::metadata::profile_validation::preview_submission;
+use aruna_operations::staging::offered_directory::{
+    OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, list_offers as read_offers,
+    offer_directory as register_offer, withdraw_offer as remove_offer,
+};
+use std::time::UNIX_EPOCH;
 
 #[derive(OpenApi)]
 #[openapi(tags((
@@ -46,6 +55,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(queue_draft, list_drafts))
         .routes(routes!(preview_draft))
         .routes(routes!(get_draft, delete_draft))
+        .routes(routes!(offer_directory, list_offers))
+        .routes(routes!(withdraw_offer))
         .routes(routes!(wipe_device))
 }
 
@@ -412,6 +423,273 @@ async fn delete_draft(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// One directory this device offers as a read-only bucket.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DeviceOffer {
+    /// Bucket the directory is served as on this device's S3 endpoint.
+    pub bucket: String,
+    pub group_id: String,
+    /// Absolute path on this machine, exactly as the owner gave it.
+    pub root_path: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DeviceOfferList {
+    pub offers: Vec<DeviceOffer>,
+}
+
+/// What one offer registered.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OfferedInventory {
+    pub bucket: String,
+    /// Files the directory currently holds.
+    pub files: usize,
+    /// Objects tombstoned because their file is gone from the directory.
+    pub removed: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct WithdrawnOffer {
+    pub bucket: String,
+    /// Objects tombstoned by the withdrawal.
+    pub removed: usize,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfferDirectoryRequest {
+    /// Bucket name to serve the directory as. It must be free on this device.
+    pub bucket: String,
+    /// Absolute path of the directory to offer.
+    pub root_path: String,
+    /// Group the bucket belongs to, as a ULID. It decides who may reference the
+    /// offered objects from the realm.
+    pub group_id: String,
+}
+
+impl From<OfferedDirectory> for DeviceOffer {
+    fn from(record: OfferedDirectory) -> Self {
+        Self {
+            bucket: record.bucket,
+            group_id: record.group_id.to_string(),
+            root_path: record.root,
+            created_at_ms: record
+                .created_at
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn map_offer_error(error: OfferedDirectoryError) -> ServerError {
+    match error {
+        OfferedDirectoryError::BucketTaken(_) | OfferedDirectoryError::ReadOnly(_) => {
+            ServerError::Conflict(error.to_string())
+        }
+        OfferedDirectoryError::NotOffered(_) => ServerError::NotFound,
+        OfferedDirectoryError::TooManyFiles(_) => ServerError::BadRequestReason(error.to_string()),
+        OfferedDirectoryError::HandleMissing => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
+        OfferedDirectoryError::Source(
+            source @ (StagingSourceError::NotFound
+            | StagingSourceError::AccessDenied
+            | StagingSourceError::CheckError(_)),
+        ) => ServerError::BadRequestReason(format!("the offered directory is unusable: {source}")),
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+/// The offer's own bucket path, which the owner must be allowed to write in the
+/// named group: an offered bucket is that group's data on this device.
+async fn offer_permission(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: GroupId,
+    bucket: &str,
+) -> ServerResult<()> {
+    ensure_permission(
+        state,
+        auth,
+        blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
+        Permission::WRITE,
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/device/offers",
+    tag = "device",
+    summary = "Offer a local directory as a read-only bucket",
+    description = r#"Serves a directory on this machine as a read-only bucket of this device's S3 endpoint.
+
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for, with WRITE on the bucket in the named group.
+
+**Behavior**
+- The directory is walked once and every file becomes one read-only object; no byte is ever copied into the node's own blob store.
+- The root is stored device-locally and re-resolved on every read. A link that leaves the offered directory is refused, and only regular files are served.
+- Objects are observations: size and modification time identify a file, and the content hash is computed on the first complete stable read.
+- Re-offering the same bucket refreshes the inventory: an unchanged file keeps its object version, a changed file gains a successor, and a file that is gone becomes a delete marker.
+- Writes addressed to the bucket are refused for as long as the offer stands.
+
+**Limits**
+- The directory is refused whole if it holds more than 100000 files; nothing is registered in that case.
+- The bucket name must be free, or already this offer's.
+
+**Errors**
+- 400 when the root does not exist, cannot be read, or holds too many files.
+- 409 when an ordinary bucket already owns the name."#,
+    request_body(
+        content = OfferDirectoryRequest,
+        description = "Bucket name, directory to offer and the group it belongs to",
+        example = json!({
+            "bucket": "field-photos",
+            "root_path": "/home/ada/photos/field",
+            "group_id": "01JGROUP0123456789ABCDEFGH"
+        })
+    ),
+    responses(
+        (status = 201, description = "The directory is offered and its inventory is registered", body = OfferedInventory,
+            example = json!({"bucket": "field-photos", "files": 128, "removed": 0})),
+        (status = 400, description = "Malformed group id, or an unusable directory", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller is not the user this device is enrolled for, or may not write in the group", body = ErrorResponse),
+        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
+        (status = 409, description = "The bucket name is taken by an ordinary bucket", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn offer_directory(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<OfferDirectoryRequest>,
+) -> ServerResult<(StatusCode, Json<OfferedInventory>)> {
+    let auth = require_owner(&state, auth).await?;
+    let group_id = parse_group_id(&request.group_id)?;
+    offer_permission(&state, &auth, group_id, &request.bucket).await?;
+    let offered = register_offer(
+        &state.get_ctx(),
+        OfferDirectoryInput {
+            bucket: request.bucket,
+            root: request.root_path,
+            group_id,
+            realm_id: state.get_realm_id(),
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+        },
+    )
+    .await
+    .map_err(map_offer_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(OfferedInventory {
+            bucket: offered.bucket,
+            files: offered.files,
+            removed: offered.removed,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/device/offers",
+    tag = "device",
+    summary = "List the directories this device offers",
+    description = r#"Lists every directory this device currently serves as a read-only bucket.
+
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+
+**Behavior**
+- The list is node-local and answers while the realm is unreachable.
+- A withdrawn offer disappears from the list; the objects it left behind are delete markers."#,
+    responses(
+        (status = 200, description = "The directories this device offers", body = DeviceOfferList,
+            example = json!({
+                "offers": [{
+                    "bucket": "field-photos",
+                    "group_id": "01JGROUP0123456789ABCDEFGH",
+                    "root_path": "/home/ada/photos/field",
+                    "created_at_ms": 1756000000000u64
+                }]
+            })),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
+        (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_offers(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<Json<DeviceOfferList>> {
+    require_owner(&state, auth).await?;
+    let offers = read_offers(&state.get_ctx())
+        .await
+        .map_err(map_offer_error)?;
+    Ok(Json(DeviceOfferList {
+        offers: offers.into_iter().map(DeviceOffer::from).collect(),
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/device/offers/{bucket}",
+    tag = "device",
+    summary = "Stop offering a directory",
+    description = r#"Withdraws one offer: the registration is removed and every object it registered becomes a delete marker.
+
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for, with WRITE on the bucket in the offer's group.
+
+**Behavior**
+- Nothing on the owner's filesystem is touched; only what this device published about it is withdrawn.
+- The registration is removed first, so an interrupted withdrawal still leaves the bucket unservable rather than half-offered.
+- A realm node that already references an offered object can no longer read it: the registration a read resolves the root through is gone, so those references degrade to unavailable rather than to another file.
+- The bucket keeps its name and its version history, and stops being read-only. Offering the same directory again uses a new bucket name."#,
+    params(("bucket" = String, Path, description = "Bucket the directory is offered as")),
+    responses(
+        (status = 200, description = "The offer is withdrawn", body = WithdrawnOffer,
+            example = json!({"bucket": "field-photos", "removed": 128})),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller is not the user this device is enrolled for, or may not write in the group", body = ErrorResponse),
+        (status = 404, description = "No such offer, or this node is not a user node", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn withdraw_offer(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+) -> ServerResult<Json<WithdrawnOffer>> {
+    let auth = require_owner(&state, auth).await?;
+    let context = state.get_ctx();
+    let offer = read_offers(&context)
+        .await
+        .map_err(map_offer_error)?
+        .into_iter()
+        .find(|offer| offer.bucket == bucket)
+        .ok_or(ServerError::NotFound)?;
+    offer_permission(&state, &auth, offer.group_id, &bucket).await?;
+    let removed = remove_offer(
+        &context,
+        WithdrawOfferInput {
+            bucket: bucket.clone(),
+            realm_id: state.get_realm_id(),
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+        },
+    )
+    .await
+    .map_err(map_offer_error)?;
+    Ok(Json(WithdrawnOffer { bucket, removed }))
+}
+
 #[utoipa::path(
     post,
     path = "/device/drafts/preview",
@@ -544,7 +822,10 @@ async fn wipe_device(
 
 #[cfg(test)]
 mod tests {
-    use super::DeviceDraft;
+    use super::{
+        DeviceDraft, DeviceOffer, OfferedDirectory, OfferedDirectoryError, ServerError,
+        StagingSourceError, UNIX_EPOCH, map_offer_error,
+    };
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
     use aruna_operations::device::repository::{IntakeEntry, IntakeState};
@@ -598,5 +879,47 @@ mod tests {
         assert!(openapi["paths"]["/device/drafts"]["get"].is_object());
         assert!(openapi["paths"]["/device/drafts/preview"]["post"].is_object());
         assert!(openapi["paths"]["/device/drafts/{draft_id}"]["delete"].is_object());
+        assert!(openapi["paths"]["/device/offers"]["post"].is_object());
+        assert!(openapi["paths"]["/device/offers"]["get"].is_object());
+        assert!(openapi["paths"]["/device/offers/{bucket}"]["delete"].is_object());
+    }
+
+    #[test]
+    fn maps_offer_errors() {
+        // A taken name and an unusable directory are the owner's problem, not
+        // this node's: neither may read as an internal fault.
+        assert!(matches!(
+            map_offer_error(OfferedDirectoryError::BucketTaken("taken".to_string())),
+            ServerError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_offer_error(OfferedDirectoryError::NotOffered("gone".to_string())),
+            ServerError::NotFound
+        ));
+        assert!(matches!(
+            map_offer_error(OfferedDirectoryError::TooManyFiles(100_000)),
+            ServerError::BadRequestReason(_)
+        ));
+        assert!(matches!(
+            map_offer_error(OfferedDirectoryError::Source(StagingSourceError::NotFound)),
+            ServerError::BadRequestReason(_)
+        ));
+    }
+
+    #[test]
+    fn maps_offer_record() {
+        let group_id = Ulid::generate();
+        let offer: DeviceOffer = OfferedDirectory {
+            bucket: "field-photos".to_string(),
+            group_id,
+            root: "/home/ada/photos".to_string(),
+            created_at: UNIX_EPOCH + std::time::Duration::from_millis(1_500),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+        }
+        .into();
+        assert_eq!(offer.bucket, "field-photos");
+        assert_eq!(offer.group_id, group_id.to_string());
+        assert_eq!(offer.root_path, "/home/ada/photos");
+        assert_eq!(offer.created_at_ms, 1_500);
     }
 }
