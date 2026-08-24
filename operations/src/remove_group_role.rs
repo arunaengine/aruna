@@ -382,9 +382,7 @@ impl RemoveGroupRoleOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -925,7 +923,7 @@ pub mod test {
             DocumentSyncTarget::GroupAuthorization { group_id }
         );
         let event = match &outbox_records[0].event {
-            DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+            DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
             other => panic!("unexpected outbox event: {other:?}"),
         };
         assert_eq!(event.target, AdminDocumentTarget::Group { group_id });

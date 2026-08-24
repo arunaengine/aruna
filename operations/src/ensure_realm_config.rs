@@ -409,9 +409,7 @@ impl EnsureRealmConfigOperation {
                 self.config.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(admin_event),
-                },
+                DocumentSyncOutboxEvent::admin(admin_event),
                 placement,
                 false,
             );
@@ -848,7 +846,7 @@ mod tests {
         assert_eq!(outbox.target, DocumentSyncTarget::RealmConfig { realm_id });
         assert!(matches!(
             &outbox.event,
-            DocumentSyncOutboxEvent::AdminOperation { event }
+            DocumentSyncOutboxEvent::AdminOperation { event, .. }
                 if event.target == target
                     && matches!(event.op, AdminDocumentOperation::RealmConfigNodeEnsured { .. })
         ));

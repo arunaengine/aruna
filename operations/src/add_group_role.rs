@@ -447,9 +447,7 @@ impl AddGroupRoleOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -1567,7 +1565,7 @@ pub mod test {
                     record.target == (DocumentSyncTarget::GroupAuthorization { group_id })
                         && matches!(
                             &record.event,
-                            DocumentSyncOutboxEvent::AdminOperation { event }
+                            DocumentSyncOutboxEvent::AdminOperation { event, .. }
                                 if event.target == target
                                     && matches!(
                                         &event.op,

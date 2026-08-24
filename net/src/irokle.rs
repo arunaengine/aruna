@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -562,11 +563,15 @@ impl DocumentSyncService {
                     target,
                     event,
                     placement,
+                    origin_signature,
                 } => {
                     documents.push(DocumentSyncEvictedDocument {
                         event_id: event.event_id,
                         target,
-                        event: DocumentSyncOutboxEvent::AdminOperation { event },
+                        event: DocumentSyncOutboxEvent::AdminOperation {
+                            event,
+                            origin_signature: Some(origin_signature),
+                        },
                         placement,
                         allow_genesis: false,
                     });
@@ -1339,12 +1344,35 @@ impl DocumentSyncService {
                     target,
                     event,
                     placement,
+                    origin_signature,
                     ..
-                } => DocumentSyncEvent::AdminOperation {
-                    target,
-                    event,
-                    placement,
-                },
+                } => {
+                    let origin_signature = match origin_signature {
+                        Some(signature) => signature,
+                        None => match self.sign_own_admin_event(&event, &placement) {
+                            Ok(signature) => signature,
+                            Err(error) => {
+                                // Retained, never counted as published: deleting
+                                // the outbox row would lose the mutation.
+                                error!(
+                                    event = "pipeline.publish.unsigned_admin",
+                                    origin = %event.origin_node_id,
+                                    %error,
+                                    "Refusing to publish an admin event this node cannot sign"
+                                );
+                                outcome.retry_indices.push(index);
+                                outcome.retry_error.get_or_insert_with(|| error.to_string());
+                                continue;
+                            }
+                        },
+                    };
+                    DocumentSyncEvent::AdminOperation {
+                        target,
+                        event,
+                        placement,
+                        origin_signature,
+                    }
+                }
             };
             let target = event.target().clone();
             let topic_id = target.sync_topic_id(self.realm_id, &event.placement());
@@ -1406,6 +1434,28 @@ impl DocumentSyncService {
             "Document sync publish batch breakdown"
         );
         Ok(outcome)
+    }
+
+    /// Signs an admin envelope this node originated. A record carrying another
+    /// origin must arrive already signed: re-signing here would substitute the
+    /// relay's identity for the origin's.
+    fn sign_own_admin_event(
+        &self,
+        event: &AdminDocumentEvent,
+        placement: &PlacementRef,
+    ) -> Result<iroh::Signature> {
+        if node_id_to_peer_id(&event.origin_node_id) != self.node.peer_id() {
+            return Err(NetError::PublisherUnauthorized(format!(
+                "admin event originated by {} arrived unsigned",
+                event.origin_node_id
+            )));
+        }
+        let bytes = event
+            .signing_bytes(placement)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let signature = irokle_crate::Signer::sign(self.node.signer(), &bytes)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        Ok(iroh::Signature::from_bytes(&signature.to_bytes()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3333,6 +3383,7 @@ impl DocumentSyncService {
                         target,
                         event,
                         placement,
+                        origin_signature,
                     } => {
                         match validate_replicated_admin_event(
                             &self.storage,
@@ -3342,6 +3393,7 @@ impl DocumentSyncService {
                             &event,
                             self.realm_id,
                             &placement,
+                            &origin_signature,
                             &mut validation_cache,
                         )
                         .await?
@@ -3361,6 +3413,7 @@ impl DocumentSyncService {
                                         target,
                                         event,
                                         placement,
+                                        origin_signature,
                                     },
                                     reason,
                                 ));
@@ -3375,7 +3428,13 @@ impl DocumentSyncService {
                                     "Deferring admin operation until prerequisite state is available"
                                 );
                                 deferred_admin_events.push((
-                                    target, *event, placement, identity, dependency, reason,
+                                    target,
+                                    *event,
+                                    placement,
+                                    identity,
+                                    origin_signature,
+                                    dependency,
+                                    reason,
                                 ));
                                 continue;
                             }
@@ -3435,7 +3494,16 @@ impl DocumentSyncService {
             loop {
                 let mut progressed = false;
                 let mut retry = Vec::new();
-                for (target, event, placement, identity, _dependency, _previous_reason) in pending {
+                for (
+                    target,
+                    event,
+                    placement,
+                    identity,
+                    signature,
+                    _dependency,
+                    _previous_reason,
+                ) in pending
+                {
                     match validate_replicated_admin_event(
                         &self.storage,
                         topic_id,
@@ -3444,6 +3512,7 @@ impl DocumentSyncService {
                         &event,
                         self.realm_id,
                         &placement,
+                        &signature,
                         &mut validation_cache,
                     )
                     .await?
@@ -3475,17 +3544,19 @@ impl DocumentSyncService {
                                     target,
                                     event: Box::new(event),
                                     placement,
+                                    origin_signature: signature,
                                 },
                                 reason,
                             ));
                         }
-                        AdminEventValidation::Deferred { dependency, reason } => {
-                            retry.push((target, event, placement, identity, dependency, reason))
-                        }
+                        AdminEventValidation::Deferred { dependency, reason } => retry.push((
+                            target, event, placement, identity, signature, dependency, reason,
+                        )),
                     }
                 }
                 if !progressed {
-                    for (target, event, placement, identity, dependency, reason) in retry {
+                    for (target, event, placement, identity, signature, dependency, reason) in retry
+                    {
                         if let Some(dependency) = dependency {
                             cross_topic_dependencies.insert(dependency);
                         } else {
@@ -3501,6 +3572,7 @@ impl DocumentSyncService {
                                     target,
                                     event: Box::new(event),
                                     placement,
+                                    origin_signature: signature,
                                 },
                                 reason,
                             ));
@@ -8124,6 +8196,11 @@ fn remove_deferred_topic(
     deferred_topics.retain(|_, topics| !topics.is_empty());
 }
 
+/// Validates one replicated administrative event. Authority comes from the
+/// origin's signature over the envelope, never from the transport publisher: a
+/// sync-eligible relay may carry another origin's event, but cannot forge,
+/// re-target, or re-actor it. The transport publisher is still an authenticated
+/// realm peer, checked by the caller's admission path.
 #[allow(clippy::too_many_arguments)]
 async fn validate_replicated_admin_event(
     storage: &StorageHandle,
@@ -8133,6 +8210,7 @@ async fn validate_replicated_admin_event(
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     placement: &PlacementRef,
+    origin_signature: &iroh::Signature,
     config_cache: &mut ConfigValidationCache,
 ) -> Result<AdminEventValidation> {
     let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
@@ -8143,10 +8221,18 @@ async fn validate_replicated_admin_event(
     if event.origin_node_id != event.actor.node_id {
         return reject("event origin node does not match its actor node");
     }
-    let expected_actor_id =
-        irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&event.origin_node_id));
-    if authenticated_actor_id != expected_actor_id {
-        return reject("signed publisher does not match the event origin node");
+    if !event.origin_signed(placement, origin_signature) {
+        return reject("admin event is not signed by its origin node");
+    }
+    // A relay hop must itself be a realm node that may carry administrative
+    // traffic. Before the config materializes only the origin may publish,
+    // which is exactly the bootstrap case.
+    let self_published = authenticated_actor_id
+        == irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&event.origin_node_id));
+    if !self_published
+        && !relay_publisher_allowed(storage, topic_id, authenticated_actor_id, realm_id).await?
+    {
+        return reject("relayed admin event publisher is not a realm relay node");
     }
     if event.actor.user_id.realm_id != event.actor.realm_id {
         return reject("actor user and actor realm do not match");
@@ -8582,9 +8668,9 @@ fn revocation_origin_known(
     event: &AdminDocumentEvent,
     realm_id: RealmId,
 ) -> bool {
-    if config
-        .is_some_and(|config| config.realm_id == realm_id && config.has_node(event.origin_node_id))
-    {
+    if config.is_some_and(|config| {
+        config.realm_id == realm_id && origin_may_publish(config, &event.origin_node_id)
+    }) {
         return true;
     }
 
@@ -8602,6 +8688,33 @@ fn revocation_origin_known(
                 .iter()
                 .any(|value| event.observed.observes(&value.dot))
         })
+}
+
+/// Whether the transport publisher of a relayed admin event is a realm node
+/// allowed to relay. User nodes are never relays, so they never appear here.
+async fn relay_publisher_allowed(
+    storage: &StorageHandle,
+    topic_id: irokle_crate::TopicId,
+    publisher: irokle_crate::ActorId,
+    realm_id: RealmId,
+) -> Result<bool> {
+    let Some(config) = read_admin_realm_config(storage, realm_id).await? else {
+        return Ok(false);
+    };
+    Ok(config
+        .nodes
+        .iter()
+        .filter(|node| node.kind.is_sync_eligible())
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .any(|node_id| {
+            publisher == irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&node_id))
+        }))
+}
+
+/// Publisher capability by node kind: a User node never originates a realm
+/// administrative event, whichever node relayed it.
+fn origin_may_publish(config: &RealmConfigDocument, origin_node_id: &NodeId) -> bool {
+    configured_node_kind(config, origin_node_id).is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
 fn configured_node_kind<'a>(
@@ -8872,7 +8985,7 @@ fn validate_config_authority(
                 configured_node_kind(config, &event.origin_node_id),
                 Some(RealmNodeKind::Management)
             ) || server_binding
-                || (self_report && configured_node_kind(config, &event.origin_node_id).is_some())
+                || (self_report && origin_may_publish(config, &event.origin_node_id))
             {
                 AdminEventValidation::Accepted
             } else {
@@ -8979,10 +9092,9 @@ async fn validate_group_admin_authority(
             reason: "current realm config is unavailable".to_string(),
         });
     };
-    if config.realm_id != realm_id || configured_node_kind(&config, &event.origin_node_id).is_none()
-    {
+    if config.realm_id != realm_id || !origin_may_publish(&config, &event.origin_node_id) {
         return Ok(AdminEventValidation::Rejected(
-            "group admin event origin is not a current realm node".to_string(),
+            "group admin event origin is not a publisher-capable realm node".to_string(),
         ));
     }
 
@@ -9120,9 +9232,11 @@ async fn validate_user_admin_authority(
             "stored realm config has the wrong realm".to_string(),
         ));
     }
-    let Some(origin_kind) = configured_node_kind(&config, &event.origin_node_id) else {
+    let Some(origin_kind) =
+        configured_node_kind(&config, &event.origin_node_id).filter(|kind| kind.is_sync_eligible())
+    else {
         return Ok(AdminEventValidation::Rejected(
-            "user admin event origin is not a current realm node".to_string(),
+            "user admin event origin is not a publisher-capable realm node".to_string(),
         ));
     };
 
@@ -10864,6 +10978,16 @@ mod tests {
         }
     }
 
+    /// Signs an event as its origin. Test node keys are `[seed; 32]`, so the
+    /// origin's secret is recoverable from its public id.
+    fn sign_as_origin(event: &AdminDocumentEvent, placement: &PlacementRef) -> iroh::Signature {
+        (0u8..=255)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
+            .find(|key| key.public() == event.origin_node_id)
+            .expect("test origin key")
+            .sign(&event.signing_bytes(placement).expect("event serializes"))
+    }
+
     fn test_admin_event(
         event_id: Ulid,
         target: AdminDocumentTarget,
@@ -12007,7 +12131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_user_origin() {
+    async fn accepts_onboarded_origin() {
         // Onboarded node kind changes must not make event arrival order diverge.
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([61; 32]);
@@ -12057,6 +12181,7 @@ mod tests {
                 &event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -12086,6 +12211,7 @@ mod tests {
                 &event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -12096,12 +12222,7 @@ mod tests {
             } if id == realm_id
         ));
 
-        config.ensure_node(
-            attacker.node_id,
-            RealmNodeKind::User {
-                owner: UserId::nil(realm_id),
-            },
-        );
+        config.ensure_node(attacker.node_id, RealmNodeKind::Server);
         let long_event = test_admin_event(
             Ulid::from_parts(1_654, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
@@ -12125,6 +12246,7 @@ mod tests {
                 &long_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&long_event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -12165,19 +12287,212 @@ mod tests {
                 &user_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&user_event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
-            .expect("onboarded user origin validation runs"),
+            .expect("onboarded origin validation runs"),
             AdminEventValidation::Accepted
         );
         apply_admin_document_operation_to_storage(&storage, config_target.clone(), user_event)
             .await
-            .expect("onboarded user revocation applies");
+            .expect("onboarded revocation applies");
         let config = read_realm_config_doc(&storage, realm_id).await;
         assert!(config.token_revoked(
             &aruna_core::auth::bearer_token_hash("owned-token"),
             unix_timestamp_secs()
+        ));
+    }
+
+    /// Fixture for the relay tests: a realm with one Server origin, one Server
+    /// relay, and one User device, plus a group-create event from the origin.
+    struct RelayFixture {
+        storage: StorageHandle,
+        realm_id: RealmId,
+        topic: irokle_crate::TopicId,
+        target: DocumentSyncTarget,
+        event: AdminDocumentEvent,
+        placement: PlacementRef,
+        origin: Actor,
+        relay: NodeId,
+        device: NodeId,
+    }
+
+    async fn relay_fixture(dir: &TempDir) -> RelayFixture {
+        let storage = storage_at(dir.path());
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let origin = test_actor(
+            31,
+            UserId::local(Ulid::from_parts(1_700, 1), realm_id),
+            realm_id,
+        );
+        let relay = node(32);
+        let device = node(33);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(origin.node_id, RealmNodeKind::Server);
+        config.ensure_node(relay, RealmNodeKind::Server);
+        config.ensure_node(
+            device,
+            RealmNodeKind::User {
+                owner: origin.user_id,
+            },
+        );
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target,
+                config.to_bytes(&origin).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        let group_id = Ulid::from_parts(1_701, 1);
+        let target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_parts(1_705, 1),
+            shard: 1,
+        };
+        let event = test_admin_event(
+            Ulid::from_parts(1_702, 1),
+            AdminDocumentTarget::Group { group_id },
+            &origin,
+            1,
+            AdminDocumentOperation::GroupCreated {
+                realm_id,
+                display_name: "Engineering".to_string(),
+                owner: origin.user_id,
+            },
+        );
+        RelayFixture {
+            storage,
+            realm_id,
+            topic: target.sync_topic_id(realm_id, &placement),
+            target,
+            event,
+            placement,
+            origin,
+            relay,
+            device,
+        }
+    }
+
+    async fn validate_relayed(fixture: &RelayFixture, publisher: NodeId) -> AdminEventValidation {
+        validate_replicated_admin_event(
+            &fixture.storage,
+            fixture.topic,
+            irokle_crate::actor_id_for(fixture.topic, node_id_to_peer_id(&publisher)),
+            &fixture.target,
+            &fixture.event,
+            fixture.realm_id,
+            &fixture.placement,
+            &sign_as_origin(&fixture.event, &fixture.placement),
+            &mut ConfigValidationCache::default(),
+        )
+        .await
+        .expect("validation runs")
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_origin() {
+        // A Server that is not the origin may carry the origin-signed envelope.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture = relay_fixture(&dir).await;
+        assert_eq!(
+            validate_relayed(&fixture, fixture.origin.node_id).await,
+            AdminEventValidation::Accepted
+        );
+        assert_eq!(
+            validate_relayed(&fixture, fixture.relay).await,
+            AdminEventValidation::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_user_relay() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture = relay_fixture(&dir).await;
+        assert!(matches!(
+            validate_relayed(&fixture, fixture.device).await,
+            AdminEventValidation::Rejected(reason)
+                if reason == "relayed admin event publisher is not a realm relay node"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_user_origin() {
+        // A device never publishes a realm administrative event, relayed or not.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut fixture = relay_fixture(&dir).await;
+        let device_actor = test_actor(33, fixture.origin.user_id, fixture.realm_id);
+        fixture.event = test_admin_event(
+            Ulid::from_parts(1_703, 1),
+            fixture.event.target.clone(),
+            &device_actor,
+            1,
+            fixture.event.op.clone(),
+        );
+        assert!(matches!(
+            validate_relayed(&fixture, fixture.relay).await,
+            AdminEventValidation::Rejected(reason)
+                if reason == "group admin event origin is not a publisher-capable realm node"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_forged_relay() {
+        // A relay that rewrites the actor invalidates the origin signature.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture = relay_fixture(&dir).await;
+        let signature = sign_as_origin(&fixture.event, &fixture.placement);
+        let mut forged = fixture.event.clone();
+        forged.actor.user_id = UserId::local(Ulid::from_parts(1_704, 1), fixture.realm_id);
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &fixture.storage,
+                fixture.topic,
+                irokle_crate::actor_id_for(fixture.topic, node_id_to_peer_id(&fixture.relay)),
+                &fixture.target,
+                &forged,
+                fixture.realm_id,
+                &fixture.placement,
+                &signature,
+                &mut ConfigValidationCache::default(),
+            )
+            .await
+            .expect("validation runs"),
+            AdminEventValidation::Rejected(reason)
+                if reason == "admin event is not signed by its origin node"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_reshard_relay() {
+        // The signature covers the placement, so a relay cannot re-route the
+        // envelope onto another shard's topic.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture = relay_fixture(&dir).await;
+        let elsewhere = PlacementRef {
+            shard: fixture.placement.shard + 1,
+            ..fixture.placement
+        };
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &fixture.storage,
+                fixture.target.sync_topic_id(fixture.realm_id, &elsewhere),
+                irokle_crate::actor_id_for(fixture.topic, node_id_to_peer_id(&fixture.relay)),
+                &fixture.target,
+                &fixture.event,
+                fixture.realm_id,
+                &elsewhere,
+                &sign_as_origin(&fixture.event, &fixture.placement),
+                &mut ConfigValidationCache::default(),
+            )
+            .await
+            .expect("validation runs"),
+            AdminEventValidation::Rejected(reason)
+                if reason == "admin event is not signed by its origin node"
         ));
     }
 
@@ -12256,6 +12571,7 @@ mod tests {
                 &flood_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&flood_event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -12284,6 +12600,7 @@ mod tests {
                 &neighbour_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&neighbour_event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -13683,6 +14000,7 @@ mod tests {
             &event,
             realm_id,
             &placement,
+            &sign_as_origin(&event, &placement),
             &mut ConfigValidationCache::default(),
         )
         .await
@@ -16166,6 +16484,7 @@ mod tests {
                     event: Box::new(strategy_event),
                     placement: PlacementRef::NIL,
                     allow_genesis: true,
+                    origin_signature: None,
                 }],
                 Vec::new(),
             )
@@ -17097,10 +17416,15 @@ mod tests {
 
         let event_a_id = Ulid::from_parts(0xA1, 1);
         let event_b_id = Ulid::from_parts(0xB2, 2);
+        // Each side originates its own event: only the origin signs an envelope.
         let admin_a = test_admin_event(
             event_a_id,
             admin_target.clone(),
-            &test_actor(1, user_id, realm_id),
+            &Actor {
+                node_id: node_a,
+                user_id,
+                realm_id,
+            },
             1,
             AdminDocumentOperation::UserNameSet {
                 name: "from-a".into(),
@@ -17109,7 +17433,11 @@ mod tests {
         let admin_b = test_admin_event(
             event_b_id,
             admin_target.clone(),
-            &test_actor(2, user_id, realm_id),
+            &Actor {
+                node_id: node_b,
+                user_id,
+                realm_id,
+            },
             1,
             AdminDocumentOperation::UserNameSet {
                 name: "from-b".into(),
@@ -17132,6 +17460,7 @@ mod tests {
                     event: Box::new(admin_a),
                     placement,
                     allow_genesis: true,
+                    origin_signature: None,
                 }],
                 vec![node_b],
             )
@@ -17147,6 +17476,7 @@ mod tests {
                     event: Box::new(admin_b),
                     placement,
                     allow_genesis: true,
+                    origin_signature: None,
                 }],
                 vec![node_a],
             )
@@ -17304,7 +17634,7 @@ mod tests {
         );
         assert_eq!(document.placement, placement);
         match &document.event {
-            DocumentSyncOutboxEvent::AdminOperation { event } => {
+            DocumentSyncOutboxEvent::AdminOperation { event, .. } => {
                 assert_eq!(
                     event.event_id, loser_event_id,
                     "embedded admin event id must survive for applier dedup"
@@ -17325,6 +17655,7 @@ mod tests {
         );
         let foreign_payload = DocumentSyncEvent::AdminOperation {
             target: target.clone(),
+            origin_signature: sign_as_origin(&foreign_admin, &placement),
             event: Box::new(foreign_admin),
             placement,
         };
@@ -17433,6 +17764,7 @@ mod tests {
                             event: Box::new(event),
                             placement,
                             allow_genesis: true,
+                            origin_signature: None,
                         }],
                         Vec::new(),
                     )
@@ -17591,6 +17923,7 @@ mod tests {
                         event: Box::new(event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
+                        origin_signature: None,
                     }],
                     Vec::new(),
                 )
@@ -17750,6 +18083,7 @@ mod tests {
                         event: Box::new(admin_event),
                         placement,
                         allow_genesis: true,
+                        origin_signature: None,
                     },
                 ],
                 Vec::new(),
@@ -17893,6 +18227,7 @@ mod tests {
                         &event,
                         realm_id,
                         &placement,
+                        &sign_as_origin(&event, &placement),
                         &mut ConfigValidationCache::default(),
                     )
                     .await
@@ -17932,6 +18267,7 @@ mod tests {
                 &ensure,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&ensure, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -17961,6 +18297,7 @@ mod tests {
                 &description,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&description, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -17997,6 +18334,7 @@ mod tests {
                 &genesis_role,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&genesis_role, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -18058,6 +18396,7 @@ mod tests {
                     &event,
                     realm_id,
                     &placement,
+                    &sign_as_origin(&event, &placement),
                     &mut ConfigValidationCache::default(),
                 )
                 .await
@@ -18129,6 +18468,7 @@ mod tests {
                 &forged_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&forged_event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -18161,6 +18501,7 @@ mod tests {
                 &orphan_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&orphan_event, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -18242,6 +18583,7 @@ mod tests {
                     &event,
                     realm_id,
                     &PlacementRef::NIL,
+                    &sign_as_origin(&event, &PlacementRef::NIL),
                     &mut ConfigValidationCache::default(),
                 )
                 .await
@@ -18286,6 +18628,7 @@ mod tests {
                 &waiting,
                 realm_id,
                 &PlacementRef::NIL,
+                &sign_as_origin(&waiting, &PlacementRef::NIL),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -18340,6 +18683,7 @@ mod tests {
                 &wrong_target,
                 realm_id,
                 &placement,
+                &sign_as_origin(&wrong_target, &placement),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -18366,6 +18710,7 @@ mod tests {
                 &malformed,
                 realm_id,
                 &placement,
+                &sign_as_origin(&malformed, &placement),
                 &mut ConfigValidationCache::default(),
             )
             .await
@@ -18470,6 +18815,7 @@ mod tests {
                     event,
                     placement: PlacementRef::NIL,
                     allow_genesis: true,
+                    origin_signature: None,
                 })
                 .collect();
             assert!(matches!(
@@ -18597,12 +18943,14 @@ mod tests {
                             event: Box::new(group_role),
                             placement: group_placement,
                             allow_genesis: true,
+                            origin_signature: None,
                         },
                         DocumentSyncPublish::AdminOperation {
                             target: group_target.clone(),
                             event: Box::new(group_create),
                             placement: group_placement,
                             allow_genesis: true,
+                            origin_signature: None,
                         },
                     ],
                     Vec::new(),
@@ -18750,30 +19098,35 @@ mod tests {
                         event: Box::new(wrong_realm_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
+                        origin_signature: None,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(impersonated_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
+                        origin_signature: None,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(reducer_invalid_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
+                        origin_signature: None,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(valid_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
+                        origin_signature: None,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(unrelated_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
+                        origin_signature: None,
                     },
                 ],
                 Vec::new(),
@@ -18898,12 +19251,14 @@ mod tests {
                             event: Box::new(invented),
                             placement: PlacementRef::NIL,
                             allow_genesis: true,
+                            origin_signature: None,
                         },
                         DocumentSyncPublish::AdminOperation {
                             target: target.clone(),
                             event: Box::new(later),
                             placement: PlacementRef::NIL,
                             allow_genesis: true,
+                            origin_signature: None,
                         },
                     ],
                     Vec::new(),
@@ -19041,12 +19396,14 @@ mod tests {
                             event: Box::new(started),
                             placement: PlacementRef::NIL,
                             allow_genesis: true,
+                            origin_signature: None,
                         },
                         DocumentSyncPublish::AdminOperation {
                             target: target.clone(),
                             event: Box::new(barrier),
                             placement: PlacementRef::NIL,
                             allow_genesis: true,
+                            origin_signature: None,
                         },
                     ],
                     Vec::new(),
@@ -19921,6 +20278,7 @@ mod tests {
                         event: Box::new(admin_event),
                         placement: PlacementRef::NIL,
                         allow_genesis: true,
+                        origin_signature: None,
                     },
                     DocumentSyncPublish::Upsert {
                         event_id: Ulid::generate(),

@@ -162,10 +162,32 @@ pub enum DocumentSyncOutboxEvent {
     },
     AdminOperation {
         event: Box<AdminDocumentEvent>,
+        /// Set only on a relayed record, where this node is not the origin and
+        /// forwards the origin's signature verbatim. `None` means the local node
+        /// is the origin and signs the envelope when it publishes.
+        origin_signature: Option<iroh::Signature>,
     },
     Delete {
         change: DocumentSyncChange,
     },
+}
+
+impl DocumentSyncOutboxEvent {
+    /// Admin record originated by this node; the publisher signs the envelope.
+    pub fn admin(event: AdminDocumentEvent) -> Self {
+        Self::AdminOperation {
+            event: Box::new(event),
+            origin_signature: None,
+        }
+    }
+
+    /// Admin record accepted from another origin, kept exactly as signed.
+    pub fn relayed_admin(event: AdminDocumentEvent, origin_signature: iroh::Signature) -> Self {
+        Self::AdminOperation {
+            event: Box::new(event),
+            origin_signature: Some(origin_signature),
+        }
+    }
 }
 
 /// A payload recovered from a genesis tie-break, journalled until its
@@ -234,6 +256,8 @@ pub enum DocumentSyncPublish {
         event: Box<AdminDocumentEvent>,
         placement: PlacementRef,
         allow_genesis: bool,
+        /// `None` when the local node is the origin and signs at publish time.
+        origin_signature: Option<iroh::Signature>,
     },
     Delete {
         event_id: Ulid,
@@ -543,6 +567,9 @@ pub enum DocumentSyncEvent {
         target: DocumentSyncTarget,
         event: Box<AdminDocumentEvent>,
         placement: PlacementRef,
+        /// The origin's signature over the envelope. Carried on the wire so a
+        /// relay hop preserves origin authority instead of substituting its own.
+        origin_signature: iroh::Signature,
     },
     Delete {
         event_id: Ulid,

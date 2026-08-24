@@ -1233,6 +1233,7 @@ async fn seed_config_topic(
                     event: Box::new(event),
                     placement,
                     allow_genesis: true,
+                    origin_signature: None,
                 }],
                 peers: Vec::new(),
             },

@@ -407,9 +407,7 @@ impl RemoveUserFromGroupOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -1038,7 +1036,7 @@ pub mod test {
         let events: Vec<_> = outbox_records
             .iter()
             .map(|record| match &record.event {
-                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
                 other => panic!("unexpected outbox event: {other:?}"),
             })
             .collect();

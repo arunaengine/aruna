@@ -650,6 +650,7 @@ async fn seed_realm_config_sync_topic(
                     event: Box::new(event),
                     placement,
                     allow_genesis: true,
+                    origin_signature: None,
                 }],
                 peers: Vec::new(),
             },

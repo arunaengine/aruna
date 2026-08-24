@@ -304,9 +304,7 @@ impl AddUserToRealmRolesOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
                 aruna_core::structs::PlacementRef::NIL,
@@ -879,7 +877,7 @@ pub mod test {
         let events: Vec<_> = outbox_records
             .iter()
             .map(|record| match &record.event {
-                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
                 other => panic!("unexpected outbox event: {other:?}"),
             })
             .collect();
@@ -1017,7 +1015,7 @@ pub mod test {
             record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
                 && matches!(
                     &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation { event }
+                    DocumentSyncOutboxEvent::AdminOperation { event, .. }
                         if event.target == target
                             && matches!(
                                 &event.op,
@@ -1031,7 +1029,7 @@ pub mod test {
                 record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
                     && matches!(
                         &record.event,
-                        DocumentSyncOutboxEvent::AdminOperation { event }
+                        DocumentSyncOutboxEvent::AdminOperation { event, .. }
                             if event.target == target
                                 && matches!(
                                     &event.op,

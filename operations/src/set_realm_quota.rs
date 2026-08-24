@@ -209,9 +209,7 @@ impl SetRealmQuotaOperation {
             self.config.actor.node_id,
             document_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(admin_event),
-            },
+            DocumentSyncOutboxEvent::admin(admin_event),
             placement,
             false,
         );

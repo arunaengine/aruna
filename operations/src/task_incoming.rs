@@ -382,11 +382,15 @@ fn document_publish_from_outbox(
             change,
             allow_genesis,
         },
-        DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
+        DocumentSyncOutboxEvent::AdminOperation {
+            event,
+            origin_signature,
+        } => DocumentSyncPublish::AdminOperation {
             target,
             event,
             placement,
             allow_genesis,
+            origin_signature,
         },
     }
 }
@@ -489,7 +493,7 @@ enum DrainPage {
 /// within one origin node.
 fn admin_origin(record: &DocumentSyncOutboxRecord) -> Option<aruna_core::NodeId> {
     match &record.event {
-        DocumentSyncOutboxEvent::AdminOperation { event } => Some(event.origin_node_id),
+        DocumentSyncOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
         _ => None,
     }
 }
@@ -3339,23 +3343,21 @@ mod tests {
             node(1),
             target,
             Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(AdminDocumentEvent {
-                    event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
-                    target: AdminDocumentTarget::User { user_id },
-                    origin_node_id: origin,
-                    origin_seq,
-                    observed: AdminDocumentClock::default(),
-                    actor: aruna_core::structs::Actor {
-                        node_id: node(1),
-                        user_id,
-                        realm_id,
-                    },
-                    op: AdminDocumentOperation::UserNameSet {
-                        name: format!("user-{origin_seq}"),
-                    },
-                }),
-            },
+            DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+                event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
+                target: AdminDocumentTarget::User { user_id },
+                origin_node_id: origin,
+                origin_seq,
+                observed: AdminDocumentClock::default(),
+                actor: aruna_core::structs::Actor {
+                    node_id: node(1),
+                    user_id,
+                    realm_id,
+                },
+                op: AdminDocumentOperation::UserNameSet {
+                    name: format!("user-{origin_seq}"),
+                },
+            }),
             placement,
             false,
         )

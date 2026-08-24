@@ -400,9 +400,7 @@ impl UpdateUserOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -981,9 +979,7 @@ mod tests {
                 );
                 assert!(outbox_records.iter().any(|record| matches!(
                     &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation {
-                        event
-                    } if matches!(
+                    DocumentSyncOutboxEvent::AdminOperation { event, .. } if matches!(
                         &event.op,
                         aruna_core::admin_documents::AdminDocumentOperation::UserNameSet { .. }
                     )

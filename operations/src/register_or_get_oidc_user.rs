@@ -263,9 +263,7 @@ impl RegisterOrGetOidcUserOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 true,
             )
@@ -704,7 +702,7 @@ mod tests {
                     assert_eq!(record.target, document_target);
                     assert_eq!(record.node_id, actor.node_id);
                     assert!(record.peers.is_empty());
-                    let DocumentSyncOutboxEvent::AdminOperation { event } = record.event else {
+                    let DocumentSyncOutboxEvent::AdminOperation { event, .. } = record.event else {
                         panic!("unexpected outbox event");
                     };
                     assert_eq!(record.outbox_id, event.event_id);
