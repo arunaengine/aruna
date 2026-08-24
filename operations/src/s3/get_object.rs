@@ -131,6 +131,9 @@ pub enum GetObjectError {
         version_id: Option<Ulid>,
         metadata: HashMap<String, String>,
     },
+    /// Policy-covered content the holders will not serve to a device, which is
+    /// never a legal destination for governed data. Terminal: the S3 answer is
+    /// an honest 403, not a fault a retry could clear.
     #[error("Governed content is not available on a user node.")]
     GovernedUnavailable,
     #[error("GetObject failed (miserably)")]
