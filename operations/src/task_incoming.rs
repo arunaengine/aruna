@@ -697,10 +697,6 @@ impl OperationsTaskHandler {
         config: Option<&aruna_core::structs::RealmConfigDocument>,
         undeliverable: &[DrainRecord],
     ) -> Vec<Vec<u8>> {
-        UNDELIVERABLE_RECORD_COUNT.fetch_add(
-            undeliverable.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
         let mut relayed = Vec::new();
         for (record_key, record, topic) in undeliverable {
             if let Some(config) = config
@@ -719,6 +715,11 @@ impl OperationsTaskHandler {
                 "Cannot publish a document sync outbox record from this node and it is not relayable; leaving it in the outbox"
             );
         }
+        // A relayed record left this node, so it never counts as undeliverable.
+        UNDELIVERABLE_RECORD_COUNT.fetch_add(
+            undeliverable.len().saturating_sub(relayed.len()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         relayed
     }
 
@@ -1279,10 +1280,10 @@ impl OperationsTaskHandler {
                     Some((record_ms, record.target.clone(), *topic, record.placement));
             }
         }
-        invocation.undeliverable += undeliverable.len();
         let relayed = self
             .relay_undeliverable_records(config, &undeliverable)
             .await;
+        invocation.undeliverable += undeliverable.len().saturating_sub(relayed.len());
         if !relayed.is_empty()
             && let Err(error) = delete_outbox_records(&self.context.storage_handle, relayed).await
         {
