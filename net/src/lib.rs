@@ -11,7 +11,7 @@ pub mod error;
 pub mod streams;
 mod telemetry;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::mem;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1159,6 +1159,23 @@ impl NetHandle {
             self.inner.node_id,
         );
         self.inner.inbound_admission.set_admitted(admitted);
+        // Node kind decides which protocols each side of a connection may
+        // speak; the accept loop and the DHT read the same table.
+        let mut peer_kinds = BTreeMap::new();
+        let mut local_kind = None;
+        for node in &document.nodes {
+            let Ok(node_id) = NodeId::from_str(&node.node_id) else {
+                continue;
+            };
+            if node_id == self.inner.node_id {
+                local_kind = Some(node.kind.clone());
+            } else {
+                peer_kinds.insert(node_id, node.kind.clone());
+            }
+        }
+        self.inner
+            .inbound_admission
+            .set_kinds(local_kind, peer_kinds);
         // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
         let peers = unique_peer_nodes(
             document
@@ -1347,6 +1364,13 @@ impl NetHandle {
         if matches!(alpn, Alpn::Dht) {
             return Err(NetError::Stream(format!(
                 "{alpn} is an internal network protocol"
+            )));
+        }
+        // Outbound half of the accept matrix: a device must not even dial a
+        // protocol its own node kind is refused on.
+        if !self.inner.inbound_admission.local_allows(alpn) {
+            return Err(NetError::Stream(format!(
+                "{alpn} is not permitted for this node kind"
             )));
         }
 

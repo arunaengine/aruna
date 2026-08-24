@@ -1,5 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
+use aruna_core::structs::RealmNodeKind;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use parking_lot::{Mutex, RwLock};
@@ -30,11 +31,17 @@ const INBOUND_CONNECTION_PEER_LIMIT: usize = 8;
 const INBOUND_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INBOUND_CONNECTION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Configured node kind per realm key, shared with every subsystem that has to
+/// apply the ALPN x kind matrix. One writer: the realm-config refresh.
+pub type PeerKinds = Arc<RwLock<BTreeMap<NodeId, RealmNodeKind>>>;
+
 #[derive(Clone, Debug)]
 pub struct InboundAdmission {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     admitted_peers: Arc<RwLock<Vec<NodeId>>>,
     bootstrap_peers: Arc<RwLock<BTreeSet<NodeId>>>,
+    peer_kinds: PeerKinds,
+    local_kind: Arc<RwLock<Option<RealmNodeKind>>>,
     realm_config_materialized: Arc<AtomicBool>,
     materialized_signal: watch::Sender<bool>,
     membership_signal: watch::Sender<u64>,
@@ -51,6 +58,8 @@ impl InboundAdmission {
             realm_peers,
             admitted_peers: Arc::new(RwLock::new(Vec::new())),
             bootstrap_peers: Arc::new(RwLock::new(bootstrap_peers.into_iter().collect())),
+            peer_kinds: Arc::new(RwLock::new(BTreeMap::new())),
+            local_kind: Arc::new(RwLock::new(None)),
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
             materialized_signal,
             membership_signal,
@@ -63,12 +72,42 @@ impl InboundAdmission {
         *self.admitted_peers.write() = peers;
     }
 
+    /// Configured kind of every other realm node plus this node's own kind.
+    /// Both halves come from the same realm-config refresh that publishes the
+    /// membership bump, so a kind change re-runs the live connection check.
+    pub(crate) fn set_kinds(
+        &self,
+        local: Option<RealmNodeKind>,
+        peers: BTreeMap<NodeId, RealmNodeKind>,
+    ) {
+        *self.peer_kinds.write() = peers;
+        *self.local_kind.write() = local;
+    }
+
     fn allows_peer(&self, peer: NodeId) -> bool {
         if self.realm_peers.read().contains(&peer) || self.admitted_peers.read().contains(&peer) {
             return true;
         }
         !self.realm_config_materialized.load(Ordering::Acquire)
             && self.bootstrap_peers.read().contains(&peer)
+    }
+
+    /// Both endpoints must be allowed to speak `alpn`: a device refuses realm
+    /// protocols it never runs, and a realm node refuses them from a device.
+    fn allows_alpn(&self, peer: NodeId, alpn: Alpn) -> bool {
+        if !self.local_allows(alpn) {
+            return false;
+        }
+        alpn.allowed_for(self.peer_kinds.read().get(&peer))
+    }
+
+    /// The outbound half of the matrix: what this node's own kind may dial.
+    pub(crate) fn local_allows(&self, alpn: Alpn) -> bool {
+        alpn.allowed_for(self.local_kind.read().as_ref())
+    }
+
+    fn admits(&self, peer: NodeId, alpn: Alpn) -> bool {
+        self.allows_peer(peer) && self.allows_alpn(peer, alpn)
     }
 
     pub(crate) fn add_bootstrap(&self, peer: NodeId) {
@@ -446,6 +485,15 @@ pub async fn run_accept_loop(
                         conn.close(0u32.into(), b"realm admission");
                         return;
                     }
+                    if !inbound_admission.allows_alpn(peer_id, alpn) {
+                        warn!(
+                            node_id = %peer_id,
+                            alpn = %alpn,
+                            "Dropping inbound Iroh connection: node kind refuses this protocol"
+                        );
+                        conn.close(0u32.into(), b"node kind");
+                        return;
+                    }
                     // A provisional session takes the same budget as an admitted
                     // one, so one unknown identity cannot hold every handshake
                     // permit and starve inbound admission for configured peers.
@@ -555,7 +603,7 @@ async fn run_admitted(
 ) {
     let close_conn = conn.clone();
     let mut membership = admission.membership_watch();
-    if !admission.allows_peer(peer_id) {
+    if !admission.admits(peer_id, alpn) {
         close_conn.close(0u32.into(), b"realm membership");
         return;
     }
@@ -573,7 +621,7 @@ async fn run_admitted(
         tokio::select! {
             _ = &mut session => return,
             changed = membership.changed() => {
-                if changed.is_err() || !admission.allows_peer(peer_id) {
+                if changed.is_err() || !admission.admits(peer_id, alpn) {
                     close_conn.close(0u32.into(), b"realm membership");
                     return;
                 }
@@ -817,6 +865,73 @@ mod tests {
         *realm_peers.write() = vec![peer(3)];
         assert!(admission.allows_peer(peer(3)));
         assert!(!admission.allows_peer(peer(1)));
+    }
+
+    fn user_kind() -> RealmNodeKind {
+        RealmNodeKind::User {
+            owner: aruna_core::types::UserId::nil(aruna_core::structs::RealmId::from_bytes(
+                [7u8; 32],
+            )),
+        }
+    }
+
+    #[test]
+    fn kind_matrix() {
+        // Contract: the full ALPN x kind matrix in `Alpn::ALL` order. Flipping a
+        // row changes a protocol boundary and must be a deliberate decision.
+        let user = user_kind();
+        let cases: [(Option<&RealmNodeKind>, [bool; 8]); 4] = [
+            (None, [true; 8]),
+            (Some(&RealmNodeKind::Management), [true; 8]),
+            (Some(&RealmNodeKind::Server), [true; 8]),
+            (
+                Some(&user),
+                [true, true, false, true, true, true, false, false],
+            ),
+        ];
+        for (kind, expected) in cases {
+            for (alpn, allowed) in Alpn::ALL.into_iter().zip(expected) {
+                assert_eq!(alpn.allowed_for(kind), allowed, "{alpn} for {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn admission_kind_gate() {
+        let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
+        let admission = InboundAdmission::new(realm_peers, []);
+        admission.mark_materialized();
+        for alpn in Alpn::ALL {
+            assert!(admission.admits(peer(1), alpn));
+        }
+
+        admission.set_kinds(
+            Some(RealmNodeKind::Management),
+            BTreeMap::from([(peer(1), user_kind())]),
+        );
+        assert!(admission.admits(peer(1), Alpn::Metadata));
+        assert!(admission.admits(peer(1), Alpn::Bao));
+        assert!(!admission.admits(peer(1), Alpn::DocumentSync));
+        assert!(!admission.admits(peer(1), Alpn::Shard));
+        assert!(!admission.admits(peer(1), Alpn::JobControl));
+        assert!(!admission.admits(peer(2), Alpn::Metadata));
+    }
+
+    #[test]
+    fn local_kind_gate() {
+        // A device refuses realm protocols on both directions of a connection.
+        let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
+        let admission = InboundAdmission::new(realm_peers, []);
+        admission.mark_materialized();
+        admission.set_kinds(
+            Some(user_kind()),
+            BTreeMap::from([(peer(1), RealmNodeKind::Server)]),
+        );
+
+        assert!(admission.local_allows(Alpn::Bao));
+        assert!(!admission.local_allows(Alpn::DocumentSync));
+        assert!(admission.admits(peer(1), Alpn::Bao));
+        assert!(!admission.admits(peer(1), Alpn::DocumentSync));
     }
 
     #[test]

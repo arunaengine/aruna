@@ -4,6 +4,8 @@
 //! differ never negotiates the ALPN, so it fails the connection instead of
 //! decoding foreign bytes. There is no fallback ALPN and no downgrade.
 
+use crate::structs::RealmNodeKind;
+
 /// Application Layer Protocol Negotiation identifiers for Aruna streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Alpn {
@@ -26,6 +28,39 @@ pub enum Alpn {
 }
 
 impl Alpn {
+    /// Every protocol, so a matrix or dispatch review can iterate all of them.
+    pub const ALL: [Alpn; 8] = [
+        Alpn::Dht,
+        Alpn::Bao,
+        Alpn::DocumentSync,
+        Alpn::Metadata,
+        Alpn::NativeReference,
+        Alpn::Notification,
+        Alpn::Shard,
+        Alpn::JobControl,
+    ];
+
+    /// The ALPN x node-kind allow matrix, consulted on both sides of every
+    /// connection. `None` is a key the realm config does not name: it keeps the
+    /// pre-matrix provisional behaviour and is bounded by admission instead.
+    ///
+    /// A `User` device speaks the read and forward surface only. Document sync,
+    /// shard exchange and job control are realm infrastructure: a device is
+    /// never a holder, a sync publisher, or a job target.
+    pub const fn allowed_for(&self, kind: Option<&RealmNodeKind>) -> bool {
+        match kind {
+            None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,
+            Some(RealmNodeKind::User { .. }) => match self {
+                Alpn::Dht
+                | Alpn::Bao
+                | Alpn::Metadata
+                | Alpn::NativeReference
+                | Alpn::Notification => true,
+                Alpn::DocumentSync | Alpn::Shard | Alpn::JobControl => false,
+            },
+        }
+    }
+
     pub const fn as_bytes(&self) -> &'static [u8] {
         match self {
             Alpn::Dht => b"aruna/dht/2",
@@ -101,6 +136,18 @@ mod tests {
             Alpn::from_bytes(Alpn::JobControl.as_bytes()),
             Some(Alpn::JobControl)
         );
+    }
+
+    #[test]
+    fn all_is_complete() {
+        // `ALL` drives the accept-matrix contract test; a missing or duplicated
+        // entry would leave a protocol unpinned.
+        let mut seen = std::collections::BTreeSet::new();
+        for alpn in Alpn::ALL {
+            assert_eq!(Alpn::from_bytes(alpn.as_bytes()), Some(alpn));
+            assert!(seen.insert(alpn));
+        }
+        assert_eq!(seen.len(), Alpn::ALL.len());
     }
 
     #[test]
