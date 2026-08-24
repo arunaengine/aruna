@@ -265,10 +265,9 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
     description = r#"Mints a single-use enrollment secret that a joining node or device redeems to enter the realm.
 
 **Authentication**: `Management` and `Server` secrets need a bearer token of this realm with WRITE
-on the realm's onboarding admin path. A `User` secret is self-service: any authenticated member of
-this realm may mint one for itself, from an unrestricted token only, because the device it enrolls
-carries the caller's whole identity. Only a management node serves the route and any other node
-answers 403.
+on the realm's onboarding admin path. A `User` secret is self-service: any authenticated member may
+mint one for itself, from an unrestricted token only. Only a management node serves the route and
+any other node answers 403.
 
 **Behavior**
 - The response carries the enrollment secret exactly once: the node stores only its hash, so a
@@ -278,7 +277,8 @@ answers 403.
   `Management` secret later lets the joiner receive the realm private key wrapped to its transport
   key, so it is the most sensitive of the three.
 - A `User` secret enrolls an owner-bound device. Its owner is always the calling credential: the
-  request body cannot name one, so a device secret can never enroll a node for somebody else.
+  request body cannot name one, so a device secret can never enroll a node for somebody else. A
+  path-restricted token cannot mint one, because the device carries the caller's whole identity.
 - Because self-service enrollment rests on no role grant, the realm's request policies are what an
   administrator gates it with. A `User` mint is evaluated against them under the operation name
   `onboarding.enroll_device` and the path `/{realm}/onboarding/devices`, so a realm deny policy on
