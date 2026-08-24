@@ -549,7 +549,6 @@ mod tests {
     use aruna_core::types::UserId;
     use aruna_operations::device::repository::{IntakeEntry, IntakeState};
     use ulid::Ulid;
-    use utoipa::OpenApi;
 
     fn entry() -> IntakeEntry {
         IntakeEntry::new(

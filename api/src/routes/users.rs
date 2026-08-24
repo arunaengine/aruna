@@ -2878,6 +2878,9 @@ mod device_tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId, RealmNodeKind};
+    use aruna_operations::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
     use aruna_operations::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
