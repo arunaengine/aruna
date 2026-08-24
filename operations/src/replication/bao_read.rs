@@ -34,6 +34,7 @@ use crate::placement_policy::{
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::mutate_realm_placement::node_kind;
 use crate::realm_peer::ensure_realm_peer;
 use crate::request_policy::{PolicyRequestExtras, policy_request_with};
 
@@ -804,6 +805,25 @@ impl IncomingBaoReadOperation {
         }
     }
 
+    /// Who this serve runs as. A User peer is owner-bound: it is admitted as a
+    /// realm member without internal trust, and the auth context is forced to
+    /// the owner its realm config names, so a device cannot read as anyone else
+    /// (D12). Every other kind keeps the internal-trust gate unchanged.
+    fn admit_peer(&mut self, document: &RealmConfigDocument) -> Option<BaoReadRefusal> {
+        let owner = node_kind(document, self.peer).and_then(|kind| kind.owner());
+        let internal_trust = owner.is_none();
+        if ensure_realm_peer(document, self.peer, self.request.realm_id, internal_trust).is_err() {
+            return Some(BaoReadRefusal::RealmPeerDenied);
+        }
+        if let Some(owner) = owner {
+            if self.request.auth_context.user_id != owner {
+                return Some(BaoReadRefusal::ReadDenied);
+            }
+            self.request.auth_context.user_id = owner;
+        }
+        None
+    }
+
     fn handle_realm(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected(event);
@@ -815,8 +835,8 @@ impl IncomingBaoReadOperation {
             Ok(document) => document,
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
-        if ensure_realm_peer(&document, self.peer, self.request.realm_id, true).is_err() {
-            return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
+        if let Some(refusal) = self.admit_peer(&document) {
+            return self.send_refusal(refusal);
         }
         self.peer_placement = document.placement_entry(self.peer).cloned();
         match &self.request.target {
@@ -1550,6 +1570,91 @@ mod tests {
         ));
     }
 
+    fn device_realm_value(peer: aruna_core::NodeId, owner: UserId) -> byteview::ByteView {
+        let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
+        config.ensure_node(peer, RealmNodeKind::User { owner });
+        postcard::to_allocvec(&config).unwrap().into()
+    }
+
+    fn device_operation(
+        local_node: aruna_core::NodeId,
+        peer: aruna_core::NodeId,
+        asserted: UserId,
+    ) -> IncomingBaoReadOperation {
+        let mut request = read_request(local_node, [4u8; 32]);
+        request.auth_context.user_id = asserted;
+        IncomingBaoReadOperation::new(peer, local_node, test_realm(), Ulid::from(9u128), request)
+    }
+
+    // A device is a realm member without internal trust: it is admitted, and the
+    // serve is authorized as the owner its realm config names.
+    #[test]
+    fn serves_device_as_owner() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let owner = UserId::new(Ulid::from(11u128), test_realm());
+        let mut operation = device_operation(local_node, peer, owner);
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(device_realm_value(peer, owner)),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        assert_eq!(operation.request.auth_context.user_id, owner);
+        // A device is never a placement destination, so nothing governed lands.
+        assert_eq!(operation.peer_placement, None);
+    }
+
+    #[test]
+    fn refuses_device_impersonation() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let owner = UserId::new(Ulid::from(11u128), test_realm());
+        let other = UserId::new(Ulid::from(12u128), test_realm());
+        let mut operation = device_operation(local_node, peer, other);
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(device_realm_value(peer, owner)),
+        }));
+
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+    }
+
+    // Governed content stays out of reach: the device claims no subject, so the
+    // destination challenge denies before a byte is offered.
+    #[test]
+    fn refuses_governed_to_device() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let owner = UserId::new(Ulid::from(11u128), test_realm());
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(21u128),
+            digest: [7u8; 32],
+        };
+        let mut operation = device_operation(local_node, peer, owner);
+        operation.request.known_refs = vec![policy_ref];
+        operation.version_refs = vec![policy_ref];
+        operation.peer_placement = None;
+
+        let (location, _) = location_value([4u8; 32]);
+        let effects = operation.challenge_destination(location);
+
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected a policy frame")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::PlacementPolicyDenied { .. }
+        ));
+    }
+
     #[test]
     fn rejects_unknown_peer() {
         let local_node = node_from_seed(1);
@@ -1601,34 +1706,6 @@ mod tests {
                 ..
             })] if *read_txn == txn_id
         ));
-    }
-
-    #[test]
-    fn rejects_user_peer() {
-        let local_node = node_from_seed(1);
-        let peer = node_from_seed(2);
-        let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
-        config.ensure_node(
-            peer,
-            RealmNodeKind::User {
-                owner: UserId::nil(test_realm()),
-            },
-        );
-        let mut operation = IncomingBaoReadOperation::new(
-            peer,
-            local_node,
-            test_realm(),
-            Ulid::from(9u128),
-            read_request(local_node, [4u8; 32]),
-        );
-
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(postcard::to_allocvec(&config).unwrap().into()),
-        }));
-
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);
     }
 
     #[test]
