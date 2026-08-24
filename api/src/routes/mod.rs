@@ -12,6 +12,7 @@ pub mod blobs;
 pub mod compute;
 pub mod connectors;
 pub mod credentials;
+pub mod device;
 pub mod drs;
 pub mod group_backends;
 pub mod groups;
@@ -54,6 +55,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(compute::router())
         .merge(connectors::router())
         .merge(credentials::router())
+        .merge(device::router())
         .merge(groups::router())
         .merge(jobs::router())
         .merge(job_audit::router())
@@ -126,6 +128,7 @@ mod tests {
         ("DELETE", "/admin/onboarding/secrets/{id}"),
         ("DELETE", "/admin/sync-quarantine"),
         ("DELETE", "/data/sync-relationships/{id}"),
+        ("DELETE", "/device/drafts/{draft_id}"),
         ("DELETE", "/groups/{group_id}/connectors/{connector_id}"),
         ("DELETE", "/groups/{group_id}/storage-backends/{backend_id}"),
         ("DELETE", "/groups/{id}/members/{user_id}"),
@@ -150,6 +153,8 @@ mod tests {
         ("GET", "/buckets/{bucket}/storage-routing"),
         ("GET", "/data/sync-relationships"),
         ("GET", "/data/sync-relationships/{id}"),
+        ("GET", "/device/drafts"),
+        ("GET", "/device/drafts/{draft_id}"),
         ("GET", "/ga4gh/drs/v1/download"),
         ("GET", "/ga4gh/drs/v1/objects/{*object_id}"),
         ("GET", "/ga4gh/drs/v1/service-info"),
@@ -233,6 +238,8 @@ mod tests {
         ("POST", "/buckets/{bucket}/placement/runs"),
         ("POST", "/data/sync-relationships"),
         ("POST", "/data/sync-relationships/{id}/run"),
+        ("POST", "/device/drafts"),
+        ("POST", "/device/drafts/preview"),
         ("POST", "/ga4gh/drs/v1/objects"),
         ("POST", "/ga4gh/tes/v1/tasks"),
         ("POST", "/ga4gh/tes/v1/tasks/{id}"),

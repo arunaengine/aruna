@@ -23,6 +23,31 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "self-scoped: only credentials whose identity is the caller",
     ),
     (
+        "device.rs",
+        "delete_draft",
+        "device plane: require_owner binds the caller to this node's enrolled owner",
+    ),
+    (
+        "device.rs",
+        "get_draft",
+        "device plane: require_owner binds the caller to this node's enrolled owner",
+    ),
+    (
+        "device.rs",
+        "list_drafts",
+        "device plane: require_owner binds the caller to this node's enrolled owner",
+    ),
+    (
+        "device.rs",
+        "preview_draft",
+        "device plane: nothing stored is read beyond the realm-public Profile",
+    ),
+    (
+        "device.rs",
+        "queue_draft",
+        "device plane: the queued create is authorized by the holder at drain time",
+    ),
+    (
         "drs.rs",
         "get_authorizations",
         "public DRS auth-scheme discovery, resolves no object",
