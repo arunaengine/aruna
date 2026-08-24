@@ -21,6 +21,7 @@ use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
 };
+use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::issue_onboarding_sync_ticket::{
@@ -87,6 +88,8 @@ pub struct ServerState {
     // Node shutdown token: long-lived response streams end when it fires, so
     // the ingress drain does not have to wait for client disconnects.
     shutdown_token: CancellationToken,
+    // Present only on a user node: the owner's local wipe latch.
+    device_wipe: Option<Arc<DeviceWipe>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -195,6 +198,7 @@ impl ServerState {
             rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
             download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
             shutdown_token: CancellationToken::new(),
+            device_wipe: None,
         };
         state.persist_trusted_realms().await;
         state
@@ -203,6 +207,17 @@ impl ServerState {
     pub fn with_shutdown_token(mut self, token: CancellationToken) -> Self {
         self.shutdown_token = token;
         self
+    }
+
+    /// Hands the device plane the wipe latch the process erases through. Only a
+    /// user node is given one; without it `POST /device/wipe` is unavailable.
+    pub fn with_device_wipe(mut self, wipe: Arc<DeviceWipe>) -> Self {
+        self.device_wipe = Some(wipe);
+        self
+    }
+
+    pub fn device_wipe(&self) -> Option<&Arc<DeviceWipe>> {
+        self.device_wipe.as_ref()
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {

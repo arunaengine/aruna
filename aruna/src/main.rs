@@ -31,6 +31,8 @@ use aruna_core::structs::NodeCapabilities;
 use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::device::wipe as device_wipe;
+use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_holder;
@@ -558,6 +560,28 @@ struct ServerBindings {
     realm_id: aruna_core::structs::RealmId,
     node_id: iroh::PublicKey,
     is_initial_boot: bool,
+    /// Present on a user node only: the owner's local wipe latch.
+    device_wipe: Option<Arc<DeviceWipe>>,
+}
+
+/// Everything a wipe erases: the store root plus every derived root, which an
+/// operator may have relocated outside it.
+fn wipe_roots(config: &Config) -> Vec<std::path::PathBuf> {
+    vec![
+        std::path::PathBuf::from(&config.storage_path),
+        std::path::PathBuf::from(&config.metadata_storage_path),
+        config.document_sync_storage_path.clone(),
+        std::path::PathBuf::from(&config.blob_root),
+    ]
+}
+
+/// Pends forever when this node serves no device plane, so the failure select
+/// never fires for it.
+async fn device_wipe_armed(wipe: Option<&Arc<DeviceWipe>>) {
+    match wipe {
+        Some(wipe) => wipe.wait().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn bind_servers(
@@ -571,29 +595,33 @@ async fn bind_servers(
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let s3_timeouts = config.s3_timeouts();
-    let state = Arc::new(
-        ServerState::new(
-            driver_ctx.clone(),
-            config.realm_id,
-            config.node_id,
-            config.node_capabilities,
-            is_initial_node,
-            Some(Arc::new(OidcValidator::new()?)),
-            jobs_runtime,
-        )
-        .await
-        .with_metrics(metrics.clone())
-        .with_rocrate_limits(config.rocrate_limits.clone())
-        .with_s3_mounts(s3_mounts_available)
-        .with_trusted_proxies(config.trusted_proxies.clone())
-        .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
-            config.rate_limits.ip_per_minute,
-            config.rate_limits.ip_burst,
-            config.rate_limits.principal_per_minute,
-            config.rate_limits.principal_burst,
-        ))
-        .with_shutdown_token(shutdown.token()),
-    );
+    let device_wipe = matches!(config.node_capabilities, NodeCapabilities::User { .. })
+        .then(|| Arc::new(DeviceWipe::new(wipe_roots(&config))));
+    let mut state = ServerState::new(
+        driver_ctx.clone(),
+        config.realm_id,
+        config.node_id,
+        config.node_capabilities,
+        is_initial_node,
+        Some(Arc::new(OidcValidator::new()?)),
+        jobs_runtime,
+    )
+    .await
+    .with_metrics(metrics.clone())
+    .with_rocrate_limits(config.rocrate_limits.clone())
+    .with_s3_mounts(s3_mounts_available)
+    .with_trusted_proxies(config.trusted_proxies.clone())
+    .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+        config.rate_limits.ip_per_minute,
+        config.rate_limits.ip_burst,
+        config.rate_limits.principal_per_minute,
+        config.rate_limits.principal_burst,
+    ))
+    .with_shutdown_token(shutdown.token());
+    if let Some(wipe) = device_wipe.clone() {
+        state = state.with_device_wipe(wipe);
+    }
+    let state = Arc::new(state);
     portal::initialize(config.portal.clone(), state.clone()).await;
 
     let cors = CorsConfig::new(config.cors_allowed_origins.clone());
@@ -673,6 +701,7 @@ async fn bind_servers(
         realm_id: config.realm_id,
         node_id: config.node_id,
         is_initial_boot,
+        device_wipe,
     })
 }
 
@@ -848,6 +877,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         realm_id,
         node_id,
         is_initial_boot,
+        device_wipe,
     } = bind_servers(
         config,
         driver_ctx.clone(),
@@ -897,6 +927,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             portal_handle = None;
             failure = Some(message);
         }
+        _ = device_wipe_armed(device_wipe.as_ref()) => {}
         _ = &mut signal => {}
     }
 
@@ -932,6 +963,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     .run()
     .await;
+
+    // The stores keep their files open until the shutdown sequence finished, so
+    // the owner's wipe erases the roots here and exits with its own status.
+    if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
+        let failed = device_wipe::purge(wipe.roots());
+        if failed.is_empty() {
+            info!("Wiped this device on its owner's request");
+        } else {
+            error!(paths = failed.len(), "The device wipe left paths behind");
+        }
+        shutdown_tracing();
+        std::process::exit(device_wipe::WIPED_EXIT_CODE);
+    }
 
     match failure {
         Some(failure) => Err(failure.into()),

@@ -240,6 +240,7 @@ mod tests {
         ("POST", "/data/sync-relationships/{id}/run"),
         ("POST", "/device/drafts"),
         ("POST", "/device/drafts/preview"),
+        ("POST", "/device/wipe"),
         ("POST", "/ga4gh/drs/v1/objects"),
         ("POST", "/ga4gh/tes/v1/tasks"),
         ("POST", "/ga4gh/tes/v1/tasks/{id}"),

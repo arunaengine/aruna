@@ -48,6 +48,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "device plane: the queued create is authorized by the holder at drain time",
     ),
     (
+        "device.rs",
+        "wipe_device",
+        "device plane: erases only this node, after require_owner and an id confirmation",
+    ),
+    (
         "drs.rs",
         "get_authorizations",
         "public DRS auth-scheme discovery, resolves no object",
