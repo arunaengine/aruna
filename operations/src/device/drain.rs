@@ -10,7 +10,7 @@ use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::Key;
+use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -27,7 +27,8 @@ use crate::process_placements::load_realm_config;
 use crate::queue_backoff::queue_retry_after_ms;
 
 use super::repository::{
-    IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, entry_with_state, intake_entry, scan_intake,
+    IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, entry_with_state, intake_entry, read_intake,
+    scan_intake,
 };
 
 /// Delay before a deferred pass looks for the realm again.
@@ -71,7 +72,10 @@ pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
                 continue;
             }
             due = true;
-            let next = publish_entry(context, &config, realm_id, node_id, &entry).await;
+            let Some(claim) = claim_entry(context, &config, realm_id, node_id, &entry).await else {
+                continue;
+            };
+            let next = publish_entry(context, realm_id, node_id, &entry, &claim).await;
             store_entry(context, &entry_with_state(&entry, next)).await;
         }
         match next_cursor {
@@ -117,6 +121,70 @@ async fn read_page(
     }
 }
 
+/// Stores `next` only while the entry still carries the state the scan read.
+/// A delete committed in between therefore wins instead of the entry coming
+/// back as `Publishing`.
+async fn claim_state(context: &Arc<DriverContext>, entry: &IntakeEntry, next: IntakeState) -> bool {
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    else {
+        warn!(draft_id = %entry.draft_id, "Failed to open a transaction for a queued draft");
+        return false;
+    };
+    if !write_claim(context, entry, next, txn_id).await {
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return false;
+    }
+    matches!(
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await,
+        Event::Storage(StorageEvent::TransactionCommitted { .. })
+    )
+}
+
+async fn write_claim(
+    context: &Arc<DriverContext>,
+    entry: &IntakeEntry,
+    next: IntakeState,
+    txn_id: TxnId,
+) -> bool {
+    let Effect::Storage(read) = read_intake(entry.draft_id, Some(txn_id)) else {
+        return false;
+    };
+    let current = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => IntakeEntry::from_bytes(&bytes).ok(),
+        _ => None,
+    };
+    if !current.is_some_and(|current| current.state == entry.state) {
+        return false;
+    }
+    let Ok((key_space, key, value)) = intake_entry(&entry_with_state(entry, next)) else {
+        warn!(draft_id = %entry.draft_id, "Failed to encode a queued draft");
+        return false;
+    };
+    matches!(
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: Some(txn_id),
+            })
+            .await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    )
+}
+
 async fn store_entry(context: &Arc<DriverContext>, entry: &IntakeEntry) {
     let Ok((key_space, key, value)) = intake_entry(entry) else {
         warn!(draft_id = %entry.draft_id, "Failed to encode a queued draft");
@@ -136,44 +204,81 @@ async fn store_entry(context: &Arc<DriverContext>, entry: &IntakeEntry) {
     }
 }
 
-/// Forwards one entry and answers with the state it must be stored under.
-async fn publish_entry(
+/// What one pass holds on an entry it may forward.
+struct Claim {
+    document_id: Ulid,
+    attempts: u32,
+}
+
+/// Mints the entry's realm document id when it has none and claims it as
+/// `Publishing`. `None` means this pass must leave the entry alone: the mint
+/// failed, or the entry was deleted or advanced while the page was in flight.
+async fn claim_entry(
     context: &Arc<DriverContext>,
     config: &RealmConfigDocument,
     realm_id: RealmId,
     node_id: aruna_core::NodeId,
     entry: &IntakeEntry,
+) -> Option<Claim> {
+    let attempts = entry.attempts().saturating_add(1);
+    let document_id = match &entry.state {
+        IntakeState::Publishing { document_id, .. } => *document_id,
+        _ => {
+            let actor = Actor {
+                node_id,
+                user_id: entry.owner,
+                realm_id,
+            };
+            match mint_forward_document(config, &actor, entry.group_id, &entry.document_path) {
+                Ok(minted) => minted.as_ulid(),
+                // Placement or configuration is not settled yet; try again later.
+                Err(error) => {
+                    claim_state(context, entry, retry_state(attempts, error.to_string())).await;
+                    return None;
+                }
+            }
+        }
+    };
+
+    // The minted id is stored before the forward, so a crash mid-publish
+    // re-forwards the same id and the holder answers from its create fence. A
+    // claim that does not commit stops the attempt: forwarding without it would
+    // mint a second id after a crash, and would resurrect a deleted entry.
+    claim_state(
+        context,
+        entry,
+        IntakeState::Publishing {
+            document_id,
+            due_at_ms: unix_timestamp_millis(),
+            attempts,
+        },
+    )
+    .await
+    .then_some(Claim {
+        document_id,
+        attempts,
+    })
+}
+
+/// Forwards one claimed entry and answers with the state it must be stored
+/// under. The entry is `Publishing` by then, so the owner cannot delete it
+/// underneath the forward.
+async fn publish_entry(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: aruna_core::NodeId,
+    entry: &IntakeEntry,
+    claim: &Claim,
 ) -> IntakeState {
     let actor = Actor {
         node_id,
         user_id: entry.owner,
         realm_id,
     };
-    let attempts = entry.attempts().saturating_add(1);
-    let document_id = match &entry.state {
-        IntakeState::Publishing { document_id, .. } => *document_id,
-        _ => match mint_forward_document(config, &actor, entry.group_id, &entry.document_path) {
-            Ok(minted) => minted.as_ulid(),
-            // Placement or configuration is not settled yet; try again later.
-            Err(error) => return retry_state(attempts, error.to_string()),
-        },
-    };
-
-    // The minted id is stored before the forward, so a crash mid-publish
-    // re-forwards the same id and the holder answers from its create fence.
-    store_entry(
-        context,
-        &entry_with_state(
-            entry,
-            IntakeState::Publishing {
-                document_id,
-                due_at_ms: unix_timestamp_millis(),
-                attempts,
-            },
-        ),
-    )
-    .await;
-
+    let Claim {
+        document_id,
+        attempts,
+    } = *claim;
     let auth = AuthContext {
         user_id: entry.owner,
         realm_id,
@@ -295,9 +400,13 @@ pub async fn restore_intake_timer(storage: &StorageHandle, task_handle: &TaskHan
 
 #[cfg(test)]
 mod tests {
-    use super::{DrainOutcome, drain_intake, permanent, publishing_retry, retry_state};
+    use super::{
+        DrainOutcome, claim_state, drain_intake, permanent, publishing_retry, retry_state,
+    };
+    use crate::device::delete_draft::DeleteDraftOperation;
+    use crate::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
     use crate::device::repository::{IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, intake_entry};
-    use crate::driver::DriverContext;
+    use crate::driver::{DriverContext, drive};
     use crate::metadata::forward::MetadataWriteError;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
@@ -334,12 +443,8 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn defers_without_realm() {
-        // No net handle means the realm is unreachable: nothing may be touched.
-        let (_tempdir, context) = context().await;
-        let entry = entry();
-        let (key_space, key, value) = intake_entry(&entry).unwrap();
+    async fn store(context: &Arc<DriverContext>, entry: &IntakeEntry) {
+        let (key_space, key, value) = intake_entry(entry).unwrap();
         context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -349,6 +454,22 @@ mod tests {
                 txn_id: None,
             })
             .await;
+    }
+
+    fn publishing() -> IntakeState {
+        IntakeState::Publishing {
+            document_id: Ulid::from_bytes([4u8; 16]),
+            due_at_ms: 1,
+            attempts: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn defers_without_realm() {
+        // No net handle means the realm is unreachable: nothing may be touched.
+        let (_tempdir, context) = context().await;
+        let entry = entry();
+        store(&context, &entry).await;
         assert_eq!(drain_intake(&context).await, DrainOutcome::Deferred);
     }
 
@@ -400,6 +521,63 @@ mod tests {
         };
         assert_eq!(attempts, 2);
         assert_eq!(last_error.as_deref(), Some("no placement"));
+    }
+
+    #[tokio::test]
+    async fn skips_deleted_entry() {
+        // The owner's delete committed while the page was in flight: the entry
+        // must stay gone instead of coming back as publishing.
+        let (_tempdir, context) = context().await;
+        let entry = entry();
+        store(&context, &entry).await;
+        drive(DeleteDraftOperation::new(entry.draft_id), context.as_ref())
+            .await
+            .unwrap();
+
+        assert!(!claim_state(&context, &entry, publishing()).await);
+        assert_eq!(
+            drive(InspectDraftOperation::new(entry.draft_id), context.as_ref()).await,
+            Err(InspectDraftError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_advanced_entry() {
+        let (_tempdir, context) = context().await;
+        let entry = entry();
+        let advanced = IntakeEntry {
+            state: IntakeState::Failed {
+                reason: "parked".to_string(),
+                retryable: true,
+            },
+            ..entry.clone()
+        };
+        store(&context, &advanced).await;
+
+        assert!(!claim_state(&context, &entry, publishing()).await);
+        assert_eq!(
+            drive(InspectDraftOperation::new(entry.draft_id), context.as_ref())
+                .await
+                .unwrap()
+                .state,
+            advanced.state
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_unchanged_entry() {
+        let (_tempdir, context) = context().await;
+        let entry = entry();
+        store(&context, &entry).await;
+
+        assert!(claim_state(&context, &entry, publishing()).await);
+        assert_eq!(
+            drive(InspectDraftOperation::new(entry.draft_id), context.as_ref())
+                .await
+                .unwrap()
+                .state,
+            publishing()
+        );
     }
 
     #[test]
