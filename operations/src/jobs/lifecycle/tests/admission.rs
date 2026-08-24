@@ -404,7 +404,10 @@ async fn device_skips_materialization() {
     let SubmitJobError::PlacementUnavailable(reason) = refused else {
         panic!("a realm node must refuse an input it does not hold");
     };
-    assert!(reason.contains("does not exist"));
+    assert!(
+        reason.contains("reads"),
+        "the refusal must name the input this node does not hold: {reason}"
+    );
 }
 
 #[tokio::test]
