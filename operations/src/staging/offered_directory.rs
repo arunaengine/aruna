@@ -10,18 +10,18 @@ use crate::blob::blob_keyspace_helper::{
 use crate::driver::{DriverContext, drive};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
-use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
-use aruna_core::keyspaces::{OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory, PortableSourceDescriptor,
     RealmId, ResolvedSourceAccess, SourceConnectorKind, SourceEntry, SourceMetadata,
     StagingStrategy, UsageDelta, VersionKey, VersionSourceBinding,
 };
-use aruna_core::types::{GroupId, NodeId, TxnId, UserId};
-use std::collections::HashMap;
+use aruna_core::types::{GroupId, Key, NodeId, TxnId, UserId};
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -50,6 +50,31 @@ pub struct OfferDirectoryInput {
 pub struct OfferDirectoryResult {
     pub bucket: String,
     pub files: usize,
+    /// Observations tombstoned because their file is gone from the root.
+    pub removed: usize,
+}
+
+/// The parts of an offer every observation write needs. The root is absent on
+/// purpose: an observation is bound to the registration, never to a path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservationScope {
+    bucket: String,
+    group_id: GroupId,
+    realm_id: RealmId,
+    node_id: NodeId,
+    user_id: UserId,
+}
+
+impl OfferDirectoryInput {
+    fn scope(&self) -> ObservationScope {
+        ObservationScope {
+            bucket: self.bucket.clone(),
+            group_id: self.group_id,
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            user_id: self.user_id,
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -87,35 +112,61 @@ pub async fn guard_bucket_write(
 }
 
 /// Registers `root` as a read-only bucket and mints one reference version per
-/// file it currently holds. Re-offering the same bucket refreshes the inventory.
+/// file it currently holds. Re-offering the same bucket refreshes the inventory:
+/// unchanged files keep their version, changed ones gain a successor and files
+/// that vanished are tombstoned.
 pub async fn offer_directory(
     context: &DriverContext,
     input: OfferDirectoryInput,
 ) -> Result<OfferDirectoryResult, OfferedDirectoryError> {
     check_root(context, &input.root).await?;
+    // The whole walk happens before anything is written, so an offer over the
+    // file cap is refused whole instead of leaving a bucket and half an
+    // inventory behind.
+    let entries = walk_root(context, &input.root).await?;
     register_bucket(context, &input).await?;
 
-    let mut offset = 0usize;
-    let mut files = 0usize;
-    loop {
-        let (entries, truncated) = list_page(context, &input.root, offset).await?;
-        for entry in &entries {
-            if files == MAX_OFFERED_FILES {
-                return Err(OfferedDirectoryError::TooManyFiles(MAX_OFFERED_FILES));
-            }
-            write_observation(context, &input, entry).await?;
-            files += 1;
-        }
-        if !truncated {
-            break;
-        }
-        offset += entries.len().max(1);
+    let scope = input.scope();
+    for entry in &entries {
+        write_observation(context, &scope, entry).await?;
     }
+    let offered = entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    let removed = sweep_observations(context, &scope, &offered).await?;
 
     Ok(OfferDirectoryResult {
         bucket: input.bucket,
-        files,
+        files: entries.len(),
+        removed,
     })
+}
+
+/// Every file under the offered root, refusing a root beyond the cap before a
+/// single observation is written.
+async fn walk_root(
+    context: &DriverContext,
+    root: &str,
+) -> Result<Vec<SourceEntry>, OfferedDirectoryError> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let (page, truncated) = list_page(context, root, offset).await?;
+        if over_cap(entries.len(), page.len()) {
+            return Err(OfferedDirectoryError::TooManyFiles(MAX_OFFERED_FILES));
+        }
+        offset += page.len().max(1);
+        entries.extend(page);
+        if !truncated {
+            return Ok(entries);
+        }
+    }
+}
+
+/// Whether one more page would take the offer past the file cap.
+fn over_cap(collected: usize, page: usize) -> bool {
+    collected.saturating_add(page) > MAX_OFFERED_FILES
 }
 
 /// The binding a served object carries: the offered bucket and the file's path
@@ -270,19 +321,16 @@ async fn register_bucket(
 /// a directory does not churn the identities realm nodes already reference.
 async fn write_observation(
     context: &DriverContext,
-    input: &OfferDirectoryInput,
+    scope: &ObservationScope,
     entry: &SourceEntry,
 ) -> Result<(), OfferedDirectoryError> {
-    let binding = offered_binding(&input.bucket, &entry.path, input.node_id);
+    let binding = offered_binding(&scope.bucket, &entry.path, scope.node_id);
     let metadata = entry_metadata(entry);
     let txn_id = start_transaction(context).await?;
 
-    let result = observe(context, input, entry, &binding, &metadata, txn_id).await;
+    let result = observe(context, scope, entry, &binding, &metadata, txn_id).await;
     if result.is_err() {
-        let _ = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
+        abort(context, txn_id).await;
         return result;
     }
     commit(context, txn_id).await
@@ -290,7 +338,7 @@ async fn write_observation(
 
 async fn observe(
     context: &DriverContext,
-    input: &OfferDirectoryInput,
+    input: &ObservationScope,
     entry: &SourceEntry,
     binding: &VersionSourceBinding,
     metadata: &SourceMetadata,
@@ -343,12 +391,16 @@ async fn observe(
     )
     .await?;
 
-    let was_live = existing.is_some_and(|version| !version.is_deleted());
+    // An offered bucket charges what it currently offers: the observation this
+    // one replaces describes content the file no longer has, so its bytes are
+    // released instead of staying charged.
+    let live = existing.filter(|version| !version.is_deleted());
     let mut usage = UsageCounterUpdate::for_group(
         input.group_id,
         UsageDelta {
-            objects: if was_live { 0 } else { 1 },
-            referenced_bytes: i128::from(metadata.content_length),
+            objects: i128::from(u8::from(live.is_none())),
+            referenced_bytes: i128::from(metadata.content_length)
+                - i128::from(live.as_ref().map_or(0, observed_bytes)),
             ..Default::default()
         },
     );
@@ -356,6 +408,156 @@ async fn observe(
         run_usage_update(context, txn_id, &mut usage).await?;
     }
     Ok(())
+}
+
+/// Bytes a stored observation charges to its group.
+fn observed_bytes(version: &BlobVersion) -> u64 {
+    match &version.state {
+        BlobVersionState::Reference {
+            cached_metadata, ..
+        } => cached_metadata.content_length,
+        BlobVersionState::Materialized { .. } | BlobVersionState::Deleted => 0,
+    }
+}
+
+/// Tombstones every observation whose file the walk did not see. A file the
+/// owner deleted or moved must stop being offered instead of pointing at
+/// something that is no longer there.
+async fn sweep_observations(
+    context: &DriverContext,
+    scope: &ObservationScope,
+    offered: &BTreeSet<String>,
+) -> Result<usize, OfferedDirectoryError> {
+    let prefix = BlobHeadKey::bucket_prefix(&scope.bucket)?;
+    let mut start: Option<Key> = None;
+    let mut removed = 0usize;
+    loop {
+        let (keys, next) = read_head_page(context, &prefix, start).await?;
+        for key in &keys {
+            if offered.contains(key) {
+                continue;
+            }
+            if tombstone_observation(context, scope, key).await? {
+                removed += 1;
+            }
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => return Ok(removed),
+        }
+    }
+}
+
+/// One page of the bucket's object keys and the cursor of the next page.
+async fn read_head_page(
+    context: &DriverContext,
+    prefix: &[u8],
+    start: Option<Key>,
+) -> Result<(Vec<String>, Option<Key>), OfferedDirectoryError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: start.map(IterStart::After),
+            limit: LIST_PAGE,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => {
+            let mut keys = Vec::with_capacity(values.len());
+            for (key, _) in values {
+                keys.push(BlobHeadKey::from_bytes(key.as_ref())?.key);
+            }
+            Ok((keys, next_start_after))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        _ => Err(StorageError::ReadError("unexpected event".to_string()).into()),
+    }
+}
+
+/// Writes a delete marker over one observation. Answers whether it removed a
+/// live object.
+async fn tombstone_observation(
+    context: &DriverContext,
+    scope: &ObservationScope,
+    key: &str,
+) -> Result<bool, OfferedDirectoryError> {
+    let txn_id = start_transaction(context).await?;
+    match tombstone(context, scope, key, txn_id).await {
+        Ok(true) => {
+            commit(context, txn_id).await?;
+            Ok(true)
+        }
+        Ok(false) => {
+            abort(context, txn_id).await;
+            Ok(false)
+        }
+        Err(error) => {
+            abort(context, txn_id).await;
+            Err(error)
+        }
+    }
+}
+
+async fn tombstone(
+    context: &DriverContext,
+    scope: &ObservationScope,
+    key: &str,
+    txn_id: TxnId,
+) -> Result<bool, OfferedDirectoryError> {
+    let pointer = read_pointer(context, &scope.bucket, key, txn_id).await?;
+    let existing = match pointer.as_ref() {
+        Some(pointer) => read_version(context, &scope.bucket, key, pointer, txn_id).await?,
+        None => None,
+    };
+    let Some(live) = existing.filter(|version| !version.is_deleted()) else {
+        return Ok(false);
+    };
+
+    let version_id = Ulid::generate();
+    let now = SystemTime::now();
+    let next = CurrentVersionPointer::next_for(pointer.as_ref(), version_id)?;
+    for effect in build_head_transition_effects(
+        &HeadAliasContext::new(
+            scope.realm_id,
+            scope.group_id,
+            scope.node_id,
+            &scope.bucket,
+            key,
+        ),
+        Some(next),
+        None,
+        Some(txn_id),
+    )? {
+        apply(context, effect).await?;
+    }
+    apply(
+        context,
+        write_blob_version_effect(
+            &VersionKey::new(&scope.bucket, key, version_id),
+            &BlobVersion::deleted(now, scope.user_id),
+            Some(txn_id),
+        )?,
+    )
+    .await?;
+
+    let mut usage = UsageCounterUpdate::for_group(
+        scope.group_id,
+        UsageDelta {
+            objects: -1,
+            referenced_bytes: -i128::from(observed_bytes(&live)),
+            ..Default::default()
+        },
+    );
+    if !usage.is_noop() {
+        run_usage_update(context, txn_id, &mut usage).await?;
+    }
+    Ok(true)
 }
 
 async fn run_usage_update(
@@ -493,6 +695,13 @@ async fn start_transaction(context: &DriverContext) -> Result<TxnId, OfferedDire
     }
 }
 
+async fn abort(context: &DriverContext, txn_id: TxnId) {
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+}
+
 async fn commit(context: &DriverContext, txn_id: TxnId) -> Result<(), OfferedDirectoryError> {
     match context
         .storage_handle
@@ -510,6 +719,7 @@ mod tests {
     use super::*;
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
     use crate::staging::test_utils::setup_driver_context;
+    use aruna_core::structs::{UsageCounters, usage_group_key};
     use futures_util::StreamExt;
 
     fn input(bucket: &str, root: &str) -> OfferDirectoryInput {
@@ -627,6 +837,96 @@ mod tests {
             .await
             .expect("third offer must succeed");
         assert_ne!(current_version(context, "refresh", "data.bin").await, first);
+    }
+
+    #[test]
+    fn refuses_over_cap() {
+        // The cap is decided while walking, before a single write.
+        assert!(!over_cap(MAX_OFFERED_FILES - 1, 1));
+        assert!(over_cap(MAX_OFFERED_FILES, 1));
+    }
+
+    // The group is charged for what the directory currently offers, so a
+    // rewritten file replaces its predecessor's bytes instead of adding to them.
+    #[tokio::test]
+    async fn charges_current_inventory() {
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
+        let root = tempfile::tempdir().expect("root must be created");
+        let file = root.path().join("data.bin");
+        std::fs::write(&file, b"one").expect("file must be written");
+        let offer = input("usage", root.path().to_str().expect("utf-8 root"));
+
+        offer_directory(context, offer.clone())
+            .await
+            .expect("first offer must succeed");
+        let usage = group_usage(context, offer.group_id).await;
+        assert_eq!((usage.objects, usage.referenced_bytes), (1, 3));
+
+        std::fs::write(&file, b"one-changed").expect("file must be rewritten");
+        offer_directory(context, offer.clone())
+            .await
+            .expect("second offer must succeed");
+        let usage = group_usage(context, offer.group_id).await;
+        assert_eq!((usage.objects, usage.referenced_bytes), (1, 11));
+    }
+
+    // A file the owner removed stops being offered: the object becomes a delete
+    // marker and its bytes are released.
+    #[tokio::test]
+    async fn tombstones_vanished_files() {
+        let fixture = setup_driver_context().await;
+        let context = &fixture.driver_context;
+        let root = tempfile::tempdir().expect("root must be created");
+        std::fs::write(root.path().join("keep.txt"), b"keep").expect("file must be written");
+        std::fs::write(root.path().join("gone.txt"), b"gone").expect("file must be written");
+        let offer = input("sweep", root.path().to_str().expect("utf-8 root"));
+
+        let first = offer_directory(context, offer.clone())
+            .await
+            .expect("first offer must succeed");
+        assert_eq!((first.files, first.removed), (2, 0));
+
+        std::fs::remove_file(root.path().join("gone.txt")).expect("file must be removed");
+        let second = offer_directory(context, offer.clone())
+            .await
+            .expect("second offer must succeed");
+        assert_eq!((second.files, second.removed), (1, 1));
+
+        let usage = group_usage(context, offer.group_id).await;
+        assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
+        assert!(
+            head_version(context, "sweep", "gone.txt")
+                .await
+                .is_deleted()
+        );
+    }
+
+    async fn group_usage(context: &DriverContext, group_id: GroupId) -> UsageCounters {
+        read(
+            context,
+            aruna_core::keyspaces::USAGE_STATS_KEYSPACE,
+            &usage_group_key(group_id),
+            None,
+        )
+        .await
+        .expect("usage counters must read")
+        .map(|value| UsageCounters::from_bytes(value.as_ref()).expect("counters must decode"))
+        .unwrap_or_default()
+    }
+
+    async fn head_version(context: &DriverContext, bucket: &str, key: &str) -> BlobVersion {
+        let txn_id = start_transaction(context).await.expect("txn must start");
+        let pointer = read_pointer(context, bucket, key, txn_id)
+            .await
+            .expect("pointer must read")
+            .expect("pointer must exist");
+        let version = read_version(context, bucket, key, &pointer, txn_id)
+            .await
+            .expect("version must read")
+            .expect("version must exist");
+        commit(context, txn_id).await.expect("txn must commit");
+        version
     }
 
     async fn current_version(context: &DriverContext, bucket: &str, key: &str) -> Ulid {
