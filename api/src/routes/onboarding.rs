@@ -586,7 +586,9 @@ node serves the route.
 - Nothing here is realm-wide: it is the claim state this management node recorded.
 
 **Errors**: an unknown, revoked or already pruned enrollment id answers 404, which is also what a
-caller sees after the enrollment finished and the record was cleaned up."#,
+caller sees after the enrollment finished and the record was cleaned up. A caller who is neither
+the secret's owner nor an onboarding administrator gets the same 404, so polling cannot be used to
+discover that somebody else's enrollment exists."#,
     params(("id" = String, Path, description = "Enrollment id of the secret, the ULID reported when it was minted")),
     responses(
         (
@@ -604,8 +606,7 @@ caller sees after the enrollment finished and the record was cleaned up."#,
         ),
         (status = 400, description = "The enrollment id is not a ULID", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is neither the secret's owner nor an onboarding administrator, or this is not a management node", body = crate::error::ErrorResponse),
-        (status = 404, description = "No enrollment secret with this id on this node", body = crate::error::ErrorResponse)
+        (status = 404, description = "No enrollment secret with this id on this node, or the caller is neither its owner nor an onboarding administrator", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -623,11 +624,14 @@ pub async fn get_onboarding_secret_status(
         .find(|entry| entry.record.enrollment_id == enrollment_id)
         .ok_or(ServerError::NotFound)?;
 
-    // The owner polls its own device; anybody else needs the admin path.
+    // The owner polls its own device; anybody else needs the admin path. A
+    // refusal answers 404 so the route cannot confirm a foreign secret exists.
     let owns = caller.realm_id == state.get_realm_id()
         && entry.record.mode.owner() == Some(caller.user_id);
     if !owns {
-        authorize_onboarding_admin(&state, auth).await?;
+        authorize_onboarding_admin(&state, auth)
+            .await
+            .map_err(|_| ServerError::NotFound)?;
     }
 
     let claimed_node_id = entry.state.claimed_node_id().map(str::to_string);
@@ -1548,7 +1552,7 @@ mod tests {
 
     #[tokio::test]
     async fn polls_secret_status() {
-        // The owner may watch its own secret; a stranger may not.
+        // The owner may watch its own secret; a stranger is told nothing.
         let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         let auth = AuthContext {
@@ -1593,7 +1597,8 @@ mod tests {
             Path(enrollment_id.clone()),
         )
         .await;
-        assert!(matches!(stranger, Err(ServerError::Forbidden)));
+        // A stranger cannot tell a foreign secret from an unknown one.
+        assert!(matches!(stranger, Err(ServerError::NotFound)));
 
         drive(
             ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
