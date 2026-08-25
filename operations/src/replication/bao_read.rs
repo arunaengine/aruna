@@ -1,5 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 
+use crate::connectors::resolver::{
+    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
+};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -11,10 +14,10 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFunctions};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-    HashPathIndexKey, ManagedCopyKey, NodePlacementEntry, Permission, PlacementPolicyRef,
-    PlacementSubject, RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn,
-    blob_object_permission_path, storage_subject,
+    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
+    GroupAuthorizationDocument, HashPathIndexKey, ManagedCopyKey, NodePlacementEntry, Permission,
+    PlacementPolicyRef, PlacementSubject, RealmConfigDocument, RealmId, ResolvedSourceAccess,
+    VersionKey, VersionedObjectArn, blob_object_permission_path, storage_subject,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use bytes::Bytes;
@@ -412,6 +415,7 @@ enum IncomingBaoReadState {
     ReadRealm,
     ReadExactVersion,
     ReadExactBucket,
+    ResolveSource,
     ReadPolicy,
     CheckPermission,
     ReadHashVersion,
@@ -469,6 +473,16 @@ pub struct IncomingBaoReadOperation {
     /// The requesting peer's placement as this realm records it. The challenge
     /// is decided against it, never against the subject the peer asserts.
     peer_placement: Option<NodePlacementEntry>,
+    /// Whether this node is an owner-bound device. A device holds one person's
+    /// own files and never receives the group policy documents the realm check
+    /// needs, so its own observations are served under the owner binding.
+    local_is_user: bool,
+    policy_allowed: bool,
+    /// The staging source an observation is served from, with the identity it
+    /// was observed under.
+    source_access: Option<ResolvedSourceAccess>,
+    source_size: Option<u64>,
+    source_fingerprint: Option<String>,
     now_ms: u64,
 }
 
@@ -509,6 +523,11 @@ impl IncomingBaoReadOperation {
             pending_location: None,
             gate: None,
             peer_placement: None,
+            local_is_user: false,
+            policy_allowed: false,
+            source_access: None,
+            source_size: None,
+            source_fingerprint: None,
             now_ms: 0,
         }
     }
@@ -618,8 +637,14 @@ impl IncomingBaoReadOperation {
         let Some(next) = self.policy_next else {
             return self.fail(BaoReadError::NotFinished);
         };
+        self.policy_allowed = allowed;
         if !allowed {
             return match next {
+                // A device never receives the group's policy documents, so this
+                // check cannot pass there. The version itself decides: only an
+                // observation of the owner's own file is served, and only under
+                // the owner binding `admit_peer` already forced.
+                PolicyNext::Exact if self.local_is_user => self.read_exact_version(),
                 PolicyNext::Exact => self.send_refusal(BaoReadRefusal::ReadDenied),
                 PolicyNext::Hash => {
                     self.had_denial = true;
@@ -844,6 +869,7 @@ impl IncomingBaoReadOperation {
             IncomingBaoReadState::ReadRealm => "read_realm",
             IncomingBaoReadState::ReadExactVersion => "read_exact_version",
             IncomingBaoReadState::ReadExactBucket => "read_exact_bucket",
+            IncomingBaoReadState::ResolveSource => "resolve_source",
             IncomingBaoReadState::ReadPolicy => "read_policy",
             IncomingBaoReadState::CheckPermission => "check_permission",
             IncomingBaoReadState::ReadHashVersion => "read_hash_version",
@@ -895,6 +921,9 @@ impl IncomingBaoReadOperation {
         if let Some(refusal) = self.admit_peer(&document) {
             return self.send_refusal(refusal);
         }
+        self.local_is_user = node_kind(&document, self.local_node)
+            .and_then(|kind| kind.owner())
+            .is_some();
         self.peer_placement = document.placement_entry(self.peer).cloned();
         match &self.request.target {
             BaoReadTarget::ExactVersion(target) => {
@@ -931,9 +960,15 @@ impl IncomingBaoReadOperation {
             Ok(version) => version,
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
+        self.version_refs = version.placement_policies.clone();
         let Some(blob_hash) = version.blob_hash().copied() else {
-            return self.send_refusal(BaoReadRefusal::NotFound);
+            return self.serve_observation(version);
         };
+        // A materialized copy is realm data: it is served only when the group's
+        // own policy check passed, exactly as before.
+        if !self.policy_allowed {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
         if self
             .request
             .expected_blake3
@@ -943,11 +978,62 @@ impl IncomingBaoReadOperation {
         }
         self.blob_hash = Some(blob_hash);
         self.location_key = version.location_key();
-        self.version_refs = version.placement_policies.clone();
         self.version_key = self
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.read_location()
+    }
+
+    /// Serves one version this node never materialized. Only a device does
+    /// this, and only for an observation of the owner's own file: the bytes are
+    /// streamed from the staging source, under the identity the requester named
+    /// and the fingerprint the observation recorded.
+    fn serve_observation(&mut self, version: BlobVersion) -> Effects {
+        if !self.local_is_user {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        }
+        let BlobVersionState::Reference {
+            source,
+            cached_metadata,
+            ..
+        } = version.state
+        else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        // The requester names the bytes it expects. Serving refuses anything
+        // that does not hash to them, so this node never streams a file under
+        // an identity it has not verified itself.
+        let Some(expected) = self.request.expected_blake3 else {
+            return self.send_refusal(BaoReadRefusal::HashMismatch);
+        };
+        self.blob_hash = Some(expected);
+        self.source_size = Some(cached_metadata.content_length);
+        self.source_fingerprint = cached_metadata.etag.clone();
+        self.version_key = self
+            .exact_target()
+            .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
+        self.state = IncomingBaoReadState::ResolveSource;
+        smallvec![resolve_version_source_binding_suboperation(
+            ResolveVersionSourceBindingInput { source },
+        )]
+    }
+
+    /// Announces an observation the same way a materialized copy is announced,
+    /// from the size the observation recorded rather than a blob location.
+    fn accept_observation(&mut self) -> Effects {
+        let (Some(blake3), Some(size)) = (self.blob_hash, self.source_size) else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let payload = match (VersionReplicationMessage::BaoReadAccepted { size, blake3 }).to_bytes()
+        {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = IncomingBaoReadState::SendAccepted;
+        smallvec![Effect::Blob(BlobEffect::SendMessage {
+            stream_id: self.stream_id,
+            payload,
+        })]
     }
 
     fn handle_exact_bucket(&mut self, event: Event) -> Effects {
@@ -1205,6 +1291,18 @@ impl Operation for IncomingBaoReadOperation {
             IncomingBaoReadState::ReadRealm => self.handle_realm(event),
             IncomingBaoReadState::ReadExactVersion => self.handle_exact_version(event),
             IncomingBaoReadState::ReadExactBucket => self.handle_exact_bucket(event),
+            IncomingBaoReadState::ResolveSource => match event {
+                Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                    result: Ok(access),
+                }) => {
+                    self.source_access = Some(access);
+                    self.accept_observation()
+                }
+                Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                    result: Err(_),
+                }) => self.send_refusal(BaoReadRefusal::NotFound),
+                other => self.unexpected(other),
+            },
             IncomingBaoReadState::ReadPolicy => self.handle_policy(event),
             IncomingBaoReadState::CheckPermission => self.handle_permission(event),
             IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
@@ -1230,10 +1328,23 @@ impl Operation for IncomingBaoReadOperation {
                         stream_id: self.stream_id,
                     })];
                 }
-                let Some(location) = self.location.clone() else {
+                let Some(expected_blake3) = self.blob_hash else {
                     return self.fail(BaoReadError::NotFinished);
                 };
-                let Some(expected_blake3) = self.blob_hash else {
+                if let Some(access) = self.source_access.clone() {
+                    let Some(size) = self.source_size else {
+                        return self.fail(BaoReadError::NotFinished);
+                    };
+                    self.state = IncomingBaoReadState::ServeRead;
+                    return smallvec![Effect::Blob(BlobEffect::ServeSourceRead {
+                        stream_id: self.stream_id,
+                        access,
+                        size,
+                        expected_blake3,
+                        fingerprint: self.source_fingerprint.clone(),
+                    })];
+                }
+                let Some(location) = self.location.clone() else {
                     return self.fail(BaoReadError::NotFinished);
                 };
                 self.state = IncomingBaoReadState::ServeRead;
