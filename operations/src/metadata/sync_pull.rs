@@ -21,7 +21,6 @@ use aruna_core::types::{GroupId, NodeId};
 use tracing::debug;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::metadata::forward::peer_acts_for;
 use crate::metadata::handle::MetadataWritePeerError;
@@ -29,6 +28,8 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::process_placements::load_realm_config;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::list_object_versions::{
@@ -89,7 +90,7 @@ async fn apply_pull(
     peer: NodeId,
     request: PullRequest,
 ) -> Result<SyncPullAck, SyncRefusal> {
-    let auth = authorize(context, peer, request.auth_token.clone()).await?;
+    let auth = authorize_peer(context, peer, request.auth_token.clone()).await?;
     // The device may only ask for a version it serves itself: a peer must not
     // make this node read another node's object under its own authority.
     if request.source.node_id != peer {
@@ -97,8 +98,9 @@ async fn apply_pull(
             "a sync pull must name the requesting device".to_string(),
         ));
     }
+    let node_id = local_node(context)?;
     let bucket = read_bucket(context, &request.target_bucket).await?;
-    ensure_write(context, &auth, &bucket, &request).await?;
+    ensure_write(context, &auth, node_id, &bucket, &request).await?;
 
     // A replay of either kind answers with the version it already produced.
     if let Some(version_id) = applied_version(context, &request).await {
@@ -108,8 +110,8 @@ async fn apply_pull(
         });
     }
     match request.deleted {
-        true => delete_target(context, &auth, &bucket, &request).await,
-        false => commit_pull(context, &auth, &bucket, request).await,
+        true => delete_target(context, &auth, node_id, &bucket, &request).await,
+        false => commit_pull(context, &auth, node_id, &bucket, request).await,
     }
 }
 
@@ -121,7 +123,7 @@ async fn apply_pull(
 /// the target object is the whole authority, exactly as it is when the same
 /// owner writes through S3. A device can therefore publish into any path its
 /// owner may already write, and nothing more.
-async fn authorize(
+async fn authorize_peer(
     context: &Arc<DriverContext>,
     peer: NodeId,
     auth_token: aruna_core::metadata::MetadataAuthToken,
@@ -172,50 +174,83 @@ fn bucket_refusal(error: GetBucketInfoError) -> SyncRefusal {
     }
 }
 
+/// This node's own id. A pull cannot be attributed without it.
+fn local_node(context: &Arc<DriverContext>) -> Result<NodeId, SyncRefusal> {
+    context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(SyncRefusal::Unavailable)
+}
+
 async fn ensure_write(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
+    node_id: NodeId,
     bucket: &BucketInfo,
     request: &PullRequest,
 ) -> Result<(), SyncRefusal> {
-    let node_id = context
-        .net_handle
-        .as_ref()
-        .ok_or(SyncRefusal::Unavailable)?
-        .node_id();
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: blob_object_permission_path(
-                auth.realm_id,
-                bucket.group_id,
-                node_id,
-                &request.target_bucket,
-                &request.target_key,
-            ),
-            required_permission: Permission::WRITE,
-        }),
+    let operation = match request.deleted {
+        true => "s3.DeleteObject",
+        false => "s3.PutObject",
+    };
+    authorize_pull(
         context,
+        auth,
+        blob_object_permission_path(
+            auth.realm_id,
+            bucket.group_id,
+            node_id,
+            &request.target_bucket,
+            &request.target_key,
+        ),
+        Permission::WRITE,
+        operation,
     )
     .await
-    .map_err(|_| SyncRefusal::Unavailable)?;
-    match allowed {
-        true => Ok(()),
-        false => Err(SyncRefusal::Forbidden),
+}
+
+/// The same boundary the equivalent S3 request passes: RBAC first, then the
+/// realm and group request policies. A pull is an ordinary write by the owner,
+/// so a policy that denies their put or delete denies this too.
+async fn authorize_pull(
+    context: &Arc<DriverContext>,
+    auth: &AuthContext,
+    path: String,
+    permission: Permission,
+    operation: &'static str,
+) -> Result<(), SyncRefusal> {
+    authorize(
+        context,
+        auth.realm_id,
+        auth,
+        &path,
+        &permission,
+        PolicyRequestExtras::operation(operation),
+    )
+    .await
+    .map_err(pull_refusal)
+}
+
+/// Only a real denial refuses the caller; an unreadable policy state or a
+/// failed check is this node's problem and stays retryable.
+fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
+    match error {
+        AuthorizeError::PermissionDenied
+        | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => SyncRefusal::Forbidden,
+        AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_))
+        | AuthorizeError::Storage(_)
+        | AuthorizeError::CheckFailed(_) => SyncRefusal::Unavailable,
     }
 }
 
 async fn delete_target(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
+    node_id: NodeId,
     bucket: &BucketInfo,
     request: &PullRequest,
 ) -> Result<SyncPullAck, SyncRefusal> {
-    let node_id = context
-        .net_handle
-        .as_ref()
-        .ok_or(SyncRefusal::Unavailable)?
-        .node_id();
     let result = drive(
         DeleteObjectOperation::new(DeleteObjectInput {
             bucket: request.target_bucket.clone(),
@@ -248,14 +283,10 @@ async fn delete_target(
 async fn commit_pull(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
+    node_id: NodeId,
     bucket: &BucketInfo,
     request: PullRequest,
 ) -> Result<SyncPullAck, SyncRefusal> {
-    let node_id = context
-        .net_handle
-        .as_ref()
-        .ok_or(SyncRefusal::Unavailable)?
-        .node_id();
     let read = BaoReadRequest {
         auth_context: auth.clone(),
         realm_id: auth.realm_id,
@@ -395,9 +426,10 @@ async fn list_heads(
     cursor: Option<SyncListCursor>,
     limit: SyncPageLimit,
 ) -> Result<SyncVersionPage, SyncRefusal> {
-    let auth = authorize(context, peer, auth_token).await?;
+    let auth = authorize_peer(context, peer, auth_token).await?;
+    let node_id = local_node(context)?;
     let info = read_bucket(context, &bucket).await?;
-    ensure_read(context, &auth, info.group_id, &bucket).await?;
+    ensure_read(context, &auth, node_id, info.group_id, &bucket).await?;
     let (key_marker, version_id_marker) = match cursor {
         Some(cursor) => (Some(cursor.key), cursor.version_id),
         None => (None, None),
@@ -492,44 +524,241 @@ fn relative_key(key: &str, prefix: &str) -> Option<String> {
 async fn ensure_read(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
+    node_id: NodeId,
     group_id: GroupId,
     bucket: &str,
 ) -> Result<(), SyncRefusal> {
-    let node_id = context
-        .net_handle
-        .as_ref()
-        .ok_or(SyncRefusal::Unavailable)?
-        .node_id();
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: aruna_core::structs::blob_bucket_permission_path(
-                auth.realm_id,
-                group_id,
-                node_id,
-                bucket,
-            ),
-            required_permission: Permission::READ,
-        }),
+    authorize_pull(
         context,
+        auth,
+        aruna_core::structs::blob_bucket_permission_path(auth.realm_id, group_id, node_id, bucket),
+        Permission::READ,
+        "s3.ListObjectVersions",
     )
     .await
-    .map_err(|_| SyncRefusal::Unavailable)?;
-    match allowed {
-        true => Ok(()),
-        false => Err(SyncRefusal::Forbidden),
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bucket_refusal, head_of, listing_prefix, relative_key};
-    use crate::s3::get_bucket_info::GetBucketInfoError;
-    use crate::s3::list_object_versions::ListObjectVersionsItem;
+    use super::*;
     use aruna_core::errors::{ConversionError, StorageError};
-    use aruna_core::structs::{SourceMetadata, SyncRefusal};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::{
+        Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
+        RealmId, SourceMetadata,
+    };
+    use aruna_core::types::UserId;
+    use aruna_storage::FjallStorage;
     use std::time::SystemTime;
-    use ulid::Ulid;
+
+    fn deny_policy(expression: &str) -> RequestPolicy {
+        RequestPolicy {
+            policy_id: Ulid::from_bytes([7; 16]),
+            name: "sync-pull-test".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
+        }
+    }
+
+    struct PolicyFixture {
+        context: Arc<DriverContext>,
+        auth: AuthContext,
+        node_id: NodeId,
+        group_id: GroupId,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A realm whose owner may write everywhere, optionally under one deny
+    /// policy: the same state an S3 request of the same shape is judged against.
+    async fn policy_fixture(expression: Option<&str>) -> PolicyFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([5; 16]), realm_id);
+        let group_id = Ulid::from_bytes([6; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+        let auth_doc =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+        let group = Group {
+            display_name: "sync".to_string(),
+            group_id,
+            realm_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+            owner: user_id,
+        };
+        let mut realm = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        realm.request_policies = expression.map(deny_policy).into_iter().collect();
+        let _ = storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        REALM_CONFIG_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        realm.to_bytes(&actor).unwrap().into(),
+                    ),
+                    (
+                        GROUP_KEYSPACE.to_string(),
+                        group_id.to_bytes().to_vec().into(),
+                        group.to_bytes(&actor).unwrap().into(),
+                    ),
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                            .to_bytes(&actor)
+                            .unwrap()
+                            .into(),
+                    ),
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        group_id.to_bytes().to_vec().into(),
+                        auth_doc.to_bytes(&actor).unwrap().into(),
+                    ),
+                ],
+                txn_id: None,
+            })
+            .await;
+        PolicyFixture {
+            context: Arc::new(DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+            auth: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            node_id,
+            group_id,
+            _dir: dir,
+        }
+    }
+
+    fn bucket_info(group_id: GroupId, user_id: UserId) -> BucketInfo {
+        BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        }
+    }
+
+    fn pull_request(deleted: bool) -> PullRequest {
+        PullRequest {
+            auth_token: aruna_core::metadata::MetadataAuthToken::internal(AuthContext {
+                user_id: UserId::local(Ulid::from_bytes([5; 16]), RealmId::from_bytes([4u8; 32])),
+                realm_id: RealmId::from_bytes([4u8; 32]),
+                path_restrictions: None,
+            }),
+            source: VersionedObjectArn::new(
+                RealmId::from_bytes([4u8; 32]),
+                iroh::SecretKey::from_bytes(&[9; 32]).public(),
+                "folder-x".to_string(),
+                "note.txt".to_string(),
+                Ulid::from_bytes([2; 16]),
+            )
+            .unwrap(),
+            blake3: None,
+            size: 4,
+            target_bucket: "lab".to_string(),
+            target_key: "note.txt".to_string(),
+            deleted,
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_denies_pull() {
+        // A deny policy that would refuse the owner's own S3 put must refuse the
+        // forwarded pull that performs the same write.
+        let fixture = policy_fixture(Some("operation == 's3.PutObject'")).await;
+        let bucket = bucket_info(fixture.group_id, fixture.auth.user_id);
+        assert_eq!(
+            ensure_write(
+                &fixture.context,
+                &fixture.auth,
+                fixture.node_id,
+                &bucket,
+                &pull_request(false),
+            )
+            .await,
+            Err(SyncRefusal::Forbidden)
+        );
+        // The same request passes once the policy is gone.
+        let allowed = policy_fixture(None).await;
+        assert!(
+            ensure_write(
+                &allowed.context,
+                &allowed.auth,
+                allowed.node_id,
+                &bucket_info(allowed.group_id, allowed.auth.user_id),
+                &pull_request(false),
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_denies_listing() {
+        // The listing runs the boundary too, under the operation an S3 client
+        // would be judged by.
+        let fixture = policy_fixture(Some("operation == 's3.ListObjectVersions'")).await;
+        assert_eq!(
+            ensure_read(
+                &fixture.context,
+                &fixture.auth,
+                fixture.node_id,
+                fixture.group_id,
+                "lab",
+            )
+            .await,
+            Err(SyncRefusal::Forbidden)
+        );
+        let allowed = policy_fixture(None).await;
+        assert!(
+            ensure_read(
+                &allowed.context,
+                &allowed.auth,
+                allowed.node_id,
+                allowed.group_id,
+                "lab",
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_denies_sync_delete() {
+        // A delete pull is judged as the delete it performs, not as a put.
+        let fixture = policy_fixture(Some("operation == 's3.DeleteObject'")).await;
+        assert_eq!(
+            ensure_write(
+                &fixture.context,
+                &fixture.auth,
+                fixture.node_id,
+                &bucket_info(fixture.group_id, fixture.auth.user_id),
+                &pull_request(true),
+            )
+            .await,
+            Err(SyncRefusal::Forbidden)
+        );
+    }
 
     fn version(key: &str, latest: bool) -> ListObjectVersionsItem {
         ListObjectVersionsItem::Version {
