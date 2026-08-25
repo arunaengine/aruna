@@ -8,9 +8,6 @@ mod topology;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, BucketInfo, EntryState, FolderMode, RemoteBinding,
@@ -18,7 +15,9 @@ use aruna_core::structs::{
 };
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
-use aruna_operations::device::sync::folders::{BindFolderInput, bind_folder, list_entries};
+use aruna_operations::device::sync::folders::{
+    BindFolderInput, bind_folder, list_entries, list_transfers,
+};
 use aruna_operations::device::sync::outbox::drain_sync_outbox;
 use aruna_operations::device::sync::reconcile_folder;
 use aruna_operations::driver::{DriverContext, drive};
@@ -39,34 +38,18 @@ fn body(bytes: &'static [u8]) -> BackendStream<Result<bytes::Bytes, StreamError>
     BackendStream::new(tokio_util::io::ReaderStream::new(bytes))
 }
 
-async fn read_row(context: &DriverContext, key_space: &str, key: &[u8]) -> Option<Vec<u8>> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|v| v.to_vec()),
-        _ => None,
-    }
-}
-
-/// Waits until the device holds the group's admin documents.
+/// Waits until the realm has pulled every queued upload.
 ///
-/// The shared fixture only waits for the sync-eligible nodes, and a User node
-/// never is one. A pull is served against the group's authorization document,
-/// so a folder bound before it arrives is refused with `ReadDenied`.
-async fn await_group(realm: &Topology, group_id: GroupId) -> TestResult<()> {
+/// The drain is a timer task the reconciliation arms, so it runs concurrently
+/// with an explicit pass and may hold the row this one wanted. Publishing is
+/// therefore complete when the outbox is empty, never after one call.
+async fn await_uploads(realm: &Topology) -> TestResult<()> {
     let device = realm.user_node();
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
-        "the seeded group never reached the device",
+        "the device never published its queued uploads",
         || async {
-            let auth = read_row(&device.context, AUTH_KEYSPACE, &group_id.to_bytes()).await;
-            let record = read_row(&device.context, GROUP_KEYSPACE, &group_id.to_bytes()).await;
-            Ok(usize::from(auth.is_none() || record.is_none()))
+            drain_sync_outbox(&device.context).await;
+            Ok(list_transfers(&device.context).await?.len())
         },
     )
     .await
@@ -246,7 +229,6 @@ async fn bind(
 async fn syncs_both_directions() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    await_group(&realm, group_id).await?;
     let device = realm.user_node();
     let server = realm.node(0);
     create_bucket(&server.context, group_id, realm.user_id).await?;
@@ -259,7 +241,7 @@ async fn syncs_both_directions() -> TestResult<()> {
         .await
         .ok_or("the first pass must reconcile")?;
     assert_eq!(plan.uploads, 1);
-    drain_sync_outbox(&device.context).await;
+    await_uploads(&realm).await?;
     assert_eq!(
         read_object(&realm, &server.context, group_id, "note.txt").await?,
         b"from the device"
@@ -306,7 +288,6 @@ async fn syncs_both_directions() -> TestResult<()> {
 async fn resolves_conflicts() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    await_group(&realm, group_id).await?;
     let device = realm.user_node();
     let server = realm.node(0);
     create_bucket(&server.context, group_id, realm.user_id).await?;
@@ -318,7 +299,7 @@ async fn resolves_conflicts() -> TestResult<()> {
     reconcile_folder(&device.context, &folder)
         .await
         .ok_or("the first pass must reconcile")?;
-    drain_sync_outbox(&device.context).await;
+    await_uploads(&realm).await?;
 
     // Both sides move before the next pass.
     std::fs::write(&file, b"the owner's own edit")?;
@@ -346,7 +327,7 @@ async fn resolves_conflicts() -> TestResult<()> {
         std::fs::read(root.path().join(&conflicted_copy))?,
         b"the realm's edit"
     );
-    drain_sync_outbox(&device.context).await;
+    await_uploads(&realm).await?;
     assert_eq!(
         read_object(&realm, &server.context, group_id, "paper.txt").await?,
         b"the owner's own edit",
