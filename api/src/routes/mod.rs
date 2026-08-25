@@ -13,6 +13,7 @@ pub mod compute;
 pub mod connectors;
 pub mod credentials;
 pub mod device;
+pub mod device_compute;
 pub mod drs;
 pub mod group_backends;
 pub mod groups;
@@ -56,6 +57,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(device::router())
+        .merge(device_compute::router())
         .merge(groups::router())
         .merge(jobs::router())
         .merge(job_audit::router())
@@ -155,6 +157,7 @@ mod tests {
         ("GET", "/buckets/{bucket}/storage-routing"),
         ("GET", "/data/sync-relationships"),
         ("GET", "/data/sync-relationships/{id}"),
+        ("GET", "/device/compute"),
         ("GET", "/device/drafts"),
         ("GET", "/device/drafts/{draft_id}"),
         ("GET", "/device/offers"),
