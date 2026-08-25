@@ -17,6 +17,9 @@ use topology::{TestResult, Topology, read_realm_config, replicate_config, spawn_
 
 const MANAGEMENT_NODES: usize = 2;
 const REPLICATION_FACTOR: u32 = 1;
+/// Far above an in-process exchange, and never a performance assertion: it is
+/// only here so a hung peer ends the test instead of the suite.
+const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tokio::test]
 async fn device_fetches_revocation() -> TestResult<()> {
@@ -101,7 +104,7 @@ async fn device_fetches_revocation() -> TestResult<()> {
     );
 
     assert!(
-        fetch_realm_documents(&device.context).await,
+        fetch_realm_documents(&device.context, FETCH_BUDGET).await,
         "a realm node must serve the device the realm documents"
     );
     assert!(
