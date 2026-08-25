@@ -17,8 +17,7 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::fs_source::{
-    MAX_COPY_ATTEMPTS, SPOOL_DIR, SPOOL_GRACE, canonical_root, current_fingerprint, jailed_file,
-    map_io_error,
+    MAX_COPY_ATTEMPTS, SPOOL_DIR, SPOOL_GRACE, canonical_root, jailed_file, map_io_error,
 };
 
 /// Why a spooled file could not be published. A refusal is the owner's data
@@ -112,9 +111,8 @@ pub(crate) async fn write_conflicted(
 }
 
 /// Answers the placement outcome and removes the spool when it did not publish.
-///
-/// The fingerprint is read at the published path: the rename that puts it there
-/// moves the change time, so one taken on the spool would never match again.
+/// The fingerprint is read at the published path, because the rename that puts
+/// it there moves the change time a spool fingerprint would carry.
 async fn finish_write(
     spooled: Spooled,
     placed: Result<(), PlaceError>,
@@ -122,10 +120,12 @@ async fn finish_write(
     written: impl FnOnce(String, &Spooled) -> LocalFileEvent,
 ) -> LocalFileEvent {
     match placed {
-        Ok(()) => match current_fingerprint(published).await {
-            Some(fingerprint) => written(fingerprint, &spooled),
-            None => LocalFileEvent::Error {
-                message: "the published file could not be read back".to_string(),
+        // The hash answers for the spool's bytes, so it is only reported with a
+        // file that still has exactly those bytes.
+        Ok(()) => match published_stat(published).await {
+            Some((fingerprint, size)) if size == spooled.size => written(fingerprint, &spooled),
+            _ => LocalFileEvent::Error {
+                message: "the published file is not the one that was written".to_string(),
             },
         },
         Err(error) => {
@@ -136,6 +136,15 @@ async fn finish_write(
             }
         }
     }
+}
+
+/// The published file's weak fingerprint and its size, read as one stat.
+async fn published_stat(path: &Path) -> Option<(String, u64)> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    Some((
+        weak_fingerprint(&FileStat::from_metadata(&metadata)),
+        metadata.len(),
+    ))
 }
 
 /// Moves one file into the folder's trash. A removal is never an unlink: the
@@ -1015,6 +1024,31 @@ mod tests {
                 .as_deref(),
             Some(fingerprint.as_str())
         );
+    }
+
+    // The reported hash is the spool's, so it may only be paired with a file
+    // that still holds exactly those bytes.
+    #[tokio::test]
+    async fn refuses_replaced_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let spooled = Spooled {
+            path: root.path().join("spool"),
+            blake3: [7u8; 32],
+            size: 5,
+        };
+        let published = root.path().join("note.txt");
+        tokio::fs::write(&published, b"another").await.unwrap();
+
+        let event = finish_write(spooled, Ok(()), &published, |fingerprint, spooled| {
+            LocalFileEvent::Written {
+                fingerprint,
+                blake3: spooled.blake3,
+                size: spooled.size,
+            }
+        })
+        .await;
+
+        assert!(matches!(event, LocalFileEvent::Error { .. }));
     }
 
     // A file that changed since it was observed must not be resolvable under
