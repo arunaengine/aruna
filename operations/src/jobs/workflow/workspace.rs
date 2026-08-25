@@ -31,8 +31,10 @@ use crate::driver::{
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::store::reserve_output_commits;
-use crate::replication::bao_read::{BaoReadOutput, local_is_user, managed_read};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget, ReplicationMode};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
+use crate::replication::protocol::{
+    BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
+};
 use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
@@ -1083,12 +1085,9 @@ async fn remote_source(
     })
 }
 
-/// One exact realm version a device fetches for itself.
-///
-/// A device plans nothing and holds no sealed facts, so the request's own
-/// version is the only authority. The bytes land in the run's own workspace
-/// bucket through the ordinary staging write below: a materialized local copy,
-/// never a reference to the realm version.
+/// One exact realm version a device fetches for itself. It plans nothing, so
+/// the request's own version is the only authority, and the bytes land in the
+/// run's own workspace as a local copy, never as a reference.
 async fn device_source(
     context: &DriverContext,
     record: &JobRecord,
@@ -1140,7 +1139,23 @@ async fn device_source(
         Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
             "staging {bucket}/{key} received no bytes"
         ))),
-        Err(error) => Err(stage_error(bucket, key, Some(error))),
+        Err(error) => Err(device_read_error(bucket, key, error)),
+    }
+}
+
+/// A read outcome no retry can change: the version is not there, is not the one
+/// named, is not the caller's to read, or is governed data a device may never
+/// hold. Everything else stays retryable, because transport is.
+fn device_read_error(bucket: &str, key: &str, error: BaoReadError) -> JobError {
+    match &error {
+        BaoReadError::GovernedUnavailable
+        | BaoReadError::Refused(
+            BaoReadRefusal::NotFound
+            | BaoReadRefusal::InvalidTarget
+            | BaoReadRefusal::HashMismatch
+            | BaoReadRefusal::ReadDenied,
+        ) => JobError::permanent(format!("staging {bucket}/{key} failed: {error}")),
+        _ => stage_error(bucket, key, Some(error)),
     }
 }
 
@@ -1721,6 +1736,31 @@ mod tests {
 
     // Both input mappings must retry only transient drift: a job that waits on a
     // rebind or a dropped observation would burn its whole attempt budget.
+    #[test]
+    fn device_read_fails_fast() {
+        // A governed or missing realm input must not burn every attempt.
+        for error in [
+            BaoReadError::GovernedUnavailable,
+            BaoReadError::Refused(BaoReadRefusal::NotFound),
+            BaoReadError::Refused(BaoReadRefusal::InvalidTarget),
+            BaoReadError::Refused(BaoReadRefusal::ReadDenied),
+        ] {
+            assert_eq!(
+                device_read_error("src", "reads.fastq", error).kind,
+                JobErrorKind::Permanent
+            );
+        }
+        assert_eq!(
+            device_read_error(
+                "src",
+                "reads.fastq",
+                BaoReadError::Refused(BaoReadRefusal::BackendFailure)
+            )
+            .kind,
+            JobErrorKind::Retryable
+        );
+    }
+
     #[test]
     fn classifies_input_errors() {
         for map in [staged_input_error, source_input_error] {
