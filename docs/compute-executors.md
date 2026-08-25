@@ -7,10 +7,16 @@ and drained is described in [Distributed execution jobs](distributed-jobs.md).
 Aruna can run one compute executor per node. Set `ARUNA_COMPUTE_EXECUTOR` to
 `none`, `docker`, `apptainer`, or `kubernetes`; the default is `none`. Selecting
 an executor whose Cargo feature was not compiled is a configuration error.
+`off` and an empty value are accepted as `none`, so a supervisor can disable
+compute by writing the key rather than by unsetting it.
 
 An explicitly selected executor must pass its startup health checks. Set
 `ARUNA_COMPUTE_OPTIONAL=1` only when the node may start without compute after a
 health failure. Invalid configuration is still rejected.
+
+Set `ARUNA_COMPUTE_LOCAL_ONLY=1` on a user device: the executor then runs only
+the owner's local jobs and is never advertised to the realm. See
+[Local runs on a user device](#local-runs-on-a-user-device).
 
 Task images are resolved before the attempt intent is committed and the
 digest-pinned reference is retained for exact-bits recovery. Kubernetes also
@@ -71,9 +77,57 @@ cross `/`. Each match is uploaded below the declared destination with the
 required `path_prefix` stripped, and a pattern that matches nothing captures
 nothing. A declared path without wildcards must still exist when the task ends.
 
+## Local runs on a user device
+
+A user device runs compute for the owner of that device alone, and only when the
+owner asks for it: `POST /jobs/` with `target: "local"`, or a TES task tagged
+`aruna-engine.org/target=local`. The realm never dispatches to a device, because
+a device advertises no executor at all, whatever compute the owner enabled on the
+machine.
+
+The desktop app writes these keys for the node it supervises:
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `ARUNA_COMPUTE_EXECUTOR` | `docker` or `apptainer`, resolved from the app's backend probe; `off` when the owner disabled compute | `none` |
+| `ARUNA_COMPUTE_LOCAL_ONLY` | `1` selects the local-only profile | unset: shared deployment |
+| `ARUNA_COMPUTE_OPTIONAL` | `1` keeps the node up when the daemon does not answer | unset: a health failure fails startup |
+| `ARUNA_COMPUTE_MAX_CONCURRENT` | how many of the owner's runs may be in flight at once; a submission beyond it is refused | unset: unmeasured |
+| `ARUNA_COMPUTE_MAX_CPU_CORES`, `ARUNA_COMPUTE_MAX_RAM_BYTES`, `ARUNA_COMPUTE_MAX_DISK_BYTES` | the owner's caps, from This device | unset: unmeasured, see [Execution envelope](#execution-envelope) |
+| `ARUNA_COMPUTE_KEEP_FAILED` | `1` keeps failed containers for inspection (Docker) | unset: they are removed |
+| `ARUNA_COMPUTE_STATE_ROOT` | Docker state root under the app's data directory | `./compute-state` |
+| `ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT`, `ARUNA_COMPUTE_APPTAINER_STATE_ROOT`, `ARUNA_COMPUTE_APPTAINER_SIF_CACHE` | delegated cgroup v2 root of the user slice, and the Apptainer roots | the cgroup root is required by Apptainer |
+
+In the local-only profile the Docker builder registers no workspace endpoint and
+skips the container-reachable `S3_PUBLIC_URL` and non-loopback `S3_ADDRESS`
+requirements: a device stages files and exposes no S3 listener a container could
+reach. Apptainer is unchanged and still needs its delegated cgroup root.
+
+A local run stages its inputs as files into the node-local workspace bucket
+`ws-<jobid>`. It refuses mounted inputs, `workspace.mode` `none` and Direct-S3
+staging, all of which need an S3 endpoint the device does not expose, and
+`workspace.mode` `existing`.
+
+Where an output lands depends on the surface. `POST /jobs/` declares workspace
+outputs, which stay in `ws-<jobid>` until the owner publishes them. A TES task
+declares each output with an `s3://bucket/key` url, and a local task writes it to
+the device-local bucket that url names, which must belong to the execution group
+and grant the owner WRITE.
+
+An input this device does not hold is refused at submit unless it names the realm
+node and version holding it; staging then fetches that exact version into
+`ws-<jobid>` as an ordinary local object, never as a reference. A holder it
+cannot reach fails the run, not the submission. A run is refused while this
+node's compute plane is drained, and while the owner's unfinished runs already
+reach `ARUNA_COMPUTE_MAX_CONCURRENT`.
+
+Local runs are listed by the ordinary `GET /jobs/` of the device's own API, and
+`GET /device/compute` reports the plane the owner configured. Nothing about a
+local run is forwarded, replicated or offered to the realm.
+
 ## Docker
 
-Required configuration:
+Required configuration, unless `ARUNA_COMPUTE_LOCAL_ONLY=1`:
 
 - `ARUNA_COMPUTE_S3_URL` or `S3_PUBLIC_URL`: the S3 endpoint a container is
   handed. `ARUNA_COMPUTE_S3_URL` wins when both are set and exists because
@@ -89,8 +143,12 @@ Optional configuration:
   When unset, `storage_opt` is omitted and task disk requests are unenforced.
 - `ARUNA_COMPUTE_DOCKER_PULL_DEADLINE`: image pull deadline in seconds;
   defaults to `300`.
+- `ARUNA_COMPUTE_STATE_ROOT`: durable Docker state root; defaults to
+  `./compute-state`. Apptainer names its own roots.
+- `ARUNA_COMPUTE_KEEP_FAILED`: `1` keeps the containers of failed attempts for
+  inspection; defaults to removing them. Docker only.
 
-Docker uses `./compute-state` by default. The state root must be durable and
+The state root must be durable and
 exclusive to one controller for the Docker daemon. A daemon lock enforces that
 contract, and a per-attempt lock serializes create, stage, and start.
 

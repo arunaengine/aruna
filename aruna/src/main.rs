@@ -993,8 +993,10 @@ async fn build_compute_registry(
     config: &Config,
 ) -> Result<(Option<Arc<aruna_compute::ExecutorRegistry>>, bool), String> {
     let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
-    let result = match selected.as_str() {
-        "none" => return Ok((None, false)),
+    let result = match selected.trim() {
+        // A supervisor that turns compute off writes a disabling value rather
+        // than unsetting the key, which an inherited environment would refill.
+        "none" | "off" | "" => return Ok((None, false)),
         "docker" => build_docker(config).await,
         "apptainer" => build_apptainer(config).await,
         "kubernetes" => build_kubernetes(config).await,
@@ -1024,6 +1026,7 @@ fn read_mount_driver() -> Option<String> {
         .filter(|driver| !driver.is_empty())
 }
 
+#[derive(Debug)]
 enum ComputeBuildError {
     Config(String),
     Unavailable(String),
@@ -1041,6 +1044,39 @@ impl From<&'static str> for ComputeBuildError {
     }
 }
 
+/// The container-facing S3 endpoint the Docker registry carries, or `None` in
+/// the local-only profile a user device runs: it exposes no S3 listener, so the
+/// checks that keep a shared deployment reachable would only refuse it.
+#[cfg(any(feature = "docker", test))]
+fn docker_workspace(
+    local_only: bool,
+    endpoint: Option<&str>,
+    s3_address: Option<&str>,
+) -> Result<Option<String>, ComputeBuildError> {
+    if local_only {
+        return Ok(None);
+    }
+    let endpoint = endpoint.ok_or_else(|| {
+        "Docker executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
+    })?;
+    if container_local_endpoint(endpoint) {
+        return Err(
+            "Docker executor requires a container-reachable S3_PUBLIC_URL"
+                .to_string()
+                .into(),
+        );
+    }
+    if !s3_address
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| !address.ip().is_loopback())
+    {
+        return Err("Docker executor requires a non-loopback S3_ADDRESS"
+            .to_string()
+            .into());
+    }
+    Ok(Some(endpoint.to_string()))
+}
+
 #[cfg(feature = "docker")]
 async fn build_docker(
     config: &Config,
@@ -1050,41 +1086,33 @@ async fn build_docker(
             .ok()
             .as_deref(),
     )?;
-    let endpoint = compute_s3_endpoint(config).ok_or_else(|| {
-        "Docker executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
-    })?;
-    if container_local_endpoint(&endpoint) {
-        return Err(
-            "Docker executor requires a container-reachable S3_PUBLIC_URL"
-                .to_string()
-                .into(),
-        );
-    }
-    if !config
-        .s3_address
-        .as_deref()
-        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|address| !address.ip().is_loopback())
-    {
-        return Err("Docker executor requires a non-loopback S3_ADDRESS"
-            .to_string()
-            .into());
-    }
-    let docker_config = aruna_compute::DockerConfig {
+    let workspace = docker_workspace(
+        env_true("ARUNA_COMPUTE_LOCAL_ONLY"),
+        compute_s3_endpoint(config).as_deref(),
+        config.s3_address.as_deref(),
+    )?;
+    let mut docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
         envelope: compute_envelope()?,
+        keep_failed: env_true("ARUNA_COMPUTE_KEEP_FAILED"),
         ..aruna_compute::DockerConfig::default()
     };
+    if let Some(state_root) = env_path("ARUNA_COMPUTE_STATE_ROOT") {
+        docker_config.state_root = state_root;
+    }
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
         .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
-    info!("Docker executor backend enabled");
+    info!(
+        local_only = workspace.is_none(),
+        "Docker executor backend enabled"
+    );
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string()))
+        .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
 }
 
 #[cfg(not(feature = "docker"))]
@@ -1359,7 +1387,17 @@ fn compute_s3_endpoint(config: &Config) -> Option<String> {
         .or_else(|| config.s3_public_url.clone())
 }
 
+/// A configured filesystem path; an empty value is treated as unset.
 #[cfg(feature = "docker")]
+fn env_path(name: &str) -> Option<std::path::PathBuf> {
+    dotenvy::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(any(feature = "docker", test))]
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()
@@ -1457,6 +1495,32 @@ mod tests {
         assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[test]
+    fn skips_s3_checks() {
+        // A device has no S3 listener and hands its containers no endpoint.
+        assert_eq!(docker_workspace(true, None, None).unwrap(), None);
+        assert_eq!(
+            docker_workspace(true, Some("http://127.0.0.1:9000"), Some("127.0.0.1:9000")).unwrap(),
+            None
+        );
+        assert_eq!(
+            docker_workspace(false, Some("https://s3.example.test"), Some("0.0.0.0:9000")).unwrap(),
+            Some("https://s3.example.test".to_string())
+        );
+        assert!(docker_workspace(false, None, Some("0.0.0.0:9000")).is_err());
+        assert!(
+            docker_workspace(false, Some("http://localhost:9000"), Some("0.0.0.0:9000")).is_err()
+        );
+        assert!(
+            docker_workspace(
+                false,
+                Some("https://s3.example.test"),
+                Some("127.0.0.1:9000")
+            )
+            .is_err()
+        );
     }
 
     #[test]

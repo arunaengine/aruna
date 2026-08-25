@@ -58,6 +58,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "device plane: erases only this node, after require_owner and an id confirmation",
     ),
     (
+        "device_compute.rs",
+        "get_device_compute",
+        "device plane: require_owner binds the caller to this node's enrolled owner",
+    ),
+    (
         "drs.rs",
         "get_authorizations",
         "public DRS auth-scheme discovery, resolves no object",

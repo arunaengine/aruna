@@ -49,6 +49,9 @@ impl ExecutorRegistry {
         self
     }
 
+    /// The endpoint a Direct-S3 attempt binding would hand its container. No
+    /// attempt path builds one yet, so nothing reads this today; it stays
+    /// because the operator configuration that fills it is documented.
     pub fn workspace_endpoint(&self) -> &WorkspaceEndpoint {
         &self.workspace
     }

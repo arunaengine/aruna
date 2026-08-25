@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
+    ActiveJobKind, JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
     parse_job_dedup_value,
 };
 use aruna_core::structured_id::{
@@ -54,6 +54,9 @@ pub struct SubmitJobSpec {
     pub retention_ms: u64,
     pub workspace_mode: WorkspaceMode,
     pub workspace_bucket: Option<String>,
+    /// Unfinished jobs of this user this node admits, counted in the admitting
+    /// transaction. `None` leaves the payload's own limit in charge.
+    pub active_cap: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,10 +144,11 @@ pub struct SubmitJobOperation {
 
 impl SubmitJobOperation {
     pub fn new(spec: SubmitJobSpec, job_id: JobId) -> Self {
-        let active_cap = spec
-            .payload
-            .rocrate_limits()
-            .map(|limits| limits.max_active_jobs);
+        let active_cap = spec.active_cap.or_else(|| {
+            spec.payload
+                .rocrate_limits()
+                .map(|limits| limits.max_active_jobs)
+        });
         let mut record = JobRecord::new(
             job_id,
             spec.payload,
@@ -228,13 +232,17 @@ impl SubmitJobOperation {
         let Some(limit) = self.active_cap else {
             return self.write_job(Some(txn_id));
         };
+        // Only the kinds that hold a slot can be counted against one.
+        let Some(kind) = ActiveJobKind::of(&self.record.payload) else {
+            return self.write_job(Some(txn_id));
+        };
         self.state = SubmitState::CheckActive { txn_id };
         if limit == 0 {
             return self.fail(SubmitJobError::ActiveJobLimit { limit });
         }
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: JOB_ACTIVE_USER_KEYSPACE.to_string(),
-            prefix: Some(job_active_prefix(self.record.created_by)),
+            prefix: Some(job_active_prefix(self.record.created_by, kind)),
             start: None,
             limit: limit as usize,
             txn_id: Some(txn_id),
@@ -511,6 +519,7 @@ mod tests {
             retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
             workspace_mode: WorkspaceMode::Kept,
             workspace_bucket: None,
+            active_cap: None,
         }
     }
 

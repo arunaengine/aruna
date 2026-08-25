@@ -39,6 +39,7 @@ use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
+use crate::mutate_realm_placement::node_kind;
 use crate::placement::{build_view, held_buckets};
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
@@ -77,7 +78,7 @@ pub async fn seed_node_info_document(
     let compute_draining = leaving || read_operator_drain(ctx).await?;
     let document = NodeInfoDocument {
         node_id,
-        executors: advertised_executors(ctx, &reservation.reserved, now).await?,
+        executors: advertised_executors(ctx, &config, node_id, &reservation.reserved, now).await?,
         labels: node_labels(ctx, &config, node_id)?,
         urls,
         utilization: NodeUtilization {
@@ -119,9 +120,14 @@ pub async fn publish_node_info(
 /// admission stays the target-side reservation.
 async fn advertised_executors(
     ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    node_id: NodeId,
     reserved: &ResourceTotals,
     now_ms: u64,
 ) -> Result<Vec<ExecutorCapability>, String> {
+    if !advertises_executors(config, node_id) {
+        return Ok(Vec::new());
+    }
     let Some(registry) = ctx.compute_handle.as_ref() else {
         return Ok(Vec::new());
     };
@@ -135,6 +141,13 @@ async fn advertised_executors(
         capability.availability = Some(availability(&capability.limits, reserved, now_ms));
     }
     Ok(capabilities)
+}
+
+/// Whether this node may advertise execution targets at all. A User device runs
+/// only its owner's local jobs, so it never offers the realm a target to
+/// dispatch to, whatever compute the owner enabled on the machine.
+fn advertises_executors(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    node_kind(config, node_id).is_some_and(|kind| kind.is_sync_eligible())
 }
 
 /// Exact local capacity currently reserved, summed over the durable per-
@@ -424,7 +437,7 @@ pub async fn refresh_node_info_heartbeat(
     let epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
     let reservation = reservation_snapshot(ctx, epoch).await?;
     let demand = demand_snapshot(ctx, epoch).await?;
-    let executors = advertised_executors(ctx, &reservation.reserved, now).await?;
+    let executors = advertised_executors(ctx, &config, node_id, &reservation.reserved, now).await?;
     let labels = node_labels(ctx, &config, node_id)?;
     let storage_bytes_used = local_storage_bytes(ctx).await?;
     let documents_held = held_documents(ctx, node_id, &config).await;
@@ -1181,6 +1194,60 @@ mod tests {
             Some(&"true".to_string())
         );
         assert!(labels.contains_key(&format!("{STORAGE_CLASS_LABEL_PREFIX}archive")));
+    }
+
+    #[test]
+    fn device_advertises_nothing() {
+        // A device never offers the realm a target to dispatch to.
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let device = node(1);
+        let server = node(2);
+        let mut config = realm_config(realm_id, &[server]);
+        config.ensure_node(
+            device,
+            RealmNodeKind::User {
+                owner: aruna_core::types::UserId::nil(realm_id),
+            },
+        );
+
+        assert!(!advertises_executors(&config, device));
+        assert!(advertises_executors(&config, server));
+        assert!(!advertises_executors(&config, node(3)));
+    }
+
+    #[tokio::test]
+    async fn device_seeds_empty() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let local = node(1);
+        let mut config = realm_config(realm_id, &[local]);
+        config.ensure_node(
+            local,
+            RealmNodeKind::User {
+                owner: aruna_core::types::UserId::nil(realm_id),
+            },
+        );
+        write_realm_config(&ctx, &config).await;
+
+        seed_node_info_document(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .expect("seeded node info document");
+        assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "user");
+        assert!(stored.executors.is_empty());
     }
 
     #[tokio::test]

@@ -13,9 +13,9 @@ use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
     InputMode, InputSelection, InputSource, JobError, JobInputFact, JobRecord,
     MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection, PathRestriction,
-    Permission, PlacementPolicyRef, UserAccess, WorkspaceMode, blob_bucket_permission_path,
-    blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
-    workspace_credential_id,
+    Permission, PlacementPolicyRef, UserAccess, VersionedObjectArn, WorkspaceMode,
+    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
+    ensure_confined_relative_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -29,8 +29,12 @@ use crate::driver::{
     quota_marked_routing, routing_snapshot,
 };
 use crate::get_realm_config::GetRealmConfigOperation;
+use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::store::reserve_output_commits;
-use crate::replication::protocol::ReplicationMode;
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
+use crate::replication::protocol::{
+    BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
+};
 use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
@@ -1081,6 +1085,80 @@ async fn remote_source(
     })
 }
 
+/// One exact realm version a device fetches for itself. It plans nothing, so
+/// the request's own version is the only authority, and the bytes land in the
+/// run's own workspace as a local copy, never as a reference.
+async fn device_source(
+    context: &DriverContext,
+    record: &JobRecord,
+    input: &InputSelection,
+    source: NodeId,
+) -> Result<StagedSource, JobError> {
+    let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    let version = version_id
+        .as_deref()
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| JobError::permanent(format!("input version is invalid for {bucket}/{key}")))?
+        .ok_or_else(|| {
+            JobError::permanent(format!("realm input {bucket}/{key} names no exact version"))
+        })?;
+    let realm_id = record.created_by.realm_id;
+    let request = BaoReadRequest {
+        auth_context: AuthContext {
+            user_id: record.created_by,
+            realm_id,
+            path_restrictions: None,
+        },
+        realm_id,
+        target: BaoReadTarget::ExactVersion(VersionedObjectArn {
+            realm_id,
+            node_id: source,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version,
+        }),
+        expected_blake3: None,
+        metadata_only: false,
+        // A device is never a managed-copy destination; the read is the
+        // owner-bound device read, which refuses governed content outright.
+        destination: None,
+        known_refs: Vec::new(),
+    };
+    match managed_read(context, source, request).await {
+        Ok(BaoReadOutput::Stream { blob, size, .. }) => Ok(StagedSource {
+            blob,
+            location: None,
+            size: Some(size),
+            source_policies: Vec::new(),
+        }),
+        Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
+            "staging {bucket}/{key} received no bytes"
+        ))),
+        Err(error) => Err(device_read_error(bucket, key, error)),
+    }
+}
+
+/// A read outcome no retry can change: the version is not there, is not the one
+/// named, is not the caller's to read, or is governed data a device may never
+/// hold. Everything else stays retryable, because transport is.
+fn device_read_error(bucket: &str, key: &str, error: BaoReadError) -> JobError {
+    match &error {
+        BaoReadError::GovernedUnavailable
+        | BaoReadError::Refused(
+            BaoReadRefusal::NotFound
+            | BaoReadRefusal::InvalidTarget
+            | BaoReadRefusal::HashMismatch
+            | BaoReadRefusal::ReadDenied,
+        ) => JobError::permanent(format!("staging {bucket}/{key} failed: {error}")),
+        _ => stage_error(bucket, key, Some(error)),
+    }
+}
+
 async fn stage_one_input(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -1103,15 +1181,24 @@ async fn stage_one_input(
                 "invalid input version_id for {src_bucket}/{src_key}"
             ))
         })?;
-    let staged = if input.source_node_id.is_some_and(|source| source != node_id) {
+    let staged = if let Some(source) = input.source_node_id.filter(|source| *source != node_id) {
         // A forwarded plan has already validated the source at its ingress
         // endpoint; only the explicit exact-version staging path is local here.
-        let fact = record
+        match record
             .input_facts
             .iter()
             .find(|fact| fact.destination_key == input.dest_key)
-            .ok_or_else(|| JobError::permanent("sealed input facts are missing".to_string()))?;
-        Box::pin(remote_source(context, record, input, fact)).await?
+        {
+            Some(fact) => Box::pin(remote_source(context, record, input, fact)).await?,
+            None => {
+                if !local_is_user(context, record.created_by.realm_id).await {
+                    return Err(JobError::permanent(
+                        "sealed input facts are missing".to_string(),
+                    ));
+                }
+                Box::pin(device_source(context, record, input, source)).await?
+            }
+        }
     } else {
         let bucket_info = Box::pin(drive(
             GetBucketInfoOperation::new(src_bucket.clone()),
@@ -1649,6 +1736,31 @@ mod tests {
 
     // Both input mappings must retry only transient drift: a job that waits on a
     // rebind or a dropped observation would burn its whole attempt budget.
+    #[test]
+    fn device_read_fails_fast() {
+        // A governed or missing realm input must not burn every attempt.
+        for error in [
+            BaoReadError::GovernedUnavailable,
+            BaoReadError::Refused(BaoReadRefusal::NotFound),
+            BaoReadError::Refused(BaoReadRefusal::InvalidTarget),
+            BaoReadError::Refused(BaoReadRefusal::ReadDenied),
+        ] {
+            assert_eq!(
+                device_read_error("src", "reads.fastq", error).kind,
+                JobErrorKind::Permanent
+            );
+        }
+        assert_eq!(
+            device_read_error(
+                "src",
+                "reads.fastq",
+                BaoReadError::Refused(BaoReadRefusal::BackendFailure)
+            )
+            .kind,
+            JobErrorKind::Retryable
+        );
+    }
+
     #[test]
     fn classifies_input_errors() {
         for map in [staged_input_error, source_input_error] {

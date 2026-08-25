@@ -8,13 +8,19 @@ use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
     ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
-    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, Permission,
-    WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
+    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
+    Permission, WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path,
+    blob_group_permission_path,
+};
+use aruna_core::types::NodeId;
+use aruna_operations::device::compute::{
+    LocalExecutionConfig, LocalExecutionError, submit_local_execution,
 };
 use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
-    cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
+    cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_owned_job,
+    read_report_routed,
 };
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -42,6 +48,7 @@ use crate::auth::{
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
+use crate::routes::device::require_owner;
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
 
@@ -71,6 +78,11 @@ pub struct ExecutionInputRequest {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    /// Realm node holding this object. Only a `local` run accepts it: the named
+    /// version is copied onto the device before the run and `version_id` is
+    /// then required. A realm run refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
     pub dest_key: String,
     /// Absolute container path; defaults to `/inputs/<dest_key>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +134,16 @@ pub struct WorkspaceRequest {
     pub bucket: Option<String>,
 }
 
+/// Where a submission runs. `local` is served by a user device only, and runs
+/// the job on that machine for its owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionTarget {
+    #[default]
+    Realm,
+    Local,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitExecutionRequest {
     pub group_id: String,
@@ -155,6 +177,10 @@ pub struct SubmitExecutionRequest {
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRequest>,
+    /// `realm` (the default) admits the job into the realm; `local` runs it on
+    /// this machine and is served by a user device only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ExecutionTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -163,8 +189,10 @@ pub struct SubmitJobResponse {
     pub job_id: String,
     pub created: bool,
     /// The replicated identity of the request itself, hex encoded. Two aliases
-    /// of one request always share it.
-    pub submission_id: String,
+    /// of one request always share it. Absent for a local run, which is never
+    /// replicated and belongs to no submission family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<String>,
     /// The alias the responder currently reduces as canonical. It may change
     /// once a partitioned lower claim is learned; `job_id` never does.
     pub canonical_job_id: String,
@@ -580,7 +608,7 @@ pub(crate) fn map_submit_error(
             format!("idempotency key already bound to job {existing_job_id}"),
         ),
         SubmitJobError::ActiveJobLimit { limit } => {
-            ServerError::Conflict(format!("active RO-Crate job limit of {limit} reached"))
+            ServerError::Conflict(format!("active job limit of {limit} reached"))
         }
         SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
         SubmitJobError::TooManyOutputs { limit } => {
@@ -658,10 +686,26 @@ fn container_path(path: &str) -> ServerResult<String> {
 
 /// Native inputs land in the container at the given path, defaulting to
 /// `/inputs/<dest_key>` so `load_inputs` always stages them.
-fn native_input(input: ExecutionInputRequest) -> ServerResult<InputSelection> {
+fn native_input(
+    input: ExecutionInputRequest,
+    target: ExecutionTarget,
+) -> ServerResult<InputSelection> {
     if input.dest_key.is_empty() {
         return Err(ServerError::BadRequest);
     }
+    // A realm submission resolves its inputs through the planner, which seals
+    // the holder itself; naming one there would claim an unverified fact.
+    let source_node_id = match (&input.source_node_id, target) {
+        (Some(node_id), ExecutionTarget::Local) => {
+            Some(NodeId::from_str(node_id).map_err(|_| ServerError::BadRequest)?)
+        }
+        (Some(_), ExecutionTarget::Realm) => {
+            return Err(ServerError::BadRequestMessage(
+                "source_node_id is only accepted by a local run".to_string(),
+            ));
+        }
+        (None, _) => None,
+    };
     let path = match &input.container_path {
         Some(path) => container_path(path)?,
         None => container_path(&format!("/inputs/{}", input.dest_key))?,
@@ -672,7 +716,7 @@ fn native_input(input: ExecutionInputRequest) -> ServerResult<InputSelection> {
             key: input.key,
             version_id: input.version_id,
         },
-        source_node_id: None,
+        source_node_id,
         dest_key: input.dest_key,
         mode: match input.mode {
             InputModeRequest::Snapshot => InputMode::Snapshot,
@@ -728,7 +772,8 @@ its own jobs.
 
 **Behavior**
 - The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs
-  this node owns.
+  this node owns. On a user device that includes every local run the owner started there; there is
+  no separate listing for them.
 - Jobs recorded on other nodes are never merged in, so a caller that submitted against another
   node pages that node's listing instead (submission answers with the `origin_node_url` it was
   accepted at).
@@ -846,10 +891,27 @@ on that bucket and that it belongs to the same group.
 - The group's standing quota is decided against a replicated demand view. A replay of an
   idempotency key this node already claimed is settled before any quota is read and is never
   quota-refused.
-- On a user device the request is always forwarded: the inputs are referenced rather than resolved
-  here, the outputs land on the admitting realm holder, and the device itself never executes,
-  admits or stores any part of the job. A device forwards the caller's own bearer token, so a
-  submission it cannot back with one is a 403 rather than a forwarded request.
+- On a user device a `realm` request is always forwarded: the inputs are referenced rather than
+  resolved here, the outputs land on the admitting realm holder, and the device itself never
+  executes, admits or stores any part of the job. A device forwards the caller's own bearer token,
+  so a submission it cannot back with one is a 403 rather than a forwarded request.
+
+**Target `local`** (a user device only; any other node answers 400)
+- The job runs on this machine for the user the device is enrolled for, and is refused for anyone
+  else with a 403. Nothing about it is forwarded, replicated or offered to the realm, and the
+  response carries no `submission_id`: a local run belongs to no submission family.
+- Inputs must be readable on the device. An input naming `source_node_id` and `version_id` is a
+  realm object: staging fetches that exact version into the run's own workspace bucket, as an
+  ordinary local object and never as a reference, so an unreachable holder fails the run rather
+  than the submission. Any other input this device does not hold is a 400 naming it.
+- Outputs stay in the node-local workspace bucket until the owner publishes them, and the run is
+  listed by this device's own `GET /jobs/`.
+- Mounted inputs and `workspace.mode` `none` are refused, because a device stages files and exposes
+  no S3 endpoint a container could reach, and so is `workspace.mode` `existing`, because a local
+  run's outputs stay in its own workspace bucket.
+- A paused compute plane, a device without a compute backend, and a device that already holds as
+  many unfinished jobs as `ARUNA_COMPUTE_MAX_CONCURRENT` all answer 409; the ceiling is counted in
+  the admitting transaction, so two submissions cannot both pass it.
 
 **Limits** (all refused with 400)
 - An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
@@ -934,10 +996,10 @@ on that bucket and that it belongs to the same group.
                 "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
             })
         ),
-        (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, or a workspace request that names no usable bucket", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is bound to a different plan, the group's compute quota refuses the admission, the composition conflicts on a staged key, or the active RO-Crate job limit is reached", body = ErrorResponse),
+        (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, a workspace request that names no usable bucket, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is bound to a different plan, the group's compute quota refuses the admission, the composition conflicts on a staged key, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, or the caller lacks WRITE on the group or on the named existing workspace bucket", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group or on the named existing workspace bucket, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
         (status = 503, description = "No family holder could admit the request, an unreadable or unsettled demand view, three lost admission transactions, or an unhealthy id clock; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -948,7 +1010,11 @@ pub async fn submit_job(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SubmitExecutionRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let target = request.target.unwrap_or_default();
+    let auth = match target {
+        ExecutionTarget::Realm => require_unrestricted_realm_auth(&state, auth)?,
+        ExecutionTarget::Local => local_auth(&state, auth).await?,
+    };
     let group_id = Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
     let (workspace_mode, workspace_bucket) = workspace_request(request.workspace)?;
     if request.image.trim().is_empty() {
@@ -980,7 +1046,7 @@ pub async fn submit_job(
     // Destination-key overlaps are the composition's collision policy to resolve.
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
-        let input = native_input(input)?;
+        let input = native_input(input, target)?;
         if inputs
             .iter()
             .any(|existing| existing.container_path == input.container_path)
@@ -1024,39 +1090,128 @@ pub async fn submit_job(
         output_prefixes,
         collision_policy: collision_policy(request.collision_policy),
     };
-    let result = submit_external_job(
-        &state.get_ctx(),
-        spec,
-        auth.user_id,
-        request.idempotency_key,
-        workspace_mode,
-        workspace_bucket,
-        state.rocrate_limits().artifact_retention_ms,
-        forwarded_job_auth(bearer)?,
-    )
-    .await
-    .map_err(map_submit_error)?;
+    let accepted = match target {
+        ExecutionTarget::Local => {
+            local_submit(&state, &auth, spec, request.idempotency_key, workspace_mode).await?
+        }
+        ExecutionTarget::Realm => {
+            let result = submit_external_job(
+                &state.get_ctx(),
+                spec,
+                auth.user_id,
+                request.idempotency_key,
+                workspace_mode,
+                workspace_bucket,
+                state.rocrate_limits().artifact_retention_ms,
+                forwarded_job_auth(bearer)?,
+            )
+            .await
+            .map_err(map_submit_error)?;
+            AcceptedJob {
+                job_id: result.job_id,
+                created: result.created,
+                submission_id: Some(hex32(&result.submission_id.0)),
+                state: result.state.name().to_string(),
+            }
+        }
+    };
 
-    let status = if result.created {
+    let status = if accepted.created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
-    let urls = job_urls(&state, result.job_id).await?;
+    let urls = job_urls(&state, accepted.job_id).await?;
     // The accepting holder's canonical binding is the alias it answered with;
     // a later merge may move it, which the status surface then reports.
     Ok((
         status,
         Json(SubmitJobResponse {
-            job_id: result.job_id.to_string(),
-            created: result.created,
-            submission_id: hex32(&result.submission_id.0),
-            canonical_job_id: result.job_id.to_string(),
-            state: result.state.name().to_string(),
+            job_id: accepted.job_id.to_string(),
+            created: accepted.created,
+            submission_id: accepted.submission_id,
+            canonical_job_id: accepted.job_id.to_string(),
+            state: accepted.state,
             origin_node_url: urls.owner_node_url,
             status_url: urls.status_url,
         }),
     ))
+}
+
+/// What both submission paths answer with. A local run has no submission
+/// family, so it names none.
+struct AcceptedJob {
+    job_id: JobId,
+    created: bool,
+    submission_id: Option<String>,
+    state: String,
+}
+
+/// The owner of this device, for a run that must stay on this machine. A node
+/// that serves no device plane refuses the target itself, not the caller.
+async fn local_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
+    if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
+        return Err(ServerError::BadRequestMessage(
+            "target `local` is served by a user device only".to_string(),
+        ));
+    }
+    require_owner(state, auth).await
+}
+
+async fn local_submit(
+    state: &ServerState,
+    auth: &AuthContext,
+    spec: ExecutionSpec,
+    idempotency_key: Option<String>,
+    workspace_mode: WorkspaceMode,
+) -> ServerResult<AcceptedJob> {
+    let context = state.get_ctx();
+    let result = submit_local_execution(
+        &context,
+        LocalExecutionConfig {
+            spec,
+            owner: auth.user_id,
+            node_id: state.get_node_id(),
+            idempotency_key,
+            workspace_mode,
+            retention_ms: state.rocrate_limits().artifact_retention_ms,
+        },
+    )
+    .await
+    .map_err(map_local_error)?;
+    // A replay answers with the state the device already reduced for that job.
+    let state = read_owned_job(&context, auth.user_id, result.job_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(JobState::Queued, |record| record.state);
+    Ok(AcceptedJob {
+        job_id: result.job_id,
+        created: result.created,
+        submission_id: None,
+        state: state.name().to_string(),
+    })
+}
+
+pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
+    match error {
+        LocalExecutionError::NotADevice => ServerError::BadRequestMessage(
+            "target `local` is served by a user device only".to_string(),
+        ),
+        LocalExecutionError::NotOwner => ServerError::Forbidden,
+        LocalExecutionError::Paused | LocalExecutionError::NoExecutor => {
+            ServerError::Conflict(error.to_string())
+        }
+        LocalExecutionError::Unsupported(_)
+        | LocalExecutionError::InputNotLocal { .. }
+        | LocalExecutionError::InputRefused { .. } => {
+            ServerError::BadRequestMessage(error.to_string())
+        }
+        LocalExecutionError::Unavailable(_) => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
+        LocalExecutionError::Submit(error) => map_submit_error(error),
+    }
 }
 
 #[utoipa::path(
@@ -2752,6 +2907,140 @@ mod tests {
         assert!(matches!(cancel, Err(ServerError::Forbidden)));
     }
 
+    fn local_request() -> SubmitExecutionRequest {
+        SubmitExecutionRequest {
+            group_id: Ulid::from_bytes([5u8; 16]).to_string(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            env: BTreeMap::new(),
+            cpu_cores: None,
+            ram_bytes: None,
+            max_walltime_ms: None,
+            executor_constraint: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+            idempotency_key: None,
+            workspace: None,
+            target: Some(ExecutionTarget::Local),
+        }
+    }
+
+    async fn management_state() -> (TempDir, Arc<ServerState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let capabilities =
+            NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();
+        let state = ServerState::new(
+            ctx,
+            realm(),
+            node_id(),
+            capabilities,
+            false,
+            None,
+            JobsRuntime::new(),
+        )
+        .await;
+        (dir, Arc::new(state))
+    }
+
+    async fn enroll_device(state: &ServerState, owner: UserId) {
+        use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
+        let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id(), RealmNodeKind::User { owner });
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: UserId::nil(realm()),
+            realm_id: realm(),
+        };
+        let bytes = config.to_bytes(&actor).expect("config serializes");
+        let event = state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm().as_bytes().to_vec().into(),
+                value: bytes.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            aruna_core::events::Event::Storage(
+                aruna_core::events::StorageEvent::WriteResult { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_needs_device() {
+        // The realm never runs a job locally on behalf of a target it has not
+        // enrolled as somebody's machine.
+        let (_dir, state) = management_state().await;
+
+        let result = submit_job(
+            State(state),
+            Extension(auth_for(user(2))),
+            Extension(None),
+            Json(local_request()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn local_refuses_stranger() {
+        let (_dir, state) = build_state().await;
+        enroll_device(&state, user(2)).await;
+
+        let result = submit_job(
+            State(state),
+            Extension(auth_for(user(3))),
+            Extension(None),
+            Json(local_request()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[test]
+    fn local_names_holder() {
+        // Only a local run may name the holder: the planner seals it otherwise.
+        let input = ExecutionInputRequest {
+            bucket: "src".to_string(),
+            key: "data.csv".to_string(),
+            version_id: Some(Ulid::from_bytes([4u8; 16]).to_string()),
+            source_node_id: Some(node_id().to_string()),
+            dest_key: "data.csv".to_string(),
+            container_path: None,
+            mode: InputModeRequest::Snapshot,
+        };
+
+        assert!(matches!(
+            native_input(input.clone(), ExecutionTarget::Realm),
+            Err(ServerError::BadRequestMessage(_))
+        ));
+        assert_eq!(
+            native_input(input, ExecutionTarget::Local)
+                .unwrap()
+                .source_node_id,
+            Some(node_id())
+        );
+    }
+
     #[tokio::test]
     async fn rejects_huge_ram() {
         // ram_bytes above i64::MAX would wrap negative in the Docker backend.
@@ -2773,6 +3062,7 @@ mod tests {
                 collision_policy: Default::default(),
                 idempotency_key: None,
                 workspace: None,
+                target: None,
             };
             let result = submit_job(
                 State(state.clone()),
@@ -2795,11 +3085,12 @@ mod tests {
             bucket: "src".to_string(),
             key: "data.csv".to_string(),
             version_id: None,
+            source_node_id: None,
             dest_key: "in/data.csv".to_string(),
             container_path: None,
             mode: InputModeRequest::Snapshot,
         };
-        let mapped = native_input(input.clone()).unwrap();
+        let mapped = native_input(input.clone(), ExecutionTarget::Realm).unwrap();
         assert_eq!(
             mapped.container_path.as_deref(),
             Some("/inputs/in/data.csv")
@@ -2810,7 +3101,10 @@ mod tests {
             ..input.clone()
         };
         assert_eq!(
-            native_input(explicit).unwrap().container_path.as_deref(),
+            native_input(explicit, ExecutionTarget::Realm)
+                .unwrap()
+                .container_path
+                .as_deref(),
             Some("/data/input.csv")
         );
 
@@ -2818,7 +3112,7 @@ mod tests {
             container_path: Some("/in/../etc".to_string()),
             ..input
         };
-        assert!(native_input(traversal).is_err());
+        assert!(native_input(traversal, ExecutionTarget::Realm).is_err());
     }
 
     #[test]

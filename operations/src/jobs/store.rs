@@ -9,8 +9,8 @@ use aruna_core::keyspaces::{
     ROCRATE_JOB_STATE_KEYSPACE, S3_PURGE_CHECKPOINT_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
-    AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobErrorKind,
-    JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope,
+    ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
+    JobErrorKind, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope,
     JobRecordError, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
     StoragePurgeCheckpoint, UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
     crate_job_id, encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key,
@@ -139,10 +139,14 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
             empty_value(),
         ));
     }
-    if record.payload.is_rocrate() && !record.state.is_terminal() {
+    // The row is what a submission counts in its own transaction; a node that
+    // configures no ceiling still pays one key per job for it.
+    if let Some(kind) = ActiveJobKind::of(&record.payload)
+        && !record.state.is_terminal()
+    {
         writes.push((
             JOB_ACTIVE_USER_KEYSPACE.to_string(),
-            job_active_key(record.created_by, record.job_id),
+            job_active_key(record.created_by, kind, record.job_id),
             empty_value(),
         ));
     }
@@ -188,10 +192,10 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             rocrate_plan_key(record.job_id),
         ),
     ];
-    if record.payload.is_rocrate() {
+    if let Some(kind) = ActiveJobKind::of(&record.payload) {
         deletes.push((
             JOB_ACTIVE_USER_KEYSPACE.to_string(),
-            job_active_key(record.created_by, record.job_id),
+            job_active_key(record.created_by, kind, record.job_id),
         ));
     }
     if record.payload.dedup_until_prune()
@@ -240,10 +244,13 @@ pub(super) fn index_deltas(
         new_schedule,
         empty_value(),
     ));
-    if old.payload.is_rocrate() && !old.is_settled() && new.is_settled() {
+    if let Some(kind) = ActiveJobKind::of(&old.payload)
+        && !old.is_settled()
+        && new.is_settled()
+    {
         deletes.push((
             JOB_ACTIVE_USER_KEYSPACE.to_string(),
-            job_active_key(new.created_by, new.job_id),
+            job_active_key(new.created_by, kind, new.job_id),
         ));
     }
 
