@@ -498,12 +498,16 @@ async fn claim_bucket(
 mod tests {
     use super::*;
     use crate::jobs::records::tests::fixture::payload;
+    use aruna_core::compute::{AttemptStatus, BackendError, FenceContext};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::events::LaunchDecline;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::{Actor, InputSelection, RealmId, RealmNodeKind};
+    use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
+    use aruna_core::structs::{Actor, InputSelection, NodeUrls, RealmId, RealmNodeKind};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
 
     const REALM: RealmId = RealmId([3u8; 32]);
 
@@ -649,6 +653,177 @@ mod tests {
 
         spec.inputs[0].mode = InputMode::Snapshot;
         assert!(local_staging(&spec, WorkspaceMode::Kept).is_ok());
+    }
+
+    struct StubBackend;
+
+    #[async_trait::async_trait]
+    impl aruna_compute::ExecutorBackend for StubBackend {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Docker
+        }
+        fn capabilities(&self) -> aruna_compute::executor::BackendCaps {
+            aruna_compute::executor::BackendCaps {
+                file_staging: true,
+                local_site: true,
+                limits: ResourceEnvelope {
+                    max_concurrent: Some(1),
+                    ..ResourceEnvelope::default()
+                },
+                ..Default::default()
+            }
+        }
+        fn run_identity(&self) -> aruna_core::compute::UserSpec {
+            aruna_core::compute::NOBODY
+        }
+        async fn health(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn resolve_image(
+            &self,
+            image: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<String, BackendError> {
+            Ok(image.to_string())
+        }
+        async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            unimplemented!()
+        }
+        async fn submit(
+            &self,
+            _context: &FenceContext,
+            _spec: &aruna_core::compute::TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
+            unimplemented!()
+        }
+        async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
+            unimplemented!()
+        }
+        async fn cancel(
+            &self,
+            _context: &FenceContext,
+        ) -> Result<aruna_core::compute::CancelEvidence, BackendError> {
+            unimplemented!()
+        }
+        async fn fetch_logs(
+            &self,
+            _context: &FenceContext,
+            _limits: &aruna_core::compute::LogLimits,
+            _sink: &dyn aruna_compute::executor::logs::LogSink,
+        ) -> Result<aruna_core::compute::LogTails, BackendError> {
+            unimplemented!()
+        }
+        async fn fetch_output(
+            &self,
+            _context: &FenceContext,
+            _path: &str,
+        ) -> Result<aruna_core::compute::TaskOutput, BackendError> {
+            unimplemented!()
+        }
+        async fn reconcile(
+            &self,
+            _context: &FenceContext,
+        ) -> aruna_core::compute::ReconcileEvidence {
+            unimplemented!()
+        }
+        async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            unimplemented!()
+        }
+    }
+
+    fn device_ctx(root: &str) -> DriverContext {
+        DriverContext {
+            compute_handle: Some(std::sync::Arc::new(
+                aruna_compute::ExecutorRegistry::new()
+                    .with_backend(std::sync::Arc::new(StubBackend)),
+            )),
+            ..test_ctx(root)
+        }
+    }
+
+    async fn rows(ctx: &DriverContext, key_space: &str) -> usize {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: None,
+                start: None,
+                limit: 16,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values.len(),
+            other => panic!("unexpected iter result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_a_local_run_local() {
+        // The device owns the job and tells nobody: no outbox row, no family
+        // record, and a second run is refused by the owner's own ceiling.
+        let dir = tempdir().unwrap();
+        let ctx = device_ctx(dir.path().to_str().unwrap());
+        let local = node(1);
+        let caller = owner(2);
+        let config = realm_config(local, RealmNodeKind::User { owner: caller });
+        write_config(&ctx, &config, local).await;
+
+        let accepted = submit_local_execution(&ctx, run_config(local, caller))
+            .await
+            .expect("the owner's run is accepted");
+
+        assert!(accepted.created);
+        let (records, _) = list_owned_jobs(&ctx, caller, None, 8, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner_node_id, local);
+        assert_eq!(records[0].created_by, caller);
+        assert_eq!(rows(&ctx, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await, 0);
+        assert_eq!(rows(&ctx, JOB_FAMILY_RECORD_KEYSPACE).await, 0);
+
+        let error = submit_local_execution(&ctx, run_config(local, caller))
+            .await
+            .expect_err("the second run exceeds the device ceiling");
+        assert!(matches!(
+            error,
+            LocalExecutionError::AtCapacity { limit } if limit == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_device_launch() {
+        // The realm's own launch path declines a device whatever it advertises,
+        // so local compute never becomes a dispatch target.
+        use crate::jobs::records::tests::fixture::Family;
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let local = node(1);
+        let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
+        write_config(&ctx, &config, local).await;
+        crate::node_info::seed_node_info_document(
+            &ctx,
+            local,
+            REALM,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let family = Family::new([8u8; 32]);
+        let spec = family.spec();
+        let intent = family.launch(&spec, local, 0);
+        let declined =
+            crate::jobs::lifecycle::target::local_capability(&ctx, &config, local, &intent, &spec)
+                .await
+                .expect_err("a device is never a launch target");
+
+        assert!(matches!(declined, LaunchDecline::Unauthorized));
     }
 
     #[tokio::test]
