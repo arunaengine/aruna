@@ -515,6 +515,8 @@ pub fn read_settings() -> Result<Settings, SetupError> {
     // A device profile runs without an S3 listener: unset or empty disables it,
     // so a supervisor can force it off over a .env that defines one. Both name
     // the same endpoint, so half a pair is a misconfiguration, not a profile.
+    // Which profile this is only becomes knowable once the persisted node
+    // identity is read, so the pair is validated again there.
     let (s3_host, s3_address) = match (
         optional_nonempty_env("S3_HOST")?,
         optional_nonempty_env("S3_ADDRESS")?,
@@ -684,6 +686,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     if realm_id != node_state.realm_id {
         return Err(SetupError::PersistedNodeStateMismatch);
     }
+    validate_s3_profile(s3_address.as_deref(), &node_capabilities)?;
 
     let mut node_state = node_state;
     if matches!(node_state.status, PersistedNodeStatus::PendingOnboarding) {
@@ -1208,6 +1211,19 @@ pub async fn mark_onboarding_phase(
     let mut updated_state = node_state.clone();
     updated_state.onboarding_phase = Some(phase);
     persist_node_state(storage, &updated_state).await
+}
+
+/// Only a device may run without an S3 listener. An infrastructure node whose
+/// `S3_HOST`/`S3_ADDRESS` pair is accidentally absent must fail its start
+/// instead of coming up silently serving no S3 endpoint at all.
+fn validate_s3_profile(
+    s3_address: Option<&str>,
+    capabilities: &NodeCapabilities,
+) -> Result<(), SetupError> {
+    if s3_address.is_some() || matches!(capabilities, NodeCapabilities::User { .. }) {
+        return Ok(());
+    }
+    Err(SetupError::MissingConfigValue("S3_ADDRESS"))
 }
 
 fn node_capabilities_from_state(

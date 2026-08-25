@@ -26,8 +26,8 @@ use crate::metadata::forward::peer_acts_for;
 use crate::metadata::handle::MetadataWritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::process_placements::load_realm_config;
-use crate::replication::bao_read::{BaoReadOutput, managed_read};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
+use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
@@ -309,7 +309,7 @@ async fn commit_pull(
         Ok(BaoReadOutput::Metadata { .. }) => return Err(SyncRefusal::Unavailable),
         Err(error) => {
             debug!(error = %error, "Could not read a device version for a sync pull");
-            return Err(SyncRefusal::Unavailable);
+            return Err(read_refusal(&error));
         }
     };
     let routing = routing_snapshot(context, bucket.group_id, &request.target_bucket)
@@ -354,6 +354,18 @@ async fn commit_pull(
         version_id: result.version_id,
         already_applied: false,
     })
+}
+
+/// Why a device read failed. Bytes that do not answer for the hash the upload
+/// named are the request's own fault: retrying re-reads the same mismatch, so
+/// the row is parked for the owner instead. Everything else is infrastructure.
+fn read_refusal(error: &BaoReadError) -> SyncRefusal {
+    match error {
+        BaoReadError::Refused(BaoReadRefusal::HashMismatch) => SyncRefusal::Invalid(
+            "the device version no longer carries the bytes this pull named".to_string(),
+        ),
+        _ => SyncRefusal::Unavailable,
+    }
 }
 
 /// The version this device's exact source already produced here, if any.
@@ -834,6 +846,27 @@ mod tests {
         assert!(!head.deleted);
         assert!(head_of(&version("notes/a/b.txt", false), "notes").is_none());
         assert!(head_of(&version("other/b.txt", true), "notes").is_none());
+    }
+
+    #[test]
+    fn parks_hash_mismatch() {
+        // The device's file no longer answers for the bytes the upload named, so
+        // re-reading it can only fail again: the row parks for the owner rather
+        // than retrying forever, while transport faults stay retryable.
+        assert_eq!(
+            read_refusal(&BaoReadError::Refused(BaoReadRefusal::HashMismatch)),
+            SyncRefusal::Invalid(
+                "the device version no longer carries the bytes this pull named".to_string()
+            )
+        );
+        assert_eq!(
+            read_refusal(&BaoReadError::Refused(BaoReadRefusal::BackendFailure)),
+            SyncRefusal::Unavailable
+        );
+        assert_eq!(
+            read_refusal(&BaoReadError::NotFinished),
+            SyncRefusal::Unavailable
+        );
     }
 
     #[test]
