@@ -12,6 +12,10 @@ An explicitly selected executor must pass its startup health checks. Set
 `ARUNA_COMPUTE_OPTIONAL=1` only when the node may start without compute after a
 health failure. Invalid configuration is still rejected.
 
+Set `ARUNA_COMPUTE_LOCAL_ONLY=1` on a user device: the executor then runs only
+the owner's local jobs and is never advertised to the realm. See
+[Local runs on a user device](#local-runs-on-a-user-device).
+
 Task images are resolved before the attempt intent is committed and the
 digest-pinned reference is retained for exact-bits recovery. Kubernetes also
 accepts tagged task images without a registry lookup and always pulls them;
@@ -71,9 +75,43 @@ cross `/`. Each match is uploaded below the declared destination with the
 required `path_prefix` stripped, and a pattern that matches nothing captures
 nothing. A declared path without wildcards must still exist when the task ends.
 
+## Local runs on a user device
+
+A user device runs compute for the owner of that device alone, and only when the
+owner asks for it: `POST /jobs/` with `target: "local"`, or a TES task tagged
+`aruna-engine.org/target=local`. The realm never dispatches to a device, because
+a device advertises no executor at all, whatever compute the owner enabled on the
+machine.
+
+The desktop app writes these keys for the node it supervises:
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `ARUNA_COMPUTE_EXECUTOR` | `docker` or `apptainer`, resolved from the app's backend probe | `none` |
+| `ARUNA_COMPUTE_LOCAL_ONLY` | `1` selects the local-only profile | unset: shared deployment |
+| `ARUNA_COMPUTE_OPTIONAL` | `1` keeps the node up when the daemon does not answer | unset: a health failure fails startup |
+| `ARUNA_COMPUTE_MAX_CPU_CORES`, `ARUNA_COMPUTE_MAX_RAM_BYTES`, `ARUNA_COMPUTE_MAX_DISK_BYTES`, `ARUNA_COMPUTE_MAX_CONCURRENT` | the owner's caps, from This device | unset: unmeasured, see [Execution envelope](#execution-envelope) |
+| `ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT` | delegated cgroup v2 root of the user slice | none; required by Apptainer |
+
+In the local-only profile the Docker builder registers no workspace endpoint and
+skips the container-reachable `S3_PUBLIC_URL` and non-loopback `S3_ADDRESS`
+requirements: a device stages files and exposes no S3 listener a container could
+reach. Apptainer is unchanged and still needs its delegated cgroup root.
+
+A local run stages its inputs as files into the node-local workspace bucket
+`ws-<jobid>` and leaves its outputs there, where the owner can publish them. It
+refuses mounted inputs, `workspace.mode` `none` and Direct-S3 staging, all of
+which need an S3 endpoint the device does not expose. A realm input is copied
+onto the device before the run, as an ordinary local object and never as a
+reference. A run is refused while this node's compute plane is drained.
+
+Local runs are listed by the ordinary `GET /jobs/` of the device's own API, and
+`GET /device/compute` reports the plane the owner configured. Nothing about a
+local run is forwarded, replicated or offered to the realm.
+
 ## Docker
 
-Required configuration:
+Required configuration, unless `ARUNA_COMPUTE_LOCAL_ONLY=1`:
 
 - `ARUNA_COMPUTE_S3_URL` or `S3_PUBLIC_URL`: the S3 endpoint a container is
   handed. `ARUNA_COMPUTE_S3_URL` wins when both are set and exists because
