@@ -135,6 +135,22 @@ pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
 /// realm state only when the drain forwards it as an ordinary create.
 pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 
+/// Device-local bindings of a directory to a realm bucket prefix, keyed by
+/// folder id. Never replicated: the root path must not leave the machine.
+pub const SYNCED_FOLDER_KEYSPACE: &str = "synced_folders";
+
+/// The merge base of every synced path, keyed by `folder id || relative path`.
+/// It is the only evidence a file is still the one the last sync wrote.
+pub const SYNC_BASE_KEYSPACE: &str = "sync_bases";
+
+/// Local versions waiting to be pulled by their realm node, keyed by ULID so a
+/// forward scan drains in observation order.
+pub const SYNC_UPLOAD_OUTBOX_KEYSPACE: &str = "sync_upload_outbox";
+
+/// Append-only record of the explicit owner actions that replaced or removed
+/// local bytes, keyed by `folder id || action id`.
+pub const SYNC_ACTION_LOG_KEYSPACE: &str = "sync_action_log";
+
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 

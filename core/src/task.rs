@@ -33,6 +33,8 @@ pub enum TaskKey {
     DrainJobFamilyOutbox,
     DrainJobWitnessQueue,
     DrainDeviceIntake,
+    ReconcileSyncedFolders,
+    DrainSyncUploadOutbox,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

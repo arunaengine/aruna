@@ -36,6 +36,7 @@ mod storage_purge;
 mod structs;
 mod sync_quarantine;
 mod sync_relationship;
+mod synced_folder;
 mod usage;
 
 pub use backends::*;
@@ -74,4 +75,5 @@ pub use storage_purge::*;
 pub use structs::*;
 pub use sync_quarantine::*;
 pub use sync_relationship::*;
+pub use synced_folder::*;
 pub use usage::*;
