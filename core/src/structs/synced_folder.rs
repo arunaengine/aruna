@@ -422,12 +422,13 @@ fn decide_two_way(
             false => SyncAction::Upload { deleted: false },
         },
         // No base: the bytes may be the same file or two unrelated ones, so
-        // nothing local is replaced and both sides are preserved.
+        // nothing local is replaced, nothing local is published, and both sides
+        // stay until the owner decides which one the realm head should be.
         (Some(local), None, Some(remote)) => match same_bytes(local, remote) {
             true => SyncAction::AdoptBase,
             false => SyncAction::ConflictCopy {
                 remote_version: remote.version_id,
-                upload: true,
+                upload: false,
             },
         },
         (Some(local), Some(synced), Some(remote)) => {
@@ -764,7 +765,7 @@ mod tests {
             decide(two_way(), Some(&local), Some(&unacked), Some(&remote)),
             SyncAction::ConflictCopy {
                 remote_version: remote.version_id,
-                upload: true,
+                upload: false,
             }
         );
         assert_eq!(

@@ -248,6 +248,11 @@ async fn fetch_heads(context: &Arc<DriverContext>, folder: &SyncedFolder) -> Opt
     }
 }
 
+/// Wakes the upload drain after an explicit owner action queued a row.
+pub(crate) async fn arm_upload_timer(context: &Arc<DriverContext>) {
+    arm_timer(context, TaskKey::DrainSyncUploadOutbox).await;
+}
+
 async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;

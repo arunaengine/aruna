@@ -27,7 +27,10 @@ use super::folders::{FolderError, list_entries, read_bound};
 use super::materialize::{
     MaterializeEntryOperation, MaterializeInput, MaterializeOutcome, fetch_remote,
 };
-use super::repository::{action_entry, base_entry, base_key, read_value, write_rows};
+use super::repository::{
+    SyncUpload, UploadState, action_entry, base_entry, base_key, read_value, upload_entry,
+    write_rows,
+};
 
 /// The identity of the bytes the owner acted on. A replace applies to exactly
 /// these bytes or to nothing.
@@ -192,9 +195,9 @@ fn pending_version(entry: &EntryState) -> Option<Ulid> {
     }
 }
 
-/// Keeps the local bytes: the entry stops being reported and the next pass
-/// queues the upload from the real observation, so what is published is what
-/// is on disk rather than what a base row remembered.
+/// Keeps the local bytes and publishes them: the automatic sync never makes an
+/// unknown-base copy the realm head, so this action is what turns the file on
+/// disk into the next realm version.
 async fn keep_local(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
@@ -207,14 +210,40 @@ async fn keep_local(
         pending_at: None,
         ..base.clone()
     };
-    let rows = vec![
+    let mut rows = vec![
         base_entry(folder.folder_id, relative, &cleared).map_err(|_| ActionError::Unavailable)?,
         action_entry(&record).map_err(|_| ActionError::Unavailable)?,
     ];
-    match write_rows(context, rows, None).await {
-        true => Ok(record),
-        false => Err(ActionError::Unavailable),
+    if let Some(upload) = queued_upload(folder.folder_id, relative, base) {
+        rows.push(upload_entry(&upload).map_err(|_| ActionError::Unavailable)?);
     }
+    if !write_rows(context, rows, None).await {
+        return Err(ActionError::Unavailable);
+    }
+    super::arm_upload_timer(context).await;
+    Ok(record)
+}
+
+/// The outbox row that publishes the bytes the last observation saw. An entry
+/// whose local side was never observed has nothing to publish yet.
+fn queued_upload(folder_id: Ulid, relative: &str, base: &SyncBase) -> Option<SyncUpload> {
+    let local = base.local.as_ref()?;
+    let now = unix_timestamp_millis();
+    Some(SyncUpload {
+        folder_id,
+        relative: relative.to_string(),
+        deleted: false,
+        fingerprint: local.fingerprint.clone()?,
+        blake3: local.blake3,
+        size: local.size,
+        local_version: local.version_id.or(base.local_version_id),
+        queued_at_ms: now,
+        state: UploadState::Pending {
+            due_at_ms: now,
+            attempts: 0,
+            last_error: None,
+        },
+    })
 }
 
 /// Accepts the current state: the entry stops being reported and the automatic
@@ -505,4 +534,43 @@ fn remove_failed(operation: &mut RemoveEntryOperation, error: ActionError) -> Ef
     operation.state = RemoveState::Error;
     operation.output = Some(Err(error));
     cleanup
+}
+
+#[cfg(test)]
+mod tests {
+    use super::queued_upload;
+    use aruna_core::structs::{EntrySide, EntryState, SyncBase};
+    use ulid::Ulid;
+
+    fn base(local: Option<EntrySide>) -> SyncBase {
+        SyncBase {
+            synced: None,
+            local_version_id: Some(Ulid::from_bytes([2u8; 16])),
+            synced_at_ms: 1,
+            entry: EntryState::LocalChanged,
+            pending_at: None,
+            local,
+            remote: None,
+        }
+    }
+
+    #[test]
+    fn publishes_observed_bytes() {
+        // Keeping the local copy is what publishes an unknown-base conflict, so
+        // it must queue exactly the bytes the owner was shown.
+        let local = EntrySide {
+            size: 4,
+            modified_at_ms: None,
+            fingerprint: Some("4-1".to_string()),
+            blake3: Some([7u8; 32]),
+            version_id: Some(Ulid::from_bytes([3u8; 16])),
+        };
+        let folder_id = Ulid::from_bytes([1u8; 16]);
+        let upload = queued_upload(folder_id, "note.txt", &base(Some(local))).expect("a row");
+        assert_eq!(upload.fingerprint, "4-1");
+        assert_eq!(upload.blake3, Some([7u8; 32]));
+        assert_eq!(upload.local_version, Some(Ulid::from_bytes([3u8; 16])));
+        assert!(!upload.deleted);
+        assert!(queued_upload(folder_id, "note.txt", &base(None)).is_none());
+    }
 }
