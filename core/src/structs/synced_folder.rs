@@ -137,10 +137,12 @@ pub enum EntryState {
         conflicted_copy: String,
     },
     /// The remote version may replace the local file only through an explicit
-    /// owner action.
+    /// owner action. The incoming bytes still landed beside the file when the
+    /// sync could add them.
     PendingReplace {
         reason: ReplaceReason,
         remote_version: Ulid,
+        conflicted_copy: Option<String>,
     },
     /// The realm deleted the object. The file is kept and reported.
     RemoteDeleted {
@@ -180,17 +182,43 @@ impl EntryState {
     }
 }
 
-/// What the last successful sync recorded about one path. It is the merge base
-/// every LB1 decision is taken against.
+/// Bytes a realm version was actually acknowledged for. This is the only
+/// evidence that may authorise replacing a file: an entry the realm never
+/// confirmed has none, and nothing about it is ever guessed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SyncBase {
+pub struct SyncedBytes {
     pub fingerprint: String,
     pub blake3: [u8; 32],
     pub size: u64,
+    pub remote_version_id: Ulid,
+}
+
+impl SyncedBytes {
+    /// Whether the file on disk still carries exactly these bytes. Both the
+    /// weak fingerprint and the strong hash must match: this is the only
+    /// condition under which the sync may overwrite a file.
+    pub fn matches(&self, local: &Observed) -> bool {
+        self.fingerprint == local.fingerprint && local.blake3 == Some(self.blake3)
+    }
+
+    /// The guard a guarded replace of this entry must carry.
+    pub fn guard(&self) -> WriteGuard {
+        WriteGuard::MatchesBase {
+            fingerprint: self.fingerprint.clone(),
+            blake3: self.blake3,
+        }
+    }
+}
+
+/// What the sync recorded about one path. It is the merge base every LB1
+/// decision is taken against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncBase {
+    /// Present only once a realm version acknowledged these exact bytes. An
+    /// entry without it has no base and is never replaced automatically.
+    pub synced: Option<SyncedBytes>,
     /// Device-local observation version the base was taken from.
     pub local_version_id: Option<Ulid>,
-    /// Realm version the base was taken from.
-    pub remote_version_id: Option<Ulid>,
     pub synced_at_ms: u64,
     pub entry: EntryState,
     /// What both sides looked like when the entry became pending, so a later
@@ -229,21 +257,6 @@ impl SyncBase {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
-    }
-
-    /// Whether the file on disk still carries exactly the bytes the base
-    /// recorded. Both the weak fingerprint and the strong hash must match: this
-    /// is the only condition under which the sync may overwrite a file.
-    pub fn matches(&self, local: &Observed) -> bool {
-        self.fingerprint == local.fingerprint && local.blake3 == Some(self.blake3)
-    }
-
-    /// The guard a guarded replace of this entry must carry.
-    pub fn guard(&self) -> WriteGuard {
-        WriteGuard::MatchesBase {
-            fingerprint: self.fingerprint.clone(),
-            blake3: self.blake3,
-        }
     }
 }
 
@@ -363,8 +376,9 @@ fn decide_upload(
     local: Option<&Observed>,
     base: Option<&SyncBase>,
 ) -> SyncAction {
-    match (local, base) {
-        (Some(local), Some(base)) if base.matches(local) => SyncAction::Nothing,
+    let synced = base.and_then(|base| base.synced.as_ref());
+    match (local, synced) {
+        (Some(local), Some(synced)) if synced.matches(local) => SyncAction::Nothing,
         (Some(_), _) => SyncAction::Upload { deleted: false },
         (None, Some(_)) if policy.propagate_deletes => SyncAction::Upload { deleted: true },
         (None, Some(_)) => SyncAction::Report(EntryState::LocalDeleted),
@@ -378,45 +392,49 @@ fn decide_two_way(
     base: Option<&SyncBase>,
     remote: Option<&RemoteHead>,
 ) -> SyncAction {
-    match (local, base, remote) {
+    // A row the realm never acknowledged carries no base at all, so it decides
+    // exactly like a path this device has never synced.
+    let synced = base.and_then(|base| base.synced.as_ref());
+    match (local, synced, remote) {
         (None, None, None) => SyncAction::Nothing,
         (None, Some(_), None) => SyncAction::Forget,
         // Nothing on disk: adding the remote file loses nothing, and the guard
         // still refuses if something appeared in the meantime.
-        (None, base, Some(remote)) => match base {
-            Some(base) if base.remote_version_id == Some(remote.version_id) => decide_gone(policy),
-            _ => SyncAction::Materialize {
-                remote_version: remote.version_id,
-                guard: WriteGuard::MustNotExist,
-            },
+        (None, Some(synced), Some(remote)) if synced.remote_version_id == remote.version_id => {
+            decide_gone(policy)
+        }
+        (None, _, Some(remote)) => SyncAction::Materialize {
+            remote_version: remote.version_id,
+            guard: WriteGuard::MustNotExist,
         },
         (Some(_), None, None) => SyncAction::Upload { deleted: false },
-        (Some(_), Some(base), None) => match base.remote_version_id {
+        (Some(local), Some(synced), None) => match synced.matches(local) {
             // The realm removed it; the file is kept whatever the owner decides.
-            Some(remote_version) => {
-                SyncAction::Report(EntryState::RemoteDeleted { remote_version })
-            }
-            // The realm never held it, so the upload is simply unfinished.
-            None => SyncAction::Upload { deleted: false },
+            true => SyncAction::Report(EntryState::RemoteDeleted {
+                remote_version: synced.remote_version_id,
+            }),
+            // A local edit always wins locally and becomes a new realm version,
+            // even when the realm deleted the object in the meantime.
+            false => SyncAction::Upload { deleted: false },
         },
         // No base: the bytes may be the same file or two unrelated ones, so
-        // nothing is replaced and nothing is published without the owner.
+        // nothing local is replaced and both sides are preserved.
         (Some(local), None, Some(remote)) => match same_bytes(local, remote) {
             true => SyncAction::AdoptBase,
             false => SyncAction::ConflictCopy {
                 remote_version: remote.version_id,
-                upload: false,
+                upload: true,
             },
         },
-        (Some(local), Some(base), Some(remote)) => {
-            let local_changed = !base.matches(local);
-            let remote_changed = base.remote_version_id != Some(remote.version_id);
+        (Some(local), Some(synced), Some(remote)) => {
+            let local_changed = !synced.matches(local);
+            let remote_changed = synced.remote_version_id != remote.version_id;
             match (local_changed, remote_changed) {
                 (false, false) => SyncAction::Nothing,
                 (true, false) => SyncAction::Upload { deleted: false },
                 (false, true) => SyncAction::Materialize {
                     remote_version: remote.version_id,
-                    guard: base.guard(),
+                    guard: synced.guard(),
                 },
                 (true, true) => SyncAction::ConflictCopy {
                     remote_version: remote.version_id,
@@ -619,16 +637,27 @@ mod tests {
 
     fn base(fingerprint: &str, hash: u8, remote: Option<Ulid>) -> SyncBase {
         SyncBase {
-            fingerprint: fingerprint.to_string(),
-            blake3: [hash; 32],
-            size: 4,
+            synced: remote.map(|remote_version_id| SyncedBytes {
+                fingerprint: fingerprint.to_string(),
+                blake3: [hash; 32],
+                size: 4,
+                remote_version_id,
+            }),
             local_version_id: None,
-            remote_version_id: remote,
             synced_at_ms: 1,
             entry: EntryState::InSync,
             pending_at: None,
             local: None,
             remote: None,
+        }
+    }
+
+    fn synced(fingerprint: &str, hash: u8, remote: Ulid) -> SyncedBytes {
+        SyncedBytes {
+            fingerprint: fingerprint.to_string(),
+            blake3: [hash; 32],
+            size: 4,
+            remote_version_id: remote,
         }
     }
 
@@ -685,7 +714,7 @@ mod tests {
             decide(two_way(), Some(&local), Some(&base), Some(&remote)),
             SyncAction::Materialize {
                 remote_version: new,
-                guard: base.guard(),
+                guard: synced("4-1", 9, old).guard(),
             }
         );
     }
@@ -711,10 +740,62 @@ mod tests {
     fn refuses_stale_fingerprint() {
         // A same-size rewrite that keeps the hash unknown must not count as the
         // base: an unknown strong hash can never satisfy a match.
-        let base = base("4-1", 9, Some(Ulid::from_bytes([1u8; 16])));
-        assert!(!base.matches(&observed("4-1", None)));
-        assert!(!base.matches(&observed("4-1", Some(8))));
-        assert!(base.matches(&observed("4-1", Some(9))));
+        let synced = synced("4-1", 9, Ulid::from_bytes([1u8; 16]));
+        assert!(!synced.matches(&observed("4-1", None)));
+        assert!(!synced.matches(&observed("4-1", Some(8))));
+        assert!(synced.matches(&observed("4-1", Some(9))));
+    }
+
+    #[test]
+    fn ignores_unacked_base() {
+        // A row the realm never acknowledged is no base at all: it may not
+        // authorise a replace, and it decides like an unknown path.
+        let unacked = base("4-1", 9, None);
+        let local = observed("4-1", Some(9));
+        let remote = head(Ulid::from_bytes([2u8; 16]), Some(7), false);
+        assert_eq!(
+            decide(two_way(), Some(&local), Some(&unacked), Some(&remote)),
+            SyncAction::ConflictCopy {
+                remote_version: remote.version_id,
+                upload: true,
+            }
+        );
+        assert_eq!(
+            decide(two_way(), Some(&local), Some(&unacked), None),
+            SyncAction::Upload { deleted: false }
+        );
+    }
+
+    #[test]
+    fn publishes_edit_over_delete() {
+        // The realm deleted the object and the owner edited the file: the edit
+        // wins locally and becomes the next realm version.
+        let old = Ulid::from_bytes([1u8; 16]);
+        let base = base("4-1", 9, Some(old));
+        let changed = observed("4-9", Some(3));
+        let marker = head(Ulid::from_bytes([2u8; 16]), None, true);
+        assert_eq!(
+            decide(two_way(), Some(&changed), Some(&base), Some(&marker)),
+            SyncAction::Upload { deleted: false }
+        );
+    }
+
+    #[test]
+    fn holds_delete_marker() {
+        // A delete marker with `propagate_deletes` off must not republish the
+        // local deletion, and the entry stays reported.
+        let old = Ulid::from_bytes([1u8; 16]);
+        let base = base("4-1", 9, Some(old));
+        let marker = head(old, None, true);
+        let keep = SyncPolicy {
+            propagate_deletes: false,
+            ..two_way()
+        };
+        assert_eq!(
+            decide(keep, None, Some(&base), Some(&marker)),
+            SyncAction::Forget
+        );
+        assert_eq!(decide(keep, None, Some(&base), None), SyncAction::Forget);
     }
 
     #[test]
@@ -749,7 +830,6 @@ mod tests {
         let base = base("4-1", 9, Some(old));
         let remote = head(Ulid::from_bytes([2u8; 16]), None, true);
         let unchanged = observed("4-1", Some(9));
-        let changed = observed("4-9", Some(3));
         let expected = SyncAction::Report(EntryState::RemoteDeleted {
             remote_version: old,
         });
@@ -758,7 +838,7 @@ mod tests {
             expected
         );
         assert_eq!(
-            decide(two_way(), Some(&changed), Some(&base), None),
+            decide(two_way(), Some(&unchanged), Some(&base), None),
             expected
         );
     }

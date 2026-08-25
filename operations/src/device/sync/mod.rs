@@ -139,7 +139,7 @@ pub async fn reconcile_folder(
             }
         }
     }
-    apply_downloads(context, folder, std::mem::take(&mut plan.downloads), &local).await;
+    apply_downloads(context, folder, std::mem::take(&mut plan.downloads)).await;
     let _ = store_folder(
         context,
         &SyncedFolder {

@@ -270,12 +270,16 @@ pub fn entry_view(path: String, base: SyncBase) -> FolderEntryView {
         EntryState::Conflict {
             conflicted_copy, ..
         } => (None, Some(conflicted_copy.clone()), None),
-        EntryState::PendingReplace { reason, .. } => (
+        EntryState::PendingReplace {
+            reason,
+            conflicted_copy,
+            ..
+        } => (
             Some(match reason {
                 ReplaceReason::BaseUnknown => ReplaceReasonName::BaseUnknown,
                 ReplaceReason::LocalModified => ReplaceReasonName::LocalModified,
             }),
-            None,
+            conflicted_copy.clone(),
             None,
         ),
         EntryState::Error { reason } => (None, None, Some(reason.clone())),

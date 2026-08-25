@@ -13,8 +13,8 @@ use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedFolder,
-    WriteGuard, decide,
+    EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
+    SyncedFolder, WriteGuard, decide,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -34,6 +34,12 @@ pub struct Download {
     /// The bytes land beside the file instead of replacing it, and the local
     /// version is published as its own realm version.
     pub conflicted: bool,
+    /// The local side as this pass observed it, strong hash included, so the
+    /// written row keeps the bytes an explicit action has to echo back.
+    pub local: Option<EntrySide>,
+    /// The synced bytes the entry already had, carried so a refused write
+    /// cannot lose them.
+    pub synced: Option<SyncedBytes>,
 }
 
 /// What one reconciled page decided.
@@ -143,10 +149,11 @@ impl ReconcileFolderOperation {
             let mut local = self.input.local.get(relative).cloned();
             // A file whose weak fingerprint still equals the base carries the
             // base's strong hash; the adapter re-verifies both before it writes.
-            if let (Some(local), Some(base)) = (local.as_mut(), base.as_ref())
-                && local.fingerprint == base.fingerprint
+            if let (Some(local), Some(synced)) =
+                (local.as_mut(), base.as_ref().and_then(|base| base.synced.as_ref()))
+                && local.fingerprint == synced.fingerprint
             {
-                local.blake3 = Some(base.blake3);
+                local.blake3 = Some(synced.blake3);
             }
             if base
                 .as_ref()
@@ -184,6 +191,11 @@ impl ReconcileFolderOperation {
         let folder_id = self.input.folder.folder_id;
         match action {
             SyncAction::Nothing => {
+                // Neither side holds the entry, so there is nothing to record:
+                // a delete marker must not churn a row into existence.
+                if local.is_none() && base.is_none() {
+                    return Ok(());
+                }
                 let current = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
                 let next = SyncBase {
                     local: local.map(EntrySide::from_local),
@@ -224,10 +236,12 @@ impl ReconcileFolderOperation {
                 };
                 self.push_download(
                     relative,
-                    remote_version,
-                    guard,
-                    false,
-                    entry,
+                    Planned {
+                        remote_version,
+                        guard,
+                        conflicted: false,
+                        entry,
+                    },
                     base,
                     local,
                     remote,
@@ -239,10 +253,12 @@ impl ReconcileFolderOperation {
             } => {
                 self.push_download(
                     relative,
-                    remote_version,
-                    WriteGuard::MustNotExist,
-                    true,
-                    EntryState::RemoteChanged,
+                    Planned {
+                        remote_version,
+                        guard: WriteGuard::MustNotExist,
+                        conflicted: true,
+                        entry: EntryState::RemoteChanged,
+                    },
                     base.clone(),
                     local,
                     remote,
@@ -298,26 +314,32 @@ impl ReconcileFolderOperation {
     /// Records one planned download and the row that reports it as in flight.
     /// The row never adopts the remote version: a download that never lands
     /// must be retried, not mistaken for a synced state.
-    #[allow(clippy::too_many_arguments)]
     fn push_download(
         &mut self,
         relative: &str,
-        remote_version: Ulid,
-        guard: WriteGuard,
-        conflicted: bool,
-        entry: EntryState,
+        planned: Planned,
         base: Option<SyncBase>,
         local: Option<&Observed>,
         remote: Option<&RemoteHead>,
     ) -> Result<(), ReconcileError> {
+        let base = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
         self.plan.downloads.push(Download {
             relative: relative.to_string(),
-            remote_version,
-            guard,
-            conflicted,
+            remote_version: planned.remote_version,
+            guard: planned.guard,
+            conflicted: planned.conflicted,
+            local: local.map(EntrySide::from_local),
+            synced: base.synced.clone(),
         });
-        let base = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
-        self.push_base(relative, SyncBase { entry, ..base }, local, remote)
+        self.push_base(
+            relative,
+            SyncBase {
+                entry: planned.entry,
+                ..base
+            },
+            local,
+            remote,
+        )
     }
 
     fn push_upload(
@@ -361,14 +383,17 @@ fn settled(base: SyncBase) -> SyncBase {
     }
 }
 
-/// The base of a file whose local bytes provably equal the remote version.
+/// The base of a file whose local bytes provably equal the remote version. An
+/// unknown local hash records no synced bytes rather than a fabricated one.
 fn adopted(local: &Observed, remote: &RemoteHead, now_ms: u64) -> SyncBase {
     SyncBase {
-        fingerprint: local.fingerprint.clone(),
-        blake3: local.blake3.unwrap_or_default(),
-        size: local.size,
+        synced: local.blake3.map(|blake3| SyncedBytes {
+            fingerprint: local.fingerprint.clone(),
+            blake3,
+            size: local.size,
+            remote_version_id: remote.version_id,
+        }),
         local_version_id: local.version_id,
-        remote_version_id: Some(remote.version_id),
         synced_at_ms: now_ms,
         entry: EntryState::InSync,
         pending_at: None,
@@ -377,23 +402,26 @@ fn adopted(local: &Observed, remote: &RemoteHead, now_ms: u64) -> SyncBase {
     }
 }
 
-/// A base row for an entry that never synced. Its recorded hash is the local
-/// one when it is known, so no later guard can be built from nothing.
+/// A base row for an entry the realm never acknowledged. It carries no synced
+/// bytes at all, so no guard can ever be built from it.
 fn unsynced(local: Option<&Observed>, now_ms: u64) -> SyncBase {
     SyncBase {
-        fingerprint: local
-            .map(|local| local.fingerprint.clone())
-            .unwrap_or_default(),
-        blake3: local.and_then(|local| local.blake3).unwrap_or_default(),
-        size: local.map(|local| local.size).unwrap_or_default(),
+        synced: None,
         local_version_id: local.and_then(|local| local.version_id),
-        remote_version_id: None,
         synced_at_ms: now_ms,
         entry: EntryState::InSync,
         pending_at: None,
         local: None,
         remote: None,
     }
+}
+
+/// One decided download, so the recording call keeps a readable signature.
+struct Planned {
+    remote_version: Ulid,
+    guard: WriteGuard,
+    conflicted: bool,
+    entry: EntryState,
 }
 
 fn upload_entry_state(deleted: bool, had_base: bool) -> EntryState {
@@ -468,11 +496,17 @@ impl Operation for ReconcileFolderOperation {
                 let Some(position) = self.hashing.get(index).copied() else {
                     return self.settle();
                 };
-                if let Event::LocalFile(LocalFileEvent::Hashed {
+                let got = format!("{event:?}");
+                let Event::LocalFile(event) = event else {
+                    return unexpected(self, "local file result", got);
+                };
+                // A refusal or an error simply leaves the strong hash unknown,
+                // which every later decision already treats as changed bytes.
+                if let LocalFileEvent::Hashed {
                     fingerprint,
                     blake3,
                     size,
-                }) = event
+                } = event
                     && let Some(local) = self.input.local.get_mut(&self.paths[position])
                     && local.fingerprint == fingerprint
                 {
@@ -555,7 +589,8 @@ impl ReconcileFolderOperation {
                 self.bases
                     .get(*index)
                     .and_then(Option::as_ref)
-                    .is_none_or(|base| base.fingerprint != local.fingerprint)
+                    .and_then(|base| base.synced.as_ref())
+                    .is_none_or(|synced| synced.fingerprint != local.fingerprint)
             })
             .map(|(index, _)| index)
             .take(MAX_HASH_BATCH)
@@ -628,11 +663,13 @@ mod tests {
 
     fn base(fingerprint: &str, remote: Option<Ulid>) -> SyncBase {
         SyncBase {
-            fingerprint: fingerprint.to_string(),
-            blake3: [9u8; 32],
-            size: 5,
+            synced: remote.map(|remote_version_id| SyncedBytes {
+                fingerprint: fingerprint.to_string(),
+                blake3: [9u8; 32],
+                size: 5,
+                remote_version_id,
+            }),
             local_version_id: None,
-            remote_version_id: remote,
             synced_at_ms: 1,
             entry: EntryState::InSync,
             pending_at: None,

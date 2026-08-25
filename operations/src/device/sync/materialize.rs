@@ -6,7 +6,6 @@
 //! explicit owner action, its audit row is committed in the same transaction as
 //! the base row that records it.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
@@ -15,8 +14,8 @@ use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ActionOutcome, AuthContext, EntrySide, EntryState, Observed, PendingMark, ReplaceReason,
-    SyncActionRecord, SyncBase, SyncedFolder, VersionedObjectArn, WriteGuard,
+    ActionOutcome, AuthContext, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord,
+    SyncBase, SyncedBytes, SyncedFolder, VersionedObjectArn, WriteGuard,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -60,6 +59,9 @@ pub struct MaterializeInput {
     /// entry keeps naming both of them after the write.
     pub local: Option<EntrySide>,
     pub remote: Option<EntrySide>,
+    /// The synced bytes the entry already had. A refused write must not lose
+    /// them, and a successful one replaces them.
+    pub synced: Option<SyncedBytes>,
     /// Audit row of the explicit action this write serves, committed with the
     /// base row. Absent for the automatic sync.
     pub audit: Option<SyncActionRecord>,
@@ -130,7 +132,8 @@ impl MaterializeEntryOperation {
         }
     }
 
-    /// The base row one outcome leaves behind.
+    /// The base row one outcome leaves behind. Nothing here is ever invented:
+    /// synced bytes appear only when this write produced them.
     fn base_row(
         &self,
         outcome: &MaterializeOutcome,
@@ -141,16 +144,23 @@ impl MaterializeEntryOperation {
             fingerprint: self.input.local_fingerprint.clone(),
             remote_version: Some(self.input.remote_version),
         };
+        let kept = SyncBase {
+            synced: self.input.synced.clone(),
+            local_version_id: None,
+            synced_at_ms: now,
+            entry: EntryState::InSync,
+            pending_at: None,
+            local: self.input.local.clone(),
+            remote: self.input.remote.clone(),
+        };
         match (outcome, written) {
             (MaterializeOutcome::Written, Some((fingerprint, blake3, size))) => SyncBase {
-                fingerprint: fingerprint.clone(),
-                blake3,
-                size,
-                local_version_id: None,
-                remote_version_id: Some(self.input.remote_version),
-                synced_at_ms: now,
-                entry: EntryState::InSync,
-                pending_at: None,
+                synced: Some(SyncedBytes {
+                    fingerprint: fingerprint.clone(),
+                    blake3,
+                    size,
+                    remote_version_id: self.input.remote_version,
+                }),
                 local: Some(EntrySide {
                     size,
                     modified_at_ms: None,
@@ -158,81 +168,54 @@ impl MaterializeEntryOperation {
                     blake3: Some(blake3),
                     version_id: None,
                 }),
-                remote: self.input.remote.clone(),
+                ..kept
             },
-            (MaterializeOutcome::Copied { relative }, _) => SyncBase {
-                entry: EntryState::Conflict {
-                    remote_version: self.input.remote_version,
-                    conflicted_copy: relative.clone(),
+            (MaterializeOutcome::Failed { message }, _) => SyncBase {
+                entry: EntryState::Error {
+                    reason: message.clone(),
                 },
-                pending_at: Some(mark),
-                ..self.pending_base(now)
+                ..kept
             },
-            (outcome, _) => SyncBase {
+            // A conflicted copy over a known base is a conflict; over none it is
+            // a replacement the owner still has to authorise.
+            (MaterializeOutcome::Copied { relative }, _) => match self.input.synced.is_some() {
+                true => SyncBase {
+                    entry: EntryState::Conflict {
+                        remote_version: self.input.remote_version,
+                        conflicted_copy: relative.clone(),
+                    },
+                    pending_at: Some(mark),
+                    ..kept
+                },
+                false => SyncBase {
+                    entry: EntryState::PendingReplace {
+                        reason: ReplaceReason::BaseUnknown,
+                        remote_version: self.input.remote_version,
+                        conflicted_copy: Some(relative.clone()),
+                    },
+                    pending_at: Some(mark),
+                    ..kept
+                },
+            },
+            (_, _) => SyncBase {
                 entry: EntryState::PendingReplace {
-                    reason: refusal_reason(outcome, &self.input.guard),
+                    reason: self.refusal_reason(),
                     remote_version: self.input.remote_version,
+                    conflicted_copy: None,
                 },
                 pending_at: Some(mark),
-                ..self.pending_base(now)
+                ..kept
             },
         }
     }
 
-    /// The synced-base half of a pending row: this node does not know the local
-    /// bytes, so its recorded hash must never satisfy a later guard.
-    fn pending_base(&self, now_ms: u64) -> SyncBase {
-        SyncBase {
-            fingerprint: self.input.local_fingerprint.clone().unwrap_or_default(),
-            blake3: [0u8; 32],
-            size: 0,
-            local_version_id: None,
-            remote_version_id: Some(self.input.remote_version),
-            synced_at_ms: now_ms,
-            entry: EntryState::InSync,
-            pending_at: None,
-            local: self.input.local.clone(),
-            remote: self.input.remote.clone(),
+    /// A refused replace is only unknown-base when this entry had no base.
+    fn refusal_reason(&self) -> ReplaceReason {
+        match self.input.synced.is_some() {
+            true => ReplaceReason::LocalModified,
+            false => ReplaceReason::BaseUnknown,
         }
     }
-
-    /// The rows one outcome commits: the base row, plus the audit row when the
-    /// write serves an explicit owner action.
-    fn rows_for(
-        &self,
-        outcome: &MaterializeOutcome,
-        written: Option<(String, [u8; 32], u64)>,
-    ) -> Result<Vec<(String, Key, Value)>, ConversionError> {
-        let after = written.as_ref().map(|(_, blake3, _)| *blake3);
-        let base = self.base_row(outcome, written);
-        let mut rows = vec![base_entry(
-            self.input.folder.folder_id,
-            &self.input.relative,
-            &base,
-        )?];
-        if let Some(audit) = self.input.audit.as_ref() {
-            rows.push(action_entry(&SyncActionRecord {
-                outcome: match outcome {
-                    MaterializeOutcome::Refused { .. } => ActionOutcome::Stale,
-                    _ => ActionOutcome::Applied,
-                },
-                after,
-                ..audit.clone()
-            })?);
-        }
-        Ok(rows)
-    }
-}
-
-/// A refused replace is only unknown-base when the guard itself was.
-fn refusal_reason(outcome: &MaterializeOutcome, guard: &WriteGuard) -> ReplaceReason {
-    match (outcome, guard) {
-        (MaterializeOutcome::Refused { .. }, WriteGuard::MustNotExist) => {
-            ReplaceReason::BaseUnknown
-        }
-        _ => ReplaceReason::LocalModified,
-    }
-}
 
 impl Operation for MaterializeEntryOperation {
     type Output = MaterializeOutcome;
@@ -284,8 +267,10 @@ impl Operation for MaterializeEntryOperation {
                     LocalFileEvent::Refused { reason } => {
                         (MaterializeOutcome::Refused { reason }, None)
                     }
+                    // A failed write is an outcome the owner has to see, not a
+                    // silent retry: it is recorded on the entry.
                     LocalFileEvent::Error { message } => {
-                        return fail(self, MaterializeError::Write(message));
+                        (MaterializeOutcome::Failed { message }, None)
                     }
                     other => return unexpected(self, format!("{other:?}")),
                 };
@@ -406,7 +391,6 @@ pub async fn apply_downloads(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
     downloads: Vec<Download>,
-    local: &BTreeMap<String, Observed>,
 ) -> usize {
     let mut applied = 0usize;
     for download in downloads {
@@ -422,11 +406,13 @@ pub async fn apply_downloads(
                 remote_version: download.remote_version,
                 guard: download.guard,
                 conflicted: download.conflicted,
-                local_fingerprint: local
-                    .get(&download.relative)
-                    .map(|observed| observed.fingerprint.clone()),
-                local: local.get(&download.relative).map(EntrySide::from_local),
+                local_fingerprint: download
+                    .local
+                    .as_ref()
+                    .and_then(|side| side.fingerprint.clone()),
+                local: download.local.clone(),
                 remote: None,
+                synced: download.synced.clone(),
                 audit: None,
                 blob,
             }),
@@ -437,6 +423,9 @@ pub async fn apply_downloads(
             Ok(MaterializeOutcome::Written | MaterializeOutcome::Copied { .. }) => applied += 1,
             Ok(MaterializeOutcome::Refused { reason }) => {
                 debug!(relative = %download.relative, reason = ?reason, "Kept the local file");
+            }
+            Ok(MaterializeOutcome::Failed { message }) => {
+                warn!(relative = %download.relative, message = %message, "Could not write the folder entry");
             }
             Err(error) => {
                 warn!(relative = %download.relative, error = %error, "Could not write the folder entry");

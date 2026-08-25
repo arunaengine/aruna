@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::SYNC_UPLOAD_OUTBOX_KEYSPACE;
+use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    AuthContext, EntrySide, EntryState, SyncBase, SyncPullAck, SyncRefusal, SyncedFolder,
-    VersionedObjectArn,
+    AuthContext, EntrySide, EntryState, SyncBase, SyncPullAck, SyncRefusal, SyncedBytes,
+    SyncedFolder, VersionedObjectArn,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId};
@@ -150,34 +150,19 @@ fn permanent(refusal: &SyncRefusal) -> bool {
 
 /// Records the realm version as the entry's new base and drops the outbox row
 /// in one transaction, so an acknowledged pull is never forwarded twice.
+///
+/// A row the owner still has to answer keeps its reported state: the pull only
+/// establishes which realm version these bytes now correspond to.
 async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &SyncPullAck) {
-    let base = SyncBase {
-        fingerprint: upload.fingerprint.clone(),
-        blake3: upload.blake3.unwrap_or_default(),
-        size: upload.size,
-        local_version_id: upload.local_version,
-        remote_version_id: Some(ack.version_id),
-        synced_at_ms: unix_timestamp_millis(),
-        entry: match upload.deleted {
-            true => EntryState::LocalDeleted,
-            false => EntryState::InSync,
-        },
-        pending_at: None,
-        local: (!upload.deleted).then(|| EntrySide {
-            size: upload.size,
-            modified_at_ms: None,
-            fingerprint: Some(upload.fingerprint.clone()),
-            blake3: upload.blake3,
-            version_id: upload.local_version,
-        }),
-        remote: Some(EntrySide {
-            size: upload.size,
-            modified_at_ms: None,
-            fingerprint: None,
-            blake3: upload.blake3,
-            version_id: Some(ack.version_id),
-        }),
-    };
+    let current = read_value(
+        context,
+        SYNC_BASE_KEYSPACE,
+        base_key(upload.folder_id, &upload.relative),
+        None,
+    )
+    .await
+    .and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
+    let base = settled_base(upload, ack, current);
     let Ok(row) = base_entry(upload.folder_id, &upload.relative, &base) else {
         warn!(relative = %upload.relative, "Failed to encode a synced base");
         return;
@@ -201,6 +186,60 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
     }
     if commit_txn(context, txn_id).await {
         info!(relative = %upload.relative, version = %ack.version_id, "Published a synced file");
+    }
+}
+
+/// The base one acknowledged pull leaves behind. A pending entry keeps the
+/// state and the observation the owner was shown; only the synced bytes move.
+fn settled_base(upload: &SyncUpload, ack: &SyncPullAck, current: Option<SyncBase>) -> SyncBase {
+    let pending = current
+        .as_ref()
+        .is_some_and(|base| base.pending_at.is_some());
+    let local = EntrySide {
+        size: upload.size,
+        modified_at_ms: None,
+        fingerprint: Some(upload.fingerprint.clone()),
+        blake3: upload.blake3,
+        version_id: upload.local_version,
+    };
+    let remote = EntrySide {
+        size: upload.size,
+        modified_at_ms: None,
+        fingerprint: None,
+        blake3: upload.blake3,
+        version_id: Some(ack.version_id),
+    };
+    // Only bytes this device knows the strong hash of become a synced base; a
+    // delete leaves none at all.
+    let synced = (!upload.deleted)
+        .then_some(upload.blake3)
+        .flatten()
+        .map(|blake3| SyncedBytes {
+            fingerprint: upload.fingerprint.clone(),
+            blake3,
+            size: upload.size,
+            remote_version_id: ack.version_id,
+        });
+    match (pending, current) {
+        (true, Some(base)) => SyncBase {
+            synced,
+            local_version_id: upload.local_version,
+            synced_at_ms: unix_timestamp_millis(),
+            remote: Some(remote),
+            ..base
+        },
+        (_, _) => SyncBase {
+            synced,
+            local_version_id: upload.local_version,
+            synced_at_ms: unix_timestamp_millis(),
+            entry: match upload.deleted {
+                true => EntryState::LocalDeleted,
+                false => EntryState::InSync,
+            },
+            pending_at: None,
+            local: (!upload.deleted).then_some(local),
+            remote: Some(remote),
+        },
     }
 }
 

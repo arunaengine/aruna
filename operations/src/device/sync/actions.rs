@@ -27,10 +27,7 @@ use super::folders::{FolderError, list_entries, read_bound};
 use super::materialize::{
     MaterializeEntryOperation, MaterializeInput, MaterializeOutcome, fetch_remote,
 };
-use super::repository::{
-    SyncUpload, UploadState, action_entry, base_entry, base_key, read_value, upload_entry,
-    write_rows,
-};
+use super::repository::{action_entry, base_entry, base_key, read_value, write_rows};
 
 /// The identity of the bytes the owner acted on. A replace applies to exactly
 /// these bytes or to nothing.
@@ -136,7 +133,7 @@ async fn replace_entry(
     let version = expected
         .remote_version
         .or_else(|| pending_version(&base.entry))
-        .or(base.remote_version_id)
+        .or_else(|| base.synced.as_ref().map(|synced| synced.remote_version_id))
         .ok_or(ActionError::NoRemoteVersion)?;
     let blob = fetch_remote(context, folder, relative, version)
         .await
@@ -154,6 +151,7 @@ async fn replace_entry(
             local_fingerprint: Some(expected.fingerprint.clone()),
             local: base.local.clone(),
             remote: base.remote.clone(),
+            synced: base.synced.clone(),
             audit: Some(record.clone()),
             blob,
         }),
@@ -191,8 +189,9 @@ fn pending_version(entry: &EntryState) -> Option<Ulid> {
     }
 }
 
-/// Publishes the local bytes as the entry's next realm version and clears the
-/// pending mark, so the automatic sync takes the entry back over.
+/// Keeps the local bytes: the entry stops being reported and the next pass
+/// queues the upload from the real observation, so what is published is what
+/// is on disk rather than what a base row remembered.
 async fn keep_local(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
@@ -200,22 +199,6 @@ async fn keep_local(
     base: &SyncBase,
     record: SyncActionRecord,
 ) -> Result<SyncActionRecord, ActionError> {
-    let now = unix_timestamp_millis();
-    let upload = SyncUpload {
-        folder_id: folder.folder_id,
-        relative: relative.to_string(),
-        deleted: false,
-        fingerprint: base.fingerprint.clone(),
-        blake3: Some(base.blake3),
-        size: base.size,
-        local_version: base.local_version_id,
-        queued_at_ms: now,
-        state: UploadState::Pending {
-            due_at_ms: now,
-            attempts: 0,
-            last_error: None,
-        },
-    };
     let cleared = SyncBase {
         entry: EntryState::LocalChanged,
         pending_at: None,
@@ -223,7 +206,6 @@ async fn keep_local(
     };
     let rows = vec![
         base_entry(folder.folder_id, relative, &cleared).map_err(|_| ActionError::Unavailable)?,
-        upload_entry(&upload).map_err(|_| ActionError::Unavailable)?,
         action_entry(&record).map_err(|_| ActionError::Unavailable)?,
     ];
     match write_rows(context, rows, None).await {
