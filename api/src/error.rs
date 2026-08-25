@@ -32,6 +32,10 @@ pub enum ServerError {
     InternalError(String),
     #[error("{0}")]
     Conflict(String),
+    /// The bytes a caller acted on are no longer the bytes on disk. The local
+    /// data is preserved and the attempt is refused, never applied blindly.
+    #[error("{0}")]
+    PreconditionFailed(String),
     #[error("{0}")]
     JobPlanConflict(String),
     /// Standing compute quota refused a new admission; the typed reason is
@@ -362,6 +366,7 @@ impl ServerError {
             ServerError::Conflict(_)
             | ServerError::JobPlanConflict(_)
             | ServerError::ComputeQuotaDenied(_) => StatusCode::CONFLICT,
+            ServerError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::BadRequest
             | ServerError::ReservedLabel(_)
@@ -392,6 +397,7 @@ impl ServerError {
             ServerError::Conflict(_) => "Conflict".to_string(),
             ServerError::JobPlanConflict(_) => "JobPlanConflict".to_string(),
             ServerError::ComputeQuotaDenied(_) => "compute_quota_denied".to_string(),
+            ServerError::PreconditionFailed(_) => "Precondition failed".to_string(),
             ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
             ServerError::ReservedLabel(_) => "reserved_label".to_string(),
             ServerError::BadRequest

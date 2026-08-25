@@ -414,21 +414,28 @@ fn listing_prefix(prefix: &str) -> String {
 /// One current head, named relative to the requested prefix. Only the latest
 /// version of a key is a head; older versions are not the folder's state.
 fn head_of(item: &ListObjectVersionsItem, prefix: &str) -> Option<RemoteHead> {
-    let (key, version_id, deleted, location, metadata) = match item {
+    let (key, version_id, deleted, location, metadata, created_at) = match item {
         ListObjectVersionsItem::Version {
             key,
             version_id,
             is_latest: true,
             location,
             source_metadata,
-            ..
-        } => (key, version_id, false, location.as_ref(), source_metadata),
+            created_at,
+        } => (
+            key,
+            version_id,
+            false,
+            location.as_ref(),
+            source_metadata,
+            created_at,
+        ),
         ListObjectVersionsItem::DeleteMarker {
             key,
             version_id,
             is_latest: true,
-            ..
-        } => (key, version_id, true, None, &None),
+            created_at,
+        } => (key, version_id, true, None, &None, created_at),
         _ => return None,
     };
     Some(RemoteHead {
@@ -441,6 +448,10 @@ fn head_of(item: &ListObjectVersionsItem, prefix: &str) -> Option<RemoteHead> {
         blake3: location
             .and_then(|location| location.get_blake3())
             .and_then(|hash| <[u8; 32]>::try_from(hash).ok()),
+        modified_at_ms: created_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u64::try_from(since.as_millis()).ok()),
         deleted,
     })
 }

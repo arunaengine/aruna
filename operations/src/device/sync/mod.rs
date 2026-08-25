@@ -109,6 +109,7 @@ pub async fn reconcile_folder(
                     fingerprint: file.fingerprint,
                     size: file.size,
                     blake3: None,
+                    modified_at_ms: file.modified_at_ms,
                     version_id: Some(file.version_id),
                 },
             )

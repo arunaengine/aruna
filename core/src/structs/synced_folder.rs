@@ -197,6 +197,10 @@ pub struct SyncBase {
     /// pass repeats neither the conflicted copy nor the report while the owner
     /// has not answered.
     pub pending_at: Option<PendingMark>,
+    /// The last observation of each side, for reporting. An explicit action
+    /// echoes the local side back as the bytes it was taken on.
+    pub local: Option<EntrySide>,
+    pub remote: Option<EntrySide>,
 }
 
 /// The observation a pending entry was recorded against.
@@ -251,7 +255,41 @@ pub struct Observed {
     /// Strong hash of exactly these bytes, when the device has computed one.
     /// An absent hash can never satisfy a base match.
     pub blake3: Option<[u8; 32]>,
+    pub modified_at_ms: Option<u64>,
     pub version_id: Option<Ulid>,
+}
+
+/// One side of an entry as it was last seen. It is reporting only: a guard is
+/// built from the synced base, never from a side.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EntrySide {
+    pub size: u64,
+    pub modified_at_ms: Option<u64>,
+    pub fingerprint: Option<String>,
+    pub blake3: Option<[u8; 32]>,
+    pub version_id: Option<Ulid>,
+}
+
+impl EntrySide {
+    pub fn from_local(local: &Observed) -> Self {
+        Self {
+            size: local.size,
+            modified_at_ms: local.modified_at_ms,
+            fingerprint: Some(local.fingerprint.clone()),
+            blake3: local.blake3,
+            version_id: local.version_id,
+        }
+    }
+
+    pub fn from_remote(remote: &RemoteHead) -> Self {
+        Self {
+            size: remote.size,
+            modified_at_ms: remote.modified_at_ms,
+            fingerprint: None,
+            blake3: remote.blake3,
+            version_id: Some(remote.version_id),
+        }
+    }
 }
 
 /// One current realm head inside the bound prefix.
@@ -262,6 +300,7 @@ pub struct RemoteHead {
     pub version_id: Ulid,
     pub size: u64,
     pub blake3: Option<[u8; 32]>,
+    pub modified_at_ms: Option<u64>,
     pub deleted: bool,
 }
 
@@ -588,6 +627,8 @@ mod tests {
             synced_at_ms: 1,
             entry: EntryState::InSync,
             pending_at: None,
+            local: None,
+            remote: None,
         }
     }
 
@@ -596,6 +637,7 @@ mod tests {
             fingerprint: fingerprint.to_string(),
             size: 4,
             blake3: hash.map(|byte| [byte; 32]),
+            modified_at_ms: None,
             version_id: None,
         }
     }
@@ -606,6 +648,7 @@ mod tests {
             version_id: version,
             size: 4,
             blake3: hash.map(|byte| [byte; 32]),
+            modified_at_ms: None,
             deleted,
         }
     }

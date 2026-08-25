@@ -13,8 +13,8 @@ use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedFolder, WriteGuard,
-    decide,
+    EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedFolder,
+    WriteGuard, decide,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -184,43 +184,60 @@ impl ReconcileFolderOperation {
         let folder_id = self.input.folder.folder_id;
         match action {
             SyncAction::Nothing => {
-                if let Some(base) = base.filter(|base| base.entry != EntryState::InSync) {
-                    self.push_base(relative, settled(base, self.input.now_ms))?;
-                }
+                let base = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
+                self.push_base(relative, settled(base, self.input.now_ms), local, remote)?;
             }
             SyncAction::AdoptBase => {
                 let (Some(local), Some(remote)) = (local, remote) else {
                     return Ok(());
                 };
-                self.push_base(relative, adopted(local, remote, self.input.now_ms))?;
+                self.push_base(
+                    relative,
+                    adopted(local, remote, self.input.now_ms),
+                    Some(local),
+                    Some(remote),
+                )?;
             }
             SyncAction::Upload { deleted } => {
                 self.push_upload(relative, deleted, local, base.as_ref())?;
                 let entry = upload_entry_state(deleted, base.is_some());
-                if let Some(base) = base {
-                    self.push_base(relative, SyncBase { entry, ..base })?;
-                }
+                let base = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
+                self.push_base(relative, SyncBase { entry, ..base }, local, remote)?;
                 self.plan.uploads += 1;
             }
             SyncAction::Materialize {
                 remote_version,
                 guard,
-            } => self.plan.downloads.push(Download {
-                relative: relative.to_string(),
-                remote_version,
-                guard,
-                conflicted: false,
-            }),
+            } => {
+                let entry = match base.is_some() {
+                    true => EntryState::RemoteChanged,
+                    false => EntryState::RemoteNew,
+                };
+                self.push_download(
+                    relative,
+                    remote_version,
+                    guard,
+                    false,
+                    entry,
+                    base,
+                    local,
+                    remote,
+                )?;
+            }
             SyncAction::ConflictCopy {
                 remote_version,
                 upload,
             } => {
-                self.plan.downloads.push(Download {
-                    relative: relative.to_string(),
+                self.push_download(
+                    relative,
                     remote_version,
-                    guard: WriteGuard::MustNotExist,
-                    conflicted: true,
-                });
+                    WriteGuard::MustNotExist,
+                    true,
+                    EntryState::RemoteChanged,
+                    base.clone(),
+                    local,
+                    remote,
+                )?;
                 if upload {
                     self.push_upload(relative, false, local, base.as_ref())?;
                     self.plan.uploads += 1;
@@ -240,6 +257,8 @@ impl ReconcileFolderOperation {
                         pending_at: Some(mark),
                         ..base
                     },
+                    local,
+                    remote,
                 )?;
             }
             SyncAction::Forget => self.deletes.push((
@@ -250,10 +269,46 @@ impl ReconcileFolderOperation {
         Ok(())
     }
 
-    fn push_base(&mut self, relative: &str, base: SyncBase) -> Result<(), ReconcileError> {
+    fn push_base(
+        &mut self,
+        relative: &str,
+        base: SyncBase,
+        local: Option<&Observed>,
+        remote: Option<&RemoteHead>,
+    ) -> Result<(), ReconcileError> {
+        let base = SyncBase {
+            local: local.map(EntrySide::from_local),
+            remote: remote.map(EntrySide::from_remote),
+            ..base
+        };
         self.writes
             .push(base_entry(self.input.folder.folder_id, relative, &base)?);
         Ok(())
+    }
+
+    /// Records one planned download and the row that reports it as in flight.
+    /// The row never adopts the remote version: a download that never lands
+    /// must be retried, not mistaken for a synced state.
+    #[allow(clippy::too_many_arguments)]
+    fn push_download(
+        &mut self,
+        relative: &str,
+        remote_version: Ulid,
+        guard: WriteGuard,
+        conflicted: bool,
+        entry: EntryState,
+        base: Option<SyncBase>,
+        local: Option<&Observed>,
+        remote: Option<&RemoteHead>,
+    ) -> Result<(), ReconcileError> {
+        self.plan.downloads.push(Download {
+            relative: relative.to_string(),
+            remote_version,
+            guard,
+            conflicted,
+        });
+        let base = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
+        self.push_base(relative, SyncBase { entry, ..base }, local, remote)
     }
 
     fn push_upload(
@@ -309,6 +364,8 @@ fn adopted(local: &Observed, remote: &RemoteHead, now_ms: u64) -> SyncBase {
         synced_at_ms: now_ms,
         entry: EntryState::InSync,
         pending_at: None,
+        local: None,
+        remote: None,
     }
 }
 
@@ -326,6 +383,8 @@ fn unsynced(local: Option<&Observed>, now_ms: u64) -> SyncBase {
         synced_at_ms: now_ms,
         entry: EntryState::InSync,
         pending_at: None,
+        local: None,
+        remote: None,
     }
 }
 

@@ -12,7 +12,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_UPLOAD_OUTBOX_KEYSPACE;
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    AuthContext, EntryState, SyncBase, SyncPullAck, SyncRefusal, SyncedFolder, VersionedObjectArn,
+    AuthContext, EntrySide, EntryState, SyncBase, SyncPullAck, SyncRefusal, SyncedFolder,
+    VersionedObjectArn,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId};
@@ -162,6 +163,20 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
             false => EntryState::InSync,
         },
         pending_at: None,
+        local: (!upload.deleted).then(|| EntrySide {
+            size: upload.size,
+            modified_at_ms: None,
+            fingerprint: Some(upload.fingerprint.clone()),
+            blake3: upload.blake3,
+            version_id: upload.local_version,
+        }),
+        remote: Some(EntrySide {
+            size: upload.size,
+            modified_at_ms: None,
+            fingerprint: None,
+            blake3: upload.blake3,
+            version_id: Some(ack.version_id),
+        }),
     };
     let Ok(row) = base_entry(upload.folder_id, &upload.relative, &base) else {
         warn!(relative = %upload.relative, "Failed to encode a synced base");

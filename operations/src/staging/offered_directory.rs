@@ -63,6 +63,7 @@ pub struct ObservedFile {
     pub relative: String,
     pub fingerprint: String,
     pub size: u64,
+    pub modified_at_ms: Option<u64>,
     pub version_id: Ulid,
 }
 
@@ -157,6 +158,7 @@ pub async fn offer_directory(
             relative: entry.path.clone(),
             fingerprint: aruna_core::structs::weak_fingerprint(size, entry.modified),
             size,
+            modified_at_ms: entry.modified.and_then(millis_since_epoch),
             version_id,
         });
     }
@@ -285,6 +287,12 @@ fn offered_binding(bucket: &str, path: &str, node_id: NodeId) -> VersionSourceBi
         },
         connector_id: None,
     }
+}
+
+fn millis_since_epoch(time: SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
 }
 
 fn entry_metadata(entry: &SourceEntry) -> SourceMetadata {

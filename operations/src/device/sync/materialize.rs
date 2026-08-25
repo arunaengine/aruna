@@ -15,8 +15,8 @@ use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ActionOutcome, AuthContext, EntryState, Observed, PendingMark, ReplaceReason, SyncActionRecord,
-    SyncBase, SyncedFolder, VersionedObjectArn, WriteGuard,
+    ActionOutcome, AuthContext, EntrySide, EntryState, Observed, PendingMark, ReplaceReason,
+    SyncActionRecord, SyncBase, SyncedFolder, VersionedObjectArn, WriteGuard,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -56,6 +56,10 @@ pub struct MaterializeInput {
     /// Fingerprint of the local file the decision was taken against, so a
     /// pending entry is marked against the state the owner will be shown.
     pub local_fingerprint: Option<String>,
+    /// The sides the reconciler last observed, carried through so the reported
+    /// entry keeps naming both of them after the write.
+    pub local: Option<EntrySide>,
+    pub remote: Option<EntrySide>,
     /// Audit row of the explicit action this write serves, committed with the
     /// base row. Absent for the automatic sync.
     pub audit: Option<SyncActionRecord>,
@@ -139,7 +143,7 @@ impl MaterializeEntryOperation {
         };
         match (outcome, written) {
             (MaterializeOutcome::Written, Some((fingerprint, blake3, size))) => SyncBase {
-                fingerprint,
+                fingerprint: fingerprint.clone(),
                 blake3,
                 size,
                 local_version_id: None,
@@ -147,6 +151,14 @@ impl MaterializeEntryOperation {
                 synced_at_ms: now,
                 entry: EntryState::InSync,
                 pending_at: None,
+                local: Some(EntrySide {
+                    size,
+                    modified_at_ms: None,
+                    fingerprint: Some(fingerprint),
+                    blake3: Some(blake3),
+                    version_id: None,
+                }),
+                remote: self.input.remote.clone(),
             },
             (MaterializeOutcome::Copied { relative }, _) => SyncBase {
                 entry: EntryState::Conflict {
@@ -179,6 +191,8 @@ impl MaterializeEntryOperation {
             synced_at_ms: now_ms,
             entry: EntryState::InSync,
             pending_at: None,
+            local: self.input.local.clone(),
+            remote: self.input.remote.clone(),
         }
     }
 
@@ -411,6 +425,8 @@ pub async fn apply_downloads(
                 local_fingerprint: local
                     .get(&download.relative)
                     .map(|observed| observed.fingerprint.clone()),
+                local: local.get(&download.relative).map(EntrySide::from_local),
+                remote: None,
                 audit: None,
                 blob,
             }),

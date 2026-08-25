@@ -152,6 +152,8 @@ async fn replace_entry(
             },
             conflicted: false,
             local_fingerprint: Some(expected.fingerprint.clone()),
+            local: base.local.clone(),
+            remote: base.remote.clone(),
             audit: Some(record.clone()),
             blob,
         }),
@@ -165,6 +167,17 @@ async fn replace_entry(
             _ => ActionOutcome::Applied,
         },
         ..record
+    })
+}
+
+/// The bytes the last observation saw, which a bulk replace is guarded by. An
+/// entry whose file changed since then is refused rather than overwritten.
+fn observed_expected(base: &SyncBase) -> Option<ExpectedEntry> {
+    let local = base.local.as_ref()?;
+    Some(ExpectedEntry {
+        fingerprint: local.fingerprint.clone()?,
+        blake3: local.blake3?,
+        remote_version: pending_version(&base.entry),
     })
 }
 
@@ -268,14 +281,17 @@ async fn apply_pending(
     let mut stale = 0usize;
     loop {
         let (entries, next) = list_entries(context, folder.folder_id, None, cursor).await?;
-        for (relative, base) in entries
-            .into_iter()
-            .filter(|(_, base)| base.entry.is_pending())
-        {
-            let expected = ExpectedEntry {
-                fingerprint: base.fingerprint.clone(),
-                blake3: base.blake3,
-                remote_version: pending_version(&base.entry),
+        // A removal is per entry: only the entries that name a remote version
+        // to take are replaced in bulk.
+        for (relative, base) in entries.into_iter().filter(|(_, base)| {
+            matches!(
+                base.entry,
+                EntryState::Conflict { .. } | EntryState::PendingReplace { .. }
+            )
+        }) {
+            let Some(expected) = observed_expected(&base) else {
+                stale += 1;
+                continue;
             };
             let step = ApplyActionInput {
                 scope: ActionScope::Entry {

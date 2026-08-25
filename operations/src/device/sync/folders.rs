@@ -27,8 +27,9 @@ use super::repository::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BindFolderInput {
+    /// Minted by the caller so it can check the derived bucket first.
+    pub folder_id: Ulid,
     pub root: String,
-    pub local_bucket: String,
     pub group_id: GroupId,
     pub remote: RemoteBinding,
     pub mode: FolderMode,
@@ -83,16 +84,17 @@ pub async fn bind_folder(
     {
         return Err(FolderError::RootOverlaps(existing.root.clone()));
     }
+    let local_bucket = folder_bucket(input.folder_id);
     if bound
         .iter()
-        .any(|folder| folder.local_bucket == input.local_bucket)
+        .any(|folder| folder.local_bucket == local_bucket)
     {
-        return Err(FolderError::BucketBound(input.local_bucket));
+        return Err(FolderError::BucketBound(local_bucket));
     }
     offer_directory(
         context,
         OfferDirectoryInput {
-            bucket: input.local_bucket.clone(),
+            bucket: local_bucket.clone(),
             root: input.root.clone(),
             group_id: input.group_id,
             realm_id: input.realm_id,
@@ -103,9 +105,9 @@ pub async fn bind_folder(
     .await?;
 
     let folder = SyncedFolder {
-        folder_id: Ulid::generate(),
+        folder_id: input.folder_id,
         root: input.root,
-        local_bucket: input.local_bucket,
+        local_bucket,
         group_id: input.group_id,
         remote: input.remote,
         mode: input.mode,
@@ -117,6 +119,12 @@ pub async fn bind_folder(
     };
     store_folder(context, &folder).await?;
     Ok(folder)
+}
+
+/// The device-local bucket a folder is observed as. The owner never names it:
+/// a derived name cannot collide with a bucket they already use.
+pub fn folder_bucket(folder_id: Ulid) -> String {
+    format!("folder-{}", folder_id.to_string().to_lowercase())
 }
 
 /// Whether two roots are the same directory or one contains the other. The
@@ -271,6 +279,23 @@ pub async fn list_entries(
         .filter(|(_, base)| state.is_none_or(|state| base.entry.name() == state))
         .collect();
     Ok((entries, next))
+}
+
+/// One entry of a folder, by its path.
+pub async fn read_entry(
+    context: &Arc<DriverContext>,
+    folder_id: Ulid,
+    relative: &str,
+) -> Result<SyncBase, FolderError> {
+    read_value(
+        context,
+        SYNC_BASE_KEYSPACE,
+        super::repository::base_key(folder_id, relative),
+        None,
+    )
+    .await
+    .and_then(|bytes| SyncBase::from_bytes(&bytes).ok())
+    .ok_or(FolderError::NotFound)
 }
 
 /// One page of a folder's audit log, oldest action first.
