@@ -195,7 +195,7 @@ pub struct UserDeviceResponse {
     pub node_id: Option<String>,
     /// Enrollment id, set while an enrollment secret is still outstanding.
     pub enrollment_id: Option<String>,
-    /// `enrolled`, `claimed` or `pending`.
+    /// `enrolled`, `claimed`, `pending` or `expired`.
     pub status: String,
     /// Expiry of an outstanding enrollment secret, in Unix seconds.
     pub expires_at: Option<u64>,
@@ -1452,6 +1452,17 @@ async fn update_user(
     Ok((StatusCode::OK, Json(user.into())))
 }
 
+/// What an outstanding enrollment reads as. An unclaimed secret past its expiry
+/// is dead whether or not a later request has pruned it, so it must never be
+/// reported as an enrollment still in flight.
+fn enrollment_status(claimed: bool, expires_at: u64, now: u64) -> &'static str {
+    match (claimed, expires_at <= now) {
+        (true, _) => "claimed",
+        (false, true) => "expired",
+        (false, false) => "pending",
+    }
+}
+
 /// The caller's devices, enrolled and still enrolling. A device's owner lives
 /// in its membership kind, so the realm configuration is the authority here and
 /// an outstanding enrollment secret only shows what has not landed yet.
@@ -1484,6 +1495,7 @@ async fn owned_devices(
     let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let now = aruna_core::util::unix_timestamp_secs();
     for entry in secrets {
         if entry.record.mode.owner() != Some(owner) {
             continue;
@@ -1499,12 +1511,7 @@ async fn owned_devices(
             id: entry.record.enrollment_id.to_string(),
             node_id: claimed.clone(),
             enrollment_id: Some(entry.record.enrollment_id.to_string()),
-            status: if claimed.is_some() {
-                "claimed"
-            } else {
-                "pending"
-            }
-            .to_string(),
+            status: enrollment_status(claimed.is_some(), entry.record.expires_at, now).to_string(),
             expires_at: Some(entry.record.expires_at),
         });
     }
@@ -1528,6 +1535,8 @@ takes no user id, so it grants no view of anybody else's.
 - An enrollment whose secret is still outstanding reads `pending`, or `claimed` once a device has
   redeemed the secret but the realm configuration has not caught up; it is addressed by its
   enrollment id and carries the secret's expiry.
+- An unclaimed enrollment whose `expires_at` has passed reads `expired`. It stays listed until a
+  later mint or admin listing prunes it, but it is never reported as still in flight.
 - An enrollment is dropped from the list as soon as the device it claimed appears as a member, so
   one device is listed once.
 - The realm configuration is the authority on ownership, and the outstanding secrets are this
@@ -1735,7 +1744,7 @@ async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> Ser
 
 #[cfg(test)]
 mod tests {
-    use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
+    use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
     use crate::auth::OidcValidator;
     use crate::error::ErrorResponse;
     use crate::server::Server;
@@ -1867,6 +1876,16 @@ mod tests {
             },
             task,
         )
+    }
+
+    // An unclaimed enrollment past its expiry is dead: reporting it as pending
+    // would show an enrollment in flight that can never complete.
+    #[test]
+    fn reports_expired_enrollment() {
+        assert_eq!(enrollment_status(false, 100, 99), "pending");
+        assert_eq!(enrollment_status(false, 100, 100), "expired");
+        assert_eq!(enrollment_status(false, 100, 101), "expired");
+        assert_eq!(enrollment_status(true, 100, 101), "claimed");
     }
 
     fn sign_oidc_token(
