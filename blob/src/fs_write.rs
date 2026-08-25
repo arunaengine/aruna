@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::fs_source::{
-    MAX_COPY_ATTEMPTS, RESERVED_PREFIX, canonical_root, jailed_file, map_io_error,
+    MAX_COPY_ATTEMPTS, SPOOL_PREFIX, canonical_root, jailed_file, map_io_error,
 };
 
 /// Why a spooled file could not be published. A refusal is the owner's data
@@ -289,13 +289,38 @@ async fn jailed_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, LocalF
         })
 }
 
+/// Removes spool files a crashed write left behind in one directory. They are
+/// this node's own bytes, never the owner's, so dropping them loses nothing.
+pub(crate) async fn sweep_spool(root: &str) -> usize {
+    let Ok(root) = canonical_root(root).await else {
+        return 0;
+    };
+    let Ok(mut reader) = tokio::fs::read_dir(&root).await else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SPOOL_PREFIX)
+        {
+            continue;
+        }
+        if tokio::fs::remove_file(entry.path()).await.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Streams the incoming bytes into a temporary file in the directory the write
 /// lands in, so publishing it is a rename inside one filesystem.
 async fn spool_temp(
     parent: &Path,
     blob: BackendStream<Result<Bytes, StreamError>>,
 ) -> Result<Spooled, String> {
-    let path = parent.join(format!("{RESERVED_PREFIX}-tmp-{}", Ulid::generate()));
+    let path = parent.join(format!("{SPOOL_PREFIX}{}", Ulid::generate()));
     match write_temp(&path, blob).await {
         Ok(spooled) => Ok(spooled),
         Err(error) => {
@@ -652,7 +677,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(RESERVED_PREFIX)
+                    .starts_with(SPOOL_PREFIX)
             })
             .count();
         assert_eq!(spooled, 0);
@@ -769,11 +794,21 @@ mod tests {
             .await
             .unwrap();
 
+        tokio::fs::write(root.path().join(".aruna-notes"), b"mine")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join(".aruna-tmp-stale"), b"spool")
+            .await
+            .unwrap();
+
         let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
             .await
             .unwrap();
-        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-        assert_eq!(paths, vec!["keep.txt"]);
+        let mut paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec![".aruna-notes", "keep.txt"]);
+        assert_eq!(sweep_spool(&path).await, 1);
+        assert!(root.path().join(".aruna-notes").exists());
     }
 
     #[test]

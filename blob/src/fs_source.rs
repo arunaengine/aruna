@@ -23,9 +23,13 @@ use std::time::SystemTime;
 use tokio::io::AsyncSeekExt;
 use tokio_util::io::ReaderStream;
 
-/// Prefix of every path this node maintains inside a folder: the trash, and the
-/// temporary files a guarded write spools. Nothing under it is ever offered.
-pub(crate) const RESERVED_PREFIX: &str = ".aruna";
+/// The one directory this node maintains inside a folder. Nothing under it is
+/// ever offered as the owner's data.
+pub(crate) const RESERVED_DIR: &str = ".aruna";
+
+/// Prefix of the temporary files a guarded write spools. They live beside the
+/// file they will become, so they are skipped by name rather than by directory.
+pub(crate) const SPOOL_PREFIX: &str = ".aruna-tmp-";
 
 /// Candidate names one conflicted copy or move-aside may try before it gives
 /// up. A folder with this many same-named copies needs the owner, not a retry.
@@ -86,9 +90,10 @@ pub(crate) async fn list_local(
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
-            // The trash and the write spool are this node's own bookkeeping,
-            // never the owner's data.
-            if name.starts_with(RESERVED_PREFIX) {
+            // This node's own bookkeeping is never the owner's data. Only the
+            // reserved directory and the spool prefix are skipped, so a file
+            // the owner named `.aruna-notes` stays theirs.
+            if name == RESERVED_DIR || name.starts_with(SPOOL_PREFIX) {
                 continue;
             }
             let relative = join_relative(&prefix, &name);
