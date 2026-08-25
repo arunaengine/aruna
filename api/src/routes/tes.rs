@@ -10,9 +10,10 @@ use aruna_core::compute::{
 };
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputSelection, blob_group_permission_path,
+    JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
+    OutputDestination, OutputSelection, blob_group_permission_path,
 };
+use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
@@ -35,6 +36,8 @@ use utoipa_axum::routes;
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
 use crate::error::ServerError;
 use crate::forwarded::external_base_url;
+use crate::routes::device::require_owner;
+use crate::routes::jobs::{ExecutionTarget, map_local_error};
 use crate::server_state::ServerState;
 
 /// GA4GH TES version this facade implements.
@@ -45,6 +48,8 @@ const GROUP_TAG_KEY: &str = "aruna-engine.org/group";
 const EXECUTOR_TAG_KEY: &str = "aruna-engine.org/executor";
 /// Optional tag carrying the submission idempotency key.
 const IDEMPOTENCY_TAG_KEY: &str = "aruna-engine.org/idempotency-key";
+/// Optional tag choosing where the task runs: `realm` or `local`.
+const TARGET_TAG_KEY: &str = "aruna-engine.org/target";
 
 /// Read-only tags derived at read time from the job and its family. They are
 /// never stored, so a task creation naming one of them is refused.
@@ -547,6 +552,11 @@ that tag. The caller needs WRITE on the target group.
   outputs to itself and resolves the referenced inputs, and the device never executes a task. The
   device forwards the caller's own bearer token, so basic authentication is refused with a 403
   here even though it is accepted on a realm node.
+- An `aruna-engine.org/target` tag of `local` runs the task on the machine instead, and is served
+  by a user device only: any other node refuses it with a 400, and a caller who is not the device's
+  owner with a 403. Such a task reads objects this device holds, keeps its outputs in the
+  node-local workspace bucket, and is neither forwarded nor replicated. `realm`, the default, is
+  the behavior above. The tag stays on the task and is reported back with it.
 
 **Limits** (all refused with 400)
 - Exactly one executor whose `command` is the full argv.
@@ -654,6 +664,15 @@ pub async fn create_task(
         Err(error) => return error.into_response(),
     };
 
+    let target = match task_target(&task.tags) {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
+    let caller = match local_owner(&state, caller, target).await {
+        Ok(caller) => caller,
+        Err(error) => return error.into_response(),
+    };
+
     // Authorize before parsing: the group comes from the tag or credential
     // alone, so the unbounded payload is only validated for permitted callers.
     let group_id = match resolve_task_group(&task, caller.credential_group) {
@@ -677,6 +696,30 @@ pub async fn create_task(
     } else {
         aruna_core::structs::WorkspaceMode::Kept
     };
+
+    if target == ExecutionTarget::Local {
+        return match submit_local_execution(
+            &state.get_ctx(),
+            LocalExecutionConfig {
+                spec,
+                owner: caller.auth.user_id,
+                node_id: state.get_node_id(),
+                idempotency_key,
+                workspace_mode,
+                retention_ms: state.rocrate_limits().artifact_retention_ms,
+            },
+        )
+        .await
+        {
+            Ok(result) => tes_json_response(
+                StatusCode::OK,
+                TesCreateTaskResponse {
+                    id: result.job_id.to_string(),
+                },
+            ),
+            Err(error) => TesError::from_server(map_local_error(error)).into_response(),
+        };
+    }
 
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
@@ -1754,6 +1797,39 @@ fn project_task(record: &JobRecord, facts: &TaskFacts, view: TesView, base_url: 
         creation_time: Some(rfc3339(record.created_at_ms)),
         ..Default::default()
     }
+}
+
+/// Where the task runs, from its tag. An unknown value is refused rather than
+/// silently sent to the realm.
+fn task_target(tags: &BTreeMap<String, String>) -> Result<ExecutionTarget, TesError> {
+    match tags.get(TARGET_TAG_KEY).map(String::as_str) {
+        None | Some("realm") => Ok(ExecutionTarget::Realm),
+        Some("local") => Ok(ExecutionTarget::Local),
+        Some(other) => Err(TesError::bad_request(format!(
+            "unknown `{TARGET_TAG_KEY}` value `{other}`"
+        ))),
+    }
+}
+
+/// Binds a local task to the owner this device is enrolled for. A node that
+/// serves no device plane refuses the target itself, not the caller.
+async fn local_owner(
+    state: &ServerState,
+    caller: TesCaller,
+    target: ExecutionTarget,
+) -> Result<TesCaller, TesError> {
+    if target == ExecutionTarget::Realm {
+        return Ok(caller);
+    }
+    if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
+        return Err(TesError::bad_request(format!(
+            "`{TARGET_TAG_KEY}` `local` is served by a user device only"
+        )));
+    }
+    let auth = require_owner(state, Some(caller.auth))
+        .await
+        .map_err(TesError::from_server)?;
+    Ok(TesCaller { auth, ..caller })
 }
 
 /// Names the first derived tag a creation tried to set. Every one of them is
@@ -3189,6 +3265,39 @@ mod tests {
         }
         let minimal = project_task(&record, &facts, TesView::Minimal, "http://x");
         assert!(minimal.tags.is_empty());
+    }
+
+    #[test]
+    fn maps_the_target_tag() {
+        // The tag is the only way a TES caller asks for the local machine.
+        let mut tags = BTreeMap::new();
+        assert_eq!(task_target(&tags).unwrap(), ExecutionTarget::Realm);
+
+        tags.insert(TARGET_TAG_KEY.to_string(), "realm".to_string());
+        assert_eq!(task_target(&tags).unwrap(), ExecutionTarget::Realm);
+
+        tags.insert(TARGET_TAG_KEY.to_string(), "local".to_string());
+        assert_eq!(task_target(&tags).unwrap(), ExecutionTarget::Local);
+
+        tags.insert(TARGET_TAG_KEY.to_string(), "elsewhere".to_string());
+        let error = task_target(&tags).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn keeps_the_target_tag() {
+        // A local task reports the target it was created with.
+        let group = Ulid::from_bytes([5u8; 16]);
+        let mut task = sample_task(group);
+        task.tags
+            .insert(TARGET_TAG_KEY.to_string(), "local".to_string());
+
+        let (spec, _) = map_task_to_spec(&task, None, false).unwrap();
+
+        assert_eq!(
+            project_tags(&spec).get(TARGET_TAG_KEY).map(String::as_str),
+            Some("local")
+        );
     }
 
     #[test]
