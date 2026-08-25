@@ -155,7 +155,7 @@ impl From<IntakeEntry> for DeviceDraft {
 /// This is the device plane's authorization boundary: the surface exists only
 /// on a User-kind node, and only for the user that node is bound to. The read
 /// is node-local, so the plane keeps working while the realm is unreachable.
-async fn require_owner(
+pub(crate) async fn require_owner(
     state: &ServerState,
     auth: Option<AuthContext>,
 ) -> ServerResult<AuthContext> {
