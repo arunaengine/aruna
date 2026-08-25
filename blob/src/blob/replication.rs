@@ -582,7 +582,8 @@ mod tests {
     use aruna_core::errors::BlobError;
     use aruna_core::events::BlobEvent;
     use aruna_core::structs::{
-        OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind, weak_fingerprint,
+        FileStat, OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind,
+        weak_fingerprint,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -601,7 +602,7 @@ mod tests {
 
     async fn fingerprint_of(path: &Path) -> String {
         let metadata = tokio::fs::metadata(path).await.unwrap();
-        weak_fingerprint(metadata.len(), metadata.modified().ok())
+        weak_fingerprint(&FileStat::from_metadata(&metadata))
     }
 
     #[tokio::test]

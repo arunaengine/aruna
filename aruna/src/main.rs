@@ -624,7 +624,7 @@ async fn bind_servers(
             let (roots, unsupported) = wipe_plan(&config);
             // A wipe erases what these roots hold, so an unsafe one fails the
             // start rather than the erasure.
-            crate::config::validate_wipe_roots(
+            aruna::config::validate_wipe_roots(
                 &roots,
                 std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)

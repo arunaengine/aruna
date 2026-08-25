@@ -22,7 +22,6 @@ use aruna_core::structs::{
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::util::unix_timestamp_millis;
-use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{debug, warn};
 
