@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
-use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
+use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
@@ -107,6 +107,9 @@ pub struct ReconcileFolderOperation {
     /// Every path this page decides, in key order.
     paths: Vec<String>,
     bases: Vec<Option<SyncBase>>,
+    /// Rows already waiting in the outbox, so a pass never re-queues an entry
+    /// whose backoff has not elapsed.
+    queued: Vec<Option<SyncUpload>>,
     /// Indices of `paths` whose strong hash the decision still needs.
     hashing: Vec<usize>,
     writes: Vec<(String, Key, Value)>,
@@ -122,6 +125,7 @@ impl ReconcileFolderOperation {
             state: ReconcileState::Init,
             paths: Vec::new(),
             bases: Vec::new(),
+            queued: Vec::new(),
             hashing: Vec::new(),
             writes: Vec::new(),
             deletes: Vec::new(),
@@ -169,8 +173,14 @@ impl ReconcileFolderOperation {
                 continue;
             }
             let action = decide(policy, local.as_ref(), base.as_ref(), remote.as_ref());
-            if let Err(error) = self.record(relative, action, local.as_ref(), base, remote.as_ref())
-            {
+            if let Err(error) = self.record(
+                index,
+                relative,
+                action,
+                local.as_ref(),
+                base,
+                remote.as_ref(),
+            ) {
                 return fail(self, error);
             }
         }
@@ -188,6 +198,7 @@ impl ReconcileFolderOperation {
     /// One decision, as the rows and downloads it implies.
     fn record(
         &mut self,
+        index: usize,
         relative: &str,
         action: SyncAction,
         local: Option<&Observed>,
@@ -226,11 +237,12 @@ impl ReconcileFolderOperation {
                 )?;
             }
             SyncAction::Upload { deleted } => {
-                self.push_upload(relative, deleted, local, base.as_ref())?;
+                if self.push_upload(index, relative, deleted, local, base.as_ref())? {
+                    self.plan.uploads += 1;
+                }
                 let entry = upload_entry_state(deleted, base.is_some());
                 let base = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
                 self.push_base(relative, SyncBase { entry, ..base }, local, remote)?;
-                self.plan.uploads += 1;
             }
             SyncAction::Materialize {
                 remote_version,
@@ -269,8 +281,7 @@ impl ReconcileFolderOperation {
                     local,
                     remote,
                 )?;
-                if upload {
-                    self.push_upload(relative, false, local, base.as_ref())?;
+                if upload && self.push_upload(index, relative, false, local, base.as_ref())? {
                     self.plan.uploads += 1;
                 }
             }
@@ -348,13 +359,16 @@ impl ReconcileFolderOperation {
         )
     }
 
+    /// Queues one upload unless the same local version is already owed.
+    /// Answers whether this pass added a row.
     fn push_upload(
         &mut self,
+        index: usize,
         relative: &str,
         deleted: bool,
         local: Option<&Observed>,
         base: Option<&SyncBase>,
-    ) -> Result<(), ReconcileError> {
+    ) -> Result<bool, ReconcileError> {
         let upload = SyncUpload {
             folder_id: self.input.folder.folder_id,
             relative: relative.to_string(),
@@ -374,8 +388,20 @@ impl ReconcileFolderOperation {
                 last_error: None,
             },
         };
+        // Rewriting the row would reset its backoff and its attempt count, so
+        // an entry that is already owed is left exactly as the drain left it.
+        if self
+            .queued
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|queued| {
+                queued.deleted == upload.deleted && queued.local_version == upload.local_version
+            })
+        {
+            return Ok(false);
+        }
         self.writes.push(upload_entry(&upload)?);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -489,10 +515,25 @@ impl Operation for ReconcileFolderOperation {
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return unexpected(self, "batch read result", got);
                 };
-                self.bases = values
-                    .into_iter()
+                let split = self.paths.len();
+                if values.len() != split * 2 {
+                    return unexpected(self, "one base and one outbox row per path", got);
+                }
+                let (bases, queued) = values.split_at(split);
+                self.bases = bases
+                    .iter()
                     .map(|(_, value)| {
-                        value.and_then(|bytes| SyncBase::from_bytes(bytes.as_ref()).ok())
+                        value
+                            .as_ref()
+                            .and_then(|bytes| SyncBase::from_bytes(bytes.as_ref()).ok())
+                    })
+                    .collect();
+                self.queued = queued
+                    .iter()
+                    .map(|(_, value)| {
+                        value
+                            .as_ref()
+                            .and_then(|bytes| SyncUpload::from_bytes(bytes.as_ref()).ok())
                     })
                     .collect();
                 self.hashing = self.hash_batch();
@@ -732,7 +773,10 @@ mod tests {
         ));
         let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
         let mut effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(ByteView::from(vec![0u8]), value)],
+            values: vec![
+                (ByteView::from(vec![0u8]), value),
+                (ByteView::from(vec![1u8]), None),
+            ],
         }));
         while !operation.is_complete() {
             let effect = effects.first().expect("the operation must ask for more");
