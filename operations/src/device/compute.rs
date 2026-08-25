@@ -62,6 +62,14 @@ pub enum LocalExecutionError {
     AtCapacity { limit: u32 },
     #[error("input {bucket}/{key} is not on this device")]
     InputNotLocal { bucket: String, key: String },
+    /// The request itself asks for a copy this device may never make.
+    #[error("input {bucket}/{key} cannot be copied onto this device: {reason}")]
+    InputRefused {
+        bucket: String,
+        key: String,
+        reason: String,
+    },
+    /// The copy did not complete, and a later attempt still might.
     #[error("input {bucket}/{key} could not be copied onto this device: {reason}")]
     InputCopy {
         bucket: String,
@@ -351,13 +359,18 @@ async fn copy_input(
         key: input.key.clone(),
         reason,
     };
+    let asked = |reason: &str| LocalExecutionError::InputRefused {
+        bucket: input.bucket.clone(),
+        key: input.key.clone(),
+        reason: reason.to_string(),
+    };
     let version = input
         .version_id
         .as_deref()
         .map(Ulid::from_string)
         .transpose()
-        .map_err(|_| refuse("the version is not a version id".to_string()))?
-        .ok_or_else(|| refuse("a realm input needs an exact version".to_string()))?;
+        .map_err(|_| asked("the version is not a version id"))?
+        .ok_or_else(|| asked("a realm input needs an exact version"))?;
     let realm_id = config.owner.realm_id;
     let request = BaoReadRequest {
         auth_context: AuthContext {
@@ -440,9 +453,11 @@ async fn claim_bucket(
     {
         Some(existing) if existing.group_id == input.group_id => return Ok(()),
         Some(_) => {
-            return Err(refuse(
-                "a local bucket of that name is another group's".to_string(),
-            ));
+            return Err(LocalExecutionError::InputRefused {
+                bucket: input.bucket.clone(),
+                key: input.key.clone(),
+                reason: "a local bucket of that name is another group's".to_string(),
+            });
         }
         None => {}
     }
@@ -664,7 +679,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            LocalExecutionError::InputCopy { reason, .. } if reason.contains("exact version")
+            LocalExecutionError::InputRefused { reason, .. } if reason.contains("exact version")
         ));
     }
 }
