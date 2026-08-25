@@ -16,7 +16,9 @@ use std::path::{Component, Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
-use crate::fs_source::{MAX_COPY_ATTEMPTS, SPOOL_DIR, canonical_root, jailed_file, map_io_error};
+use crate::fs_source::{
+    MAX_COPY_ATTEMPTS, SPOOL_DIR, canonical_root, current_fingerprint, jailed_file, map_io_error,
+};
 
 /// Why a spooled file could not be published. A refusal is the owner's data
 /// winning; a failure is this node's problem.
@@ -26,11 +28,10 @@ enum PlaceError {
 }
 
 /// One fully written temporary file, and the identity of the bytes it holds.
-/// The rename preserves size and modification time, so its fingerprint is the
-/// fingerprint the published file will carry.
+/// Its weak fingerprint is not the published file's: publishing moves the name,
+/// which moves the change time, so the fingerprint is read at the target.
 struct Spooled {
     path: PathBuf,
-    fingerprint: String,
     blake3: [u8; 32],
     size: u64,
 }
@@ -54,15 +55,18 @@ pub(crate) async fn write_guarded(
     };
     let placed = match guard {
         WriteGuard::MustNotExist => place_new(&spooled.path, &target),
-        WriteGuard::MatchesBase {
-            fingerprint,
-            blake3,
-        } => exchange_guarded(&spooled.path, &target, fingerprint, blake3).await,
+        // The weak fingerprint is the operation's own pre-check; what the
+        // adapter re-verifies under the swap is the strong hash.
+        WriteGuard::MatchesBase { blake3, .. } => {
+            exchange_guarded(&spooled.path, &target, blake3).await
+        }
     };
-    finish_write(spooled, placed, |spooled| LocalFileEvent::Written {
-        fingerprint: spooled.fingerprint.clone(),
-        blake3: spooled.blake3,
-        size: spooled.size,
+    finish_write(spooled, placed, &target, |fingerprint, spooled| {
+        LocalFileEvent::Written {
+            fingerprint,
+            blake3: spooled.blake3,
+            size: spooled.size,
+        }
     })
     .await
 }
@@ -93,24 +97,38 @@ pub(crate) async fn write_conflicted(
             break;
         }
     }
+    let published = parent.join(&chosen);
     let relative = sibling_path(relative, &chosen);
-    finish_write(spooled, placed, move |spooled| LocalFileEvent::Copied {
-        relative: relative.clone(),
-        fingerprint: spooled.fingerprint.clone(),
-        blake3: spooled.blake3,
-        size: spooled.size,
+    finish_write(spooled, placed, &published, move |fingerprint, spooled| {
+        LocalFileEvent::Copied {
+            relative: relative.clone(),
+            fingerprint,
+            blake3: spooled.blake3,
+            size: spooled.size,
+        }
     })
     .await
 }
 
 /// Answers the placement outcome and removes the spool when it did not publish.
+///
+/// The published fingerprint is read from the file that landed, never from the
+/// spool it came from: renaming into place moves the change time, so a
+/// fingerprint taken before the rename would never match the next observation
+/// and every write would read as drift.
 async fn finish_write(
     spooled: Spooled,
     placed: Result<(), PlaceError>,
-    written: impl FnOnce(&Spooled) -> LocalFileEvent,
+    published: &Path,
+    written: impl FnOnce(String, &Spooled) -> LocalFileEvent,
 ) -> LocalFileEvent {
     match placed {
-        Ok(()) => written(&spooled),
+        Ok(()) => match current_fingerprint(published).await {
+            Some(fingerprint) => written(fingerprint, &spooled),
+            None => LocalFileEvent::Error {
+                message: "the published file could not be read back".to_string(),
+            },
+        },
         Err(error) => {
             let _ = tokio::fs::remove_file(&spooled.path).await;
             match error {
@@ -370,12 +388,8 @@ async fn write_temp(
     }
     file.flush().await.map_err(|error| error.to_string())?;
     file.sync_all().await.map_err(|error| error.to_string())?;
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|error| error.to_string())?;
     Ok(Spooled {
         path: path.to_path_buf(),
-        fingerprint: weak_fingerprint(&FileStat::from_metadata(&metadata)),
         blake3: *hasher.finalize().as_bytes(),
         size,
     })
@@ -389,7 +403,6 @@ async fn write_temp(
 async fn exchange_guarded(
     spool: &Path,
     target: &Path,
-    fingerprint: &str,
     blake3: &[u8; 32],
 ) -> Result<(), PlaceError> {
     let Ok(link) = tokio::fs::symlink_metadata(target).await else {
@@ -399,9 +412,11 @@ async fn exchange_guarded(
         return Err(PlaceError::Refused(LocalFileRefusal::NotRegular));
     }
     exchange(spool, target)?;
-    // The displaced file now sits at the spool path.
+    // The displaced file now sits at the spool path. Only its strong hash can
+    // answer for it here: the exchange moved its name, and with it the change
+    // time its weak fingerprint carries.
     let displaced = match hash_stable(spool).await {
-        Ok((current, hash, _)) => current == fingerprint && &hash == blake3,
+        Ok((_, hash, _)) => &hash == blake3,
         Err(_) => false,
     };
     if displaced {
@@ -655,6 +670,67 @@ mod tests {
         .await;
         assert!(matches!(event, LocalFileEvent::Written { size: 5, .. }));
         assert_eq!(tokio::fs::read(&file).await.unwrap(), b"newer");
+    }
+
+    // The fingerprint a write reports must be the one the next observation
+    // reads, or every synced file would look changed the moment it landed and
+    // be uploaded and conflicted again on the next pass.
+    #[tokio::test]
+    async fn write_matches_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+
+        let LocalFileEvent::Written { fingerprint, .. } =
+            write_guarded(&path, "note.txt", &WriteGuard::MustNotExist, body(b"hello")).await
+        else {
+            panic!("the file must be written");
+        };
+
+        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+            .await
+            .unwrap();
+        let observed = entries
+            .iter()
+            .find(|entry| entry.path == "note.txt")
+            .and_then(|entry| entry.stat)
+            .expect("the listing stats the file it lists");
+        assert_eq!(fingerprint, weak_fingerprint(&observed));
+    }
+
+    // A guarded replace answers for the base by its strong hash: the swap moves
+    // the displaced file's name, so its weak fingerprint cannot answer here.
+    #[tokio::test]
+    async fn replaces_under_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let file = root.path().join("note.txt");
+        tokio::fs::write(&file, b"base").await.unwrap();
+        let (fingerprint, blake3) = identity(&file).await;
+
+        let event = write_guarded(
+            &path,
+            "note.txt",
+            &WriteGuard::MatchesBase {
+                fingerprint,
+                blake3,
+            },
+            body(b"newer"),
+        )
+        .await;
+
+        let LocalFileEvent::Written { fingerprint, .. } = event else {
+            panic!("an unchanged base must be replaced");
+        };
+        assert_eq!(tokio::fs::read(&file).await.unwrap(), b"newer");
+        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+            .await
+            .unwrap();
+        let observed = entries
+            .iter()
+            .find(|entry| entry.path == "note.txt")
+            .and_then(|entry| entry.stat)
+            .expect("the listing stats the file it lists");
+        assert_eq!(fingerprint, weak_fingerprint(&observed));
     }
 
     // The one rule the whole design rests on: bytes that no longer equal the
