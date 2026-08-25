@@ -1867,18 +1867,35 @@ mod tests {
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         S3ServerTimeouts, SetupError, fjall_persist_policy_env, load, load_oidc_providers_from_env,
         parse_node_labels_env, persist_node_state, portal_config_env, read_settings,
-        rocrate_limits_env, validate_public_url,
+        rocrate_limits_env, validate_public_url, validate_s3_profile,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
-        DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
-        RoCrateLimits, StaticRealmEndpoint,
+        DynamicDiscoveryMethod, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RelayPolicy, RoCrateLimits, StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_to_config_string};
     use aruna_storage::{FjallPersistPolicy, FjallStorage};
     use std::sync::OnceLock;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    // Only a device serves no S3 endpoint. An infrastructure node whose pair is
+    // accidentally absent must fail its start instead of coming up without one.
+    #[test]
+    fn s3_optional_for_devices() {
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let device = NodeCapabilities::user_node(realm_id).expect("device capabilities");
+        let management =
+            NodeCapabilities::management_node(generate_signing_key()).expect("management");
+
+        assert!(validate_s3_profile(None, &device).is_ok());
+        assert!(validate_s3_profile(Some("0.0.0.0:9000"), &management).is_ok());
+        assert!(matches!(
+            validate_s3_profile(None, &management),
+            Err(SetupError::MissingConfigValue("S3_ADDRESS"))
+        ));
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
