@@ -30,7 +30,7 @@ use crate::process_placements::load_realm_config;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
+use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::list_object_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
@@ -146,15 +146,30 @@ async fn authorize(
     }
 }
 
+/// Reads the target bucket. Only a bucket that is really absent is `NotFound`:
+/// the drain parks that permanently, so a storage or decoding failure has to
+/// stay retryable instead.
 async fn read_bucket(
     context: &Arc<DriverContext>,
     bucket: &str,
 ) -> Result<BucketInfo, SyncRefusal> {
-    drive(GetBucketInfoOperation::new(bucket.to_string()), context)
-        .await
-        .ok()
-        .and_then(|result| result.and_then(Result::ok))
-        .ok_or(SyncRefusal::NotFound)
+    match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
+        Ok(Some(Ok(info))) => Ok(info),
+        Ok(None) => Err(SyncRefusal::NotFound),
+        Ok(Some(Err(error))) | Err(error) => {
+            debug!(error = %error, bucket = %bucket, "A sync pull could not read its target bucket");
+            Err(bucket_refusal(error))
+        }
+    }
+}
+
+/// A bucket that is not there is permanent; everything else is this node's
+/// problem and must not park the device's upload.
+fn bucket_refusal(error: GetBucketInfoError) -> SyncRefusal {
+    match error {
+        GetBucketInfoError::NotFound => SyncRefusal::NotFound,
+        _ => SyncRefusal::Unavailable,
+    }
 }
 
 async fn ensure_write(
@@ -252,7 +267,9 @@ async fn commit_pull(
     };
     let blob = match managed_read(context, request.source.node_id, read).await {
         Ok(BaoReadOutput::Stream { blob, .. }) => blob,
-        Ok(BaoReadOutput::Metadata { .. }) => return Err(SyncRefusal::NotFound),
+        // A metadata-only answer to a full read is a broken exchange, not an
+        // absent object: parking the upload on it would lose the file.
+        Ok(BaoReadOutput::Metadata { .. }) => return Err(SyncRefusal::Unavailable),
         Err(error) => {
             debug!(error = %error, "Could not read a device version for a sync pull");
             return Err(SyncRefusal::Unavailable);
@@ -506,9 +523,11 @@ async fn ensure_read(
 
 #[cfg(test)]
 mod tests {
-    use super::{head_of, listing_prefix, relative_key};
+    use super::{bucket_refusal, head_of, listing_prefix, relative_key};
+    use crate::s3::get_bucket_info::GetBucketInfoError;
     use crate::s3::list_object_versions::ListObjectVersionsItem;
-    use aruna_core::structs::SourceMetadata;
+    use aruna_core::errors::{ConversionError, StorageError};
+    use aruna_core::structs::{SourceMetadata, SyncRefusal};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -538,6 +557,32 @@ mod tests {
         assert!(!head.deleted);
         assert!(head_of(&version("notes/a/b.txt", false), "notes").is_none());
         assert!(head_of(&version("other/b.txt", true), "notes").is_none());
+    }
+
+    #[test]
+    fn keeps_reads_retryable() {
+        // The drain parks a NotFound for good, so only a bucket that is really
+        // absent may answer it; a storage fault must stay retryable.
+        assert_eq!(
+            bucket_refusal(GetBucketInfoError::NotFound),
+            SyncRefusal::NotFound
+        );
+        assert_eq!(
+            bucket_refusal(GetBucketInfoError::StorageError(
+                StorageError::KeyspaceError("unavailable".to_string())
+            )),
+            SyncRefusal::Unavailable
+        );
+        assert_eq!(
+            bucket_refusal(GetBucketInfoError::ConversionError(
+                ConversionError::FromStrError("broken".to_string())
+            )),
+            SyncRefusal::Unavailable
+        );
+        assert_eq!(
+            bucket_refusal(GetBucketInfoError::GetBucketInfoFailed),
+            SyncRefusal::Unavailable
+        );
     }
 
     #[test]
