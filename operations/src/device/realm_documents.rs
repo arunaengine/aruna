@@ -167,7 +167,17 @@ async fn install_documents(
             return false;
         }
     };
-    if let Some(installed) = load_realm_config(context, plan.realm_id).await {
+    let stored_config = read_bytes(
+        context,
+        DocumentSyncTarget::RealmConfig {
+            realm_id: plan.realm_id,
+        },
+    )
+    .await;
+    if let Some(installed) = stored_config
+        .as_deref()
+        .and_then(|bytes| RealmConfigDocument::from_bytes(bytes).ok())
+    {
         keep_revocations(&mut config, &installed, unix_timestamp_secs());
     }
     let actor = Actor {
@@ -179,6 +189,21 @@ async fn install_documents(
         warn!("A fetched realm configuration could not be stored");
         return false;
     };
+    // Nothing changed: writing it again would re-register every realm peer on
+    // every beat for a copy the device already holds.
+    let stored_authorization = read_bytes(
+        context,
+        DocumentSyncTarget::RealmAuthorization {
+            realm_id: plan.realm_id,
+        },
+    )
+    .await;
+    if stored_config.as_deref() == Some(bytes.as_slice())
+        && stored_authorization == documents.realm_authorization
+    {
+        debug!("This device already holds the realm documents it fetched");
+        return true;
+    }
     let mut writes = vec![(
         DocumentSyncTarget::RealmConfig {
             realm_id: plan.realm_id,
@@ -267,6 +292,27 @@ async fn installed_clock(context: &Arc<DriverContext>, realm_id: RealmId) -> Adm
         return AdminDocumentClock::default();
     };
     postcard::from_bytes(&bytes).unwrap_or_default()
+}
+
+/// One stored document, or `None` when this device holds it not (yet).
+async fn read_bytes(context: &Arc<DriverContext>, target: DocumentSyncTarget) -> Option<Vec<u8>> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            value.map(|bytes| bytes.as_ref().to_vec())
+        }
+        other => {
+            warn!(event = ?other, "Failed to read an installed realm document");
+            None
+        }
+    }
 }
 
 async fn write_bytes(
