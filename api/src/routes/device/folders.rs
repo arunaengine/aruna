@@ -85,6 +85,7 @@ pub struct EntryQuery {
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ActionQuery {
+    /// Cursor from a previous page.
     pub cursor: Option<String>,
 }
 
@@ -227,7 +228,7 @@ async fn folder_detail(
     post,
     path = "/device/folders",
     tag = "device",
-    summary = "Bind a local directory to a realm bucket prefix",
+    summary = "Bind a directory to a realm prefix",
     description = r#"Keeps a directory on this machine in sync with one prefix of one realm bucket.
 
 **Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. A device holds no group authorization document, so the owner binding is the whole local authority: the realm node that serves the folder authorizes the owner's WRITE on the remote bucket every time it pulls, and refuses the pull otherwise.
@@ -260,7 +261,31 @@ async fn folder_detail(
         })
     ),
     responses(
-        (status = 201, description = "The folder is bound and its first observation is registered", body = SyncedFolderView),
+        (status = 201, description = "The folder is bound and its first observation is registered", body = SyncedFolderView,
+            example = json!({
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": true,
+                "state": "active",
+                "counters": {
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            })),
         (status = 400, description = "Malformed ids, or an unusable directory", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -322,7 +347,31 @@ async fn bind_synced_folder(
 **Behavior**
 - The list is node-local and answers while the realm is unreachable."#,
     responses(
-        (status = 200, description = "The folders this device binds", body = SyncedFolderList),
+        (status = 200, description = "The folders this device binds", body = SyncedFolderList,
+            example = json!({"folders": [{
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": true,
+                "state": "active",
+                "counters": {
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            }]})),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
@@ -358,7 +407,31 @@ async fn list_synced_folders(
 - The counters are derived from the stored entries, so they always describe what the entries route would list."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder and its counters", body = SyncedFolderView),
+        (status = 200, description = "The folder and its counters", body = SyncedFolderView,
+            example = json!({
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": true,
+                "state": "active",
+                "counters": {
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -387,9 +460,7 @@ async fn get_synced_folder(
     summary = "Stop syncing a folder",
     description = r#"Unbinds one folder. Nothing on the owner's filesystem is touched.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
-
-**Authorization**: the owner binding alone, as for binding; the realm objects the folder published are untouched, so nothing outside this device is decided here.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. The owner binding is the whole authority, as it is for binding: the realm objects the folder published are untouched, so nothing outside this device is decided here.
 
 **Behavior**
 - The binding, its merge bases, its queued uploads and its audit log are removed from this device.
@@ -397,7 +468,8 @@ async fn get_synced_folder(
 - The files on disk, including any conflicted copies and anything in the folder's trash, are left exactly as they are."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder is unbound", body = UnboundFolder),
+        (status = 200, description = "The folder is unbound", body = UnboundFolder,
+            example = json!({"folder_id": "01JFOLDER0123456789ABCDEFG", "removed": 128})),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -446,7 +518,31 @@ async fn unbind_synced_folder(
 - Queued uploads stay queued; nothing on disk changes."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder is paused", body = SyncedFolderView),
+        (status = 200, description = "The folder is paused", body = SyncedFolderView,
+            example = json!({
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": true,
+                "state": "paused",
+                "counters": {
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -478,7 +574,31 @@ async fn pause_folder(
 **Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder is active again", body = SyncedFolderView),
+        (status = 200, description = "The folder is active again", body = SyncedFolderView,
+            example = json!({
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": true,
+                "state": "active",
+                "counters": {
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -514,7 +634,31 @@ async fn resume_folder(
 - A paused folder is refused."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder was reconciled", body = SyncedFolderView),
+        (status = 200, description = "The folder was reconciled", body = SyncedFolderView,
+            example = json!({
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": true,
+                "state": "active",
+                "counters": {
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -569,7 +713,25 @@ async fn sync_folder(
         EntryQuery
     ),
     responses(
-        (status = 200, description = "One page of the folder's entries", body = FolderEntryPage),
+        (status = 200, description = "One page of the folder's entries", body = FolderEntryPage,
+            example = json!({"entries": [{
+                "path": "notes/paper.txt",
+                "state": "conflict",
+                "local": {
+                    "size": 4096,
+                    "modified_at_ms": 1775748100000_i64,
+                    "fingerprint": "1000-17c3d4f9e00-17c3d4f9e00-2a",
+                    "blake3": "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
+                },
+                "remote": {
+                    "size": 4200,
+                    "modified_at_ms": 1775748150000_i64,
+                    "blake3": "6b1f8c9d0e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+                    "version_id": "01JJRSTVWXYZ0123456789ABCD"
+                },
+                "conflicted_copy": "notes/paper (conflicted copy 2026-08-25 1032, realm).txt",
+                "updated_at_ms": 1775748191000_i64
+            }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -637,7 +799,25 @@ async fn list_folder_entries(
         })
     ),
     responses(
-        (status = 200, description = "The entry as it stands after the action", body = FolderEntryView),
+        (status = 200, description = "The entry as it stands after the action", body = FolderEntryView,
+            example = json!({
+                "path": "notes/paper.txt",
+                "state": "in_sync",
+                "local": {
+                    "size": 4096,
+                    "modified_at_ms": 1775748100000_i64,
+                    "fingerprint": "1000-17c3d4f9e00-17c3d4f9e00-2a",
+                    "blake3": "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
+                },
+                "remote": {
+                    "size": 4200,
+                    "modified_at_ms": 1775748150000_i64,
+                    "blake3": "6b1f8c9d0e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+                    "version_id": "01JJRSTVWXYZ0123456789ABCD"
+                },
+                "conflicted_copy": "notes/paper (conflicted copy 2026-08-25 1032, realm).txt",
+                "updated_at_ms": 1775748191000_i64
+            })),
         (status = 400, description = "Malformed ids or hashes", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -732,7 +912,31 @@ fn action_kind(action: EntryAction) -> ActionKind {
         example = json!({"action": "replace_local", "scope": "all_pending", "confirm": "data"})
     ),
     responses(
-        (status = 200, description = "The folder with fresh counters", body = SyncedFolderView),
+        (status = 200, description = "The folder with fresh counters", body = SyncedFolderView,
+            example = json!({
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": true,
+                "state": "active",
+                "counters": {
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            })),
         (status = 400, description = "Malformed folder id or an unsupported action", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -795,7 +999,17 @@ async fn act_on_folder(
         ActionQuery
     ),
     responses(
-        (status = 200, description = "One page of the folder's audit log", body = ActionRecordPage),
+        (status = 200, description = "One page of the folder's audit log", body = ActionRecordPage,
+            example = json!({"actions": [{
+                "action": "replace_local",
+                "scope": "entry",
+                "path": "notes/paper.txt",
+                "actor": "01JUSER0123456789ABCDEFGHI",
+                "at_ms": 1775748191000_i64,
+                "before_blake3": "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
+                "after_blake3": "6b1f8c9d0e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+                "outcome": "applied"
+            }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),

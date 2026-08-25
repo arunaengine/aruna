@@ -39,7 +39,34 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
 - `bytes_done` stays 0 until a transfer settles: a pull moves the bytes in one pass, so there is no partial progress to report.
 - The list is node-local and answers while the realm is unreachable."#,
     responses(
-        (status = 200, description = "The transfers this device still owes", body = DeviceTransferList),
+        (status = 200, description = "The transfers this device still owes", body = DeviceTransferList,
+            example = json!({
+                "uploads": [{
+                    "id": "01JFOLDER0123456789ABCDEFG:notes/paper.txt",
+                    "direction": "upload",
+                    "folder_id": "01JFOLDER0123456789ABCDEFG",
+                    "path": "notes/paper.txt",
+                    "bucket": "lab-data",
+                    "key": "ada/notes/paper.txt",
+                    "state": "queued",
+                    "bytes_total": 4096,
+                    "bytes_done": 0,
+                    "attempts": 0
+                }],
+                "downloads": [{
+                    "id": "01JFOLDER0123456789ABCDEFG:notes/reads.fastq",
+                    "direction": "download",
+                    "folder_id": "01JFOLDER0123456789ABCDEFG",
+                    "path": "notes/reads.fastq",
+                    "bucket": "lab-data",
+                    "key": "ada/notes/reads.fastq",
+                    "state": "running",
+                    "bytes_total": 1048576,
+                    "bytes_done": 0,
+                    "attempts": 1,
+                    "next_attempt_ms": 1775748191000_i64
+                }]
+            })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),

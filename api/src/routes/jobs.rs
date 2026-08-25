@@ -900,8 +900,7 @@ on that bucket and that it belongs to the same group.
   executes, admits or stores any part of the job. A device forwards the caller's own bearer token,
   so a submission it cannot back with one is a 403 rather than a forwarded request.
 
-**Target `local`** (a user device only; any other node answers 400)
-- The job runs on this machine for the user the device is enrolled for, and is refused for anyone
+- `target` `local` is served by a user device only; any other node answers 400. The job runs on this machine for the user the device is enrolled for, and is refused for anyone
   else with a 403. Nothing about it is forwarded, replicated or offered to the realm, and the
   response carries no `submission_id`: a local run belongs to no submission family.
 - Inputs must be readable on the device. An input naming `source_node_id` and `version_id` is a
