@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::admin_documents::AdminDocumentEvent;
+use aruna_core::admin_document_reducer::AdminDocumentReducerState;
+use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget};
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::StorageEffect;
@@ -12,12 +13,15 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+    ADMIN_DOCUMENT_STATE_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataError, MetadataProfileValidationStatus, MetadataQueryResults,
 };
-use aruna_core::storage_entries::metadata_create_acceptance_key;
+use aruna_core::storage_entries::{
+    admin_document_reducer_state_key, metadata_create_acceptance_key,
+};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, JobId, MetadataRegistryRecord,
     MintPersistentIdSpec, Permission, PersistentIdFailure, PersistentIdMapping, PlacementRef,
@@ -2122,7 +2126,30 @@ async fn read_realm_documents(
     Ok(RealmDocuments {
         realm_config,
         realm_authorization,
+        clock: applied_clock(context, realm_id).await,
     })
+}
+
+/// What this node has applied to the realm configuration, as the reducer keeps
+/// it. A device compares it with its own copy's and never accepts less.
+async fn applied_clock(context: &Arc<DriverContext>, realm_id: RealmId) -> AdminDocumentClock {
+    let key = admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(bytes), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    else {
+        return AdminDocumentClock::default();
+    };
+    postcard::from_bytes::<AdminDocumentReducerState>(&bytes)
+        .map(|state| state.clock)
+        .unwrap_or_default()
 }
 
 /// One stored document, or `None` when this node holds it not (yet).

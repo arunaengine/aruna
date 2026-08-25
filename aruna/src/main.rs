@@ -358,6 +358,9 @@ struct CoreAnnouncement {
     allow_genesis: bool,
 }
 
+/// How long a device waits for the realm documents before it serves anyway.
+const STARTUP_DOCUMENT_FETCH: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn prepare_startup(
     config: &Config,
     driver_ctx: &Arc<DriverContext>,
@@ -376,10 +379,11 @@ async fn prepare_startup(
     // Prepare local topics before binding; remote convergence stays behind the gate.
     prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
     // A device runs no document sync, so it fetches the realm documents it is
-    // judged by before it serves anything. A realm that cannot be reached is no
-    // reason to stay down: the stored copy answers until the next attempt.
+    // judged by before it serves anything. The attempt is short on purpose: an
+    // unreachable realm must not keep the owner's own machine down, and the
+    // stored copy answers until the beat retries.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
-        && !fetch_realm_documents(driver_ctx).await
+        && !fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH).await
     {
         warn!("Serving this device from its stored realm documents for now");
     }

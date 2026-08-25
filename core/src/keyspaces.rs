@@ -135,6 +135,11 @@ pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
 /// realm state only when the drain forwards it as an ordinary create.
 pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 
+/// The realm-config clock the realm documents this device holds were copied at,
+/// keyed by realm id. It is what keeps a later copy from rolling the device
+/// back, and it is never replicated.
+pub const DEVICE_REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
+
 /// Device-local bindings of a directory to a realm bucket prefix, keyed by
 /// folder id. Never replicated: the root path must not leave the machine.
 pub const SYNCED_FOLDER_KEYSPACE: &str = "synced_folders";

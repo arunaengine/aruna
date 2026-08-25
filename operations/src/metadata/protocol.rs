@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_core::admin_documents::AdminDocumentEvent;
+use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
@@ -423,6 +423,9 @@ pub struct RealmDocuments {
     pub realm_config: Vec<u8>,
     /// Absent while the realm has no authorization document yet.
     pub realm_authorization: Option<Vec<u8>>,
+    /// What the serving node had applied when it made this copy. A device
+    /// refuses a copy that has seen less than the one it already holds.
+    pub clock: AdminDocumentClock,
 }
 
 /// One page of immutable records plus the cursor of the next one.

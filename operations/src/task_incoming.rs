@@ -168,6 +168,10 @@ const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 /// How long a device keeps its copy of the realm documents before asking for
 /// them again. A revocation reaches it within this window at the latest.
 const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
+
+/// How long one attempt may spend on the realm as a whole. The folder cadence
+/// is what it shares that time with, so it is bounded once, not per node.
+const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_SWEEP_TICKS: usize = 12;
 /// How long a record may wait for its shard topic's genesis before the drain
@@ -965,7 +969,11 @@ impl OperationsTaskHandler {
                 return;
             }
         }
-        let fetched = crate::device::realm_documents::fetch_realm_documents(&self.context).await;
+        let fetched = crate::device::realm_documents::fetch_realm_documents(
+            &self.context,
+            REALM_DOCUMENTS_BUDGET,
+        )
+        .await;
         let mut state = self
             .realm_documents
             .lock()
