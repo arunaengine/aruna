@@ -8,6 +8,9 @@ mod topology;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, BucketInfo, EntryState, FolderMode, RemoteBinding,
@@ -24,7 +27,7 @@ use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperati
 use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use futures_util::StreamExt;
-use topology::{TestResult, Topology};
+use topology::{TestResult, Topology, wait_for_convergence};
 use ulid::Ulid;
 
 const MANAGEMENT_NODES: usize = 2;
@@ -34,6 +37,39 @@ const REMOTE_BUCKET: &str = "lab-data";
 
 fn body(bytes: &'static [u8]) -> BackendStream<Result<bytes::Bytes, StreamError>> {
     BackendStream::new(tokio_util::io::ReaderStream::new(bytes))
+}
+
+async fn read_row(context: &DriverContext, key_space: &str, key: &[u8]) -> Option<Vec<u8>> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|v| v.to_vec()),
+        _ => None,
+    }
+}
+
+/// Waits until the device holds the group's admin documents.
+///
+/// The shared fixture only waits for the sync-eligible nodes, and a User node
+/// never is one. A pull is served against the group's authorization document,
+/// so a folder bound before it arrives is refused with `ReadDenied`.
+async fn await_group(realm: &Topology, group_id: GroupId) -> TestResult<()> {
+    let device = realm.user_node();
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "the seeded group never reached the device",
+        || async {
+            let auth = read_row(&device.context, AUTH_KEYSPACE, &group_id.to_bytes()).await;
+            let record = read_row(&device.context, GROUP_KEYSPACE, &group_id.to_bytes()).await;
+            Ok(usize::from(auth.is_none() || record.is_none()))
+        },
+    )
+    .await
 }
 
 async fn create_bucket(
@@ -210,6 +246,7 @@ async fn bind(
 async fn syncs_both_directions() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
+    await_group(&realm, group_id).await?;
     let device = realm.user_node();
     let server = realm.node(0);
     create_bucket(&server.context, group_id, realm.user_id).await?;
@@ -269,6 +306,7 @@ async fn syncs_both_directions() -> TestResult<()> {
 async fn resolves_conflicts() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
+    await_group(&realm, group_id).await?;
     let device = realm.user_node();
     let server = realm.node(0);
     create_bucket(&server.context, group_id, realm.user_id).await?;
