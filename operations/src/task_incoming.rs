@@ -517,6 +517,19 @@ enum DeferOutcome {
     Undeliverable,
 }
 
+/// The shared realm topics one drain page published, which the realm's devices
+/// read but never fetch on their own.
+fn device_push_topics(records: &[DrainRecord]) -> Vec<irokle::TopicId> {
+    let mut topics: Vec<irokle::TopicId> = records
+        .iter()
+        .filter(|(_, record, _)| crate::startup::realm_wide_target(&record.target))
+        .map(|(_, _, topic)| *topic)
+        .collect();
+    topics.sort();
+    topics.dedup();
+    topics
+}
+
 /// Splits FIFO-ordered drain records into those to publish now, those deferred
 /// because their shard topic has no local genesis yet, and those that can never
 /// publish from this node at all.
@@ -1234,17 +1247,7 @@ impl OperationsTaskHandler {
         // sources: a target must see writes made during the window.
         if let Some(config) = config {
             let now_ms = aruna_core::util::unix_timestamp_millis();
-            // A realm-wide publish also targets the realm's devices: they hold
-            // no realm data but read the shared configuration, revocations
-            // included, and never fetch it themselves.
-            let wide_peers = crate::startup::realm_wide_peers(config, net_handle.node_id());
             for (_, record, _) in &mut records {
-                if crate::startup::realm_wide_target(&record.target) {
-                    if !wide_peers.is_empty() {
-                        record.peers = wide_peers.clone();
-                    }
-                    continue;
-                }
                 if !record.target.uses_shard_topic() {
                     continue;
                 }
@@ -1256,6 +1259,33 @@ impl OperationsTaskHandler {
             }
         }
         records
+    }
+
+    /// Hands the shared realm documents to this realm's devices after the drain
+    /// published them. It is deliberately outside the drain's outcome: a device
+    /// is not realm infrastructure, so one that is offline is logged and left to
+    /// fetch the topics itself, never a reason to retry the drain.
+    async fn push_to_devices(
+        &self,
+        net_handle: &aruna_net::NetHandle,
+        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        topics: Vec<irokle::TopicId>,
+    ) {
+        let Some(config) = config else {
+            return;
+        };
+        if topics.is_empty() {
+            return;
+        }
+        let peers = crate::startup::realm_device_peers(config, net_handle.node_id());
+        if peers.is_empty() {
+            return;
+        }
+        if let DocumentSyncNetEvent::Error { error, .. } =
+            net_handle.sync_document_topics(topics, peers).await
+        {
+            debug!(error = %error, "Could not hand the shared realm documents to every device");
+        }
     }
 
     async fn process_drain_page(
@@ -1320,6 +1350,7 @@ impl OperationsTaskHandler {
             warn!(%error, "Failed to delete relayed admin outbox records");
         }
 
+        let device_topics = device_push_topics(&to_publish);
         let (groups, subbatches) = Self::build_drain_batches(to_publish);
         invocation.groups += groups;
         invocation.subbatches += subbatches.len();
@@ -1328,6 +1359,8 @@ impl OperationsTaskHandler {
             .await;
         invocation.publish_elapsed += publish_elapsed;
         invocation.outcome.merge(outcome);
+        self.push_to_devices(net_handle, config, device_topics)
+            .await;
     }
 
     fn build_drain_batches(records: Vec<DrainRecord>) -> (usize, Vec<DrainSubBatch>) {
@@ -3538,6 +3571,43 @@ mod tests {
             shard: 1,
         };
         value
+    }
+
+    // The device push carries the shared realm documents and nothing else: a
+    // group or shard record is realm infrastructure and never rides it.
+    #[test]
+    fn pushes_realm_documents() {
+        let realm_id = RealmId([3; 32]);
+        let config_topic = irokle::TopicId::hash(b"realm-config-topic");
+        let group_topic = irokle::TopicId::hash(b"group-topic");
+        let records = vec![
+            (
+                b"config".to_vec(),
+                admin_outbox(
+                    realm_id,
+                    node(4),
+                    1,
+                    DocumentSyncTarget::RealmConfig { realm_id },
+                    admin_placement(1),
+                ),
+                config_topic,
+            ),
+            (
+                b"authorization".to_vec(),
+                admin_outbox(
+                    realm_id,
+                    node(4),
+                    2,
+                    DocumentSyncTarget::RealmAuthorization { realm_id },
+                    admin_placement(1),
+                ),
+                config_topic,
+            ),
+            (b"group".to_vec(), admin_record(node(4), 3), group_topic),
+        ];
+
+        assert_eq!(device_push_topics(&records), vec![config_topic]);
+        assert!(device_push_topics(&records[2..]).is_empty());
     }
 
     // A blocked admin operation blocks the rest of its origin sequence for the

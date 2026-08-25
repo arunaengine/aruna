@@ -76,24 +76,20 @@ fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<Node
         .collect()
 }
 
-/// Peers one realm-wide topic is exchanged with. A device holds no realm data
-/// but must keep receiving the shared configuration, revocations included, so a
-/// realm node pushes these topics to it as well. The device only ever receives:
-/// it never targets another device, and it never serves the protocol.
-pub(crate) fn realm_wide_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
-    let mut peers = shared_topic_peers(config, node_id);
+/// The realm's devices, as a best-effort push target for the shared realm
+/// documents. They are never realm infrastructure: a device may be offline for
+/// days, so it is kept out of every peer set whose failure blocks the realm.
+pub(crate) fn realm_device_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
     if !sync_eligible_node(config, node_id) {
-        return peers;
+        return Vec::new();
     }
-    peers.extend(
-        config
-            .nodes
-            .iter()
-            .filter(|node| !node.kind.is_sync_eligible())
-            .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-            .filter(|candidate| *candidate != node_id),
-    );
-    peers
+    config
+        .nodes
+        .iter()
+        .filter(|node| !node.kind.is_sync_eligible())
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .filter(|candidate| *candidate != node_id)
+        .collect()
 }
 
 /// Work units one bounded restore pass may process. A work-unit limit, never a
@@ -1113,21 +1109,16 @@ fn plan_shard_groups(
         && shared_peers
             .iter()
             .all(|peer| node_id.as_bytes() < peer.as_bytes());
-    let mut wide_peers = realm_wide_peers(config, node_id);
-    wide_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        let wide = realm_wide_target(&target);
-        let groups = if wide && !realm_minter {
+        // Restore probes and syncs its peers as infrastructure, so only
+        // sync-eligible nodes belong here; devices are pushed to separately.
+        let groups = if realm_wide_target(&target) && !realm_minter {
             &mut plan.shared_join_groups
         } else {
             &mut plan.shared_groups
         };
-        let peers = match wide {
-            true => wide_peers.clone(),
-            false => shared_peers.clone(),
-        };
-        groups.entry(peers).or_default().push(topic);
+        groups.entry(shared_peers.clone()).or_default().push(topic);
         plan.summary.shared_topics += 1;
     }
 
@@ -1741,10 +1732,11 @@ mod tests {
         );
     }
 
-    // A revoked token must reach the device that holds it, so a realm node
-    // pushes the shared realm topics to devices while a device pushes nothing.
+    // A device may be offline for days, so it must never sit in a peer set the
+    // restore probes and syncs: those failures block the realm's own recovery.
+    // It is a separate best-effort push target instead.
     #[test]
-    fn realm_topics_reach_devices() {
+    fn units_skip_devices() {
         let realm_id = RealmId([7; 32]);
         let (server, other, device) = (node(1), node(2), node(3));
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
@@ -1757,13 +1749,16 @@ mod tests {
             },
         );
 
-        let from_server = realm_wide_peers(&config, server);
-        assert!(from_server.contains(&device));
-        assert!(from_server.contains(&other));
-        let from_device = realm_wide_peers(&config, device);
-        assert_eq!(from_device.len(), 2);
-        assert!(from_device.contains(&server) && from_device.contains(&other));
-        assert!(!shared_topic_peers(&config, server).contains(&device));
+        for unit in plan_shard_groups(&config, server, realm_id, 0).into_units() {
+            assert!(
+                !unit.peers.contains(&device),
+                "{:?} targets a device",
+                unit.kind
+            );
+        }
+        assert_eq!(realm_device_peers(&config, server), vec![device]);
+        // A device pushes to nobody: it is not the realm's infrastructure.
+        assert!(realm_device_peers(&config, device).is_empty());
     }
 
     #[test]
