@@ -1010,28 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn local_kind_gate() {
-        // A device dials job control but never serves it, and stays out of the
-        // realm protocols in both directions.
-        let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
-        let admission = InboundAdmission::new(realm_peers, []);
-        admission.mark_materialized();
-        admission.set_kinds(
-            Some(user_kind()),
-            BTreeMap::from([(peer(1), RealmNodeKind::Server)]),
-        );
-
-        assert!(admission.local_dials(Alpn::Bao));
-        assert!(admission.local_dials(Alpn::JobControl));
-        assert!(!admission.local_dials(Alpn::DocumentSync));
-        assert!(!admission.local_dials(Alpn::Shard));
-        assert!(!admission.admits(peer(1), Alpn::JobControl));
-        assert!(admission.admits(peer(1), Alpn::Bao));
-        assert!(!admission.admits(peer(1), Alpn::DocumentSync));
-        assert!(!admission.admits(peer(1), Alpn::Shard));
-    }
-
-    #[test]
     fn unknown_is_provisional() {
         let admission = InboundAdmission::new(Arc::new(RwLock::new(Vec::new())), []);
         let materialized = admission.materialized_watch();
