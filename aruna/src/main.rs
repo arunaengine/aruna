@@ -1044,10 +1044,9 @@ impl From<&'static str> for ComputeBuildError {
     }
 }
 
-/// The container-facing S3 endpoint the Docker registry publishes, or `None` in
-/// the local-only profile a user device runs: it stages files, hands containers
-/// no endpoint and exposes no S3 listener, so the checks that keep a shared
-/// deployment reachable would only refuse a working machine.
+/// The container-facing S3 endpoint the Docker registry carries, or `None` in
+/// the local-only profile a user device runs: it exposes no S3 listener, so the
+/// checks that keep a shared deployment reachable would only refuse it.
 #[cfg(any(feature = "docker", test))]
 fn docker_workspace(
     local_only: bool,

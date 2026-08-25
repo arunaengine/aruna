@@ -104,12 +104,22 @@ requirements: a device stages files and exposes no S3 listener a container could
 reach. Apptainer is unchanged and still needs its delegated cgroup root.
 
 A local run stages its inputs as files into the node-local workspace bucket
-`ws-<jobid>` and leaves its outputs there, where the owner can publish them. It
-refuses mounted inputs, `workspace.mode` `none` and Direct-S3 staging, all of
-which need an S3 endpoint the device does not expose, and `workspace.mode`
-`existing`, because its outputs stay in its own workspace bucket. A realm input is copied
-onto the device before the run, as an ordinary local object and never as a
-reference. A run is refused while this node's compute plane is drained.
+`ws-<jobid>`. It refuses mounted inputs, `workspace.mode` `none` and Direct-S3
+staging, all of which need an S3 endpoint the device does not expose, and
+`workspace.mode` `existing`.
+
+Where an output lands depends on the surface. `POST /jobs/` declares workspace
+outputs, which stay in `ws-<jobid>` until the owner publishes them. A TES task
+declares each output with an `s3://bucket/key` url, and a local task writes it to
+the device-local bucket that url names, which must belong to the execution group
+and grant the owner WRITE.
+
+An input this device does not hold is refused at submit unless it names the realm
+node and version holding it; staging then fetches that exact version into
+`ws-<jobid>` as an ordinary local object, never as a reference. A holder it
+cannot reach fails the run, not the submission. A run is refused while this
+node's compute plane is drained, and while the owner's unfinished runs already
+reach `ARUNA_COMPUTE_MAX_CONCURRENT`.
 
 Local runs are listed by the ordinary `GET /jobs/` of the device's own API, and
 `GET /device/compute` reports the plane the owner configured. Nothing about a
