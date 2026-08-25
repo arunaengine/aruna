@@ -13,9 +13,9 @@ use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
     InputMode, InputSelection, InputSource, JobError, JobInputFact, JobRecord,
     MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection, PathRestriction,
-    Permission, PlacementPolicyRef, UserAccess, WorkspaceMode, blob_bucket_permission_path,
-    blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
-    workspace_credential_id,
+    Permission, PlacementPolicyRef, UserAccess, VersionedObjectArn, WorkspaceMode,
+    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
+    ensure_confined_relative_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -29,8 +29,10 @@ use crate::driver::{
     quota_marked_routing, routing_snapshot,
 };
 use crate::get_realm_config::GetRealmConfigOperation;
+use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::store::reserve_output_commits;
-use crate::replication::protocol::ReplicationMode;
+use crate::replication::bao_read::{BaoReadOutput, local_is_user, managed_read};
+use crate::replication::protocol::{BaoReadRequest, BaoReadTarget, ReplicationMode};
 use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
@@ -1081,6 +1083,67 @@ async fn remote_source(
     })
 }
 
+/// One exact realm version a device fetches for itself.
+///
+/// A device plans nothing and holds no sealed facts, so the request's own
+/// version is the only authority. The bytes land in the run's own workspace
+/// bucket through the ordinary staging write below: a materialized local copy,
+/// never a reference to the realm version.
+async fn device_source(
+    context: &DriverContext,
+    record: &JobRecord,
+    input: &InputSelection,
+    source: NodeId,
+) -> Result<StagedSource, JobError> {
+    let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    let version = version_id
+        .as_deref()
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| JobError::permanent(format!("input version is invalid for {bucket}/{key}")))?
+        .ok_or_else(|| {
+            JobError::permanent(format!("realm input {bucket}/{key} names no exact version"))
+        })?;
+    let realm_id = record.created_by.realm_id;
+    let request = BaoReadRequest {
+        auth_context: AuthContext {
+            user_id: record.created_by,
+            realm_id,
+            path_restrictions: None,
+        },
+        realm_id,
+        target: BaoReadTarget::ExactVersion(VersionedObjectArn {
+            realm_id,
+            node_id: source,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version,
+        }),
+        expected_blake3: None,
+        metadata_only: false,
+        // A device is never a managed-copy destination; the read is the
+        // owner-bound device read, which refuses governed content outright.
+        destination: None,
+        known_refs: Vec::new(),
+    };
+    match managed_read(context, source, request).await {
+        Ok(BaoReadOutput::Stream { blob, size, .. }) => Ok(StagedSource {
+            blob,
+            location: None,
+            size: Some(size),
+            source_policies: Vec::new(),
+        }),
+        Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
+            "staging {bucket}/{key} received no bytes"
+        ))),
+        Err(error) => Err(stage_error(bucket, key, Some(error))),
+    }
+}
+
 async fn stage_one_input(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -1103,15 +1166,24 @@ async fn stage_one_input(
                 "invalid input version_id for {src_bucket}/{src_key}"
             ))
         })?;
-    let staged = if input.source_node_id.is_some_and(|source| source != node_id) {
+    let staged = if let Some(source) = input.source_node_id.filter(|source| *source != node_id) {
         // A forwarded plan has already validated the source at its ingress
         // endpoint; only the explicit exact-version staging path is local here.
-        let fact = record
+        match record
             .input_facts
             .iter()
             .find(|fact| fact.destination_key == input.dest_key)
-            .ok_or_else(|| JobError::permanent("sealed input facts are missing".to_string()))?;
-        Box::pin(remote_source(context, record, input, fact)).await?
+        {
+            Some(fact) => Box::pin(remote_source(context, record, input, fact)).await?,
+            None => {
+                if !local_is_user(context, record.created_by.realm_id).await {
+                    return Err(JobError::permanent(
+                        "sealed input facts are missing".to_string(),
+                    ));
+                }
+                Box::pin(device_source(context, record, input, source)).await?
+            }
+        }
     } else {
         let bucket_info = Box::pin(drive(
             GetBucketInfoOperation::new(src_bucket.clone()),
