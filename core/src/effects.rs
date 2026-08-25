@@ -12,7 +12,7 @@ use crate::stream::{BackendStream, StreamError};
 use crate::structs::{
     BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey,
     JobRecordEnvelope, JobRecordKind, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim,
-    RealmId, ResolvedBackend, ResolvedSourceAccess, SubmissionId,
+    RealmId, ResolvedBackend, ResolvedSourceAccess, SubmissionId, WriteGuard,
 };
 use crate::task::TaskEffect;
 use crate::types::UserId;
@@ -27,6 +27,7 @@ use ulid::Ulid;
 pub enum Effect {
     Blob(BlobEffect),
     StagingSource(StagingSourceEffect),
+    LocalFile(LocalFileEffect),
     Storage(StorageEffect),
     Net(NetEffect),
     Metadata(MetadataEffect),
@@ -161,6 +162,85 @@ pub enum StagingSourceEffect {
         access: ResolvedSourceAccess,
         range: Option<Range<u64>>,
     },
+}
+
+/// Writes into a folder the owner bound on their own machine. Every variant is
+/// non-destructive by construction: a write only lands through a guard the
+/// adapter re-verifies at rename time, a conflicted copy never replaces
+/// anything, and a removal moves the file aside instead of unlinking it.
+#[derive(Debug)]
+pub enum LocalFileEffect {
+    Write {
+        root: String,
+        relative: String,
+        guard: WriteGuard,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Adds the incoming bytes beside the file under a free conflicted-copy
+    /// name. The file the owner has is never touched.
+    WriteConflicted {
+        root: String,
+        relative: String,
+        /// Timestamp the copy is named after, so the name is reproducible.
+        at_ms: u64,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Moves one file into the folder's trash directory.
+    MoveAside { root: String, relative: String },
+    /// Weak fingerprint and blake3 of one file, read as one stable observation.
+    Hash { root: String, relative: String },
+}
+
+impl PartialEq for LocalFileEffect {
+    /// Streams carry no identity, so two write effects compare by their target
+    /// and their guard alone.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                LocalFileEffect::Write {
+                    root,
+                    relative,
+                    guard,
+                    ..
+                },
+                LocalFileEffect::Write {
+                    root: other_root,
+                    relative: other_relative,
+                    guard: other_guard,
+                    ..
+                },
+            ) => root == other_root && relative == other_relative && guard == other_guard,
+            (
+                LocalFileEffect::WriteConflicted {
+                    root,
+                    relative,
+                    at_ms,
+                    ..
+                },
+                LocalFileEffect::WriteConflicted {
+                    root: other_root,
+                    relative: other_relative,
+                    at_ms: other_at,
+                    ..
+                },
+            ) => root == other_root && relative == other_relative && at_ms == other_at,
+            (
+                LocalFileEffect::MoveAside { root, relative },
+                LocalFileEffect::MoveAside {
+                    root: other_root,
+                    relative: other_relative,
+                },
+            )
+            | (
+                LocalFileEffect::Hash { root, relative },
+                LocalFileEffect::Hash {
+                    root: other_root,
+                    relative: other_relative,
+                },
+            ) => root == other_root && relative == other_relative,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]

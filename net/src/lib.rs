@@ -2636,6 +2636,7 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
+        Effect::LocalFile(_) => "local_file",
         Effect::Storage(_) => "storage",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",

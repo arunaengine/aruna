@@ -5,7 +5,7 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
+use aruna_core::effects::{BlobEffect, Effect, LocalFileEffect, StagingSourceEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
@@ -174,6 +174,9 @@ impl Handle for BlobHandle {
             Effect::StagingSource(staging_source_effect) => {
                 self.send_staging_source_effect(staging_source_effect).await
             }
+            Effect::LocalFile(local_file_effect) => {
+                self.send_local_file_effect(local_file_effect).await
+            }
             _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
         }
     }
@@ -309,6 +312,31 @@ impl BlobHandle {
 
     pub fn clear_reservation(&self, id: Ulid) {
         self.handler.clear_active(id);
+    }
+
+    /// Executes one write into a folder the owner bound on this machine. The
+    /// adapter enforces the jail and the guard; the policy is the operation's.
+    pub async fn send_local_file_effect(&self, effect: LocalFileEffect) -> Event {
+        Event::LocalFile(match effect {
+            LocalFileEffect::Write {
+                root,
+                relative,
+                guard,
+                blob,
+            } => crate::fs_source::write_guarded(&root, &relative, &guard, blob).await,
+            LocalFileEffect::WriteConflicted {
+                root,
+                relative,
+                at_ms,
+                blob,
+            } => crate::fs_source::write_conflicted(&root, &relative, at_ms, blob).await,
+            LocalFileEffect::MoveAside { root, relative } => {
+                crate::fs_source::move_aside(&root, &relative).await
+            }
+            LocalFileEffect::Hash { root, relative } => {
+                crate::fs_source::hash_local(&root, &relative).await
+            }
+        })
     }
 
     pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {

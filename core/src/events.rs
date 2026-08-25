@@ -27,6 +27,7 @@ use ulid::Ulid;
 pub enum Event {
     Blob(BlobEvent),
     StagingSource(StagingSourceEvent),
+    LocalFile(LocalFileEvent),
     Storage(StorageEvent),
     Net(NetEvent),
     Metadata(MetadataEvent),
@@ -143,6 +144,52 @@ pub enum StagingSourceEvent {
     },
     Error {
         error: StagingSourceError,
+    },
+}
+
+/// Why the adapter refused to touch a file on the owner's disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalFileRefusal {
+    /// The target no longer carries the bytes the guard named.
+    Drifted,
+    /// The target exists and the guard forbids replacing anything.
+    Exists,
+    Missing,
+    /// The path resolved outside the folder root.
+    Escaped,
+    /// The target is not a regular file, so no guard can vouch for its bytes.
+    NotRegular,
+}
+
+/// Reply to a [`crate::effects::LocalFileEffect`]. A refusal is an outcome, not
+/// a fault: the operation records it and reports the entry to the owner.
+#[derive(Debug, PartialEq)]
+pub enum LocalFileEvent {
+    Written {
+        fingerprint: String,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    /// The incoming bytes landed beside the file under this relative path.
+    Copied {
+        relative: String,
+        fingerprint: String,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    Moved {
+        to: String,
+    },
+    Hashed {
+        fingerprint: String,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    Refused {
+        reason: LocalFileRefusal,
+    },
+    Error {
+        message: String,
     },
 }
 
