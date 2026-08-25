@@ -125,7 +125,7 @@ async fn finish_write(
 
 /// Moves one file into the folder's trash. A removal is never an unlink: the
 /// bytes stay on the owner's disk until the owner removes them.
-pub(crate) async fn move_aside(root: &str, relative: &str) -> LocalFileEvent {
+pub(crate) async fn move_aside(root: &str, relative: &str, guard: &WriteGuard) -> LocalFileEvent {
     let resolved_root = match canonical_root(root).await {
         Ok(root) => root,
         Err(error) => {
@@ -152,12 +152,33 @@ pub(crate) async fn move_aside(root: &str, relative: &str) -> LocalFileEvent {
             };
         }
     }
+    let resolved = resolved_root.join(relative);
+    if let WriteGuard::MatchesBase {
+        fingerprint,
+        blake3,
+    } = guard
+    {
+        // The owner asked to remove exactly these bytes; anything else stays.
+        match hash_stable(&resolved).await {
+            Ok((current, hash, _)) if current == *fingerprint && hash == *blake3 => {}
+            Ok(_) => {
+                return LocalFileEvent::Refused {
+                    reason: LocalFileRefusal::Drifted,
+                };
+            }
+            Err(_) => {
+                return LocalFileEvent::Refused {
+                    reason: LocalFileRefusal::Drifted,
+                };
+            }
+        }
+    }
     let trashed = format!("{SYNC_TRASH_DIR}/{relative}");
     let (parent, _) = match jailed_target(root, &trashed).await {
         Ok(resolved) => resolved,
         Err(event) => return event,
     };
-    let source = resolved_root.join(relative);
+    let source = resolved;
     for attempt in 1..=MAX_COPY_ATTEMPTS {
         let candidate = suffixed_name(relative, attempt);
         match place_new(&source, &parent.join(&candidate)) {
@@ -728,7 +749,9 @@ mod tests {
             .await
             .unwrap();
 
-        let LocalFileEvent::Moved { to } = move_aside(&path, "gone.txt").await else {
+        let LocalFileEvent::Moved { to } =
+            move_aside(&path, "gone.txt", &WriteGuard::MustNotExist).await
+        else {
             panic!("the file must move into the trash");
         };
         assert_eq!(to, format!("{SYNC_TRASH_DIR}/gone.txt"));
@@ -738,7 +761,7 @@ mod tests {
             b"kept"
         );
         assert_eq!(
-            move_aside(&path, "gone.txt").await,
+            move_aside(&path, "gone.txt", &WriteGuard::MustNotExist).await,
             LocalFileEvent::Refused {
                 reason: LocalFileRefusal::Missing
             }
@@ -789,7 +812,7 @@ mod tests {
         tokio::fs::write(root.path().join("keep.txt"), b"keep")
             .await
             .unwrap();
-        move_aside(&path, "keep.txt").await;
+        move_aside(&path, "keep.txt", &WriteGuard::MustNotExist).await;
         tokio::fs::write(root.path().join("keep.txt"), b"again")
             .await
             .unwrap();

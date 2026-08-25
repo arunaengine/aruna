@@ -196,6 +196,9 @@ pub struct ActionRecordView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_blake3: Option<String>,
     pub outcome: ActionOutcomeName,
+    /// Where a removal put the file, relative to the folder root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trashed_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -357,6 +360,7 @@ pub fn action_view(record: SyncActionRecord) -> ActionRecordView {
         before_blake3: record.before.as_ref().map(hex_hash),
         after_blake3: record.after.as_ref().map(hex_hash),
         outcome,
+        trashed_to: record.trashed_to,
         message,
     }
 }

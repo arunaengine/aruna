@@ -512,6 +512,9 @@ pub struct SyncActionRecord {
     pub before: Option<[u8; 32]>,
     pub after: Option<[u8; 32]>,
     pub outcome: ActionOutcome,
+    /// Where a removal put the file. It is never unlinked, so the owner can
+    /// always find the bytes an action moved.
+    pub trashed_to: Option<String>,
     /// Entries an all-pending action covered.
     pub entries: usize,
 }

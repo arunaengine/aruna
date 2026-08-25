@@ -328,9 +328,11 @@ impl BlobHandle {
                 at_ms,
                 blob,
             } => crate::fs_write::write_conflicted(&root, &relative, at_ms, blob).await,
-            LocalFileEffect::MoveAside { root, relative } => {
-                crate::fs_write::move_aside(&root, &relative).await
-            }
+            LocalFileEffect::MoveAside {
+                root,
+                relative,
+                guard,
+            } => crate::fs_write::move_aside(&root, &relative, &guard).await,
             LocalFileEffect::Hash { root, relative } => {
                 crate::fs_write::hash_local(&root, &relative).await
             }

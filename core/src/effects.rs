@@ -185,8 +185,13 @@ pub enum LocalFileEffect {
         at_ms: u64,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
-    /// Moves one file into the folder's trash directory.
-    MoveAside { root: String, relative: String },
+    /// Moves one file into the folder's trash directory, but only while it
+    /// still carries the bytes the owner decided about.
+    MoveAside {
+        root: String,
+        relative: String,
+        guard: WriteGuard,
+    },
     /// Weak fingerprint and blake3 of one file, read as one stable observation.
     Hash { root: String, relative: String },
 }
@@ -225,13 +230,18 @@ impl PartialEq for LocalFileEffect {
                 },
             ) => root == other_root && relative == other_relative && at_ms == other_at,
             (
-                LocalFileEffect::MoveAside { root, relative },
+                LocalFileEffect::MoveAside {
+                    root,
+                    relative,
+                    guard,
+                },
                 LocalFileEffect::MoveAside {
                     root: other_root,
                     relative: other_relative,
+                    guard: other_guard,
                 },
-            )
-            | (
+            ) => root == other_root && relative == other_relative && guard == other_guard,
+            (
                 LocalFileEffect::Hash { root, relative },
                 LocalFileEffect::Hash {
                     root: other_root,

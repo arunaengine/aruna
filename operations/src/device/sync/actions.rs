@@ -88,6 +88,7 @@ fn record_for(input: &ApplyActionInput, scope: ActionScope) -> SyncActionRecord 
         before: input.expected.as_ref().map(|expected| expected.blake3),
         after: None,
         outcome: ActionOutcome::Applied,
+        trashed_to: None,
         entries: 1,
     }
 }
@@ -110,7 +111,9 @@ async fn apply_entry(
     match input.kind {
         ActionKind::Replace => replace_entry(context, folder, input, relative, &base, record).await,
         ActionKind::KeepLocal => keep_local(context, folder, relative, &base, record).await,
-        ActionKind::RemoveLocal => remove_local(context, folder, relative, record).await,
+        ActionKind::RemoveLocal => {
+            remove_local(context, folder, relative, input, &base, record).await
+        }
         ActionKind::Resolve => settle_entry(context, folder, relative, &base, record).await,
     }
 }
@@ -238,14 +241,27 @@ async fn settle_entry(
     }
 }
 
+/// Moves the file the owner named into the folder's trash, under a guard built
+/// from the bytes they were shown when they gave one.
 async fn remove_local(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
     relative: &str,
+    input: &ApplyActionInput,
+    base: &SyncBase,
     record: SyncActionRecord,
 ) -> Result<SyncActionRecord, ActionError> {
+    let expected = input
+        .expected
+        .clone()
+        .or_else(|| observed_expected(base))
+        .ok_or(ActionError::ExpectedMissing)?;
+    let guard = WriteGuard::MatchesBase {
+        fingerprint: expected.fingerprint,
+        blake3: expected.blake3,
+    };
     drive(
-        RemoveEntryOperation::new(folder.clone(), relative.to_string(), record),
+        RemoveEntryOperation::new(folder.clone(), relative.to_string(), guard, record),
         context,
     )
     .await
@@ -342,20 +358,31 @@ enum RemoveState {
 pub struct RemoveEntryOperation {
     folder: SyncedFolder,
     relative: String,
+    guard: WriteGuard,
     record: SyncActionRecord,
     state: RemoveState,
     rows: Vec<(String, Key, Value)>,
+    /// A refused move keeps the entry exactly as it was: only the audit row is
+    /// written, never the base-row deletion.
+    refused: bool,
     output: Option<Result<SyncActionRecord, ActionError>>,
 }
 
 impl RemoveEntryOperation {
-    pub fn new(folder: SyncedFolder, relative: String, record: SyncActionRecord) -> Self {
+    pub fn new(
+        folder: SyncedFolder,
+        relative: String,
+        guard: WriteGuard,
+        record: SyncActionRecord,
+    ) -> Self {
         Self {
             folder,
             relative,
+            guard,
             record,
             state: RemoveState::Init,
             rows: Vec::new(),
+            refused: false,
             output: None,
         }
     }
@@ -370,6 +397,7 @@ impl Operation for RemoveEntryOperation {
         smallvec![Effect::LocalFile(LocalFileEffect::MoveAside {
             root: self.folder.root.clone(),
             relative: self.relative.clone(),
+            guard: self.guard.clone(),
         })]
     }
 
@@ -379,16 +407,20 @@ impl Operation for RemoveEntryOperation {
         }
         match (self.state, event) {
             (RemoveState::MoveFile, Event::LocalFile(event)) => {
+                let refused = matches!(event, LocalFileEvent::Refused { .. });
                 self.record = match event {
+                    // The trash path is the evidence the bytes still exist.
                     LocalFileEvent::Moved { to } => SyncActionRecord {
-                        scope: ActionScope::Entry { relative: to },
-                        // The trash path is the evidence the bytes still exist.
+                        trashed_to: Some(to),
                         outcome: ActionOutcome::Applied,
                         ..self.record.clone()
                     },
                     LocalFileEvent::Refused { reason } => SyncActionRecord {
-                        outcome: ActionOutcome::Failed {
-                            reason: format!("{reason:?}"),
+                        outcome: match reason {
+                            aruna_core::events::LocalFileRefusal::Drifted => ActionOutcome::Stale,
+                            other => ActionOutcome::Failed {
+                                reason: format!("{other:?}"),
+                            },
                         },
                         ..self.record.clone()
                     },
@@ -403,6 +435,7 @@ impl Operation for RemoveEntryOperation {
                     return remove_failed(self, ActionError::Unavailable);
                 };
                 self.rows = vec![row];
+                self.refused = refused;
                 self.state = RemoveState::StartTransaction;
                 smallvec![Effect::Storage(StorageEffect::StartTransaction {
                     read: false
@@ -422,6 +455,10 @@ impl Operation for RemoveEntryOperation {
                 RemoveState::WriteRows { txn_id },
                 Event::Storage(StorageEvent::BatchWriteResult { .. }),
             ) => {
+                if self.refused {
+                    self.state = RemoveState::Commit;
+                    return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+                }
                 self.state = RemoveState::DeleteBase { txn_id };
                 smallvec![Effect::Storage(StorageEffect::Delete {
                     key_space: SYNC_BASE_KEYSPACE.to_string(),
