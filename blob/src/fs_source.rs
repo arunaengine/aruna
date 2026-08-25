@@ -43,6 +43,9 @@ pub(crate) fn is_local_access(access: &ResolvedSourceAccess) -> bool {
 pub(crate) async fn check_local(access: &ResolvedSourceAccess) -> Result<(), StagingSourceError> {
     let (root, _) = access_parts(access)?;
     let resolved = canonical_root(&root).await?;
+    // Every sweep starts by dropping the spool a crashed write left behind.
+    // Those bytes are this node's own, never the owner's.
+    crate::fs_write::sweep_spool(&root).await;
     match tokio::fs::metadata(&resolved).await {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(StagingSourceError::CheckError(
