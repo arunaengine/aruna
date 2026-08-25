@@ -246,7 +246,7 @@ fn covers(
     installed
         .origins
         .iter()
-        .filter(|(origin, _)| origins.contains(origin))
+        .filter(|(origin, _)| origins.contains(*origin))
         .all(|(origin, seq)| offered.sequence_for(origin) >= *seq)
 }
 
@@ -256,7 +256,7 @@ fn trim_clock(clock: &AdminDocumentClock, origins: &BTreeSet<NodeId>) -> AdminDo
         origins: clock
             .origins
             .iter()
-            .filter(|(origin, _)| origins.contains(origin))
+            .filter(|(origin, _)| origins.contains(*origin))
             .map(|(origin, seq)| (*origin, *seq))
             .collect(),
     }
