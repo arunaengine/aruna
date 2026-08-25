@@ -513,20 +513,23 @@ mod tests {
         ));
     }
 
-    /// Writes `count` outstanding secrets for `owner`, straight to storage, so a
-    /// later mint has to scan past a full page to find this owner's slot.
+    async fn write_secret(context: &DriverContext, record: &OnboardingSecretRecord) {
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: ONBOARDING_KEYSPACE.to_string(),
+                key: super::secret_record_key(record.enrollment_id),
+                value: ByteView::from(postcard::to_allocvec(record).unwrap()),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    /// Fills the range with other owners' outstanding secrets, so a scan that
+    /// stops at its first page never reaches what comes after them.
     async fn fill_secrets(context: &DriverContext, owner: UserId, count: usize) {
         for _ in 0..count {
-            let record = device_record(owner);
-            context
-                .storage_handle
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: ONBOARDING_KEYSPACE.to_string(),
-                    key: super::secret_record_key(record.enrollment_id),
-                    value: ByteView::from(postcard::to_allocvec(&record).unwrap()),
-                    txn_id: None,
-                })
-                .await;
+            write_secret(context, &device_record(owner)).await;
         }
     }
 
@@ -539,8 +542,16 @@ mod tests {
         let other = UserId::local(Ulid::generate(), realm());
         let (_dir, context) = context_with_cap(Some(1), &[]).await;
         fill_secrets(&context, other, super::MAX_SCANNED_SECRETS + 8).await;
-        // This owner's outstanding secret sorts after that whole first page.
-        fill_secrets(&context, owner, 1).await;
+        // The highest possible id, so this owner's slot provably sorts behind
+        // every generated one instead of relying on when it was written.
+        write_secret(
+            &context,
+            &OnboardingSecretRecord {
+                enrollment_id: Ulid::from_bytes([0xff; 16]),
+                ..device_record(owner)
+            },
+        )
+        .await;
 
         assert!(matches!(
             mint(&context, owner).await,

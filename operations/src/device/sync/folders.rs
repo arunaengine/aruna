@@ -450,7 +450,7 @@ mod tests {
         iroh::SecretKey::from_bytes(&[3; 32]).public()
     }
 
-    fn folder(state: FolderState) -> SyncedFolder {
+    fn bound_folder(state: FolderState) -> SyncedFolder {
         SyncedFolder {
             folder_id: Ulid::from_bytes([1u8; 16]),
             root: "/home/ada/data".to_string(),
@@ -510,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn resumes_interrupted_unbind() {
         let (_dir, context) = context().await;
-        let folder = folder(FolderState::Deleting);
+        let folder = bound_folder(FolderState::Deleting);
         store_folder(&context, &folder).await.expect("row stored");
         let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
             .expect("base encodes");
@@ -542,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn marks_folder_deleting() {
         let (_dir, context) = context().await;
-        let folder = folder(FolderState::Active);
+        let folder = bound_folder(FolderState::Active);
         store_folder(&context, &folder).await.expect("row stored");
 
         assert_eq!(
@@ -552,7 +552,7 @@ mod tests {
                 .state,
             FolderState::Paused
         );
-        store_folder(&context, &folder(FolderState::Deleting))
+        store_folder(&context, &bound_folder(FolderState::Deleting))
             .await
             .expect("row stored");
         assert_eq!(
