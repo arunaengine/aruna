@@ -89,14 +89,19 @@ impl OperationsInboundHandler {
         }
     }
 
-    /// Blob replication is trusted only from realm nodes eligible to hold and
-    /// sync data; an unknown peer is rejected. An owner-bound device is also
-    /// admitted, because the plane is how it reads its owner's data and how the
-    /// realm pulls its observations, but it never becomes a replication source:
-    /// the serve forces the owner's identity and re-checks every request.
-    /// Device-to-device transfer is not a path. Fails closed when the config is
-    /// unreadable.
-    async fn bao_peer_admitted(&self, realm_id: RealmId, peer: NodeId) -> bool {
+    /// What the bao plane admits this peer as.
+    ///
+    /// Replication is trusted only from realm nodes eligible to hold and sync
+    /// data. An owner-bound device is admitted for bao reads alone, and only by
+    /// a sync-eligible node: it never reaches the manifest or summary branches,
+    /// so it can never become a replication source, and device-to-device
+    /// transfer is not a path. Fails closed when the config is unreadable.
+    async fn bao_peer_admitted(
+        &self,
+        realm_id: RealmId,
+        local: NodeId,
+        peer: NodeId,
+    ) -> Option<BaoAdmission> {
         let config = match drive(
             GetRealmConfigOperation::new(realm_id),
             self.context.as_ref(),
@@ -106,27 +111,34 @@ impl OperationsInboundHandler {
             Ok(config) => config,
             Err(error) => {
                 warn!(peer = %peer, error = %error, "Failed to read realm config for replication gate");
-                return false;
+                return None;
             }
         };
-        // An owner-bound device is admitted to the plane so it can read its
-        // owner's data and serve its own observations. It stays outside
-        // replication: the serve forces the owner's identity, and every
-        // per-request gate still decides what it may actually read.
-        if node_kind(&config, peer)
-            .and_then(|kind| kind.owner())
-            .is_some()
-        {
-            return true;
-        }
-        match config.sync_eligible_node_ids() {
-            Ok(ids) => ids.contains(&peer),
+        let eligible = match config.sync_eligible_node_ids() {
+            Ok(ids) => ids,
             Err(error) => {
                 warn!(peer = %peer, error = %error, "Failed to resolve replication peers");
-                false
+                return None;
             }
+        };
+        if eligible.contains(&peer) {
+            return Some(BaoAdmission::Infra);
         }
+        // Only a realm node answers a device, so a device never reaches another
+        // device's plane.
+        let device = node_kind(&config, peer)
+            .and_then(|kind| kind.owner())
+            .is_some();
+        (device && eligible.contains(&local)).then_some(BaoAdmission::DeviceRead)
     }
+}
+
+/// What the bao plane admitted a peer as. A device reaches the read branch and
+/// nothing else, so replication stays infrastructure-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaoAdmission {
+    Infra,
+    DeviceRead,
 }
 
 async fn emit_replication_watch(
@@ -613,13 +625,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                             };
                             // #332: only an authenticated sync-eligible realm peer
                             // may open the blob replication plane at all.
-                            let eligible = timeout(
+                            let admission = timeout(
                                 INBOUND_BAO_TIMEOUT,
-                                self.bao_peer_admitted(*net_handle.realm_id(), node_id),
+                                self.bao_peer_admitted(*net_handle.realm_id(), net_handle.node_id(), node_id),
                             )
                             .await
-                            .unwrap_or(false);
-                            if !eligible {
+                            .ok()
+                            .flatten();
+                            if admission.is_none() {
                                 warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
                                 close_bao_stream(stream);
                                 return;
@@ -640,17 +653,18 @@ impl InboundEventHandler for OperationsInboundHandler {
                                     return;
                                 }
                             };
-                            let eligible = timeout(
+                            let admission = timeout(
                                 INBOUND_BAO_TIMEOUT,
-                                self.bao_peer_admitted(*net_handle.realm_id(), node_id),
+                                self.bao_peer_admitted(*net_handle.realm_id(), net_handle.node_id(), node_id),
                             )
                             .await
-                            .unwrap_or(false);
-                            if !eligible {
+                            .ok()
+                            .flatten();
+                            let Some(admission) = admission else {
                                 warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
                                 close_failed_bao(&blob_handle, stream_id).await;
                                 return;
-                            }
+                            };
                             let first_event = blob_handle
                                 .send_blob_effect(BlobEffect::ReadMessage { stream_id });
                             let first_event = match timeout(INBOUND_BAO_TIMEOUT, first_event).await {
@@ -670,6 +684,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             manifest,
                                             ..
                                         }) => {
+                                            // A manifest carries its own asserted
+                                            // identity, so only infrastructure may
+                                            // ever publish one.
+                                            if admission != BaoAdmission::Infra {
+                                                warn!(peer = %node_id, stream_id = %stream_id, "Refusing a replication manifest from a device");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
                                             debug!(
                                                 peer = %node_id,
                                                 stream_id = %stream_id,
@@ -799,6 +821,13 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         Ok(VersionReplicationMessage::LocationSummaryRequest(
                                             request,
                                         )) => {
+                                            // The summary describes what this node
+                                            // holds; a device is never told.
+                                            if admission != BaoAdmission::Infra {
+                                                warn!(peer = %node_id, stream_id = %stream_id, "Refusing a location summary to a device");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
                                             let identity_allowed = request.realm_id
                                                 == *net_handle.realm_id()
                                                 && auth_matches(
@@ -1227,11 +1256,27 @@ mod tests {
         );
 
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        assert!(handler.bao_peer_admitted(realm_id, server).await);
-        // A device is never a replication source, and a device serving its own
-        // content admits the realm's infrastructure only.
-        assert!(!handler.bao_peer_admitted(realm_id, user).await);
-        assert!(!handler.bao_peer_admitted(realm_id, unknown).await);
+        let foreign = aruna_core::structs::RealmId::from_bytes([4u8; 32]);
+        // A realm node reaches the whole plane; a device reaches reads only, and
+        // only through a realm node, so it is never a replication source and
+        // never answered by another device.
+        assert_eq!(
+            handler.bao_peer_admitted(realm_id, server, server).await,
+            Some(BaoAdmission::Infra)
+        );
+        assert_eq!(
+            handler.bao_peer_admitted(realm_id, server, user).await,
+            Some(BaoAdmission::DeviceRead)
+        );
+        assert_eq!(handler.bao_peer_admitted(realm_id, user, user).await, None);
+        assert_eq!(
+            handler.bao_peer_admitted(realm_id, server, unknown).await,
+            None
+        );
+        assert_eq!(
+            handler.bao_peer_admitted(foreign, server, server).await,
+            None
+        );
     }
 
     #[tokio::test]
