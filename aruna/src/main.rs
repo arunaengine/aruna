@@ -1024,6 +1024,7 @@ fn read_mount_driver() -> Option<String> {
         .filter(|driver| !driver.is_empty())
 }
 
+#[derive(Debug)]
 enum ComputeBuildError {
     Config(String),
     Unavailable(String),
@@ -1041,6 +1042,40 @@ impl From<&'static str> for ComputeBuildError {
     }
 }
 
+/// The container-facing S3 endpoint the Docker registry publishes, or `None` in
+/// the local-only profile a user device runs: it stages files, hands containers
+/// no endpoint and exposes no S3 listener, so the checks that keep a shared
+/// deployment reachable would only refuse a working machine.
+#[cfg(any(feature = "docker", test))]
+fn docker_workspace(
+    local_only: bool,
+    endpoint: Option<&str>,
+    s3_address: Option<&str>,
+) -> Result<Option<String>, ComputeBuildError> {
+    if local_only {
+        return Ok(None);
+    }
+    let endpoint = endpoint.ok_or_else(|| {
+        "Docker executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
+    })?;
+    if container_local_endpoint(endpoint) {
+        return Err(
+            "Docker executor requires a container-reachable S3_PUBLIC_URL"
+                .to_string()
+                .into(),
+        );
+    }
+    if !s3_address
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| !address.ip().is_loopback())
+    {
+        return Err("Docker executor requires a non-loopback S3_ADDRESS"
+            .to_string()
+            .into());
+    }
+    Ok(Some(endpoint.to_string()))
+}
+
 #[cfg(feature = "docker")]
 async fn build_docker(
     config: &Config,
@@ -1050,26 +1085,11 @@ async fn build_docker(
             .ok()
             .as_deref(),
     )?;
-    let endpoint = compute_s3_endpoint(config).ok_or_else(|| {
-        "Docker executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
-    })?;
-    if container_local_endpoint(&endpoint) {
-        return Err(
-            "Docker executor requires a container-reachable S3_PUBLIC_URL"
-                .to_string()
-                .into(),
-        );
-    }
-    if !config
-        .s3_address
-        .as_deref()
-        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|address| !address.ip().is_loopback())
-    {
-        return Err("Docker executor requires a non-loopback S3_ADDRESS"
-            .to_string()
-            .into());
-    }
+    let workspace = docker_workspace(
+        env_true("ARUNA_COMPUTE_LOCAL_ONLY"),
+        compute_s3_endpoint(config).as_deref(),
+        config.s3_address.as_deref(),
+    )?;
     let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
@@ -1081,10 +1101,13 @@ async fn build_docker(
     aruna_compute::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
-    info!("Docker executor backend enabled");
+    info!(
+        local_only = workspace.is_none(),
+        "Docker executor backend enabled"
+    );
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string()))
+        .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
 }
 
 #[cfg(not(feature = "docker"))]
@@ -1359,7 +1382,7 @@ fn compute_s3_endpoint(config: &Config) -> Option<String> {
         .or_else(|| config.s3_public_url.clone())
 }
 
-#[cfg(feature = "docker")]
+#[cfg(any(feature = "docker", test))]
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()
@@ -1457,6 +1480,32 @@ mod tests {
         assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[test]
+    fn local_only_skips_s3() {
+        // A device has no S3 listener and hands its containers no endpoint.
+        assert_eq!(docker_workspace(true, None, None).unwrap(), None);
+        assert_eq!(
+            docker_workspace(true, Some("http://127.0.0.1:9000"), Some("127.0.0.1:9000")).unwrap(),
+            None
+        );
+        assert_eq!(
+            docker_workspace(false, Some("https://s3.example.test"), Some("0.0.0.0:9000")).unwrap(),
+            Some("https://s3.example.test".to_string())
+        );
+        assert!(docker_workspace(false, None, Some("0.0.0.0:9000")).is_err());
+        assert!(
+            docker_workspace(false, Some("http://localhost:9000"), Some("0.0.0.0:9000")).is_err()
+        );
+        assert!(
+            docker_workspace(
+                false,
+                Some("https://s3.example.test"),
+                Some("127.0.0.1:9000")
+            )
+            .is_err()
+        );
     }
 
     #[test]
