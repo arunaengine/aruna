@@ -56,7 +56,7 @@ pub enum LocalExecutionError {
     Paused,
     #[error("this device has no compute backend for the request")]
     NoExecutor,
-    #[error("{0} needs an S3 endpoint a device does not expose")]
+    #[error("this device does not run the request: {0}")]
     Unsupported(&'static str),
     #[error("this device already runs {limit} jobs")]
     AtCapacity { limit: u32 },
@@ -203,18 +203,32 @@ impl LocalRuns {
     }
 }
 
-/// Only file staging runs on a device: mounted inputs and Direct-S3 both hand
-/// the container an S3 endpoint, and a device exposes none.
+/// Only file staging into the run's own workspace happens on a device: mounted
+/// inputs and Direct-S3 both hand the container an S3 endpoint a device does not
+/// expose, and a local run's outputs stay in `ws-<jobid>` until the owner
+/// publishes them.
 fn local_staging(spec: &ExecutionSpec, mode: WorkspaceMode) -> Result<(), LocalExecutionError> {
-    if mode == WorkspaceMode::None {
-        return Err(LocalExecutionError::Unsupported("workspace mode none"));
+    match mode {
+        WorkspaceMode::None => {
+            return Err(LocalExecutionError::Unsupported(
+                "workspace mode none needs an S3 endpoint a device does not expose",
+            ));
+        }
+        WorkspaceMode::Existing => {
+            return Err(LocalExecutionError::Unsupported(
+                "a local run keeps its outputs in its own workspace bucket",
+            ));
+        }
+        WorkspaceMode::Temporary | WorkspaceMode::Kept => {}
     }
     if spec
         .inputs
         .iter()
         .any(|input| input.mode == InputMode::Mount)
     {
-        return Err(LocalExecutionError::Unsupported("a mounted input"));
+        return Err(LocalExecutionError::Unsupported(
+            "a mounted input needs an S3 endpoint a device does not expose",
+        ));
     }
     Ok(())
 }
@@ -637,12 +651,14 @@ mod tests {
 
     #[test]
     fn refuses_foreign_staging() {
-        // Both modes hand the container an S3 endpoint a device does not expose.
+        // Only file staging into the run's own workspace happens on a device.
         let mut spec = payload();
-        assert!(matches!(
-            local_staging(&spec, WorkspaceMode::None),
-            Err(LocalExecutionError::Unsupported(_))
-        ));
+        for mode in [WorkspaceMode::None, WorkspaceMode::Existing] {
+            assert!(matches!(
+                local_staging(&spec, mode),
+                Err(LocalExecutionError::Unsupported(_))
+            ));
+        }
 
         spec.inputs.push(input("project", None, None));
         spec.inputs[0].mode = InputMode::Mount;

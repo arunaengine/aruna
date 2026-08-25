@@ -906,8 +906,9 @@ on that bucket and that it belongs to the same group.
   input that this device does not hold is a 400 naming it.
 - Outputs stay in the node-local workspace bucket until the owner publishes them, and the run is
   listed by this device's own `GET /jobs/`.
-- Mounted inputs and `workspace.mode` `none` are refused: a device stages files and exposes no S3
-  endpoint a container could reach.
+- Mounted inputs and `workspace.mode` `none` are refused, because a device stages files and exposes
+  no S3 endpoint a container could reach, and so is `workspace.mode` `existing`, because a local
+  run's outputs stay in its own workspace bucket.
 - A paused compute plane, a device without a compute backend, and a device already running as many
   jobs as its configured ceiling all answer 409.
 

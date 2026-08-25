@@ -106,7 +106,8 @@ reach. Apptainer is unchanged and still needs its delegated cgroup root.
 A local run stages its inputs as files into the node-local workspace bucket
 `ws-<jobid>` and leaves its outputs there, where the owner can publish them. It
 refuses mounted inputs, `workspace.mode` `none` and Direct-S3 staging, all of
-which need an S3 endpoint the device does not expose. A realm input is copied
+which need an S3 endpoint the device does not expose, and `workspace.mode`
+`existing`, because its outputs stay in its own workspace bucket. A realm input is copied
 onto the device before the run, as an ordinary local object and never as a
 reference. A run is refused while this node's compute plane is drained.
 
