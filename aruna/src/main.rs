@@ -993,8 +993,10 @@ async fn build_compute_registry(
     config: &Config,
 ) -> Result<(Option<Arc<aruna_compute::ExecutorRegistry>>, bool), String> {
     let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
-    let result = match selected.as_str() {
-        "none" => return Ok((None, false)),
+    let result = match selected.trim() {
+        // A supervisor that turns compute off writes a disabling value rather
+        // than unsetting the key, which an inherited environment would refill.
+        "none" | "off" | "" => return Ok((None, false)),
         "docker" => build_docker(config).await,
         "apptainer" => build_apptainer(config).await,
         "kubernetes" => build_kubernetes(config).await,
@@ -1090,12 +1092,16 @@ async fn build_docker(
         compute_s3_endpoint(config).as_deref(),
         config.s3_address.as_deref(),
     )?;
-    let docker_config = aruna_compute::DockerConfig {
+    let mut docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
         envelope: compute_envelope()?,
+        keep_failed: env_true("ARUNA_COMPUTE_KEEP_FAILED"),
         ..aruna_compute::DockerConfig::default()
     };
+    if let Some(state_root) = env_path("ARUNA_COMPUTE_STATE_ROOT") {
+        docker_config.state_root = state_root;
+    }
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
         .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
@@ -1380,6 +1386,16 @@ fn compute_s3_endpoint(config: &Config) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| config.s3_public_url.clone())
+}
+
+/// A configured filesystem path; an empty value is treated as unset.
+#[cfg(feature = "docker")]
+fn env_path(name: &str) -> Option<std::path::PathBuf> {
+    dotenvy::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 #[cfg(any(feature = "docker", test))]

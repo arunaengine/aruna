@@ -7,6 +7,8 @@ and drained is described in [Distributed execution jobs](distributed-jobs.md).
 Aruna can run one compute executor per node. Set `ARUNA_COMPUTE_EXECUTOR` to
 `none`, `docker`, `apptainer`, or `kubernetes`; the default is `none`. Selecting
 an executor whose Cargo feature was not compiled is a configuration error.
+`off` and an empty value are accepted as `none`, so a supervisor can disable
+compute by writing the key rather than by unsetting it.
 
 An explicitly selected executor must pass its startup health checks. Set
 `ARUNA_COMPUTE_OPTIONAL=1` only when the node may start without compute after a
@@ -87,11 +89,14 @@ The desktop app writes these keys for the node it supervises:
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `ARUNA_COMPUTE_EXECUTOR` | `docker` or `apptainer`, resolved from the app's backend probe | `none` |
+| `ARUNA_COMPUTE_EXECUTOR` | `docker` or `apptainer`, resolved from the app's backend probe; `off` when the owner disabled compute | `none` |
 | `ARUNA_COMPUTE_LOCAL_ONLY` | `1` selects the local-only profile | unset: shared deployment |
 | `ARUNA_COMPUTE_OPTIONAL` | `1` keeps the node up when the daemon does not answer | unset: a health failure fails startup |
-| `ARUNA_COMPUTE_MAX_CPU_CORES`, `ARUNA_COMPUTE_MAX_RAM_BYTES`, `ARUNA_COMPUTE_MAX_DISK_BYTES`, `ARUNA_COMPUTE_MAX_CONCURRENT` | the owner's caps, from This device | unset: unmeasured, see [Execution envelope](#execution-envelope) |
-| `ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT` | delegated cgroup v2 root of the user slice | none; required by Apptainer |
+| `ARUNA_COMPUTE_MAX_CONCURRENT` | how many of the owner's runs may be in flight at once; a submission beyond it is refused | unset: unmeasured |
+| `ARUNA_COMPUTE_MAX_CPU_CORES`, `ARUNA_COMPUTE_MAX_RAM_BYTES`, `ARUNA_COMPUTE_MAX_DISK_BYTES` | the owner's caps, from This device | unset: unmeasured, see [Execution envelope](#execution-envelope) |
+| `ARUNA_COMPUTE_KEEP_FAILED` | `1` keeps failed containers for inspection (Docker) | unset: they are removed |
+| `ARUNA_COMPUTE_STATE_ROOT` | Docker state root under the app's data directory | `./compute-state` |
+| `ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT`, `ARUNA_COMPUTE_APPTAINER_STATE_ROOT`, `ARUNA_COMPUTE_APPTAINER_SIF_CACHE` | delegated cgroup v2 root of the user slice, and the Apptainer roots | the cgroup root is required by Apptainer |
 
 In the local-only profile the Docker builder registers no workspace endpoint and
 skips the container-reachable `S3_PUBLIC_URL` and non-loopback `S3_ADDRESS`
@@ -127,8 +132,12 @@ Optional configuration:
   When unset, `storage_opt` is omitted and task disk requests are unenforced.
 - `ARUNA_COMPUTE_DOCKER_PULL_DEADLINE`: image pull deadline in seconds;
   defaults to `300`.
+- `ARUNA_COMPUTE_STATE_ROOT`: durable Docker state root; defaults to
+  `./compute-state`. Apptainer names its own roots.
+- `ARUNA_COMPUTE_KEEP_FAILED`: `1` keeps the containers of failed attempts for
+  inspection; defaults to removing them. Docker only.
 
-Docker uses `./compute-state` by default. The state root must be durable and
+The state root must be durable and
 exclusive to one controller for the Docker daemon. A daemon lock enforces that
 contract, and a per-attempt lock serializes create, stage, and start.
 
