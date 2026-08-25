@@ -28,11 +28,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "device plane: require_owner binds the caller to this node's enrolled owner",
     ),
     (
-        "device_compute.rs",
-        "get_device_compute",
-        "device plane: require_owner binds the caller to this node's enrolled owner",
-    ),
-    (
         "device.rs",
         "get_draft",
         "device plane: require_owner binds the caller to this node's enrolled owner",
@@ -61,6 +56,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "device.rs",
         "wipe_device",
         "device plane: erases only this node, after require_owner and an id confirmation",
+    ),
+    (
+        "device_compute.rs",
+        "get_device_compute",
+        "device plane: require_owner binds the caller to this node's enrolled owner",
     ),
     (
         "drs.rs",
