@@ -76,22 +76,6 @@ fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<Node
         .collect()
 }
 
-/// The realm's devices, as a best-effort push target for the shared realm
-/// documents. They are never realm infrastructure: a device may be offline for
-/// days, so it is kept out of every peer set whose failure blocks the realm.
-pub(crate) fn realm_device_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
-    if !sync_eligible_node(config, node_id) {
-        return Vec::new();
-    }
-    config
-        .nodes
-        .iter()
-        .filter(|node| !node.kind.is_sync_eligible())
-        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .filter(|candidate| *candidate != node_id)
-        .collect()
-}
-
 /// Work units one bounded restore pass may process. A work-unit limit, never a
 /// wall-clock deadline, so the bound holds however many shards share a
 /// co-holder set.
@@ -861,7 +845,6 @@ pub async fn restore_shard_subscriptions(
         summary.shared_topics = pass.summary.shared_topics;
         summary.withheld_topics += pass.summary.withheld_topics;
         if pass.wrapped {
-            refresh_device_members(context, realm_id, node_id).await;
             return summary;
         }
     }
@@ -1112,18 +1095,20 @@ fn plan_shard_groups(
             .all(|peer| node_id.as_bytes() < peer.as_bytes());
     let device_local = !sync_eligible_node(config, node_id);
     for target in shared_targets(realm_id, node_id) {
-        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let wide = realm_wide_target(&target);
-        // Restore probes and syncs its peers as infrastructure, so only
-        // sync-eligible nodes belong here; devices are pushed to separately.
+        // A device takes no part in the realm's own topics: it fetches the
+        // realm-wide documents as a routed read and mints the topics that are
+        // its own here, exchanged with nobody.
+        if device_local && wide {
+            continue;
+        }
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let groups = if wide && !realm_minter {
             &mut plan.shared_join_groups
         } else {
             &mut plan.shared_groups
         };
-        // A device exchanges the realm-wide documents and nothing else: the
-        // topics that are its own are minted here and synced with nobody.
-        let peers = match device_local && !wide {
+        let peers = match device_local {
             true => Vec::new(),
             false => shared_peers.clone(),
         };
@@ -1427,13 +1412,18 @@ async fn restore_shared(
     if to_ensure.is_empty() {
         return outcome;
     }
+    // A unit without peers holds topics this node is alone on: they are minted
+    // here and no peer joins their membership.
+    if unit.peers.is_empty() {
+        if let Err(error) = net_handle.ensure_local_topics(&to_ensure) {
+            warn!(error = %error, "Failed to mint this node's own shared topics");
+            outcome.fail_topics(to_ensure.iter().copied());
+        }
+        return outcome;
+    }
     if let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, unit.peers.clone()) {
         warn!(error = %error, "Failed to ensure shared realm topics on restart");
         outcome.fail_topics(to_ensure.iter().copied());
-    }
-    // Nothing to reach: these topics belong to this node alone.
-    if unit.peers.is_empty() {
-        return outcome;
     }
     let event = net_handle
         .sync_document_topics(to_ensure.clone(), unit.peers.clone())
@@ -1636,74 +1626,6 @@ async fn project_restored_metadata_create_events(
     }
 }
 
-/// Admits the realm's devices to the realm-wide topics on this node, so a
-/// device may fetch them. It adds membership only: a device never joins a peer
-/// set the realm's own recovery probes or syncs.
-pub async fn refresh_device_members(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    node_id: NodeId,
-) {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return;
-    };
-    let RealmConfigLoad::Found(config) = load_realm_config(context, realm_id).await else {
-        return;
-    };
-    let devices = realm_device_peers(&config, node_id);
-    if devices.is_empty() {
-        return;
-    }
-    // Only topics this node already holds: minting one from here would fork it.
-    let topics: Vec<::irokle::TopicId> = realm_wide_topics(realm_id)
-        .into_iter()
-        .filter(|topic| {
-            net_handle
-                .document_sync_topic_exists(*topic)
-                .unwrap_or(false)
-        })
-        .collect();
-    if topics.is_empty() {
-        return;
-    }
-    if let Err(error) = net_handle.ensure_document_sync_topics(&topics, devices) {
-        warn!(error = %error, "Failed to admit the realm's devices to the shared topics");
-    }
-}
-
-/// Fetches the realm-wide documents on a device. It is never a reliable push
-/// target - it may be closed when the realm revokes a token - so this is how it
-/// catches up, and it is the only document sync a device ever opens.
-pub async fn pull_realm_documents(context: &Arc<DriverContext>) -> bool {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return false;
-    };
-    let realm_id = *net_handle.realm_id();
-    let node_id = net_handle.node_id();
-    let RealmConfigLoad::Found(config) = load_realm_config(context, realm_id).await else {
-        return false;
-    };
-    if sync_eligible_node(&config, node_id) {
-        return false;
-    }
-    let peers = shared_topic_peers(&config, node_id);
-    if peers.is_empty() {
-        return false;
-    }
-    let topics = realm_wide_topics(realm_id).to_vec();
-    let event = net_handle.sync_document_topics(topics, peers).await;
-    apply_restored_reconcile(context, node_id, event).await
-}
-
-/// The realm-wide topics, the only ones a device exchanges.
-fn realm_wide_topics(realm_id: RealmId) -> [::irokle::TopicId; 2] {
-    [
-        DocumentSyncTarget::RealmConfig { realm_id },
-        DocumentSyncTarget::RealmAuthorization { realm_id },
-    ]
-    .map(|target| target.sync_topic_id(realm_id, &PlacementRef::NIL))
-}
-
 async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigLoad {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
     match context
@@ -1839,9 +1761,20 @@ mod tests {
                 unit.kind
             );
         }
-        assert_eq!(realm_device_peers(&config, server), vec![device]);
-        // A device pushes to nobody: it is not the realm's infrastructure.
-        assert!(realm_device_peers(&config, device).is_empty());
+        // The device plans no realm-wide topic and reaches nobody with the ones
+        // that are its own.
+        let planned = plan_shard_groups(&config, device, realm_id, 0);
+        assert_eq!(
+            planned.summary.shared_topics,
+            SHARED_RESTORE_TOPIC_COUNT - 2
+        );
+        assert!(
+            planned
+                .into_units()
+                .iter()
+                .all(|unit| unit.peers.is_empty()),
+            "a device reaches no peer for its own topics"
+        );
     }
 
     #[test]

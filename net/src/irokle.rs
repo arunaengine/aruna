@@ -403,21 +403,6 @@ pub struct DocumentSyncService {
     // Flips true on the first realm-config-driven peer refresh, after which
     // `configured_peers` no longer grant admission.
     realm_config_materialized: Arc<AtomicBool>,
-    // User-kind nodes of the realm. They are admitted for the realm-wide
-    // documents only: a device fetches the shared configuration it is judged by
-    // and takes no part in any other topic.
-    device_peers: Arc<RwLock<BTreeSet<PeerId>>>,
-}
-
-/// The two documents every node of a realm holds, and the only ones a device
-/// exchanges: the realm configuration it is judged by and the realm's
-/// authorization document.
-fn realm_wide_topics(realm_id: RealmId) -> [irokle_crate::TopicId; 2] {
-    [
-        DocumentSyncTarget::RealmConfig { realm_id },
-        DocumentSyncTarget::RealmAuthorization { realm_id },
-    ]
-    .map(|target| target.sync_topic_id(realm_id, &PlacementRef::NIL))
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -522,7 +507,6 @@ impl DocumentSyncService {
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
-            device_peers: Arc::new(RwLock::new(BTreeSet::new())),
         })
     }
 
@@ -985,6 +969,21 @@ impl DocumentSyncService {
         self.flush_database()
     }
 
+    /// Ensures topics this node holds alone: it mints what is missing and no
+    /// peer joins their membership, so nothing about them is ever exchanged.
+    pub fn ensure_local_topics(&self, topics: &[irokle_crate::TopicId]) -> Result<()> {
+        if topics.is_empty() {
+            return Ok(());
+        }
+        let mut seen_topics = BTreeSet::new();
+        for topic_id in topics.iter().copied() {
+            if seen_topics.insert(topic_id) {
+                self.ensure_topic(topic_id, &BTreeSet::new(), true)?;
+            }
+        }
+        self.flush_database()
+    }
+
     /// Notes a live inbound document sync connection so the resync scheduler retries
     /// the peer immediately. The connection itself is not pooled for outbound
     /// reuse: streams opened over it toward the original dialer would never be
@@ -1001,11 +1000,10 @@ impl DocumentSyncService {
     fn admit_inbound(&self, peer: NodeId) -> Result<InboundSyncPermit> {
         let peer_id = node_id_to_peer_id(&peer);
         // The bootstrap peers admit only until realm config materializes; after
-        // that the sync-eligible set and the realm's devices are the authority,
-        // and a device is bounded to its topics by `device_topic_denied`.
+        // that the current sync-eligible set is the sole authority, so a removed
+        // startup peer fails here without a restart.
         let bootstrap_window = !self.realm_config_materialized.load(Ordering::Acquire);
         let admitted = self.default_peers.read().contains(&peer_id)
-            || self.device_peers.read().contains(&peer_id)
             || (bootstrap_window && self.configured_peers.contains(&peer_id));
         if !admitted {
             return Err(NetError::AdmissionRejected(format!(
@@ -1017,38 +1015,6 @@ impl DocumentSyncService {
                 "document sync stream budget exhausted for peer {peer_id}"
             ))
         })
-    }
-
-    /// Publishes the realm's devices, which are admitted for the realm-wide
-    /// documents alone.
-    pub fn set_device_peers(&self, nodes: impl IntoIterator<Item = NodeId>) {
-        let peers = nodes
-            .into_iter()
-            .map(|node_id| node_id_to_peer_id(&node_id))
-            .filter(|peer| *peer != self.node.peer_id())
-            .collect();
-        *self.device_peers.write() = peers;
-    }
-
-    /// The first topic a device peer may not exchange, if any. A realm node
-    /// serves a device the shared realm documents and nothing else; every other
-    /// peer is unrestricted here and bounded by its own membership.
-    fn device_topic_denied(
-        &self,
-        peer: NodeId,
-        topics: &[irokle_crate::TopicId],
-    ) -> Option<irokle_crate::TopicId> {
-        let peer_id = node_id_to_peer_id(&peer);
-        if self.default_peers.read().contains(&peer_id)
-            || !self.device_peers.read().contains(&peer_id)
-        {
-            return None;
-        }
-        let allowed = realm_wide_topics(self.realm_id);
-        topics
-            .iter()
-            .copied()
-            .find(|topic| !allowed.contains(topic))
     }
 
     pub async fn handle_inbound_stream(
@@ -1068,11 +1034,6 @@ impl DocumentSyncService {
         )
         .await
         .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT))??;
-        if let Some(topic) = self.device_topic_denied(peer, &touched_topics) {
-            return Err(NetError::AdmissionRejected(format!(
-                "device {peer} may not sync topic {topic}"
-            )));
-        }
         let read_elapsed = stream_started.elapsed();
         let message_count = messages.len();
         let handle_started = Instant::now();

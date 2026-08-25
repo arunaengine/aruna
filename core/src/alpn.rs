@@ -66,9 +66,9 @@ impl Alpn {
     /// connection. `None` is a key the realm config does not name: it keeps the
     /// pre-matrix provisional behaviour and is bounded by admission instead.
     ///
-    /// A `User` device speaks the read and forward surface only, plus the two
-    /// directional protocols: it dials job control and both dials and serves
-    /// document sync. Which peer it takes that from is [`Alpn::accepts`].
+    /// A `User` device speaks the read and forward surface only. Document sync
+    /// and shard exchange are realm infrastructure a device never touches in
+    /// any direction; job control it dials for its owner but never serves.
     pub const fn permits(&self, kind: Option<&RealmNodeKind>, role: AlpnRole) -> bool {
         match kind {
             None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,
@@ -78,31 +78,13 @@ impl Alpn {
                 | Alpn::Metadata
                 | Alpn::NativeReference
                 | Alpn::Notification => true,
-                Alpn::Shard => false,
-                Alpn::DocumentSync => match role {
-                    AlpnRole::LocalServe | AlpnRole::LocalDial => true,
-                    AlpnRole::PeerInbound => false,
-                },
+                Alpn::DocumentSync | Alpn::Shard => false,
                 Alpn::JobControl => match role {
                     AlpnRole::PeerInbound | AlpnRole::LocalDial => true,
                     AlpnRole::LocalServe => false,
                 },
             },
         }
-    }
-
-    /// Whether this node accepts `alpn` from a peer, judged on both kinds. Only
-    /// document sync needs the pair: realm infrastructure serves a device the
-    /// shared realm documents, and two devices never exchange anything.
-    pub fn accepts(&self, local: Option<&RealmNodeKind>, peer: Option<&RealmNodeKind>) -> bool {
-        if !self.permits(local, AlpnRole::LocalServe) {
-            return false;
-        }
-        let device_peer = matches!(peer, Some(RealmNodeKind::User { .. }));
-        if matches!(self, Alpn::DocumentSync) && device_peer {
-            return !matches!(local, Some(RealmNodeKind::User { .. }));
-        }
-        self.permits(peer, AlpnRole::PeerInbound)
     }
 
     pub const fn as_bytes(&self) -> &'static [u8] {

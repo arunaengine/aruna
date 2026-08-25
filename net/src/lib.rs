@@ -1026,6 +1026,12 @@ impl NetHandle {
             .ensure_document_sync_topics(topics, peers)
     }
 
+    /// Ensures topics this node is the only holder of. No peer is added to
+    /// their membership, so a device's own topics stay entirely local.
+    pub fn ensure_local_topics(&self, topics: &[::irokle::TopicId]) -> Result<()> {
+        self.inner.document_sync.ensure_local_topics(topics)
+    }
+
     /// Whether a document sync topic's genesis is known locally.
     pub fn document_sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
         self.inner.document_sync.topic_exists(topic)
@@ -1205,15 +1211,6 @@ impl NetHandle {
             self.inner.node_id,
         );
         self.inner.inbound_admission.set_admitted(admitted);
-        // A device fetches the realm-wide documents itself; irokle admits it for
-        // those topics alone and for nothing else the realm holds.
-        self.inner.document_sync.set_device_peers(
-            document
-                .nodes
-                .iter()
-                .filter(|node| !node.kind.is_sync_eligible())
-                .filter_map(|node| NodeId::from_str(&node.node_id).ok()),
-        );
         // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
         let peers = unique_peer_nodes(
             document
