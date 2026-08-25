@@ -18,6 +18,7 @@ use crate::metadata::projector::{
     project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::mutate_realm_placement::node_kind;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::permission_rules::GroupPermissionRules;
@@ -89,9 +90,12 @@ impl OperationsInboundHandler {
     }
 
     /// Blob replication is trusted only from realm nodes eligible to hold and
-    /// sync data; unknown or user-kind peers are rejected. A device serves the
-    /// same set: the realm nodes pull its offered content, and device-to-device
-    /// transfer is not a path. Fails closed when the config is unreadable.
+    /// sync data; an unknown peer is rejected. An owner-bound device is also
+    /// admitted, because the plane is how it reads its owner's data and how the
+    /// realm pulls its observations, but it never becomes a replication source:
+    /// the serve forces the owner's identity and re-checks every request.
+    /// Device-to-device transfer is not a path. Fails closed when the config is
+    /// unreadable.
     async fn bao_peer_admitted(&self, realm_id: RealmId, peer: NodeId) -> bool {
         let config = match drive(
             GetRealmConfigOperation::new(realm_id),
@@ -105,6 +109,16 @@ impl OperationsInboundHandler {
                 return false;
             }
         };
+        // An owner-bound device is admitted to the plane so it can read its
+        // owner's data and serve its own observations. It stays outside
+        // replication: the serve forces the owner's identity, and every
+        // per-request gate still decides what it may actually read.
+        if node_kind(&config, peer)
+            .and_then(|kind| kind.owner())
+            .is_some()
+        {
+            return true;
+        }
         match config.sync_eligible_node_ids() {
             Ok(ids) => ids.contains(&peer),
             Err(error) => {
