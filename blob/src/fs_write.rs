@@ -17,7 +17,8 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::fs_source::{
-    MAX_COPY_ATTEMPTS, SPOOL_DIR, canonical_root, current_fingerprint, jailed_file, map_io_error,
+    MAX_COPY_ATTEMPTS, SPOOL_DIR, SPOOL_GRACE, canonical_root, current_fingerprint, jailed_file,
+    map_io_error,
 };
 
 /// Why a spooled file could not be published. A refusal is the owner's data
@@ -327,7 +328,8 @@ async fn jailed_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, LocalF
 }
 
 /// Removes what a crashed write left in the spool directory. Nothing outside
-/// that directory is ever touched, and everything inside it is this node's own.
+/// that directory is ever touched, everything inside it is this node's own, and
+/// a file young enough to belong to a write in flight is left alone.
 pub(crate) async fn sweep_spool(root: &str) -> usize {
     let Ok(root) = canonical_root(root).await else {
         return 0;
@@ -335,13 +337,30 @@ pub(crate) async fn sweep_spool(root: &str) -> usize {
     let Ok(mut reader) = tokio::fs::read_dir(root.join(SPOOL_DIR)).await else {
         return 0;
     };
+    let now = std::time::SystemTime::now();
     let mut removed = 0usize;
     while let Ok(Some(entry)) = reader.next_entry().await {
+        if in_flight(&entry, now).await {
+            continue;
+        }
         if tokio::fs::remove_file(entry.path()).await.is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+/// Whether a spool file is young enough that a concurrent pass may still be
+/// writing it. An unreadable timestamp counts as in flight: the bytes are this
+/// node's own either way, and the next sweep will find it again.
+async fn in_flight(entry: &tokio::fs::DirEntry, now: std::time::SystemTime) -> bool {
+    let Ok(metadata) = entry.metadata().await else {
+        return true;
+    };
+    metadata.modified().ok().is_none_or(|modified| {
+        now.duration_since(modified)
+            .is_ok_and(|age| age < SPOOL_GRACE)
+    })
 }
 
 /// Streams the incoming bytes into the folder's own spool directory, so
@@ -871,6 +890,33 @@ mod tests {
         assert!(!outside.path().join("deep").exists());
     }
 
+    /// Writes one spool file and dates it past the sweep's grace.
+    async fn age_spool(path: &std::path::Path) {
+        tokio::fs::write(path, b"spool").await.unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        let stale = std::time::SystemTime::now() - SPOOL_GRACE - std::time::Duration::from_secs(60);
+        file.set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+    }
+
+    // A write in flight spools into the same directory every sweep reads, so a
+    // fresh file is left alone and only a leftover is removed.
+    #[tokio::test]
+    async fn spares_fresh_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let spool = root.path().join(SPOOL_DIR);
+        tokio::fs::create_dir_all(&spool).await.unwrap();
+        tokio::fs::write(spool.join("in-flight"), b"streaming")
+            .await
+            .unwrap();
+        age_spool(&spool.join("leftover")).await;
+
+        assert_eq!(sweep_spool(&path).await, 1);
+        assert!(spool.join("in-flight").exists());
+        assert!(!spool.join("leftover").exists());
+    }
+
     // The trash and the write spool are this node's bookkeeping and live in the
     // reserved directory. Everything else in the folder is the owner's, whatever
     // it is named, and a sweep must never remove it.
@@ -894,9 +940,7 @@ mod tests {
         tokio::fs::create_dir_all(root.path().join(SPOOL_DIR))
             .await
             .unwrap();
-        tokio::fs::write(root.path().join(SPOOL_DIR).join("stale"), b"spool")
-            .await
-            .unwrap();
+        age_spool(&root.path().join(SPOOL_DIR).join("stale")).await;
 
         let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
             .await

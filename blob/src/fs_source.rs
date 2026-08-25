@@ -31,6 +31,11 @@ pub(crate) const RESERVED_DIR: &str = ".aruna";
 /// files and never one the owner happens to have named like a spool.
 pub(crate) const SPOOL_DIR: &str = ".aruna/tmp";
 
+/// How long a spool file is left alone. A sweep runs on every folder check and
+/// a write may be streaming into the directory at that moment, so only a file
+/// old enough that no write can still be holding it is a leftover.
+pub(crate) const SPOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Candidate names one conflicted copy or move-aside may try before it gives
 /// up. A folder with this many same-named copies needs the owner, not a retry.
 pub(crate) const MAX_COPY_ATTEMPTS: usize = 100;
