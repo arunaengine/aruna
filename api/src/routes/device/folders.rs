@@ -12,21 +12,20 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, parse_group_id};
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, AuthContext, FolderMode, FolderState, Permission,
-    RemoteBinding, blob_bucket_permission_path,
+    ActionKind, ActionOutcome, ActionScope, AuthContext, FolderMode, FolderState, RemoteBinding,
 };
-use aruna_core::types::{GroupId, Key, NodeId};
+use aruna_core::types::{Key, NodeId};
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, bind_folder, folder_bucket, folder_counters, list_actions,
-    list_entries, list_folders, read_bound, read_entry, set_folder_state, unbind_folder,
+    BindFolderInput, FolderError, bind_folder, folder_counters, list_actions, list_entries,
+    list_folders, read_bound, read_entry, set_folder_state, unbind_folder,
 };
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 
@@ -213,23 +212,6 @@ fn map_action_error(error: ActionError) -> ServerError {
     }
 }
 
-/// The folder's own bucket path, which the owner must be allowed to write in
-/// the named group: a synced folder is that group's data on this device.
-async fn folder_permission(
-    state: &ServerState,
-    auth: &AuthContext,
-    group_id: GroupId,
-    bucket: &str,
-) -> ServerResult<()> {
-    ensure_permission(
-        state,
-        auth,
-        blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
-        Permission::WRITE,
-    )
-    .await
-}
-
 /// One folder with the counters its entries currently add up to.
 async fn folder_detail(
     state: &ServerState,
@@ -248,7 +230,7 @@ async fn folder_detail(
     summary = "Bind a local directory to a realm bucket prefix",
     description = r#"Keeps a directory on this machine in sync with one prefix of one realm bucket.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for, with WRITE on the folder's derived bucket in the named group. The realm node re-checks WRITE on the remote bucket when it pulls.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. A device holds no group authorization document, so the owner binding is the whole local authority: the realm node that serves the folder authorizes the owner's WRITE on the remote bucket every time it pulls, and refuses the pull otherwise.
 
 **Behavior**
 - The device-local bucket is derived from the folder id, so the owner never names it and it cannot collide with a bucket they already use.
@@ -281,7 +263,7 @@ async fn folder_detail(
         (status = 201, description = "The folder is bound and its first observation is registered", body = SyncedFolderView),
         (status = 400, description = "Malformed ids, or an unusable directory", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the owner, or may not write in the group", body = ErrorResponse),
+        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The root overlaps a bound folder", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -296,7 +278,6 @@ async fn bind_synced_folder(
     let auth = require_owner(&state, auth).await?;
     let group_id = parse_group_id(&request.group_id)?;
     let folder_id = Ulid::generate();
-    folder_permission(&state, &auth, group_id, &folder_bucket(folder_id)).await?;
     let node_id = NodeId::from_str(&request.remote_node_id).map_err(|_| {
         ServerError::BadRequestReason("remote_node_id is not a node id".to_string())
     })?;
@@ -408,6 +389,8 @@ async fn get_synced_folder(
 
 **Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
 
+**Authorization**: the owner binding alone, as for binding; the realm objects the folder published are untouched, so nothing outside this device is decided here.
+
 **Behavior**
 - The binding, its merge bases, its queued uploads and its audit log are removed from this device.
 - The device's own observation bucket is emptied with delete markers; the realm objects the folder published stay.
@@ -431,10 +414,10 @@ async fn unbind_synced_folder(
     let auth = require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let context = state.get_ctx();
-    let folder = read_bound(&context, folder_id)
+    // An unknown folder answers 404 before anything is torn down.
+    read_bound(&context, folder_id)
         .await
         .map_err(map_folder_error)?;
-    folder_permission(&state, &auth, folder.group_id, &folder.local_bucket).await?;
     let removed = unbind_folder(
         &context,
         folder_id,
