@@ -1940,6 +1940,10 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedAdminEventQueued
             | MetadataTransportMessage::ForwardedGroupCreated { .. }
             | MetadataTransportMessage::ForwardedGroupCreateConflict { .. }
+            | MetadataTransportMessage::ForwardSyncPull { .. }
+            | MetadataTransportMessage::ForwardedSyncPull { .. }
+            | MetadataTransportMessage::ForwardListVersions { .. }
+            | MetadataTransportMessage::ForwardedVersions { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4766,6 +4770,10 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedAdminEventQueued => "forwarded_admin_event_queued",
         MetadataTransportMessage::ForwardGroupCreate { .. } => "forward_group_create",
         MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
+        MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
+        MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
+        MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
+        MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
         MetadataTransportMessage::ForwardedGroupCreateConflict { .. } => {
             "forwarded_group_create_conflict"
         }

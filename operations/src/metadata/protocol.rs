@@ -13,7 +13,8 @@ use aruna_core::metadata::{
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, PathClaimRecord,
     PersistentIdFailure, PersistentIdMapping, PlacementPolicy, PlacementPolicyDocument,
-    PlacementPolicyRef, PlacementRef, SubmissionId, SyncRelationship,
+    PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor, SyncPageLimit, SyncPullAck,
+    SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -374,6 +375,35 @@ pub enum MetadataTransportMessage {
     },
     ForwardedGroupCreateConflict {
         reason: String,
+    },
+    /// One device version a synced folder asks its realm node to pull and
+    /// commit as the owner. The realm node reads the exact version from the
+    /// device and writes its own copy, so the device never pushes. Appended
+    /// after the earlier variants so their indices stay stable.
+    ForwardSyncPull {
+        auth_token: MetadataAuthToken,
+        source: Box<VersionedObjectArn>,
+        blake3: Option<[u8; 32]>,
+        size: u64,
+        target_bucket: String,
+        target_key: String,
+        /// A local delete asks for a delete marker instead of a version.
+        deleted: bool,
+    },
+    ForwardedSyncPull {
+        result: Result<SyncPullAck, SyncRefusal>,
+    },
+    /// Bounded listing of the current heads under one bucket prefix, served as
+    /// a routed read with the requesting owner's authority.
+    ForwardListVersions {
+        auth_token: MetadataAuthToken,
+        bucket: String,
+        prefix: String,
+        cursor: Option<SyncListCursor>,
+        limit: SyncPageLimit,
+    },
+    ForwardedVersions {
+        result: Result<SyncVersionPage, SyncRefusal>,
     },
 }
 
