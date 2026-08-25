@@ -260,7 +260,13 @@ async fn delete_target(
             realm_id: auth.realm_id,
             node_id,
             deleted_by: auth.user_id,
-        }),
+        })
+        // The marker carries the device version it came from, so a retried
+        // delete is recognized as the same one instead of stacking markers.
+        .with_metadata(HashMap::from([(
+            SYNC_SOURCE_VERSION_TAG.to_string(),
+            request.source.version.to_string(),
+        )])),
         context,
     )
     .await
@@ -711,6 +717,48 @@ mod tests {
             .await
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn replayed_delete_settles() {
+        // A retried delete must answer with the marker it already produced; the
+        // source version on the marker is what makes it recognizable.
+        let fixture = policy_fixture(None).await;
+        let request = pull_request(true);
+        let version_id = Ulid::from_bytes([7; 16]);
+        let mut marker = BlobVersion::deleted(SystemTime::UNIX_EPOCH, fixture.auth.user_id);
+        marker.metadata = HashMap::from([(
+            SYNC_SOURCE_VERSION_TAG.to_string(),
+            request.source.version.to_string(),
+        )]);
+        let key = VersionKey::new(&request.target_bucket, &request.target_key, version_id);
+        let _ = fixture
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: key.to_bytes().unwrap().into(),
+                value: marker.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert_eq!(
+            applied_version(&fixture.context, &request).await,
+            Some(version_id)
+        );
+        let newer = PullRequest {
+            source: VersionedObjectArn::new(
+                request.source.realm_id,
+                request.source.node_id,
+                request.source.bucket.clone(),
+                request.source.key.clone(),
+                Ulid::from_bytes([8; 16]),
+            )
+            .unwrap(),
+            ..pull_request(true)
+        };
+        assert_eq!(applied_version(&fixture.context, &newer).await, None);
     }
 
     #[tokio::test]

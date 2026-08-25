@@ -23,7 +23,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -155,6 +155,7 @@ pub struct DeleteObjectOperation {
     copy_removal: Option<ManagedCopyRemoval>,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
     restrictions: Option<Vec<PathRestriction>>,
+    metadata: HashMap<String, String>,
 }
 
 impl DeleteObjectOperation {
@@ -182,7 +183,16 @@ impl DeleteObjectOperation {
             copy_removal: None,
             output: None,
             restrictions: None,
+            metadata: HashMap::new(),
         }
+    }
+
+    /// Metadata the delete marker carries. A forwarded sync delete tags the
+    /// device version it came from here, so a replay is recognized instead of
+    /// minting a second marker.
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     /// The deleter's credential restrictions. They are persisted on the durable
@@ -786,7 +796,8 @@ impl DeleteObjectOperation {
             .deleted_version_created_at
             .get_or_insert_with(SystemTime::now)
             .to_owned();
-        let version = BlobVersion::deleted(created_at, self.input.deleted_by);
+        let mut version = BlobVersion::deleted(created_at, self.input.deleted_by);
+        version.metadata = self.metadata.clone();
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
