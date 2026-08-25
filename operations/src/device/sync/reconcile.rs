@@ -115,6 +115,9 @@ pub struct ReconcileFolderOperation {
     /// Indices this pass could not hash within its batch. They are left for the
     /// next pass rather than decided on bytes nobody read.
     deferred: BTreeSet<usize>,
+    /// Whether this folder's filesystem timestamps below the second. Without
+    /// that, a rewrite can land inside one timestamp and no stat can tell.
+    fine_timestamps: bool,
     writes: Vec<(String, Key, Value)>,
     deletes: Vec<(String, Key)>,
     plan: ReconcilePlan,
@@ -124,6 +127,7 @@ pub struct ReconcileFolderOperation {
 impl ReconcileFolderOperation {
     pub fn new(input: ReconcileInput) -> Self {
         Self {
+            fine_timestamps: input.local.values().any(fine_stat),
             input,
             state: ReconcileState::Init,
             paths: Vec::new(),
@@ -160,14 +164,11 @@ impl ReconcileFolderOperation {
             let base = self.bases.get(index).cloned().flatten();
             let remote = self.input.remote.get(relative).cloned();
             let mut local = self.input.local.get(relative).cloned();
-            // A file whose complete stat still equals the base carries the
-            // base's strong hash; the adapter re-verifies both before it writes.
-            // An incomplete fingerprint proves nothing and was hashed instead.
-            if let (Some(local), Some(synced)) = (
-                local.as_mut(),
-                base.as_ref().and_then(|base| base.synced.as_ref()),
-            ) && local.fingerprint == synced.fingerprint
-                && fingerprint_complete(&local.fingerprint)
+            // A settled observation carries the base's strong hash; anything
+            // else was read instead, so its own hash is already in place.
+            if let Some(local) = local.as_mut()
+                && self.reuses_hash(index, local)
+                && let Some(synced) = base.as_ref().and_then(|base| base.synced.as_ref())
             {
                 local.blake3 = Some(synced.blake3);
             }
@@ -414,6 +415,33 @@ impl ReconcileFolderOperation {
         self.writes.push(upload_entry(&upload)?);
         Ok(true)
     }
+}
+
+/// How long a file must have been still before its stat may stand in for its
+/// bytes. Below it a rewrite can share the timestamps of the observation that
+/// preceded it, whatever resolution the filesystem keeps.
+const SETTLE_WINDOW_MS: u64 = 2_000;
+
+/// Whether one observation shows sub-second timestamps. A whole-second stat may
+/// be a coarse filesystem or a file that happened to land on the second, so the
+/// answer is taken over the whole page and never from one file alone.
+fn fine_stat(local: &Observed) -> bool {
+    local.stat.is_some_and(|stat| {
+        [stat.modified_ns, stat.changed_ns]
+            .into_iter()
+            .flatten()
+            .any(|nanos| nanos % 1_000_000_000 != 0)
+    })
+}
+
+/// Whether the file has been still long enough that a rewrite could not have
+/// happened inside the observation's own timestamp.
+fn stat_settled(local: &Observed, now_ms: u64) -> bool {
+    let Some(changed_ns) = local.stat.and_then(|stat| stat.changed_ns) else {
+        return false;
+    };
+    let changed_ms = u64::try_from(changed_ns / 1_000_000).unwrap_or(u64::MAX);
+    now_ms.saturating_sub(changed_ms) >= SETTLE_WINDOW_MS
 }
 
 /// The base a settled entry keeps: the synced bytes and their timestamp are
@@ -677,20 +705,34 @@ impl ReconcileFolderOperation {
             .iter()
             .enumerate()
             .filter(|(index, relative)| {
-                let Some(local) = self.input.local.get(*relative) else {
-                    return false;
-                };
-                if !fingerprint_complete(&local.fingerprint) {
-                    return true;
-                }
-                self.bases
-                    .get(*index)
-                    .and_then(Option::as_ref)
-                    .and_then(|base| base.synced.as_ref())
-                    .is_none_or(|synced| synced.fingerprint != local.fingerprint)
+                self.input
+                    .local
+                    .get(*relative)
+                    .is_some_and(|local| !self.reuses_hash(*index, local))
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// Whether the recorded hash may stand in for reading this file.
+    ///
+    /// Only a settled observation may: the stat must equal the base's, name
+    /// every field, come from a filesystem that timestamps finely enough for a
+    /// rewrite to move it, and be old enough that a rewrite cannot hide inside
+    /// the timestamp it was taken at. Anything else is hashed.
+    fn reuses_hash(&self, index: usize, local: &Observed) -> bool {
+        let Some(synced) = self
+            .bases
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|base| base.synced.as_ref())
+        else {
+            return false;
+        };
+        synced.fingerprint == local.fingerprint
+            && fingerprint_complete(&local.fingerprint)
+            && self.fine_timestamps
+            && stat_settled(local, self.input.now_ms)
     }
 
     fn emit_deletes(&mut self, txn_id: TxnId) -> Effects {
@@ -732,7 +774,7 @@ fn fail(operation: &mut ReconcileFolderOperation, error: ReconcileError) -> Effe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{FolderMode, FolderState, RealmId, RemoteBinding};
+    use aruna_core::structs::{FileStat, FolderMode, FolderState, RealmId, RemoteBinding};
     use aruna_core::types::UserId;
     use byteview::ByteView;
 
@@ -775,6 +817,12 @@ mod tests {
         }
     }
 
+    /// When every fixture pass observes, far enough past the fixture's stat
+    /// timestamps that a file which has not changed reads as settled.
+    const OBSERVED_AT_MS: u64 = 10_000;
+
+    /// An observation of a file that has been still for a while, on a
+    /// filesystem that timestamps below the second.
     fn observed(fingerprint: &str) -> Observed {
         Observed {
             fingerprint: fingerprint.to_string(),
@@ -782,6 +830,26 @@ mod tests {
             blake3: None,
             modified_at_ms: Some(3),
             version_id: Some(Ulid::from_bytes([6u8; 16])),
+            stat: Some(FileStat {
+                size: 5,
+                modified_ns: Some(1_500_000),
+                changed_ns: Some(1_500_000),
+                inode: Some(42),
+            }),
+        }
+    }
+
+    /// The same file as the sweep saw it moments ago: the write that made it
+    /// could still be hiding inside these timestamps.
+    fn observed_now(fingerprint: &str, now_ms: u64) -> Observed {
+        Observed {
+            stat: Some(FileStat {
+                size: 5,
+                modified_ns: Some(u128::from(now_ms) * 1_000_000 + 500_000),
+                changed_ns: Some(u128::from(now_ms) * 1_000_000 + 500_000),
+                inode: Some(42),
+            }),
+            ..observed(fingerprint)
         }
     }
 
@@ -809,7 +877,7 @@ mod tests {
             remote: remote
                 .map(|remote| BTreeMap::from([("paper.txt".to_string(), remote)]))
                 .unwrap_or_default(),
-            now_ms: 10,
+            now_ms: OBSERVED_AT_MS,
         };
         (ReconcileFolderOperation::new(input), base)
     }
@@ -978,6 +1046,55 @@ mod tests {
         assert!(plan.downloads.is_empty());
         assert_eq!(plan.uploads, 0);
         assert_eq!(plan.pending, 1);
+    }
+
+    /// Whether the first thing this pass asks for is a hash of the file.
+    fn hashes_first(local: Observed, base: Option<SyncBase>) -> bool {
+        let (mut operation, base) = operation(Some(local), base, None);
+        operation.start();
+        let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (ByteView::from(vec![0u8]), value),
+                (ByteView::from(vec![1u8]), None),
+            ],
+        }));
+        matches!(
+            effects.first(),
+            Some(Effect::LocalFile(LocalFileEffect::Hash { .. }))
+        )
+    }
+
+    #[test]
+    fn hashes_young_file() {
+        // A rewrite can restore the size, the inode and the modification time,
+        // so a file that changed moments ago is read rather than trusted; one
+        // that has been still keeps the hash the base recorded for it.
+        let settled = base("5-1-1-1", Some(Ulid::from_bytes([4u8; 16])));
+        assert!(hashes_first(
+            observed_now("5-1-1-1", OBSERVED_AT_MS),
+            Some(settled.clone())
+        ));
+        assert!(!hashes_first(observed("5-1-1-1"), Some(settled)));
+    }
+
+    #[test]
+    fn hashes_coarse_stat() {
+        // Whole-second timestamps cannot tell a rewrite from the write before
+        // it, so the bytes are always read on such a filesystem.
+        let coarse = Observed {
+            stat: Some(FileStat {
+                size: 5,
+                modified_ns: Some(1_000_000_000),
+                changed_ns: Some(1_000_000_000),
+                inode: Some(42),
+            }),
+            ..observed("5-1-1-1")
+        };
+        assert!(hashes_first(
+            coarse,
+            Some(base("5-1-1-1", Some(Ulid::from_bytes([4u8; 16]))))
+        ));
     }
 
     #[test]

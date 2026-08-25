@@ -9,6 +9,7 @@
 
 use crate::errors::ConversionError;
 use crate::id::NodeId;
+use crate::structs::FileStat;
 use crate::types::{GroupId, UserId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -280,6 +281,9 @@ pub struct Observed {
     pub blake3: Option<[u8; 32]>,
     pub modified_at_ms: Option<u64>,
     pub version_id: Option<Ulid>,
+    /// The stat the fingerprint was built from. It decides whether the
+    /// observation is settled enough to stand in for reading the file.
+    pub stat: Option<FileStat>,
 }
 
 /// One side of an entry as it was last seen. It is reporting only: a guard is
@@ -682,6 +686,7 @@ mod tests {
             blake3: hash.map(|byte| [byte; 32]),
             modified_at_ms: None,
             version_id: None,
+            stat: None,
         }
     }
 

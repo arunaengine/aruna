@@ -65,6 +65,9 @@ pub struct ObservedFile {
     pub size: u64,
     pub modified_at_ms: Option<u64>,
     pub version_id: Ulid,
+    /// The stat the listing read, for the decisions that need more than the
+    /// fingerprint it was folded into.
+    pub stat: Option<aruna_core::structs::FileStat>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +163,7 @@ pub async fn offer_directory(
             size,
             modified_at_ms: entry.modified.and_then(millis_since_epoch),
             version_id,
+            stat: entry.stat,
         });
     }
     let offered = entries

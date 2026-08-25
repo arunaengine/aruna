@@ -110,6 +110,7 @@ pub async fn reconcile_folder(
                     blake3: None,
                     modified_at_ms: file.modified_at_ms,
                     version_id: Some(file.version_id),
+                    stat: file.stat,
                 },
             )
         })

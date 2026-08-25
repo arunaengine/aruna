@@ -42,7 +42,7 @@ const UNKNOWN_FIELD: &str = "?";
 /// The stat facts one weak fingerprint is built from. Size and mtime alone are
 /// forgeable: a rewrite can restore both. The change time and the inode cannot
 /// be set by a user tool, so a rewritten file always moves one of them.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileStat {
     pub size: u64,
     /// Modification time in nanoseconds, at whatever resolution the filesystem
