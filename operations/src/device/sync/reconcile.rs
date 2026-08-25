@@ -184,8 +184,17 @@ impl ReconcileFolderOperation {
         let folder_id = self.input.folder.folder_id;
         match action {
             SyncAction::Nothing => {
-                let base = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
-                self.push_base(relative, settled(base, self.input.now_ms), local, remote)?;
+                let current = base.unwrap_or_else(|| unsynced(local, self.input.now_ms));
+                let next = SyncBase {
+                    local: local.map(EntrySide::from_local),
+                    remote: remote.map(EntrySide::from_remote),
+                    ..settled(current.clone())
+                };
+                // An entry that already reads this way must not be rewritten on
+                // every pass: a large folder would rewrite its whole base table.
+                if next != current {
+                    self.push_base(relative, next, local, remote)?;
+                }
             }
             SyncAction::AdoptBase => {
                 let (Some(local), Some(remote)) = (local, remote) else {
@@ -342,13 +351,12 @@ impl ReconcileFolderOperation {
     }
 }
 
-/// The base a settled entry keeps: the synced bytes are unchanged, only the
-/// reported state and the pending mark clear.
-fn settled(base: SyncBase, now_ms: u64) -> SyncBase {
+/// The base a settled entry keeps: the synced bytes and their timestamp are
+/// unchanged, only the reported state and the pending mark clear.
+fn settled(base: SyncBase) -> SyncBase {
     SyncBase {
         entry: EntryState::InSync,
         pending_at: None,
-        synced_at_ms: now_ms,
         ..base
     }
 }
@@ -588,4 +596,198 @@ fn fail(operation: &mut ReconcileFolderOperation, error: ReconcileError) -> Effe
     operation.state = ReconcileState::Error;
     operation.output = Some(Err(error));
     cleanup
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::{FolderMode, FolderState, RealmId, RemoteBinding};
+    use aruna_core::types::UserId;
+    use byteview::ByteView;
+
+    fn folder() -> SyncedFolder {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        SyncedFolder {
+            folder_id: Ulid::from_bytes([1u8; 16]),
+            root: "/home/ada/data".to_string(),
+            local_bucket: "folder-x".to_string(),
+            group_id: Ulid::from_bytes([2u8; 16]),
+            remote: RemoteBinding {
+                node_id: aruna_core::NodeId::from_bytes(&[3u8; 32]).expect("node id"),
+                bucket: "lab".to_string(),
+                prefix: String::new(),
+            },
+            mode: FolderMode::TwoWay,
+            propagate_deletes: true,
+            state: FolderState::Active,
+            created_by: UserId::new(Ulid::from_bytes([4u8; 16]), realm_id),
+            created_at_ms: 1,
+            last_reconcile_ms: None,
+        }
+    }
+
+    fn base(fingerprint: &str, remote: Option<Ulid>) -> SyncBase {
+        SyncBase {
+            fingerprint: fingerprint.to_string(),
+            blake3: [9u8; 32],
+            size: 5,
+            local_version_id: None,
+            remote_version_id: remote,
+            synced_at_ms: 1,
+            entry: EntryState::InSync,
+            pending_at: None,
+            local: None,
+            remote: None,
+        }
+    }
+
+    fn observed(fingerprint: &str) -> Observed {
+        Observed {
+            fingerprint: fingerprint.to_string(),
+            size: 5,
+            blake3: None,
+            modified_at_ms: Some(3),
+            version_id: Some(Ulid::from_bytes([6u8; 16])),
+        }
+    }
+
+    fn head(version: Ulid, deleted: bool) -> RemoteHead {
+        RemoteHead {
+            relative: "paper.txt".to_string(),
+            version_id: version,
+            size: 5,
+            blake3: Some([8u8; 32]),
+            modified_at_ms: Some(4),
+            deleted,
+        }
+    }
+
+    fn operation(
+        local: Option<Observed>,
+        base: Option<SyncBase>,
+        remote: Option<RemoteHead>,
+    ) -> (ReconcileFolderOperation, Option<SyncBase>) {
+        let input = ReconcileInput {
+            folder: folder(),
+            local: local
+                .map(|local| BTreeMap::from([("paper.txt".to_string(), local)]))
+                .unwrap_or_default(),
+            remote: remote
+                .map(|remote| BTreeMap::from([("paper.txt".to_string(), remote)]))
+                .unwrap_or_default(),
+            now_ms: 10,
+        };
+        (ReconcileFolderOperation::new(input), base)
+    }
+
+    /// Feeds the stored base back and runs the operation to completion.
+    fn run(mut operation: ReconcileFolderOperation, base: Option<SyncBase>) -> ReconcilePlan {
+        let effects = operation.start();
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::BatchRead { .. }))
+        ));
+        let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
+        let mut effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(ByteView::from(vec![0u8]), value)],
+        }));
+        while !operation.is_complete() {
+            let effect = effects.first().expect("the operation must ask for more");
+            let event = match effect {
+                Effect::LocalFile(LocalFileEffect::Hash { .. }) => {
+                    Event::LocalFile(LocalFileEvent::Hashed {
+                        fingerprint: "5-2".to_string(),
+                        blake3: [5u8; 32],
+                        size: 5,
+                    })
+                }
+                Effect::Storage(StorageEffect::StartTransaction { .. }) => {
+                    Event::Storage(StorageEvent::TransactionStarted {
+                        txn_id: Ulid::from_bytes([2u8; 16]),
+                    })
+                }
+                Effect::Storage(StorageEffect::BatchWrite { .. }) => {
+                    Event::Storage(StorageEvent::BatchWriteResult {
+                        entries: Vec::new(),
+                    })
+                }
+                Effect::Storage(StorageEffect::BatchDelete { .. }) => {
+                    Event::Storage(StorageEvent::BatchDeleteResult {
+                        entries: Vec::new(),
+                    })
+                }
+                Effect::Storage(StorageEffect::CommitTransaction { txn_id }) => {
+                    Event::Storage(StorageEvent::TransactionCommitted { txn_id: *txn_id })
+                }
+                other => panic!("unexpected effect {other:?}"),
+            };
+            effects = operation.step(event);
+        }
+        operation.finalize().expect("the page must decide")
+    }
+
+    #[test]
+    fn rejects_wrong_event() {
+        // An event the state cannot explain must fail loudly, not be ignored.
+        let (mut operation, _) = operation(Some(observed("5-1")), None, None);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([2u8; 16]),
+        }));
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(ReconcileError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn plans_conflict_copy() {
+        // Both sides changed: the local bytes are published and the remote
+        // version is only ever added beside them.
+        let version = Ulid::from_bytes([3u8; 16]);
+        let (operation, base) = operation(
+            Some(observed("5-2")),
+            Some(base("5-1", Some(Ulid::from_bytes([4u8; 16])))),
+            Some(head(version, false)),
+        );
+        let plan = run(operation, base);
+        assert_eq!(plan.uploads, 1);
+        assert_eq!(plan.downloads.len(), 1);
+        assert!(plan.downloads[0].conflicted);
+        assert_eq!(plan.downloads[0].guard, WriteGuard::MustNotExist);
+    }
+
+    #[test]
+    fn keeps_remote_delete() {
+        // A realm deletion never plans a write on the owner's disk.
+        let version = Ulid::from_bytes([4u8; 16]);
+        let (operation, base) = operation(
+            Some(observed("5-1")),
+            Some(base("5-1", Some(version))),
+            Some(head(Ulid::from_bytes([5u8; 16]), true)),
+        );
+        let plan = run(operation, base);
+        assert!(plan.downloads.is_empty());
+        assert_eq!(plan.uploads, 0);
+        assert_eq!(plan.pending, 1);
+    }
+
+    #[test]
+    fn guards_unchanged_replace() {
+        // The one automatic overwrite carries the base it was decided on.
+        let (operation, base) = operation(
+            Some(observed("5-1")),
+            Some(base("5-1", Some(Ulid::from_bytes([4u8; 16])))),
+            Some(head(Ulid::from_bytes([5u8; 16]), false)),
+        );
+        let plan = run(operation, base);
+        assert_eq!(plan.uploads, 0);
+        assert_eq!(plan.downloads.len(), 1);
+        assert!(!plan.downloads[0].conflicted);
+        assert!(matches!(
+            plan.downloads[0].guard,
+            WriteGuard::MatchesBase { .. }
+        ));
+    }
 }

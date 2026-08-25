@@ -24,6 +24,7 @@ use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use aruna_blob::blob::BlobHandler;
 use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
@@ -36,9 +37,9 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, GroupAuthorizationDocument, MetadataRegistryRecord, NodePlacementEntry,
-    PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-    TokenClaims, TransitionLimits,
+    Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument, MetadataRegistryRecord,
+    NodePlacementEntry, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RealmNodeKind, TokenClaims, TransitionLimits,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
@@ -977,6 +978,22 @@ async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNo
     )
     .await?;
     let task_handle = TaskHandle::new();
+    let blob_root = temp_dir.path().join("blobstore");
+    std::fs::create_dir_all(&blob_root)?;
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            root: blob_root.to_string_lossy().to_string(),
+            service_config: std::collections::HashMap::new(),
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100_000),
+            multipart_bucket: Some("uploaded-parts".to_string()),
+            timeouts: Default::default(),
+        },
+        storage.clone(),
+        net.clone(),
+    )
+    .await?;
     let metadata_handle = MetadataHandle::new(
         temp_dir.path().join("metadata"),
         net.node_id(),
@@ -989,7 +1006,7 @@ async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNo
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
-        blob_handle: None,
+        blob_handle: Some(blob_handle),
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
