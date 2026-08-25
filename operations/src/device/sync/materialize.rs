@@ -44,6 +44,11 @@ pub enum MaterializeOutcome {
     Refused {
         reason: LocalFileRefusal,
     },
+    /// The write itself failed. Nothing on disk changed and the entry reports
+    /// the reason instead of retrying silently forever.
+    Failed {
+        message: String,
+    },
 }
 
 pub struct MaterializeInput {
