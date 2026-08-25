@@ -1230,8 +1230,11 @@ fn validate_s3_profile(
 pub fn validate_wipe_roots(
     roots: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
-) -> Result<(), SetupError> {
-    for root in roots {
+) -> Result<Vec<std::path::PathBuf>, SetupError> {
+    // Without a home to compare against, no root can be shown to be safe.
+    let home = normalize_root(home.ok_or(SetupError::MissingConfigValue("HOME"))?);
+    let roots: Vec<std::path::PathBuf> = roots.iter().map(|root| normalize_root(root)).collect();
+    for root in &roots {
         let refuse = |message: &str| SetupError::InvalidConfigValue {
             key: "STORAGE_PATH",
             value: root.display().to_string(),
@@ -1240,7 +1243,7 @@ pub fn validate_wipe_roots(
         if root.parent().is_none() {
             return Err(refuse("a wipe root may not be the filesystem root"));
         }
-        if home.is_some_and(|home| home.starts_with(root)) {
+        if home.starts_with(root) {
             return Err(refuse("a wipe root may not contain a home directory"));
         }
         if roots
@@ -1250,7 +1253,14 @@ pub fn validate_wipe_roots(
             return Err(refuse("a wipe root may not contain another wipe root"));
         }
     }
-    Ok(())
+    Ok(roots)
+}
+
+/// The path a wipe would really erase: absolute, and resolved where it exists,
+/// so a relative root or a link cannot hide what it covers.
+fn normalize_root(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    std::fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
 fn node_capabilities_from_state(
@@ -1915,13 +1925,18 @@ mod tests {
         let home = std::path::PathBuf::from("/home/ada");
         let store = std::path::PathBuf::from("/home/ada/.aruna/store");
         let blobs = std::path::PathBuf::from("/home/ada/.aruna/blobs");
-        assert!(validate_wipe_roots(&[store.clone(), blobs.clone()], Some(&home)).is_ok());
+        assert_eq!(
+            validate_wipe_roots(&[store.clone(), blobs.clone()], Some(&home)).unwrap(),
+            vec![store.clone(), blobs.clone()]
+        );
 
         for unsafe_root in [
             std::path::PathBuf::from("/"),
             home.clone(),
             std::path::PathBuf::from("/home"),
             std::path::PathBuf::from("/home/ada/.aruna"),
+            // The same directory, reached through a path that hides it.
+            std::path::PathBuf::from("/home/ada/.aruna/store/../.."),
         ] {
             assert!(
                 validate_wipe_roots(
@@ -1933,6 +1948,11 @@ mod tests {
                 unsafe_root.display()
             );
         }
+        // A device that cannot say where its owner's home is cannot be judged.
+        assert!(matches!(
+            validate_wipe_roots(&[store], None),
+            Err(SetupError::MissingConfigValue("HOME"))
+        ));
     }
 
     // Only a device serves no S3 endpoint. An infrastructure node whose pair is

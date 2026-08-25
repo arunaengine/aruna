@@ -632,8 +632,9 @@ async fn bind_servers(
         true => {
             let (roots, unsupported) = wipe_plan(&config);
             // A wipe erases what these roots hold, so an unsafe one fails the
-            // start rather than the erasure.
-            aruna::config::validate_wipe_roots(
+            // start rather than the erasure, and what it erases is the
+            // normalized path, never the one that hid it.
+            let roots = aruna::config::validate_wipe_roots(
                 &roots,
                 std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)
