@@ -130,17 +130,15 @@ pub enum BlobEffect {
         location: BackendLocation,
         expected_blake3: [u8; 32],
     },
-    /// Serves one version whose bytes this node never copied into its blob
-    /// store: a device streams the owner's own file through its staging source.
-    /// The file is refused unless it still carries `fingerprint` and hashes to
-    /// `expected_blake3`, so a changed file is never served under a stale
-    /// identity.
+    /// Serves one version this node never copied into its blob store: a device
+    /// streams the owner's own file. The file is refused unless it still
+    /// carries `fingerprint` and hashes to `expected_blake3`.
     ServeSourceRead {
         stream_id: Ulid,
         access: ResolvedSourceAccess,
         size: u64,
         expected_blake3: [u8; 32],
-        fingerprint: Option<String>,
+        fingerprint: String,
     },
     ReceiveRead {
         stream_id: Ulid,

@@ -834,6 +834,58 @@ mod tests {
         assert!(root.path().join(".aruna-notes").exists());
     }
 
+    #[tokio::test]
+    async fn hashes_stable_source() {
+        // The identity the serve path checks a file against comes from here, so
+        // the fingerprint and the hash must describe the same read.
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("note.txt");
+        tokio::fs::write(&file, b"hello").await.unwrap();
+        let (fingerprint, blake3, size) = hash_stable(&file).await.expect("file hashes");
+        assert_eq!(size, 5);
+        assert_eq!(blake3, *::blake3::hash(b"hello").as_bytes());
+        assert_eq!(
+            crate::fs_source::current_fingerprint(&file)
+                .await
+                .as_deref(),
+            Some(fingerprint.as_str())
+        );
+    }
+
+    // A file that changed since it was observed must not be resolvable under
+    // the identity it had then.
+    #[tokio::test]
+    async fn detects_changed_source() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("note.txt");
+        tokio::fs::write(&file, b"before").await.unwrap();
+        let (_, before) = crate::fs_source::stable_source(&access(root.path(), "note.txt"))
+            .await
+            .expect("source resolves");
+        tokio::fs::write(&file, b"after-and-longer").await.unwrap();
+        let (_, after) = crate::fs_source::stable_source(&access(root.path(), "note.txt"))
+            .await
+            .expect("source resolves");
+        assert_ne!(before, after);
+    }
+
+    // A link out of the offered directory must not resolve for a serve either.
+    #[tokio::test]
+    async fn refuses_escaping_source() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(outside.path().join("secret"), b"secret")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("link"))
+            .unwrap();
+        assert!(
+            crate::fs_source::stable_source(&access(root.path(), "link"))
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn splits_copy_names() {
         assert_eq!(
