@@ -14,7 +14,9 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend};
+use aruna_core::structs::{
+    BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend, ResolvedSourceAccess,
+};
 use aruna_core::util::unix_timestamp_millis;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -128,6 +130,73 @@ impl BlobHandler {
         drop(stream);
         self.connections.lock().await.remove(&stream_id);
 
+        match result {
+            Ok(()) => BlobEvent::ReadServed { stream_id },
+            Err(error) => BlobEvent::Error(BlobError::ReplicationFailed(error.to_string())),
+        }
+    }
+
+    /// Serves one version this node never materialized: the bytes come from the
+    /// owner's own file through the staging source. The file is refused unless
+    /// it still carries the fingerprint the observation recorded and hashes to
+    /// the identity the requester named, so a changed file is never streamed
+    /// under a stale one.
+    pub async fn serve_source_read(
+        &self,
+        stream_id: Ulid,
+        access: ResolvedSourceAccess,
+        size: u64,
+        expected_blake3: [u8; 32],
+        fingerprint: Option<String>,
+    ) -> BlobEvent {
+        let (path, current) = match crate::fs_source::stable_source(&access).await {
+            Ok(resolved) => resolved,
+            Err(error) => return BlobEvent::Error(BlobError::ReadError(error.to_string())),
+        };
+        if fingerprint
+            .as_deref()
+            .is_some_and(|recorded| recorded != current)
+        {
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "the offered file changed since it was observed".to_string(),
+            ));
+        }
+        let mut reader = match crate::bao_tree::LocalFileReader::open(&path, size).await {
+            Ok(reader) => reader,
+            Err(error) => return BlobEvent::Error(BlobError::ReadError(error.to_string())),
+        };
+        let mut outboard =
+            match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
+                Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,
+                Ok(_) => {
+                    return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                        "the offered file does not carry the expected hash".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    return BlobEvent::Error(BlobError::OutboardCreationFailed(error.to_string()));
+                }
+            };
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
+        };
+        let mut stream = stream.lock().await;
+        let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
+        let mut sender = SendStreamWrapper::new(&mut stream.0, self.transfer_idle_timeout());
+        let result = encode_ranges_validated(reader, &mut outboard, &ranges, &mut sender).await;
+        _ = stream.0.finish();
+        _ = stream.1.stop(0u32.into());
+        drop(stream);
+        self.connections.lock().await.remove(&stream_id);
+
+        // The encoder validates every chunk against the outboard, so a file
+        // rewritten mid-stream already fails; this only names the cause.
+        if crate::fs_source::current_fingerprint(&path).await != Some(current) {
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "the offered file changed while it was served".to_string(),
+            ));
+        }
         match result {
             Ok(()) => BlobEvent::ReadServed { stream_id },
             Err(error) => BlobEvent::Error(BlobError::ReplicationFailed(error.to_string())),

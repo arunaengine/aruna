@@ -54,6 +54,25 @@ pub(crate) async fn check_local(access: &ResolvedSourceAccess) -> Result<(), Sta
     }
 }
 
+/// Resolves one staging-source access to the jailed file it names, together
+/// with the weak fingerprint it currently carries. Serving a device's own
+/// observation needs both: the path to stream, and the identity to re-check.
+pub(crate) async fn stable_source(
+    access: &ResolvedSourceAccess,
+) -> Result<(PathBuf, String), StagingSourceError> {
+    let (root, path) = access_parts(access)?;
+    let resolved = jailed_file(&root, &path).await?;
+    let metadata = tokio::fs::metadata(&resolved).await.map_err(map_io_error)?;
+    let fingerprint = weak_fingerprint(metadata.len(), metadata.modified().ok());
+    Ok((resolved, fingerprint))
+}
+
+/// The weak fingerprint one already-resolved file carries now.
+pub(crate) async fn current_fingerprint(path: &Path) -> Option<String> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    Some(weak_fingerprint(metadata.len(), metadata.modified().ok()))
+}
+
 pub(crate) async fn head_local(
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {

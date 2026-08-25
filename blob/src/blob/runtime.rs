@@ -67,6 +67,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
         BlobEffect::ServeRead { .. } => (EffectClass::Transfer, "serve_read"),
+        BlobEffect::ServeSourceRead { .. } => (EffectClass::Transfer, "serve_source_read"),
         BlobEffect::ReceiveRead { .. } => (EffectClass::Transfer, "receive_read"),
         BlobEffect::OpenConnection { .. } => (EffectClass::Control, "open_connection"),
         BlobEffect::SendMessage { .. } => (EffectClass::Control, "send_message"),
@@ -647,6 +648,22 @@ impl BlobHandler {
                 location,
                 expected_blake3,
             } => Box::pin(self.serve_read(stream_id, location, expected_blake3)).await,
+            BlobEffect::ServeSourceRead {
+                stream_id,
+                access,
+                size,
+                expected_blake3,
+                fingerprint,
+            } => {
+                Box::pin(self.serve_source_read(
+                    stream_id,
+                    access,
+                    size,
+                    expected_blake3,
+                    fingerprint,
+                ))
+                .await
+            }
             BlobEffect::ReceiveRead {
                 stream_id,
                 size,
