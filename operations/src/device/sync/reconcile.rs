@@ -46,8 +46,12 @@ pub struct Download {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcilePlan {
     pub downloads: Vec<Download>,
+    /// Rows this pass newly queued for upload. A row that was already queued is
+    /// not counted, so a waiting backoff never keeps the timer hot.
     pub uploads: usize,
     pub pending: usize,
+    /// The realm listing was cut short; the next pass resumes where it stopped.
+    pub truncated: bool,
 }
 
 impl ReconcilePlan {
@@ -55,6 +59,7 @@ impl ReconcilePlan {
         self.downloads.extend(other.downloads);
         self.uploads += other.uploads;
         self.pending += other.pending;
+        self.truncated |= other.truncated;
     }
 }
 

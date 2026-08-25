@@ -87,6 +87,10 @@ pub struct SyncedFolder {
     pub created_by: UserId,
     pub created_at_ms: u64,
     pub last_reconcile_ms: Option<u64>,
+    /// Where the next pass resumes listing the realm heads. A folder larger
+    /// than one pass converges over several, and a pass never decides about
+    /// keys it did not list.
+    pub list_cursor: Option<SyncListCursor>,
 }
 
 impl SyncedFolder {
@@ -956,6 +960,7 @@ mod tests {
             created_by: UserId::new(Ulid::from_bytes([4u8; 16]), realm_id),
             created_at_ms: 7,
             last_reconcile_ms: None,
+            list_cursor: None,
         };
         assert_eq!(
             SyncedFolder::from_bytes(&folder.to_bytes().expect("folder encodes")).expect("decodes"),

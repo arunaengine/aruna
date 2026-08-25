@@ -67,7 +67,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
             continue;
         }
         match reconcile_folder(context, &folder).await {
-            Some(plan) => work |= plan.uploads > 0 || !plan.downloads.is_empty(),
+            Some(plan) => work |= plan.uploads > 0 || plan.truncated,
             None => debug!(folder = %folder.folder_id, "Could not reconcile the folder"),
         }
     }
@@ -115,20 +115,28 @@ pub async fn reconcile_folder(
             )
         })
         .collect();
-    let remote = match folder.mode {
-        aruna_core::structs::FolderMode::UploadOnly => BTreeMap::new(),
+    let view = match folder.mode {
+        aruna_core::structs::FolderMode::UploadOnly => RemoteView::default(),
         aruna_core::structs::FolderMode::TwoWay => fetch_heads(context, folder).await?,
     };
 
-    let mut keys: Vec<String> = local.keys().chain(remote.keys()).cloned().collect();
+    let mut keys: Vec<String> = local
+        .keys()
+        .chain(view.heads.keys())
+        .filter(|key| view.covers(key))
+        .cloned()
+        .collect();
     keys.sort();
     keys.dedup();
-    let mut plan = ReconcilePlan::default();
+    let mut plan = ReconcilePlan {
+        truncated: view.next_cursor.is_some(),
+        ..ReconcilePlan::default()
+    };
     for chunk in keys.chunks(SYNC_PAGE_SIZE) {
         let page = ReconcileInput {
             folder: folder.clone(),
             local: subset(&local, chunk),
-            remote: subset(&remote, chunk),
+            remote: subset(&view.heads, chunk),
             now_ms: unix_timestamp_millis(),
         };
         match crate::driver::drive(ReconcileFolderOperation::new(page), context).await {
@@ -144,6 +152,7 @@ pub async fn reconcile_folder(
         context,
         &SyncedFolder {
             last_reconcile_ms: Some(unix_timestamp_millis()),
+            list_cursor: view.next_cursor,
             ..folder.clone()
         },
     )
@@ -161,12 +170,31 @@ fn subset<T: Clone>(source: &BTreeMap<String, T>, keys: &[String]) -> BTreeMap<S
         .collect()
 }
 
+/// What one pass listed of the realm side, and the window it may decide about.
+/// A pass never judges a key it did not list: that is how a folder larger than
+/// one listing converges without inventing deletions.
+#[derive(Default)]
+struct RemoteView {
+    heads: BTreeMap<String, RemoteHead>,
+    /// Exclusive lower bound this pass resumed from.
+    resume_after: Option<String>,
+    /// Inclusive upper bound the listing reached, when it was cut short.
+    boundary: Option<String>,
+    /// Where the next pass resumes. `None` restarts from the beginning.
+    next_cursor: Option<SyncListCursor>,
+}
+
+impl RemoteView {
+    /// Whether this pass listed far enough to decide about `key`.
+    fn covers(&self, key: &str) -> bool {
+        self.resume_after.as_deref().is_none_or(|after| key > after)
+            && self.boundary.as_deref().is_none_or(|bound| key <= bound)
+    }
+}
+
 /// Every current head under the folder's bound prefix, as bounded pages served
 /// by the folder's realm node with the owner's authority.
-async fn fetch_heads(
-    context: &Arc<DriverContext>,
-    folder: &SyncedFolder,
-) -> Option<BTreeMap<String, RemoteHead>> {
+async fn fetch_heads(context: &Arc<DriverContext>, folder: &SyncedFolder) -> Option<RemoteView> {
     let metadata = context.metadata_handle.as_ref()?;
     let realm_id = *context.net_handle.as_ref()?.realm_id();
     let auth = AuthContext {
@@ -174,8 +202,14 @@ async fn fetch_heads(
         realm_id,
         path_restrictions: None,
     };
-    let mut heads = BTreeMap::new();
-    let mut cursor: Option<SyncListCursor> = None;
+    let mut view = RemoteView {
+        resume_after: folder
+            .list_cursor
+            .as_ref()
+            .and_then(|cursor| folder.remote.relative_path(&cursor.key)),
+        ..RemoteView::default()
+    };
+    let mut cursor = folder.list_cursor.clone();
     loop {
         let message = MetadataTransportMessage::ForwardListVersions {
             auth_token: MetadataAuthToken::internal(auth.clone()),
@@ -194,14 +228,22 @@ async fn fetch_heads(
         };
         let (page_heads, next) = page.into_parts();
         for head in page_heads {
-            heads.insert(head.relative.clone(), head);
+            view.boundary = Some(head.relative.clone());
+            view.heads.insert(head.relative.clone(), head);
         }
-        if heads.len() >= MAX_REMOTE_HEADS {
-            return Some(heads);
+        // A folder past the in-memory bound stops here and resumes next pass;
+        // the boundary keeps this pass from judging the keys it never saw.
+        if view.heads.len() >= MAX_REMOTE_HEADS {
+            view.next_cursor = next;
+            return Some(view);
         }
         match next {
             Some(next) => cursor = Some(next),
-            None => return Some(heads),
+            None => {
+                // The listing reached the end, so every key is in the window.
+                view.boundary = None;
+                return Some(view);
+            }
         }
     }
 }
