@@ -1941,7 +1941,7 @@ mod tests {
     // Only a device serves no S3 endpoint. An infrastructure node whose pair is
     // accidentally absent must fail its start instead of coming up without one.
     #[test]
-    fn s3_optional_for_devices() {
+    fn devices_skip_s3() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let device = NodeCapabilities::user_node(realm_id).expect("device capabilities");
         let management =

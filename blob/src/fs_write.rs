@@ -975,7 +975,7 @@ mod tests {
     // Every spooled byte lands in the reserved directory, so a write never
     // creates a name inside the owner's own tree.
     #[tokio::test]
-    async fn spools_in_reserved_dir() {
+    async fn spools_in_reserved() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().to_string_lossy().to_string();
         let event = write_guarded(

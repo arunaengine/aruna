@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_denies_sync_delete() {
+    async fn policy_denies_delete() {
         // A delete pull is judged as the delete it performs, not as a put.
         let fixture = policy_fixture(Some("operation == 's3.DeleteObject'")).await;
         assert_eq!(

@@ -537,7 +537,7 @@ mod tests {
     // page is full of other owners' records, so a single-page scan would miss
     // it and hand out a device over the cap.
     #[tokio::test]
-    async fn cap_scans_every_page() {
+    async fn cap_scans_pages() {
         let owner = UserId::local(Ulid::generate(), realm());
         let other = UserId::local(Ulid::generate(), realm());
         let (_dir, context) = context_with_cap(Some(1), &[]).await;

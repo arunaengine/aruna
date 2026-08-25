@@ -3007,7 +3007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_defers_group_check() {
+    async fn device_defers_group() {
         // A device holds no group authorization document, so neither target may
         // answer 403 for the owner: the holder authorizes a realm submission and
         // the owner binding a local run.
