@@ -36,7 +36,13 @@ pub enum FolderMode {
 pub enum FolderState {
     Active,
     Paused,
-    Error { reason: String },
+    /// The owner unbound it and the cleanup has not finished. The row is the
+    /// durable handle on that cleanup, so it is the last thing removed and a
+    /// retry after a crash resumes instead of finding nothing.
+    Deleting,
+    Error {
+        reason: String,
+    },
 }
 
 /// The realm side of a binding: one bucket prefix on one named realm node.

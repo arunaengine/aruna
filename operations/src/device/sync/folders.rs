@@ -169,6 +169,10 @@ pub async fn read_bound(
 
 /// Stops syncing one folder. Nothing on the owner's filesystem is touched: the
 /// device only withdraws what it published about the directory.
+///
+/// The binding is marked `Deleting` first and removed last, so a crash or a
+/// failure in the middle leaves a folder that the next call resumes instead of
+/// an orphaned offer, outbox row or audit log with nothing pointing at it.
 pub async fn unbind_folder(
     context: &Arc<DriverContext>,
     folder_id: Ulid,
@@ -177,6 +181,40 @@ pub async fn unbind_folder(
     user_id: UserId,
 ) -> Result<usize, FolderError> {
     let folder = read_bound(context, folder_id).await?;
+    if folder.state != FolderState::Deleting {
+        store_folder(
+            context,
+            &SyncedFolder {
+                state: FolderState::Deleting,
+                ..folder.clone()
+            },
+        )
+        .await?;
+    }
+    for key_space in [
+        SYNC_BASE_KEYSPACE,
+        SYNC_UPLOAD_OUTBOX_KEYSPACE,
+        SYNC_ACTION_LOG_KEYSPACE,
+    ] {
+        clear_rows(context, key_space, folder_id).await?;
+    }
+    let removed = match withdraw_offer(
+        context,
+        WithdrawOfferInput {
+            bucket: folder.local_bucket,
+            realm_id,
+            node_id,
+            user_id,
+        },
+    )
+    .await
+    {
+        Ok(removed) => removed,
+        // A resumed unbind finds the registration already withdrawn and
+        // finishes the rest instead of failing on it.
+        Err(OfferedDirectoryError::NotOffered(_)) => 0,
+        Err(error) => return Err(error.into()),
+    };
     let Some(txn_id) = start_txn(context).await else {
         return Err(FolderError::Unavailable);
     };
@@ -191,23 +229,6 @@ pub async fn unbind_folder(
         abort_txn(context, txn_id).await;
         return Err(FolderError::Unavailable);
     }
-    for key_space in [
-        SYNC_BASE_KEYSPACE,
-        SYNC_UPLOAD_OUTBOX_KEYSPACE,
-        SYNC_ACTION_LOG_KEYSPACE,
-    ] {
-        clear_rows(context, key_space, folder_id).await?;
-    }
-    let removed = withdraw_offer(
-        context,
-        WithdrawOfferInput {
-            bucket: folder.local_bucket,
-            realm_id,
-            node_id,
-            user_id,
-        },
-    )
-    .await?;
     Ok(removed)
 }
 
@@ -239,10 +260,12 @@ pub async fn set_folder_state(
     folder_id: Ulid,
     state: FolderState,
 ) -> Result<SyncedFolder, FolderError> {
-    let folder = SyncedFolder {
-        state,
-        ..read_bound(context, folder_id).await?
-    };
+    let current = read_bound(context, folder_id).await?;
+    // A folder whose cleanup is running is on its way out, not resumable.
+    if current.state == FolderState::Deleting {
+        return Err(FolderError::NotFound);
+    }
+    let folder = SyncedFolder { state, ..current };
     store_folder(context, &folder).await?;
     Ok(folder)
 }
@@ -405,7 +428,9 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
 
 #[cfg(test)]
 mod tests {
-    use super::overlaps;
+    use super::*;
+    use aruna_core::structs::{EntrySide, SyncedBytes};
+    use aruna_storage::FjallStorage;
 
     #[test]
     fn refuses_nested_roots() {
@@ -415,5 +440,124 @@ mod tests {
         assert!(overlaps("/home/ada/data/sub", "/home/ada/data"));
         assert!(!overlaps("/home/ada/data", "/home/ada/database"));
         assert!(!overlaps("/home/ada/data", "/home/ada/other"));
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([7u8; 32])
+    }
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[3; 32]).public()
+    }
+
+    fn folder(state: FolderState) -> SyncedFolder {
+        SyncedFolder {
+            folder_id: Ulid::from_bytes([1u8; 16]),
+            root: "/home/ada/data".to_string(),
+            local_bucket: "folder-x".to_string(),
+            group_id: Ulid::from_bytes([2u8; 16]),
+            remote: RemoteBinding {
+                node_id: node(),
+                bucket: "lab".to_string(),
+                prefix: String::new(),
+            },
+            mode: FolderMode::TwoWay,
+            propagate_deletes: true,
+            state,
+            created_by: UserId::new(Ulid::from_bytes([4u8; 16]), realm()),
+            created_at_ms: 1,
+            last_reconcile_ms: None,
+            list_cursor: None,
+        }
+    }
+
+    fn base_row() -> SyncBase {
+        SyncBase {
+            synced: Some(SyncedBytes {
+                fingerprint: "4-1-1-1".to_string(),
+                blake3: [9u8; 32],
+                size: 4,
+                remote_version_id: Ulid::from_bytes([5u8; 16]),
+            }),
+            local_version_id: None,
+            synced_at_ms: 1,
+            entry: EntryState::InSync,
+            pending_at: None,
+            local: None::<EntrySide>,
+            remote: None,
+        }
+    }
+
+    async fn context() -> (tempfile::TempDir, Arc<DriverContext>) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        (
+            dir,
+            Arc::new(DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+        )
+    }
+
+    // An unbind interrupted after its state was persisted must finish on the
+    // next call: the binding is the durable handle on the cleanup, so it may
+    // never be missing while rows it owns are still there.
+    #[tokio::test]
+    async fn resumes_interrupted_unbind() {
+        let (_dir, context) = context().await;
+        let folder = folder(FolderState::Deleting);
+        store_folder(&context, &folder).await.expect("row stored");
+        let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
+            .expect("base encodes");
+        assert!(super::super::repository::write_rows(&context, vec![row], None).await);
+
+        let removed = unbind_folder(
+            &context,
+            folder.folder_id,
+            realm(),
+            node(),
+            folder.created_by,
+        )
+        .await
+        .expect("a resumed unbind finishes");
+
+        assert_eq!(removed, 0);
+        assert_eq!(
+            read_bound(&context, folder.folder_id).await,
+            Err(FolderError::NotFound)
+        );
+        let (entries, _) = list_entries(&context, folder.folder_id, None, None)
+            .await
+            .expect("the entries read");
+        assert!(entries.is_empty());
+    }
+
+    // The binding survives until the cleanup is done, so a crash in the middle
+    // leaves something to resume from rather than an orphaned offer.
+    #[tokio::test]
+    async fn marks_folder_deleting() {
+        let (_dir, context) = context().await;
+        let folder = folder(FolderState::Active);
+        store_folder(&context, &folder).await.expect("row stored");
+
+        assert_eq!(
+            set_folder_state(&context, folder.folder_id, FolderState::Paused)
+                .await
+                .expect("a bound folder pauses")
+                .state,
+            FolderState::Paused
+        );
+        store_folder(&context, &folder(FolderState::Deleting))
+            .await
+            .expect("row stored");
+        assert_eq!(
+            set_folder_state(&context, folder.folder_id, FolderState::Active).await,
+            Err(FolderError::NotFound)
+        );
     }
 }

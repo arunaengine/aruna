@@ -536,7 +536,9 @@ async fn sync_folder(
         .await
         .map_err(map_folder_error)?;
     if folder.state != FolderState::Active {
-        return Err(ServerError::Conflict("the folder is paused".to_string()));
+        return Err(ServerError::Conflict(
+            "the folder is not active".to_string(),
+        ));
     }
     aruna_operations::device::sync::reconcile_folder(&context, &folder)
         .await
