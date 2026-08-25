@@ -1234,7 +1234,17 @@ impl OperationsTaskHandler {
         // sources: a target must see writes made during the window.
         if let Some(config) = config {
             let now_ms = aruna_core::util::unix_timestamp_millis();
+            // A realm-wide publish also targets the realm's devices: they hold
+            // no realm data but read the shared configuration, revocations
+            // included, and never fetch it themselves.
+            let wide_peers = crate::startup::realm_wide_peers(config, net_handle.node_id());
             for (_, record, _) in &mut records {
+                if crate::startup::realm_wide_target(&record.target) {
+                    if !wide_peers.is_empty() {
+                        record.peers = wide_peers.clone();
+                    }
+                    continue;
+                }
                 if !record.target.uses_shard_topic() {
                     continue;
                 }

@@ -51,7 +51,7 @@ fn shared_targets(
 /// node-owned target names its node in the topic id, so only that node ever
 /// plans it; a realm-wide one is planned by every node and needs a single
 /// designated minter instead.
-fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
+pub(crate) fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
     matches!(
         target,
         DocumentSyncTarget::RealmConfig { .. } | DocumentSyncTarget::RealmAuthorization { .. }
@@ -74,6 +74,26 @@ fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<Node
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
         .filter(|candidate| *candidate != node_id)
         .collect()
+}
+
+/// Peers one realm-wide topic is exchanged with. A device holds no realm data
+/// but must keep receiving the shared configuration, revocations included, so a
+/// realm node pushes these topics to it as well. The device only ever receives:
+/// it never targets another device, and it never serves the protocol.
+pub(crate) fn realm_wide_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
+    let mut peers = shared_topic_peers(config, node_id);
+    if !sync_eligible_node(config, node_id) {
+        return peers;
+    }
+    peers.extend(
+        config
+            .nodes
+            .iter()
+            .filter(|node| !node.kind.is_sync_eligible())
+            .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+            .filter(|candidate| *candidate != node_id),
+    );
+    peers
 }
 
 /// Work units one bounded restore pass may process. A work-unit limit, never a
@@ -1093,14 +1113,21 @@ fn plan_shard_groups(
         && shared_peers
             .iter()
             .all(|peer| node_id.as_bytes() < peer.as_bytes());
+    let mut wide_peers = realm_wide_peers(config, node_id);
+    wide_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        let groups = if realm_wide_target(&target) && !realm_minter {
+        let wide = realm_wide_target(&target);
+        let groups = if wide && !realm_minter {
             &mut plan.shared_join_groups
         } else {
             &mut plan.shared_groups
         };
-        groups.entry(shared_peers.clone()).or_default().push(topic);
+        let peers = match wide {
+            true => wide_peers.clone(),
+            false => shared_peers.clone(),
+        };
+        groups.entry(peers).or_default().push(topic);
         plan.summary.shared_topics += 1;
     }
 
@@ -1712,6 +1739,31 @@ mod tests {
             !mints_realm_topics(user),
             "a node outside the sync-eligible set is never the realm minter"
         );
+    }
+
+    // A revoked token must reach the device that holds it, so a realm node
+    // pushes the shared realm topics to devices while a device pushes nothing.
+    #[test]
+    fn realm_topics_reach_devices() {
+        let realm_id = RealmId([7; 32]);
+        let (server, other, device) = (node(1), node(2), node(3));
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.ensure_node(server, RealmNodeKind::Server);
+        config.ensure_node(other, RealmNodeKind::Server);
+        config.ensure_node(
+            device,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+
+        let from_server = realm_wide_peers(&config, server);
+        assert!(from_server.contains(&device));
+        assert!(from_server.contains(&other));
+        let from_device = realm_wide_peers(&config, device);
+        assert_eq!(from_device.len(), 2);
+        assert!(from_device.contains(&server) && from_device.contains(&other));
+        assert!(!shared_topic_peers(&config, server).contains(&device));
     }
 
     #[test]
