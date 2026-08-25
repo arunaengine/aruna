@@ -714,12 +714,9 @@ impl ReconcileFolderOperation {
             .collect()
     }
 
-    /// Whether the recorded hash may stand in for reading this file.
-    ///
-    /// Only a settled observation may: the stat must equal the base's, name
-    /// every field, come from a filesystem that timestamps finely enough for a
-    /// rewrite to move it, and be old enough that a rewrite cannot hide inside
-    /// the timestamp it was taken at. Anything else is hashed.
+    /// Whether the recorded hash may stand in for reading this file. Only a
+    /// settled observation may: the same complete stat, a filesystem that
+    /// timestamps finely, and a file still since before the window.
     fn reuses_hash(&self, index: usize, local: &Observed) -> bool {
         let Some(synced) = self
             .bases
