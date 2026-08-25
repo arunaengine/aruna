@@ -1499,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn local_only_skips_s3() {
+    fn skips_s3_checks() {
         // A device has no S3 listener and hands its containers no endpoint.
         assert_eq!(docker_workspace(true, None, None).unwrap(), None);
         assert_eq!(

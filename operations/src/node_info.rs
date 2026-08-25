@@ -1216,7 +1216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_seeds_without_executors() {
+    async fn device_seeds_empty() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([9u8; 32]);

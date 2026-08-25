@@ -2983,7 +2983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_needs_a_device() {
+    async fn local_needs_device() {
         // The realm never runs a job locally on behalf of a target it has not
         // enrolled as somebody's machine.
         let (_dir, state) = management_state().await;
@@ -3000,7 +3000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_refuses_a_stranger() {
+    async fn local_refuses_stranger() {
         let (_dir, state) = build_state().await;
         enroll_device(&state, user(2)).await;
 
@@ -3016,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_input_names_no_node() {
+    fn local_names_holder() {
         // Only a local run may name the holder: the planner seals it otherwise.
         let input = ExecutionInputRequest {
             bucket: "src".to_string(),

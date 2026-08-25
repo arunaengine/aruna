@@ -133,7 +133,7 @@ async fn get_device_compute(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn openapi_has_device_compute() {
+    fn openapi_lists_route() {
         let openapi = crate::openapi::ApiDoc::openapi();
         assert!(openapi.paths.paths.contains_key("/device/compute"));
     }

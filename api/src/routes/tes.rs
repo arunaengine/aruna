@@ -3268,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_the_target_tag() {
+    fn maps_target_tag() {
         // The tag is the only way a TES caller asks for the local machine.
         let mut tags = BTreeMap::new();
         assert_eq!(task_target(&tags).unwrap(), ExecutionTarget::Realm);
@@ -3285,7 +3285,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_target_tag() {
+    fn keeps_target_tag() {
         // A local task reports the target it was created with.
         let group = Ulid::from_bytes([5u8; 16]);
         let mut task = sample_task(group);

@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_server_node() {
+    async fn refuses_server_node() {
         // Only a device has an owner to run local jobs for.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
@@ -616,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_foreign_caller() {
+    async fn refuses_foreign_caller() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let local = node(1);
@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_a_local_run_local() {
+    async fn keeps_runs_local() {
         // The device owns the job and tells nobody: no outbox row, no family
         // record, and a second run is refused by the owner's own ceiling.
         let dir = tempdir().unwrap();
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_device_launch() {
+    async fn refuses_device_launch() {
         // The realm's own launch path declines a device whatever it advertises,
         // so local compute never becomes a dispatch target.
         use crate::jobs::records::tests::fixture::Family;
@@ -843,7 +843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_missing_input() {
+    async fn refuses_missing_input() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let local = node(1);
@@ -862,7 +862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_floating_copy() {
+    async fn refuses_floating_copy() {
         // A realm input is copied by exact version or not at all.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
