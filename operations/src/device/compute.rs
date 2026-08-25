@@ -142,6 +142,8 @@ pub struct ComputeStatus {
     pub limits: ResourceEnvelope,
     pub running: u32,
     pub queued: u32,
+    /// Why a local run would be refused right now, if it would be.
+    pub message: Option<String>,
 }
 
 /// Reports the local compute plane and the owner's runs on it.
@@ -162,22 +164,30 @@ pub async fn compute_status(
     let paused = read_operator_drain(context)
         .await
         .map_err(LocalExecutionError::Unavailable)?;
-    let (kind, limits, healthy) = match &backend {
+    let (kind, limits, failure) = match &backend {
         Some(backend) => (
             Some(backend.kind().as_wire()),
             backend.capabilities().limits,
-            backend.health().await.is_ok(),
+            backend.health().await.err().map(|error| error.to_string()),
         ),
-        None => (None, ResourceEnvelope::default(), false),
+        None => (
+            None,
+            ResourceEnvelope::default(),
+            Some("no compute backend is configured on this device".to_string()),
+        ),
     };
     Ok(ComputeStatus {
         enabled: backend.is_some(),
         backend: kind,
-        healthy,
+        healthy: backend.is_some() && failure.is_none(),
         paused,
         limits,
         running: runs.running,
         queued: runs.queued,
+        message: match paused {
+            true => Some(LocalExecutionError::Paused.to_string()),
+            false => failure,
+        },
     })
 }
 
