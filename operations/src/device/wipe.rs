@@ -149,13 +149,18 @@ fn fail(operation: &mut WipeDeviceOperation, error: WipeDeviceError) -> Effects 
 #[derive(Debug)]
 pub struct DeviceWipe {
     roots: Vec<PathBuf>,
+    unsupported: Vec<String>,
     armed: CancellationToken,
 }
 
 impl DeviceWipe {
-    pub fn new(roots: Vec<PathBuf>) -> Self {
+    /// `unsupported` names configured storage this process cannot erase, such
+    /// as an object-storage backend a device was pointed at. A wipe that leaves
+    /// any of it behind must never report a complete erasure.
+    pub fn new(roots: Vec<PathBuf>, unsupported: Vec<String>) -> Self {
         Self {
             roots,
+            unsupported,
             armed: CancellationToken::new(),
         }
     }
@@ -175,6 +180,11 @@ impl DeviceWipe {
 
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
+    }
+
+    /// Configured storage this process cannot erase, by backend name.
+    pub fn unsupported(&self) -> &[String] {
+        &self.unsupported
     }
 }
 
@@ -302,10 +312,14 @@ mod tests {
 
     #[test]
     fn arms_once() {
-        let wipe = DeviceWipe::new(vec![std::path::PathBuf::from("/tmp/aruna-wipe-test")]);
+        let wipe = DeviceWipe::new(
+            vec![std::path::PathBuf::from("/tmp/aruna-wipe-test")],
+            Vec::new(),
+        );
         assert!(!wipe.is_armed());
         wipe.arm();
         assert!(wipe.is_armed());
         assert_eq!(wipe.roots().len(), 1);
+        assert!(wipe.unsupported().is_empty());
     }
 }

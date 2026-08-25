@@ -564,15 +564,40 @@ struct ServerBindings {
     device_wipe: Option<Arc<DeviceWipe>>,
 }
 
-/// Everything a wipe erases: the store root plus every derived root, which an
-/// operator may have relocated outside it.
-fn wipe_roots(config: &Config) -> Vec<std::path::PathBuf> {
-    vec![
+/// Everything a wipe erases: the store root, every derived root an operator may
+/// have relocated outside it, and every filesystem backend this node writes to.
+/// A backend whose bytes this process cannot remove is named instead, so the
+/// wipe reports an incomplete erasure rather than claiming a complete one.
+fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    let (mut roots, unsupported) = backend_wipe(&config.blob_backends);
+    roots.extend([
         std::path::PathBuf::from(&config.storage_path),
         std::path::PathBuf::from(&config.metadata_storage_path),
         config.document_sync_storage_path.clone(),
         std::path::PathBuf::from(&config.blob_root),
-    ]
+    ]);
+    roots.sort();
+    roots.dedup();
+    (roots, unsupported)
+}
+
+/// The filesystem roots a wipe has to visit, and the backends it cannot erase.
+fn backend_wipe(
+    backends: &aruna_core::structs::NodeBackendsConfig,
+) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    let mut roots = Vec::new();
+    let mut unsupported = Vec::new();
+    for entry in &backends.backends {
+        match entry.config.backend_type {
+            aruna_core::structs::Backend::FileSystem => {
+                roots.push(std::path::PathBuf::from(&entry.config.root));
+            }
+            _ => unsupported.push(entry.name.clone()),
+        }
+    }
+    unsupported.sort();
+    unsupported.dedup();
+    (roots, unsupported)
 }
 
 /// Pends forever when this node serves no device plane, so the failure select
@@ -595,8 +620,11 @@ async fn bind_servers(
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let s3_timeouts = config.s3_timeouts();
-    let device_wipe = matches!(config.node_capabilities, NodeCapabilities::User { .. })
-        .then(|| Arc::new(DeviceWipe::new(wipe_roots(&config))));
+    let device_wipe =
+        matches!(config.node_capabilities, NodeCapabilities::User { .. }).then(|| {
+            let (roots, unsupported) = wipe_plan(&config);
+            Arc::new(DeviceWipe::new(roots, unsupported))
+        });
     let mut state = ServerState::new(
         driver_ctx.clone(),
         config.realm_id,
@@ -969,14 +997,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the owner's wipe erases the roots here and exits with its own status.
     if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
         let failed = device_wipe::purge(wipe.roots());
-        // Only a complete erasure may claim the wiped status; anything left
-        // behind exits with its own code so a supervisor does not read the
-        // device as erased.
-        let code = if failed.is_empty() {
+        // Only a complete erasure may claim the wiped status; paths left behind
+        // and storage this process cannot erase at all both exit with their own
+        // code so a supervisor does not read the device as erased.
+        let code = if failed.is_empty() && wipe.unsupported().is_empty() {
             info!("Wiped this device on its owner's request");
             device_wipe::WIPED_EXIT_CODE
         } else {
-            error!(paths = failed.len(), "The device wipe left paths behind");
+            error!(
+                paths = failed.len(),
+                backends = wipe.unsupported().join(","),
+                "The device wipe did not erase everything this node stores"
+            );
             device_wipe::WIPE_INCOMPLETE_EXIT_CODE
         };
         shutdown_tracing();
@@ -1480,6 +1512,49 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         }
+    }
+
+    fn backend(
+        name: &str,
+        backend_type: aruna_core::structs::Backend,
+        root: &str,
+    ) -> aruna_core::structs::NodeBackendEntry {
+        aruna_core::structs::NodeBackendEntry {
+            name: name.to_string(),
+            config: aruna_core::structs::BackendConfig {
+                backend_type,
+                root: root.to_string(),
+                service_config: std::collections::HashMap::new(),
+                bucket_prefix: None,
+                max_bucket_size: None,
+                multipart_bucket: None,
+                timeouts: aruna_core::structs::BlobTimeoutConfig::default(),
+            },
+            class: None,
+            allow_tenants: true,
+            quota_bytes: None,
+            cleanup: aruna_core::structs::CleanupStrategy::node_default(),
+        }
+    }
+
+    // A relocated filesystem backend must be erased, and one this process
+    // cannot erase must be named instead of quietly reported as wiped.
+    #[test]
+    fn wipe_covers_backends() {
+        let backends = aruna_core::structs::NodeBackendsConfig {
+            backends: vec![
+                backend("hot", aruna_core::structs::Backend::FileSystem, "/srv/hot"),
+                backend("cold", aruna_core::structs::Backend::S3, ""),
+            ],
+            default_name: "hot".to_string(),
+            rules: Vec::new(),
+            serve_group_backends: true,
+            extra_deny: Vec::new(),
+        };
+
+        let (roots, unsupported) = backend_wipe(&backends);
+        assert_eq!(roots, vec![std::path::PathBuf::from("/srv/hot")]);
+        assert_eq!(unsupported, vec!["cold".to_string()]);
     }
 
     #[test]
