@@ -149,9 +149,10 @@ impl ReconcileFolderOperation {
             let mut local = self.input.local.get(relative).cloned();
             // A file whose weak fingerprint still equals the base carries the
             // base's strong hash; the adapter re-verifies both before it writes.
-            if let (Some(local), Some(synced)) =
-                (local.as_mut(), base.as_ref().and_then(|base| base.synced.as_ref()))
-                && local.fingerprint == synced.fingerprint
+            if let (Some(local), Some(synced)) = (
+                local.as_mut(),
+                base.as_ref().and_then(|base| base.synced.as_ref()),
+            ) && local.fingerprint == synced.fingerprint
             {
                 local.blake3 = Some(synced.blake3);
             }

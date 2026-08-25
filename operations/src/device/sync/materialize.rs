@@ -14,8 +14,8 @@ use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ActionOutcome, AuthContext, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord,
-    SyncBase, SyncedBytes, SyncedFolder, VersionedObjectArn, WriteGuard,
+    ActionOutcome, AuthContext, EntrySide, EntryState, PendingMark, ReplaceReason,
+    SyncActionRecord, SyncBase, SyncedBytes, SyncedFolder, VersionedObjectArn, WriteGuard,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -216,6 +216,37 @@ impl MaterializeEntryOperation {
             false => ReplaceReason::BaseUnknown,
         }
     }
+
+    /// The rows one outcome commits: the base row, plus the audit row when the
+    /// write serves an explicit owner action.
+    fn rows_for(
+        &self,
+        outcome: &MaterializeOutcome,
+        written: Option<(String, [u8; 32], u64)>,
+    ) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+        let after = written.as_ref().map(|(_, blake3, _)| *blake3);
+        let base = self.base_row(outcome, written);
+        let mut rows = vec![base_entry(
+            self.input.folder.folder_id,
+            &self.input.relative,
+            &base,
+        )?];
+        if let Some(audit) = self.input.audit.as_ref() {
+            rows.push(action_entry(&SyncActionRecord {
+                outcome: match outcome {
+                    MaterializeOutcome::Refused { .. } => ActionOutcome::Stale,
+                    MaterializeOutcome::Failed { message } => ActionOutcome::Failed {
+                        reason: message.clone(),
+                    },
+                    _ => ActionOutcome::Applied,
+                },
+                after,
+                ..audit.clone()
+            })?);
+        }
+        Ok(rows)
+    }
+}
 
 impl Operation for MaterializeEntryOperation {
     type Output = MaterializeOutcome;
