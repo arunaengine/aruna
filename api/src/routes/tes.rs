@@ -554,9 +554,13 @@ that tag. The caller needs WRITE on the target group.
   here even though it is accepted on a realm node.
 - An `aruna-engine.org/target` tag of `local` runs the task on the machine instead, and is served
   by a user device only: any other node refuses it with a 400, and a caller who is not the device's
-  owner with a 403. Such a task reads objects this device holds, keeps its outputs in the
-  node-local workspace bucket, and is neither forwarded nor replicated. `realm`, the default, is
-  the behavior above. The tag stays on the task and is reported back with it.
+  owner with a 403. `realm`, the default, is the behavior above. The tag stays on the task and is
+  reported back with it.
+- A local task reads objects this device holds and writes each declared output to the device-local
+  bucket its `s3://` url names, which must belong to the execution group and grant the owner WRITE;
+  the run's own workspace bucket holds the staged inputs. Nothing about it is forwarded or
+  replicated. A paused compute plane, a device without a compute backend and a device already at
+  its configured run ceiling each answer 409.
 
 **Limits** (all refused with 400)
 - Exactly one executor whose `command` is the full argv.
@@ -644,10 +648,10 @@ that tag. The caller needs WRITE on the target group.
                 "id": "01JABCDEF0123456789ABCDEFG"
             })
         ),
-        (status = 400, description = "Malformed task, an unsupported TES feature, an input that is not a readable object, more outputs than a task may declare, or a reserved tag", body = TesErrorPayload),
+        (status = 400, description = "Malformed task, an unsupported TES feature, an input that is not a readable object, more outputs than a task may declare, a reserved tag, an unknown target tag value, or the local target on a node that serves no device plane", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
-        (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, a path restricted credential, or a routed authority refusing the submission", body = TesErrorPayload),
-        (status = 409, description = "The idempotency key tag is already bound to a different task, the group's standing compute quota refuses this admission, or the composition conflicts on a staged key", body = TesErrorPayload),
+        (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, a path restricted credential, a routed authority refusing the submission, or a local task from someone other than this device's owner", body = TesErrorPayload),
+        (status = 409, description = "The idempotency key tag is already bound to a different task, the group's standing compute quota refuses this admission, the composition conflicts on a staged key, or this device's compute plane is paused, absent or at its run ceiling", body = TesErrorPayload),
         (status = 503, description = "Retryable admission failure; the caller may create the task again with the same idempotency key", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
@@ -3265,6 +3269,106 @@ mod tests {
         }
         let minimal = project_task(&record, &facts, TesView::Minimal, "http://x");
         assert!(minimal.tags.is_empty());
+    }
+
+    async fn management_state() -> (TempDir, Arc<ServerState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let capabilities =
+            NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();
+        let state = ServerState::new(
+            ctx,
+            realm(),
+            node_id(),
+            capabilities,
+            false,
+            None,
+            JobsRuntime::new(),
+        )
+        .await;
+        (dir, Arc::new(state))
+    }
+
+    async fn enroll_device(state: &ServerState, owner: UserId) {
+        use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
+        let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id(), RealmNodeKind::User { owner });
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: UserId::nil(realm()),
+            realm_id: realm(),
+        };
+        let bytes = config.to_bytes(&actor).expect("config serializes");
+        let _ = state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm().as_bytes().to_vec().into(),
+                value: bytes.into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    fn local_task(group: Ulid) -> TesTask {
+        let mut task = sample_task(group);
+        task.tags
+            .insert(TARGET_TAG_KEY.to_string(), "local".to_string());
+        task
+    }
+
+    fn bearer_auth(user_id: UserId) -> Option<AuthContext> {
+        Some(AuthContext {
+            user_id,
+            realm_id: realm(),
+            path_restrictions: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn local_needs_device() {
+        // A node that serves no device plane refuses the target, not the caller.
+        let (_dir, state) = management_state().await;
+        let group = Ulid::from_bytes([5u8; 16]);
+
+        let response = create_task(
+            State(state),
+            Extension(bearer_auth(user(2))),
+            Extension(None),
+            HeaderMap::new(),
+            Json(local_task(group)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn local_refuses_stranger() {
+        let (_dir, state) = build_state(false).await;
+        enroll_device(&state, user(2)).await;
+        let group = Ulid::from_bytes([5u8; 16]);
+
+        let response = create_task(
+            State(state),
+            Extension(bearer_auth(user(3))),
+            Extension(None),
+            HeaderMap::new(),
+            Json(local_task(group)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
