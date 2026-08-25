@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn device_needs_expected_hash() {
+    fn device_needs_hash() {
         // Without a named identity this node would have to invent one.
         let mut operation = device_serve(None);
         let effects = operation.serve_observation(observation(5, Some("5-1")));
@@ -1682,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn device_serves_own_file() {
+    fn device_serves_file() {
         let mut operation = device_serve(Some([5u8; 32]));
         let effects = operation.serve_observation(observation(5, Some("5-1")));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
@@ -1690,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn denied_policy_keeps_blob() {
+    fn denied_keeps_blob() {
         // A device may bypass the group check for its own observations, never
         // for a materialized copy it holds.
         let mut operation = device_serve(Some([4u8; 32]));
@@ -1712,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn source_step_rejects_event() {
+    fn source_rejects_event() {
         // An event the resolve state cannot explain must fail, not be ignored.
         let mut operation = device_serve(Some([5u8; 32]));
         operation.state = super::IncomingBaoReadState::ResolveSource;
