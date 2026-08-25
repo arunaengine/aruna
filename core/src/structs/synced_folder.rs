@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_only_ignores_remote() {
+    fn upload_only_ignores() {
         // An upload-only folder never writes to disk, whatever the realm holds.
         let policy = SyncPolicy {
             mode: FolderMode::UploadOnly,

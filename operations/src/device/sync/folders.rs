@@ -116,6 +116,7 @@ pub async fn bind_folder(
         created_by: input.user_id,
         created_at_ms: unix_timestamp_millis(),
         last_reconcile_ms: None,
+        list_cursor: None,
     };
     store_folder(context, &folder).await?;
     Ok(folder)

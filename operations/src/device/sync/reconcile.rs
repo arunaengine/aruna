@@ -705,6 +705,7 @@ mod tests {
             created_by: UserId::new(Ulid::from_bytes([4u8; 16]), realm_id),
             created_at_ms: 1,
             last_reconcile_ms: None,
+            list_cursor: None,
         }
     }
 

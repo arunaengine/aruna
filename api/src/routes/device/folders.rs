@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn names_folder_by_root() {
+    fn names_folder_root() {
         // The confirmation is the directory's own name, on either platform.
         assert_eq!(folder_name("/home/ada/data"), "data");
         assert_eq!(folder_name("/home/ada/data/"), "data");
