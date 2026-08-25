@@ -5,7 +5,7 @@
 //! through the guarded local-file effects the plan it answers with names, and
 //! reach the realm through the upload rows it queues.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -112,6 +112,9 @@ pub struct ReconcileFolderOperation {
     queued: Vec<Option<SyncUpload>>,
     /// Indices of `paths` whose strong hash the decision still needs.
     hashing: Vec<usize>,
+    /// Indices this pass could not hash within its batch. They are left for the
+    /// next pass rather than decided on bytes nobody read.
+    deferred: BTreeSet<usize>,
     writes: Vec<(String, Key, Value)>,
     deletes: Vec<(String, Key)>,
     plan: ReconcilePlan,
@@ -127,6 +130,7 @@ impl ReconcileFolderOperation {
             bases: Vec::new(),
             queued: Vec::new(),
             hashing: Vec::new(),
+            deferred: BTreeSet::new(),
             writes: Vec::new(),
             deletes: Vec::new(),
             plan: ReconcilePlan::default(),
@@ -174,7 +178,9 @@ impl ReconcileFolderOperation {
                 self.plan.pending += 1;
                 continue;
             }
-            if self.awaits_upload(index, local.as_ref(), base.as_ref()) {
+            if self.awaits_upload(index, local.as_ref(), base.as_ref())
+                || self.deferred.contains(&index)
+            {
                 continue;
             }
             let action = decide(policy, local.as_ref(), base.as_ref(), remote.as_ref());
@@ -549,7 +555,13 @@ impl Operation for ReconcileFolderOperation {
                             .and_then(|bytes| SyncUpload::from_bytes(bytes.as_ref()).ok())
                     })
                     .collect();
-                self.hashing = self.hash_batch();
+                let eligible = self.hash_batch();
+                // A page that cannot hash every moved file decides only what it
+                // read: the rest waits for the next pass, which is asked for
+                // promptly instead of after the idle wait.
+                self.plan.truncated |= eligible.len() > MAX_HASH_BATCH;
+                self.deferred = eligible.iter().copied().skip(MAX_HASH_BATCH).collect();
+                self.hashing = eligible.into_iter().take(MAX_HASH_BATCH).collect();
                 self.next_hash(0)
             }
             ReconcileState::HashEntry { index } => {
@@ -659,7 +671,7 @@ impl ReconcileFolderOperation {
 
     /// Paths the recorded stat no longer vouches for: it moved, it was never
     /// recorded, or the filesystem could not answer for it. Only those need a
-    /// strong hash; the batch is bounded so one pass stays short.
+    /// strong hash, and only the first [`MAX_HASH_BATCH`] of them are read here.
     fn hash_batch(&self) -> Vec<usize> {
         self.paths
             .iter()
@@ -678,7 +690,6 @@ impl ReconcileFolderOperation {
                     .is_none_or(|synced| synced.fingerprint != local.fingerprint)
             })
             .map(|(index, _)| index)
-            .take(MAX_HASH_BATCH)
             .collect()
     }
 
@@ -875,6 +886,33 @@ mod tests {
             operation.finalize(),
             Err(ReconcileError::UnexpectedEvent { .. })
         ));
+    }
+
+    #[test]
+    fn defers_unhashed_paths() {
+        // More moved files than one pass may hash: the rest stay undecided, and
+        // the folder asks to be passed again rather than waiting out the idle.
+        let mut local = BTreeMap::new();
+        let mut paths = Vec::new();
+        for index in 0..(MAX_HASH_BATCH + 2) {
+            let relative = format!("file-{index:04}.txt");
+            local.insert(relative.clone(), observed("5-1-1-1"));
+            paths.push(relative);
+        }
+        let mut operation = ReconcileFolderOperation::new(ReconcileInput {
+            folder: folder(),
+            local,
+            remote: BTreeMap::new(),
+            now_ms: 10,
+        });
+        operation.start();
+        let values = (0..paths.len() * 2)
+            .map(|index| (ByteView::from(vec![index as u8]), None))
+            .collect();
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+
+        assert_eq!(operation.deferred.len(), 2);
+        assert!(operation.plan.truncated, "the folder must be passed again");
     }
 
     #[test]
