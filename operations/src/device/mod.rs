@@ -8,6 +8,7 @@ pub mod drain;
 pub mod enqueue_draft;
 pub mod inspect_draft;
 pub mod list_drafts;
+pub mod realm_documents;
 pub mod repository;
 pub mod sync;
 pub mod wipe;

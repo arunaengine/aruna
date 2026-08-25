@@ -1908,6 +1908,12 @@ impl MetadataHandle {
                 })
                 .await
             }
+            fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
+                Box::pin(async {
+                    super::forward::serve_realm_documents(context, peer, fetch).await
+                })
+                .await
+            }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async { super::forward::apply_admin_relay(context, peer, forward).await })
                     .await
@@ -1952,6 +1958,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedGroupCreateConflict { .. }
             | MetadataTransportMessage::ForwardedSyncPull { .. }
             | MetadataTransportMessage::ForwardedVersions { .. }
+            | MetadataTransportMessage::FetchedRealmDocuments { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4782,6 +4789,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
         MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
         MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
+        MetadataTransportMessage::FetchRealmDocuments { .. } => "fetch_realm_documents",
+        MetadataTransportMessage::FetchedRealmDocuments { .. } => "fetched_realm_documents",
         MetadataTransportMessage::ForwardedGroupCreateConflict { .. } => {
             "forwarded_group_create_conflict"
         }

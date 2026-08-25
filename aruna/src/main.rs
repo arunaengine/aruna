@@ -31,6 +31,7 @@ use aruna_core::structs::NodeCapabilities;
 use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::device::wipe as device_wipe;
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
@@ -374,6 +375,14 @@ async fn prepare_startup(
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
     prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    // A device runs no document sync, so it fetches the realm documents it is
+    // judged by before it serves anything. A realm that cannot be reached is no
+    // reason to stay down: the stored copy answers until the next attempt.
+    if matches!(config.node_capabilities, NodeCapabilities::User { .. })
+        && !fetch_realm_documents(driver_ctx).await
+    {
+        warn!("Serving this device from its stored realm documents for now");
+    }
     Ok(announcement)
 }
 

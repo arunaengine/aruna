@@ -1,17 +1,17 @@
 //! A device holds no realm data, but it is judged by the realm's own documents:
-//! a revoked token must stop working there too. The realm pushes them when it
-//! can, and a device that was closed at the time fetches them itself.
+//! a revoked token must stop working there too. A device runs no document sync,
+//! so it fetches them as a routed read whenever it comes back.
 
 mod topology;
 
 use aruna_core::structs::{Actor, RealmNodeKind};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::auth::realm_token_revoked;
+use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::drive;
 use aruna_operations::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::startup::{pull_realm_documents, refresh_device_members};
 
 use topology::{TestResult, Topology, read_realm_config, replicate_config, spawn_node, write};
 
@@ -20,9 +20,9 @@ const REPLICATION_FACTOR: u32 = 1;
 
 #[tokio::test]
 async fn device_fetches_revocation() -> TestResult<()> {
-    // The realm revokes a token while the device is not in its configuration at
-    // all, so no push can reach it. The device's own fetch is the only way it
-    // learns, and until it runs the token still passes there.
+    // The realm revokes a token while the device is away. Nothing is pushed to a
+    // device, so its own fetch is the only way it learns, and until it runs the
+    // token still passes there.
     let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
     let realm_id = realm.realm_id;
     let token_hash = "a".repeat(64);
@@ -74,8 +74,6 @@ async fn device_fetches_revocation() -> TestResult<()> {
         )
         .await?;
         node.net.refresh_realm_peers_from_document(&known).await?;
-        // Membership of the realm-wide topics is what lets a device fetch them.
-        refresh_device_members(&node.context, realm_id, node.node_id()).await;
     }
     // The device comes back with the configuration as it was before the
     // revocation: exactly what a device that was closed knows.
@@ -103,8 +101,8 @@ async fn device_fetches_revocation() -> TestResult<()> {
     );
 
     assert!(
-        pull_realm_documents(&device.context).await,
-        "the device must reconcile the realm documents it fetched"
+        fetch_realm_documents(&device.context).await,
+        "a realm node must serve the device the realm documents"
     );
     assert!(
         realm_token_revoked(&device.context.storage_handle, realm_id, &token_hash).await?,

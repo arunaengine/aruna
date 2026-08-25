@@ -405,6 +405,24 @@ pub enum MetadataTransportMessage {
     ForwardedVersions {
         result: Result<SyncVersionPage, SyncRefusal>,
     },
+    /// The realm-wide documents a device asks a realm node for. A device takes
+    /// no part in document sync, so this routed read is how the configuration
+    /// it is judged by - revocations included - reaches it.
+    FetchRealmDocuments {
+        auth_token: MetadataAuthToken,
+    },
+    FetchedRealmDocuments {
+        result: Result<RealmDocuments, SyncRefusal>,
+    },
+}
+
+/// The realm-wide documents as the serving node stores them. The copies a
+/// device installs from them are never published again: they are a read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmDocuments {
+    pub realm_config: Vec<u8>,
+    /// Absent while the realm has no authorization document yet.
+    pub realm_authorization: Option<Vec<u8>>,
 }
 
 /// One page of immutable records plus the cursor of the next one.

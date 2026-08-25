@@ -21,7 +21,7 @@ use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, JobId, MetadataRegistryRecord,
     MintPersistentIdSpec, Permission, PersistentIdFailure, PersistentIdMapping, PlacementRef,
-    RealmConfigDocument, RealmId, RealmNodeKind,
+    RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -58,7 +58,7 @@ use crate::metadata::handle::{
 use crate::metadata::profile_validation::{current_validation_status, revalidate_current};
 use crate::metadata::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
-    PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
+    PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution, RealmDocuments,
 };
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
@@ -2061,6 +2061,92 @@ pub async fn forward_group_create(
         }
     }
     Err(MetadataApiError::ServiceUnavailable.into())
+}
+
+/// Serves the realm-wide documents to one of the realm's devices.
+///
+/// A device runs no document sync, so this routed read is how it sees the realm
+/// configuration it is judged by. It is served by realm infrastructure only,
+/// for the owner the realm config binds the asking device to, and it hands out
+/// copies of documents this node already holds.
+pub(crate) async fn serve_realm_documents(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::FetchRealmDocuments { auth_token } = message else {
+        return reject("unexpected metadata control message");
+    };
+    MetadataTransportMessage::FetchedRealmDocuments {
+        result: read_realm_documents(context, peer, auth_token).await,
+    }
+}
+
+async fn read_realm_documents(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+) -> Result<RealmDocuments, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    // Only realm infrastructure answers: a device holds no realm state to serve.
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    // The documents are this realm's own; nothing about another realm is served.
+    if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    let realm_config = read_document(context, DocumentSyncTarget::RealmConfig { realm_id })
+        .await?
+        .ok_or(SyncRefusal::NotFound)?;
+    let realm_authorization =
+        read_document(context, DocumentSyncTarget::RealmAuthorization { realm_id }).await?;
+    Ok(RealmDocuments {
+        realm_config,
+        realm_authorization,
+    })
+}
+
+/// One stored document, or `None` when this node holds it not (yet).
+async fn read_document(
+    context: &Arc<DriverContext>,
+    target: DocumentSyncTarget,
+) -> Result<Option<Vec<u8>>, SyncRefusal> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|bytes| bytes.as_ref().to_vec()))
+        }
+        other => {
+            warn!(event = ?other, "Failed to read a realm document for a device");
+            Err(SyncRefusal::Unavailable)
+        }
+    }
 }
 
 /// Originates a group create requested by a device. Authority is the caller's

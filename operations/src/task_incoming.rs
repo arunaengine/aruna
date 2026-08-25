@@ -164,6 +164,10 @@ const OUTBOX_CONTINUATION_STREAK: u32 = 8;
 const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
 const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+
+/// How long a device keeps its copy of the realm documents before asking for
+/// them again. A revocation reaches it within this window at the latest.
+const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_SWEEP_TICKS: usize = 12;
 /// How long a record may wait for its shard topic's genesis before the drain
@@ -209,6 +213,9 @@ struct OperationsTaskHandler {
     rotation: std::sync::Mutex<OutboxRotation>,
     drain_guard: tokio::sync::Mutex<()>,
     outbox_limits: OutboxLimits,
+    // When a device may next fetch the realm documents, and how many attempts
+    // have failed. Loss on restart is fine: a restart fetches them anyway.
+    realm_documents: std::sync::Mutex<(u32, u64)>,
 }
 
 /// Outcome counts accumulated across the invocations of one rotation.
@@ -638,6 +645,7 @@ impl OperationsTaskHandler {
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
+            realm_documents: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -941,6 +949,36 @@ impl OperationsTaskHandler {
         {
             warn!(task_id = ?task_id, message = %message, "Failed to schedule shard placement sync after local realm config change");
         }
+    }
+
+    /// Fetches the realm documents on a device, at most once per backoff
+    /// window. A device is judged by state it does not hold, so this is the one
+    /// beat that keeps a revocation or an eviction reaching it.
+    async fn fetch_realm_documents(&self) {
+        let now = unix_timestamp_millis();
+        {
+            let due = self
+                .realm_documents
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if due.1 > now {
+                return;
+            }
+        }
+        let fetched = crate::device::realm_documents::fetch_realm_documents(&self.context).await;
+        let mut state = self
+            .realm_documents
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let attempts = match fetched {
+            true => 0,
+            false => state.0.saturating_add(1),
+        };
+        let after = match fetched {
+            true => REALM_DOCUMENTS_AFTER.as_millis() as u64,
+            false => queue_retry_after_ms(attempts),
+        };
+        *state = (attempts, now.saturating_add(after));
     }
 
     /// Takes the open rotation, leaving a fresh one for a concurrent
@@ -2845,6 +2883,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 };
                 self.reschedule_timer(TaskKey::ReconcileSyncedFolders, after)
                     .await;
+                // After the folders, never before them: an unreachable realm
+                // must not hold up the owner's own files.
+                self.fetch_realm_documents().await;
             }
             TaskKey::DrainSyncUploadOutbox => {
                 let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
