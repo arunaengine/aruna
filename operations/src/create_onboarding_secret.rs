@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -14,8 +14,9 @@ use ulid::Ulid;
 use crate::onboarding_secret_state::secret_state_write_entry;
 
 pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
-/// Caps the outstanding-secret scan: expired secrets are pruned on every mint,
-/// so a realm never carries anywhere near this many live enrollments.
+/// Secrets one page of the outstanding-secret scan reads. The scan follows its
+/// cursor to the end of the range: an owner's secret beyond the first page
+/// still occupies one of their device slots.
 pub(crate) const MAX_SCANNED_SECRETS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,8 @@ enum CreateOnboardingSecretState {
         txn_id: TxnId,
         cap: u32,
         enrolled: Vec<String>,
+        /// Secrets counted by the pages already read.
+        pending: u32,
     },
     WriteRecord {
         txn_id: TxnId,
@@ -228,22 +231,22 @@ impl Operation for CreateOnboardingSecretOperation {
                     txn_id,
                     cap,
                     enrolled,
+                    pending: 0,
                 };
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: ONBOARDING_KEYSPACE.to_string(),
-                    prefix: Some(ByteView::from(SECRET_RECORD_PREFIX.as_bytes().to_vec())),
-                    start: None,
-                    limit: MAX_SCANNED_SECRETS,
-                    txn_id: Some(txn_id),
-                })]
+                smallvec![scan_secrets(txn_id, None)]
             }
             CreateOnboardingSecretState::CountPending {
                 txn_id,
                 cap,
                 enrolled,
+                pending,
             } => {
                 let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+                let Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) = event
+                else {
                     return fail(
                         self,
                         CreateOnboardingSecretError::UnexpectedEvent {
@@ -253,19 +256,32 @@ impl Operation for CreateOnboardingSecretOperation {
                         },
                     );
                 };
-                let pending = pending_devices(
+                let pending = pending.saturating_add(pending_devices(
                     &values,
                     self.input.record.mode.owner(),
                     self.input.record.enrollment_id,
                     &enrolled,
-                );
+                ));
                 if enrolled.len() as u32 + pending >= cap {
                     return fail(
                         self,
                         CreateOnboardingSecretError::DeviceCapExceeded { limit: cap },
                     );
                 }
-                self.emit_write_record(txn_id)
+                // The range is followed to its end: a slot this owner holds may
+                // sit behind any number of other owners' records.
+                match next_start_after {
+                    Some(next) => {
+                        self.state = CreateOnboardingSecretState::CountPending {
+                            txn_id,
+                            cap,
+                            enrolled,
+                            pending,
+                        };
+                        smallvec![scan_secrets(txn_id, Some(next))]
+                    }
+                    None => self.emit_write_record(txn_id),
+                }
             }
             CreateOnboardingSecretState::WriteRecord { txn_id } => {
                 let got = format!("{event:?}");
@@ -336,6 +352,18 @@ fn fail(
     operation.state = CreateOnboardingSecretState::Error;
     operation.output = Some(Err(error));
     cleanup
+}
+
+/// One page of the outstanding-secret range, inside the minting transaction so
+/// the read conflicts with a concurrent insert.
+pub(crate) fn scan_secrets(txn_id: TxnId, start_after: Option<Key>) -> Effect {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: ONBOARDING_KEYSPACE.to_string(),
+        prefix: Some(ByteView::from(SECRET_RECORD_PREFIX.as_bytes().to_vec())),
+        start: start_after.map(IterStart::After),
+        limit: MAX_SCANNED_SECRETS,
+        txn_id: Some(txn_id),
+    })
 }
 
 pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
@@ -483,6 +511,58 @@ mod tests {
             mint(&context, owner).await,
             Err(CreateOnboardingSecretError::DeviceCapExceeded { limit: 1 })
         ));
+    }
+
+    async fn write_secret(context: &DriverContext, record: &OnboardingSecretRecord) {
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: ONBOARDING_KEYSPACE.to_string(),
+                key: super::secret_record_key(record.enrollment_id),
+                value: ByteView::from(postcard::to_allocvec(record).unwrap()),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    /// Fills the range with other owners' outstanding secrets, so a scan that
+    /// stops at its first page never reaches what comes after them.
+    async fn fill_secrets(context: &DriverContext, owner: UserId, count: usize) {
+        for _ in 0..count {
+            write_secret(context, &device_record(owner)).await;
+        }
+    }
+
+    // An owner's slot must be found wherever it sits in the range: the first
+    // page is full of other owners' records, so a single-page scan would miss
+    // it and hand out a device over the cap.
+    #[tokio::test]
+    async fn cap_scans_every_page() {
+        let owner = UserId::local(Ulid::generate(), realm());
+        let other = UserId::local(Ulid::generate(), realm());
+        let (_dir, context) = context_with_cap(Some(1), &[]).await;
+        fill_secrets(&context, other, super::MAX_SCANNED_SECRETS + 8).await;
+        // The highest possible id, so this owner's slot provably sorts behind
+        // every generated one instead of relying on when it was written.
+        write_secret(
+            &context,
+            &OnboardingSecretRecord {
+                enrollment_id: Ulid::from_bytes([0xff; 16]),
+                ..device_record(owner)
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            mint(&context, owner).await,
+            Err(CreateOnboardingSecretError::DeviceCapExceeded { limit: 1 })
+        ));
+        // Another owner is still unaffected by the records ahead of them.
+        assert!(
+            mint(&context, UserId::local(Ulid::generate(), realm()))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

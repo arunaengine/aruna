@@ -522,6 +522,17 @@ pub(crate) fn require_unrestricted_realm_auth(
     Ok(auth)
 }
 
+/// Whether this node has to leave group authorization to somebody else. A user
+/// device holds no group authorization document, so a check here could only
+/// ever deny: a realm submission is authorized by the holder that receives it,
+/// and anything the device runs for itself by the owner binding.
+pub(crate) fn defers_group_auth(state: &ServerState) -> bool {
+    matches!(
+        state.node_capabilities(),
+        aruna_core::structs::NodeCapabilities::User { .. }
+    )
+}
+
 pub(crate) async fn ensure_permission(
     state: &ServerState,
     auth: &AuthContext,

@@ -653,6 +653,7 @@ mod tests {
             kind: SourceEntryKind::Directory,
             size: None,
             modified: None,
+            stat: None,
         };
 
         let MappedEntry::Directory(directory) = map_source_entry(&root, entry).unwrap() else {

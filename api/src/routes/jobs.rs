@@ -43,7 +43,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
+    ValidatedArunaBearerTokenCarrier, defers_group_auth, ensure_permission,
+    require_unrestricted_realm_auth,
 };
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -666,6 +667,9 @@ async fn validate_existing_workspace(
     if info.group_id != group_id {
         return Err(ServerError::BadRequest);
     }
+    if defers_group_auth(state) {
+        return Ok(());
+    }
     ensure_permission(
         state,
         auth,
@@ -1029,13 +1033,15 @@ pub async fn submit_job(
         return Err(ServerError::BadRequest);
     }
     let output_prefixes = validate_output_prefixes(request.output_prefixes)?;
-    ensure_permission(
-        &state,
-        &auth,
-        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
-        Permission::WRITE,
-    )
-    .await?;
+    if !defers_group_auth(&state) {
+        ensure_permission(
+            &state,
+            &auth,
+            blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
+            Permission::WRITE,
+        )
+        .await?;
+    }
     if let Some(bucket) = workspace_bucket.as_deref() {
         validate_existing_workspace(&state, &auth, group_id, bucket).await?;
     }
@@ -2998,6 +3004,32 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn device_defers_group_check() {
+        // A device holds no group authorization document, so neither target may
+        // answer 403 for the owner: the holder authorizes a realm submission and
+        // the owner binding a local run.
+        let (_dir, state) = build_state().await;
+        enroll_device(&state, user(2)).await;
+
+        for target in [None, Some(ExecutionTarget::Local)] {
+            let result = submit_job(
+                State(state.clone()),
+                Extension(auth_for(user(2))),
+                Extension(None),
+                Json(SubmitExecutionRequest {
+                    target,
+                    ..local_request()
+                }),
+            )
+            .await;
+            assert!(
+                !matches!(result, Err(ServerError::Forbidden)),
+                "{target:?} must not be refused by a local group check"
+            );
+        }
     }
 
     #[tokio::test]

@@ -192,6 +192,17 @@ impl RemoteView {
     }
 }
 
+/// Closes one listing window. An exhausted listing covers every remaining key,
+/// however the pass ended: the boundary is cleared so local-only keys after the
+/// last head are decided too, and the next pass restarts instead of repeating
+/// exactly this window.
+fn close_window(view: &mut RemoteView, next: Option<SyncListCursor>) {
+    if next.is_none() {
+        view.boundary = None;
+    }
+    view.next_cursor = next;
+}
+
 /// Every current head under the folder's bound prefix, as bounded pages served
 /// by the folder's realm node with the owner's authority.
 async fn fetch_heads(context: &Arc<DriverContext>, folder: &SyncedFolder) -> Option<RemoteView> {
@@ -234,18 +245,22 @@ async fn fetch_heads(context: &Arc<DriverContext>, folder: &SyncedFolder) -> Opt
         // A folder past the in-memory bound stops here and resumes next pass;
         // the boundary keeps this pass from judging the keys it never saw.
         if view.heads.len() >= MAX_REMOTE_HEADS {
-            view.next_cursor = next;
+            close_window(&mut view, next);
             return Some(view);
         }
         match next {
             Some(next) => cursor = Some(next),
             None => {
-                // The listing reached the end, so every key is in the window.
-                view.boundary = None;
+                close_window(&mut view, None);
                 return Some(view);
             }
         }
     }
+}
+
+/// Wakes the upload drain after an explicit owner action queued a row.
+pub(crate) async fn arm_upload_timer(context: &Arc<DriverContext>) {
+    arm_timer(context, TaskKey::DrainSyncUploadOutbox).await;
 }
 
 async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
@@ -271,4 +286,50 @@ pub async fn restore_sync_timers(storage: &StorageHandle, task_handle: &TaskHand
         warn!(message = %message, "Failed to restore the synced-folder timer");
     }
     restore_upload_timer(storage, task_handle).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(boundary: &str) -> RemoteView {
+        RemoteView {
+            boundary: Some(boundary.to_string()),
+            ..RemoteView::default()
+        }
+    }
+
+    // The in-memory bound and the end of the listing can coincide. The window
+    // must then cover the keys after the last head, and the next pass must start
+    // over instead of listing exactly this window again forever.
+    #[test]
+    fn clears_final_boundary() {
+        let mut exhausted = view("m.txt");
+        close_window(&mut exhausted, None);
+        assert!(exhausted.next_cursor.is_none());
+        assert!(exhausted.covers("z.txt"));
+
+        let mut truncated = view("m.txt");
+        close_window(
+            &mut truncated,
+            Some(SyncListCursor {
+                key: "m.txt".to_string(),
+                version_id: None,
+            }),
+        );
+        assert!(truncated.next_cursor.is_some());
+        assert!(!truncated.covers("z.txt"));
+        assert!(truncated.covers("a.txt"));
+    }
+
+    // A resumed pass never re-decides the keys the previous one already passed.
+    #[test]
+    fn window_skips_resumed() {
+        let resumed = RemoteView {
+            resume_after: Some("m.txt".to_string()),
+            ..RemoteView::default()
+        };
+        assert!(!resumed.covers("a.txt"));
+        assert!(resumed.covers("z.txt"));
+    }
 }

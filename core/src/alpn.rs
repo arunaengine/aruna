@@ -66,10 +66,12 @@ impl Alpn {
     /// connection. `None` is a key the realm config does not name: it keeps the
     /// pre-matrix provisional behaviour and is bounded by admission instead.
     ///
-    /// A `User` device speaks the read and forward surface only. Document sync
-    /// and shard exchange are realm infrastructure a device never touches. Job
-    /// control is directional: a device dials it for its owner's submissions
-    /// and routed job reads, but never serves it.
+    /// A `User` device speaks the read and forward surface only. Shard exchange
+    /// is realm infrastructure a device never touches. Two protocols are
+    /// directional: a device dials job control for its owner's submissions and
+    /// routed job reads but never serves it, and it accepts document sync so
+    /// the shared realm topics keep reaching it (revocations among them) while
+    /// it never dials it and no realm node accepts a device's dial.
     pub const fn permits(&self, kind: Option<&RealmNodeKind>, role: AlpnRole) -> bool {
         match kind {
             None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,
@@ -79,7 +81,11 @@ impl Alpn {
                 | Alpn::Metadata
                 | Alpn::NativeReference
                 | Alpn::Notification => true,
-                Alpn::DocumentSync | Alpn::Shard => false,
+                Alpn::Shard => false,
+                Alpn::DocumentSync => match role {
+                    AlpnRole::LocalServe => true,
+                    AlpnRole::PeerInbound | AlpnRole::LocalDial => false,
+                },
                 Alpn::JobControl => match role {
                     AlpnRole::PeerInbound | AlpnRole::LocalDial => true,
                     AlpnRole::LocalServe => false,

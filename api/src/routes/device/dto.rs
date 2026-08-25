@@ -39,6 +39,8 @@ pub enum FolderModeName {
 pub enum FolderStateName {
     Active,
     Paused,
+    /// The owner unbound it and the cleanup is still running.
+    Deleting,
     Error,
 }
 
@@ -304,6 +306,7 @@ pub fn folder_view(folder: SyncedFolder, counters: FolderCounters) -> SyncedFold
     let (state, message) = match folder.state {
         FolderState::Active => (FolderStateName::Active, None),
         FolderState::Paused => (FolderStateName::Paused, None),
+        FolderState::Deleting => (FolderStateName::Deleting, None),
         FolderState::Error { reason } => (FolderStateName::Error, Some(reason)),
     };
     SyncedFolderView {

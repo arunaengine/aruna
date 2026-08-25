@@ -14,7 +14,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::AuthContext;
 use aruna_operations::device::wipe::{
-    WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation,
+    WIPE_INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError,
+    WipeDeviceOperation,
 };
 use aruna_operations::driver::drive;
 
@@ -37,6 +38,10 @@ pub struct WipeDeviceResponse {
     /// Process exit status the supervisor sees once the wipe completes. A wipe
     /// that leaves paths behind exits with 80 instead.
     pub exit_code: i32,
+    /// Why this wipe cannot erase everything this node stores, when it cannot.
+    /// It names the configured backends whose bytes stay where they are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
 }
 
 #[utoipa::path(
@@ -52,6 +57,7 @@ pub struct WipeDeviceResponse {
 - Realm-side eviction is a separate, earlier step. The desktop calls `DELETE /users/me/devices/{id}` on a management node first, so the realm drops the membership; this route only erases what the device holds.
 - The node accepts the wipe, answers, then runs its ordinary shutdown, erases the contents of its storage roots including the persisted identity, and exits with status 79 so a supervisor can tell an erased device from a crash or an ordinary stop.
 - Status 79 is claimed only when every root was emptied. A wipe that left paths behind logs them and exits with status 80: data may still be on disk, so the device must not be treated as erased.
+- Every configured node-local filesystem backend is erased, including one an operator relocated outside the store root. A backend this process cannot erase, such as object storage, is refused a complete status up front: the answer carries `incomplete_reason` and `exit_code` 80, and the bytes on that backend stay where they are.
 - The storage roots themselves are kept, so a mounted volume stays mounted.
 - Everything local is lost: queued drafts, blobs, credentials and the node identity. Re-enrolling mints a new node id.
 
@@ -99,11 +105,24 @@ async fn wipe_device(
         other => ServerError::InternalError(other.to_string()),
     })?;
     wipe.arm();
+    // A backend this process cannot erase is known before the wipe runs, so the
+    // owner is told now rather than left to read a successful status.
+    let incomplete_reason = (!wipe.unsupported().is_empty()).then(|| {
+        format!(
+            "this device stores data on backends it cannot erase: {}",
+            wipe.unsupported().join(", ")
+        )
+    });
+    let exit_code = match incomplete_reason {
+        Some(_) => WIPE_INCOMPLETE_EXIT_CODE,
+        None => WIPED_EXIT_CODE,
+    };
     Ok((
         StatusCode::ACCEPTED,
         Json(WipeDeviceResponse {
             node_id: node_id.to_string(),
-            exit_code: WIPED_EXIT_CODE,
+            exit_code,
+            incomplete_reason,
         }),
     ))
 }

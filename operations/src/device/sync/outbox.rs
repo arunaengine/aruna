@@ -12,8 +12,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    AuthContext, EntrySide, EntryState, SyncBase, SyncPullAck, SyncRefusal, SyncedBytes,
-    SyncedFolder, VersionedObjectArn,
+    AuthContext, EntrySide, EntryState, FolderState, SyncBase, SyncPullAck, SyncRefusal,
+    SyncedBytes, SyncedFolder, VersionedObjectArn,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId};
@@ -60,6 +60,10 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
             let Some(folder) = load_folder(context, upload.folder_id).await else {
                 continue;
             };
+            // An unbinding folder publishes nothing more; its rows are going.
+            if folder.state == FolderState::Deleting {
+                continue;
+            }
             let attempts = upload.attempts().saturating_add(1);
             if !claim_upload(context, &upload, attempts).await {
                 continue;

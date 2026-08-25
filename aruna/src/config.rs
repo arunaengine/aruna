@@ -515,6 +515,8 @@ pub fn read_settings() -> Result<Settings, SetupError> {
     // A device profile runs without an S3 listener: unset or empty disables it,
     // so a supervisor can force it off over a .env that defines one. Both name
     // the same endpoint, so half a pair is a misconfiguration, not a profile.
+    // Which profile this is only becomes knowable once the persisted node
+    // identity is read, so the pair is validated again there.
     let (s3_host, s3_address) = match (
         optional_nonempty_env("S3_HOST")?,
         optional_nonempty_env("S3_ADDRESS")?,
@@ -684,6 +686,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     if realm_id != node_state.realm_id {
         return Err(SetupError::PersistedNodeStateMismatch);
     }
+    validate_s3_profile(s3_address.as_deref(), &node_capabilities)?;
 
     let mut node_state = node_state;
     if matches!(node_state.status, PersistedNodeStatus::PendingOnboarding) {
@@ -1208,6 +1211,19 @@ pub async fn mark_onboarding_phase(
     let mut updated_state = node_state.clone();
     updated_state.onboarding_phase = Some(phase);
     persist_node_state(storage, &updated_state).await
+}
+
+/// Only a device may run without an S3 listener. An infrastructure node whose
+/// `S3_HOST`/`S3_ADDRESS` pair is accidentally absent must fail its start
+/// instead of coming up silently serving no S3 endpoint at all.
+fn validate_s3_profile(
+    s3_address: Option<&str>,
+    capabilities: &NodeCapabilities,
+) -> Result<(), SetupError> {
+    if s3_address.is_some() || matches!(capabilities, NodeCapabilities::User { .. }) {
+        return Ok(());
+    }
+    Err(SetupError::MissingConfigValue("S3_ADDRESS"))
 }
 
 fn node_capabilities_from_state(
@@ -1851,18 +1867,35 @@ mod tests {
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         S3ServerTimeouts, SetupError, fjall_persist_policy_env, load, load_oidc_providers_from_env,
         parse_node_labels_env, persist_node_state, portal_config_env, read_settings,
-        rocrate_limits_env, validate_public_url,
+        rocrate_limits_env, validate_public_url, validate_s3_profile,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
-        DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
-        RoCrateLimits, StaticRealmEndpoint,
+        DynamicDiscoveryMethod, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RelayPolicy, RoCrateLimits, StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_to_config_string};
     use aruna_storage::{FjallPersistPolicy, FjallStorage};
     use std::sync::OnceLock;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    // Only a device serves no S3 endpoint. An infrastructure node whose pair is
+    // accidentally absent must fail its start instead of coming up without one.
+    #[test]
+    fn s3_optional_for_devices() {
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let device = NodeCapabilities::user_node(realm_id).expect("device capabilities");
+        let management =
+            NodeCapabilities::management_node(generate_signing_key()).expect("management");
+
+        assert!(validate_s3_profile(None, &device).is_ok());
+        assert!(validate_s3_profile(Some("0.0.0.0:9000"), &management).is_ok());
+        assert!(matches!(
+            validate_s3_profile(None, &management),
+            Err(SetupError::MissingConfigValue("S3_ADDRESS"))
+        ));
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

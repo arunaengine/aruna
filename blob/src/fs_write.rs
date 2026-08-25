@@ -9,16 +9,14 @@
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{SYNC_TRASH_DIR, WriteGuard, weak_fingerprint};
+use aruna_core::structs::{FileStat, SYNC_TRASH_DIR, WriteGuard, weak_fingerprint};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::{Component, Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
-use crate::fs_source::{
-    MAX_COPY_ATTEMPTS, SPOOL_PREFIX, canonical_root, jailed_file, map_io_error,
-};
+use crate::fs_source::{MAX_COPY_ATTEMPTS, SPOOL_DIR, canonical_root, jailed_file, map_io_error};
 
 /// Why a spooled file could not be published. A refusal is the owner's data
 /// winning; a failure is this node's problem.
@@ -46,11 +44,11 @@ pub(crate) async fn write_guarded(
     guard: &WriteGuard,
     blob: BackendStream<Result<Bytes, StreamError>>,
 ) -> LocalFileEvent {
-    let (parent, target) = match jailed_target(root, relative).await {
+    let (_, target) = match jailed_target(root, relative).await {
         Ok(resolved) => resolved,
         Err(event) => return event,
     };
-    let spooled = match spool_temp(&parent, blob).await {
+    let spooled = match spool_file(root, blob).await {
         Ok(spooled) => spooled,
         Err(message) => return LocalFileEvent::Error { message },
     };
@@ -81,7 +79,7 @@ pub(crate) async fn write_conflicted(
         Ok(resolved) => resolved,
         Err(event) => return event,
     };
-    let spooled = match spool_temp(&parent, blob).await {
+    let spooled = match spool_file(root, blob).await {
         Ok(spooled) => spooled,
         Err(message) => return LocalFileEvent::Error { message },
     };
@@ -310,24 +308,17 @@ async fn jailed_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, LocalF
         })
 }
 
-/// Removes spool files a crashed write left behind in one directory. They are
-/// this node's own bytes, never the owner's, so dropping them loses nothing.
+/// Removes what a crashed write left in the spool directory. Nothing outside
+/// that directory is ever touched, and everything inside it is this node's own.
 pub(crate) async fn sweep_spool(root: &str) -> usize {
     let Ok(root) = canonical_root(root).await else {
         return 0;
     };
-    let Ok(mut reader) = tokio::fs::read_dir(&root).await else {
+    let Ok(mut reader) = tokio::fs::read_dir(root.join(SPOOL_DIR)).await else {
         return 0;
     };
     let mut removed = 0usize;
     while let Ok(Some(entry)) = reader.next_entry().await {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(SPOOL_PREFIX)
-        {
-            continue;
-        }
         if tokio::fs::remove_file(entry.path()).await.is_ok() {
             removed += 1;
         }
@@ -335,13 +326,21 @@ pub(crate) async fn sweep_spool(root: &str) -> usize {
     removed
 }
 
-/// Streams the incoming bytes into a temporary file in the directory the write
-/// lands in, so publishing it is a rename inside one filesystem.
-async fn spool_temp(
-    parent: &Path,
+/// Streams the incoming bytes into the folder's own spool directory, so
+/// publishing them is a rename inside one filesystem and no temporary file ever
+/// carries a name in the owner's own tree.
+async fn spool_file(
+    root: &str,
     blob: BackendStream<Result<Bytes, StreamError>>,
 ) -> Result<Spooled, String> {
-    let path = parent.join(format!("{SPOOL_PREFIX}{}", Ulid::generate()));
+    let parent = canonical_root(root)
+        .await
+        .map_err(|error| error.to_string())?
+        .join(SPOOL_DIR);
+    tokio::fs::create_dir_all(&parent)
+        .await
+        .map_err(|error| error.to_string())?;
+    let path = parent.join(Ulid::generate().to_string());
     match write_temp(&path, blob).await {
         Ok(spooled) => Ok(spooled),
         Err(error) => {
@@ -376,7 +375,7 @@ async fn write_temp(
         .map_err(|error| error.to_string())?;
     Ok(Spooled {
         path: path.to_path_buf(),
-        fingerprint: weak_fingerprint(metadata.len(), metadata.modified().ok()),
+        fingerprint: weak_fingerprint(&FileStat::from_metadata(&metadata)),
         blake3: *hasher.finalize().as_bytes(),
         size,
     })
@@ -462,7 +461,7 @@ async fn rescue_displaced(spool: &Path, target: &Path) -> Result<(), PlaceError>
 /// read: those bytes are not one representation of anything.
 async fn hash_stable(path: &Path) -> Result<(String, [u8; 32], u64), StagingSourceError> {
     let before = tokio::fs::metadata(path).await.map_err(map_io_error)?;
-    let fingerprint = weak_fingerprint(before.len(), before.modified().ok());
+    let fingerprint = weak_fingerprint(&FileStat::from_metadata(&before));
     let mut file = tokio::fs::File::open(path).await.map_err(map_io_error)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 256 * 1024];
@@ -476,7 +475,7 @@ async fn hash_stable(path: &Path) -> Result<(String, [u8; 32], u64), StagingSour
         hasher.update(&buffer[..read]);
     }
     let after = tokio::fs::metadata(path).await.map_err(map_io_error)?;
-    if weak_fingerprint(after.len(), after.modified().ok()) != fingerprint {
+    if weak_fingerprint(&FileStat::from_metadata(&after)) != fingerprint {
         return Err(StagingSourceError::SourceUnstable);
     }
     Ok((fingerprint, *hasher.finalize().as_bytes(), before.len()))
@@ -691,16 +690,9 @@ mod tests {
             tokio::fs::read(&file).await.unwrap(),
             b"the owner's own edit"
         );
-        let spooled = std::fs::read_dir(root.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(SPOOL_PREFIX)
-            })
-            .count();
+        let spooled = std::fs::read_dir(root.path().join(SPOOL_DIR))
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or_default();
         assert_eq!(spooled, 0);
     }
 
@@ -803,8 +795,9 @@ mod tests {
         assert!(!outside.path().join("deep").exists());
     }
 
-    // The trash and the write spool are this node's bookkeeping, so a sweep
-    // must never offer them back as the owner's data.
+    // The trash and the write spool are this node's bookkeeping and live in the
+    // reserved directory. Everything else in the folder is the owner's, whatever
+    // it is named, and a sweep must never remove it.
     #[tokio::test]
     async fn hides_reserved_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -817,10 +810,15 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::fs::write(root.path().join(".aruna-notes"), b"mine")
+        for name in [".aruna-notes", ".aruna-tmp-notes"] {
+            tokio::fs::write(root.path().join(name), b"mine")
+                .await
+                .unwrap();
+        }
+        tokio::fs::create_dir_all(root.path().join(SPOOL_DIR))
             .await
             .unwrap();
-        tokio::fs::write(root.path().join(".aruna-tmp-stale"), b"spool")
+        tokio::fs::write(root.path().join(SPOOL_DIR).join("stale"), b"spool")
             .await
             .unwrap();
 
@@ -829,9 +827,58 @@ mod tests {
             .unwrap();
         let mut paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         paths.sort();
-        assert_eq!(paths, vec![".aruna-notes", "keep.txt"]);
+        assert_eq!(paths, vec![".aruna-notes", ".aruna-tmp-notes", "keep.txt"]);
         assert_eq!(sweep_spool(&path).await, 1);
         assert!(root.path().join(".aruna-notes").exists());
+        assert!(root.path().join(".aruna-tmp-notes").exists());
+    }
+
+    // A sweep runs on every folder check, so a file the owner named like an
+    // older spool must survive it and stay listed as their own data.
+    #[tokio::test]
+    async fn keeps_owner_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        tokio::fs::write(root.path().join(".aruna-tmp-notes"), b"mine")
+            .await
+            .unwrap();
+
+        assert_eq!(sweep_spool(&path).await, 0);
+        assert_eq!(
+            tokio::fs::read(root.path().join(".aruna-tmp-notes"))
+                .await
+                .unwrap(),
+            b"mine"
+        );
+    }
+
+    // Every spooled byte lands in the reserved directory, so a write never
+    // creates a name inside the owner's own tree.
+    #[tokio::test]
+    async fn spools_in_reserved_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let event = write_guarded(
+            &path,
+            "nested/note.txt",
+            &WriteGuard::MustNotExist,
+            body(b"hello"),
+        )
+        .await;
+
+        assert!(matches!(event, LocalFileEvent::Written { .. }));
+        assert!(root.path().join(SPOOL_DIR).is_dir());
+        let leftovers = std::fs::read_dir(root.path().join(SPOOL_DIR))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(leftovers, 0);
+        let nested = std::fs::read_dir(root.path().join("nested"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(nested, vec!["note.txt".to_string()]);
     }
 
     #[tokio::test]

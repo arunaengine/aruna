@@ -12,7 +12,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::create_onboarding_secret::{
-    MAX_SCANNED_SECRETS, SECRET_RECORD_PREFIX, enrolled_devices, pending_devices, secret_record_key,
+    enrolled_devices, pending_devices, scan_secrets, secret_record_key,
 };
 use crate::onboarding_secret_state::{
     resolve_secret_state, secret_state_key, secret_state_write_entry,
@@ -52,6 +52,8 @@ enum ReserveOnboardingSecretState {
         record: OnboardingSecretRecord,
         cap: u32,
         enrolled: Vec<String>,
+        /// Secrets counted by the pages already read.
+        pending: u32,
     },
     WriteReserved {
         txn_id: TxnId,
@@ -364,23 +366,23 @@ impl Operation for ReserveOnboardingSecretOperation {
                     record,
                     cap,
                     enrolled,
+                    pending: 0,
                 };
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: ONBOARDING_KEYSPACE.to_string(),
-                    prefix: Some(ByteView::from(SECRET_RECORD_PREFIX.as_bytes().to_vec())),
-                    start: None,
-                    limit: MAX_SCANNED_SECRETS,
-                    txn_id: Some(txn_id),
-                })]
+                smallvec![scan_secrets(txn_id, None)]
             }
             ReserveOnboardingSecretState::CountPending {
                 txn_id,
                 record,
                 cap,
                 enrolled,
+                pending,
             } => {
                 let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+                let Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) = event
+                else {
                     return fail(
                         self,
                         ReserveOnboardingSecretError::UnexpectedEvent {
@@ -390,19 +392,33 @@ impl Operation for ReserveOnboardingSecretOperation {
                         },
                     );
                 };
-                let pending = pending_devices(
+                let pending = pending.saturating_add(pending_devices(
                     &values,
                     record.mode.owner(),
                     self.input.enrollment_id,
                     &enrolled,
-                );
+                ));
                 if enrolled.len() as u32 + pending >= cap {
                     return fail(
                         self,
                         ReserveOnboardingSecretError::DeviceCapExceeded { limit: cap },
                     );
                 }
-                self.emit_reserve_write(txn_id, record)
+                // The range is followed to its end, so a slot this owner holds
+                // cannot hide behind another owner's records.
+                match next_start_after {
+                    Some(next) => {
+                        self.state = ReserveOnboardingSecretState::CountPending {
+                            txn_id,
+                            record,
+                            cap,
+                            enrolled,
+                            pending,
+                        };
+                        smallvec![scan_secrets(txn_id, Some(next))]
+                    }
+                    None => self.emit_reserve_write(txn_id, record),
+                }
             }
             ReserveOnboardingSecretState::WriteReserved { txn_id, record } => {
                 let got = format!("{event:?}");

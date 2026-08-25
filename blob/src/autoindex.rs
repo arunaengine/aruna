@@ -96,6 +96,7 @@ pub(crate) async fn list_http_autoindex(
                     None
                 },
                 modified: entry.modified,
+                stat: None,
             });
         }
         if !recursive {

@@ -253,6 +253,7 @@ async fn list_operator(
             size: (kind == aruna_core::structs::SourceEntryKind::File)
                 .then(|| entry.metadata().content_length()),
             modified: entry.metadata().last_modified().map(Into::into),
+            stat: None,
         });
     }
 

@@ -1913,6 +1913,7 @@ mod tests {
                 kind: SourceEntryKind::File,
                 size: Some(4),
                 modified: None,
+                stat: None,
             }],
             "folder/",
             "imported",
