@@ -142,9 +142,13 @@ async fn forward_upload(
 
 /// Authorization and target verdicts do not improve by waiting.
 fn permanent(refusal: &SyncRefusal) -> bool {
+    // Invalid covers a device serve refused for its bytes: retrying cannot help.
     matches!(
         refusal,
-        SyncRefusal::Unauthorized | SyncRefusal::Forbidden | SyncRefusal::NotFound
+        SyncRefusal::Unauthorized
+            | SyncRefusal::Forbidden
+            | SyncRefusal::NotFound
+            | SyncRefusal::Invalid(_)
     )
 }
 
