@@ -67,11 +67,11 @@ impl Alpn {
     /// pre-matrix provisional behaviour and is bounded by admission instead.
     ///
     /// A `User` device speaks the read and forward surface only. Shard exchange
-    /// is realm infrastructure a device never touches. Two protocols are
-    /// directional: a device dials job control for its owner's submissions and
-    /// routed job reads but never serves it, and it accepts document sync so
-    /// the shared realm topics keep reaching it (revocations among them) while
-    /// it never dials it and no realm node accepts a device's dial.
+    /// is realm infrastructure a device never touches. Job control and document
+    /// sync are directional: a device dials both and serves only document sync,
+    /// so the shared realm documents reach it whether the realm pushed while it
+    /// was up or it fetches them after being away. Which peer a device accepts
+    /// document sync from is [`Alpn::accepts`]: never another device.
     pub const fn permits(&self, kind: Option<&RealmNodeKind>, role: AlpnRole) -> bool {
         match kind {
             None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,
@@ -83,8 +83,8 @@ impl Alpn {
                 | Alpn::Notification => true,
                 Alpn::Shard => false,
                 Alpn::DocumentSync => match role {
-                    AlpnRole::LocalServe => true,
-                    AlpnRole::PeerInbound | AlpnRole::LocalDial => false,
+                    AlpnRole::LocalServe | AlpnRole::LocalDial => true,
+                    AlpnRole::PeerInbound => false,
                 },
                 Alpn::JobControl => match role {
                     AlpnRole::PeerInbound | AlpnRole::LocalDial => true,
@@ -92,6 +92,20 @@ impl Alpn {
                 },
             },
         }
+    }
+
+    /// Whether this node accepts `alpn` from a peer, judged on both kinds. Only
+    /// document sync needs the pair: realm infrastructure serves a device the
+    /// shared realm documents, and two devices never exchange anything.
+    pub fn accepts(&self, local: Option<&RealmNodeKind>, peer: Option<&RealmNodeKind>) -> bool {
+        if !self.permits(local, AlpnRole::LocalServe) {
+            return false;
+        }
+        let device_peer = matches!(peer, Some(RealmNodeKind::User { .. }));
+        if matches!(self, Alpn::DocumentSync) && device_peer {
+            return !matches!(local, Some(RealmNodeKind::User { .. }));
+        }
+        self.permits(peer, AlpnRole::PeerInbound)
     }
 
     pub const fn as_bytes(&self) -> &'static [u8] {

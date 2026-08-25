@@ -2561,7 +2561,7 @@ async fn durable_rearm_loop(
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_intake_timer(&context.storage_handle, &task_handle).await;
-        restore_sync_timers(&context.storage_handle, &task_handle).await;
+        restore_sync_timers(&context, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2689,7 +2689,7 @@ impl TaskQueues {
         restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_intake_timer(&context.storage_handle, &task_handle).await;
-        restore_sync_timers(&context.storage_handle, &task_handle).await;
+        restore_sync_timers(&context, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2881,6 +2881,10 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 self.drain_job_witness_queue().await;
             }
             TaskKey::ReconcileSyncedFolders => {
+                // The same beat carries a device's fetch of the realm-wide
+                // documents: nothing else wakes it up for a revocation it
+                // missed while it was closed.
+                crate::startup::pull_realm_documents(&self.context).await;
                 let after = match crate::device::sync::reconcile_folders(&self.context).await {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
                     DrainOutcome::More => RECONCILE_CONTINUE_AFTER,

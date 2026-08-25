@@ -1109,16 +1109,24 @@ fn plan_shard_groups(
         && shared_peers
             .iter()
             .all(|peer| node_id.as_bytes() < peer.as_bytes());
+    let device_local = !sync_eligible_node(config, node_id);
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let wide = realm_wide_target(&target);
         // Restore probes and syncs its peers as infrastructure, so only
         // sync-eligible nodes belong here; devices are pushed to separately.
-        let groups = if realm_wide_target(&target) && !realm_minter {
+        let groups = if wide && !realm_minter {
             &mut plan.shared_join_groups
         } else {
             &mut plan.shared_groups
         };
-        groups.entry(shared_peers.clone()).or_default().push(topic);
+        // A device exchanges the realm-wide documents and nothing else: the
+        // topics that are its own are minted here and synced with nobody.
+        let peers = match device_local && !wide {
+            true => Vec::new(),
+            false => shared_peers.clone(),
+        };
+        groups.entry(peers).or_default().push(topic);
         plan.summary.shared_topics += 1;
     }
 
@@ -1307,12 +1315,14 @@ impl ShardPlan {
     /// Flattens the plan into a deterministic list of bounded work units.
     fn into_units(self) -> Vec<RestoreUnit> {
         let mut units = Vec::new();
+        // A unit without peers still has local work: its topics are ensured and
+        // minted here, and only the peer exchange is skipped.
         let mut push = |kind,
                         peers: Vec<NodeId>,
                         publishers: Vec<NodeId>,
                         retained: BTreeSet<NodeId>,
                         topics: Vec<_>| {
-            if peers.is_empty() || topics.is_empty() {
+            if topics.is_empty() {
                 return;
             }
             for chunk in topics.chunks(SHARD_RESTORE_CHUNK_TOPICS) {
@@ -1419,6 +1429,10 @@ async fn restore_shared(
     if let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, unit.peers.clone()) {
         warn!(error = %error, "Failed to ensure shared realm topics on restart");
         outcome.fail_topics(to_ensure.iter().copied());
+    }
+    // Nothing to reach: these topics belong to this node alone.
+    if unit.peers.is_empty() {
+        return outcome;
     }
     let event = net_handle
         .sync_document_topics(to_ensure.clone(), unit.peers.clone())
@@ -1619,6 +1633,41 @@ async fn project_restored_metadata_create_events(
     if let Err(error) = project_metadata_create_events_from_log(context, pairs).await {
         warn!(error = ?error, "Failed to project restored metadata create events from log");
     }
+}
+
+/// Fetches the realm-wide documents on a device.
+///
+/// A device is never a reliable push target: it may be closed when the realm
+/// revokes a token. This is how it catches up, and it is the only document sync
+/// a device ever opens.
+pub async fn pull_realm_documents(context: &Arc<DriverContext>) -> bool {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return false;
+    };
+    let realm_id = *net_handle.realm_id();
+    let node_id = net_handle.node_id();
+    let RealmConfigLoad::Found(config) = load_realm_config(context, realm_id).await else {
+        return false;
+    };
+    if sync_eligible_node(&config, node_id) {
+        return false;
+    }
+    let peers = shared_topic_peers(&config, node_id);
+    if peers.is_empty() {
+        return false;
+    }
+    let topics = realm_wide_topics(realm_id).to_vec();
+    let event = net_handle.sync_document_topics(topics, peers).await;
+    apply_restored_reconcile(context, node_id, event).await
+}
+
+/// The realm-wide topics, the only ones a device exchanges.
+fn realm_wide_topics(realm_id: RealmId) -> [::irokle::TopicId; 2] {
+    [
+        DocumentSyncTarget::RealmConfig { realm_id },
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+    ]
+    .map(|target| target.sync_topic_id(realm_id, &PlacementRef::NIL))
 }
 
 async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigLoad {

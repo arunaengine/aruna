@@ -128,15 +128,10 @@ impl InboundAdmission {
     /// Both endpoints must be allowed to speak `alpn`: this node must serve it
     /// and the dialing key's kind must be allowed to open it here.
     fn allows_alpn(&self, peer: NodeId, alpn: Alpn) -> bool {
-        if !self.local_serves(alpn) {
-            return false;
-        }
-        alpn.permits(self.peer_kinds.read().get(&peer), AlpnRole::PeerInbound)
-    }
-
-    /// What this node's own kind accepts for itself.
-    fn local_serves(&self, alpn: Alpn) -> bool {
-        alpn.permits(self.local_kind.read().as_ref(), AlpnRole::LocalServe)
+        alpn.accepts(
+            self.local_kind.read().as_ref(),
+            self.peer_kinds.read().get(&peer),
+        )
     }
 
     /// The outbound half of the matrix: what this node's own kind may dial.
@@ -925,15 +920,15 @@ mod tests {
             (
                 Some(&user),
                 [
-                    // PeerInbound: a realm node accepts a device's job control,
-                    // and never a device's document sync.
+                    // PeerInbound: a realm node accepts a device's job control;
+                    // document sync is decided by the pair, see `accepts`.
                     [true, true, false, true, true, true, false, true],
-                    // LocalServe: a device accepts the shared realm topics but
+                    // LocalServe: a device takes the shared realm documents but
                     // never serves job control.
                     [true, true, true, true, true, true, false, false],
-                    // LocalDial: the device's submission facade dials job
-                    // control; document sync stays receive-only.
-                    [true, true, false, true, true, true, false, true],
+                    // LocalDial: the device dials job control for its owner and
+                    // document sync to fetch the realm documents it was sent.
+                    [true, true, true, true, true, true, false, true],
                 ],
             ),
         ];
@@ -974,8 +969,8 @@ mod tests {
 
     #[test]
     fn local_kind_gate() {
-        // A device dials job control but never serves it, and takes the shared
-        // realm documents in one direction only.
+        // A device dials job control but never serves it, and exchanges the
+        // shared realm documents with realm infrastructure in both directions.
         let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
         let admission = InboundAdmission::new(realm_peers, []);
         admission.mark_materialized();
@@ -986,7 +981,9 @@ mod tests {
 
         assert!(admission.local_dials(Alpn::Bao));
         assert!(admission.local_dials(Alpn::JobControl));
-        assert!(!admission.local_dials(Alpn::DocumentSync));
+        // The device fetches the realm documents itself when it was away.
+        assert!(admission.local_dials(Alpn::DocumentSync));
+        assert!(!admission.local_dials(Alpn::Shard));
         assert!(!admission.admits(peer(1), Alpn::JobControl));
         assert!(admission.admits(peer(1), Alpn::Bao));
         // A realm node's push of the realm configuration reaches the device.
@@ -995,9 +992,10 @@ mod tests {
     }
 
     #[test]
-    fn device_sync_receive_only() {
-        // Another device may not open document sync here, and a key the realm
-        // configuration does not name is refused whatever it dials.
+    fn device_sync_pairs() {
+        // A device takes the realm documents from realm infrastructure and from
+        // nothing else: not from another device, and not from a key the realm
+        // configuration does not name.
         let realm_peers = Arc::new(RwLock::new(vec![peer(1), peer(2)]));
         let admission = InboundAdmission::new(realm_peers, []);
         admission.mark_materialized();
@@ -1009,6 +1007,22 @@ mod tests {
         assert!(admission.admits(peer(1), Alpn::DocumentSync));
         assert!(!admission.admits(peer(2), Alpn::DocumentSync));
         assert!(!admission.admits(peer(3), Alpn::DocumentSync));
+    }
+
+    #[test]
+    fn realm_serves_devices() {
+        // The other half of the pair: a realm node answers a device's fetch of
+        // the realm documents, which is how one that was offline catches up.
+        let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
+        let admission = InboundAdmission::new(realm_peers, []);
+        admission.mark_materialized();
+        admission.set_kinds(
+            Some(RealmNodeKind::Server),
+            BTreeMap::from([(peer(1), user_kind())]),
+        );
+
+        assert!(admission.admits(peer(1), Alpn::DocumentSync));
+        assert!(!admission.admits(peer(1), Alpn::Shard));
     }
 
     #[test]

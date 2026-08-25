@@ -962,7 +962,7 @@ impl Topology {
     }
 }
 
-async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNode> {
+pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNode> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open_test(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
     let net = NetHandle::new(
@@ -1320,7 +1320,7 @@ async fn reconcile_nodes(
 /// Flushes every node's document-sync outbox and pulls the realm-config topic,
 /// so an admin event converges on the next poll instead of waiting out the
 /// drain timer and a gossip round.
-async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
+pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
     // Concurrent for the same reason the reconcile pass is: both loops make
     // seconds-long network calls per node, and they share one poll's budget.
     join_all(nodes.iter().map(|node| {
@@ -1352,7 +1352,12 @@ async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
     .await;
 }
 
-async fn write(node: &TestNode, key_space: &str, key: Vec<u8>, value: Vec<u8>) -> TestResult<()> {
+pub async fn write(
+    node: &TestNode,
+    key_space: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> TestResult<()> {
     match node
         .context
         .storage_handle
@@ -1405,7 +1410,10 @@ async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option
     }
 }
 
-async fn read_realm_config(node: &TestNode, realm_id: RealmId) -> TestResult<RealmConfigDocument> {
+pub async fn read_realm_config(
+    node: &TestNode,
+    realm_id: RealmId,
+) -> TestResult<RealmConfigDocument> {
     match node
         .context
         .storage_handle

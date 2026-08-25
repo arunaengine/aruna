@@ -275,10 +275,14 @@ async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
     }
 }
 
-/// Re-arms both folder timers when this device binds any folder. A node that
-/// binds none is not a device that syncs, so nothing is scheduled there.
-pub async fn restore_sync_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
-    if outbox::has_rows(storage, aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE).await
+/// Re-arms the device timers. The folder pass is armed for a bound folder and
+/// on every device, because it is also the beat a device fetches the realm-wide
+/// documents on; a realm node with no folders schedules nothing.
+pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
+    let storage = &context.storage_handle;
+    let due = outbox::has_rows(storage, aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE).await
+        || local_is_device(context).await;
+    if due
         && let TaskEvent::Error { message, .. } = task_handle
             .schedule_timer_if_idle(TaskKey::ReconcileSyncedFolders, Duration::ZERO)
             .await
@@ -286,6 +290,14 @@ pub async fn restore_sync_timers(storage: &StorageHandle, task_handle: &TaskHand
         warn!(message = %message, "Failed to restore the synced-folder timer");
     }
     restore_upload_timer(storage, task_handle).await;
+}
+
+/// Whether this node is a user device, which decides who keeps the folder beat.
+async fn local_is_device(context: &Arc<DriverContext>) -> bool {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return false;
+    };
+    crate::replication::bao_read::local_is_user(context, *net_handle.realm_id()).await
 }
 
 #[cfg(test)]

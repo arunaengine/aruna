@@ -1205,6 +1205,15 @@ impl NetHandle {
             self.inner.node_id,
         );
         self.inner.inbound_admission.set_admitted(admitted);
+        // A device fetches the realm-wide documents itself; irokle admits it for
+        // those topics alone and for nothing else the realm holds.
+        self.inner.document_sync.set_device_peers(
+            document
+                .nodes
+                .iter()
+                .filter(|node| !node.kind.is_sync_eligible())
+                .filter_map(|node| NodeId::from_str(&node.node_id).ok()),
+        );
         // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
         let peers = unique_peer_nodes(
             document

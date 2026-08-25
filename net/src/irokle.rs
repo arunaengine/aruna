@@ -403,6 +403,21 @@ pub struct DocumentSyncService {
     // Flips true on the first realm-config-driven peer refresh, after which
     // `configured_peers` no longer grant admission.
     realm_config_materialized: Arc<AtomicBool>,
+    // User-kind nodes of the realm. They are admitted for the realm-wide
+    // documents only: a device fetches the shared configuration it is judged by
+    // and takes no part in any other topic.
+    device_peers: Arc<RwLock<BTreeSet<PeerId>>>,
+}
+
+/// The two documents every node of a realm holds, and the only ones a device
+/// exchanges: the realm configuration it is judged by and the realm's
+/// authorization document.
+fn realm_wide_topics(realm_id: RealmId) -> [irokle_crate::TopicId; 2] {
+    [
+        DocumentSyncTarget::RealmConfig { realm_id },
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+    ]
+    .map(|target| target.sync_topic_id(realm_id, &PlacementRef::NIL))
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -507,6 +522,7 @@ impl DocumentSyncService {
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
+            device_peers: Arc::new(RwLock::new(BTreeSet::new())),
         })
     }
 
@@ -986,9 +1002,11 @@ impl DocumentSyncService {
         let peer_id = node_id_to_peer_id(&peer);
         // The bootstrap peers admit only until realm config materializes; after
         // that the current sync-eligible set is the sole authority, so a removed
-        // startup peer fails here without a restart.
+        // startup peer fails here without a restart. A device is admitted too,
+        // bounded to the realm-wide topics by `device_topic_denied`.
         let bootstrap_window = !self.realm_config_materialized.load(Ordering::Acquire);
         let admitted = self.default_peers.read().contains(&peer_id)
+            || self.device_peers.read().contains(&peer_id)
             || (bootstrap_window && self.configured_peers.contains(&peer_id));
         if !admitted {
             return Err(NetError::AdmissionRejected(format!(
@@ -1000,6 +1018,38 @@ impl DocumentSyncService {
                 "document sync stream budget exhausted for peer {peer_id}"
             ))
         })
+    }
+
+    /// Publishes the realm's devices, which are admitted for the realm-wide
+    /// documents alone.
+    pub fn set_device_peers(&self, nodes: impl IntoIterator<Item = NodeId>) {
+        let peers = nodes
+            .into_iter()
+            .map(|node_id| node_id_to_peer_id(&node_id))
+            .filter(|peer| *peer != self.node.peer_id())
+            .collect();
+        *self.device_peers.write() = peers;
+    }
+
+    /// The first topic a device peer may not exchange, if any. A realm node
+    /// serves a device the shared realm documents and nothing else; every other
+    /// peer is unrestricted here and bounded by its own membership.
+    fn device_topic_denied(
+        &self,
+        peer: NodeId,
+        topics: &[irokle_crate::TopicId],
+    ) -> Option<irokle_crate::TopicId> {
+        let peer_id = node_id_to_peer_id(&peer);
+        if self.default_peers.read().contains(&peer_id)
+            || !self.device_peers.read().contains(&peer_id)
+        {
+            return None;
+        }
+        let allowed = realm_wide_topics(self.realm_id);
+        topics
+            .iter()
+            .copied()
+            .find(|topic| !allowed.contains(topic))
     }
 
     pub async fn handle_inbound_stream(
@@ -1019,6 +1069,11 @@ impl DocumentSyncService {
         )
         .await
         .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT))??;
+        if let Some(topic) = self.device_topic_denied(peer, &touched_topics) {
+            return Err(NetError::AdmissionRejected(format!(
+                "device {peer} may not sync topic {topic}"
+            )));
+        }
         let read_elapsed = stream_started.elapsed();
         let message_count = messages.len();
         let handle_started = Instant::now();
