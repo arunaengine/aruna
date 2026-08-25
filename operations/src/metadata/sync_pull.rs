@@ -13,9 +13,9 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BucketInfo, Permission, RemoteHead, SYNC_SOURCE_VERSION_TAG,
-    SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal, SyncVersionPage, VersionKey,
-    VersionedObjectArn, blob_object_permission_path,
+    AuthContext, BlobVersion, BlobVersionState, BucketInfo, Permission, RemoteHead,
+    SYNC_SOURCE_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal,
+    SyncVersionPage, VersionKey, VersionedObjectArn, blob_object_permission_path,
 };
 use aruna_core::types::{GroupId, NodeId};
 use tracing::debug;
@@ -398,13 +398,17 @@ async fn applied_version(context: &Arc<DriverContext>, request: &PullRequest) ->
             let Ok(version) = BlobVersion::from_bytes(value.as_ref()) else {
                 continue;
             };
+            // The same device version is published once and deleted once, and
+            // both carry its tag: only the kind that matches this request is a
+            // replay of it. Otherwise a delete of a file that was just uploaded
+            // would answer with the upload and leave the realm object live.
             if version
                 .metadata
                 .get(SYNC_SOURCE_VERSION_TAG)
                 .is_some_and(|tag| *tag == source)
+                && matches!(version.state, BlobVersionState::Deleted) == request.deleted
                 && let Ok(parsed) = VersionKey::from_bytes(key.as_ref())
             {
-                // A delete marker replays as the same no-op as a version.
                 return Some(parsed.version_id);
             }
         }
@@ -728,6 +732,48 @@ mod tests {
             )
             .await
             .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_follows_upload() {
+        // The same device version is uploaded and then deleted: the delete must
+        // not read the upload's own version as its replay, or the realm object
+        // would stay live after the owner removed the file.
+        let fixture = policy_fixture(None).await;
+        let request = pull_request(true);
+        let mut version = BlobVersion::materialized(
+            [4u8; 32],
+            aruna_core::structs::BackendRef::node_default(),
+            SystemTime::UNIX_EPOCH,
+            fixture.auth.user_id,
+            None,
+        );
+        version.metadata = HashMap::from([(
+            SYNC_SOURCE_VERSION_TAG.to_string(),
+            request.source.version.to_string(),
+        )]);
+        let key = VersionKey::new(
+            &request.target_bucket,
+            &request.target_key,
+            Ulid::from_bytes([6; 16]),
+        );
+        let _ = fixture
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: key.to_bytes().unwrap().into(),
+                value: version.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert_eq!(applied_version(&fixture.context, &request).await, None);
+        // The upload itself still replays as the version it produced.
+        assert_eq!(
+            applied_version(&fixture.context, &pull_request(false)).await,
+            Some(Ulid::from_bytes([6; 16]))
         );
     }
 
