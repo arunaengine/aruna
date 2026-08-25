@@ -1898,6 +1898,16 @@ impl MetadataHandle {
                 })
                 .await
             }
+            pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
+                Box::pin(async { super::sync_pull::serve_sync_pull(context, peer, pull).await })
+                    .await
+            }
+            listing @ MetadataTransportMessage::ForwardListVersions { .. } => {
+                Box::pin(async {
+                    super::sync_pull::serve_list_versions(context, peer, listing).await
+                })
+                .await
+            }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async { super::forward::apply_admin_relay(context, peer, forward).await })
                     .await
@@ -1940,9 +1950,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedAdminEventQueued
             | MetadataTransportMessage::ForwardedGroupCreated { .. }
             | MetadataTransportMessage::ForwardedGroupCreateConflict { .. }
-            | MetadataTransportMessage::ForwardSyncPull { .. }
             | MetadataTransportMessage::ForwardedSyncPull { .. }
-            | MetadataTransportMessage::ForwardListVersions { .. }
             | MetadataTransportMessage::ForwardedVersions { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())

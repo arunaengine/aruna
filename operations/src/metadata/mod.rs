@@ -17,6 +17,7 @@ mod search_cursor;
 mod search_enrichment;
 pub mod stats;
 mod summary_cache;
+pub mod sync_pull;
 pub mod timestamp_index;
 pub mod visibility_index;
 
