@@ -59,10 +59,7 @@ pub(crate) async fn write_guarded(
         WriteGuard::MatchesBase {
             fingerprint,
             blake3,
-        } => match verify_target(&target, fingerprint, blake3).await {
-            Ok(()) => rename_over(&spooled.path, &target),
-            Err(refusal) => Err(PlaceError::Refused(refusal)),
-        },
+        } => exchange_guarded(&spooled.path, &target, fingerprint, blake3).await,
     };
     finish_write(spooled, placed, |spooled| LocalFileEvent::Written {
         fingerprint: spooled.fingerprint.clone(),
@@ -235,9 +232,17 @@ async fn jailed_target(root: &str, relative: &str) -> Result<(PathBuf, PathBuf),
         return Err(escaped);
     };
     let parent = match candidate.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => root.join(parent),
-        _ => root.clone(),
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new(""),
     };
+    // Directories are created only once the deepest part that already exists is
+    // proved to be inside the root, so a link on the way out is never followed
+    // and never extended.
+    let anchor = jailed_ancestor(&root, parent).await?;
+    if !anchor.starts_with(&root) {
+        return Err(escaped);
+    }
+    let parent = root.join(parent);
     tokio::fs::create_dir_all(&parent)
         .await
         .map_err(|error| LocalFileEvent::Error {
@@ -251,8 +256,37 @@ async fn jailed_target(root: &str, relative: &str) -> Result<(PathBuf, PathBuf),
     if !parent.starts_with(&root) {
         return Err(escaped);
     }
-    let target = parent.join(name);
-    Ok((parent, target))
+    Ok((parent.clone(), parent.join(name)))
+}
+
+/// Resolves the deepest existing directory of `relative` under `root`, refusing
+/// a symlink anywhere along the way. Every component that does exist must be a
+/// real directory inside the root before anything is created.
+async fn jailed_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, LocalFileEvent> {
+    let escaped = LocalFileEvent::Refused {
+        reason: LocalFileRefusal::Escaped,
+    };
+    let mut anchor = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(escaped);
+        };
+        let next = anchor.join(part);
+        match tokio::fs::symlink_metadata(&next).await {
+            // A link component is refused rather than resolved: a write must
+            // never follow one, even one that stays inside the root.
+            Ok(metadata) if metadata.file_type().is_symlink() => return Err(escaped),
+            Ok(metadata) if metadata.is_dir() => anchor = next,
+            Ok(_) => return Err(escaped),
+            // The rest of the path does not exist yet, so the anchor is final.
+            Err(_) => break,
+        }
+    }
+    tokio::fs::canonicalize(&anchor)
+        .await
+        .map_err(|error| LocalFileEvent::Error {
+            message: error.to_string(),
+        })
 }
 
 /// Streams the incoming bytes into a temporary file in the directory the write
@@ -302,26 +336,80 @@ async fn write_temp(
     })
 }
 
-/// The second half of the replace rule: the target must still carry exactly the
-/// bytes the guard names, by weak fingerprint and by strong hash.
-async fn verify_target(
+/// The second half of the replace rule, without a window between the check and
+/// the write: the spool and the target swap places atomically, and the bytes
+/// that were displaced are identified afterwards. Only bytes that match the
+/// guard are discarded; anything else is put back, and if even that fails the
+/// owner's bytes are moved aside rather than lost.
+async fn exchange_guarded(
+    spool: &Path,
     target: &Path,
     fingerprint: &str,
     blake3: &[u8; 32],
-) -> Result<(), LocalFileRefusal> {
+) -> Result<(), PlaceError> {
     let Ok(link) = tokio::fs::symlink_metadata(target).await else {
-        return Err(LocalFileRefusal::Missing);
+        return Err(PlaceError::Refused(LocalFileRefusal::Missing));
     };
     if !link.is_file() {
-        return Err(LocalFileRefusal::NotRegular);
+        return Err(PlaceError::Refused(LocalFileRefusal::NotRegular));
     }
-    let Ok((current, hash, _)) = hash_stable(target).await else {
-        return Err(LocalFileRefusal::Drifted);
+    exchange(spool, target)?;
+    // The displaced file now sits at the spool path.
+    let displaced = match hash_stable(spool).await {
+        Ok((current, hash, _)) => current == fingerprint && &hash == blake3,
+        Err(_) => false,
     };
-    match current == fingerprint && &hash == blake3 {
-        true => Ok(()),
-        false => Err(LocalFileRefusal::Drifted),
+    if displaced {
+        let _ = tokio::fs::remove_file(spool).await;
+        return Ok(());
     }
+    match exchange(spool, target) {
+        Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
+        // The swap back failed, so the owner's bytes stay under a name of their
+        // own instead of being left where the incoming version belongs.
+        Err(_) => match rescue_displaced(spool, target).await {
+            Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+/// Swaps two existing paths in one step. Neither file is ever destroyed.
+fn exchange(left: &Path, right: &Path) -> Result<(), PlaceError> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        left,
+        rustix::fs::CWD,
+        right,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(|error| PlaceError::Failed(error.to_string()))
+}
+
+/// Puts bytes that could not be swapped back beside their own path, so a failed
+/// exchange still leaves them on the owner's disk under a findable name.
+async fn rescue_displaced(spool: &Path, target: &Path) -> Result<(), PlaceError> {
+    let Some(parent) = target.parent() else {
+        return Err(PlaceError::Failed(
+            "the target has no directory".to_string(),
+        ));
+    };
+    let relative = target.to_string_lossy().to_string();
+    let stamp = conflict_stamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis() as u64)
+            .unwrap_or_default(),
+    );
+    for attempt in 1..=MAX_COPY_ATTEMPTS {
+        let candidate = parent.join(copy_name(&relative, &stamp, attempt));
+        if place_new(spool, &candidate).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(PlaceError::Failed(
+        "the displaced file could not be put aside".to_string(),
+    ))
 }
 
 /// Hashes one file and refuses the result when the file changed while it was
@@ -379,10 +467,6 @@ fn link_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
         }
         Err(error) => Err(PlaceError::Failed(error.to_string())),
     }
-}
-
-fn rename_over(source: &Path, target: &Path) -> Result<(), PlaceError> {
-    std::fs::rename(source, target).map_err(|error| PlaceError::Failed(error.to_string()))
 }
 
 /// `2026-08-25 1032`, the stamp a conflicted copy is named after.
@@ -654,7 +738,21 @@ mod tests {
             write_guarded(&path, "away/out.txt", &WriteGuard::MustNotExist, body(b"x")).await,
             escaped
         );
+        // A link deeper in the path must not be extended either.
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("nested/away")).unwrap();
+        assert_eq!(
+            write_guarded(
+                &path,
+                "nested/away/deep/out.txt",
+                &WriteGuard::MustNotExist,
+                body(b"x")
+            )
+            .await,
+            escaped
+        );
         assert!(!outside.path().join("out.txt").exists());
+        assert!(!outside.path().join("deep").exists());
     }
 
     // The trash and the write spool are this node's bookkeeping, so a sweep
