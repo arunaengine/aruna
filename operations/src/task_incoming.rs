@@ -73,6 +73,10 @@ use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::device::drain::{
     DrainOutcome, INTAKE_CONTINUE_AFTER, INTAKE_DEFER_RETRY_AFTER, restore_intake_timer,
 };
+use crate::device::sync::{
+    RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
+    UPLOAD_DEFER_RETRY_AFTER, restore_sync_timers,
+};
 use crate::document_sync_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
     restore_document_sync_outbox_timers,
@@ -2514,6 +2518,7 @@ async fn durable_rearm_loop(
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_intake_timer(&context.storage_handle, &task_handle).await;
+        restore_sync_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2641,6 +2646,7 @@ impl TaskQueues {
         restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_intake_timer(&context.storage_handle, &task_handle).await;
+        restore_sync_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2830,6 +2836,26 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainJobWitnessQueue => {
                 self.drain_job_witness_queue().await;
+            }
+            TaskKey::ReconcileSyncedFolders => {
+                let after = match crate::device::sync::reconcile_folders(&self.context).await {
+                    DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
+                    DrainOutcome::More => RECONCILE_CONTINUE_AFTER,
+                    DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
+                };
+                self.reschedule_timer(TaskKey::ReconcileSyncedFolders, after)
+                    .await;
+            }
+            TaskKey::DrainSyncUploadOutbox => {
+                let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
+                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_RETRY_AFTER),
+                    DrainOutcome::More => Some(UPLOAD_CONTINUE_AFTER),
+                    DrainOutcome::Idle => None,
+                };
+                if let Some(after) = after {
+                    self.reschedule_timer(TaskKey::DrainSyncUploadOutbox, after)
+                        .await;
+                }
             }
             TaskKey::DrainDeviceIntake => {
                 let after = match crate::device::drain::drain_intake(&self.context).await {

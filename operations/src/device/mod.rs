@@ -8,4 +8,5 @@ pub mod enqueue_draft;
 pub mod inspect_draft;
 pub mod list_drafts;
 pub mod repository;
+pub mod sync;
 pub mod wipe;

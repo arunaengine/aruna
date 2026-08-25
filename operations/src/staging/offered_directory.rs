@@ -52,6 +52,18 @@ pub struct OfferDirectoryResult {
     pub files: usize,
     /// Observations tombstoned because their file is gone from the root.
     pub removed: usize,
+    /// Every file the walk saw, with the version that now names it. A synced
+    /// folder reconciles against exactly these observations.
+    pub observed: Vec<ObservedFile>,
+}
+
+/// One file as the sweep observed it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedFile {
+    pub relative: String,
+    pub fingerprint: String,
+    pub size: u64,
+    pub version_id: Ulid,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,8 +149,16 @@ pub async fn offer_directory(
     register_bucket(context, &input).await?;
 
     let scope = input.scope();
+    let mut observed = Vec::with_capacity(entries.len());
     for entry in &entries {
-        write_observation(context, &scope, entry).await?;
+        let version_id = write_observation(context, &scope, entry).await?;
+        let size = entry.size.unwrap_or_default();
+        observed.push(ObservedFile {
+            relative: entry.path.clone(),
+            fingerprint: aruna_core::structs::weak_fingerprint(size, entry.modified),
+            size,
+            version_id,
+        });
     }
     let offered = entries
         .iter()
@@ -150,6 +170,7 @@ pub async fn offer_directory(
         bucket: input.bucket,
         files: entries.len(),
         removed,
+        observed,
     })
 }
 
@@ -400,17 +421,17 @@ async fn write_observation(
     context: &DriverContext,
     scope: &ObservationScope,
     entry: &SourceEntry,
-) -> Result<(), OfferedDirectoryError> {
+) -> Result<Ulid, OfferedDirectoryError> {
     let binding = offered_binding(&scope.bucket, &entry.path, scope.node_id);
     let metadata = entry_metadata(entry);
     let txn_id = start_transaction(context).await?;
 
     let result = observe(context, scope, entry, &binding, &metadata, txn_id).await;
-    if result.is_err() {
+    let Ok(version_id) = result else {
         abort(context, txn_id).await;
         return result;
-    }
-    commit(context, txn_id).await
+    };
+    commit(context, txn_id).await.map(|()| version_id)
 }
 
 async fn observe(
@@ -420,7 +441,7 @@ async fn observe(
     binding: &VersionSourceBinding,
     metadata: &SourceMetadata,
     txn_id: TxnId,
-) -> Result<(), OfferedDirectoryError> {
+) -> Result<Ulid, OfferedDirectoryError> {
     let pointer = read_pointer(context, &input.bucket, &entry.path, txn_id).await?;
     let existing = match pointer.as_ref() {
         Some(pointer) => read_version(context, &input.bucket, &entry.path, pointer, txn_id).await?,
@@ -437,8 +458,9 @@ async fn observe(
     }) = existing.as_ref()
         && source == binding
         && cached_metadata.observation_fingerprint() == metadata.observation_fingerprint()
+        && let Some(pointer) = pointer.as_ref()
     {
-        return Ok(());
+        return Ok(pointer.version_id);
     }
 
     let version_id = Ulid::generate();
@@ -484,7 +506,7 @@ async fn observe(
     if !usage.is_noop() {
         run_usage_update(context, txn_id, &mut usage).await?;
     }
-    Ok(())
+    Ok(version_id)
 }
 
 /// Bytes a stored observation charges to its group.

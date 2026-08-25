@@ -193,6 +193,29 @@ pub struct SyncBase {
     pub remote_version_id: Option<Ulid>,
     pub synced_at_ms: u64,
     pub entry: EntryState,
+    /// What both sides looked like when the entry became pending, so a later
+    /// pass repeats neither the conflicted copy nor the report while the owner
+    /// has not answered.
+    pub pending_at: Option<PendingMark>,
+}
+
+/// The observation a pending entry was recorded against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingMark {
+    pub fingerprint: Option<String>,
+    pub remote_version: Option<Ulid>,
+}
+
+impl SyncBase {
+    /// Whether the entry is still waiting on the same facts it was reported
+    /// for. A changed file or a newer realm version reopens the decision.
+    pub fn holds_pending(&self, local: Option<&Observed>, remote: Option<&RemoteHead>) -> bool {
+        let Some(mark) = self.pending_at.as_ref() else {
+            return false;
+        };
+        mark.fingerprint.as_deref() == local.map(|local| local.fingerprint.as_str())
+            && mark.remote_version == remote.map(|remote| remote.version_id)
+    }
 }
 
 impl SyncBase {
@@ -564,6 +587,7 @@ mod tests {
             remote_version_id: remote,
             synced_at_ms: 1,
             entry: EntryState::InSync,
+            pending_at: None,
         }
     }
 
