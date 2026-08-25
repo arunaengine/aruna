@@ -56,8 +56,10 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
             if !upload.is_due(now) {
                 continue;
             }
-            due = true;
             let Some(folder) = load_folder(context, upload.folder_id).await else {
+                // The folder is unbound: this row is nobody's work any more, and
+                // leaving it would keep the drain awake for a folder that is gone.
+                drop_upload(context, &upload).await;
                 continue;
             };
             // An unbinding folder publishes nothing more; its rows are going.
@@ -68,6 +70,8 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
             if !claim_upload(context, &upload, attempts).await {
                 continue;
             }
+            // Only a row this pass really forwards keeps the drain running.
+            due = true;
             let source = match VersionedObjectArn::new(
                 realm_id,
                 node_id,
@@ -141,6 +145,22 @@ async fn forward_upload(
             .await;
         }
         Err(error) => retry(context, upload, error.to_string(), attempts).await,
+    }
+}
+
+/// Removes one upload row whose folder no longer exists.
+async fn drop_upload(context: &Arc<DriverContext>, upload: &SyncUpload) {
+    if !super::repository::delete_rows(
+        context,
+        vec![(
+            SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+            base_key(upload.folder_id, &upload.relative),
+        )],
+        None,
+    )
+    .await
+    {
+        warn!(relative = %upload.relative, "Failed to drop an orphaned upload row");
     }
 }
 
