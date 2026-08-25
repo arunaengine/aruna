@@ -11,7 +11,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::startup::pull_realm_documents;
+use aruna_operations::startup::{pull_realm_documents, refresh_device_members};
 
 use topology::{TestResult, Topology, read_realm_config, replicate_config, spawn_node, write};
 
@@ -56,20 +56,31 @@ async fn device_fetches_revocation() -> TestResult<()> {
         },
     )
     .await?;
-    let mut config = realm.config.clone();
-    config.ensure_node(
-        device.node_id(),
-        RealmNodeKind::User {
-            owner: realm.user_id,
-        },
-    );
+    let kind = RealmNodeKind::User {
+        owner: realm.user_id,
+    };
     for node in &realm.nodes {
         device.net.add_peer_addr(node.net.endpoint_addr()).await;
         node.net.add_peer_addr(device.net.endpoint_addr()).await;
-        // The realm nodes learn the device as a peer they may serve, and never
-        // write it into their own configuration: nothing pushes to it.
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        // The realm learns the device from its own materialized configuration,
+        // which already carries the revocation the device has never seen.
+        let mut known = read_realm_config(node, realm_id).await?;
+        known.ensure_node(device.node_id(), kind.clone());
+        write(
+            node,
+            aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            known.to_bytes(&realm.actor(node))?,
+        )
+        .await?;
+        node.net.refresh_realm_peers_from_document(&known).await?;
+        // Membership of the realm-wide topics is what lets a device fetch them.
+        refresh_device_members(&node.context, realm_id, node.node_id()).await;
     }
+    // The device comes back with the configuration as it was before the
+    // revocation: exactly what a device that was closed knows.
+    let mut config = realm.config.clone();
+    config.ensure_node(device.node_id(), kind);
     let actor = Actor {
         node_id: device.node_id(),
         user_id: realm.user_id,

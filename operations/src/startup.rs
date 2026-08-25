@@ -861,6 +861,7 @@ pub async fn restore_shard_subscriptions(
         summary.shared_topics = pass.summary.shared_topics;
         summary.withheld_topics += pass.summary.withheld_topics;
         if pass.wrapped {
+            refresh_device_members(context, realm_id, node_id).await;
             return summary;
         }
     }
@@ -1632,6 +1633,41 @@ async fn project_restored_metadata_create_events(
     }
     if let Err(error) = project_metadata_create_events_from_log(context, pairs).await {
         warn!(error = ?error, "Failed to project restored metadata create events from log");
+    }
+}
+
+/// Admits the realm's devices to the realm-wide topics on this node, so a
+/// device may fetch them. It adds membership only: a device never joins a peer
+/// set the realm's own recovery probes or syncs.
+pub async fn refresh_device_members(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: NodeId,
+) {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return;
+    };
+    let RealmConfigLoad::Found(config) = load_realm_config(context, realm_id).await else {
+        return;
+    };
+    let devices = realm_device_peers(&config, node_id);
+    if devices.is_empty() {
+        return;
+    }
+    // Only topics this node already holds: minting one from here would fork it.
+    let topics: Vec<::irokle::TopicId> = realm_wide_topics(realm_id)
+        .into_iter()
+        .filter(|topic| {
+            net_handle
+                .document_sync_topic_exists(*topic)
+                .unwrap_or(false)
+        })
+        .collect();
+    if topics.is_empty() {
+        return;
+    }
+    if let Err(error) = net_handle.ensure_document_sync_topics(&topics, devices) {
+        warn!(error = %error, "Failed to admit the realm's devices to the shared topics");
     }
 }
 

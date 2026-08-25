@@ -2806,6 +2806,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 {
                     warn!(error = %error, "Placement subject reconcile failed");
                 }
+                // A device that enrolled since the last pass becomes a member of
+                // the realm-wide topics here, which is what lets it fetch them.
+                crate::startup::refresh_device_members(&self.context, realm_id, node_id).await;
                 let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
                 match outcome.status {
                     PlacementReconcileStatus::Clean => self.reset_backoff(&key),
