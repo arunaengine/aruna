@@ -83,6 +83,10 @@ pub struct SourceEntry {
     pub kind: SourceEntryKind,
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
+    /// Full stat facts, for a source that has them. A listing and a later stat
+    /// of the same file must derive one identity, so the local lister fills
+    /// this in and every other source leaves it absent.
+    pub stat: Option<crate::structs::FileStat>,
 }
 
 #[cfg(test)]

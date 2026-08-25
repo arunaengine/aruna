@@ -9,7 +9,7 @@
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{SYNC_TRASH_DIR, WriteGuard, weak_fingerprint};
+use aruna_core::structs::{FileStat, SYNC_TRASH_DIR, WriteGuard, weak_fingerprint};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::{Component, Path, PathBuf};
@@ -375,7 +375,7 @@ async fn write_temp(
         .map_err(|error| error.to_string())?;
     Ok(Spooled {
         path: path.to_path_buf(),
-        fingerprint: weak_fingerprint(metadata.len(), metadata.modified().ok()),
+        fingerprint: weak_fingerprint(&FileStat::from_metadata(&metadata)),
         blake3: *hasher.finalize().as_bytes(),
         size,
     })
@@ -461,7 +461,7 @@ async fn rescue_displaced(spool: &Path, target: &Path) -> Result<(), PlaceError>
 /// read: those bytes are not one representation of anything.
 async fn hash_stable(path: &Path) -> Result<(String, [u8; 32], u64), StagingSourceError> {
     let before = tokio::fs::metadata(path).await.map_err(map_io_error)?;
-    let fingerprint = weak_fingerprint(before.len(), before.modified().ok());
+    let fingerprint = weak_fingerprint(&FileStat::from_metadata(&before));
     let mut file = tokio::fs::File::open(path).await.map_err(map_io_error)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 256 * 1024];
@@ -475,7 +475,7 @@ async fn hash_stable(path: &Path) -> Result<(String, [u8; 32], u64), StagingSour
         hasher.update(&buffer[..read]);
     }
     let after = tokio::fs::metadata(path).await.map_err(map_io_error)?;
-    if weak_fingerprint(after.len(), after.modified().ok()) != fingerprint {
+    if weak_fingerprint(&FileStat::from_metadata(&after)) != fingerprint {
         return Err(StagingSourceError::SourceUnstable);
     }
     Ok((fingerprint, *hasher.finalize().as_bytes(), before.len()))

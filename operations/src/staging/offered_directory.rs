@@ -156,7 +156,7 @@ pub async fn offer_directory(
         let size = entry.size.unwrap_or_default();
         observed.push(ObservedFile {
             relative: entry.path.clone(),
-            fingerprint: aruna_core::structs::weak_fingerprint(size, entry.modified),
+            fingerprint: entry_fingerprint(entry),
             size,
             modified_at_ms: entry.modified.and_then(millis_since_epoch),
             version_id,
@@ -295,12 +295,22 @@ fn millis_since_epoch(time: SystemTime) -> Option<u64> {
         .and_then(|since| u64::try_from(since.as_millis()).ok())
 }
 
+/// The weak identity one listed file carries. A source that reports the full
+/// stat is fingerprinted by it; one that reports only size and mtime produces
+/// an incomplete fingerprint, which never stands in for reading the bytes.
+fn entry_fingerprint(entry: &SourceEntry) -> String {
+    let stat = entry.stat.unwrap_or_else(|| {
+        aruna_core::structs::FileStat::partial(entry.size.unwrap_or_default(), entry.modified)
+    });
+    aruna_core::structs::weak_fingerprint(&stat)
+}
+
 fn entry_metadata(entry: &SourceEntry) -> SourceMetadata {
     let size = entry.size.unwrap_or_default();
     SourceMetadata {
         content_length: size,
         content_type: None,
-        etag: Some(aruna_core::structs::weak_fingerprint(size, entry.modified)),
+        etag: Some(entry_fingerprint(entry)),
         last_modified: entry.modified,
         source_version: None,
     }

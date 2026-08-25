@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
-    SyncedFolder, WriteGuard, decide,
+    SyncedFolder, WriteGuard, decide, fingerprint_complete,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -156,12 +156,14 @@ impl ReconcileFolderOperation {
             let base = self.bases.get(index).cloned().flatten();
             let remote = self.input.remote.get(relative).cloned();
             let mut local = self.input.local.get(relative).cloned();
-            // A file whose weak fingerprint still equals the base carries the
+            // A file whose complete stat still equals the base carries the
             // base's strong hash; the adapter re-verifies both before it writes.
+            // An incomplete fingerprint proves nothing and was hashed instead.
             if let (Some(local), Some(synced)) = (
                 local.as_mut(),
                 base.as_ref().and_then(|base| base.synced.as_ref()),
             ) && local.fingerprint == synced.fingerprint
+                && fingerprint_complete(&local.fingerprint)
             {
                 local.blake3 = Some(synced.blake3);
             }
@@ -631,8 +633,9 @@ impl Operation for ReconcileFolderOperation {
 }
 
 impl ReconcileFolderOperation {
-    /// Paths whose weak fingerprint already says the file moved. Only those
-    /// need a strong hash; the batch is bounded so one pass stays short.
+    /// Paths the recorded stat no longer vouches for: it moved, it was never
+    /// recorded, or the filesystem could not answer for it. Only those need a
+    /// strong hash; the batch is bounded so one pass stays short.
     fn hash_batch(&self) -> Vec<usize> {
         self.paths
             .iter()
@@ -641,6 +644,9 @@ impl ReconcileFolderOperation {
                 let Some(local) = self.input.local.get(*relative) else {
                     return false;
                 };
+                if !fingerprint_complete(&local.fingerprint) {
+                    return true;
+                }
                 self.bases
                     .get(*index)
                     .and_then(Option::as_ref)
@@ -792,7 +798,7 @@ mod tests {
             let event = match effect {
                 Effect::LocalFile(LocalFileEffect::Hash { .. }) => {
                     Event::LocalFile(LocalFileEvent::Hashed {
-                        fingerprint: "5-2".to_string(),
+                        fingerprint: "5-2-2-2".to_string(),
                         blake3: [5u8; 32],
                         size: 5,
                     })
@@ -825,7 +831,7 @@ mod tests {
     #[test]
     fn rejects_wrong_event() {
         // An event the state cannot explain must fail loudly, not be ignored.
-        let (mut operation, _) = operation(Some(observed("5-1")), None, None);
+        let (mut operation, _) = operation(Some(observed("5-1-1-1")), None, None);
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([2u8; 16]),
@@ -843,8 +849,8 @@ mod tests {
         // version is only ever added beside them.
         let version = Ulid::from_bytes([3u8; 16]);
         let (operation, base) = operation(
-            Some(observed("5-2")),
-            Some(base("5-1", Some(Ulid::from_bytes([4u8; 16])))),
+            Some(observed("5-2-2-2")),
+            Some(base("5-1-1-1", Some(Ulid::from_bytes([4u8; 16])))),
             Some(head(version, false)),
         );
         let plan = run(operation, base);
@@ -859,8 +865,8 @@ mod tests {
         // A realm deletion never plans a write on the owner's disk.
         let version = Ulid::from_bytes([4u8; 16]);
         let (operation, base) = operation(
-            Some(observed("5-1")),
-            Some(base("5-1", Some(version))),
+            Some(observed("5-1-1-1")),
+            Some(base("5-1-1-1", Some(version))),
             Some(head(Ulid::from_bytes([5u8; 16]), true)),
         );
         let plan = run(operation, base);
@@ -870,11 +876,34 @@ mod tests {
     }
 
     #[test]
+    fn hashes_partial_fingerprint() {
+        // A stat the filesystem could not fill in proves nothing, so the file is
+        // read instead of being assumed to still carry the recorded bytes.
+        let (mut operation, base) = operation(
+            Some(observed("5-1")),
+            Some(base("5-1", Some(Ulid::from_bytes([4u8; 16])))),
+            Some(head(Ulid::from_bytes([5u8; 16]), false)),
+        );
+        operation.start();
+        let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (ByteView::from(vec![0u8]), value),
+                (ByteView::from(vec![1u8]), None),
+            ],
+        }));
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::LocalFile(LocalFileEffect::Hash { .. }))
+        ));
+    }
+
+    #[test]
     fn guards_unchanged_replace() {
         // The one automatic overwrite carries the base it was decided on.
         let (operation, base) = operation(
-            Some(observed("5-1")),
-            Some(base("5-1", Some(Ulid::from_bytes([4u8; 16])))),
+            Some(observed("5-1-1-1")),
+            Some(base("5-1-1-1", Some(Ulid::from_bytes([4u8; 16])))),
             Some(head(Ulid::from_bytes([5u8; 16]), false)),
         );
         let plan = run(operation, base);

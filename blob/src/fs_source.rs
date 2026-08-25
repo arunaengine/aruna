@@ -12,7 +12,7 @@
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind, SourceEntry,
+    FileStat, OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind, SourceEntry,
     SourceEntryKind, SourceMetadata, weak_fingerprint,
 };
 use bytes::Bytes;
@@ -64,14 +64,14 @@ pub(crate) async fn stable_source(
     let (root, path) = access_parts(access)?;
     let resolved = jailed_file(&root, &path).await?;
     let metadata = tokio::fs::metadata(&resolved).await.map_err(map_io_error)?;
-    let fingerprint = weak_fingerprint(metadata.len(), metadata.modified().ok());
+    let fingerprint = weak_fingerprint(&FileStat::from_metadata(&metadata));
     Ok((resolved, fingerprint))
 }
 
 /// The weak fingerprint one already-resolved file carries now.
 pub(crate) async fn current_fingerprint(path: &Path) -> Option<String> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
-    Some(weak_fingerprint(metadata.len(), metadata.modified().ok()))
+    Some(weak_fingerprint(&FileStat::from_metadata(&metadata)))
 }
 
 pub(crate) async fn head_local(
@@ -153,6 +153,9 @@ pub(crate) async fn list_local(
                 kind,
                 size: (kind == SourceEntryKind::File).then_some(metadata.len()),
                 modified: metadata.modified().ok(),
+                // The listing carries the same stat the serve path reads, so an
+                // observation and a later read agree on one identity.
+                stat: Some(FileStat::from_metadata(&metadata)),
             });
         }
     }
@@ -168,7 +171,7 @@ pub(crate) async fn read_local(
     let resolved = jailed_file(&root, &path).await?;
     let before = tokio::fs::metadata(&resolved).await.map_err(map_io_error)?;
     let metadata = file_metadata(&before);
-    let fingerprint = weak_fingerprint(before.len(), before.modified().ok());
+    let fingerprint = weak_fingerprint(&FileStat::from_metadata(&before));
 
     let mut file = tokio::fs::File::open(&resolved)
         .await
@@ -202,7 +205,7 @@ async fn verify_stable(path: PathBuf, fingerprint: String) -> Result<(), StreamE
     let after = tokio::fs::metadata(&path)
         .await
         .map_err(|error| StreamError(Box::new(error)))?;
-    if weak_fingerprint(after.len(), after.modified().ok()) == fingerprint {
+    if weak_fingerprint(&FileStat::from_metadata(&after)) == fingerprint {
         return Ok(());
     }
     Err(StreamError(Box::new(StagingSourceError::SourceUnstable)))
@@ -270,7 +273,7 @@ fn file_metadata(metadata: &std::fs::Metadata) -> SourceMetadata {
     SourceMetadata {
         content_length: metadata.len(),
         content_type: None,
-        etag: Some(weak_fingerprint(metadata.len(), modified)),
+        etag: Some(weak_fingerprint(&FileStat::from_metadata(metadata))),
         last_modified: modified,
         source_version: None,
     }
