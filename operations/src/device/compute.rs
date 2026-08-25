@@ -1,36 +1,29 @@
 //! Owner-initiated local execution on a user device.
 //!
 //! The device runs its owner's jobs against device-local data and nothing else.
-//! The realm never dispatches here, no record of a local run is forwarded or
-//! replicated, and outputs stay in the node-local workspace bucket until the
-//! owner publishes them. A realm input is copied onto the device first, as an
-//! ordinary local object and never as a reference to the realm version.
+//! The realm never dispatches here and no record of a local run is forwarded or
+//! replicated. An input the device does not hold must name the realm version
+//! that holds it, which staging then materializes in the run's own workspace as
+//! an ordinary local object, never as a reference.
 
 use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::structs::{
-    AuthContext, BucketInfo, ExecutionSpec, InputMode, InputSource, JobPayload, JobState,
-    RealmConfigDocument, VersionedObjectArn, WorkspaceMode,
+    ExecutionSpec, InputMode, InputSource, JobPayload, JobState, WorkspaceMode,
 };
-use aruna_core::types::{GroupId, NodeId, UserId};
-use std::time::SystemTime;
+use aruna_core::types::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive, routing_snapshot};
+use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{list_owned_jobs, submit_execution_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::api::load_realm_config;
 use crate::mutate_realm_placement::node_kind;
 use crate::node_info::read_operator_drain;
-use crate::replication::bao_read::{BaoReadOutput, managed_read};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
-use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 
-/// Runs one scan of the owner's job index reports on. A device queues its
-/// owner's work, not a realm's, so this bounds the count rather than paging it.
+/// Unfinished runs one status scan counts before it stops. A device queues its
+/// owner's work, not a realm's, so the count is bounded instead of paged.
 const MAX_RUN_SCAN: usize = 64;
 
 /// One owner-initiated run of the local executor.
@@ -58,20 +51,11 @@ pub enum LocalExecutionError {
     NoExecutor,
     #[error("this device does not run the request: {0}")]
     Unsupported(&'static str),
-    #[error("this device already runs {limit} jobs")]
-    AtCapacity { limit: u32 },
     #[error("input {bucket}/{key} is not on this device")]
     InputNotLocal { bucket: String, key: String },
     /// The request itself asks for a copy this device may never make.
     #[error("input {bucket}/{key} cannot be copied onto this device: {reason}")]
     InputRefused {
-        bucket: String,
-        key: String,
-        reason: String,
-    },
-    /// The copy did not complete, and a later attempt still might.
-    #[error("input {bucket}/{key} could not be copied onto this device: {reason}")]
-    InputCopy {
         bucket: String,
         key: String,
         reason: String,
@@ -84,10 +68,9 @@ pub enum LocalExecutionError {
 
 /// Accepts one local run on behalf of the device owner.
 ///
-/// Every refusal is decided before the job exists: the caller is the enrolled
-/// owner, the plane is not paused, the request needs nothing but file staging,
-/// the device is below its configured concurrency, and every input either sits
-/// on this device or was copied onto it here.
+/// Every refusal it can decide is decided before the job exists; the run
+/// ceiling is counted by the admitting transaction, so two concurrent
+/// submissions cannot both pass it.
 pub async fn submit_local_execution(
     context: &DriverContext,
     mut config: LocalExecutionConfig,
@@ -109,13 +92,8 @@ pub async fn submit_local_execution(
     }
     local_staging(&config.spec, config.workspace_mode)?;
     let limits = backend_limits(context, config.spec.executor_constraint.as_deref())?;
-    if let Some(limit) = limits.max_concurrent {
-        let runs = count_runs(context, config.owner).await?;
-        if runs.active() >= limit {
-            return Err(LocalExecutionError::AtCapacity { limit });
-        }
-    }
-    resolve_inputs(context, &mut config, &realm).await?;
+    resolve_inputs(context, &config).await?;
+    pin_outputs(&mut config.spec, config.node_id);
     submit_execution_job(
         context,
         config.spec,
@@ -125,9 +103,19 @@ pub async fn submit_local_execution(
         config.workspace_mode,
         None,
         config.retention_ms,
+        limits.max_concurrent,
     )
     .await
     .map_err(LocalExecutionError::Submit)
+}
+
+/// Pins every declared output to this device, the only node that will ever
+/// write them. A workspace output is pinned by the run itself once its bucket
+/// exists.
+fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
+    for output in &mut spec.file_outputs {
+        output.destination_node_id = Some(node_id);
+    }
 }
 
 /// This device's compute plane as the owner's tools see it.
@@ -148,10 +136,8 @@ pub struct ComputeStatus {
 
 /// Reports the local compute plane and the owner's runs on it.
 ///
-/// The counters come from the durable job records rather than the in-process
-/// jobs runtime, which counts every job class on the node and starts empty
-/// after a restart. They are bounded by one scan, so a device holding more
-/// unfinished runs than that reports the bound.
+/// The counters come from the durable job records, so they survive a restart,
+/// and stop at [`MAX_RUN_SCAN`] unfinished runs.
 pub async fn compute_status(
     context: &DriverContext,
     owner: UserId,
@@ -197,16 +183,8 @@ struct LocalRuns {
     queued: u32,
 }
 
-impl LocalRuns {
-    fn active(&self) -> u32 {
-        self.running + self.queued
-    }
-}
-
-/// Only file staging into the run's own workspace happens on a device: mounted
-/// inputs and Direct-S3 both hand the container an S3 endpoint a device does not
-/// expose, and a local run's outputs stay in `ws-<jobid>` until the owner
-/// publishes them.
+/// Only file staging into the run's own workspace happens on a device: the
+/// other modes hand the container an S3 endpoint a device does not expose.
 fn local_staging(spec: &ExecutionSpec, mode: WorkspaceMode) -> Result<(), LocalExecutionError> {
     match mode {
         WorkspaceMode::None => {
@@ -269,75 +247,63 @@ async fn count_runs(
     })
 }
 
-/// Makes every declared input readable on this device.
-///
-/// An input naming another node is a realm object: its exact version is copied
-/// here and the selection is rewritten to that local copy, so the run reads
-/// device-local bytes and no reference to the realm version is ever created.
+/// Refuses at submit time what staging could only discover mid-run: an input
+/// naming another node is fetched by exact version, anything else must already
+/// be readable here.
 async fn resolve_inputs(
     context: &DriverContext,
-    config: &mut LocalExecutionConfig,
-    realm: &RealmConfigDocument,
+    config: &LocalExecutionConfig,
 ) -> Result<(), LocalExecutionError> {
-    let group_id = config.spec.group_id;
-    let quota_ceiling = realm.quota.effective_group_ceiling(&group_id);
-    for index in 0..config.spec.inputs.len() {
-        let input = &config.spec.inputs[index];
+    for input in &config.spec.inputs {
         let InputSource::S3 {
             bucket,
             key,
             version_id,
         } = &input.source;
-        let (bucket, key, version_id) = (bucket.clone(), key.clone(), version_id.clone());
         match input
             .source_node_id
             .filter(|source| *source != config.node_id)
         {
-            Some(source) => {
-                let copied = copy_input(
-                    context,
-                    config,
-                    CopyInput {
-                        source,
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        version_id,
-                        group_id,
-                        quota_ceiling,
-                    },
-                )
-                .await?;
-                let input = &mut config.spec.inputs[index];
-                input.source = InputSource::S3 {
-                    bucket,
-                    key,
-                    version_id: Some(copied.to_string()),
-                };
-                input.source_node_id = None;
-            }
-            None => resolve_local(context, &bucket, &key, version_id.as_deref()).await?,
+            Some(_) => remote_version(bucket, key, version_id.as_deref())?,
+            None => resolve_local(context, bucket, key, version_id.as_deref()).await?,
         }
     }
     Ok(())
 }
 
-/// Refuses at submit time what staging could only discover mid-run.
+/// A realm input is fetched by exact version or not at all: a device plans
+/// nothing, so the request is the only thing that can name the version.
+fn remote_version(
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<(), LocalExecutionError> {
+    let refuse = |reason: &str| LocalExecutionError::InputRefused {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        reason: reason.to_string(),
+    };
+    match version_id.map(Ulid::from_string) {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(_)) => Err(refuse("the version is not a version id")),
+        None => Err(refuse("a realm input needs an exact version")),
+    }
+}
+
 async fn resolve_local(
     context: &DriverContext,
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
 ) -> Result<(), LocalExecutionError> {
-    let version_id = version_id.map(Ulid::from_string).transpose().map_err(|_| {
-        LocalExecutionError::InputNotLocal {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-        }
-    })?;
-    let missing = LocalExecutionError::InputNotLocal {
+    let missing = || LocalExecutionError::InputNotLocal {
         bucket: bucket.to_string(),
         key: key.to_string(),
     };
+    let version_id = version_id
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| missing())?;
     match drive(
         HeadObjectOperation::new(HeadObjectInput {
             bucket: bucket.to_string(),
@@ -355,156 +321,8 @@ async fn resolve_local(
             HeadObjectError::NoSuchKey
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
-        ) => Err(missing),
+        ) => Err(missing()),
         Err(error) => Err(LocalExecutionError::Unavailable(error.to_string())),
-    }
-}
-
-struct CopyInput {
-    source: NodeId,
-    bucket: String,
-    key: String,
-    version_id: Option<String>,
-    group_id: GroupId,
-    quota_ceiling: Option<u64>,
-}
-
-/// Copies one exact realm version onto this device and returns the local
-/// version it created. The bytes are read with the owner's own authorization
-/// and written through the ordinary local write path, so the copy is an
-/// ordinary device-local object that the realm neither owns nor tracks.
-async fn copy_input(
-    context: &DriverContext,
-    config: &LocalExecutionConfig,
-    input: CopyInput,
-) -> Result<Ulid, LocalExecutionError> {
-    let refuse = |reason: String| LocalExecutionError::InputCopy {
-        bucket: input.bucket.clone(),
-        key: input.key.clone(),
-        reason,
-    };
-    let asked = |reason: &str| LocalExecutionError::InputRefused {
-        bucket: input.bucket.clone(),
-        key: input.key.clone(),
-        reason: reason.to_string(),
-    };
-    let version = input
-        .version_id
-        .as_deref()
-        .map(Ulid::from_string)
-        .transpose()
-        .map_err(|_| asked("the version is not a version id"))?
-        .ok_or_else(|| asked("a realm input needs an exact version"))?;
-    let realm_id = config.owner.realm_id;
-    let request = BaoReadRequest {
-        auth_context: AuthContext {
-            user_id: config.owner,
-            realm_id,
-            path_restrictions: None,
-        },
-        realm_id,
-        target: BaoReadTarget::ExactVersion(VersionedObjectArn {
-            realm_id,
-            node_id: input.source,
-            bucket: input.bucket.clone(),
-            key: input.key.clone(),
-            version,
-        }),
-        expected_blake3: None,
-        metadata_only: false,
-        // A device is never a managed-copy destination; the read is the
-        // owner-bound device read, which refuses governed content outright.
-        destination: None,
-        known_refs: Vec::new(),
-    };
-    let (blob, size) = match managed_read(context, input.source, request).await {
-        Ok(BaoReadOutput::Stream { blob, size, .. }) => (blob, size),
-        Ok(BaoReadOutput::Metadata { .. }) => {
-            return Err(refuse("the holder returned no bytes".to_string()));
-        }
-        Err(error) => return Err(refuse(error.to_string())),
-    };
-    claim_bucket(context, config, &input).await?;
-    let routing = routing_snapshot(context, input.group_id, &input.bucket)
-        .await
-        .map_err(|error| refuse(error.to_string()))?;
-    let result = drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: config.owner,
-            group_id: input.group_id,
-            realm_id,
-            node_id: config.node_id,
-            request: PutObjectInput {
-                bucket: input.bucket.clone(),
-                key: input.key.clone(),
-                content_length: Some(size),
-                body: Some(blob),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: None,
-            quota_ceiling: input.quota_ceiling,
-            routing,
-        }),
-        context,
-    )
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| refuse(error.to_string()))?
-    .ok_or_else(|| refuse("the copy did not finish".to_string()))?;
-    Ok(result.version_id)
-}
-
-/// The device-local bucket the copy lands in: the source name under the
-/// execution's own group. A name another group already holds is refused rather
-/// than written into.
-async fn claim_bucket(
-    context: &DriverContext,
-    config: &LocalExecutionConfig,
-    input: &CopyInput,
-) -> Result<(), LocalExecutionError> {
-    let refuse = |reason: String| LocalExecutionError::InputCopy {
-        bucket: input.bucket.clone(),
-        key: input.key.clone(),
-        reason,
-    };
-    match drive(GetBucketInfoOperation::new(input.bucket.clone()), context)
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| refuse(error.to_string()))?
-    {
-        Some(existing) if existing.group_id == input.group_id => return Ok(()),
-        Some(_) => {
-            return Err(LocalExecutionError::InputRefused {
-                bucket: input.bucket.clone(),
-                key: input.key.clone(),
-                reason: "a local bucket of that name is another group's".to_string(),
-            });
-        }
-        None => {}
-    }
-    match drive(
-        CreateBucketOperation::new(
-            input.bucket.clone(),
-            BucketInfo {
-                group_id: input.group_id,
-                created_at: SystemTime::now(),
-                created_by: config.owner,
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-            },
-        ),
-        context,
-    )
-    .await
-    .and_then(|result| result.transpose())
-    {
-        Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => Ok(()),
-        Err(error) => Err(refuse(error.to_string())),
     }
 }
 
@@ -517,8 +335,13 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::LaunchDecline;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
-    use aruna_core::structs::{Actor, InputSelection, NodeUrls, RealmId, RealmNodeKind};
+    use aruna_core::keyspaces::{
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        Actor, InputSelection, NodeUrls, OutputDestination, OutputSelection, RealmConfigDocument,
+        RealmId, RealmNodeKind,
+    };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
@@ -799,13 +622,14 @@ mod tests {
         assert_eq!(records[0].created_by, caller);
         assert_eq!(rows(&ctx, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await, 0);
         assert_eq!(rows(&ctx, JOB_FAMILY_RECORD_KEYSPACE).await, 0);
+        assert_eq!(rows(&ctx, JOB_FAMILY_OUTBOX_KEYSPACE).await, 0);
 
         let error = submit_local_execution(&ctx, run_config(local, caller))
             .await
             .expect_err("the second run exceeds the device ceiling");
         assert!(matches!(
             error,
-            LocalExecutionError::AtCapacity { limit } if limit == 1
+            LocalExecutionError::Submit(SubmitJobError::ActiveJobLimit { limit }) if limit == 1
         ));
     }
 
@@ -843,15 +667,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pins_output_destination() {
+        // A declared output with no endpoint fails capture mid-run, so the
+        // device names itself as the writer before the job exists.
+        let dir = tempdir().unwrap();
+        let ctx = device_ctx(dir.path().to_str().unwrap());
+        let local = node(1);
+        let caller = owner(2);
+        let config = realm_config(local, RealmNodeKind::User { owner: caller });
+        write_config(&ctx, &config, local).await;
+        let mut run = run_config(local, caller);
+        run.spec.file_outputs.push(OutputSelection {
+            container_path: "/out/report.txt".to_string(),
+            path_prefix: None,
+            destination_node_id: None,
+            destination: OutputDestination::S3 {
+                bucket: "results".to_string(),
+                key: "report.txt".to_string(),
+            },
+            name: None,
+            description: None,
+        });
+
+        submit_local_execution(&ctx, run)
+            .await
+            .expect("the owner's run is accepted");
+
+        let (records, _) = list_owned_jobs(&ctx, caller, None, 8, |_| true)
+            .await
+            .unwrap();
+        let JobPayload::Execution(spec) = &records[0].payload else {
+            panic!("expected an execution payload");
+        };
+        assert_eq!(spec.file_outputs[0].destination_node_id, Some(local));
+    }
+
+    #[tokio::test]
     async fn refuses_missing_input() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let local = node(1);
-        let realm = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         let mut config = run_config(local, owner(2));
         config.spec.inputs.push(input("project", None, None));
 
-        let error = resolve_inputs(&ctx, &mut config, &realm)
+        let error = resolve_inputs(&ctx, &config)
             .await
             .expect_err("an input the device does not hold is refused");
 
@@ -867,14 +726,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let local = node(1);
-        let realm = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         let mut config = run_config(local, owner(2));
         config
             .spec
             .inputs
             .push(input("project", Some(node(4)), None));
 
-        let error = resolve_inputs(&ctx, &mut config, &realm)
+        let error = resolve_inputs(&ctx, &config)
             .await
             .expect_err("a realm input without a version is refused");
 

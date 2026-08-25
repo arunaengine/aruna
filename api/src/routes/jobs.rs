@@ -608,7 +608,7 @@ pub(crate) fn map_submit_error(
             format!("idempotency key already bound to job {existing_job_id}"),
         ),
         SubmitJobError::ActiveJobLimit { limit } => {
-            ServerError::Conflict(format!("active RO-Crate job limit of {limit} reached"))
+            ServerError::Conflict(format!("active job limit of {limit} reached"))
         }
         SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
         SubmitJobError::TooManyOutputs { limit } => {
@@ -901,16 +901,17 @@ on that bucket and that it belongs to the same group.
   else with a 403. Nothing about it is forwarded, replicated or offered to the realm, and the
   response carries no `submission_id`: a local run belongs to no submission family.
 - Inputs must be readable on the device. An input naming `source_node_id` and `version_id` is a
-  realm object: that exact version is copied into a device-local bucket of the same name under the
-  execution's group before the run, as an ordinary local object and never as a reference. Any other
-  input that this device does not hold is a 400 naming it.
+  realm object: staging fetches that exact version into the run's own workspace bucket, as an
+  ordinary local object and never as a reference, so an unreachable holder fails the run rather
+  than the submission. Any other input this device does not hold is a 400 naming it.
 - Outputs stay in the node-local workspace bucket until the owner publishes them, and the run is
   listed by this device's own `GET /jobs/`.
 - Mounted inputs and `workspace.mode` `none` are refused, because a device stages files and exposes
   no S3 endpoint a container could reach, and so is `workspace.mode` `existing`, because a local
   run's outputs stay in its own workspace bucket.
-- A paused compute plane, a device without a compute backend, and a device already running as many
-  jobs as its configured ceiling all answer 409.
+- A paused compute plane, a device without a compute backend, and a device that already holds as
+  many unfinished jobs as `ARUNA_COMPUTE_MAX_CONCURRENT` all answer 409; the ceiling is counted in
+  the admitting transaction, so two submissions cannot both pass it.
 
 **Limits** (all refused with 400)
 - An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
@@ -999,7 +1000,7 @@ on that bucket and that it belongs to the same group.
         (status = 409, description = "The idempotency key is bound to a different plan, the group's compute quota refuses the admission, the composition conflicts on a staged key, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group or on the named existing workspace bucket, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
-        (status = 503, description = "No family holder could admit the request, an unreadable or unsettled demand view, three lost admission transactions, an unhealthy id clock, or a realm input a local run could not copy onto the device; retryable", body = ErrorResponse)
+        (status = 503, description = "No family holder could admit the request, an unreadable or unsettled demand view, three lost admission transactions, or an unhealthy id clock; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1198,15 +1199,15 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
             "target `local` is served by a user device only".to_string(),
         ),
         LocalExecutionError::NotOwner => ServerError::Forbidden,
-        LocalExecutionError::Paused
-        | LocalExecutionError::NoExecutor
-        | LocalExecutionError::AtCapacity { .. } => ServerError::Conflict(error.to_string()),
+        LocalExecutionError::Paused | LocalExecutionError::NoExecutor => {
+            ServerError::Conflict(error.to_string())
+        }
         LocalExecutionError::Unsupported(_)
         | LocalExecutionError::InputNotLocal { .. }
         | LocalExecutionError::InputRefused { .. } => {
             ServerError::BadRequestMessage(error.to_string())
         }
-        LocalExecutionError::InputCopy { .. } | LocalExecutionError::Unavailable(_) => {
+        LocalExecutionError::Unavailable(_) => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
         LocalExecutionError::Submit(error) => map_submit_error(error),
