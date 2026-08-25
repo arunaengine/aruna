@@ -174,6 +174,9 @@ impl ReconcileFolderOperation {
                 self.plan.pending += 1;
                 continue;
             }
+            if self.awaits_upload(index, local.as_ref(), base.as_ref()) {
+                continue;
+            }
             let action = decide(policy, local.as_ref(), base.as_ref(), remote.as_ref());
             if let Err(error) = self.record(
                 index,
@@ -633,6 +636,27 @@ impl Operation for ReconcileFolderOperation {
 }
 
 impl ReconcileFolderOperation {
+    /// Whether the realm is already owed exactly these local bytes. The queued
+    /// row is the decision this pass would take again, and repeating it before
+    /// the realm answers adds a second conflicted copy of the same file.
+    fn awaits_upload(
+        &self,
+        index: usize,
+        local: Option<&Observed>,
+        base: Option<&SyncBase>,
+    ) -> bool {
+        if base.is_some_and(|base| base.synced.is_some()) {
+            return false;
+        }
+        let Some(version) = local.and_then(|local| local.version_id) else {
+            return false;
+        };
+        self.queued
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|queued| !queued.deleted && queued.local_version == Some(version))
+    }
+
     /// Paths the recorded stat no longer vouches for: it moved, it was never
     /// recorded, or the filesystem could not answer for it. Only those need a
     /// strong hash; the batch is bounded so one pass stays short.
@@ -780,17 +804,27 @@ mod tests {
     }
 
     /// Feeds the stored base back and runs the operation to completion.
-    fn run(mut operation: ReconcileFolderOperation, base: Option<SyncBase>) -> ReconcilePlan {
+    fn run(operation: ReconcileFolderOperation, base: Option<SyncBase>) -> ReconcilePlan {
+        run_queued(operation, base, None)
+    }
+
+    /// The same, with an upload row already waiting for this path.
+    fn run_queued(
+        mut operation: ReconcileFolderOperation,
+        base: Option<SyncBase>,
+        queued: Option<SyncUpload>,
+    ) -> ReconcilePlan {
         let effects = operation.start();
         assert!(matches!(
             effects.first(),
             Some(Effect::Storage(StorageEffect::BatchRead { .. }))
         ));
         let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
+        let queued = queued.map(|row| ByteView::from(row.to_bytes().expect("row encodes")));
         let mut effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (ByteView::from(vec![0u8]), value),
-                (ByteView::from(vec![1u8]), None),
+                (ByteView::from(vec![1u8]), queued),
             ],
         }));
         while !operation.is_complete() {
@@ -841,6 +875,39 @@ mod tests {
             operation.finalize(),
             Err(ReconcileError::UnexpectedEvent { .. })
         ));
+    }
+
+    #[test]
+    fn holds_queued_upload() {
+        // The owner kept their copy and the realm has not answered yet. Until it
+        // does, the entry must not be decided again: a second pass would write
+        // another conflicted copy of a file that is already on its way.
+        let version = Ulid::from_bytes([3u8; 16]);
+        let queued = SyncUpload {
+            folder_id: folder().folder_id,
+            relative: "paper.txt".to_string(),
+            deleted: false,
+            fingerprint: "5-1-1-1".to_string(),
+            blake3: Some([5u8; 32]),
+            size: 5,
+            local_version: observed("5-1-1-1").version_id,
+            queued_at_ms: 1,
+            state: UploadState::Pending {
+                due_at_ms: 1,
+                attempts: 3,
+                last_error: Some("the realm is unreachable".to_string()),
+            },
+        };
+        for _ in 0..2 {
+            let (operation, base) = operation(
+                Some(observed("5-1-1-1")),
+                Some(base("5-1-1-1", None)),
+                Some(head(version, false)),
+            );
+            let plan = run_queued(operation, base, Some(queued.clone()));
+            assert!(plan.downloads.is_empty(), "no second conflicted copy");
+            assert_eq!(plan.uploads, 0);
+        }
     }
 
     #[test]
