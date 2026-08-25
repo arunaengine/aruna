@@ -103,7 +103,7 @@ async fn install_documents(
     documents: RealmDocuments,
 ) -> bool {
     match RealmConfigDocument::from_bytes(&documents.realm_config) {
-        Ok(config) if config.realm_id == realm_id => config,
+        Ok(config) if config.realm_id == realm_id => {}
         Ok(_) => {
             warn!("A realm node served the configuration of another realm");
             return false;
@@ -112,7 +112,7 @@ async fn install_documents(
             warn!(error = %error, "A fetched realm configuration does not decode");
             return false;
         }
-    };
+    }
     let mut writes = vec![(
         DocumentSyncTarget::RealmConfig { realm_id },
         documents.realm_config,
