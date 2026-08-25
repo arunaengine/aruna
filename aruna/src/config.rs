@@ -1260,7 +1260,29 @@ pub fn validate_wipe_roots(
 /// so a relative root or a link cannot hide what it covers.
 fn normalize_root(path: &std::path::Path) -> std::path::PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    std::fs::canonicalize(&absolute).unwrap_or(absolute)
+    // `absolute` keeps `..` on POSIX and a path that does not exist yet cannot
+    // be canonicalized, so the components are folded here first: without it a
+    // root that climbs out of itself would be judged as the path that hid it.
+    let folded = fold_components(&absolute);
+    std::fs::canonicalize(&folded).unwrap_or(folded)
+}
+
+/// Resolves `.` and `..` lexically. It is not link-aware, which is why the
+/// canonical form still wins wherever the path exists.
+fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
+    let mut folded = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !folded.pop() {
+                    folded.push(component.as_os_str());
+                }
+            }
+            other => folded.push(other.as_os_str()),
+        }
+    }
+    folded
 }
 
 fn node_capabilities_from_state(
@@ -1919,12 +1941,13 @@ mod tests {
 
     // A wipe erases the contents of every root it is given, so a root that
     // holds the owner's home, another root, or the whole filesystem must fail
-    // the start instead of the erasure.
+    // the start instead of the erasure. The paths are deliberately ones no test
+    // machine has: the judgement may not depend on what exists.
     #[test]
     fn refuses_unsafe_roots() {
-        let home = std::path::PathBuf::from("/home/ada");
-        let store = std::path::PathBuf::from("/home/ada/.aruna/store");
-        let blobs = std::path::PathBuf::from("/home/ada/.aruna/blobs");
+        let home = std::path::PathBuf::from("/nonexistent-aruna-test/ada");
+        let store = home.join(".aruna/store");
+        let blobs = home.join(".aruna/blobs");
         assert_eq!(
             validate_wipe_roots(&[store.clone(), blobs.clone()], Some(&home)).unwrap(),
             vec![store.clone(), blobs.clone()]
@@ -1933,10 +1956,11 @@ mod tests {
         for unsafe_root in [
             std::path::PathBuf::from("/"),
             home.clone(),
-            std::path::PathBuf::from("/home"),
-            std::path::PathBuf::from("/home/ada/.aruna"),
-            // The same directory, reached through a path that hides it.
-            std::path::PathBuf::from("/home/ada/.aruna/store/../.."),
+            std::path::PathBuf::from("/nonexistent-aruna-test"),
+            home.join(".aruna"),
+            // The same directories, reached through paths that hide them.
+            home.join(".aruna/store/../.."),
+            home.join("./.aruna/./store/../../"),
         ] {
             assert!(
                 validate_wipe_roots(
