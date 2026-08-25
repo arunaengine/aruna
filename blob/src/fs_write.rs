@@ -113,10 +113,8 @@ pub(crate) async fn write_conflicted(
 
 /// Answers the placement outcome and removes the spool when it did not publish.
 ///
-/// The published fingerprint is read from the file that landed, never from the
-/// spool it came from: renaming into place moves the change time, so a
-/// fingerprint taken before the rename would never match the next observation
-/// and every write would read as drift.
+/// The fingerprint is read at the published path: the rename that puts it there
+/// moves the change time, so one taken on the spool would never match again.
 async fn finish_write(
     spooled: Spooled,
     placed: Result<(), PlaceError>,

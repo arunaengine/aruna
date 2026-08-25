@@ -1635,11 +1635,9 @@ async fn project_restored_metadata_create_events(
     }
 }
 
-/// Fetches the realm-wide documents on a device.
-///
-/// A device is never a reliable push target: it may be closed when the realm
-/// revokes a token. This is how it catches up, and it is the only document sync
-/// a device ever opens.
+/// Fetches the realm-wide documents on a device. It is never a reliable push
+/// target - it may be closed when the realm revokes a token - so this is how it
+/// catches up, and it is the only document sync a device ever opens.
 pub async fn pull_realm_documents(context: &Arc<DriverContext>) -> bool {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return false;

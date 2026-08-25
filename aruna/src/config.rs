@@ -513,10 +513,8 @@ pub fn read_settings() -> Result<Settings, SetupError> {
     let rocrate_limits = rocrate_limits_env()?;
     let rate_limits = rate_limits_env()?;
     // A device profile runs without an S3 listener: unset or empty disables it,
-    // so a supervisor can force it off over a .env that defines one. Both name
-    // the same endpoint, so half a pair is a misconfiguration, not a profile.
-    // Which profile this is only becomes knowable once the persisted node
-    // identity is read, so the pair is validated again there.
+    // and half a pair is a misconfiguration. Which profile this is only becomes
+    // knowable with the node identity, so it is validated again there.
     let (s3_host, s3_address) = match (
         optional_nonempty_env("S3_HOST")?,
         optional_nonempty_env("S3_ADDRESS")?,
@@ -1227,9 +1225,8 @@ fn validate_s3_profile(
 }
 
 /// Refuses a device profile whose wipe would take more than this node's own
-/// storage with it. The wipe erases the contents of every root, so a root that
-/// is the filesystem root, the owner's home, or the parent of another root is a
-/// configuration mistake this node must not start with.
+/// storage: the filesystem root, the owner's home, or the parent of another
+/// root is a configuration mistake this node must not start with.
 pub fn validate_wipe_roots(
     roots: &[std::path::PathBuf],
     home: Option<&std::path::Path>,

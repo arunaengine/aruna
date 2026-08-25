@@ -1001,9 +1001,8 @@ impl DocumentSyncService {
     fn admit_inbound(&self, peer: NodeId) -> Result<InboundSyncPermit> {
         let peer_id = node_id_to_peer_id(&peer);
         // The bootstrap peers admit only until realm config materializes; after
-        // that the current sync-eligible set is the sole authority, so a removed
-        // startup peer fails here without a restart. A device is admitted too,
-        // bounded to the realm-wide topics by `device_topic_denied`.
+        // that the sync-eligible set and the realm's devices are the authority,
+        // and a device is bounded to its topics by `device_topic_denied`.
         let bootstrap_window = !self.realm_config_materialized.load(Ordering::Acquire);
         let admitted = self.default_peers.read().contains(&peer_id)
             || self.device_peers.read().contains(&peer_id)

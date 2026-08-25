@@ -564,10 +564,9 @@ struct ServerBindings {
     device_wipe: Option<Arc<DeviceWipe>>,
 }
 
-/// Everything a wipe erases: the store root, every derived root an operator may
-/// have relocated outside it, and every filesystem backend this node writes to.
-/// A backend whose bytes this process cannot remove is named instead, so the
-/// wipe reports an incomplete erasure rather than claiming a complete one.
+/// Everything a wipe erases: the store root, every derived root, and every
+/// filesystem backend. A backend this process cannot erase is named instead, so
+/// the wipe reports an incomplete erasure rather than claiming a complete one.
 fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
     let (mut roots, unsupported) = backend_wipe(&config.blob_backends);
     roots.extend([

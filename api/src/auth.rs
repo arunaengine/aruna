@@ -522,10 +522,9 @@ pub(crate) fn require_unrestricted_realm_auth(
     Ok(auth)
 }
 
-/// Whether this node has to leave group authorization to somebody else. A user
-/// device holds no group authorization document, so a check here could only
-/// ever deny: a realm submission is authorized by the holder that receives it,
-/// and anything the device runs for itself by the owner binding.
+/// Whether this node leaves group authorization to somebody else. A device
+/// holds no group authorization document, so a check here could only deny: the
+/// holder authorizes a realm submission, the owner binding a local run.
 pub(crate) fn defers_group_auth(state: &ServerState) -> bool {
     matches!(
         state.node_capabilities(),

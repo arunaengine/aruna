@@ -398,10 +398,8 @@ async fn applied_version(context: &Arc<DriverContext>, request: &PullRequest) ->
             let Ok(version) = BlobVersion::from_bytes(value.as_ref()) else {
                 continue;
             };
-            // The same device version is published once and deleted once, and
-            // both carry its tag: only the kind that matches this request is a
-            // replay of it. Otherwise a delete of a file that was just uploaded
-            // would answer with the upload and leave the realm object live.
+            // A device version is published once and deleted once, both under
+            // its tag: only the kind this request asks for is its replay.
             if version
                 .metadata
                 .get(SYNC_SOURCE_VERSION_TAG)

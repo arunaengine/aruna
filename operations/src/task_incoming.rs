@@ -1261,10 +1261,9 @@ impl OperationsTaskHandler {
         records
     }
 
-    /// Hands the shared realm documents to this realm's devices after the drain
-    /// published them. It is deliberately outside the drain's outcome: a device
-    /// is not realm infrastructure, so one that is offline is logged and left to
-    /// fetch the topics itself, never a reason to retry the drain.
+    /// Hands the shared realm documents to this realm's devices, outside the
+    /// drain's outcome on purpose: an offline device is logged and left to fetch
+    /// them itself, never a reason to retry the drain.
     async fn push_to_devices(
         &self,
         net_handle: &aruna_net::NetHandle,

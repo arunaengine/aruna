@@ -66,12 +66,9 @@ impl Alpn {
     /// connection. `None` is a key the realm config does not name: it keeps the
     /// pre-matrix provisional behaviour and is bounded by admission instead.
     ///
-    /// A `User` device speaks the read and forward surface only. Shard exchange
-    /// is realm infrastructure a device never touches. Job control and document
-    /// sync are directional: a device dials both and serves only document sync,
-    /// so the shared realm documents reach it whether the realm pushed while it
-    /// was up or it fetches them after being away. Which peer a device accepts
-    /// document sync from is [`Alpn::accepts`]: never another device.
+    /// A `User` device speaks the read and forward surface only, plus the two
+    /// directional protocols: it dials job control and both dials and serves
+    /// document sync. Which peer it takes that from is [`Alpn::accepts`].
     pub const fn permits(&self, kind: Option<&RealmNodeKind>, role: AlpnRole) -> bool {
         match kind {
             None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,

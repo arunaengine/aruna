@@ -40,9 +40,8 @@ impl OfferedDirectory {
 const UNKNOWN_FIELD: &str = "?";
 
 /// The stat facts one weak fingerprint is built from. Size and mtime alone are
-/// forgeable by ordinary tools: a rewrite can restore both. The inode and the
-/// change time cannot be set by a user tool, so a file that was rewritten in
-/// place, replaced, or restored with its timestamps always moves one of them.
+/// forgeable: a rewrite can restore both. The change time and the inode cannot
+/// be set by a user tool, so a rewritten file always moves one of them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FileStat {
     pub size: u64,

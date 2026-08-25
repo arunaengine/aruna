@@ -193,8 +193,7 @@ impl RemoteView {
 }
 
 /// Closes one listing window. An exhausted listing covers every remaining key,
-/// however the pass ended: the boundary is cleared so local-only keys after the
-/// last head are decided too, and the next pass restarts instead of repeating
+/// so its boundary clears and the next pass starts over instead of repeating
 /// exactly this window.
 fn close_window(view: &mut RemoteView, next: Option<SyncListCursor>) {
     if next.is_none() {
