@@ -1959,7 +1959,8 @@ mod tests {
     // accidentally absent must fail its start instead of coming up without one.
     #[test]
     fn devices_skip_s3() {
-        let realm_id = RealmId::from_bytes([4u8; 32]);
+        // A realm id is a verifying key, so it has to be one a device can hold.
+        let realm_id = RealmId::from_bytes(generate_signing_key().verifying_key().to_bytes());
         let device = NodeCapabilities::user_node(realm_id).expect("device capabilities");
         let management =
             NodeCapabilities::management_node(generate_signing_key()).expect("management");
