@@ -960,9 +960,10 @@ mod tests {
         );
         assert!(admission.admits(peer(1), Alpn::Metadata));
         assert!(admission.admits(peer(1), Alpn::Bao));
-        // A realm node accepts a device's routed job control.
+        // A realm node accepts a device's routed job control, and its fetch of
+        // the realm documents; the realm's own shard exchange stays closed.
         assert!(admission.admits(peer(1), Alpn::JobControl));
-        assert!(!admission.admits(peer(1), Alpn::DocumentSync));
+        assert!(admission.admits(peer(1), Alpn::DocumentSync));
         assert!(!admission.admits(peer(1), Alpn::Shard));
         assert!(!admission.admits(peer(2), Alpn::Metadata));
     }
