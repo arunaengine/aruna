@@ -1226,6 +1226,36 @@ fn validate_s3_profile(
     Err(SetupError::MissingConfigValue("S3_ADDRESS"))
 }
 
+/// Refuses a device profile whose wipe would take more than this node's own
+/// storage with it. The wipe erases the contents of every root, so a root that
+/// is the filesystem root, the owner's home, or the parent of another root is a
+/// configuration mistake this node must not start with.
+pub fn validate_wipe_roots(
+    roots: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> Result<(), SetupError> {
+    for root in roots {
+        let refuse = |message: &str| SetupError::InvalidConfigValue {
+            key: "STORAGE_PATH",
+            value: root.display().to_string(),
+            message: message.to_string(),
+        };
+        if root.parent().is_none() {
+            return Err(refuse("a wipe root may not be the filesystem root"));
+        }
+        if home.is_some_and(|home| home.starts_with(root)) {
+            return Err(refuse("a wipe root may not contain a home directory"));
+        }
+        if roots
+            .iter()
+            .any(|other| other != root && other.starts_with(root))
+        {
+            return Err(refuse("a wipe root may not contain another wipe root"));
+        }
+    }
+    Ok(())
+}
+
 fn node_capabilities_from_state(
     node_state: &PersistedNodeState,
 ) -> Result<(RealmId, NodeCapabilities), SetupError> {
@@ -1867,7 +1897,7 @@ mod tests {
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         S3ServerTimeouts, SetupError, fjall_persist_policy_env, load, load_oidc_providers_from_env,
         parse_node_labels_env, persist_node_state, portal_config_env, read_settings,
-        rocrate_limits_env, validate_public_url, validate_s3_profile,
+        rocrate_limits_env, validate_public_url, validate_s3_profile, validate_wipe_roots,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
@@ -1879,6 +1909,34 @@ mod tests {
     use std::sync::OnceLock;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    // A wipe erases the contents of every root it is given, so a root that
+    // holds the owner's home, another root, or the whole filesystem must fail
+    // the start instead of the erasure.
+    #[test]
+    fn refuses_unsafe_roots() {
+        let home = std::path::PathBuf::from("/home/ada");
+        let store = std::path::PathBuf::from("/home/ada/.aruna/store");
+        let blobs = std::path::PathBuf::from("/home/ada/.aruna/blobs");
+        assert!(validate_wipe_roots(&[store.clone(), blobs.clone()], Some(&home)).is_ok());
+
+        for unsafe_root in [
+            std::path::PathBuf::from("/"),
+            home.clone(),
+            std::path::PathBuf::from("/home"),
+            std::path::PathBuf::from("/home/ada/.aruna"),
+        ] {
+            assert!(
+                validate_wipe_roots(
+                    &[store.clone(), blobs.clone(), unsafe_root.clone()],
+                    Some(&home)
+                )
+                .is_err(),
+                "{} must be refused",
+                unsafe_root.display()
+            );
+        }
+    }
 
     // Only a device serves no S3 endpoint. An infrastructure node whose pair is
     // accidentally absent must fail its start instead of coming up without one.

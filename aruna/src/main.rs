@@ -620,11 +620,21 @@ async fn bind_servers(
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let s3_timeouts = config.s3_timeouts();
-    let device_wipe =
-        matches!(config.node_capabilities, NodeCapabilities::User { .. }).then(|| {
+    let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
+        true => {
             let (roots, unsupported) = wipe_plan(&config);
-            Arc::new(DeviceWipe::new(roots, unsupported))
-        });
+            // A wipe erases what these roots hold, so an unsafe one fails the
+            // start rather than the erasure.
+            crate::config::validate_wipe_roots(
+                &roots,
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref(),
+            )?;
+            Some(Arc::new(DeviceWipe::new(roots, unsupported)))
+        }
+        false => None,
+    };
     let mut state = ServerState::new(
         driver_ctx.clone(),
         config.realm_id,
