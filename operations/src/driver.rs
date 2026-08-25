@@ -350,7 +350,7 @@ async fn dispatch_effect_until(
         }
         Effect::LocalFile(local_file_effect) => {
             if let Some(blob_handle) = &context.blob_handle {
-                Box::pin(blob_handle.send_local_file_effect(local_file_effect)).await
+                Box::pin(blob_handle.send_file_effect(local_file_effect)).await
             } else {
                 Event::LocalFile(aruna_core::events::LocalFileEvent::Error {
                     message: "this node has no local file adapter".to_string(),

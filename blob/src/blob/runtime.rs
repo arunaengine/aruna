@@ -174,9 +174,7 @@ impl Handle for BlobHandle {
             Effect::StagingSource(staging_source_effect) => {
                 self.send_staging_source_effect(staging_source_effect).await
             }
-            Effect::LocalFile(local_file_effect) => {
-                self.send_local_file_effect(local_file_effect).await
-            }
+            Effect::LocalFile(file_effect) => self.send_file_effect(file_effect).await,
             _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
         }
     }
@@ -316,25 +314,25 @@ impl BlobHandle {
 
     /// Executes one write into a folder the owner bound on this machine. The
     /// adapter enforces the jail and the guard; the policy is the operation's.
-    pub async fn send_local_file_effect(&self, effect: LocalFileEffect) -> Event {
+    pub async fn send_file_effect(&self, effect: LocalFileEffect) -> Event {
         Event::LocalFile(match effect {
             LocalFileEffect::Write {
                 root,
                 relative,
                 guard,
                 blob,
-            } => crate::fs_source::write_guarded(&root, &relative, &guard, blob).await,
+            } => crate::fs_write::write_guarded(&root, &relative, &guard, blob).await,
             LocalFileEffect::WriteConflicted {
                 root,
                 relative,
                 at_ms,
                 blob,
-            } => crate::fs_source::write_conflicted(&root, &relative, at_ms, blob).await,
+            } => crate::fs_write::write_conflicted(&root, &relative, at_ms, blob).await,
             LocalFileEffect::MoveAside { root, relative } => {
-                crate::fs_source::move_aside(&root, &relative).await
+                crate::fs_write::move_aside(&root, &relative).await
             }
             LocalFileEffect::Hash { root, relative } => {
-                crate::fs_source::hash_local(&root, &relative).await
+                crate::fs_write::hash_local(&root, &relative).await
             }
         })
     }

@@ -8,6 +8,7 @@ pub mod egress;
 pub mod error;
 mod framing;
 mod fs_source;
+mod fs_write;
 pub mod hash;
 mod messages;
 pub mod opendal;
