@@ -484,6 +484,8 @@ impl Operation for ReconcileFolderOperation {
             return smallvec![];
         }
         let folder_id = self.input.folder.folder_id;
+        // Both rows of every path in one read: the base decides, and the outbox
+        // row says whether an upload is already owed.
         let reads = paths
             .iter()
             .map(|relative| {
@@ -492,6 +494,12 @@ impl Operation for ReconcileFolderOperation {
                     base_key(folder_id, relative),
                 )
             })
+            .chain(paths.iter().map(|relative| {
+                (
+                    SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+                    base_key(folder_id, relative),
+                )
+            }))
             .collect();
         self.paths = paths;
         self.state = ReconcileState::ReadBases;

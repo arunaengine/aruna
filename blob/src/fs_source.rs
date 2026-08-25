@@ -16,7 +16,6 @@ use aruna_core::structs::{
     SourceEntryKind, SourceMetadata, weak_fingerprint,
 };
 use bytes::Bytes;
-use futures::StreamExt;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
