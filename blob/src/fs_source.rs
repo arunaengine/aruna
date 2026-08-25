@@ -267,6 +267,7 @@ pub(crate) fn map_io_error(error: std::io::Error) -> StagingSourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::collections::HashMap;
 
     fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
