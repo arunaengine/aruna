@@ -18,7 +18,7 @@ pub const MAX_SYNC_PAGE: usize = 256;
 
 /// Version metadata tag naming the device version a realm object was pulled
 /// from. It makes a replayed pull idempotent instead of a second version.
-pub const SYNC_SOURCE_VERSION_TAG: &str = "aruna:sync-source-version";
+pub const SYNC_SOURCE_VERSION_TAG: &str = "aruna-sync-source-version";
 
 /// Directory a folder's move-aside puts files into, relative to the root.
 pub const SYNC_TRASH_DIR: &str = ".aruna/trash";

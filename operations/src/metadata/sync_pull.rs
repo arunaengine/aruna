@@ -8,13 +8,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aruna_core::effects::IterStart;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
 use aruna_core::structs::{
-    AuthContext, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Permission,
-    RemoteHead, SYNC_SOURCE_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal,
-    SyncVersionPage, VersionKey, VersionedObjectArn, blob_object_permission_path,
+    AuthContext, BlobVersion, BucketInfo, Permission, RemoteHead, SYNC_SOURCE_VERSION_TAG,
+    SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal, SyncVersionPage, VersionKey,
+    VersionedObjectArn, blob_object_permission_path,
 };
 use aruna_core::types::{GroupId, NodeId};
 use tracing::debug;
@@ -34,6 +35,9 @@ use crate::s3::list_object_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
 use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+
+/// Versions one idempotency scan reads at a time.
+const VERSION_SCAN_PAGE: usize = 256;
 
 /// Serves one forwarded sync pull.
 pub async fn serve_sync_pull(
@@ -96,6 +100,13 @@ async fn apply_pull(
     let bucket = read_bucket(context, &request.target_bucket).await?;
     ensure_write(context, &auth, &bucket, &request).await?;
 
+    // A replay of either kind answers with the version it already produced.
+    if let Some(version_id) = applied_version(context, &request).await {
+        return Ok(SyncPullAck {
+            version_id,
+            already_applied: true,
+        });
+    }
     match request.deleted {
         true => delete_target(context, &auth, &bucket, &request).await,
         false => commit_pull(context, &auth, &bucket, request).await,
@@ -104,6 +115,12 @@ async fn apply_pull(
 
 /// The owner the device forwards for. A User peer is owner-bound, so the
 /// binding is re-checked here rather than trusted from the request.
+///
+/// Deliberate deviation: this node holds no record of which folder a device
+/// bound, so a pull carries no binding proof. The owner's WRITE permission on
+/// the target object is the whole authority, exactly as it is when the same
+/// owner writes through S3. A device can therefore publish into any path its
+/// owner may already write, and nothing more.
 async fn authorize(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -219,12 +236,6 @@ async fn commit_pull(
     bucket: &BucketInfo,
     request: PullRequest,
 ) -> Result<SyncPullAck, SyncRefusal> {
-    if let Some(version_id) = applied_version(context, &request).await {
-        return Ok(SyncPullAck {
-            version_id,
-            already_applied: true,
-        });
-    }
     let node_id = context
         .net_handle
         .as_ref()
@@ -291,54 +302,50 @@ async fn commit_pull(
     })
 }
 
-/// The version this device's exact source already produced here, if any. It
-/// makes a replayed pull a no-op instead of a second version.
+/// The version this device's exact source already produced here, if any.
+///
+/// Every version of the key is examined, not only the head: a later unrelated
+/// write must not make a replayed pull look new and mint a second copy.
 async fn applied_version(context: &Arc<DriverContext>, request: &PullRequest) -> Option<Ulid> {
-    let pointer = read_row(
-        context,
-        BLOB_HEAD_KEYSPACE,
-        BlobHeadKey::new(&request.target_bucket, &request.target_key)
-            .to_bytes()
-            .ok()?,
-    )
-    .await
-    .and_then(|bytes| CurrentVersionPointer::from_bytes(&bytes).ok())?;
-    let version = read_row(
-        context,
-        BLOB_VERSIONS_KEYSPACE,
-        VersionKey::new(
-            &request.target_bucket,
-            &request.target_key,
-            pointer.version_id,
-        )
-        .to_bytes()
-        .ok()?,
-    )
-    .await
-    .and_then(|bytes| BlobVersion::from_bytes(&bytes).ok())?;
-    version
-        .metadata
-        .get(SYNC_SOURCE_VERSION_TAG)
-        .is_some_and(|tag| *tag == request.source.version.to_string())
-        .then_some(pointer.version_id)
-}
-
-async fn read_row(
-    context: &Arc<DriverContext>,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Option<byteview::ByteView> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        _ => None,
+    let source = request.source.version.to_string();
+    let prefix = VersionKey::object_prefix(&request.target_bucket, &request.target_key).ok()?;
+    let mut start: Option<aruna_core::types::Key> = None;
+    loop {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                prefix: Some(prefix.clone().into()),
+                start: start.map(IterStart::After),
+                limit: VERSION_SCAN_PAGE,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return None;
+        };
+        for (key, value) in &values {
+            let Ok(version) = BlobVersion::from_bytes(value.as_ref()) else {
+                continue;
+            };
+            if version
+                .metadata
+                .get(SYNC_SOURCE_VERSION_TAG)
+                .is_some_and(|tag| *tag == source)
+                && let Ok(parsed) = VersionKey::from_bytes(key.as_ref())
+            {
+                // A delete marker replays as the same no-op as a version.
+                return Some(parsed.version_id);
+            }
+        }
+        match next_start_after {
+            Some(next) => start = Some(next),
+            None => return None,
+        }
     }
 }
 
