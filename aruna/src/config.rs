@@ -1276,6 +1276,25 @@ pub fn validate_wipe_roots(
     Ok(roots)
 }
 
+/// Drops every root that lies inside another: erasing the outer one takes it
+/// along, and the default layout keeps the blob store under the storage path.
+pub fn outermost_roots(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let normalized: Vec<std::path::PathBuf> =
+        roots.iter().map(|root| normalize_root(root)).collect();
+    let mut kept: Vec<std::path::PathBuf> = normalized
+        .iter()
+        .filter(|root| {
+            !normalized
+                .iter()
+                .any(|other| other != *root && root.starts_with(other))
+        })
+        .cloned()
+        .collect();
+    kept.sort();
+    kept.dedup();
+    kept
+}
+
 /// The path a wipe would really erase: absolute, and resolved where it exists,
 /// so a relative root or a link cannot hide what it covers.
 fn normalize_root(path: &std::path::Path) -> std::path::PathBuf {
@@ -1947,8 +1966,9 @@ mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         S3ServerTimeouts, SetupError, fjall_persist_policy_env, load, load_oidc_providers_from_env,
-        parse_node_labels_env, persist_node_state, portal_config_env, read_settings,
-        rocrate_limits_env, validate_public_url, validate_s3_profile, validate_wipe_roots,
+        normalize_root, outermost_roots, parse_node_labels_env, persist_node_state,
+        portal_config_env, read_settings, rocrate_limits_env, validate_public_url,
+        validate_s3_profile, validate_wipe_roots,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
@@ -1965,6 +1985,18 @@ mod tests {
     // holds the owner's home, another root, or the whole filesystem must fail
     // the start instead of the erasure. The paths are deliberately ones no test
     // machine has: the judgement may not depend on what exists.
+    #[test]
+    fn folds_nested_roots() {
+        // The blob store defaults to a directory under the storage path; the
+        // wipe visits the storage path once and never lists the nested one.
+        let home = std::env::temp_dir().join("aruna-wipe-home");
+        let store = home.join("data");
+        let blobs = store.join("blobstore");
+        let folded = outermost_roots(&[blobs.clone(), store.clone(), store.clone()]);
+        assert_eq!(folded, vec![normalize_root(&store)]);
+        assert!(validate_wipe_roots(&folded, Some(&home)).is_ok());
+    }
+
     #[test]
     fn refuses_unsafe_roots() {
         let home = std::path::PathBuf::from("/nonexistent-aruna-test/ada");

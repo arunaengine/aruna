@@ -96,13 +96,12 @@ async fn publish_core(
     allow_genesis: bool,
     documents: Vec<DocumentSyncTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(debug_assertions)]
-    {
-        if documents.is_empty() {
-            return Ok(());
-        }
-        core_barrier().await;
+    // A device announces nothing: it holds no sync topic and is refused one.
+    if documents.is_empty() {
+        return Ok(());
     }
+    #[cfg(debug_assertions)]
+    core_barrier().await;
     publish_core_documents(
         core_ctx.as_ref(),
         node_id,
@@ -508,19 +507,30 @@ async fn join_realm(
     }
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
-    let documents = prepare_core_documents(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        false,
-        true,
-    )
-    .await?;
+    let documents = match is_device(config) {
+        true => Vec::new(),
+        false => {
+            prepare_core_documents(
+                driver_ctx.as_ref(),
+                config.node_id,
+                config.realm_id,
+                false,
+                true,
+            )
+            .await?
+        }
+    };
     mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
     Ok(CoreAnnouncement {
         documents,
         allow_genesis: false,
     })
+}
+
+/// A device reads the realm's documents over metadata and publishes none of
+/// its own over sync, so it never joins or announces a sync topic.
+fn is_device(config: &Config) -> bool {
+    matches!(config.node_capabilities, NodeCapabilities::User { .. })
 }
 
 async fn provision_realm(
@@ -553,14 +563,19 @@ async fn provision_realm(
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let allow_genesis = config.is_initial_node();
-    let documents = prepare_core_documents(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        allow_genesis,
-        false,
-    )
-    .await?;
+    let documents = match is_device(config) {
+        true => Vec::new(),
+        false => {
+            prepare_core_documents(
+                driver_ctx.as_ref(),
+                config.node_id,
+                config.realm_id,
+                allow_genesis,
+                false,
+            )
+            .await?
+        }
+    };
     Ok(CoreAnnouncement {
         documents,
         allow_genesis,
@@ -589,9 +604,7 @@ fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
         config.document_sync_storage_path.clone(),
         std::path::PathBuf::from(&config.blob_root),
     ]);
-    roots.sort();
-    roots.dedup();
-    (roots, unsupported)
+    (aruna::config::outermost_roots(&roots), unsupported)
 }
 
 /// The filesystem roots a wipe has to visit, and the backends it cannot erase.
