@@ -76,8 +76,8 @@ Behavior:
   --help, -h       Print this help and exit.
 
   Values may arrive in the Just parameter form, so --node-count nodes=2 and
-  --portal-dir portal_dir=P are accepted, and --portal-dir nodes=2 sets the
-  node count that `just preview nodes=2` intends.
+  --portal-dir portal_dir=P are accepted, and each flag also takes the other's
+  named value: `just preview nodes=2 portal_dir=P` hands them over swapped.
 
 Readiness:
   Every node is awaited on /readyz on its generated ops port. A 503 keeps
@@ -150,6 +150,15 @@ apply_portal_value() {
   case "$value" in
     nodes=*) NODE_COUNT="${value#nodes=}" ;;
     *) PORTAL_DIR="$(strip_named_value portal_dir "$value")" ;;
+  esac
+}
+
+apply_node_value() {
+  local value=$1
+
+  case "$value" in
+    portal_dir=*) PORTAL_DIR="${value#portal_dir=}" ;;
+    *) NODE_COUNT="$(strip_named_value nodes "$value")" ;;
   esac
 }
 
@@ -671,10 +680,10 @@ while (($# > 0)); do
     --node-count)
       shift
       [[ $# -gt 0 ]] || die "missing value for --node-count"
-      NODE_COUNT="$(strip_named_value nodes "$1")"
+      apply_node_value "$1"
       ;;
     --node-count=*)
-      NODE_COUNT="$(strip_named_value nodes "${1#*=}")"
+      apply_node_value "${1#*=}"
       ;;
     --portal-dir)
       shift
