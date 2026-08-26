@@ -546,9 +546,12 @@ enum DeferOutcome {
 /// defer/publish boundary would let the newer op publish first, invert its origin
 /// sequence on receivers, and drop the older op forever as StaleOriginSequence —
 /// so a topic never straddles that boundary within a run, across pages included.
+/// `publishes_shared` is whether this node may publish into the shared realm
+/// topics at all; a device may not, so its records there are undeliverable.
 fn partition_drain_records(
     records: Vec<DrainRecord>,
     defer: &mut DrainDeferState,
+    publishes_shared: bool,
     mut topic_available: impl FnMut(irokle::TopicId) -> bool,
     mut classify_defer: impl FnMut(&DocumentSyncOutboxRecord) -> DeferOutcome,
 ) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
@@ -562,7 +565,10 @@ fn partition_drain_records(
             continue;
         }
         if !record.target.uses_shard_topic() {
-            to_publish.push((record_key, record, topic));
+            match publishes_shared {
+                true => to_publish.push((record_key, record, topic)),
+                false => undeliverable.push((record_key, record, topic)),
+            }
             continue;
         }
         if defer.undeliverable_topics.contains(&topic) {
@@ -730,10 +736,22 @@ impl OperationsTaskHandler {
         undeliverable: &[DrainRecord],
     ) -> Vec<Vec<u8>> {
         let mut relayed = Vec::new();
+        let device = self.is_device(config);
         for (record_key, record, topic) in undeliverable {
             if let Some(config) = config
                 && self.relay_admin_record(config, record).await
             {
+                relayed.push(record_key.clone());
+                continue;
+            }
+            // A device can never become a holder, so an unrelayable row of its
+            // own would only be error-logged on every drain: drop it instead.
+            if device && !matches!(record.event, DocumentSyncOutboxEvent::AdminOperation { .. }) {
+                warn!(
+                    event = "pipeline.drain.dropped",
+                    target = ?record.target,
+                    "Dropping a document sync outbox record no device can publish"
+                );
                 relayed.push(record_key.clone());
                 continue;
             }
@@ -753,6 +771,19 @@ impl OperationsTaskHandler {
             std::sync::atomic::Ordering::Relaxed,
         );
         relayed
+    }
+
+    /// Whether this node is a device: configured with a kind that holds no
+    /// sync topic. Unknown kinds count as infrastructure.
+    fn is_device(&self, config: Option<&aruna_core::structs::RealmConfigDocument>) -> bool {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            return false;
+        };
+        config
+            .and_then(|config| {
+                crate::mutate_realm_placement::node_kind(config, net_handle.node_id())
+            })
+            .is_some_and(|kind| !kind.is_sync_eligible())
     }
 
     /// Signs one locally originated administrative envelope and hands it to a
@@ -1333,6 +1364,7 @@ impl OperationsTaskHandler {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut invocation.defer,
+            !self.is_device(config),
             |topic| {
                 net_handle
                     .document_sync_topic_exists(topic)
@@ -3517,6 +3549,7 @@ mod tests {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut defer,
+            true,
             |_| {
                 calls += 1;
                 calls > 1
@@ -3611,6 +3644,7 @@ mod tests {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut defer,
+            true,
             |topic| topic != blocked_topic,
             |_| DeferOutcome::Retry,
         );
@@ -3632,6 +3666,7 @@ mod tests {
         let (_, deferred, _) = partition_drain_records(
             vec![(b"first".to_vec(), shard_topic_record(1), topic)],
             &mut defer,
+            true,
             |_| false,
             |_| DeferOutcome::Retry,
         );
@@ -3643,6 +3678,7 @@ mod tests {
                 (b"second".to_vec(), shard_topic_record(2), topic),
             ],
             &mut defer,
+            true,
             |_| true,
             |_| DeferOutcome::Retry,
         );
@@ -3661,6 +3697,7 @@ mod tests {
         let (_, deferred, _) = partition_drain_records(
             vec![(b"first".to_vec(), admin_record(origin, 1), blocked_topic)],
             &mut defer,
+            true,
             |_| false,
             |_| DeferOutcome::Retry,
         );
@@ -3669,6 +3706,7 @@ mod tests {
         let (published, deferred, undeliverable) = partition_drain_records(
             vec![(b"second".to_vec(), admin_record(origin, 2), healthy_topic)],
             &mut defer,
+            true,
             |_| true,
             |_| DeferOutcome::Retry,
         );
@@ -4186,7 +4224,7 @@ mod tests {
 
         let mut defer = DrainDeferState::default();
         let (to_publish, deferred, undeliverable) =
-            partition_drain_records(records, &mut defer, |_| true, |_| DeferOutcome::Retry);
+            partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
 
         assert!(deferred.is_empty());
         assert!(undeliverable.is_empty());
@@ -4210,6 +4248,7 @@ mod tests {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut defer,
+            true,
             |_| false,
             |_| {
                 classified += 1;

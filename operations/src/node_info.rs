@@ -981,6 +981,12 @@ async fn replicate_node_info(
     node_id: NodeId,
     realm_id: RealmId,
 ) -> Result<(), String> {
+    // A device belongs to no sync topic, so its info document stays local:
+    // an outbox row for it could never be published, only retried forever.
+    let config = load_realm_config(ctx, realm_id).await?;
+    if node_kind(&config, node_id).is_some_and(|kind| !kind.is_sync_eligible()) {
+        return Ok(());
+    }
     drive(
         ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -1248,6 +1254,47 @@ mod tests {
             .expect("seeded node info document");
         assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "user");
         assert!(stored.executors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_publishes_locally() {
+        // A device heartbeat revises the stored document but queues no outbox
+        // row: it holds no topic the row could ever be published into.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let local = node(1);
+        let mut config = realm_config(realm_id, &[node(2)]);
+        config.ensure_node(
+            local,
+            RealmNodeKind::User {
+                owner: aruna_core::types::UserId::nil(realm_id),
+            },
+        );
+        write_realm_config(&ctx, &config).await;
+
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+        refresh_node_info_heartbeat(&ctx, local, realm_id)
+            .await
+            .unwrap();
+
+        assert!(
+            read_node_info_document(&ctx.storage_handle, local)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(read_outbox(&ctx).await.is_empty());
     }
 
     #[tokio::test]
