@@ -104,6 +104,26 @@ pub async fn fetch_realm_documents(context: &Arc<DriverContext>, budget: Duratio
     let Some(plan) = fetch_plan(context).await else {
         return false;
     };
+    fetch_with_plan(context, plan, budget).await
+}
+
+/// The same fetch for a device that holds no realm configuration yet: the owner
+/// and the peers to ask are given instead of read back from a stored copy. This
+/// is the onboarding path, where the realm documents are what the device is
+/// still missing.
+pub async fn fetch_from_peers(
+    context: &Arc<DriverContext>,
+    owner: UserId,
+    peers: Vec<NodeId>,
+    budget: Duration,
+) -> bool {
+    let Some(plan) = build_plan(context, owner, peers).await else {
+        return false;
+    };
+    fetch_with_plan(context, plan, budget).await
+}
+
+async fn fetch_with_plan(context: &Arc<DriverContext>, plan: FetchPlan, budget: Duration) -> bool {
     let Ok(selection) = tokio::time::timeout(budget, ask_realm(context, &plan)).await else {
         return false;
     };
@@ -148,7 +168,6 @@ fn rebase_after(behind: u32) -> (bool, u32) {
 
 async fn fetch_plan(context: &Arc<DriverContext>) -> Option<FetchPlan> {
     let net_handle = context.net_handle.as_ref()?;
-    context.metadata_handle.as_ref()?;
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
     let config = load_realm_config(context, realm_id).await?;
@@ -157,9 +176,20 @@ async fn fetch_plan(context: &Arc<DriverContext>) -> Option<FetchPlan> {
     // A different node answers first every time, so one lagging peer never owns
     // this device's view of the realm.
     peers.shuffle(&mut rand::rng());
+    build_plan(context, owner, peers).await
+}
+
+async fn build_plan(
+    context: &Arc<DriverContext>,
+    owner: UserId,
+    peers: Vec<NodeId>,
+) -> Option<FetchPlan> {
+    let net_handle = context.net_handle.as_ref()?;
+    context.metadata_handle.as_ref()?;
+    let realm_id = *net_handle.realm_id();
     Some(FetchPlan {
         realm_id,
-        node_id,
+        node_id: net_handle.node_id(),
         owner,
         auth: AuthContext {
             user_id: owner,
@@ -676,6 +706,19 @@ mod tests {
             .await,
             Some(stored),
             "the documents themselves are not rewritten"
+        );
+    }
+
+    // The explicit plan still needs the handles that name this device and carry
+    // the read: an owner and a peer list alone never make one.
+    #[tokio::test]
+    async fn plan_needs_handles() {
+        let (_dir, context) = device(&config(&[1])).await;
+
+        assert!(
+            build_plan(&context, UserId::nil(realm()), vec![node(2)])
+                .await
+                .is_none()
         );
     }
 

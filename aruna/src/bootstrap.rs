@@ -14,6 +14,7 @@ use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
+use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::notifications::watch::interest::{
@@ -31,10 +32,25 @@ use crypto_box::{
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
 const ONBOARDING_PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Ceiling for the doubling retry delay, so a peer that is not ready yet is
+/// asked patiently instead of ten times a second for the whole budget.
+const ONBOARDING_PLACEMENT_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// Longest a device waits on one answer, so a hung peer costs one attempt
+/// rather than the whole onboarding budget.
+const DEVICE_FETCH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Delay before retry `attempt`, doubling from the base interval up to the cap.
+fn backoff(attempt: u32) -> Duration {
+    ONBOARDING_PLACEMENT_RETRY_INTERVAL
+        .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+        .min(ONBOARDING_PLACEMENT_RETRY_MAX)
+}
 
 pub async fn realm_bootstrap_exists(
     driver_ctx: &DriverContext,
@@ -174,14 +190,24 @@ pub async fn prepare_core_documents(
     }
 }
 
+/// Fetches the documents a joining node needs before it serves its realm.
+/// Infrastructure syncs the ticket's topics from the bootstrap peer; a device is
+/// refused that protocol, so it reads the realm documents over metadata instead.
 pub async fn fetch_core_onboarding_documents(
-    driver_ctx: &DriverContext,
+    driver_ctx: &Arc<DriverContext>,
     node_state: &PersistedNodeState,
     realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<NodeId>,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
+    // Realm infrastructure refuses a device the sync protocol, so a device asks
+    // the bootstrap peer for the realm documents as a routed read instead. Its
+    // own user document is not fetched here: a device holds no shard topic, and
+    // the document reaches it later over the same route.
+    if let Some(owner) = node_state.identity.owner() {
+        return fetch_device_documents(driver_ctx, owner, bootstrap_peer, timeout).await;
+    }
     let onboarding_sync_ticket = node_state
         .onboarding_sync_ticket
         .as_deref()
@@ -236,10 +262,42 @@ pub async fn fetch_core_onboarding_documents(
     Ok(())
 }
 
+/// Asks the bootstrap peer for the realm documents until it serves them. The
+/// realm-config update that admits the device may land after the enrollment
+/// answer, and until it does the peer refuses the read as unauthorized.
+async fn fetch_device_documents(
+    driver_ctx: &Arc<DriverContext>,
+    owner: UserId,
+    bootstrap_peer: NodeId,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let budget = timeout.min(DEVICE_FETCH_BUDGET);
+    let mut attempt = 0;
+    loop {
+        if fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out after {timeout:?} fetching the realm documents for this device from bootstrap peer {bootstrap_peer}"
+            )
+            .into());
+        }
+        warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
+        tokio::time::sleep(backoff(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+/// Waits until the realm configuration names this node as ready, re-reading it
+/// from the bootstrap peer between checks: over document sync, or as a routed
+/// read when `device_owner` says this node is a device.
 pub async fn wait_for_onboarding_placement(
-    driver_ctx: &DriverContext,
+    driver_ctx: &Arc<DriverContext>,
     realm_id: aruna_core::structs::RealmId,
     node_id: NodeId,
+    device_owner: Option<UserId>,
     bootstrap_peer: Option<NodeId>,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -247,6 +305,7 @@ pub async fn wait_for_onboarding_placement(
     let target = DocumentSyncTarget::RealmConfig { realm_id };
 
     tokio::time::timeout(timeout, async {
+        let mut attempt = 0;
         loop {
             let config = drive(GetRealmConfigOperation::new(realm_id), driver_ctx).await?;
             if node_is_ready(&config, node_id) {
@@ -259,21 +318,34 @@ pub async fn wait_for_onboarding_placement(
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
 
-            if let Err(error) = sync_topic_from_peer(
-                driver_ctx
-                    .net_handle
-                    .as_ref()
-                    .ok_or("net handle unavailable")?,
-                target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
-                bootstrap_peer,
-                &target,
-                timeout,
-            )
-            .await
-            {
-                warn!(error = %error, "Retrying onboarding placement sync");
+            match device_owner {
+                // A device has no membership in the realm-config topic, so it
+                // re-reads the documents the same way it first fetched them.
+                Some(owner) => {
+                    let budget = timeout.min(DEVICE_FETCH_BUDGET);
+                    if !fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
+                        warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
+                    }
+                }
+                None => {
+                    if let Err(error) = sync_topic_from_peer(
+                        driver_ctx
+                            .net_handle
+                            .as_ref()
+                            .ok_or("net handle unavailable")?,
+                        target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
+                        bootstrap_peer,
+                        &target,
+                        timeout,
+                    )
+                    .await
+                    {
+                        warn!(error = %error, "Retrying onboarding placement sync");
+                    }
+                }
             }
-            tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
+            tokio::time::sleep(backoff(attempt)).await;
+            attempt = attempt.saturating_add(1);
         }
     })
     .await
@@ -383,12 +455,14 @@ async fn sync_with_retry(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempt = 0;
     loop {
         match sync_topic_from_peer(net_handle, topic, bootstrap_peer, document, timeout).await {
             Ok(()) => return Ok(()),
             Err(error) if tokio::time::Instant::now() < deadline => {
                 warn!(error = %error, document = ?document, "Retrying onboarding document sync");
-                tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
+                tokio::time::sleep(backoff(attempt)).await;
+                attempt = attempt.saturating_add(1);
             }
             Err(error) => return Err(error),
         }
@@ -474,9 +548,10 @@ pub async fn ensure_initial_local_onboarding_secret(
 #[cfg(test)]
 mod tests {
     use super::{
-        node_is_ready, prepare_core_documents, publish_core_documents, sync_topic_from_peer,
-        sync_with_retry, unique_user_topic, watch_target_needed,
+        backoff, node_is_ready, prepare_core_documents, publish_core_documents,
+        sync_topic_from_peer, sync_with_retry, unique_user_topic, watch_target_needed,
     };
+    use crate::config::PersistedNodeIdentity;
     use aruna_core::NodeId;
     use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
     use aruna_core::effects::StorageEffect;
@@ -525,6 +600,40 @@ mod tests {
         );
         assert!(unique_user_topic(&mut synced_topics, realm_id, &second_shard, &second).is_some());
         assert_eq!(synced_topics.len(), 2);
+    }
+
+    // The retries must survive a full sync budget without flooding the log, and
+    // must keep asking at a usable pace once they reach the ceiling.
+    #[test]
+    fn backoff_grows_capped() {
+        assert_eq!(backoff(0), Duration::from_millis(100));
+        assert_eq!(backoff(1), Duration::from_millis(200));
+        assert_eq!(backoff(4), Duration::from_millis(1_600));
+        assert_eq!(backoff(6), Duration::from_secs(5));
+        assert_eq!(backoff(u32::MAX), Duration::from_secs(5));
+    }
+
+    // Only a device takes the metadata route, and it is the persisted owner that
+    // selects it: infrastructure keeps fetching its documents over sync.
+    #[test]
+    fn device_identity_routes() {
+        let owner = aruna_core::UserId::nil(RealmId::from_bytes([2u8; 32]));
+        assert_eq!(PersistedNodeIdentity::User { owner }.owner(), Some(owner));
+        assert_eq!(
+            PersistedNodeIdentity::Server {
+                issuer_private_key_pem: String::new(),
+                delegation_signature: String::new(),
+            }
+            .owner(),
+            None
+        );
+        assert_eq!(
+            PersistedNodeIdentity::Management {
+                realm_private_key_pem: String::new(),
+            }
+            .owner(),
+            None
+        );
     }
 
     #[test]

@@ -769,7 +769,7 @@ async fn spawn_joiner_node_with_mode(
     announce_realm_presence(seed.context.as_ref(), &seed.realm_id, seed.net.node_id()).await?;
 
     fetch_core_onboarding_documents(
-        joiner_context.as_ref(),
+        &joiner_context,
         &config.node_state,
         &config.realm_id,
         config.peer_endpoints.first().map(|endpoint| endpoint.id),
@@ -778,9 +778,10 @@ async fn spawn_joiner_node_with_mode(
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
     wait_for_onboarding_placement(
-        joiner_context.as_ref(),
+        &joiner_context,
         config.realm_id,
         config.node_id,
+        config.device_owner(),
         config.peer_endpoints.first().map(|endpoint| endpoint.id),
         config.onboarding_sync_timeout(),
     )

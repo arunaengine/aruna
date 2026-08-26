@@ -478,7 +478,7 @@ async fn join_realm(
         .or_else(|| config.peer_nodes.first().copied());
     if matches!(phase, OnboardingPhase::Bootstrapped) {
         fetch_core_onboarding_documents(
-            driver_ctx.as_ref(),
+            driver_ctx,
             &config.node_state,
             &config.realm_id,
             bootstrap_peer,
@@ -487,9 +487,10 @@ async fn join_realm(
         .await?;
     }
     wait_for_onboarding_placement(
-        driver_ctx.as_ref(),
+        driver_ctx,
         config.realm_id,
         config.node_id,
+        config.device_owner(),
         bootstrap_peer,
         config.onboarding_sync_timeout(),
     )

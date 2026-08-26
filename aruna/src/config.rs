@@ -17,6 +17,7 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits,
     STORAGE_CLASS_LABEL_PREFIX, StaticRealmEndpoint,
 };
+use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
     DiscoveryMethod, IrohRuntimeConfig, RelayMethod, endpoint_addr_from_config_string,
@@ -187,7 +188,21 @@ pub enum PersistedNodeIdentity {
         issuer_private_key_pem: String,
         delegation_signature: String,
     },
-    User,
+    /// Owner-bound device. The owner is copied from the enrollment answer: a
+    /// device holds no realm state to read it back from before it has joined.
+    User {
+        owner: UserId,
+    },
+}
+
+impl PersistedNodeIdentity {
+    /// Owner of a device identity; `None` for infrastructure nodes.
+    pub fn owner(&self) -> Option<UserId> {
+        match self {
+            Self::User { owner } => Some(*owner),
+            Self::Management { .. } | Self::Server { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +287,11 @@ impl Config {
                 self.blob_transfer_idle_timeout_secs,
             ),
         }
+    }
+
+    /// Owner this node is enrolled for when it is a device; `None` otherwise.
+    pub fn device_owner(&self) -> Option<UserId> {
+        self.node_state.identity.owner()
     }
 
     /// Budget for the onboarding document sync and the placement wait built on
@@ -1324,7 +1344,7 @@ fn node_capabilities_from_state(
                 delegation_signature.clone(),
             )?,
         )),
-        PersistedNodeIdentity::User => Ok((
+        PersistedNodeIdentity::User { .. } => Ok((
             node_state.realm_id,
             NodeCapabilities::user_node(node_state.realm_id)?,
         )),
@@ -1530,7 +1550,9 @@ async fn bootstrap_onboarded_node_state(
             },
             // A device holds no realm or issuer key material: its authority is
             // its owner's, carried by the membership record written at finalize.
-            OnboardingMode::User { .. } => PersistedNodeIdentity::User,
+            // The owner is kept so the device can name it before that record
+            // reaches it.
+            OnboardingMode::User { owner } => PersistedNodeIdentity::User { owner },
         };
 
     Ok(BootstrappedNodeState {
@@ -2878,14 +2900,17 @@ mod tests {
 
         let realm_signing_key = generate_signing_key();
         let net_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::Complete,
-            realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
+            realm_id,
             net_secret_key: net_signing_key.to_bytes(),
             onboarding_phase: None,
             onboarding_sync_ticket: None,
-            identity: PersistedNodeIdentity::User,
+            identity: PersistedNodeIdentity::User {
+                owner: aruna_core::types::UserId::nil(realm_id),
+            },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);
@@ -2943,14 +2968,17 @@ mod tests {
 
         let realm_signing_key = generate_signing_key();
         let net_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::PendingOnboarding,
-            realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
+            realm_id,
             net_secret_key: net_signing_key.to_bytes(),
             onboarding_phase: Some(aruna_core::onboarding::OnboardingPhase::CoreDocumentsFetched),
             onboarding_sync_ticket: Some("already-fetched".to_string()),
-            identity: PersistedNodeIdentity::User,
+            identity: PersistedNodeIdentity::User {
+                owner: aruna_core::types::UserId::nil(realm_id),
+            },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);
