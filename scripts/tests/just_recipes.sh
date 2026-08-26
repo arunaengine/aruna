@@ -397,6 +397,15 @@ test_argument_flow() {
   output="$(run_recipe preview-no-oidc "$PORTAL_FIXTURE" 2)"
   check_has "a portal path with spaces survives positionally" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
     "PORTAL_DIR='$PORTAL_FIXTURE'"
+
+  # Just hands named values over by position, so the swapped order arrives as
+  # --node-count portal_dir=P --portal-dir nodes=2 and must mean the same.
+  output="$(PORTAL_ARTIFACT_URL="http://127.0.0.1:1/portal.tar.gz" \
+    run_recipe preview-no-oidc nodes=2 "portal_dir=$PORTAL_FIXTURE")"
+  check_eq "swapped named values keep the node count" "2" "$(node_dir_count)"
+  check_lacks "swapped named values never download" "$(cat "$DOCTOR_LOG")" "portal update"
+  check_has "swapped named values reach the node env" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
+    "PORTAL_DIR='$PORTAL_FIXTURE'"
 }
 
 test_readiness_contract() {
