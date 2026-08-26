@@ -322,7 +322,7 @@ fn sync_state_key() -> Key {
     ByteView::from(SYNC_STATE_KEY.to_vec())
 }
 
-async fn read_intake_entries(context: &Arc<DriverContext>) -> Vec<IntakeEntry> {
+pub(crate) async fn read_intake_entries(context: &Arc<DriverContext>) -> Vec<IntakeEntry> {
     let mut entries = Vec::new();
     let mut cursor: Option<Key> = None;
     loop {

@@ -2703,6 +2703,9 @@ impl TaskQueues {
         restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_intake_timer(&context.storage_handle, &task_handle).await;
+        // Before the first refresh: a queued edit is the one local change no
+        // holder would hand back.
+        crate::device::edit::replay_queued_edits(&context).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;

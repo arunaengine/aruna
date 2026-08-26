@@ -24,7 +24,8 @@ use ulid::Ulid;
 
 use crate::device::enqueue_draft::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
 use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
-use crate::device::repository::IntakeEntry;
+use crate::device::repository::{IntakeEntry, IntakeKind, IntakeState};
+use crate::device::status::read_intake_entries;
 use crate::driver::{DriverContext, drive};
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
@@ -87,6 +88,9 @@ pub async fn apply_local_edit(
             DeviceEditError::Unavailable
         }
     })?;
+    // The queue is durable first, so a crash before this leaves work to replay
+    // rather than an edit the realm never hears about.
+    request_persist(context).await;
 
     let mut edited = replica.clone();
     edited.record = Some(Box::new(record.clone()));
@@ -133,6 +137,9 @@ async fn merge_locally(
         .ok_or(DeviceEditError::Unavailable)?;
     let graph_iri = record.graph_iri.clone();
     let deterministic_actor = Some(actor);
+    // WAL-only durability: the publishing engine ignores the explicit actor and
+    // would publish into a topic no device can join. Crash safety comes from
+    // replaying the queued batch instead.
     let effect = match authored {
         MetadataBatchSource::ReplaceRoCrate { jsonld } => MetadataEffect::ApplyRoCrate {
             request: MetadataApplyRoCrateRequest {
@@ -143,7 +150,7 @@ async fn merge_locally(
                     permission_paths: vec![record.permission_path.clone()],
                 }
                 .normalized(),
-                durability: MetadataRequestDurability::Durable,
+                durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor,
             },
         },
@@ -151,7 +158,7 @@ async fn merge_locally(
             request: MetadataUpsertEntityRequest {
                 graph_iri,
                 jsonld: jsonld.clone(),
-                durability: MetadataRequestDurability::Durable,
+                durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor,
             },
         },
@@ -160,7 +167,7 @@ async fn merge_locally(
                 request: MetadataUpsertEntityRequest {
                     graph_iri,
                     jsonld: jsonld.clone(),
-                    durability: MetadataRequestDurability::Durable,
+                    durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor,
                 },
             }
@@ -214,6 +221,68 @@ async fn arm_drain(context: &Arc<DriverContext>) {
     }
 }
 
+/// Asks the metadata backend to make what it just wrote durable. Best effort:
+/// a failure leaves exactly the queued work the replay covers.
+async fn request_persist(context: &Arc<DriverContext>) {
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return;
+    };
+    if let Err(error) = metadata.flush_persistence().await {
+        warn!(error = %error, "Could not persist an offline edit's graph");
+    }
+}
+
+/// Whether one queued entry's batch has to go back into the local graph after a
+/// restart. An edit that is still on its way to the realm is the only local
+/// change nothing else would restore; a published one comes back with the next
+/// refresh, and a parked one is not this device's state to keep.
+pub fn replays_edit(entry: &IntakeEntry) -> bool {
+    matches!(entry.kind, IntakeKind::Edit { .. })
+        && matches!(
+            entry.state,
+            IntakeState::Pending { .. } | IntakeState::Publishing { .. }
+        )
+}
+
+/// Re-merges every queued edit into this device's replicas, and answers how
+/// many were replayed.
+///
+/// Local edits are written to craqle's WAL and persisted afterwards, so a crash
+/// in between can leave the graph behind the queue. Merging is idempotent by
+/// dot, so a batch the graph already carries costs nothing.
+pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return 0;
+    };
+    let mut replayed = 0usize;
+    for entry in read_intake_entries(context).await {
+        let IntakeKind::Edit { batch, .. } = &entry.kind else {
+            continue;
+        };
+        if !replays_edit(&entry) {
+            continue;
+        }
+        match metadata
+            .send_metadata_effect(MetadataEffect::MergeBatch {
+                graph_iri: batch.graph_iri.clone(),
+                batch: (**batch).clone(),
+            })
+            .await
+        {
+            Event::Metadata(MetadataEvent::BatchMerged { applied, .. }) => {
+                replayed += usize::from(applied);
+            }
+            other => {
+                warn!(draft_id = %entry.draft_id, event = ?other, "Could not replay a queued edit");
+            }
+        }
+    }
+    if replayed > 0 {
+        request_persist(context).await;
+    }
+    replayed
+}
+
 /// Whether this replica may take the edit locally: the owner selected it and
 /// a refresh has left it something to edit.
 pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
@@ -222,7 +291,12 @@ pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::device_edit_actor;
+    use super::{device_edit_actor, replays_edit};
+    use crate::device::repository::{IntakeEntry, IntakeKind, IntakeState};
+    use aruna_core::metadata::{MetadataBatch, MetadataBatchSource};
+    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+    use aruna_core::types::UserId;
+    use craqle::VectorClock;
     use ulid::Ulid;
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -246,5 +320,79 @@ mod tests {
             device_edit_actor(node(1), draft),
             device_edit_actor(node(1), Ulid::generate())
         );
+    }
+
+    fn record() -> MetadataRegistryRecord {
+        let document_id = Ulid::from_bytes([2u8; 16]);
+        MetadataRegistryRecord {
+            realm_id: RealmId::from_bytes([3u8; 32]),
+            group_id: Ulid::from_bytes([1u8; 16]),
+            document_id,
+            document_path: "notes".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: false,
+            permission_path: "/notes".to_string(),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: Ulid::from_bytes([4u8; 16]),
+            last_event_id: Ulid::from_bytes([5u8; 16]),
+        }
+    }
+
+    fn edit(state: IntakeState) -> IntakeEntry {
+        let mut entry = IntakeEntry::edit(
+            Ulid::generate(),
+            UserId::local(Ulid::generate(), RealmId::from_bytes([3u8; 32])),
+            &record(),
+            MetadataBatch {
+                graph_iri: record().graph_iri,
+                actor: [7u8; 32],
+                counter: 1,
+                base_clock: VectorClock::default(),
+                ops: Vec::new(),
+                timestamp_millis: 9,
+            },
+            MetadataBatchSource::UpsertDataEntity {
+                jsonld: "{}".to_string(),
+            },
+        );
+        entry.state = state;
+        entry
+    }
+
+    #[test]
+    fn replays_unpublished_edits() {
+        // Only an edit still on its way to the realm is local state nothing
+        // else restores; a create carries no batch to replay at all.
+        assert!(replays_edit(&edit(IntakeState::Pending {
+            due_at_ms: 0,
+            attempts: 0,
+            last_error: None,
+        })));
+        assert!(replays_edit(&edit(IntakeState::Publishing {
+            document_id: record().document_id,
+            due_at_ms: 0,
+            attempts: 1,
+        })));
+        assert!(!replays_edit(&edit(IntakeState::Published {
+            document_id: record().document_id,
+        })));
+        assert!(!replays_edit(&edit(IntakeState::Failed {
+            reason: "denied".to_string(),
+            retryable: false,
+        })));
+
+        let create = IntakeEntry::new(
+            Ulid::generate(),
+            UserId::local(Ulid::generate(), RealmId::from_bytes([3u8; 32])),
+            Ulid::from_bytes([1u8; 16]),
+            "notes".to_string(),
+            false,
+            "{}".to_string(),
+        );
+        assert!(matches!(create.kind, IntakeKind::Create));
+        assert!(!replays_edit(&create));
     }
 }
