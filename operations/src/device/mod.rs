@@ -5,10 +5,15 @@
 pub mod compute;
 pub mod delete_draft;
 pub mod drain;
+pub mod edit;
 pub mod enqueue_draft;
 pub mod inspect_draft;
 pub mod list_drafts;
 pub mod realm_documents;
+pub mod refresh;
+pub mod replica;
 pub mod repository;
+pub mod selection;
+pub mod status;
 pub mod sync;
 pub mod wipe;

@@ -369,6 +369,17 @@ pub struct MetadataRawRoCrateResponse {
     pub projected_event_id: Option<String>,
     pub context_digest: String,
     pub dataset_digest: Option<String>,
+    /// Present only while the merged graph fails profile validation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged: Option<MetadataMergedRoCrateResponse>,
+}
+
+/// The merged graph while it is invalid: what the editor opens to fix it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataMergedRoCrateResponse {
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+    pub findings: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1603,9 +1614,15 @@ unreadable one because both answer 404.
   export view.
 - The projected views (`full`, `summary`, `page`) require the document's graph to be materialized
   and answer 503 while a recently accepted write is still being projected.
-- The `raw` view returns the last accepted revision together with its winning event id,
+- The `raw` view returns the displayed revision together with the last event merged into it,
   projection state (`pending`, `materialized` or `failed`) and digests, so it is the view that can
   be read during that window.
+- Metadata graphs merge as OR-Sets, and only a valid crate is displayed. When the merged graph
+  fails profile validation the displayed revision stays at the last valid render and the `raw`
+  view also carries `merged` with the invalid render and its finding count, which is what an
+  editor opens so the owner can fix it.
+- The projected views (`full`, `summary`, `page`) render the merged graph, so they show the merged
+  state even while `merged` is present.
 - The pagination fields of the returned crate are only populated for the `page` view.
 - In the `summary` and `page` views the crate's root identifier is rewritten to a view-specific
   identifier carrying the requested view and cursor, so a partial crate is not mistaken for the
@@ -3316,6 +3333,16 @@ fn map_rocrate_export_response(
             projected_event_id: raw.projected_event_id.map(|event_id| event_id.to_string()),
             context_digest: hex::encode(raw.revision.context_digest),
             dataset_digest: dataset_digest.map(hex::encode),
+            merged: raw
+                .revision
+                .merged
+                .map(|merged| {
+                    Ok::<_, ServerError>(MetadataMergedRoCrateResponse {
+                        rocrate: parse_jsonld(merged.jsonld)?,
+                        findings: merged.findings,
+                    })
+                })
+                .transpose()?,
         })),
     }
 }

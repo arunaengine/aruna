@@ -7,8 +7,8 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
-    MetadataProfileValidationFinding, MetadataProfileValidationStatus, MetadataQueryResults,
-    MetadataSearchHit,
+    MetadataBatch, MetadataBatchSource, MetadataProfileValidationFinding,
+    MetadataProfileValidationStatus, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, PathClaimRecord,
@@ -18,6 +18,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
+use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -414,6 +415,43 @@ pub enum MetadataTransportMessage {
     FetchedRealmDocuments {
         result: Result<RealmDocuments, SyncRefusal>,
     },
+    /// The state a device seeds or refreshes one metadata replica from. A
+    /// device holds no bucket, so this routed read is how the OR-Set graph, the
+    /// registry record and the displayed render reach it.
+    FetchGraphState {
+        auth_token: MetadataAuthToken,
+        document_id: Ulid,
+    },
+    FetchedGraphState {
+        result: Result<Box<GraphState>, SyncRefusal>,
+    },
+    /// An edit a device already applied to its replica. The holder appends it
+    /// as an `ApplyBatch` event unchanged, so both sides converge on the same
+    /// OR-Set state whatever else happened meanwhile.
+    ForwardApplyBatch {
+        auth_token: MetadataAuthToken,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        batch: Box<MetadataBatch>,
+        authored: MetadataBatchSource,
+    },
+    ForwardedApplyBatch {
+        result: Result<Box<MetadataRegistryRecord>, SyncRefusal>,
+    },
+}
+
+/// One document as a holder serves it to a device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphState {
+    pub record: MetadataRegistryRecord,
+    /// The graph's live quads with their dots, joined into the device's replica.
+    pub snapshot: GraphReplicaSnapshot,
+    /// The last valid render, which is what the device displays and exports.
+    pub displayed_jsonld: String,
+    pub dataset_digest: Option<[u8; 32]>,
+    /// Profile findings against the merged state while it is invalid. Zero
+    /// means the displayed render is the merged one.
+    pub findings: u32,
 }
 
 /// The realm-wide documents as the serving node stores them. The copies a

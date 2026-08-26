@@ -140,6 +140,15 @@ pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 /// back, and it is never replicated.
 pub const DEVICE_REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
 
+/// The one row a device keeps about its exchange with the realm: when the realm
+/// last answered, when the last pass finished, and whether one is in flight.
+pub const DEVICE_SYNC_STATE_KEYSPACE: &str = "device_sync_state";
+
+/// The metadata documents this device keeps a local craqle replica of, keyed
+/// by document id. Never replicated: it records what the owner selected and
+/// how far this device has synced each replica.
+pub const DEVICE_REPLICA_KEYSPACE: &str = "device_replica";
+
 /// Device-local bindings of a directory to a realm bucket prefix, keyed by
 /// folder id. Never replicated: the root path must not leave the machine.
 pub const SYNCED_FOLDER_KEYSPACE: &str = "synced_folders";

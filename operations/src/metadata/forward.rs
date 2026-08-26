@@ -17,7 +17,9 @@ use aruna_core::keyspaces::{
     METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataError, MetadataProfileValidationStatus, MetadataQueryResults,
+    MetadataBatch, MetadataBatchSource, MetadataCreateEventRecord, MetadataEffect, MetadataError,
+    MetadataEvent, MetadataMaterializationState, MetadataProfileValidationStatus,
+    MetadataQueryResults, MetadataRawRevision, raw_context_digest,
 };
 use aruna_core::storage_entries::{
     admin_document_reducer_state_key, metadata_create_acceptance_key,
@@ -46,6 +48,8 @@ use crate::create_metadata_document::{
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
 };
+use crate::device::edit::{DeviceEditError, accepts_edits, apply_local_edit};
+use crate::device::replica::{ReplicaRecord, read_replica};
 use crate::document_sync_outbox::{
     new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
 };
@@ -53,7 +57,7 @@ use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
-    MetadataApiError, ensure_record_readable, export_metadata_rocrate,
+    MetadataApiError, MetadataRoCrateExportView, ensure_record_readable, export_metadata_rocrate,
     get_visible_metadata_document, load_record_by_document,
 };
 use crate::metadata::handle::{
@@ -61,9 +65,11 @@ use crate::metadata::handle::{
 };
 use crate::metadata::profile_validation::{current_validation_status, revalidate_current};
 use crate::metadata::protocol::{
-    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
-    PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution, RealmDocuments,
+    GraphState, MetadataAuthToken, MetadataReadError, MetadataTransportMessage,
+    MetadataWriteAuthError, PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
+    RealmDocuments,
 };
+use crate::metadata::raw::{MetadataRawView, load_raw_view};
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
@@ -336,6 +342,90 @@ where
     }
 }
 
+/// The replica this device keeps of one document, when it can answer on its
+/// own. A node that holds buckets is never a device and always reads its own
+/// registry instead.
+async fn device_replica(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+    local_node: Option<NodeId>,
+    document_id: Ulid,
+) -> Option<ReplicaRecord> {
+    if local_node.is_none_or(|node| is_sync_eligible(config, node)) {
+        return None;
+    }
+    read_replica(context, document_id)
+        .await
+        .filter(ReplicaRecord::serves_reads)
+}
+
+/// Exports one document from this device's replica. The displayed render is
+/// what the device holds, and the graph views come from the local craqle graph
+/// the replica installed.
+async fn device_export(
+    context: &Arc<DriverContext>,
+    replica: ReplicaRecord,
+    request: &ExportMetadataRoCrateRequest,
+) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    let record = replica
+        .record
+        .map(|record| *record)
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    ensure_record_readable(
+        context.as_ref(),
+        record.realm_id,
+        request.auth.as_ref(),
+        &record,
+        None,
+    )
+    .await?;
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    match request.view {
+        MetadataRoCrateExportView::Full => Ok(ExportMetadataRoCrateResult::Full {
+            jsonld: replica.displayed_jsonld,
+            record,
+        }),
+        MetadataRoCrateExportView::Raw => Ok(ExportMetadataRoCrateResult::Raw {
+            raw: MetadataRawView {
+                revision: MetadataRawRevision {
+                    context_digest: raw_context_digest(&replica.displayed_jsonld)
+                        .unwrap_or_default(),
+                    jsonld: replica.displayed_jsonld,
+                    winning_event_id: record.last_event_id,
+                    dataset_digest: replica.dataset_digest,
+                    merged: None,
+                },
+                projection_state: MetadataMaterializationState::Materialized,
+                projected_event_id: Some(record.last_event_id),
+            },
+            dataset_digest: replica.dataset_digest,
+            record,
+        }),
+        MetadataRoCrateExportView::Summary => Ok(ExportMetadataRoCrateResult::Summary {
+            jsonld: handle
+                .export_rocrate_summary_jsonld(record.graph_iri.clone())
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+            record,
+        }),
+        MetadataRoCrateExportView::Page => Ok(ExportMetadataRoCrateResult::Page {
+            page: handle
+                .export_rocrate_page(
+                    record.graph_iri.clone(),
+                    request.limit.unwrap_or(100).clamp(1, 1_000),
+                    request.offset,
+                    request.after.clone(),
+                )
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+            record,
+        }),
+    }
+}
+
 pub async fn get_metadata_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -348,6 +438,24 @@ pub async fn get_metadata_routed(
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    // A device answers from its own replica, so a selected document stays
+    // readable while the realm is out of reach.
+    if let Some(replica) = device_replica(context, &config, local_node, request.document_id).await {
+        let record = replica
+            .record
+            .map(|record| *record)
+            .ok_or(MetadataApiError::ServiceUnavailable)?;
+        ensure_record_readable(
+            context.as_ref(),
+            realm_id,
+            request.auth.as_ref(),
+            &record,
+            None,
+        )
+        .await?;
+        return Ok(record);
+    }
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
@@ -356,7 +464,6 @@ pub async fn get_metadata_routed(
     let holders =
         read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
     let holder_count = holders.len();
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
     let config = Arc::new(config);
     let metadata = context.metadata_handle.clone();
@@ -605,6 +712,12 @@ pub async fn export_rocrate_routed(
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    if let Some(replica) = device_replica(context, &config, local_node, request.document_id).await {
+        let export = device_export(context, replica, &request).await?;
+        ensure_export_limit(&export, metadata_bytes)?;
+        return Ok(export);
+    }
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
@@ -613,7 +726,6 @@ pub async fn export_rocrate_routed(
     let holders =
         read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
     let holder_count = holders.len();
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
     let metadata = context.metadata_handle.clone();
     let request_template = request.clone();
@@ -801,6 +913,15 @@ pub async fn update_metadata_document_routed(
         .ok_or_else(|| {
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
+    // On a device a selected document is edited locally and queued; a holder
+    // sees the change set when the intake drain forwards it.
+    if let Some(replica) = device_replica(context, &config, Some(actor.node_id), document_id).await
+        && accepts_edits(&replica)
+    {
+        return apply_local_edit(context, actor.user_id, actor.node_id, &replica, mutation)
+            .await
+            .map_err(device_edit_error);
+    }
     let placement = resolve_metadata_id(
         &config,
         actor.realm_id,
@@ -888,6 +1009,93 @@ pub async fn update_metadata_document_routed(
                 .into(),
         ),
         other => Err(unexpected_response(other)),
+    }
+}
+
+/// Forwards one edit a device made on its replica to a holder.
+///
+/// The batch is idempotent by its dot, but an ambiguous delivery still stops
+/// the attempt: replaying it would append a second event for a merge that
+/// changes nothing.
+pub async fn apply_batch_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+    batch: Box<MetadataBatch>,
+    authored: MetadataBatchSource,
+    auth_token: MetadataAuthToken,
+) -> Result<MetadataRegistryRecord, MetadataWriteError> {
+    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
+        MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
+    })?;
+    let config_digest = config
+        .digest()
+        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    let placement = resolve_metadata_id(&config, realm_id, None, document_id)
+        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    let metadata = context.metadata_handle.as_ref().ok_or_else(|| {
+        MetadataWriteError::Undeliverable("no metadata handle to forward with".to_string())
+    })?;
+    let message = MetadataTransportMessage::ForwardApplyBatch {
+        auth_token,
+        config_digest,
+        document_id,
+        batch,
+        authored,
+    };
+    let mut detail = String::from("the document's bucket has no reachable holder");
+    for holder in distinct_holders(&resolve_shard_holders(&config, &placement)) {
+        match metadata
+            .request_forwarded_write(holder, message.clone())
+            .await
+        {
+            Ok(MetadataTransportMessage::ForwardedApplyBatch { result: Ok(record) }) => {
+                return Ok(*record);
+            }
+            Ok(MetadataTransportMessage::ForwardedApplyBatch {
+                result: Err(SyncRefusal::Unavailable),
+            }) => detail = format!("{holder}: holder could not apply the device edit"),
+            Ok(MetadataTransportMessage::ForwardedApplyBatch {
+                result: Err(refusal),
+            }) => return Err(batch_refusal(refusal)),
+            Ok(other) => return Err(unexpected_response(other)),
+            Err(error) => {
+                warn!(holder = %holder, error = %error, "Failed to forward a device edit to holder");
+                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
+                    return Err(MetadataWriteError::Undeliverable(format!(
+                        "forward to holder `{holder}` may have applied the device edit before failing; refusing to replay it: {error}"
+                    )));
+                }
+                detail = format!("{holder}: {error}");
+            }
+        }
+    }
+    Err(MetadataWriteError::Undeliverable(detail))
+}
+
+/// An offline edit's verdict, as the metadata routes report it.
+fn device_edit_error(error: DeviceEditError) -> MetadataWriteError {
+    match error {
+        DeviceEditError::Invalid(message) => {
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
+        }
+        DeviceEditError::NoReplica => MetadataWriteError::NotFound,
+        other => MetadataWriteError::Undeliverable(other.to_string()),
+    }
+}
+
+/// A holder's verdict on a device edit, as the drain classifies it.
+fn batch_refusal(refusal: SyncRefusal) -> MetadataWriteError {
+    match refusal {
+        SyncRefusal::Unauthorized => MetadataWriteError::Unauthorized,
+        SyncRefusal::Forbidden => MetadataWriteError::Forbidden,
+        SyncRefusal::NotFound => MetadataWriteError::NotFound,
+        SyncRefusal::Invalid(message) => {
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
+        }
+        SyncRefusal::Unavailable => {
+            MetadataWriteError::Undeliverable("no holder could apply the device edit".to_string())
+        }
     }
 }
 
@@ -2176,6 +2384,197 @@ async fn read_document(
     }
 }
 
+/// Serves one document's graph state to a device that keeps a replica of it.
+///
+/// Only a holder answers, and only for the owner the realm config binds the
+/// asking device to. The device joins the snapshot into its own replica, so
+/// what travels is state, never authority.
+pub(crate) async fn serve_graph_state(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::FetchGraphState {
+        auth_token,
+        document_id,
+    } = message
+    else {
+        return reject("unexpected metadata control message");
+    };
+    MetadataTransportMessage::FetchedGraphState {
+        result: read_graph_state(context, peer, auth_token, document_id)
+            .await
+            .map(Box::new),
+    }
+}
+
+async fn read_graph_state(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+    document_id: Ulid,
+) -> Result<GraphState, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    let record = load_record_by_document(context.as_ref(), document_id)
+        .await
+        .map_err(sync_refusal)?;
+    ensure_record_readable(context.as_ref(), realm_id, Some(&auth), &record, None)
+        .await
+        .map_err(sync_refusal)?;
+    let graph_iri = record.graph_iri.clone();
+    let snapshot = match metadata
+        .send_metadata_effect(MetadataEffect::GraphSnapshot { graph_iri })
+        .await
+    {
+        Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => *snapshot,
+        other => {
+            warn!(%document_id, event = ?other, "Could not snapshot a graph for a device");
+            return Err(SyncRefusal::Unavailable);
+        }
+    };
+    let raw = load_raw_view(context.as_ref(), document_id, None)
+        .await
+        .map_err(|_| SyncRefusal::Unavailable)?
+        .ok_or(SyncRefusal::NotFound)?;
+    Ok(GraphState {
+        record,
+        snapshot,
+        displayed_jsonld: raw.revision.jsonld,
+        dataset_digest: raw.revision.dataset_digest,
+        findings: raw.revision.merged.map_or(0, |merged| merged.findings),
+    })
+}
+
+fn sync_refusal(error: MetadataApiError) -> SyncRefusal {
+    match error {
+        MetadataApiError::Unauthorized => SyncRefusal::Unauthorized,
+        MetadataApiError::Forbidden => SyncRefusal::Forbidden,
+        MetadataApiError::NotFound => SyncRefusal::NotFound,
+        _ => SyncRefusal::Unavailable,
+    }
+}
+
+/// Applies an edit a device already made on its replica.
+///
+/// The batch is appended unchanged as an ordinary update event, so every holder
+/// materializes the same OR-Set change set the owner saw locally and the two
+/// sides converge whatever else happened while the device was away.
+pub(crate) async fn apply_device_batch(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    MetadataTransportMessage::ForwardedApplyBatch {
+        result: run_device_batch(context, peer, message).await.map(Box::new),
+    }
+}
+
+async fn run_device_batch(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataRegistryRecord, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = authorize_forwarded_caller(context, peer, realm_id, &message)
+        .await
+        .map_err(|error| match error {
+            ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
+            ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
+            ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    let MetadataTransportMessage::ForwardApplyBatch {
+        config_digest,
+        document_id,
+        batch,
+        authored,
+        ..
+    } = message
+    else {
+        return Err(SyncRefusal::Invalid(
+            "unexpected metadata control message".to_string(),
+        ));
+    };
+    if config.digest().ok() != Some(config_digest) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let record = held_record(context, &config, net_handle.node_id(), document_id)
+        .await
+        .map_err(|error| match error {
+            HeldRecordError::NotFound => SyncRefusal::NotFound,
+            HeldRecordError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    // The batch names the graph it was planned against; another graph's change
+    // set must never be applied here.
+    if batch.graph_iri != record.graph_iri {
+        return Err(SyncRefusal::Invalid(
+            "the batch was planned against another document".to_string(),
+        ));
+    }
+    authorize_write(context, auth.clone(), record.permission_path.clone())
+        .await
+        .map_err(|error| match error {
+            ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
+            ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
+            ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    let operation = UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        actor: Actor {
+            node_id: net_handle.node_id(),
+            user_id: auth.user_id,
+            realm_id,
+        },
+        group_id: record.group_id,
+        document_id,
+        public: record.public,
+        mutation: UpdateMetadataDocumentMutation::ApplyBatch { batch, authored },
+    });
+    update_metadata_document(operation, context.as_ref())
+        .await
+        .map_err(|error| match error {
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)) => {
+                SyncRefusal::Invalid(message)
+            }
+            other => {
+                warn!(%document_id, error = %other, "A device edit did not apply");
+                SyncRefusal::Unavailable
+            }
+        })
+}
+
 /// Originates a group create requested by a device. Authority is the caller's
 /// forwarded token, checked exactly as the local HTTP handler would; a User
 /// peer may only ever act for the owner its realm config binds it to.
@@ -2824,6 +3223,7 @@ pub(crate) async fn authorize_forwarded_caller(
             auth_token.clone()
         }
         MetadataTransportMessage::ForwardGroupCreate { auth_token, .. } => auth_token.clone(),
+        MetadataTransportMessage::ForwardApplyBatch { auth_token, .. } => Some(auth_token.clone()),
         _ => None,
     };
     let auth = metadata_handle
@@ -3115,6 +3515,7 @@ mod tests {
             findings: Vec::new(),
             completeness: MetadataProfileValidationCompleteness::Complete,
             stale_reason: None,
+            dataset_digest: None,
         }
     }
 

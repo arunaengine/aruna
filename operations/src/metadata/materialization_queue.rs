@@ -14,12 +14,12 @@ use aruna_core::keyspaces::{
     METADATA_MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataApplyRoCrateRequest, MetadataCreateCrateRequest, MetadataCreateEventPayload,
-    MetadataCreateEventRecord, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataMaterializationDeadLetterRecord,
-    MetadataMaterializationJobRecord, MetadataMaterializationState,
-    MetadataMaterializationStatusRecord, MetadataRawRevision, MetadataRequestDurability,
-    deterministic_materialization_actor,
+    MetadataApplyRoCrateRequest, MetadataBatch, MetadataCreateCrateRequest,
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataError,
+    MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy,
+    MetadataMaterializationDeadLetterRecord, MetadataMaterializationJobRecord,
+    MetadataMaterializationState, MetadataMaterializationStatusRecord, MetadataRawRevision,
+    MetadataRequestDurability, deterministic_materialization_actor,
 };
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, materialization_prune_entry, materialization_prune_key,
@@ -27,7 +27,7 @@ use aruna_core::storage_entries::{
     metadata_materialization_document_job_key, metadata_materialization_document_job_prefix,
     metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
     metadata_materialization_job_write_entry, metadata_materialization_status_key,
-    metadata_materialization_status_write_entry,
+    metadata_materialization_status_write_entry, metadata_profile_validation_status_write_entry,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -46,6 +46,7 @@ use crate::driver::DriverContext;
 use crate::queue_backoff::queue_retry_after_ms;
 
 use super::iri_index::MetadataIriIndexError;
+use super::profile_validation::{assess_render, violation_count};
 use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
     start_write_transaction,
@@ -101,6 +102,7 @@ struct CompletedMaterializationJob {
     status: Option<MetadataMaterializationStatusRecord>,
     iri_index_writes: Vec<(String, ByteView, ByteView)>,
     raw_state_write: Option<(String, ByteView, ByteView)>,
+    validation_write: Option<(String, ByteView, ByteView)>,
     sync: Option<CompletedMaterializationSync>,
 }
 
@@ -707,6 +709,9 @@ async fn plan_finish_chunk(
                         plan.writes.extend(job.iri_index_writes);
                         if let Some(raw_state_write) = job.raw_state_write {
                             plan.writes.push(raw_state_write);
+                        }
+                        if let Some(validation_write) = job.validation_write {
+                            plan.writes.push(validation_write);
                         }
                         plan.writes
                             .push(metadata_materialization_status_write_entry(&status)?);
@@ -1592,6 +1597,7 @@ async fn process_materialization_job(
                     status: None,
                     iri_index_writes: Vec::new(),
                     raw_state_write: None,
+                    validation_write: None,
                     sync: None,
                 },
                 Duration::ZERO,
@@ -1613,6 +1619,7 @@ async fn process_materialization_job(
                     status: None,
                     iri_index_writes: Vec::new(),
                     raw_state_write: None,
+                    validation_write: None,
                     sync: None,
                 },
                 Duration::ZERO,
@@ -1634,6 +1641,7 @@ async fn process_materialization_job(
                 )),
                 iri_index_writes: Vec::new(),
                 raw_state_write: None,
+                validation_write: None,
                 sync: None,
             },
             Duration::ZERO,
@@ -1667,6 +1675,7 @@ async fn process_materialization_job(
                     )),
                     iri_index_writes,
                     raw_state_write: Some(materialized.raw_state_write),
+                    validation_write: materialized.validation_write,
                     sync: Some(CompletedMaterializationSync {
                         graph_iri: event.record.graph_iri.clone(),
                         peers: event.record.holder_node_ids.clone(),
@@ -1689,6 +1698,7 @@ async fn process_materialization_job(
                     )),
                     iri_index_writes: Vec::new(),
                     raw_state_write: None,
+                    validation_write: None,
                     sync: None,
                 },
                 craqle_elapsed,
@@ -2098,6 +2108,7 @@ async fn metadata_graph_deleted(
 struct MaterializedCreateEvent {
     raw_revision: Option<MetadataRawRevision>,
     raw_state_write: (String, ByteView, ByteView),
+    validation_write: Option<(String, ByteView, ByteView)>,
 }
 
 async fn materialize_create_event(
@@ -2105,6 +2116,9 @@ async fn materialize_create_event(
     event: &MetadataCreateEventRecord,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<MaterializedCreateEvent, MetadataMaterializationQueueError> {
+    if let MetadataCreateEventPayload::ApplyBatch { batch, .. } = &event.payload {
+        return merge_batch_event(context, event, batch, raw_state_cache).await;
+    }
     let raw_plan = crate::metadata::raw::prepare_raw_event(context, event, raw_state_cache).await?;
     let metadata_handle = context
         .metadata_handle
@@ -2125,6 +2139,7 @@ async fn materialize_create_event(
             Ok(MaterializedCreateEvent {
                 raw_revision: raw_plan.revision,
                 raw_state_write: raw_plan.state_write,
+                validation_write: None,
             })
         }
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
@@ -2132,6 +2147,94 @@ async fn materialize_create_event(
             "{other:?}"
         ))),
     }
+}
+
+/// Merges the origin's batch, then re-renders and re-validates the graph.
+///
+/// The merge is order independent and idempotent by dot, so every holder ends
+/// at the same graph whatever order the events arrive in.
+async fn merge_batch_event(
+    context: &DriverContext,
+    event: &MetadataCreateEventRecord,
+    batch: &MetadataBatch,
+    raw_state_cache: &mut RawStateCache,
+) -> Result<MaterializedCreateEvent, MetadataMaterializationQueueError> {
+    let metadata_handle = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataMaterializationQueueError::MetadataHandleMissing)?;
+    // A batch carries quads only, so the event's visibility is applied here the
+    // way a crate replacement used to carry it.
+    match metadata_handle
+        .send_effect(Effect::Metadata(MetadataEffect::SetGraphPolicy {
+            graph_iri: event.record.graph_iri.clone(),
+            policy: MetadataGraphPolicy {
+                public: event.record.public,
+                permission_paths: vec![event.record.permission_path.clone()],
+            }
+            .normalized(),
+        }))
+        .await
+    {
+        Event::Metadata(MetadataEvent::GraphPolicySet { .. }) => {}
+        Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
+        other => {
+            return Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    }
+    match metadata_handle
+        .send_effect(Effect::Metadata(MetadataEffect::MergeBatch {
+            graph_iri: event.record.graph_iri.clone(),
+            batch: batch.clone(),
+        }))
+        .await
+    {
+        Event::Metadata(MetadataEvent::BatchMerged { .. }) => {}
+        Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
+        other => {
+            return Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    }
+    let render = match metadata_handle
+        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
+            graph_iri: event.record.graph_iri.clone(),
+        }))
+        .await
+    {
+        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => jsonld,
+        Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
+        other => {
+            return Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let mut status = assess_render(context, event.record.document_id, &render).await;
+    let findings = violation_count(&status);
+    let raw_plan = crate::metadata::raw::prepare_merged_event(
+        context,
+        event,
+        render,
+        findings,
+        raw_state_cache,
+    )
+    .await?;
+    raw_plan.cache(raw_state_cache);
+    status.dataset_revision = event.event_id;
+    status.dataset_digest = raw_plan
+        .revision
+        .as_ref()
+        .and_then(|revision| revision.dataset_digest);
+    let validation_write = metadata_profile_validation_status_write_entry(&status)?;
+    Ok(MaterializedCreateEvent {
+        raw_revision: raw_plan.revision,
+        raw_state_write: raw_plan.state_write,
+        validation_write: Some(validation_write),
+    })
 }
 
 async fn project_materialized_iri_references(
@@ -2224,6 +2327,12 @@ fn graph_materialization_effect(
                     durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor,
                 },
+            })
+        }
+        MetadataCreateEventPayload::ApplyBatch { batch, .. } => {
+            Effect::Metadata(MetadataEffect::MergeBatch {
+                graph_iri: event.record.graph_iri.clone(),
+                batch: batch.clone(),
             })
         }
     }
@@ -3635,6 +3744,7 @@ mod tests {
             winning_event_id: event_id,
             context_digest: [1; 32],
             dataset_digest: Some([2; 32]),
+            merged: None,
         };
         match graph_materialization_effect(&contextual, Some(&raw_revision), true) {
             Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
@@ -3924,6 +4034,7 @@ mod tests {
                 status: Some(materialization_success_status(&old_job, &old_event, None)),
                 iri_index_writes: Vec::new(),
                 raw_state_write: None,
+                validation_write: None,
                 sync: None,
             },
         )];
@@ -4040,6 +4151,7 @@ mod tests {
                         raw_state_key.clone(),
                         ByteView::from(vec![1]),
                     )),
+                    validation_write: None,
                     sync: None,
                 },
             )],
@@ -4137,6 +4249,7 @@ mod tests {
                     raw_revision_key(document_id),
                     ByteView::from(event_id.to_bytes().to_vec()),
                 )),
+                validation_write: None,
                 sync: None,
             }
         };
@@ -4521,6 +4634,7 @@ mod tests {
                 status: None,
                 iri_index_writes: Vec::new(),
                 raw_state_write: None,
+                validation_write: None,
                 sync: Some(CompletedMaterializationSync {
                     graph_iri: graph_iri.clone(),
                     peers,

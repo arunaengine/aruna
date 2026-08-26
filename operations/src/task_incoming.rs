@@ -974,6 +974,9 @@ impl OperationsTaskHandler {
             REALM_DOCUMENTS_BUDGET,
         )
         .await;
+        if fetched {
+            crate::device::status::note_contact(&self.context).await;
+        }
         let mut state = self
             .realm_documents
             .lock()
@@ -987,6 +990,14 @@ impl OperationsTaskHandler {
             false => queue_retry_after_ms(attempts),
         };
         *state = (attempts, now.saturating_add(after));
+    }
+
+    /// Refreshes the metadata replicas this device keeps, on the same beat the
+    /// folders run on. A node that keeps none does nothing.
+    async fn refresh_device_replicas(&self) {
+        if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
+            crate::device::status::note_sync(&self.context).await;
+        }
     }
 
     /// Takes the open rotation, leaving a fresh one for a concurrent
@@ -2894,6 +2905,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 // After the folders, never before them: an unreachable realm
                 // must not hold up the owner's own files.
                 self.fetch_realm_documents().await;
+                self.refresh_device_replicas().await;
             }
             TaskKey::DrainSyncUploadOutbox => {
                 let after = match crate::device::sync::drain_sync_outbox(&self.context).await {

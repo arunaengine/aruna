@@ -9,7 +9,7 @@ use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::repository::{IntakeEntry, MAX_INTAKE_ENTRIES, intake_entry};
+use super::repository::{IntakeEntry, IntakeKind, MAX_INTAKE_ENTRIES, intake_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnqueueDraftInput {
@@ -86,7 +86,11 @@ impl Operation for EnqueueDraftOperation {
         if self.input.entry.document_path.trim().is_empty() {
             return fail(self, EnqueueDraftError::MissingPath);
         }
-        if self.input.entry.jsonld.trim().is_empty() {
+        // An edit carries its submission in the kind; only a create authors the
+        // crate text this field holds.
+        if matches!(self.input.entry.kind, IntakeKind::Create)
+            && self.input.entry.jsonld.trim().is_empty()
+        {
             return fail(self, EnqueueDraftError::MissingPayload);
         }
         self.state = EnqueueDraftState::StartTransaction;

@@ -6,7 +6,7 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::{MetadataAuthToken, MetadataError};
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::task::{TaskEvent, TaskKey};
@@ -22,14 +22,19 @@ use crate::create_metadata_document::{
     CreateMetadataDocumentPayload, mint_forward_document,
 };
 use crate::driver::DriverContext;
-use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use crate::metadata::forward::{
+    MetadataWriteError, apply_batch_routed, create_metadata_document_routed,
+};
 use crate::process_placements::load_realm_config;
 use crate::queue_backoff::queue_retry_after_ms;
+use crate::update_metadata_document::UpdateMetadataDocumentError;
 
+use super::replica::{read_replica, store_replica};
 use super::repository::{
-    IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, entry_with_state, intake_entry, read_intake,
-    scan_intake,
+    IntakeEntry, IntakeKind, IntakeState, MAX_INTAKE_ATTEMPTS, entry_with_state, intake_entry,
+    read_intake, scan_intake,
 };
+use super::selection::track_created;
 
 /// Delay before a deferred pass looks for the realm again.
 pub const INTAKE_DEFER_RETRY_AFTER: Duration = Duration::from_secs(15);
@@ -221,8 +226,10 @@ async fn claim_entry(
     entry: &IntakeEntry,
 ) -> Option<Claim> {
     let attempts = entry.attempts().saturating_add(1);
-    let document_id = match &entry.state {
-        IntakeState::Publishing { document_id, .. } => *document_id,
+    let document_id = match (&entry.kind, &entry.state) {
+        // An edit already names its document; nothing is minted for it.
+        (IntakeKind::Edit { document_id, .. }, _) => *document_id,
+        (_, IntakeState::Publishing { document_id, .. }) => *document_id,
         _ => {
             let actor = Actor {
                 node_id,
@@ -284,6 +291,9 @@ async fn publish_entry(
         realm_id,
         path_restrictions: None,
     };
+    if matches!(entry.kind, IntakeKind::Edit { .. }) {
+        return publish_edit(context, realm_id, entry, claim, auth).await;
+    }
     let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(
         CreateMetadataDocumentConfig {
             actor,
@@ -305,11 +315,25 @@ async fn publish_entry(
     {
         Ok(_) => {
             info!(draft_id = %entry.draft_id, document_id = %document_id, "Published a queued draft");
+            track_created(
+                context,
+                document_id,
+                entry.group_id,
+                entry.document_path.clone(),
+            )
+            .await;
             IntakeState::Published { document_id }
         }
         // The id was minted for this entry alone, so an existing document under
         // it is this entry's own earlier forward.
         Err(MetadataWriteError::Create(CreateMetadataDocumentError::DocumentAlreadyExists)) => {
+            track_created(
+                context,
+                document_id,
+                entry.group_id,
+                entry.document_path.clone(),
+            )
+            .await;
             IntakeState::Published { document_id }
         }
         Err(error) if permanent(&error) => IntakeState::Failed {
@@ -322,13 +346,70 @@ async fn publish_entry(
     }
 }
 
-/// Authorization and target verdicts do not improve by waiting.
+/// Forwards one claimed edit. The batch is what the owner already applied
+/// locally, so a holder that accepts it converges with this device.
+async fn publish_edit(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    entry: &IntakeEntry,
+    claim: &Claim,
+    auth: AuthContext,
+) -> IntakeState {
+    let IntakeKind::Edit {
+        document_id,
+        batch,
+        authored,
+    } = &entry.kind
+    else {
+        return IntakeState::Failed {
+            reason: "not an edit".to_string(),
+            retryable: false,
+        };
+    };
+    match apply_batch_routed(
+        context,
+        realm_id,
+        *document_id,
+        batch.clone(),
+        authored.clone(),
+        MetadataAuthToken::internal(auth),
+    )
+    .await
+    {
+        Ok(_) => {
+            info!(draft_id = %entry.draft_id, document_id = %document_id, "Published an offline edit");
+            settle_edit(context, *document_id).await;
+            IntakeState::Published {
+                document_id: *document_id,
+            }
+        }
+        Err(error) if permanent(&error) => IntakeState::Failed {
+            reason: error.to_string(),
+            retryable: false,
+        },
+        Err(error) => publishing_retry(*document_id, claim.attempts, error.to_string()),
+    }
+}
+
+/// Records that the realm has seen one of this replica's edits.
+async fn settle_edit(context: &Arc<DriverContext>, document_id: Ulid) {
+    let Some(mut replica) = read_replica(context, document_id).await else {
+        return;
+    };
+    replica.pending_edits = replica.pending_edits.saturating_sub(1);
+    store_replica(context, &replica).await;
+}
+
+/// Authorization, target and payload verdicts do not improve by waiting.
 fn permanent(error: &MetadataWriteError) -> bool {
     matches!(
         error,
         MetadataWriteError::Unauthorized
             | MetadataWriteError::Forbidden
             | MetadataWriteError::NotFound
+            | MetadataWriteError::Update(UpdateMetadataDocumentError::MetadataError(
+                MetadataError::InvalidInput(_)
+            ))
     )
 }
 

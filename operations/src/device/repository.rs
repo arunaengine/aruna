@@ -3,6 +3,8 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
+use aruna_core::metadata::{MetadataBatch, MetadataBatchSource};
+use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, TxnId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
@@ -20,9 +22,9 @@ pub const INTAKE_PAGE_SIZE: usize = 64;
 /// entry that keeps failing must stay visible instead of retrying forever.
 pub const MAX_INTAKE_ATTEMPTS: u32 = 8;
 
-/// What the owner asked the device to create once the realm is reachable.
-/// Only creates queue: an update or delete of shared state must be refused
-/// while the realm is unreachable rather than replayed later.
+/// What the owner asked the device to publish once the realm is reachable: a
+/// create of a new document, or an edit already applied to a local replica.
+/// A delete of shared state still needs connectivity and is never queued.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntakeEntry {
     /// Stable local reference. It never becomes the realm document id.
@@ -32,10 +34,26 @@ pub struct IntakeEntry {
     pub group_id: GroupId,
     pub document_path: String,
     pub public: bool,
-    /// RO-Crate JSON-LD exactly as the owner authored it.
+    /// RO-Crate JSON-LD exactly as the owner authored it. Empty for an edit,
+    /// whose submission travels inside the kind.
     pub jsonld: String,
     pub created_at_ms: u64,
     pub state: IntakeState,
+    pub kind: IntakeKind,
+}
+
+/// What one entry publishes. Appended after the create fields so a create
+/// entry keeps describing itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntakeKind {
+    Create,
+    /// An OR-Set change set the owner already applied to this device's replica.
+    /// A holder appends it as an `ApplyBatch` event, unchanged.
+    Edit {
+        document_id: Ulid,
+        batch: Box<MetadataBatch>,
+        authored: MetadataBatchSource,
+    },
 }
 
 /// Lifecycle of one queued create.
@@ -85,6 +103,51 @@ impl IntakeEntry {
                 due_at_ms: now,
                 attempts: 0,
                 last_error: None,
+            },
+            kind: IntakeKind::Create,
+        }
+    }
+
+    /// One offline edit of a document this device holds a replica of. The batch
+    /// is already merged locally; queueing only records that a holder has not
+    /// seen it yet.
+    pub fn edit(
+        draft_id: Ulid,
+        owner: UserId,
+        record: &MetadataRegistryRecord,
+        batch: MetadataBatch,
+        authored: MetadataBatchSource,
+    ) -> Self {
+        let now = unix_timestamp_millis();
+        Self {
+            draft_id,
+            owner,
+            group_id: record.group_id,
+            document_path: record.document_path.clone(),
+            public: record.public,
+            jsonld: String::new(),
+            created_at_ms: now,
+            state: IntakeState::Pending {
+                due_at_ms: now,
+                attempts: 0,
+                last_error: None,
+            },
+            kind: IntakeKind::Edit {
+                document_id: record.document_id,
+                batch: Box::new(batch),
+                authored,
+            },
+        }
+    }
+
+    /// The document this entry publishes onto, once it is known.
+    pub fn document_id(&self) -> Option<Ulid> {
+        match &self.kind {
+            IntakeKind::Edit { document_id, .. } => Some(*document_id),
+            IntakeKind::Create => match &self.state {
+                IntakeState::Publishing { document_id, .. }
+                | IntakeState::Published { document_id } => Some(*document_id),
+                IntakeState::Pending { .. } | IntakeState::Failed { .. } => None,
             },
         }
     }
@@ -163,9 +226,49 @@ pub fn read_intake(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
 #[cfg(test)]
 mod tests {
     use super::{IntakeEntry, IntakeState, intake_key};
-    use aruna_core::structs::RealmId;
+    use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
+    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_core::types::UserId;
+    use craqle::VectorClock;
     use ulid::Ulid;
+
+    fn record() -> MetadataRegistryRecord {
+        let document_id = Ulid::from_bytes([2u8; 16]);
+        MetadataRegistryRecord {
+            realm_id: RealmId::from_bytes([3u8; 32]),
+            group_id: Ulid::from_bytes([1u8; 16]),
+            document_id,
+            document_path: "notes".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: false,
+            permission_path: "/notes".to_string(),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: Ulid::from_bytes([4u8; 16]),
+            last_event_id: Ulid::from_bytes([5u8; 16]),
+        }
+    }
+
+    fn batch() -> MetadataBatch {
+        MetadataBatch {
+            graph_iri: record().graph_iri,
+            actor: [7u8; 32],
+            counter: 1,
+            base_clock: VectorClock::default(),
+            ops: vec![MetadataQuadOp::Add {
+                subject: "<https://example.org/s>".to_string(),
+                predicate: "<https://example.org/p>".to_string(),
+                object: "\"o\"".to_string(),
+                dot: MetadataDot {
+                    actor: [7u8; 32],
+                    counter: 1,
+                },
+            }],
+            timestamp_millis: 9,
+        }
+    }
 
     fn entry() -> IntakeEntry {
         IntakeEntry::new(
@@ -193,6 +296,24 @@ mod tests {
         let entry = entry();
         let bytes = entry.to_bytes().unwrap();
         assert_eq!(IntakeEntry::from_bytes(&bytes).unwrap(), entry);
+    }
+
+    #[test]
+    fn round_trips_edit() {
+        // The batch is the only copy of what the owner changed offline, so it
+        // has to survive the store byte for byte.
+        let entry = IntakeEntry::edit(
+            Ulid::generate(),
+            UserId::local(Ulid::generate(), RealmId::from_bytes([3u8; 32])),
+            &record(),
+            batch(),
+            MetadataBatchSource::UpsertDataEntity {
+                jsonld: r#"{"@id":"data.csv"}"#.to_string(),
+            },
+        );
+        let decoded = IntakeEntry::from_bytes(&entry.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.document_id(), Some(record().document_id));
     }
 
     #[test]

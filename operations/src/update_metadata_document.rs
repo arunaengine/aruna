@@ -5,11 +5,10 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataApplyRoCrateRequest,
+    METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataBatch, MetadataBatchSource,
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentLifecycleRecord,
-    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
-    MetadataProfileValidationStatus, MetadataRawOriginBudget, MetadataRequestDurability,
-    raw_quotas,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataProfileValidationStatus,
+    MetadataRawOriginBudget, deterministic_materialization_actor, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
@@ -59,9 +58,21 @@ pub struct UpdateMetadataDocumentConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UpdateMetadataDocumentMutation {
-    ReplaceRoCrate { jsonld: String },
-    UpsertDataEntity { jsonld: String },
-    UpsertContextualEntity { jsonld: String },
+    ReplaceRoCrate {
+        jsonld: String,
+    },
+    UpsertDataEntity {
+        jsonld: String,
+    },
+    UpsertContextualEntity {
+        jsonld: String,
+    },
+    /// A batch a device planned against its own replica. It is appended
+    /// verbatim, under the device's actor, so both replicas converge on it.
+    ApplyBatch {
+        batch: Box<MetadataBatch>,
+        authored: MetadataBatchSource,
+    },
 }
 
 /// Validates a metadata update and persists the event plus projection work.
@@ -72,9 +83,13 @@ pub enum UpdateMetadataDocumentMutation {
 #[derive(Debug, PartialEq)]
 pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,
+    /// Minted before the batch is planned: it is the batch actor as well as the
+    /// event id, so a plan can never be attributed to another event.
+    event_id: Ulid,
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
     update_event: Option<MetadataCreateEventRecord>,
+    planned_batch: Option<MetadataBatch>,
     raw_budget: Option<MetadataRawOriginBudget>,
     next_raw_budget: Option<MetadataRawOriginBudget>,
     accepted_create: Option<MetadataCreateEventRecord>,
@@ -92,7 +107,7 @@ enum UpdateMetadataDocumentState {
     Init,
     ReadCurrent,
     ReadRealmConfig,
-    ValidateMutation,
+    PlanBatch,
     StartTransaction,
     ReadFence,
     ReadRawFence,
@@ -143,15 +158,22 @@ impl UpdateMetadataDocumentOperation {
             }
             UpdateMetadataDocumentMutation::ReplaceRoCrate { .. } => None,
             UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
-            | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. } => {
+            | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateMetadataDocumentMutation::ApplyBatch { .. } => {
                 Some(stale_status(config.document_id, "dataset_revision_changed"))
             }
         };
+        let planned_batch = match &config.mutation {
+            UpdateMetadataDocumentMutation::ApplyBatch { batch, .. } => Some((**batch).clone()),
+            _ => None,
+        };
         Self {
             config,
+            event_id: Ulid::generate(),
             txn_id: None,
             record: None,
             update_event: None,
+            planned_batch,
             raw_budget: None,
             next_raw_budget: None,
             accepted_create: None,
@@ -167,53 +189,63 @@ impl UpdateMetadataDocumentOperation {
         u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
     }
 
-    fn graph_policy(&self, record: &MetadataRegistryRecord) -> MetadataGraphPolicy {
-        MetadataGraphPolicy {
-            public: self.config.public,
-            permission_paths: vec![record.permission_path.clone()],
-        }
-        .normalized()
-    }
-
     fn updated_record(&self, mut record: MetadataRegistryRecord) -> MetadataRegistryRecord {
         record.public = self.config.public;
         record.updated_at_ms = Self::current_timestamp_ms();
         record
     }
 
-    fn update_event_payload(&self) -> MetadataCreateEventPayload {
+    fn batch_source(&self) -> MetadataBatchSource {
         match &self.config.mutation {
             UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
-                MetadataCreateEventPayload::ReplaceRoCrate {
+                MetadataBatchSource::ReplaceRoCrate {
                     jsonld: jsonld.clone(),
                 }
             }
             UpdateMetadataDocumentMutation::UpsertDataEntity { jsonld } => {
-                MetadataCreateEventPayload::UpsertDataEntity {
+                MetadataBatchSource::UpsertDataEntity {
                     jsonld: jsonld.clone(),
                 }
             }
             UpdateMetadataDocumentMutation::UpsertContextualEntity { jsonld } => {
-                MetadataCreateEventPayload::UpsertContextualEntity {
+                MetadataBatchSource::UpsertContextualEntity {
                     jsonld: jsonld.clone(),
                 }
             }
+            UpdateMetadataDocumentMutation::ApplyBatch { authored, .. } => authored.clone(),
         }
     }
 
-    fn update_event_record(&self, record: &MetadataRegistryRecord) -> MetadataCreateEventRecord {
-        let event_id = Ulid::generate();
+    fn update_event_payload(
+        &self,
+    ) -> Result<MetadataCreateEventPayload, UpdateMetadataDocumentError> {
+        let Some(batch) = self.planned_batch.clone() else {
+            return Err(MetadataError::Backend(
+                "metadata batch is missing before update commit".to_string(),
+            )
+            .into());
+        };
+        Ok(MetadataCreateEventPayload::ApplyBatch {
+            batch,
+            authored: self.batch_source(),
+        })
+    }
+
+    fn update_event_record(
+        &self,
+        record: &MetadataRegistryRecord,
+    ) -> Result<MetadataCreateEventRecord, UpdateMetadataDocumentError> {
         let mut record = record.clone();
-        record.last_event_id = event_id;
+        record.last_event_id = self.event_id;
         let occurred_at_ms = record.updated_at_ms;
-        MetadataCreateEventRecord {
-            event_id,
+        Ok(MetadataCreateEventRecord {
+            event_id: self.event_id,
             record,
             user_id: self.config.actor.user_id,
             node_id: self.config.actor.node_id,
-            payload: self.update_event_payload(),
+            payload: self.update_event_payload()?,
             occurred_at_ms,
-        }
+        })
     }
 
     fn audit_record(&self, event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
@@ -230,28 +262,26 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn validation_effect(
+    /// Plans the change set against the local graph. The planner runs the same
+    /// structural validation the applying call would, so this replaces it.
+    fn plan_batch_effect(
         &self,
         record: &MetadataRegistryRecord,
     ) -> Result<Option<Effect>, MetadataError> {
         match &self.config.mutation {
-            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
-                Ok(Some(Effect::Metadata(MetadataEffect::ValidateRoCrate {
-                    request: MetadataApplyRoCrateRequest {
-                        graph_iri: record.graph_iri.clone(),
-                        jsonld: jsonld.clone(),
-                        policy: self.graph_policy(record),
-                        durability: MetadataRequestDurability::WalAlreadyDurable,
-                        deterministic_actor: None,
-                    },
-                })))
-            }
+            // A device already planned its batch, so there is nothing to plan.
+            UpdateMetadataDocumentMutation::ApplyBatch { .. } => return Ok(None),
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { .. } => {}
             UpdateMetadataDocumentMutation::UpsertDataEntity { jsonld }
             | UpdateMetadataDocumentMutation::UpsertContextualEntity { jsonld } => {
                 validate_entity_jsonld(jsonld)?;
-                Ok(None)
             }
         }
+        Ok(Some(Effect::Metadata(MetadataEffect::PlanBatch {
+            graph_iri: record.graph_iri.clone(),
+            actor: deterministic_materialization_actor(self.event_id),
+            source: self.batch_source(),
+        })))
     }
 
     fn begin_transaction_effect(&mut self) -> Effects {
@@ -345,6 +375,9 @@ impl UpdateMetadataDocumentOperation {
         };
         profile_status.document_id = event.record.document_id;
         profile_status.dataset_revision = event.event_id;
+        // The merged render is only known once the batch materializes, so the
+        // accepted status carries no digest to be fresh against yet.
+        profile_status.dataset_digest = None;
         writes.push(metadata_profile_validation_status_write_entry(
             &profile_status,
         )?);
@@ -550,7 +583,8 @@ pub async fn update_metadata_document(
             validate_submission(context, operation.config.document_id, jsonld).await?
         }
         UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
-        | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. } => {
+        | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. }
+        | UpdateMetadataDocumentMutation::ApplyBatch { .. } => {
             stale_status(operation.config.document_id, "dataset_revision_changed")
         }
     });
@@ -662,9 +696,9 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let Some(record) = self.record.clone() else {
                         return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
                     };
-                    match self.validation_effect(&record) {
+                    match self.plan_batch_effect(&record) {
                         Ok(Some(effect)) => {
-                            self.state = UpdateMetadataDocumentState::ValidateMutation;
+                            self.state = UpdateMetadataDocumentState::PlanBatch;
                             smallvec![effect]
                         }
                         Ok(None) => self.begin_transaction_effect(),
@@ -674,12 +708,13 @@ impl Operation for UpdateMetadataDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("realm config read result", format!("{other:?}")),
             },
-            UpdateMetadataDocumentState::ValidateMutation => match event {
-                Event::Metadata(MetadataEvent::ValidationResult { .. }) => {
+            UpdateMetadataDocumentState::PlanBatch => match event {
+                Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => {
+                    self.planned_batch = Some(batch);
                     self.begin_transaction_effect()
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata validation result", format!("{other:?}")),
+                other => self.unexpected_event("metadata batch plan result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -697,7 +732,10 @@ impl Operation for UpdateMetadataDocumentOperation {
             UpdateMetadataDocumentState::ReadFence => match parse_registry_read(event) {
                 Ok(Some(record)) => {
                     let record = self.updated_record(record);
-                    let update_event = self.update_event_record(&record);
+                    let update_event = match self.update_event_record(&record) {
+                        Ok(update_event) => update_event,
+                        Err(error) => return self.fail(error),
+                    };
                     self.record = Some(update_event.record.clone());
                     self.update_event = Some(update_event);
                     let Some(txn_id) = self.txn_id else {
@@ -1119,12 +1157,53 @@ mod tests {
                 Effect::Metadata(MetadataEffect::ApplyRoCrate { .. })
                 | Effect::Metadata(MetadataEffect::UpsertDataEntity { .. })
                 | Effect::Metadata(MetadataEffect::UpsertContextualEntity { .. })
+                | Effect::Metadata(MetadataEffect::MergeBatch { .. })
                 | Effect::Metadata(MetadataEffect::SyncGraphBestEffort { .. }) => {
                     panic!("unexpected graph mutation or sync effect: {effect:?}");
                 }
                 _ => {}
             }
         }
+    }
+
+    fn batch_planned(record: &MetadataRegistryRecord) -> Event {
+        Event::Metadata(MetadataEvent::BatchPlanned {
+            graph_iri: record.graph_iri.clone(),
+            batch: MetadataBatch {
+                graph_iri: record.graph_iri.clone(),
+                actor: [7u8; 32],
+                counter: 1,
+                base_clock: craqle::VectorClock::default(),
+                ops: Vec::new(),
+                timestamp_millis: 1,
+            },
+        })
+    }
+
+    fn assert_plan_batch(effects: &[Effect]) {
+        let [Effect::Metadata(MetadataEffect::PlanBatch { .. })] = effects else {
+            panic!("expected batch planning before transaction, got {effects:?}");
+        };
+    }
+
+    fn is_replace(payload: &MetadataCreateEventPayload) -> bool {
+        matches!(
+            payload,
+            MetadataCreateEventPayload::ApplyBatch {
+                authored: MetadataBatchSource::ReplaceRoCrate { .. },
+                ..
+            }
+        )
+    }
+
+    fn is_data_upsert(payload: &MetadataCreateEventPayload) -> bool {
+        matches!(
+            payload,
+            MetadataCreateEventPayload::ApplyBatch {
+                authored: MetadataBatchSource::UpsertDataEntity { .. },
+                ..
+            }
+        )
     }
 
     fn assert_start_transaction(effects: &[Effect]) {
@@ -1244,9 +1323,7 @@ mod tests {
         operation.start();
         operation.step(registry_read(&record));
         operation.step(realm_config_read(&record));
-        operation.step(Event::Metadata(MetadataEvent::ValidationResult {
-            graph_iri: record.graph_iri.clone(),
-        }));
+        operation.step(batch_planned(&record));
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),
@@ -1263,9 +1340,7 @@ mod tests {
         ));
         let effects = operation.step(raw_events(&record));
 
-        let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
-            matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
-        });
+        let event = assert_update_batch(effects.as_slice(), txn_id, is_replace);
         assert_eq!(event.record.placement, record.placement);
     }
 
@@ -1289,9 +1364,8 @@ mod tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        // Entity upserts validate synchronously, so the transaction starts
-        // straight from the realm config read.
-        assert_start_transaction(operation.step(realm_config_read(&record)).as_slice());
+        assert_plan_batch(operation.step(realm_config_read(&record)).as_slice());
+        assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),
@@ -1310,7 +1384,7 @@ mod tests {
         let event = assert_update_batch(
             operation.step(raw_events(&record)).as_slice(),
             txn_id,
-            |payload| matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. }),
+            is_data_upsert,
         );
         assert_eq!(event.record.placement, fenced.placement);
     }
@@ -1387,7 +1461,8 @@ mod tests {
     ) -> Effects {
         operation.start();
         operation.step(registry_read(record));
-        assert_start_transaction(operation.step(config).as_slice());
+        assert_plan_batch(operation.step(config).as_slice());
+        assert_start_transaction(operation.step(batch_planned(record)).as_slice());
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let reads = operation.step(registry_read(record));
         let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = reads.as_slice() else {
@@ -1481,6 +1556,7 @@ mod tests {
         operation.start();
         operation.step(registry_read(&record));
         operation.step(realm_config_read(&record));
+        operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         operation.step(raw_budget_read(
@@ -1523,6 +1599,7 @@ mod tests {
         operation.start();
         operation.step(registry_read(&record));
         operation.step(realm_config_read(&record));
+        operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         operation.step(raw_budget_read(
@@ -1558,6 +1635,7 @@ mod tests {
         operation.start();
         operation.step(registry_read(&record));
         operation.step(realm_config_read(&record));
+        operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         let effects = operation.step(raw_missing_budget(&record));
@@ -1578,9 +1656,7 @@ mod tests {
             )],
             next_start_after: None,
         }));
-        let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
-            matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
-        });
+        let event = assert_update_batch(effects.as_slice(), txn_id, is_data_upsert);
         let budget_value = effects
             .iter()
             .find_map(|effect| match effect {
@@ -1621,6 +1697,7 @@ mod tests {
         operation.start();
         operation.step(registry_read(&current));
         operation.step(realm_config_read(&current));
+        operation.step(batch_planned(&current));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&current));
         let effects = operation.step(raw_missing_for(&original, outsider.node_id));
@@ -1651,6 +1728,7 @@ mod tests {
         operation.start();
         operation.step(registry_read(&record));
         operation.step(realm_config_read(&record));
+        operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         // The exhausted budget is rejected at the sidecar fence read itself.
@@ -1685,7 +1763,8 @@ mod tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        assert_start_transaction(operation.step(realm_config_read(&record)).as_slice());
+        assert_plan_batch(operation.step(realm_config_read(&record)).as_slice());
+        assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: metadata_registry_key(record.group_id, record.document_id),
@@ -1719,15 +1798,13 @@ mod tests {
         let effects = operation.step(registry_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(realm_config_read(&record));
-        let [Effect::Metadata(MetadataEffect::ValidateRoCrate { request })] = effects.as_slice()
+        let [Effect::Metadata(MetadataEffect::PlanBatch { graph_iri, .. })] = effects.as_slice()
         else {
-            panic!("expected RO-Crate validation before transaction, got {effects:?}");
+            panic!("expected batch planning before transaction, got {effects:?}");
         };
-        assert_eq!(request.graph_iri, record.graph_iri);
+        assert_eq!(*graph_iri, record.graph_iri);
 
-        let effects = operation.step(Event::Metadata(MetadataEvent::ValidationResult {
-            graph_iri: record.graph_iri.clone(),
-        }));
+        let effects = operation.step(batch_planned(&record));
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -1742,9 +1819,7 @@ mod tests {
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(raw_events(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
-        assert_update_batch(effects.as_slice(), txn_id, |payload| {
-            matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
-        });
+        assert_update_batch(effects.as_slice(), txn_id, is_replace);
     }
 
     #[test]
@@ -1765,7 +1840,8 @@ mod tests {
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(realm_config_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
-        assert_start_transaction(effects.as_slice());
+        assert_plan_batch(effects.as_slice());
+        assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
 
         let _effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
@@ -1775,9 +1851,7 @@ mod tests {
             postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         let effects = operation.step(raw_events(&record));
-        let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
-            matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
-        });
+        let event = assert_update_batch(effects.as_slice(), txn_id, is_data_upsert);
         assert_eq!(event.record.last_event_id, event.event_id);
     }
 
@@ -1797,8 +1871,8 @@ mod tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        let effects = operation.step(realm_config_read(&record));
-        assert_start_transaction(effects.as_slice());
+        assert_plan_batch(operation.step(realm_config_read(&record)).as_slice());
+        assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
 
         let _effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
@@ -1832,9 +1906,7 @@ mod tests {
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(realm_config_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
-        let effects = operation.step(Event::Metadata(MetadataEvent::ValidationResult {
-            graph_iri: record.graph_iri.clone(),
-        }));
+        let effects = operation.step(batch_planned(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_no_graph_mutation_or_sync(effects.as_slice());
