@@ -461,6 +461,10 @@ pub struct RealmDocuments {
     pub realm_config: Vec<u8>,
     /// Absent while the realm has no authorization document yet.
     pub realm_authorization: Option<Vec<u8>>,
+    /// The device owner's own user document, so the owner's profile answers on
+    /// the device as it does on a realm node. Absent while the serving node
+    /// holds none.
+    pub owner: Option<Vec<u8>>,
     /// What the serving node had applied when it made this copy. A device
     /// refuses a copy that has seen less than the one it already holds.
     pub clock: AdminDocumentClock,

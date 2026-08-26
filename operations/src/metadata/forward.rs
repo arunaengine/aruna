@@ -2331,9 +2331,18 @@ async fn read_realm_documents(
         .ok_or(SyncRefusal::NotFound)?;
     let realm_authorization =
         read_document(context, DocumentSyncTarget::RealmAuthorization { realm_id }).await?;
+    // The token's own subject: for a device that is its owner by the check above.
+    let owner = read_document(
+        context,
+        DocumentSyncTarget::User {
+            user_id: auth.user_id,
+        },
+    )
+    .await?;
     Ok(RealmDocuments {
         realm_config,
         realm_authorization,
+        owner,
         clock: applied_clock(context, realm_id).await,
     })
 }

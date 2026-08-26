@@ -367,8 +367,13 @@ async fn install_documents(
         },
     )
     .await;
+    let owner_target = DocumentSyncTarget::User {
+        user_id: plan.owner,
+    };
+    let stored_owner = read_bytes(context, owner_target.clone()).await;
     let unchanged = stored_config.as_deref() == Some(bytes.as_slice())
-        && stored_authorization.as_deref() == accepted.documents.realm_authorization.as_deref();
+        && stored_authorization.as_deref() == accepted.documents.realm_authorization.as_deref()
+        && stored_owner.as_deref() == accepted.documents.owner.as_deref();
     if unchanged {
         // Nothing but the marker moves: writing the documents again would
         // re-register every realm peer on every beat for a copy this device
@@ -404,6 +409,13 @@ async fn install_documents(
             }
             .storage_key(),
             Value::from(authorization),
+        ));
+    }
+    if let Some(owner) = accepted.documents.owner {
+        writes.push((
+            owner_target.storage_keyspace().to_string(),
+            owner_target.storage_key(),
+            Value::from(owner),
         ));
     }
     if !write_batch(context, writes).await {
@@ -549,6 +561,7 @@ mod tests {
                 })
                 .expect("config encodes"),
             realm_authorization: None,
+            owner: None,
             clock: clock(seen),
         };
         accept(documents, realm()).expect("the answer is this realm's")
