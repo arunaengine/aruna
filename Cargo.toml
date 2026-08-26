@@ -75,7 +75,7 @@ crossfire = "3.1.19"
 crypto_box = "0.9.1"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
-fjall = "3.1.8"
+fjall = "3.1.9"
 flate2 = "1.1.9"
 futures = "0.3.33"
 futures-core = "0.3.33"
