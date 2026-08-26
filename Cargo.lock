@@ -1789,7 +1789,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1958,7 +1958,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.2.0"
-source = "git+https://github.com/arunaengine/craqle?branch=feat%2Forset-merge-api#5fe1be797770e816316ff8144e07a07edc5e06ca"
+source = "git+https://github.com/arunaengine/craqle?branch=main#9f1b9e45c5b93d6ea4f8b159166754a7a141700e"
 dependencies = [
  "blake3",
  "chrono",
@@ -2310,7 +2310,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -5647,14 +5647,13 @@ dependencies = [
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
- "rand 0.8.7",
  "rand 0.9.5",
  "rustc-hash",
  "siphasher",
  "sparesults",
  "spareval",
  "spargebra",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5695,7 +5694,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxsdatatypes",
- "rand 0.8.7",
+ "rand 0.9.5",
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.20",
@@ -7908,7 +7907,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "oxsdatatypes",
- "rand 0.8.7",
+ "rand 0.9.5",
  "regex",
  "rustc-hash",
  "sha1 0.10.7",
@@ -7929,7 +7928,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "peg",
- "rand 0.8.7",
+ "rand 0.9.5",
  "thiserror 2.0.20",
 ]
 
@@ -7940,7 +7939,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aed7a854b8ea67618f8ce69aabb0e904d7704226060e9d5a2930eb3136c3fa3b"
 dependencies = [
  "oxrdf",
- "rand 0.8.7",
+ "rand 0.9.5",
  "spargebra",
 ]
 
