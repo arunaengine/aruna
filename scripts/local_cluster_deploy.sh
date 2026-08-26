@@ -32,6 +32,7 @@ HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) 
 WITH_KEYCLOAK=0
 AUTO_PORTAL_DIR=0
 AUTO_PORTAL_DOWNLOAD=0
+INTERRUPTED=0
 PIDS=()
 NODE_NAMES=()
 NODE_DIRS=()
@@ -225,15 +226,20 @@ cleanup() {
       down --volumes >/dev/null 2>&1 || true
   fi
 
-  if [[ $status -ne 0 && $status -ne 130 ]]; then
+  if [[ "$INTERRUPTED" == "1" ]]; then
+    log "Stopped the deployment"
+  elif [[ $status -ne 0 ]]; then
     printf 'Deployment failed. Inspect logs in %s\n' "$DEPLOY_ROOT" >&2
   fi
 
   exit "$status"
 }
 
+# A requested stop is the deployment's normal end, not a failure: exit 0 so
+# `just preview` reports nothing after Ctrl-C.
 handle_signal() {
-  exit 130
+  INTERRUPTED=1
+  exit 0
 }
 
 assert_port_free() {
@@ -526,12 +532,14 @@ start_node() {
   local node_dir=$2
   local log_file="$node_dir/$name.log"
 
+  # Own session: a terminal Ctrl-C reaches the script alone, so the one
+  # SIGTERM cleanup sends is the node's first signal and it drains gracefully.
   (
     cd "$node_dir"
     if [[ -n "${RUST_LOG:-}" ]]; then
-      exec env -i PATH="$PATH" RUST_LOG="$RUST_LOG" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
+      exec setsid env -i PATH="$PATH" RUST_LOG="$RUST_LOG" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
     else
-      exec env -i PATH="$PATH" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
+      exec setsid env -i PATH="$PATH" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
     fi
   ) >"$log_file" 2>&1 &
 
