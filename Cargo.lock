@@ -1958,7 +1958,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.2.0"
-source = "git+https://github.com/arunaengine/craqle?branch=main#cc91161401696e547f06331b114d4898ac07bca7"
+source = "git+https://github.com/arunaengine/craqle?branch=feat%2Forset-merge-api#5fe1be797770e816316ff8144e07a07edc5e06ca"
 dependencies = [
  "blake3",
  "chrono",
