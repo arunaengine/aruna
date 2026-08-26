@@ -61,7 +61,10 @@ async fn commit(storage: &StorageHandle, txn_id: TxnId) -> Event {
 }
 
 fn committed(event: &Event) -> bool {
-    matches!(event, Event::Storage(StorageEvent::TransactionCommitted { .. }))
+    matches!(
+        event,
+        Event::Storage(StorageEvent::TransactionCommitted { .. })
+    )
 }
 
 #[tokio::test]
@@ -71,7 +74,10 @@ async fn long_txn_conflicts() {
     write(&storage, "state", "v0", None).await;
 
     let long = start_txn(&storage, false).await;
-    assert_eq!(read(&storage, "state", Some(long)).await.as_deref(), Some(b"v0".as_slice()));
+    assert_eq!(
+        read(&storage, "state", Some(long)).await.as_deref(),
+        Some(b"v0".as_slice())
+    );
     // A transaction opened at the same sequence number, committed while the
     // long one is still open.
     let sibling = start_txn(&storage, false).await;
@@ -79,7 +85,10 @@ async fn long_txn_conflicts() {
     assert!(committed(&commit(&storage, sibling).await));
 
     let other = start_txn(&storage, false).await;
-    assert_eq!(read(&storage, "state", Some(other)).await.as_deref(), Some(b"v0".as_slice()));
+    assert_eq!(
+        read(&storage, "state", Some(other)).await.as_deref(),
+        Some(b"v0".as_slice())
+    );
     write(&storage, "state", "other", Some(other)).await;
     assert!(committed(&commit(&storage, other).await));
 
@@ -109,5 +118,8 @@ async fn long_txn_conflicts() {
         ),
         "the stale transaction must not commit: {outcome:?}"
     );
-    assert_eq!(read(&storage, "state", None).await.as_deref(), Some(b"other".as_slice()));
+    assert_eq!(
+        read(&storage, "state", None).await.as_deref(),
+        Some(b"other".as_slice())
+    );
 }
