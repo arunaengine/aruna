@@ -283,6 +283,12 @@ pub struct RealmInfoResponse {
     /// to omit the whole extension without changing the rest of the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_overview: Option<RealmPublicOverview>,
+    /// True on a management node, the only kind that mints enrollments and
+    /// issues the realm's credentials. Public.
+    pub is_management_node: bool,
+    /// API base urls of the realm's management nodes, from their node
+    /// information documents; a device follows one to enroll. Public.
+    pub management_urls: Vec<String>,
     /// Realm discovery configuration. Realm-authenticated callers only.
     #[schema(value_type = Object)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -903,7 +909,12 @@ token of another realm or one this node cannot validate, the response is the pub
 
 **Behavior**
 - The public part is the realm id, description, metadata replication policy, the OIDC providers a
-  client needs to obtain a token, the public interface urls, and `public_overview`.
+  client needs to obtain a token, the public interface urls, `public_overview`, and where the
+  realm's management nodes are: `is_management_node` says whether this node is one, and
+  `management_urls` lists the api base urls the management nodes published, this node's own first.
+  Only a management node mints enrollments and issues the realm's credentials, so a device or a
+  client that reached any other node follows one of these urls instead. The list comes from the
+  node information documents that reached this node, so it may lag or omit a fresh node.
 - That overview contains only three nullable aggregates: `live_datasets` is the realm's
   lifecycle-live metadata registry count, never caller-filtered or replica-multiplied; `groups` is
   the realm's stored group count; and `nodes_configured` is the membership count in this node's
@@ -940,6 +951,8 @@ token of another realm or one this node cannot validate, the response is the pub
                             "groups": 12,
                             "nodes_configured": 3
                         },
+                        "is_management_node": false,
+                        "management_urls": ["https://mgmt.example.test/api/v1"],
                         "oidc_providers": [
                             {
                                 "id": "example",
@@ -966,6 +979,8 @@ token of another realm or one this node cannot validate, the response is the pub
                             "groups": 12,
                             "nodes_configured": 3
                         },
+                        "is_management_node": true,
+                        "management_urls": ["https://node.example.test/api/v1"],
                         "oidc_providers": [],
                         "discovery": {"Dynamic": {"methods": [{"DhtSigned": {"ttl_secs": 3600, "refresh_after_secs": 1800}}]}},
                         "nodes": [
@@ -1070,9 +1085,16 @@ pub async fn get_realm_info(
         nodes_configured: u64::try_from(config.nodes.len()).ok(),
     });
 
+    let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
+    let management_urls = management_urls(
+        &state,
+        &config,
+        &node_info_docs,
+        interfaces.rest.url.as_deref(),
+    );
+
     let (discovery, nodes, quota) = if realm_authenticated {
         let present_nodes = load_realm_presence_best_effort(&state).await;
-        let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
         let nodes = map_realm_nodes(&state, &config, present_nodes, node_info_docs);
@@ -1102,12 +1124,51 @@ pub async fn get_realm_info(
                 })
                 .collect(),
             public_overview,
+            is_management_node: state.is_management_node(),
+            management_urls,
             discovery,
             nodes,
             quota,
             interfaces,
         }),
     ))
+}
+
+/// The management nodes' published api urls, this node first. A management
+/// node whose own document has not landed yet names its published interface.
+fn management_urls(
+    state: &ServerState,
+    config: &RealmConfigDocument,
+    node_info_docs: &BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
+    own_url: Option<&str>,
+) -> Vec<String> {
+    let current = state.get_node_id();
+    let mut urls: Vec<String> = Vec::new();
+    for node in &config.nodes {
+        if !matches!(node.kind, RealmNodeKind::Management) {
+            continue;
+        }
+        let Ok(node_id) = node.node_id.parse::<aruna_core::NodeId>() else {
+            continue;
+        };
+        let is_current = node_id == current;
+        let url = node_info_docs
+            .get(&node_id)
+            .and_then(|doc| doc.urls.api.clone())
+            .or_else(|| is_current.then(|| own_url.map(str::to_string)).flatten());
+        let Some(url) = url else {
+            continue;
+        };
+        if urls.contains(&url) {
+            continue;
+        }
+        if is_current {
+            urls.insert(0, url);
+        } else {
+            urls.push(url);
+        }
+    }
+    urls
 }
 
 async fn load_node_info_documents_best_effort(
@@ -3546,6 +3607,12 @@ mod tests {
             assert_eq!(info.realm_id, realm_id.to_string());
             assert_eq!(info.description, "Realm");
             assert!(info.nodes.is_empty(), "realm topology is not public");
+            assert!(info.is_management_node, "the node kind is public");
+            assert_eq!(
+                info.management_urls,
+                vec!["http://127.0.0.1:3000/api/v1".to_string()],
+                "a management node names its own published url"
+            );
             assert!(info.quota.is_none(), "quota policy is not public");
             assert!(info.discovery.is_none(), "discovery is not public");
             assert_eq!(
@@ -3632,6 +3699,65 @@ mod tests {
         assert!(body.get("quota").is_none());
         assert_eq!(body["nodes"], serde_json::json!([]));
         assert!(!body.to_string().contains("Protected group title"));
+    }
+
+    #[tokio::test]
+    async fn management_urls_follow_documents() {
+        // The published document names the url a device follows; without one
+        // a management node falls back to its own interface, and a server
+        // node lists the others but never itself.
+        use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+        use aruna_core::structs::{
+            NodeInfoDocument, NodeUrls, NodeUtilization, node_info_storage_key,
+        };
+
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        state
+            .register_rest_interface("0.0.0.0:3000".parse().unwrap())
+            .await;
+        let node_id = state.get_node_id();
+        let document = NodeInfoDocument {
+            node_id,
+            executors: Vec::new(),
+            labels: Default::default(),
+            urls: NodeUrls {
+                api: Some("https://mgmt.example/api/v1".to_string()),
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 0,
+                documents_held: None,
+                load_permille: None,
+                heartbeat_at_ms: 1_700_000_000_000,
+            },
+            updated_at_ms: 1_700_000_000_500,
+            epoch: aruna_core::structs::AdvertisementEpoch {
+                membership_generation: 1,
+                publisher_generation: 1,
+                observed_at_ms: 1_700_000_000_500,
+            },
+            compute_draining: false,
+            leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
+        };
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_INFO_KEYSPACE.to_string(),
+                key: node_info_storage_key(node_id).into(),
+                value: document.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let (_status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        assert!(info.is_management_node);
+        assert_eq!(
+            info.management_urls,
+            vec!["https://mgmt.example/api/v1".to_string()]
+        );
     }
 
     #[tokio::test]
