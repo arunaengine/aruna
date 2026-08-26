@@ -21,3 +21,7 @@ preview portal_dir=env_var_or_default("ARUNA_TEST_DEPLOY_PORTAL_DIR", "") nodes=
 # Same without Keycloak, so the portal runs in guest mode; prints every url and the admin credentials.
 preview-no-oidc portal_dir=env_var_or_default("ARUNA_TEST_DEPLOY_PORTAL_DIR", "") nodes="3":
 	bash scripts/local_cluster_deploy.sh --node-count {{nodes}} --auto-portal-dir --portal-dir "{{portal_dir}}"
+
+# Stops whatever a cluster recipe left running: the deploy script, every node by pid file, then Keycloak.
+stop:
+	bash scripts/local_cluster_stop.sh

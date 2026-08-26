@@ -126,6 +126,17 @@ Useful overrides:
 - `ARUNA_TEST_DEPLOY_BASE_PORT` shifts the entire local port range
 - `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` exits once the cluster is ready instead of keeping it running
 
+Ctrl-C stops the cluster again. A deployment that outlived its terminal is
+stopped with:
+
+```bash
+just stop
+```
+
+It interrupts a deploy script that still monitors the nodes, stops every node
+named by a pid file under `target/test-deploy/`, and removes the Keycloak
+compose project. Logs, `summary.txt` and `credentials.txt` stay in place.
+
 `just local-cluster-oidc` extends the same 3-node startup check with a local Keycloak instance.
 
 ### Run a single node from source

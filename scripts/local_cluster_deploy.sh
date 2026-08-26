@@ -62,6 +62,8 @@ Usage: bash scripts/local_cluster_deploy.sh [--with-keycloak] [--node-count N] [
 
 Behavior:
   default          Build the workspace in release mode and launch 3 local Aruna nodes.
+                   Ctrl-C, SIGTERM or a closed terminal stop them again; a deployment
+                   left behind is stopped with scripts/local_cluster_stop.sh (just stop).
   --with-keycloak  Start a local Keycloak instance and configure every node for OIDC.
   --node-count N   Launch N total Aruna nodes. Defaults to 3. Also --node-count=N.
   --portal-dir P   Serve the portal dist at P on every node's own portal port,
@@ -734,7 +736,7 @@ mkdir -p "$(dirname -- "$DEPLOY_ROOT")"
 assert_removable "$DEPLOY_ROOT"
 
 trap cleanup EXIT
-trap handle_signal INT TERM
+trap handle_signal INT TERM HUP
 
 if [[ "$SKIP_BUILD" != "1" ]]; then
   require_command cargo
