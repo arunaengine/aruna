@@ -412,8 +412,8 @@ pub async fn get_realm_policies(
     summary = "Replace the realm's request policy set",
     description = r#"Replaces the realm's request policy set wholesale with the submitted list.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path, and only a
-management node serves it; every other node answers 403.
+**Authentication**: realm bearer token with WRITE on the realm configuration path. A management
+node serves it, and every other node relays the call to one.
 
 **Behavior**
 - Policies missing from the request are removed, an entry without a `policy_id` is given a fresh
@@ -465,10 +465,10 @@ management node serves it; every other node answers 403.
         ),
         (status = 400, description = "Unknown policy kind, malformed policy or hash, or a set that breaks the size or compile limits", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, the caller may not write the realm configuration, or this is not a management node", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller may not write the realm configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
+        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

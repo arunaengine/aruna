@@ -1596,13 +1596,13 @@ revoked, and a device owned by anybody else answers 404 rather than admitting it
 **Behavior**
 - `id` is what `GET /users/me/devices` reported: an enrollment id while the enrollment is still in
   flight, or a node id once the device has joined.
-- Revoking an in-flight enrollment deletes the enrollment record on this node, so the secret can
-  no longer be redeemed. It does not reach back into an enrollment that already completed.
+- Revoking an in-flight enrollment deletes the enrollment record on the management node holding it,
+  so the secret can no longer be redeemed. It does not reach back into a completed enrollment.
 - Evicting a device that already joined drops it from the realm configuration and retires the
   secret it redeemed. The eviction replicates like any other configuration change, and each node
   closes the device's open connections when it applies the new membership.
-- The eviction is a realm configuration change, so it must be sent to a management node; another
-  node answers 403 because its peers would refuse the event.
+- The eviction is a realm configuration change, so it is served by a management node; a call to any
+  other node is relayed to one, because its peers would refuse the event.
 
 **Errors**: an id that is neither an enrollment id nor a node id of a device owned by the caller
 answers 404, which is also what a caller sees after an earlier revoke."#,
@@ -1610,8 +1610,9 @@ answers 404, which is also what a caller sees after an earlier revoke."#,
     responses(
         (status = 204, description = "Device enrollment revoked, or the device evicted from the realm; no response body"),
         (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm, or this node is not a management node", body = ErrorResponse),
-        (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse)
+        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
+        (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1645,9 +1646,10 @@ async fn revoke_user_device(
     summary = "Evict any enrolled device as a realm admin",
     description = r#"Evicts one enrolled user device from the realm on behalf of the realm's administration.
 
-**Authentication**: realm bearer token with WRITE on the realm's onboarding administration path,
-and only a management node serves it; every other node answers 403. This is the same authorization
-the onboarding administration routes carry, so the realm request policies constrain it too.
+**Authentication**: realm bearer token with WRITE on the realm's onboarding administration path. A
+management node serves it, and every other node relays the call to one. This is the same
+authorization the onboarding administration routes carry, so the realm request policies constrain
+it too.
 
 **Behavior**
 - `node_id` is the device's node id, which `GET /users/me/devices` reports to its owner and the
@@ -1667,8 +1669,9 @@ after an earlier eviction."#,
     responses(
         (status = 204, description = "Device evicted from the realm; no response body"),
         (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The caller is not a realm onboarding admin, or this node is not a management node", body = ErrorResponse),
-        (status = 404, description = "No enrolled device carries this node id", body = ErrorResponse)
+        (status = 403, description = "The caller is not a realm onboarding admin", body = ErrorResponse),
+        (status = 404, description = "No enrolled device carries this node id", body = ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

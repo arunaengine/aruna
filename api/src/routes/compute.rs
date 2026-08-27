@@ -356,8 +356,8 @@ pub async fn get_compute_config(
     summary = "Replace the realm compute configuration",
     description = r#"Replaces the stored realm compute configuration with the submitted one.
 
-**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path,
-and only a management node serves it; every other node answers 403.
+**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path.
+A management node serves it, and every other node relays the call to one.
 
 **Behavior**
 - The body replaces the stored configuration wholesale rather than patching it: links and group
@@ -443,10 +443,10 @@ and only a management node serves it; every other node answers 403.
         })),
         (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, or a zero witness delay", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, the caller may not administer the realm configuration, or this is not a management node", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
+        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

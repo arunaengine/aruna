@@ -65,6 +65,10 @@ pub enum ServerError {
     ServiceUnavailable,
     #[error("{0}")]
     ServiceUnavailableReason(String),
+    /// A management-only route reached a node that is not one, and no management
+    /// node answered the relay.
+    #[error("No management node is reachable")]
+    NoManagementNode,
 }
 
 #[derive(Debug, Error)]
@@ -343,7 +347,9 @@ impl IntoResponse for ServerError {
         let mut response = (status, Json(body)).into_response();
         if matches!(
             &self,
-            ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_)
+            ServerError::ServiceUnavailable
+                | ServerError::ServiceUnavailableReason(_)
+                | ServerError::NoManagementNode
         ) || matches!(&self, ServerError::MetadataProfileValidation(findings) if profile_validation_unavailable(findings))
         {
             response.headers_mut().insert(
@@ -381,9 +387,9 @@ impl ServerError {
                 }
             }
             ServerError::BadGateway | ServerError::BadGatewayReason(_) => StatusCode::BAD_GATEWAY,
-            ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ServerError::ServiceUnavailable
+            | ServerError::ServiceUnavailableReason(_)
+            | ServerError::NoManagementNode => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -412,6 +418,7 @@ impl ServerError {
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 "Service unavailable".to_string()
             }
+            ServerError::NoManagementNode => "no_management_node".to_string(),
         }
     }
 

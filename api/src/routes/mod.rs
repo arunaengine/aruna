@@ -20,6 +20,7 @@ pub mod groups;
 pub mod info;
 pub mod job_audit;
 pub mod jobs;
+pub mod management_relay;
 pub mod metadata;
 pub mod notifications;
 pub mod oai;
@@ -77,6 +78,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     let (router, _) = rest_api().split_for_parts();
     router
+        .layer(from_fn_with_state(
+            state.clone(),
+            management_relay::relay_middleware,
+        ))
         .layer(from_fn_with_state(
             state.clone(),
             crate::rate_limit::principal_middleware,

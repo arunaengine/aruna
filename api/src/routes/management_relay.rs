@@ -1,0 +1,346 @@
+//! Transparent relay of management-only REST routes.
+//!
+//! A caller must not need to know which node kind serves their portal. A
+//! management-only route that reaches a node of another kind is re-issued
+//! against a management node and its answer is passed back verbatim.
+
+use crate::error::ServerError;
+use crate::routes::info::{load_node_info_documents_best_effort, management_node_urls};
+use crate::server_state::ServerState;
+use aruna_core::NodeId;
+use aruna_operations::driver::drive;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use axum::body::Bytes;
+use axum::extract::{FromRequest, MatchedPath, Request, State};
+use axum::http::{HeaderName, HeaderValue, Method, Uri, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
+
+/// Loop guard: a request that already carries a hop is answered by the node it
+/// reached, never relayed again.
+pub(crate) const RELAY_HOP_HEADER: HeaderName = HeaderName::from_static("x-aruna-relay-hop");
+
+/// The nest every REST route is served under, stripped before the path is
+/// appended to a peer's published api base url.
+const API_PREFIX: &str = "/api/v1";
+
+/// Realm membership changes rarely, so the resolved targets are reused inside
+/// this window instead of re-reading realm state per request.
+const MANAGEMENT_URL_TTL: Duration = Duration::from_secs(60);
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
+const RELAY_TARGET_LIMIT: usize = 3;
+
+/// Management-only routes, by method and route template. Explicit by design:
+/// node-local routes such as compute drain, placement diagnostics and sync
+/// quarantine must keep answering on the node they were called on.
+const RELAYED_ROUTES: &[(&str, &str)] = &[
+    ("DELETE", "/admin/devices/{node_id}"),
+    ("DELETE", "/admin/onboarding/secrets/{id}"),
+    ("DELETE", "/users/me/devices/{id}"),
+    ("GET", "/admin/onboarding/secrets"),
+    ("GET", "/info/realm/placement"),
+    ("GET", "/onboarding/secrets/{id}/status"),
+    ("PATCH", "/info/realm/placement"),
+    ("POST", "/admin/onboarding/secrets"),
+    ("POST", "/onboarding/bootstrap"),
+    ("PUT", "/admin/compute/config"),
+    ("PUT", "/info/realm/quota"),
+    ("PUT", "/policies/realm"),
+];
+
+static RELAY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(RELAY_CONNECT_TIMEOUT)
+        .timeout(RELAY_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+});
+
+/// Management api urls this node last resolved, and when.
+#[derive(Debug, Default)]
+pub struct ManagementUrlCache {
+    urls: Vec<String>,
+    refreshed_at: Option<Instant>,
+}
+
+pub(crate) async fn relay_middleware(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let matched = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string());
+    let route = relay_route(
+        request.method(),
+        matched.as_deref(),
+        state.is_management_node(),
+        request.headers().contains_key(RELAY_HOP_HEADER),
+    );
+    match route {
+        Some(route) => relay(&state, route, request).await,
+        None => next.run(request).await,
+    }
+}
+
+/// The allowlisted route this request must be relayed for, if any.
+fn relay_route(
+    method: &Method,
+    matched: Option<&str>,
+    is_management: bool,
+    has_hop: bool,
+) -> Option<&'static str> {
+    if is_management || has_hop {
+        return None;
+    }
+    let matched = matched?;
+    RELAYED_ROUTES
+        .iter()
+        .find(|(route_method, route)| {
+            method.as_str() == *route_method
+                && (matched == *route || matched == format!("{API_PREFIX}{route}"))
+        })
+        .map(|(_, route)| *route)
+}
+
+async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) -> Response {
+    let targets = management_targets(state).await;
+    if targets.is_empty() {
+        warn!(route, "No management node is known for a relayed route");
+        return ServerError::NoManagementNode.into_response();
+    }
+
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
+    let content_type = request.headers().get(header::CONTENT_TYPE).cloned();
+    let body = match Bytes::from_request(request, &()).await {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let hop = HeaderValue::from_str(&state.get_node_id().to_string())
+        .unwrap_or_else(|_| HeaderValue::from_static("relayed"));
+
+    for target in targets.iter().take(RELAY_TARGET_LIMIT) {
+        let url = relay_url(target, &uri);
+        let mut outgoing = RELAY_CLIENT
+            .request(method.clone(), &url)
+            .header(RELAY_HOP_HEADER, hop.clone())
+            .body(body.clone());
+        if let Some(authorization) = &authorization {
+            outgoing = outgoing.header(header::AUTHORIZATION, authorization.clone());
+        }
+        if let Some(content_type) = &content_type {
+            outgoing = outgoing.header(header::CONTENT_TYPE, content_type.clone());
+        }
+        match outgoing.send().await {
+            Ok(response) => return relayed_response(route, &url, response).await,
+            Err(error) => {
+                warn!(route, relay_target = %url, error = %error, "Management relay target failed")
+            }
+        }
+    }
+
+    warn!(route, "No management node answered a relayed route");
+    ServerError::NoManagementNode.into_response()
+}
+
+/// The peer's published api base url carries the nest, so the incoming path
+/// contributes only what follows it.
+fn relay_url(target: &str, uri: &Uri) -> String {
+    let base = target.trim_end_matches('/');
+    let path = uri.path();
+    let suffix = path.strip_prefix(API_PREFIX).unwrap_or(path);
+    match uri.query() {
+        Some(query) => format!("{base}{suffix}?{query}"),
+        None => format!("{base}{suffix}"),
+    }
+}
+
+async fn relayed_response(route: &'static str, url: &str, response: reqwest::Response) -> Response {
+    let status = response.status();
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    match response.bytes().await {
+        Ok(body) => {
+            debug!(route, relay_target = %url, status = status.as_u16(), "Relayed a management route");
+            let mut relayed = (status, body).into_response();
+            match content_type {
+                Some(content_type) => relayed
+                    .headers_mut()
+                    .insert(header::CONTENT_TYPE, content_type),
+                None => relayed.headers_mut().remove(header::CONTENT_TYPE),
+            };
+            relayed
+        }
+        Err(error) => {
+            warn!(route, relay_target = %url, error = %error, "Management relay response failed");
+            ServerError::BadGateway.into_response()
+        }
+    }
+}
+
+/// Cached management targets; a stale window triggers a realm-config read, and
+/// a failed read reuses the last known set rather than dropping every target.
+async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
+    let cache = state.management_url_cache();
+    {
+        let cached = cache.read().await;
+        if is_fresh(cached.refreshed_at) {
+            return cached.urls.clone();
+        }
+    }
+
+    let mut cached = cache.write().await;
+    if is_fresh(cached.refreshed_at) {
+        return cached.urls.clone();
+    }
+    match drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(config) => {
+            let documents = load_node_info_documents_best_effort(state, &config).await;
+            cached.urls = peer_management_urls(state.get_node_id(), &config, &documents);
+        }
+        Err(error) => debug!(error = %error, "Management relay reuses cached management urls"),
+    }
+    cached.refreshed_at = Some(Instant::now());
+    cached.urls.clone()
+}
+
+fn is_fresh(refreshed_at: Option<Instant>) -> bool {
+    refreshed_at.is_some_and(|refreshed_at| refreshed_at.elapsed() < MANAGEMENT_URL_TTL)
+}
+
+/// Management peers in node-id order, this node excluded. The order is stable
+/// so repeated calls pin the same peer: an onboarding secret is minted into one
+/// management node's local store and its status and revoke must return there.
+fn peer_management_urls(
+    current: NodeId,
+    config: &aruna_core::structs::RealmConfigDocument,
+    documents: &BTreeMap<NodeId, aruna_core::structs::NodeInfoDocument>,
+) -> Vec<String> {
+    let ordered: BTreeMap<NodeId, String> = management_node_urls(config, documents)
+        .into_iter()
+        .filter(|(node_id, _)| *node_id != current)
+        .filter_map(|(node_id, url)| url.map(|url| (node_id, url)))
+        .collect();
+    let mut urls: Vec<String> = Vec::new();
+    for url in ordered.into_values() {
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{API_PREFIX, RELAYED_ROUTES, relay_route, relay_url};
+    use axum::http::{Method, Uri};
+
+    #[test]
+    fn matches_allowlisted_routes() {
+        assert_eq!(
+            relay_route(&Method::PUT, Some("/api/v1/info/realm/quota"), false, false),
+            Some("/info/realm/quota")
+        );
+        assert_eq!(
+            relay_route(
+                &Method::DELETE,
+                Some("/api/v1/admin/onboarding/secrets/{id}"),
+                false,
+                false
+            ),
+            Some("/admin/onboarding/secrets/{id}")
+        );
+        // Node-local admin routes stay on the node they were called on.
+        assert_eq!(
+            relay_route(
+                &Method::POST,
+                Some("/api/v1/admin/compute/drain"),
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            relay_route(
+                &Method::GET,
+                Some("/api/v1/admin/placement-diagnostics"),
+                false,
+                false
+            ),
+            None
+        );
+        // The method is part of the match: only PUT on the quota route relays.
+        assert_eq!(
+            relay_route(&Method::GET, Some("/api/v1/info/realm/quota"), false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn hop_header_stops_relay() {
+        assert_eq!(
+            relay_route(&Method::PUT, Some("/api/v1/info/realm/quota"), false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn management_node_answers_itself() {
+        assert_eq!(
+            relay_route(&Method::PUT, Some("/api/v1/info/realm/quota"), true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn builds_target_url() {
+        let uri: Uri = "/api/v1/admin/onboarding/secrets?limit=5".parse().unwrap();
+        assert_eq!(
+            relay_url("https://mgmt.example.test/api/v1/", &uri),
+            "https://mgmt.example.test/api/v1/admin/onboarding/secrets?limit=5"
+        );
+    }
+
+    #[test]
+    fn allowlist_matches_router() {
+        // A renamed or removed route must not leave a dead allowlist entry
+        // behind, silently turning a relayed route into a local 403.
+        let documented = crate::routes::rest_openapi().paths.paths;
+        for (method, route) in RELAYED_ROUTES {
+            let item = documented
+                .get(*route)
+                .unwrap_or_else(|| panic!("{route} is not a registered route"));
+            let registered = match *method {
+                "DELETE" => item.delete.is_some(),
+                "GET" => item.get.is_some(),
+                "PATCH" => item.patch.is_some(),
+                "POST" => item.post.is_some(),
+                "PUT" => item.put.is_some(),
+                other => panic!("{other} is not covered by the allowlist check"),
+            };
+            assert!(registered, "{method} {route} is not a registered route");
+            assert!(
+                relay_route(
+                    &Method::from_bytes(method.as_bytes()).expect("valid method"),
+                    Some(&format!("{API_PREFIX}{route}")),
+                    false,
+                    false
+                )
+                .is_some(),
+                "{method} {route} must match the relay allowlist"
+            );
+        }
+    }
+}

@@ -1167,6 +1167,26 @@ pub async fn get_realm_info(
     ))
 }
 
+/// Every management node of the realm with the api url it published, in
+/// realm-config order. The caller decides where its own node belongs.
+pub(crate) fn management_node_urls(
+    config: &RealmConfigDocument,
+    node_info_docs: &BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
+) -> Vec<(aruna_core::NodeId, Option<String>)> {
+    config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
+        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .map(|node_id| {
+            let url = node_info_docs
+                .get(&node_id)
+                .and_then(|doc| doc.urls.api.clone());
+            (node_id, url)
+        })
+        .collect()
+}
+
 /// The management nodes' published api urls, this node first. A management
 /// node whose own document has not landed yet names its published interface.
 fn management_urls(
@@ -1177,18 +1197,9 @@ fn management_urls(
 ) -> Vec<String> {
     let current = state.get_node_id();
     let mut urls: Vec<String> = Vec::new();
-    for node in &config.nodes {
-        if !matches!(node.kind, RealmNodeKind::Management) {
-            continue;
-        }
-        let Ok(node_id) = node.node_id.parse::<aruna_core::NodeId>() else {
-            continue;
-        };
+    for (node_id, published) in management_node_urls(config, node_info_docs) {
         let is_current = node_id == current;
-        let url = node_info_docs
-            .get(&node_id)
-            .and_then(|doc| doc.urls.api.clone())
-            .or_else(|| is_current.then(|| own_url.map(str::to_string)).flatten());
+        let url = published.or_else(|| is_current.then(|| own_url.map(str::to_string)).flatten());
         let Some(url) = url else {
             continue;
         };
@@ -1204,7 +1215,7 @@ fn management_urls(
     urls
 }
 
-async fn load_node_info_documents_best_effort(
+pub(crate) async fn load_node_info_documents_best_effort(
     state: &ServerState,
     config: &RealmConfigDocument,
 ) -> BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument> {
@@ -1309,8 +1320,8 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     summary = "Read the realm's placement strategies, bindings and overrides",
     description = r#"Returns the placement policy as stored in this node's copy of the realm configuration.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path, and only
-a management node serves it; every other node answers 403 whatever the caller holds.
+**Authentication**: realm bearer token with WRITE on the realm's configuration admin path. A
+management node serves it, and every other node relays the call to one.
 
 **Behavior**
 - The response carries the defined strategies with their replica count, distinctness requirement,
@@ -1362,9 +1373,10 @@ a management node serves it; every other node answers 403 whatever the caller ho
             })
         ),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
-        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
+        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1397,8 +1409,8 @@ pub async fn get_realm_placement(
     summary = "Apply one change to the realm's placement policy",
     description = r#"Applies exactly one change to the realm's placement policy and returns the whole policy.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path, and only
-a management node serves it; every other node answers 403.
+**Authentication**: realm bearer token with WRITE on the realm's configuration admin path. A
+management node serves it, and every other node relays the call to one.
 
 **Behavior**
 - The body carries exactly one change, selected by its `mutation` field: define or replace a
@@ -1490,11 +1502,11 @@ response."#,
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "The strategy is still referenced by a binding or override, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
         (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = crate::error::ErrorResponse)
+        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1622,8 +1634,9 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
     summary = "Replace the realm-wide quota policy",
     description = r#"Replaces the realm-wide quota policy wholesale and echoes back the stored result.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path, and only
-a management node serves it; an anonymous caller is rejected and every other node answers 403.
+**Authentication**: realm bearer token with WRITE on the realm's configuration admin path; an
+anonymous caller is rejected. A management node serves it, and every other node relays the call to
+one.
 
 **Behavior**
 - This replaces the stored policy rather than patching it: overrides absent from the body are
@@ -1695,10 +1708,10 @@ a management node serves it; an anonymous caller is rejected and every other nod
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = crate::error::ErrorResponse)
+        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

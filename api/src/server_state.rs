@@ -1,6 +1,7 @@
 use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::OidcError;
 use crate::openapi::ApiDoc;
+use crate::routes::management_relay::ManagementUrlCache;
 use aruna_core::NodeId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::credential_seal::CredentialSealKey;
@@ -90,6 +91,8 @@ pub struct ServerState {
     shutdown_token: CancellationToken,
     // Present only on a user node: the owner's local wipe latch.
     device_wipe: Option<Arc<DeviceWipe>>,
+    // Management api urls the management-route relay re-issues against.
+    management_urls: Arc<RwLock<ManagementUrlCache>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -199,6 +202,7 @@ impl ServerState {
             download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
             shutdown_token: CancellationToken::new(),
             device_wipe: None,
+            management_urls: Arc::new(RwLock::new(ManagementUrlCache::default())),
         };
         state.persist_trusted_realms().await;
         state
@@ -408,6 +412,10 @@ impl ServerState {
 
     pub fn is_management_node(&self) -> bool {
         matches!(self.node_capabilities, NodeCapabilities::Management { .. })
+    }
+
+    pub(crate) fn management_url_cache(&self) -> &Arc<RwLock<ManagementUrlCache>> {
+        &self.management_urls
     }
 
     pub fn bootstrap_endpoint(&self) -> Option<EndpointAddr> {

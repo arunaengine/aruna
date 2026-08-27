@@ -267,8 +267,8 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
 
 **Authentication**: `Management` and `Server` secrets need a bearer token of this realm with WRITE
 on the realm's onboarding admin path. A `User` secret is self-service: any authenticated member may
-mint one for itself, from an unrestricted token only. Only a management node serves the route and
-any other node answers 403.
+mint one for itself, from an unrestricted token only. A management node serves the route, and every
+other node relays the call to one.
 
 **Behavior**
 - The response carries the enrollment secret exactly once: the node stores only its hash, so a
@@ -339,9 +339,9 @@ interface answers 400. A realm policy that forbids enrollment answers 403."#,
         ),
         (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Token belongs to another realm or is path-restricted, this is not a management node, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or is path-restricted, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The owner already holds the realm's maximum number of devices, or a concurrent mint won the transaction; retry", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity is exhausted; retry", body = crate::error::ErrorResponse)
+        (status = 503, description = "Storage cleanup capacity is exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -467,8 +467,8 @@ fn enroll_url(secret: &str, seed_url: &str, realm_id: RealmId) -> ServerResult<S
     summary = "List outstanding node enrollment secrets",
     description = r#"Lists this management node's live and in-flight enrollment secrets as bookkeeping only.
 
-**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path;
-only a management node serves it and any other node answers 403.
+**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path. A
+management node serves it, and every other node relays the call to one.
 
 **Behavior**
 - Each entry carries the enrollment id, the mode, the owner a `User` secret is bound to, the
@@ -504,7 +504,8 @@ only a management node serves it and any other node answers 403.
             })
         ),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse)
+        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -537,8 +538,8 @@ pub async fn list_onboarding_secrets(
     summary = "Revoke a pending node enrollment secret",
     description = r#"Deletes the enrollment record on this node, making the secret unredeemable from here on.
 
-**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path;
-only a management node serves it and any other node answers 403.
+**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path. A
+management node serves it, and every other node relays the call to one.
 
 **Behavior**
 - This is the remedy for a secret that leaked or was never used, and it is the only remedy, since
@@ -552,8 +553,9 @@ answers 404."#,
     responses(
         (status = 204, description = "Secret deleted and no longer redeemable; no response body"),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
-        (status = 404, description = "No enrollment secret with this id on this node", body = crate::error::ErrorResponse)
+        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
+        (status = 404, description = "No enrollment secret with this id on this node", body = crate::error::ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -583,8 +585,8 @@ pub async fn revoke_onboarding_secret(
     description = r#"Reports whether an outstanding enrollment secret is still pending, already claimed or expired.
 
 **Authentication**: bearer token of this realm. The owner a `User` secret is bound to may poll its
-own secret; every other caller needs WRITE on the realm's onboarding admin path. Only a management
-node serves the route.
+own secret; every other caller needs WRITE on the realm's onboarding admin path. A management node
+serves the route, and every other node relays the call to one.
 
 **Behavior**
 - This is the wizard's progress poll: mint a secret, hand it to the joiner, then watch this route
@@ -616,7 +618,8 @@ discover that somebody else's enrollment exists."#,
         ),
         (status = 400, description = "The enrollment id is not a ULID", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 404, description = "No enrollment secret with this id on this node, or the caller is neither its owner nor an onboarding administrator", body = crate::error::ErrorResponse)
+        (status = 404, description = "No enrollment secret with this id on this node, or the caller is neither its owner nor an onboarding administrator", body = crate::error::ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -672,8 +675,8 @@ pub async fn get_secret_status(
     description = r#"Redeems an enrollment secret and returns the one-time material a joiner needs to enter the realm.
 
 **Authentication**: none; deliberately unauthenticated, because a joining node has no realm token
-yet. The enrollment secret plus a signature by the joiner's own node key are the credentials, and
-only a management node serves this route.
+yet. The enrollment secret plus a signature by the joiner's own node key are the credentials. A
+management node serves this route, and every other node relays the call to one.
 
 **Behavior**
 - The secret is single-use and is consumed when enrollment finalizes, which also adds the joiner to
@@ -755,9 +758,9 @@ redemption that lost its transaction to a concurrent one, which is safe to retry
         ),
         (status = 400, description = "Malformed node id, key material or proof, or key material missing for the mode the secret was minted for", body = crate::error::ErrorResponse),
         (status = 401, description = "Unknown, expired, already claimed or non-matching enrollment secret, or a proof that does not verify", body = crate::error::ErrorResponse),
-        (status = 403, description = "This node does not serve enrollment, or the secret was not minted for node enrollment", body = crate::error::ErrorResponse),
+        (status = 403, description = "The secret was not minted for node enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The device's owner already holds the realm's maximum number of devices, or a concurrent enrollment won the transaction; retry", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity is exhausted; retry", body = crate::error::ErrorResponse)
+        (status = 503, description = "Storage cleanup capacity is exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     )
 )]
 pub async fn bootstrap_onboarding(
