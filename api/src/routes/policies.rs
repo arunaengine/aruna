@@ -1,5 +1,6 @@
 use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::groups::refuse_group_edit;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
@@ -650,7 +651,7 @@ pub async fn get_group_policies(
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not write this group's configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no authorization document for the group", body = ErrorResponse),
-        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse),
+        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry, or this node is a device where group changes are made through the realm", body = ErrorResponse),
         (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -663,6 +664,7 @@ pub async fn set_group_policies(
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
+    refuse_group_edit(&state).await?;
     // Request policies live at this boundary; the operation only checks roles.
     require_group_admin(&state, &auth, group_id).await?;
 

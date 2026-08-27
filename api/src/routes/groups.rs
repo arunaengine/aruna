@@ -289,6 +289,21 @@ fn require_unrestricted(auth: Option<AuthContext>) -> ServerResult<AuthContext> 
     Ok(auth)
 }
 
+/// Refuses a group-document edit on a device. Every realm holder rejects an
+/// admin envelope a device originated, so applying it locally would answer the
+/// caller with success and then diverge; the action journal replaces this.
+pub(crate) async fn refuse_group_edit(state: &ServerState) -> ServerResult<()> {
+    let device = is_user_origin(&state.get_ctx(), state.get_realm_id(), state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?;
+    match device {
+        true => Err(ServerError::Conflict(
+            "group changes are made through the realm".to_string(),
+        )),
+        false => Ok(()),
+    }
+}
+
 fn actor_for(state: &ServerState, auth: &AuthContext) -> Actor {
     Actor {
         node_id: state.get_node_id(),
@@ -1042,7 +1057,8 @@ for the user being added, so authority can be delegated per member.
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default user role to fall back on", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
-        (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse)
+        (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse),
+        (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1055,6 +1071,7 @@ pub async fn add_group_member(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let user_id = parse_member_user_id(&request.user_id)?;
+    refuse_group_edit(&state).await?;
 
     ensure_permission(
         &state,
@@ -1139,7 +1156,7 @@ removing anyone else requires WRITE on the group's administrative path for that 
         (status = 400, description = "Malformed group, user or role id, or a user id standing for everyone", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
-        (status = 409, description = "The removal would leave the group without an administrator", body = ErrorResponse)
+        (status = 409, description = "The removal would leave the group without an administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1157,6 +1174,7 @@ pub async fn remove_group_member(
         .as_deref()
         .map(|role_id| parse_role_id(role_id).map(|role_id| HashSet::from([role_id])))
         .transpose()?;
+    refuse_group_edit(&state).await?;
 
     // Self-leave via this endpoint needs no admin permission, matching the operation.
     if user_id != auth.user_id {
@@ -1210,7 +1228,7 @@ No group permission is required, because the token's own subject is the only use
     responses(
         (status = 204, description = "The caller no longer holds any role in the group; no response body is returned"),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 409, description = "The caller is the group's last administrator", body = ErrorResponse)
+        (status = 409, description = "The caller is the group's last administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1221,6 +1239,7 @@ pub async fn leave_group(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
+    refuse_group_edit(&state).await?;
 
     drive(
         RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
@@ -1293,7 +1312,8 @@ pub async fn leave_group(
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than read", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
-        (status = 404, description = "No such group on this node", body = ErrorResponse)
+        (status = 404, description = "No such group on this node", body = ErrorResponse),
+        (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1306,6 +1326,7 @@ pub async fn create_group_role(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let realm_id = state.get_realm_id();
+    refuse_group_edit(&state).await?;
 
     ensure_permission(
         &state,
@@ -1407,7 +1428,7 @@ pub async fn create_group_role(
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
         (status = 404, description = "No such role in this group, or the group is not present on this node", body = ErrorResponse),
-        (status = 409, description = "The built-in admin role cannot be deleted", body = ErrorResponse)
+        (status = 409, description = "The built-in admin role cannot be deleted, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1419,6 +1440,7 @@ pub async fn delete_group_role(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let role_id = parse_role_id(&role_id)?;
+    refuse_group_edit(&state).await?;
 
     ensure_permission(
         &state,
@@ -1794,8 +1816,9 @@ fn encode_object_token(token: ListObjectsV2ContinuationToken) -> ServerResult<St
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateGroupRequest, DataPathKind, DataPathsQuery, ListGroupsQuery, create_group, get_group,
-        get_group_usage, list_data_paths, list_group_members, list_groups,
+        AddGroupMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, ListGroupsQuery,
+        add_group_member, create_group, get_group, get_group_usage, list_data_paths,
+        list_group_members, list_groups,
     };
     use crate::auth::ValidatedArunaBearerTokenCarrier;
     use crate::error::{ServerError, ServerResult};
@@ -1951,14 +1974,16 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        // Policy loading fails closed without the realm config document.
+        // Policy loading fails closed without the realm config document, and a
+        // node the configuration does not name has no resolvable kind.
+        let mut config =
+            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(state.get_node_id(), RealmNodeKind::Management);
         store_bytes(
             &state,
             aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
             realm_id.as_bytes().to_vec(),
-            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .unwrap(),
+            config.to_bytes(&actor).unwrap(),
         )
         .await;
 
@@ -2073,6 +2098,38 @@ mod tests {
         )
         .await
         .map(|(status, _)| assert_eq!(status, StatusCode::CREATED))
+    }
+
+    #[tokio::test]
+    async fn device_refuses_member_add() {
+        // A local apply would enqueue an admin record every realm holder rejects,
+        // so the device must refuse instead of answering success and diverging.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        let error = add_group_member(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Path(Ulid::generate().to_string()),
+            Json(AddGroupMemberRequest {
+                user_id: admin.to_string(),
+                role_ids: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ServerError::Conflict(reason) if reason.contains("through the realm"))
+        );
     }
 
     #[tokio::test]
