@@ -2025,11 +2025,6 @@ async fn ensure_group_write(
     auth: &AuthContext,
     group_id: Ulid,
 ) -> Result<(), TesError> {
-    // A device holds no group authorization document: a forwarded task is
-    // authorized by the holder and a local run by the owner binding.
-    if crate::auth::defers_group_auth(state) {
-        return Ok(());
-    }
     crate::auth::ensure_permission(
         state,
         auth,

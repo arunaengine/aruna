@@ -231,7 +231,7 @@ async fn folder_detail(
     summary = "Bind a directory to a realm prefix",
     description = r#"Keeps a directory on this machine in sync with one prefix of one realm bucket.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. A device holds no group authorization document, so the owner binding is the whole local authority: the realm node that serves the folder authorizes the owner's WRITE on the remote bucket every time it pulls, and refuses the pull otherwise.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. A device caches the realm's documents, but its copy is never the authority for a remote write: the realm node that serves the folder authorizes the owner's WRITE on the remote bucket every time it pulls, and refuses the pull otherwise.
 
 **Behavior**
 - The device-local bucket is derived from the folder id, so the owner never names it and it cannot collide with a bucket they already use.

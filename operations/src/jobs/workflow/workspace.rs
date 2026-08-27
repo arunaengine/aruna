@@ -67,9 +67,6 @@ pub async fn ensure_group_write(
     record: &JobRecord,
     node_id: NodeId,
 ) -> Result<(), JobError> {
-    if owner_runs_locally(context, record, node_id).await {
-        return Ok(());
-    }
     let allowed = Box::pin(drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
@@ -99,18 +96,6 @@ pub async fn ensure_group_write(
     }
 }
 
-/// Whether this node is the device its owner submitted the job on. A device
-/// holds no group authorization document, so the owner binding in the realm
-/// configuration is the whole authority for a run on the owner's own machine.
-async fn owner_runs_locally(context: &DriverContext, record: &JobRecord, node_id: NodeId) -> bool {
-    crate::metadata::api::load_realm_config(context, record.created_by.realm_id)
-        .await
-        .and_then(|config| {
-            crate::mutate_realm_placement::node_kind(&config, node_id).and_then(|kind| kind.owner())
-        })
-        == Some(record.created_by)
-}
-
 /// Create the durable run bucket `ws-{jobid}` under the job's group. Idempotent
 /// across attempts: an already-existing bucket is accepted.
 pub async fn ensure_workspace_bucket(
@@ -133,9 +118,6 @@ pub async fn ensure_workspace_bucket(
             return Err(JobError::permanent(
                 "existing workspace bucket is outside the execution group",
             ));
-        }
-        if owner_runs_locally(context, record, node_id).await {
-            return Ok(());
         }
         let allowed = Box::pin(drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -2078,9 +2060,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_owner_authorizes() {
-        // A device holds no group authorization document, so its owner's own
-        // run is authorized by the owner binding. Nobody else's is.
+    async fn device_checks_grant() {
+        // The cached group documents are the whole authority on a device too:
+        // the owner binding does not stand in for a grant the owner lacks.
         let CredentialFixture {
             context,
             net,
@@ -2091,8 +2073,8 @@ mod tests {
             ..
         } = credential_fixture().await;
         let realm_id = record.created_by.realm_id;
-        let owner = UserId::local(Ulid::from_bytes([9; 16]), realm_id);
-        let stranger = UserId::local(Ulid::from_bytes([8; 16]), realm_id);
+        let owner = record.created_by;
+        let ungranted = UserId::local(Ulid::from_bytes([9; 16]), realm_id);
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.ensure_node(node_id, aruna_core::structs::RealmNodeKind::User { owner });
         let actor = Actor {
@@ -2110,24 +2092,15 @@ mod tests {
             })
             .await;
 
-        let owned = JobRecord::new(
-            record.job_id,
-            JobPayload::Execution(spec.clone()),
-            owner,
-            node_id,
-            1,
-            1,
-            None,
-        );
         assert!(
-            ensure_group_write(&context, &spec, &owned, node_id)
+            ensure_group_write(&context, &spec, &record, node_id)
                 .await
                 .is_ok()
         );
         let foreign = JobRecord::new(
             record.job_id,
             JobPayload::Execution(spec.clone()),
-            stranger,
+            ungranted,
             node_id,
             1,
             1,

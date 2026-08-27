@@ -436,8 +436,8 @@ pub async fn create_group(
     }
 
     let ctx = state.get_ctx();
-    // A device holds no authorization bucket, so quota and permission are the
-    // receiving ingress's decision, taken under the caller's own token.
+    // A device originates no realm administration, so the create travels to an
+    // ingress, which decides quota and permission under the caller's own token.
     if is_user_origin(&ctx, realm_id, state.get_node_id())
         .await
         .map_err(map_metadata_api_error)?

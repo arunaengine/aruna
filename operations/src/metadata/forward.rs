@@ -153,8 +153,9 @@ pub fn write_route(
     MetadataWriteRoute::Forward(resolve_shard_holders(config, placement))
 }
 
-/// User-kind nodes hold no metadata or authorization buckets, so their HTTP
-/// write handlers must defer permission checks to the selected holder.
+/// Whether the local node is a device. Devices cache the realm's documents, so
+/// their local checks are real, but they hold no metadata bucket: an effectful
+/// write goes to an ingress, which stays the authority for what it applies.
 pub async fn is_user_origin(
     context: &Arc<DriverContext>,
     realm_id: RealmId,

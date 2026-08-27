@@ -197,6 +197,8 @@ pub async fn list_audit(
     .await
     .map_err(|_| ServerError::ServiceUnavailable)?
     .map_err(map_metadata_api_error)?;
+    // A device holds no audit rows of its own, so this read is pure fan-out and
+    // every peer re-checks the same group-admin authority on the caller's token.
     if !user_origin {
         tokio::time::timeout_at(
             deadline,
