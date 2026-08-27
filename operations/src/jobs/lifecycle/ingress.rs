@@ -50,7 +50,7 @@ use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
+use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// sealed into the immutable spec, so a later config change cannot widen it.
@@ -80,7 +80,7 @@ pub struct SubmissionAck {
 
 /// Why a holder did not accept a forwarded submission. Only a definitive
 /// refusal ends the ingress; anything else lets it try the next holder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubmissionRefusal {
     Unauthorized,
     /// This node does not hold the family in its own unconflicted view.
@@ -90,7 +90,10 @@ pub enum SubmissionRefusal {
     Conflict {
         existing_job_id: JobId,
     },
-    Invalid,
+    /// The holder read the request and refused it; the reason reaches the caller.
+    Invalid {
+        reason: String,
+    },
     Unavailable,
 }
 
@@ -257,7 +260,15 @@ async fn resolve_facts(
             context,
         )
         .await
-        .map_err(|error| SubmitJobError::PlacementUnavailable(format!("{reference}: {error}")))?
+        // A definitive miss is the submitter's error, never a retryable 503.
+        .map_err(|error| match error {
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker => {
+                SubmitJobError::InvalidWorkspace(format!("{reference}: input object not found"))
+            }
+            other => SubmitJobError::PlacementUnavailable(format!("{reference}: {other}")),
+        })?
         .transpose()
         .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?
         .ok_or_else(|| {
@@ -669,6 +680,11 @@ async fn forward_once(
             MetadataTransportMessage::ForwardedJobSubmission {
                 result: Err(SubmissionRefusal::Unauthorized),
             } => return Err(SubmitJobError::AuthorityDenied),
+            // A holder that read the request and refused it answers for every
+            // holder; retrying the rest would only repeat the refusal.
+            MetadataTransportMessage::ForwardedJobSubmission {
+                result: Err(SubmissionRefusal::Invalid { reason }),
+            } => return Err(SubmitJobError::InvalidWorkspace(reason)),
             MetadataTransportMessage::ForwardedJobSubmission {
                 result: Err(reason),
             } => {
@@ -766,7 +782,11 @@ async fn admit_forwarded(
     {
         return Err(SubmissionRefusal::IdentityMismatch);
     }
-    let identity = request.identity().map_err(|_| SubmissionRefusal::Invalid)?;
+    let identity = request
+        .identity()
+        .map_err(|error| SubmissionRefusal::Invalid {
+            reason: error.to_string(),
+        })?;
     if identity.submission_id != submission_id {
         return Err(SubmissionRefusal::IdentityMismatch);
     }
@@ -814,7 +834,9 @@ async fn pin_device_request(
 fn refusal_of(error: SubmitJobError) -> SubmissionRefusal {
     match error {
         SubmitJobError::PlacementUnavailable(_) => SubmissionRefusal::Unavailable,
-        _ => SubmissionRefusal::Invalid,
+        other => SubmissionRefusal::Invalid {
+            reason: other.to_string(),
+        },
     }
 }
 
@@ -1079,7 +1101,9 @@ mod tests {
         );
         assert_eq!(
             refusal_of(SubmitJobError::InvalidWorkspace("absent".to_string())),
-            SubmissionRefusal::Invalid
+            SubmissionRefusal::Invalid {
+                reason: "invalid workspace: absent".to_string()
+            }
         );
     }
 }
