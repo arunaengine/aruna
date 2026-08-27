@@ -386,7 +386,8 @@ async fn onboarding_sync_topics(
 mod tests {
     use super::{
         BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
-        bootstrap_onboarding_finalize, emit_node_onboarded_notification, onboarding_sync_topics,
+        bootstrap_onboarding_finalize, emit_node_onboarded_notification, onboarding_node_kind,
+        onboarding_sync_topics,
     };
     use crate::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -420,6 +421,25 @@ mod tests {
 
     const LOCAL_NODE_SECRET: [u8; 32] = [4u8; 32];
     const ONBOARDING_SECRET_EXPIRES_AT: u64 = 1_000;
+
+    #[test]
+    fn kind_follows_mode() {
+        // The admitter records the kind the secret was minted for; admitting a
+        // management joiner as a server would 403 it on every config mutation.
+        let owner = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
+        assert_eq!(
+            onboarding_node_kind(OnboardingMode::Management),
+            RealmNodeKind::Management
+        );
+        assert_eq!(
+            onboarding_node_kind(OnboardingMode::Server),
+            RealmNodeKind::Server
+        );
+        assert_eq!(
+            onboarding_node_kind(OnboardingMode::User { owner }),
+            RealmNodeKind::User { owner }
+        );
+    }
 
     struct FinalizeFixture {
         _tempdir: TempDir,
