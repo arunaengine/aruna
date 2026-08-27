@@ -94,7 +94,7 @@ use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
 use crate::error::{NetError, Result};
-use crate::streams::BiStream;
+use crate::streams::{BiStream, PeerKinds};
 
 use ::irokle as irokle_crate;
 
@@ -403,6 +403,9 @@ pub struct DocumentSyncService {
     // Flips true on the first realm-config-driven peer refresh, after which
     // `configured_peers` no longer grant admission.
     realm_config_materialized: Arc<AtomicBool>,
+    // Realm-config kind table shared with the accept loop, so the dial side
+    // applies the same node-kind boundary. Empty until the embedder attaches it.
+    peer_kinds: PeerKinds,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -507,7 +510,46 @@ impl DocumentSyncService {
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
+            peer_kinds: PeerKinds::default(),
         })
+    }
+
+    /// Shares the realm-config kind table so topic membership and sync fan-out
+    /// apply the same node-kind boundary as the accept loop.
+    pub(crate) fn set_peer_kinds(&mut self, peer_kinds: PeerKinds) {
+        self.peer_kinds = peer_kinds;
+    }
+
+    /// Whether a peer may hold sync state: a user device never joins a topic and
+    /// is never dialed for one. A peer whose kind is unknown stays eligible; the
+    /// table is empty until realm config materializes.
+    fn peer_is_eligible(&self, peer: &PeerId) -> bool {
+        let Ok(node_id) = NodeId::from_bytes(peer.as_bytes()) else {
+            return true;
+        };
+        self.peer_kinds
+            .read()
+            .get(&node_id)
+            .is_none_or(RealmNodeKind::is_sync_eligible)
+    }
+
+    /// Dial-side mirror of the accept matrix: drops peers whose configured kind
+    /// carries no sync responsibility.
+    fn eligible_peers(
+        &self,
+        peers: impl IntoIterator<Item = PeerId>,
+        topic_id: Option<irokle_crate::TopicId>,
+    ) -> BTreeSet<PeerId> {
+        peers
+            .into_iter()
+            .filter(|peer| {
+                let eligible = self.peer_is_eligible(peer);
+                if !eligible {
+                    debug!(node_id = %peer, ?topic_id, "Skipping a document sync peer that is not sync eligible");
+                }
+                eligible
+            })
+            .collect()
     }
 
     pub fn node(&self) -> irokle_crate::Irokle<irokle_crate::FjallStorage> {
@@ -1637,9 +1679,9 @@ impl DocumentSyncService {
                         DocumentSyncEvent::TYPE_ID
                     )));
                 }
-                let missing_peers = peers
-                    .iter()
-                    .copied()
+                let missing_peers = self
+                    .eligible_peers(peers.iter().copied(), Some(topic_id))
+                    .into_iter()
                     .filter(|peer| !state.members.contains(peer))
                     .collect::<Vec<_>>();
                 if !missing_peers.is_empty() {
@@ -1669,7 +1711,7 @@ impl DocumentSyncService {
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
             let genesis = TopicGenesis {
                 event_type_id: DocumentSyncEvent::TYPE_ID.to_string(),
-                initial_peers: peers.clone(),
+                initial_peers: self.eligible_peers(peers.iter().copied(), Some(topic_id)),
                 replication_policy: ReplicationPolicy::all(),
             };
             let oplog = Oplog::with_storage(self.node.storage().clone());
@@ -1706,7 +1748,7 @@ impl DocumentSyncService {
     }
 
     fn sync_peers(&self, peers: Vec<NodeId>) -> BTreeSet<PeerId> {
-        let mut sync_peers = if peers.is_empty() {
+        let candidates = if peers.is_empty() {
             self.default_peers.read().clone()
         } else {
             peers
@@ -1714,6 +1756,7 @@ impl DocumentSyncService {
                 .map(|node_id| node_id_to_peer_id(&node_id))
                 .collect()
         };
+        let mut sync_peers = self.eligible_peers(candidates, None);
         sync_peers.remove(&self.node.peer_id());
         sync_peers
     }
@@ -1862,25 +1905,21 @@ impl DocumentSyncService {
         let mut subject = [0u8; 64];
         subject[..32].copy_from_slice(topic_id.as_ref());
         subject[32..].copy_from_slice(self.node.peer_id().as_bytes());
-        if peers.is_empty() {
-            let defaults = self.default_peers.read();
-            Ok(select_sync_peers(
-                defaults.iter().copied(),
-                self.node.peer_id(),
-                &subject,
-                round,
-            ))
+        let candidates = if peers.is_empty() {
+            self.default_peers.read().clone()
         } else {
-            Ok(select_sync_peers(
-                peers
-                    .iter()
-                    .copied()
-                    .map(|node_id| node_id_to_peer_id(&node_id)),
-                self.node.peer_id(),
-                &subject,
-                round,
-            ))
-        }
+            peers
+                .iter()
+                .copied()
+                .map(|node_id| node_id_to_peer_id(&node_id))
+                .collect()
+        };
+        Ok(select_sync_peers(
+            self.eligible_peers(candidates, Some(*topic_id)),
+            self.node.peer_id(),
+            &subject,
+            round,
+        ))
     }
 
     fn log_peer_selection(&self, topic_id: irokle_crate::TopicId, selection: &PeerSelection) {

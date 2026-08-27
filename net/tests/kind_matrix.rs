@@ -4,13 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::UserId;
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use async_trait::async_trait;
+use irokle::Storage as _;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
@@ -114,6 +116,57 @@ async fn refuses_user_sync() -> Result<(), Box<dyn std::error::Error>> {
     assert!(refused, "a user-kind key must not reach document sync");
 
     device.shutdown().await;
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
+    // Dial-side mirror of the accept matrix: whatever peer list a caller hands
+    // it, a realm node never writes a device into a topic's membership and
+    // never picks one as a sync target.
+    let realm_id = RealmId::from_bytes([95u8; 32]);
+    let temp_realm = tempdir()?;
+    let storage_realm = FjallStorage::open(temp_realm.path().to_str().ok_or("invalid temp path")?)?;
+    let realm = NetHandle::new(
+        config(realm_id, iroh::SecretKey::from_bytes(&[95u8; 32])),
+        storage_realm,
+    )
+    .await?;
+    let device = iroh::SecretKey::from_bytes(&[96u8; 32]).public();
+    let server = iroh::SecretKey::from_bytes(&[97u8; 32]).public();
+
+    let mut view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    view.ensure_node(realm.node_id(), RealmNodeKind::Management);
+    view.ensure_node(server, RealmNodeKind::Server);
+    view.ensure_node(device, user_kind(realm_id));
+    realm.refresh_realm_peers_from_document(&view).await?;
+
+    let topic =
+        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+    realm.ensure_document_sync_topics(&[topic], vec![device, server])?;
+    realm.allow_document_sync_peers(&[topic], vec![device])?;
+
+    let members = realm
+        .document_sync_node()
+        .storage()
+        .topic_state(&topic)?
+        .ok_or("expected the shared topic")?
+        .members;
+    assert!(
+        !members.contains(&irokle::PeerId::from_bytes(*device.as_bytes())),
+        "a device must never be added to a sync topic"
+    );
+    assert!(members.contains(&irokle::PeerId::from_bytes(*server.as_bytes())));
+
+    // The device has no known address, so a selection that kept it as a target
+    // would fail this sync instead of finishing with nothing to dial.
+    tokio::time::timeout(
+        NETWORK_HANG_CAP,
+        realm.sync_document_topic_with_peers(topic, vec![device]),
+    )
+    .await??;
+
     realm.shutdown().await;
     Ok(())
 }

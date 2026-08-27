@@ -635,7 +635,7 @@ impl NetHandle {
         // joiner admits its seed's pushes before the first realm config applies.
         let mut document_sync_peers = realm_peer_nodes.clone();
         document_sync_peers.extend(peer_hints.iter().copied());
-        let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
+        let mut document_sync = DocumentSyncService::open_with_persist_policy(
             endpoint.clone(),
             storage.clone(),
             document_sync_path,
@@ -644,7 +644,10 @@ impl NetHandle {
             config.document_sync_runtime.unwrap_or_default(),
             config.fjall_persist_policy,
             config.realm_id,
-        )?);
+        )?;
+        // Dial-side half of the ALPN x kind matrix: sync never targets a device.
+        document_sync.set_peer_kinds(inbound_admission.peer_kinds());
+        let document_sync = Arc::new(document_sync);
 
         let streams = Arc::new(StreamsService::new(
             connection_pool.clone(),
