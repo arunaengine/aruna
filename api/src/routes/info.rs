@@ -885,6 +885,8 @@ pub enum RealmNodeKindInfo {
 pub enum RealmNodeConnectionStatus {
     Connected,
     Configured,
+    /// Presence does not describe this node: a device publishes none.
+    Unknown,
 }
 
 impl From<&RealmNodeKind> for RealmNodeKindInfo {
@@ -933,7 +935,10 @@ token of another realm or one this node cannot validate, the response is the pub
   node counts as present.
 - `present` true and `connection_status` `connected` therefore mean the peer was confirmed live by a
   fresh lookup just now; `configured` means no fresh confirmation, which is not evidence that the
-  peer is down. Stale presence is candidate data and is never reported as a connection."#,
+  peer is down. Stale presence is candidate data and is never reported as a connection.
+- A `user` node is a device and publishes no presence at all, so `present` is always false and
+  `connection_status` is `unknown`, on the device's own node too. That is the absence of a signal,
+  never a report that the device is down."#,
     responses(
         (
             status = 200,
@@ -1011,7 +1016,7 @@ token of another realm or one this node cannot validate, the response is the pub
                                 "owner": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                                 "configured": true,
                                 "present": false,
-                                "connection_status": "configured",
+                                "connection_status": "unknown",
                                 "placement": null,
                                 "info": null
                             }
@@ -1937,8 +1942,12 @@ fn map_realm_nodes(
         .map(|node| {
             let parsed = node.node_id.parse::<aruna_core::NodeId>().ok();
             let is_current = node.node_id == current_node.to_string();
-            let present =
-                is_current || parsed.is_some_and(|node_id| present_nodes.contains(&node_id));
+            let kind = RealmNodeKindInfo::from(&node.kind);
+            // A device publishes no realm presence, so presence carries no
+            // statement about it, not even on the device's own node.
+            let is_device = matches!(kind, RealmNodeKindInfo::User);
+            let present = !is_device
+                && (is_current || parsed.is_some_and(|node_id| present_nodes.contains(&node_id)));
             let placement = parsed
                 .and_then(|node_id| config.placement_entry(node_id))
                 .map(|entry| RealmNodePlacementResponse {
@@ -1952,14 +1961,14 @@ fn map_realm_nodes(
                 .map(map_node_info_document);
             RealmNodeInfoResponse {
                 node_id: node.node_id.clone(),
-                kind: RealmNodeKindInfo::from(&node.kind),
+                kind,
                 owner: node.kind.owner().map(|owner| owner.to_string()),
                 configured: true,
                 present,
-                connection_status: if present {
-                    RealmNodeConnectionStatus::Connected
-                } else {
-                    RealmNodeConnectionStatus::Configured
+                connection_status: match (is_device, present) {
+                    (true, _) => RealmNodeConnectionStatus::Unknown,
+                    (false, true) => RealmNodeConnectionStatus::Connected,
+                    (false, false) => RealmNodeConnectionStatus::Configured,
                 },
                 placement,
                 info,
@@ -2381,12 +2390,13 @@ fn transport_addr_to_string(addr: &iroh::TransportAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, RealmPlacementBinding,
-        RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
-        RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
-        get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
-        map_mutate_realm_placement_error, map_set_realm_quota_error, mutate_realm_placement,
-        presence_nodes, set_realm_quota,
+        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, RealmNodeConnectionStatus,
+        RealmNodeKindInfo, RealmPlacementBinding, RealmPlacementBindingScope,
+        RealmPlacementMutationRequest, RealmPlacementOverride, RealmPlacementStrategy,
+        RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus, get_info, get_realm_info,
+        get_realm_placement, get_usage, map_handle_error, map_mutate_realm_placement_error,
+        map_realm_nodes, map_set_realm_quota_error, mutate_realm_placement, presence_nodes,
+        set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -2416,7 +2426,7 @@ mod tests {
     use axum::extract::{FromRequest, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use tower::ServiceExt;
@@ -3977,5 +3987,47 @@ mod tests {
 
         let stale = presence_nodes(RealmPresence::new(nodes, true), local);
         assert_eq!(stale, HashSet::from([local]));
+    }
+
+    #[tokio::test]
+    async fn device_never_connected() {
+        // Devices publish no presence, so a presence answer naming one, and
+        // this node answering about itself, may still not connect it.
+        let (state, realm_id, owner, _tempdir) = setup_management_state().await;
+        let mut config = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        let device = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
+        for node_id in [device, state.get_node_id()] {
+            config.nodes.push(aruna_core::structs::RealmNode {
+                node_id: node_id.to_string(),
+                kind: aruna_core::structs::RealmNodeKind::User { owner },
+            });
+        }
+
+        let present = HashSet::from([device, state.get_node_id()]);
+        let nodes = map_realm_nodes(&state, &config, present, BTreeMap::new());
+
+        let devices: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.kind == RealmNodeKindInfo::User)
+            .collect();
+        assert_eq!(devices.len(), 2);
+        for node in devices {
+            assert!(!node.present, "a device is never presence-confirmed");
+            assert_eq!(node.connection_status, RealmNodeConnectionStatus::Unknown);
+        }
+        let infra = nodes
+            .iter()
+            .find(|node| node.kind != RealmNodeKindInfo::User)
+            .unwrap();
+        assert!(infra.present);
+        assert_eq!(
+            infra.connection_status,
+            RealmNodeConnectionStatus::Connected
+        );
     }
 }
