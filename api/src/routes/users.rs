@@ -1612,6 +1612,7 @@ answers 404, which is also what a caller sees after an earlier revoke."#,
         (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
         (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
         (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1671,6 +1672,7 @@ after an earlier eviction."#,
         (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm onboarding admin", body = ErrorResponse),
         (status = 404, description = "No enrolled device carries this node id", body = ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

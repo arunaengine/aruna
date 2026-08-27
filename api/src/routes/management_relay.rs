@@ -125,6 +125,8 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
     let hop = HeaderValue::from_str(&state.get_node_id().to_string())
         .unwrap_or_else(|_| HeaderValue::from_static("relayed"));
 
+    // Targets are tried in order, but only a failure that provably predates
+    // processing may move a non-idempotent request on to the next target.
     for target in targets.iter().take(RELAY_TARGET_LIMIT) {
         let url = relay_url(target, &uri);
         let mut outgoing = RELAY_CLIENT
@@ -140,13 +142,24 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
         match outgoing.send().await {
             Ok(response) => return relayed_response(route, &url, response).await,
             Err(error) => {
-                warn!(route, relay_target = %url, error = %error, "Management relay target failed")
+                let is_connect = error.is_connect();
+                warn!(route, relay_target = %url, is_connect, error = %error, "Management relay target failed");
+                if !may_try_next(&method, is_connect) {
+                    return ServerError::RelayFailed.into_response();
+                }
             }
         }
     }
 
     warn!(route, "No management node answered a relayed route");
     ServerError::NoManagementNode.into_response()
+}
+
+/// Whether a send failure may be retried against the next target. A connect
+/// failure, which reqwest also reports for a connect timeout, provably predates
+/// any processing; later failures are only safe to repeat for an idempotent method.
+fn may_try_next(method: &Method, is_connect: bool) -> bool {
+    is_connect || method == Method::GET
 }
 
 /// The peer's published api base url carries the nest, so the incoming path
@@ -242,8 +255,11 @@ fn peer_management_urls(
 
 #[cfg(test)]
 mod tests {
-    use super::{API_PREFIX, RELAYED_ROUTES, relay_route, relay_url};
-    use axum::http::{Method, Uri};
+    use super::{API_PREFIX, RELAYED_ROUTES, may_try_next, relay_route, relay_url};
+    use crate::error::{ErrorResponse, ServerError};
+    use axum::body::to_bytes;
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::response::IntoResponse;
 
     #[test]
     fn matches_allowlisted_routes() {
@@ -309,6 +325,31 @@ mod tests {
             relay_url("https://mgmt.example.test/api/v1/", &uri),
             "https://mgmt.example.test/api/v1/admin/onboarding/secrets?limit=5"
         );
+    }
+
+    #[test]
+    fn connect_failure_advances() {
+        assert!(may_try_next(&Method::POST, true));
+        assert!(may_try_next(&Method::GET, true));
+    }
+
+    #[test]
+    fn get_failure_advances() {
+        assert!(may_try_next(&Method::GET, false));
+    }
+
+    #[tokio::test]
+    async fn post_failure_stops() {
+        // A failure after the connect succeeded may already have minted a secret.
+        assert!(!may_try_next(&Method::POST, false));
+        assert!(!may_try_next(&Method::DELETE, false));
+
+        let response = ServerError::RelayFailed.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: ErrorResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body.code.as_deref(), Some("relay_failed"));
     }
 
     #[test]

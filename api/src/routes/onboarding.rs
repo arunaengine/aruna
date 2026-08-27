@@ -341,6 +341,7 @@ interface answers 400. A realm policy that forbids enrollment answers 403."#,
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is path-restricted, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The owner already holds the realm's maximum number of devices, or a concurrent mint won the transaction; retry", body = crate::error::ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
         (status = 503, description = "Storage cleanup capacity is exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -555,6 +556,7 @@ answers 404."#,
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
         (status = 404, description = "No enrollment secret with this id on this node", body = crate::error::ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -760,6 +762,7 @@ redemption that lost its transaction to a concurrent one, which is safe to retry
         (status = 401, description = "Unknown, expired, already claimed or non-matching enrollment secret, or a proof that does not verify", body = crate::error::ErrorResponse),
         (status = 403, description = "The secret was not minted for node enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The device's owner already holds the realm's maximum number of devices, or a concurrent enrollment won the transaction; retry", body = crate::error::ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
         (status = 503, description = "Storage cleanup capacity is exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     )
 )]

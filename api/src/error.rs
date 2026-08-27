@@ -69,6 +69,10 @@ pub enum ServerError {
     /// node answered the relay.
     #[error("No management node is reachable")]
     NoManagementNode,
+    /// A relayed request failed after the management node could already have
+    /// applied it, so it must not be re-sent to another node.
+    #[error("Relaying to a management node failed")]
+    RelayFailed,
 }
 
 #[derive(Debug, Error)]
@@ -386,7 +390,9 @@ impl ServerError {
                     StatusCode::BAD_REQUEST
                 }
             }
-            ServerError::BadGateway | ServerError::BadGatewayReason(_) => StatusCode::BAD_GATEWAY,
+            ServerError::BadGateway
+            | ServerError::BadGatewayReason(_)
+            | ServerError::RelayFailed => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable
             | ServerError::ServiceUnavailableReason(_)
             | ServerError::NoManagementNode => StatusCode::SERVICE_UNAVAILABLE,
@@ -419,6 +425,7 @@ impl ServerError {
                 "Service unavailable".to_string()
             }
             ServerError::NoManagementNode => "no_management_node".to_string(),
+            ServerError::RelayFailed => "relay_failed".to_string(),
         }
     }
 
