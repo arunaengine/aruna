@@ -25,6 +25,10 @@ pub const STORAGE_CLASS_LABEL_PREFIX: &str = "aruna-engine.org/storage-class/";
 /// absent while the node declares no location; writes are rejected.
 pub const LOCATION_LABEL_KEY: &str = "aruna-engine.org/location";
 
+/// Derived read-only label carrying the node's own id, so a submission can
+/// target one exact node as an ordinary label match; writes are rejected.
+pub const NODE_LABEL_KEY: &str = "aruna-engine.org/node";
+
 /// Names the first derived label a write surface tried to set. Every such label
 /// is stamped by the owning node, so no operator input may claim one.
 pub fn reserved_label(labels: &BTreeMap<String, String>) -> Option<&str> {
@@ -33,6 +37,7 @@ pub fn reserved_label(labels: &BTreeMap<String, String>) -> Option<&str> {
         .find(|key| {
             key.as_str() == KIND_LABEL_KEY
                 || key.as_str() == LOCATION_LABEL_KEY
+                || key.as_str() == NODE_LABEL_KEY
                 || key.starts_with(STORAGE_CLASS_LABEL_PREFIX)
         })
         .map(String::as_str)

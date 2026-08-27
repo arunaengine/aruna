@@ -7,10 +7,10 @@ use crate::structs::{
     Actor, BandPool, BindingDirectory, BindingError, BindingScope, CandidateMapNode,
     CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
     DocumentClass, FrozenStrategySelector, HandleRange, HandleRangeDirectory, JobId,
-    KIND_LABEL_KEY, METADATA_HANDLE, NodePlacementEntry, PlacementActivation, PlacementBinding,
-    PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, PlacementTransition,
-    SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start, coordinator_spans,
-    shard_for_subject,
+    KIND_LABEL_KEY, METADATA_HANDLE, NODE_LABEL_KEY, NodePlacementEntry, PlacementActivation,
+    PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
+    PlacementTransition, SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start,
+    coordinator_spans, shard_for_subject,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -802,6 +802,8 @@ impl RealmConfigDocument {
                 KIND_LABEL_KEY.to_string(),
                 realm_node.kind.label().to_string(),
             );
+            // The config's own id string, so a submission can pin this node.
+            labels.insert(NODE_LABEL_KEY.to_string(), realm_node.node_id.clone());
             crate::structs::stamp_location(
                 &mut labels,
                 entry
@@ -1119,9 +1121,9 @@ mod test {
     use crate::request_policy::{PolicyKind, RequestPolicy};
     use crate::structs::{
         Actor, CandidatePlacementMap, DynamicDiscoveryMethod, KIND_LABEL_KEY,
-        MetadataGroupReplicationOverride, MetadataPathReplicationOverride, OidcProviderConfig,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
+        MetadataGroupReplicationOverride, MetadataPathReplicationOverride, NODE_LABEL_KEY,
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
     };
     use crate::types::UserId;
     use ulid::Ulid;
@@ -1521,6 +1523,11 @@ mod test {
         assert_eq!(
             frozen.nodes[0].labels.get(KIND_LABEL_KEY),
             Some(&"server".to_string())
+        );
+        // Every candidate carries its own id as an immutable label.
+        assert_eq!(
+            frozen.nodes[0].labels.get(NODE_LABEL_KEY),
+            Some(&frozen.nodes[0].node_id.to_string())
         );
         assert_eq!(config.candidate_nodes().len(), 2);
 
