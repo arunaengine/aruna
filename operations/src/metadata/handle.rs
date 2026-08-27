@@ -7663,6 +7663,27 @@ mod tests {
         applied
     }
 
+    async fn graph_state(
+        handle: &MetadataHandle,
+        graph_iri: &str,
+    ) -> Vec<(String, String, String)> {
+        let event = handle
+            .send_metadata_effect(MetadataEffect::GraphSnapshot {
+                graph_iri: graph_iri.to_string(),
+            })
+            .await;
+        let Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) = event else {
+            panic!("expected a graph snapshot, got {event:?}");
+        };
+        let mut quads = snapshot
+            .quads
+            .into_iter()
+            .map(|quad| (quad.subject.0, quad.predicate.0, quad.object.0))
+            .collect::<Vec<_>>();
+        quads.sort();
+        quads
+    }
+
     #[tokio::test]
     async fn merges_converge() {
         // Two holders plan against the same base and merge in opposite orders.
@@ -7715,8 +7736,13 @@ mod tests {
             .await
             .expect("right render");
         assert_eq!(left_render, right_render);
-        assert!(left_render.contains("ada"));
-        assert!(left_render.contains("grace"));
+        // The export renders only entities the crate references, so both
+        // concurrent adds are checked against the authoritative graph state.
+        let left_state = graph_state(&left, graph_iri).await;
+        assert_eq!(left_state, graph_state(&right, graph_iri).await);
+        for subject in ["<#ada>", "<#grace>"] {
+            assert!(left_state.iter().any(|(held, ..)| held == subject));
+        }
     }
 
     #[tokio::test]
