@@ -20,6 +20,7 @@ use aruna_operations::get_realm_nodes::{
     GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
+use aruna_operations::metadata::{MetadataHandle, PeerContacts};
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
     drive_realm_placement_mutation,
@@ -824,6 +825,11 @@ pub struct RealmNodeInfoResponse {
     pub configured: bool,
     pub present: bool,
     pub connection_status: RealmNodeConnectionStatus,
+    /// When a `user` node last reached this node, in unix milliseconds. This
+    /// node's own observation; absent for other kinds and for a device it has
+    /// not seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
     /// Placement map entry (location/weight/status) when the node is mapped.
     pub placement: Option<RealmNodePlacementResponse>,
     /// Latest published node info document (capabilities/labels/urls/utilization) if received.
@@ -885,6 +891,9 @@ pub enum RealmNodeKindInfo {
 pub enum RealmNodeConnectionStatus {
     Connected,
     Configured,
+    /// A device that reached this node recently. Not a connection: it is what
+    /// this node itself saw, and only this node saw it.
+    Seen,
     /// Presence does not describe this node: a device publishes none.
     Unknown,
 }
@@ -937,8 +946,13 @@ token of another realm or one this node cannot validate, the response is the pub
   fresh lookup just now; `configured` means no fresh confirmation, which is not evidence that the
   peer is down. Stale presence is candidate data and is never reported as a connection.
 - A `user` node is a device and publishes no presence at all, so `present` is always false and
-  `connection_status` is `unknown`, on the device's own node too. That is the absence of a signal,
-  never a report that the device is down."#,
+  `connection_status` is never `connected`. That is the absence of a signal, never a report that
+  the device is down.
+- A device is instead reported from what this node itself saw: `last_seen_ms` is when the device
+  last reached this node over an authorized request, and `connection_status` `seen` means that was
+  within the last three minutes, otherwise `unknown`. Both are this node's own observation, are
+  never realm state, and start empty after a restart; a device that talks to a different realm node
+  is `unknown` here and `seen` there. A node answering about itself reports itself seen now."#,
     responses(
         (
             status = 200,
@@ -1016,7 +1030,8 @@ token of another realm or one this node cannot validate, the response is the pub
                                 "owner": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                                 "configured": true,
                                 "present": false,
-                                "connection_status": "unknown",
+                                "connection_status": "seen",
+                                "last_seen_ms": 1775744591123_i64,
                                 "placement": null,
                                 "info": null
                             }
@@ -1102,7 +1117,20 @@ pub async fn get_realm_info(
         let present_nodes = load_realm_presence_best_effort(&state).await;
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
-        let nodes = map_realm_nodes(&state, &config, present_nodes, node_info_docs);
+        let contacts = state
+            .get_ctx()
+            .metadata_handle
+            .as_ref()
+            .map(MetadataHandle::peer_contacts)
+            .unwrap_or_default();
+        let nodes = map_realm_nodes(
+            &state,
+            &config,
+            present_nodes,
+            node_info_docs,
+            &contacts,
+            unix_timestamp_millis(),
+        );
         (
             Some(discovery),
             nodes,
@@ -1934,6 +1962,8 @@ fn map_realm_nodes(
     config: &RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
     node_info_docs: BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
+    contacts: &PeerContacts,
+    now_ms: u64,
 ) -> Vec<RealmNodeInfoResponse> {
     let current_node = state.get_node_id();
     config
@@ -1959,17 +1989,28 @@ fn map_realm_nodes(
             let info = parsed
                 .and_then(|node_id| node_info_docs.get(&node_id))
                 .map(map_node_info_document);
+            // A device answering for itself is in contact by definition.
+            let last_seen_ms = match (is_device, is_current) {
+                (true, true) => Some(now_ms),
+                (true, false) => parsed.and_then(|node_id| contacts.last_seen(&node_id)),
+                (false, _) => None,
+            };
+            let seen_recently = is_device
+                && (is_current
+                    || parsed.is_some_and(|node_id| contacts.seen_recently(&node_id, now_ms)));
             RealmNodeInfoResponse {
                 node_id: node.node_id.clone(),
                 kind,
                 owner: node.kind.owner().map(|owner| owner.to_string()),
                 configured: true,
                 present,
-                connection_status: match (is_device, present) {
-                    (true, _) => RealmNodeConnectionStatus::Unknown,
-                    (false, true) => RealmNodeConnectionStatus::Connected,
-                    (false, false) => RealmNodeConnectionStatus::Configured,
+                connection_status: match (is_device, seen_recently, present) {
+                    (true, true, _) => RealmNodeConnectionStatus::Seen,
+                    (true, false, _) => RealmNodeConnectionStatus::Unknown,
+                    (false, _, true) => RealmNodeConnectionStatus::Connected,
+                    (false, _, false) => RealmNodeConnectionStatus::Configured,
                 },
+                last_seen_ms,
                 placement,
                 info,
             }
@@ -2390,13 +2431,13 @@ fn transport_addr_to_string(addr: &iroh::TransportAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, RealmNodeConnectionStatus,
-        RealmNodeKindInfo, RealmPlacementBinding, RealmPlacementBindingScope,
-        RealmPlacementMutationRequest, RealmPlacementOverride, RealmPlacementStrategy,
-        RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus, get_info, get_realm_info,
-        get_realm_placement, get_usage, map_handle_error, map_mutate_realm_placement_error,
-        map_realm_nodes, map_set_realm_quota_error, mutate_realm_placement, presence_nodes,
-        set_realm_quota,
+        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, PeerContacts,
+        RealmNodeConnectionStatus, RealmNodeKindInfo, RealmPlacementBinding,
+        RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
+        RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
+        get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
+        map_mutate_realm_placement_error, map_realm_nodes, map_set_realm_quota_error,
+        mutate_realm_placement, presence_nodes, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -4009,7 +4050,14 @@ mod tests {
         }
 
         let present = HashSet::from([device, state.get_node_id()]);
-        let nodes = map_realm_nodes(&state, &config, present, BTreeMap::new());
+        let nodes = map_realm_nodes(
+            &state,
+            &config,
+            present,
+            BTreeMap::new(),
+            &PeerContacts::default(),
+            10_000,
+        );
 
         let devices: Vec<_> = nodes
             .iter()
@@ -4018,7 +4066,7 @@ mod tests {
         assert_eq!(devices.len(), 2);
         for node in devices {
             assert!(!node.present, "a device is never presence-confirmed");
-            assert_eq!(node.connection_status, RealmNodeConnectionStatus::Unknown);
+            assert_ne!(node.connection_status, RealmNodeConnectionStatus::Connected);
         }
         let infra = nodes
             .iter()
@@ -4029,5 +4077,67 @@ mod tests {
             infra.connection_status,
             RealmNodeConnectionStatus::Connected
         );
+    }
+
+    #[tokio::test]
+    async fn reports_device_seen() {
+        // A device is reported from this node's own contact record, and the
+        // device's own node is serving the request, so it saw itself now.
+        let (state, realm_id, owner, _tempdir) = setup_management_state().await;
+        let mut config = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        let recent = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
+        let stale = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
+        for node_id in [recent, stale, state.get_node_id()] {
+            config.nodes.push(aruna_core::structs::RealmNode {
+                node_id: node_id.to_string(),
+                kind: aruna_core::structs::RealmNodeKind::User { owner },
+            });
+        }
+        let now_ms = 1_000_000;
+        let window = aruna_operations::metadata::PEER_CONTACT_WINDOW.as_millis() as u64;
+        let contacts = PeerContacts::default();
+        contacts.note(recent, now_ms - window);
+        contacts.note(stale, now_ms - window - 1);
+
+        let nodes = map_realm_nodes(
+            &state,
+            &config,
+            HashSet::new(),
+            BTreeMap::new(),
+            &contacts,
+            now_ms,
+        );
+        let device = |node_id: aruna_core::NodeId| {
+            nodes
+                .iter()
+                .find(|node| {
+                    node.node_id == node_id.to_string() && node.kind == RealmNodeKindInfo::User
+                })
+                .unwrap()
+        };
+
+        assert_eq!(
+            device(recent).connection_status,
+            RealmNodeConnectionStatus::Seen
+        );
+        assert_eq!(device(recent).last_seen_ms, Some(now_ms - window));
+        assert_eq!(
+            device(stale).connection_status,
+            RealmNodeConnectionStatus::Unknown
+        );
+        assert_eq!(device(stale).last_seen_ms, Some(now_ms - window - 1));
+        let current = device(state.get_node_id());
+        assert_eq!(current.connection_status, RealmNodeConnectionStatus::Seen);
+        assert_eq!(current.last_seen_ms, Some(now_ms));
+        let infra = nodes
+            .iter()
+            .find(|node| node.kind != RealmNodeKindInfo::User)
+            .unwrap();
+        assert_eq!(infra.last_seen_ms, None, "only devices report contact");
     }
 }

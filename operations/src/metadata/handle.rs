@@ -28,6 +28,7 @@ use aruna_core::structs::{
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
@@ -53,6 +54,7 @@ use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
+use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
 use super::profile_shacl::{
     ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
@@ -297,6 +299,7 @@ struct MetadataInner {
     deferred_persist_running: AtomicBool,
     profile_validation_disabled: bool,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
+    peer_contacts: PeerContacts,
 }
 
 #[derive(Clone)]
@@ -906,6 +909,7 @@ impl MetadataHandle {
                 deferred_persist_running: AtomicBool::new(false),
                 profile_validation_disabled: metadata_options.profile_validation_disabled,
                 profile_shacl,
+                peer_contacts: PeerContacts::default(),
             }),
             storage_priority: StoragePriority::Foreground,
         })
@@ -2272,6 +2276,7 @@ impl MetadataHandle {
             .await
             .map_err(|_| MetadataReadError::Unavailable)?;
         }
+        self.note_peer_contact(peer);
         Ok(auth)
     }
 
@@ -2284,11 +2289,13 @@ impl MetadataHandle {
             return Err(MetadataWritePeerError::Unauthorized);
         };
         let MetadataAuthToken::Bearer(token) = auth_token else {
-            return self
+            let auth = self
                 .authorize_remote_peer(peer, Some(auth_token))
                 .await
                 .map_err(MetadataWritePeerError::Unavailable)?
-                .ok_or(MetadataWritePeerError::Unauthorized);
+                .ok_or(MetadataWritePeerError::Unauthorized)?;
+            self.note_peer_contact(peer);
+            return Ok(auth);
         };
         let auth = validate_aruna_bearer_token(&self.inner.auth_validation, token.as_str())
             .await
@@ -2313,7 +2320,19 @@ impl MetadataHandle {
             .await
             .map_err(MetadataWritePeerError::Unavailable)?;
         }
+        self.note_peer_contact(peer);
         Ok(auth)
+    }
+
+    /// This node's own liveness observation, taken where the peer identity is
+    /// authorized. Never realm state: it is neither replicated nor published.
+    fn note_peer_contact(&self, peer: NodeId) {
+        self.inner.peer_contacts.note(peer, unix_timestamp_millis());
+    }
+
+    /// When this node last saw each authorized peer.
+    pub fn peer_contacts(&self) -> PeerContacts {
+        self.inner.peer_contacts.clone()
     }
 
     pub(crate) async fn claims_for_revocation(
