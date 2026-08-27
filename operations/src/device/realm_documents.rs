@@ -490,6 +490,38 @@ pub async fn installed_memberships(
     postcard::from_bytes(&bytes).unwrap_or_default()
 }
 
+/// Adds one group to this device's projection, replacing the entry it already
+/// holds for the same group. It keeps the same first-by-group-id set a serving
+/// node projects, so the next fetch agrees with what the device shows now.
+pub async fn install_membership(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    membership: DeviceGroupMembership,
+) -> bool {
+    let mut memberships = installed_memberships(context, realm_id).await;
+    match memberships
+        .iter()
+        .position(|held| held.group_id == membership.group_id)
+    {
+        Some(index) => memberships[index] = membership,
+        None => memberships.push(membership),
+    }
+    memberships.sort_by_key(|membership| membership.group_id);
+    memberships.truncate(MAX_DEVICE_GROUPS);
+    let Ok(bytes) = postcard::to_allocvec(&memberships) else {
+        return false;
+    };
+    write_batch(
+        context,
+        vec![(
+            DEVICE_GROUP_MEMBERSHIP_KEYSPACE.to_string(),
+            Key::from(realm_id.as_bytes().to_vec()),
+            Value::from(bytes),
+        )],
+    )
+    .await
+}
+
 /// What the copy this device holds was accepted at. An absent marker reads as
 /// nothing seen, which accepts the first copy and refuses nothing.
 async fn installed_marker(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmMarker {
@@ -564,6 +596,7 @@ async fn write_batch(context: &Arc<DriverContext>, writes: Vec<(String, Key, Val
 mod tests {
     use super::*;
     use aruna_core::structs::{RealmNodeKind, TokenRevocation};
+    use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -759,6 +792,33 @@ mod tests {
             .await,
             Some(stored),
             "the documents themselves are not rewritten"
+        );
+    }
+
+    fn membership(seed: u128, display_name: &str) -> DeviceGroupMembership {
+        DeviceGroupMembership {
+            group_id: Ulid::from(seed),
+            realm_id: realm(),
+            display_name: display_name.to_string(),
+            roles: Vec::new(),
+        }
+    }
+
+    // A group the owner created on this device must show at once, and creating
+    // it again must not leave the device holding it twice.
+    #[tokio::test]
+    async fn installs_created_group() {
+        let (_dir, context) = device(&config(&[1])).await;
+
+        assert!(install_membership(&context, realm(), membership(2, "second")).await);
+        assert!(install_membership(&context, realm(), membership(1, "first")).await);
+        assert!(install_membership(&context, realm(), membership(2, "renamed")).await);
+
+        let held = installed_memberships(&context, realm()).await;
+        assert_eq!(
+            held,
+            vec![membership(1, "first"), membership(2, "renamed")],
+            "one entry per group, in the order a serving node projects them"
         );
     }
 

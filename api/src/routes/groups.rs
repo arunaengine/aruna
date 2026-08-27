@@ -7,9 +7,9 @@ use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmId, Role,
-    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
-    usage_group_key,
+    Actor, AuthContext, DeviceGroupMembership, Group, GroupAuthorizationDocument, Permission,
+    RealmId, Role, blob_bucket_permission_path, blob_group_permission_path,
+    blob_object_permission_path, usage_group_key,
 };
 use aruna_core::types::RoleId;
 use aruna_operations::add_group_role::{
@@ -19,6 +19,7 @@ use aruna_operations::add_user_to_group::{
     AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
 };
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
+use aruna_operations::device::realm_documents::install_membership;
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -437,6 +438,14 @@ pub async fn create_group(
                 ForwardGroupError::Api(err) => map_metadata_api_error(err),
             })?;
         request_span.record("group_id", field::display(forwarded.0.group_id));
+        // Projected here so the new group shows on the next read instead of
+        // after the device's next realm-document fetch.
+        if let Some(membership) =
+            DeviceGroupMembership::project(&forwarded.0, &forwarded.1, auth.user_id)
+            && !install_membership(&ctx, realm_id, membership).await
+        {
+            warn!(group_id = %forwarded.0.group_id, "Failed to project a forwarded group locally");
+        }
         return Ok((StatusCode::CREATED, Json(forwarded.into())));
     }
 
