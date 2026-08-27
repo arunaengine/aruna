@@ -163,12 +163,15 @@ fn may_try_next(method: &Method, is_connect: bool) -> bool {
     is_connect || method == Method::GET
 }
 
-/// The peer's published api base url carries the nest, so the incoming path
-/// contributes only what follows it.
+/// Published api urls are bare origins (`API_PUBLIC_URL`), so the nest comes
+/// from the incoming path; a target that already carries it contributes it.
 fn relay_url(target: &str, uri: &Uri) -> String {
     let base = target.trim_end_matches('/');
     let path = uri.path();
-    let suffix = path.strip_prefix(API_PREFIX).unwrap_or(path);
+    let suffix = match base.ends_with(API_PREFIX) {
+        true => path.strip_prefix(API_PREFIX).unwrap_or(path),
+        false => path,
+    };
     match uri.query() {
         Some(query) => format!("{base}{suffix}?{query}"),
         None => format!("{base}{suffix}"),
@@ -333,7 +336,12 @@ mod tests {
 
     #[test]
     fn builds_target_url() {
+        // Node info documents publish `API_PUBLIC_URL` as a bare origin.
         let uri: Uri = "/api/v1/admin/onboarding/secrets?limit=5".parse().unwrap();
+        assert_eq!(
+            relay_url("http://127.0.0.1:43001", &uri),
+            "http://127.0.0.1:43001/api/v1/admin/onboarding/secrets?limit=5"
+        );
         assert_eq!(
             relay_url("https://mgmt.example.test/api/v1/", &uri),
             "https://mgmt.example.test/api/v1/admin/onboarding/secrets?limit=5"
