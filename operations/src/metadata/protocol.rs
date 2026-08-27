@@ -474,6 +474,10 @@ pub struct RealmDocuments {
     /// capped at [`MAX_DEVICE_GROUPS`]. Display only: a device is excluded from
     /// the admin document plane and holds no group authorization document.
     pub groups: Vec<DeviceGroupMembership>,
+    /// The api urls the realm's management nodes published, in node-id order. A
+    /// device holds no peer node-info document, so a management-only route has
+    /// no target there without this list.
+    pub management_urls: Vec<String>,
     /// What the serving node had applied when it made this copy. A device
     /// refuses a copy that has seen less than the one it already holds.
     pub clock: AdminDocumentClock,

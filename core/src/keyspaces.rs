@@ -145,6 +145,11 @@ pub const DEVICE_REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
 /// group authorization and defers every permission decision to its ingress.
 pub const DEVICE_GROUP_MEMBERSHIP_KEYSPACE: &str = "device_group_memberships";
 
+/// The api urls of the realm's management nodes, as a realm node served them,
+/// keyed by realm id. A device holds no peer node-info document, so this is the
+/// only address it has for a management-only route.
+pub const DEVICE_MANAGEMENT_URL_KEYSPACE: &str = "device_management_urls";
+
 /// The one row a device keeps about its exchange with the realm: when the realm
 /// last answered, when the last pass finished, and whether one is in flight.
 pub const DEVICE_SYNC_STATE_KEYSPACE: &str = "device_sync_state";

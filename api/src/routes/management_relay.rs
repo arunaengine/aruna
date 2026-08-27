@@ -8,6 +8,7 @@ use crate::error::ServerError;
 use crate::routes::info::{load_node_info_documents_best_effort, management_node_urls};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
+use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use axum::body::Bytes;
@@ -219,7 +220,9 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
     {
         Ok(config) => {
             let documents = load_node_info_documents_best_effort(state, &config).await;
-            cached.urls = peer_management_urls(state.get_node_id(), &config, &documents);
+            let peers = peer_management_urls(state.get_node_id(), &config, &documents);
+            let installed = installed_management_urls(&state.get_ctx(), state.get_realm_id()).await;
+            cached.urls = relay_targets(peers, installed);
         }
         Err(error) => debug!(error = %error, "Management relay reuses cached management urls"),
     }
@@ -229,6 +232,16 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
 
 fn is_fresh(refreshed_at: Option<Instant>) -> bool {
     refreshed_at.is_some_and(|refreshed_at| refreshed_at.elapsed() < MANAGEMENT_URL_TTL)
+}
+
+/// The targets a relayed route is tried against. A device holds no peer
+/// node-info document, so the list a realm node installed on it is the only
+/// address it has for a management node.
+fn relay_targets(peers: Vec<String>, installed: Vec<String>) -> Vec<String> {
+    match peers.is_empty() {
+        true => installed,
+        false => peers,
+    }
 }
 
 /// Management peers in node-id order, this node excluded. The order is stable
@@ -255,7 +268,7 @@ fn peer_management_urls(
 
 #[cfg(test)]
 mod tests {
-    use super::{API_PREFIX, RELAYED_ROUTES, may_try_next, relay_route, relay_url};
+    use super::{API_PREFIX, RELAYED_ROUTES, may_try_next, relay_route, relay_targets, relay_url};
     use crate::error::{ErrorResponse, ServerError};
     use axum::body::to_bytes;
     use axum::http::{Method, StatusCode, Uri};
@@ -325,6 +338,24 @@ mod tests {
             relay_url("https://mgmt.example.test/api/v1/", &uri),
             "https://mgmt.example.test/api/v1/admin/onboarding/secrets?limit=5"
         );
+    }
+
+    #[test]
+    fn uses_installed_urls() {
+        // A device resolves no peer from node-info documents it never holds.
+        let installed = vec!["https://mgmt.example.test/api/v1".to_string()];
+        assert_eq!(
+            relay_targets(Vec::new(), installed.clone()),
+            installed,
+            "a device relays to the list its realm installed"
+        );
+        let peers = vec!["https://peer.example.test/api/v1".to_string()];
+        assert_eq!(
+            relay_targets(peers.clone(), installed),
+            peers,
+            "a resolved peer is never displaced by an installed copy"
+        );
+        assert!(relay_targets(Vec::new(), Vec::new()).is_empty());
     }
 
     #[test]

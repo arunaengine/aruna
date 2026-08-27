@@ -23,7 +23,9 @@ use aruna_core::auth::revocation_live;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DEVICE_GROUP_MEMBERSHIP_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE};
+use aruna_core::keyspaces::{
+    DEVICE_GROUP_MEMBERSHIP_KEYSPACE, DEVICE_MANAGEMENT_URL_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE,
+};
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
     Actor, AuthContext, DeviceGroupMembership, RealmConfigDocument, RealmId, SyncRefusal,
@@ -375,10 +377,12 @@ async fn install_documents(
     };
     let stored_owner = read_bytes(context, owner_target.clone()).await;
     let stored_groups = installed_memberships(context, plan.realm_id).await;
+    let stored_urls = installed_management_urls(context, plan.realm_id).await;
     let unchanged = stored_config.as_deref() == Some(bytes.as_slice())
         && stored_authorization.as_deref() == accepted.documents.realm_authorization.as_deref()
         && stored_owner.as_deref() == accepted.documents.owner.as_deref()
-        && stored_groups == accepted.documents.groups;
+        && stored_groups == accepted.documents.groups
+        && stored_urls == accepted.documents.management_urls;
     if unchanged {
         // Nothing but the marker moves: writing the documents again would
         // re-register every realm peer on every beat for a copy this device
@@ -434,6 +438,15 @@ async fn install_documents(
         Key::from(plan.realm_id.as_bytes().to_vec()),
         Value::from(group_bytes),
     ));
+    let Ok(url_bytes) = postcard::to_allocvec(&accepted.documents.management_urls) else {
+        warn!("The fetched management urls could not be stored");
+        return false;
+    };
+    writes.push((
+        DEVICE_MANAGEMENT_URL_KEYSPACE.to_string(),
+        Key::from(plan.realm_id.as_bytes().to_vec()),
+        Value::from(url_bytes),
+    ));
     if !write_batch(context, writes).await {
         return false;
     }
@@ -480,6 +493,29 @@ pub async fn installed_memberships(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: DEVICE_GROUP_MEMBERSHIP_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    postcard::from_bytes(&bytes).unwrap_or_default()
+}
+
+/// The management api urls a realm node last served this device, in the order
+/// it served them. A device holds no peer node-info document, so relaying a
+/// management-only route has no other target.
+pub async fn installed_management_urls(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+) -> Vec<String> {
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(bytes), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DEVICE_MANAGEMENT_URL_KEYSPACE.to_string(),
             key: realm_id.as_bytes().to_vec().into(),
             txn_id: None,
         })
@@ -635,6 +671,7 @@ mod tests {
             realm_authorization: None,
             owner: None,
             groups: Vec::new(),
+            management_urls: Vec::new(),
             clock: clock(seen),
         };
         accept(documents, realm()).expect("the answer is this realm's")

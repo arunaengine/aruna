@@ -72,6 +72,7 @@ use crate::metadata::protocol::{
     RealmDocuments,
 };
 use crate::metadata::raw::{MetadataRawView, load_raw_view};
+use crate::node_info::read_node_info_documents;
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
@@ -2346,8 +2347,41 @@ async fn read_realm_documents(
         realm_authorization,
         owner,
         groups: device_group_memberships(context, auth.user_id).await,
+        management_urls: management_urls(context, &config).await,
         clock: applied_clock(context, realm_id).await,
     })
+}
+
+/// The api urls the realm's management nodes published, in node-id order so
+/// repeated answers pin the same peer. A device relays its management-only
+/// routes to these.
+async fn management_urls(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+) -> Vec<String> {
+    let node_ids: Vec<NodeId> = config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .collect();
+    let documents = match read_node_info_documents(context, &node_ids).await {
+        Ok(documents) => documents,
+        Err(error) => {
+            warn!(%error, "Failed to read the management urls for a device");
+            return Vec::new();
+        }
+    };
+    let mut urls: Vec<String> = Vec::new();
+    for url in documents
+        .values()
+        .filter_map(|document| document.urls.api.clone())
+    {
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
 }
 
 /// The caller's own group memberships, projected for a device that holds none.

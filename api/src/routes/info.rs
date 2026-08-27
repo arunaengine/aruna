@@ -14,6 +14,7 @@ use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, Request
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::allocate_handle::{HandleAllocationError, provision_metadata_binding};
+use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::{
@@ -1106,12 +1107,17 @@ pub async fn get_realm_info(
     });
 
     let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
-    let management_urls = management_urls(
+    let mut management_urls = management_urls(
         &state,
         &config,
         &node_info_docs,
         interfaces.rest.url.as_deref(),
     );
+    // A device holds no peer node-info document, so the list a realm node
+    // installed on it is what the portal is offered there.
+    if management_urls.is_empty() {
+        management_urls = installed_management_urls(&state.get_ctx(), config.realm_id).await;
+    }
 
     let (discovery, nodes, quota) = if realm_authenticated {
         let present_nodes = load_realm_presence_best_effort(&state).await;
