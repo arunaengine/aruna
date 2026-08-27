@@ -25,9 +25,9 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_key, metadata_create_acceptance_key,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, DeviceGroupMembership, Group, GroupAuthorizationDocument, JobId,
-    MetadataRegistryRecord, MintPersistentIdSpec, Permission, PersistentIdFailure,
-    PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, JobId, MetadataRegistryRecord,
+    MintPersistentIdSpec, Permission, PersistentIdFailure, PersistentIdMapping, PlacementRef,
+    RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -67,9 +67,9 @@ use crate::metadata::handle::{
 };
 use crate::metadata::profile_validation::{current_validation_status, revalidate_current};
 use crate::metadata::protocol::{
-    GraphState, MAX_DEVICE_GROUPS, MetadataAuthToken, MetadataReadError, MetadataTransportMessage,
-    MetadataWriteAuthError, PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
-    RealmDocuments,
+    DeviceGroupDocuments, GraphState, MAX_DEVICE_GROUPS, MetadataAuthToken, MetadataReadError,
+    MetadataTransportMessage, MetadataWriteAuthError, PersistentIdOutcome, PersistentIdRequest,
+    PersistentIdResolution, RealmDocuments,
 };
 use crate::metadata::raw::{MetadataRawView, load_raw_view};
 use crate::node_info::read_node_info_documents;
@@ -2346,7 +2346,7 @@ async fn read_realm_documents(
         realm_config,
         realm_authorization,
         owner,
-        groups: device_group_memberships(context, auth.user_id).await,
+        groups: device_group_documents(context, auth.user_id).await,
         management_urls: management_urls(context, &config).await,
         clock: applied_clock(context, realm_id).await,
     })
@@ -2384,13 +2384,13 @@ async fn management_urls(
     urls
 }
 
-/// The caller's own group memberships, projected for a device that holds none.
-/// A read that fails yields an empty list: this projection is for display and
-/// must not cost the device the realm configuration it is judged by.
-async fn device_group_memberships(
+/// The caller's own groups, as the documents this node stores. A read that
+/// fails yields an empty list: one unreadable group must not cost the device
+/// the realm configuration it is judged by.
+async fn device_group_documents(
     context: &Arc<DriverContext>,
     user_id: UserId,
-) -> Vec<DeviceGroupMembership> {
+) -> Vec<DeviceGroupDocuments> {
     let groups = match drive(ListGroupOperation::new(), context.as_ref()).await {
         Ok(groups) => groups,
         Err(error) => {
@@ -2398,9 +2398,9 @@ async fn device_group_memberships(
             return Vec::new();
         }
     };
-    let mut memberships = Vec::new();
+    let mut documents = Vec::new();
     for Group { group_id, .. } in groups {
-        if memberships.len() >= MAX_DEVICE_GROUPS {
+        if documents.len() >= MAX_DEVICE_GROUPS {
             break;
         }
         let read = drive(
@@ -2408,15 +2408,28 @@ async fn device_group_memberships(
             context.as_ref(),
         )
         .await;
-        let Ok((group, auth_doc)) = read else {
+        let Ok((group, authorization)) = read else {
             warn!(%group_id, "Failed to read a group for a device");
             continue;
         };
-        if let Some(membership) = DeviceGroupMembership::project(&group, &auth_doc, user_id) {
-            memberships.push(membership);
+        if !holds_any_role(&authorization, user_id) {
+            continue;
         }
+        documents.push(DeviceGroupDocuments {
+            group,
+            authorization,
+        });
     }
-    memberships
+    documents
+}
+
+/// Whether the owner holds a role in this group. A device caches its owner's
+/// groups only; a realm-scale group list is not theirs to hold.
+fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -> bool {
+    authorization
+        .roles
+        .values()
+        .any(|role| role.assigned_users.contains(&user_id))
 }
 
 /// What this node has applied to the realm configuration, as the reducer keeps

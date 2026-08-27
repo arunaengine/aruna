@@ -11,10 +11,10 @@ use aruna_core::metadata::{
     MetadataProfileValidationStatus, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::structs::{
-    DeviceGroupMembership, Group, GroupAuthorizationDocument, MetadataRegistryRecord,
-    PathClaimRecord, PersistentIdFailure, PersistentIdMapping, PlacementPolicy,
-    PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor,
-    SyncPageLimit, SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, PathClaimRecord,
+    PersistentIdFailure, PersistentIdMapping, PlacementPolicy, PlacementPolicyDocument,
+    PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor, SyncPageLimit, SyncPullAck,
+    SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -454,10 +454,19 @@ pub struct GraphState {
     pub findings: u32,
 }
 
-/// The most group memberships a serving node projects into one device's copy.
-/// A device displays its owner's groups; it never mirrors a realm-scale
-/// membership list, and the bound is what keeps this answer small.
+/// The most groups a serving node hands one device. A device caches its
+/// owner's groups; it never mirrors a realm-scale group list, and the bound is
+/// what keeps this answer small.
 pub const MAX_DEVICE_GROUPS: usize = 256;
+
+/// One group as a realm node stores it. The device writes both documents into
+/// the keyspaces every local read already uses, so the group answers there
+/// exactly as it does on a realm node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceGroupDocuments {
+    pub group: Group,
+    pub authorization: GroupAuthorizationDocument,
+}
 
 /// The realm-wide documents as the serving node stores them. The copies a
 /// device installs from them are never published again: they are a read.
@@ -470,10 +479,10 @@ pub struct RealmDocuments {
     /// the device as it does on a realm node. Absent while the serving node
     /// holds none.
     pub owner: Option<Vec<u8>>,
-    /// The owner's own group memberships, projected by the serving node and
-    /// capped at [`MAX_DEVICE_GROUPS`]. Display only: a device is excluded from
-    /// the admin document plane and holds no group authorization document.
-    pub groups: Vec<DeviceGroupMembership>,
+    /// The owner's own groups as the serving node stores them, in group-id
+    /// order and capped at [`MAX_DEVICE_GROUPS`]. The device caches them, so
+    /// its local checks are the realm's rules; it still publishes nothing.
+    pub groups: Vec<DeviceGroupDocuments>,
     /// The api urls the realm's management nodes published, in node-id order. A
     /// device holds no peer node-info document, so a management-only route has
     /// no target there without this list.

@@ -140,11 +140,6 @@ pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 /// back, and it is never replicated.
 pub const DEVICE_REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
 
-/// The groups a device's owner belongs to, as a realm node projected them,
-/// keyed by realm id. Display only and never replicated: a device holds no
-/// group authorization and defers every permission decision to its ingress.
-pub const DEVICE_GROUP_MEMBERSHIP_KEYSPACE: &str = "device_group_memberships";
-
 /// The api urls of the realm's management nodes, as a realm node served them,
 /// keyed by realm id. A device holds no peer node-info document, so this is the
 /// only address it has for a management-only route.

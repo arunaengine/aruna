@@ -2,8 +2,9 @@
 //!
 //! A device runs no document sync, so nothing pushes the realm configuration to
 //! it. It fetches the documents from a realm node as an ordinary routed read
-//! and installs the copies locally: read-only state it is judged by - node
-//! kinds, its owner binding, quotas and token revocations - never published on.
+//! and installs the copies into the same keyspaces a realm node uses, so every
+//! local read and permission check runs unchanged. The copies are never
+//! published on: a device originates no realm administration.
 //!
 //! What it installs never regresses. A copy is refused unless its realm-config
 //! clock covers the installed one, and every revocation the device already
@@ -24,13 +25,14 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DEVICE_GROUP_MEMBERSHIP_KEYSPACE, DEVICE_MANAGEMENT_URL_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE,
+    DEVICE_MANAGEMENT_URL_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE, GROUP_KEYSPACE,
 };
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    Actor, AuthContext, DeviceGroupMembership, RealmConfigDocument, RealmId, SyncRefusal,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, RealmConfigDocument, RealmId,
+    SyncRefusal,
 };
-use aruna_core::types::{Key, UserId, Value};
+use aruna_core::types::{GroupId, Key, UserId, Value};
 use aruna_core::util::unix_timestamp_secs;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -38,7 +40,9 @@ use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
-use crate::metadata::protocol::{MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments};
+use crate::metadata::protocol::{
+    DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
+};
 use crate::mutate_realm_placement::node_kind;
 
 /// Attempts in which every answering peer served a copy the marker does not
@@ -46,6 +50,10 @@ use crate::mutate_realm_placement::node_kind;
 /// only be too high through a peer that lied, and the realm agreeing against it
 /// is the evidence that it did.
 const REBASE_ATTEMPTS: u32 = 3;
+
+/// How many cached groups one reconciliation looks at. Above
+/// [`MAX_DEVICE_GROUPS`] so a group installed outside a fetch is still seen.
+const GROUP_SCAN_LIMIT: usize = MAX_DEVICE_GROUPS + 8;
 
 /// What the device accepted last, and how often the realm has disagreed with it
 /// since. Device-local: it is the memory that keeps a copy from going backwards.
@@ -376,7 +384,7 @@ async fn install_documents(
         user_id: plan.owner,
     };
     let stored_owner = read_bytes(context, owner_target.clone()).await;
-    let stored_groups = installed_memberships(context, plan.realm_id).await;
+    let stored_groups = installed_group_docs(context).await;
     let stored_urls = installed_management_urls(context, plan.realm_id).await;
     let unchanged = stored_config.as_deref() == Some(bytes.as_slice())
         && stored_authorization.as_deref() == accepted.documents.realm_authorization.as_deref()
@@ -427,17 +435,13 @@ async fn install_documents(
             Value::from(owner),
         ));
     }
-    // The memberships go to their own keyspace, never to AUTH_KEYSPACE: a device
-    // holds no group authorization and defers every permission to its ingress.
-    let Ok(group_bytes) = postcard::to_allocvec(&accepted.documents.groups) else {
-        warn!("The fetched group memberships could not be stored");
-        return false;
-    };
-    writes.push((
-        DEVICE_GROUP_MEMBERSHIP_KEYSPACE.to_string(),
-        Key::from(plan.realm_id.as_bytes().to_vec()),
-        Value::from(group_bytes),
-    ));
+    for documents in &accepted.documents.groups {
+        let Some(group_writes) = group_doc_writes(documents, &actor) else {
+            warn!(group_id = %documents.group.group_id, "A fetched group could not be stored");
+            return false;
+        };
+        writes.extend(group_writes);
+    }
     let Ok(url_bytes) = postcard::to_allocvec(&accepted.documents.management_urls) else {
         warn!("The fetched management urls could not be stored");
         return false;
@@ -450,6 +454,7 @@ async fn install_documents(
     if !write_batch(context, writes).await {
         return false;
     }
+    prune_groups(context, &stored_groups, &accepted.documents.groups).await;
     // The peer set and the node kinds this device enforces follow the copy it
     // just installed, exactly as they follow a synced one on a realm node.
     if let Some(net_handle) = context.net_handle.as_ref()
@@ -480,27 +485,130 @@ fn keep_revocations(fetched: &mut RealmConfigDocument, installed: &RealmConfigDo
     }
 }
 
-/// The group memberships a realm node last projected onto this device. Display
-/// only: a device holds no group authorization document, so this is never an
-/// input to a permission decision.
-pub async fn installed_memberships(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-) -> Vec<DeviceGroupMembership> {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
+/// The group documents this device holds, in the group-id order both the scan
+/// and a serving node's listing produce, so a fetched set compares directly.
+/// A group whose two rows disagree is treated as absent and reinstalled.
+async fn installed_group_docs(context: &Arc<DriverContext>) -> Vec<DeviceGroupDocuments> {
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: DEVICE_GROUP_MEMBERSHIP_KEYSPACE.to_string(),
-            key: realm_id.as_bytes().to_vec().into(),
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: GROUP_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: GROUP_SCAN_LIMIT,
             txn_id: None,
         })
         .await
     else {
         return Vec::new();
     };
-    postcard::from_bytes(&bytes).unwrap_or_default()
+    let mut documents = Vec::with_capacity(values.len());
+    for (_, value) in values {
+        let Ok(group) = Group::from_bytes(&value) else {
+            continue;
+        };
+        let read = read_bytes(
+            context,
+            DocumentSyncTarget::GroupAuthorization {
+                group_id: group.group_id,
+            },
+        )
+        .await;
+        let Some(authorization) = read
+            .as_deref()
+            .and_then(|bytes| GroupAuthorizationDocument::from_bytes(bytes).ok())
+        else {
+            continue;
+        };
+        documents.push(DeviceGroupDocuments {
+            group,
+            authorization,
+        });
+    }
+    documents
+}
+
+/// The two rows one group occupies, encoded as a realm node encodes them.
+fn group_doc_writes(
+    documents: &DeviceGroupDocuments,
+    actor: &Actor,
+) -> Option<[(String, Key, Value); 2]> {
+    let group_id = documents.group.group_id;
+    let group = DocumentSyncTarget::Group { group_id };
+    let authorization = DocumentSyncTarget::GroupAuthorization { group_id };
+    Some([
+        (
+            group.storage_keyspace().to_string(),
+            group.storage_key(),
+            Value::from(documents.group.to_bytes(actor).ok()?),
+        ),
+        (
+            authorization.storage_keyspace().to_string(),
+            authorization.storage_key(),
+            Value::from(documents.authorization.to_bytes(actor).ok()?),
+        ),
+    ])
+}
+
+/// Drops the groups the realm no longer lists for this owner. Both rows key by
+/// group id; the realm authorization row shares AUTH_KEYSPACE but keys by realm
+/// id, so it can never be named here.
+async fn prune_groups(
+    context: &Arc<DriverContext>,
+    stored: &[DeviceGroupDocuments],
+    fetched: &[DeviceGroupDocuments],
+) {
+    let kept: BTreeSet<GroupId> = fetched
+        .iter()
+        .map(|documents| documents.group.group_id)
+        .collect();
+    let mut deletes = Vec::new();
+    for group_id in stored
+        .iter()
+        .map(|documents| documents.group.group_id)
+        .filter(|group_id| !kept.contains(group_id))
+    {
+        for target in [
+            DocumentSyncTarget::Group { group_id },
+            DocumentSyncTarget::GroupAuthorization { group_id },
+        ] {
+            deletes.push((target.storage_keyspace().to_string(), target.storage_key()));
+        }
+    }
+    if deletes.is_empty() {
+        return;
+    }
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        })
+        .await;
+    if !matches!(
+        event,
+        Event::Storage(StorageEvent::BatchDeleteResult { .. })
+    ) {
+        warn!(event = ?event, "Failed to drop the groups this device no longer holds");
+    }
+}
+
+/// Writes one group's documents where every local read already looks for them,
+/// so a group the owner just created answers before the next fetch.
+pub async fn install_group_docs(
+    context: &Arc<DriverContext>,
+    actor: &Actor,
+    group: &Group,
+    authorization: &GroupAuthorizationDocument,
+) -> bool {
+    let documents = DeviceGroupDocuments {
+        group: group.clone(),
+        authorization: authorization.clone(),
+    };
+    let Some(writes) = group_doc_writes(&documents, actor) else {
+        return false;
+    };
+    write_batch(context, writes.to_vec()).await
 }
 
 /// The management api urls a realm node last served this device, in the order
@@ -524,38 +632,6 @@ pub async fn installed_management_urls(
         return Vec::new();
     };
     postcard::from_bytes(&bytes).unwrap_or_default()
-}
-
-/// Adds one group to this device's projection, replacing the entry it already
-/// holds for the same group. It keeps the same first-by-group-id set a serving
-/// node projects, so the next fetch agrees with what the device shows now.
-pub async fn install_membership(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    membership: DeviceGroupMembership,
-) -> bool {
-    let mut memberships = installed_memberships(context, realm_id).await;
-    match memberships
-        .iter()
-        .position(|held| held.group_id == membership.group_id)
-    {
-        Some(index) => memberships[index] = membership,
-        None => memberships.push(membership),
-    }
-    memberships.sort_by_key(|membership| membership.group_id);
-    memberships.truncate(MAX_DEVICE_GROUPS);
-    let Ok(bytes) = postcard::to_allocvec(&memberships) else {
-        return false;
-    };
-    write_batch(
-        context,
-        vec![(
-            DEVICE_GROUP_MEMBERSHIP_KEYSPACE.to_string(),
-            Key::from(realm_id.as_bytes().to_vec()),
-            Value::from(bytes),
-        )],
-    )
-    .await
 }
 
 /// What the copy this device holds was accepted at. An absent marker reads as
@@ -675,6 +751,12 @@ mod tests {
             clock: clock(seen),
         };
         accept(documents, realm()).expect("the answer is this realm's")
+    }
+
+    fn answer_groups(nodes: &[u8], groups: Vec<DeviceGroupDocuments>) -> Accepted {
+        let mut accepted = answer(nodes, &[]);
+        accepted.documents.groups = groups;
+        accepted
     }
 
     // A copy that has seen less than the installed one is a rollback, whoever
@@ -832,30 +914,108 @@ mod tests {
         );
     }
 
-    fn membership(seed: u128, display_name: &str) -> DeviceGroupMembership {
-        DeviceGroupMembership {
-            group_id: Ulid::from(seed),
-            realm_id: realm(),
-            display_name: display_name.to_string(),
-            roles: Vec::new(),
+    fn group_docs(seed: u128, display_name: &str) -> DeviceGroupDocuments {
+        let group_id = Ulid::from(seed);
+        let owner = UserId::nil(realm());
+        DeviceGroupDocuments {
+            group: Group {
+                display_name: display_name.to_string(),
+                group_id,
+                realm_id: realm(),
+                roles: Default::default(),
+                owner,
+            },
+            authorization: GroupAuthorizationDocument::new_default_group_doc(
+                owner,
+                realm(),
+                group_id,
+            ),
         }
     }
 
-    // A group the owner created on this device must show at once, and creating
-    // it again must not leave the device holding it twice.
+    fn owner_actor() -> Actor {
+        Actor {
+            node_id: node(1),
+            user_id: UserId::nil(realm()),
+            realm_id: realm(),
+        }
+    }
+
+    // A group the owner created on this device must answer at once, from the
+    // same two rows a realm node holds, and a repeat must not duplicate it.
     #[tokio::test]
     async fn installs_created_group() {
         let (_dir, context) = device(&config(&[1])).await;
+        let actor = owner_actor();
 
-        assert!(install_membership(&context, realm(), membership(2, "second")).await);
-        assert!(install_membership(&context, realm(), membership(1, "first")).await);
-        assert!(install_membership(&context, realm(), membership(2, "renamed")).await);
+        let second = group_docs(2, "second");
+        assert!(install_group_docs(&context, &actor, &second.group, &second.authorization).await);
+        let first = group_docs(1, "first");
+        assert!(install_group_docs(&context, &actor, &first.group, &first.authorization).await);
+        let renamed = group_docs(2, "renamed");
+        assert!(install_group_docs(&context, &actor, &renamed.group, &renamed.authorization).await);
 
-        let held = installed_memberships(&context, realm()).await;
         assert_eq!(
-            held,
-            vec![membership(1, "first"), membership(2, "renamed")],
-            "one entry per group, in the order a serving node projects them"
+            installed_group_docs(&context).await,
+            vec![first, renamed],
+            "one pair of rows per group, in group-id order"
+        );
+    }
+
+    // A group the realm no longer lists for this owner leaves the device, and
+    // the realm authorization row that shares its keyspace must survive it.
+    #[tokio::test]
+    async fn prunes_dropped_groups() {
+        let (_dir, context) = device(&config(&[1])).await;
+        let actor = owner_actor();
+        let kept = group_docs(1, "kept");
+        let dropped = group_docs(2, "dropped");
+        let realm_auth = DocumentSyncTarget::RealmAuthorization { realm_id: realm() };
+        assert!(
+            write_batch(
+                &context,
+                vec![(
+                    realm_auth.storage_keyspace().to_string(),
+                    realm_auth.storage_key(),
+                    Value::from(vec![7u8; 8]),
+                )],
+            )
+            .await
+        );
+        assert!(install_group_docs(&context, &actor, &kept.group, &kept.authorization).await);
+        assert!(install_group_docs(&context, &actor, &dropped.group, &dropped.authorization).await);
+        let plan = FetchPlan {
+            realm_id: realm(),
+            node_id: node(1),
+            owner: UserId::nil(realm()),
+            auth: AuthContext {
+                user_id: UserId::nil(realm()),
+                realm_id: realm(),
+                path_restrictions: None,
+            },
+            peers: Vec::new(),
+            marker: RealmMarker::default(),
+        };
+
+        assert!(
+            install_documents(&context, &plan, answer_groups(&[1], vec![kept.clone()]), 0).await
+        );
+
+        assert_eq!(installed_group_docs(&context).await, vec![kept]);
+        assert!(
+            read_bytes(
+                &context,
+                DocumentSyncTarget::Group {
+                    group_id: dropped.group.group_id
+                }
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            read_bytes(&context, realm_auth).await,
+            Some(vec![7u8; 8]),
+            "the realm authorization row is not a group row"
         );
     }
 

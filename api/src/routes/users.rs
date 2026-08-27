@@ -1,13 +1,12 @@
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::map_metadata_api_error;
 use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::{
-    Actor, AuthContext, DeviceGroupMembership, Group, GroupAuthorizationDocument, Permission,
-    RealmAuthorizationDocument, Role, User,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
+    Role, User,
 };
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
@@ -16,7 +15,6 @@ use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::delete_onboarding_secret::{
     DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
 };
-use aruna_operations::device::realm_documents::installed_memberships;
 use aruna_operations::driver::drive;
 use aruna_operations::ensure_canonical_user_token_subject::{
     EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
@@ -31,7 +29,6 @@ use aruna_operations::inspect_onboarding_secret::{
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
 use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
-use aruna_operations::metadata::forward::is_user_origin;
 use aruna_operations::read_realm_authorization::{
     ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
 };
@@ -396,36 +393,10 @@ fn collect_assigned_group_roles(
         .collect()
 }
 
-/// One projected membership as the user-info response shows it.
-fn map_device_membership(membership: DeviceGroupMembership) -> UserInfoGroupResponse {
-    UserInfoGroupResponse {
-        group_id: membership.group_id.to_string(),
-        display_name: membership.display_name,
-        roles: membership
-            .roles
-            .into_iter()
-            .map(|role| map_user_info_role(role.role_id, role))
-            .collect(),
-    }
-}
-
 async fn collect_user_group_memberships(
     state: &ServerState,
     user_id: UserId,
 ) -> ServerResult<Vec<UserInfoGroupResponse>> {
-    let ctx = state.get_ctx();
-    // A device holds no group documents, so the projection a realm node
-    // installed on it is the whole local view.
-    if is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
-        .await
-        .map_err(map_metadata_api_error)?
-    {
-        return Ok(installed_memberships(&ctx, state.get_realm_id())
-            .await
-            .into_iter()
-            .map(map_device_membership)
-            .collect());
-    }
     let groups = drive(ListGroupOperation::new(), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;

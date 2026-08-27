@@ -1392,6 +1392,26 @@ pub async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Opti
     }
 }
 
+/// The realm authorization row, which shares AUTH_KEYSPACE with the group rows
+/// but keys by realm id.
+pub async fn read_realm_auth(node: &TestNode, realm_id: RealmId) -> TestResult<Option<Vec<u8>>> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: AUTH_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|bytes| bytes.to_vec()))
+        }
+        other => Err(format!("unexpected realm auth read event: {other:?}").into()),
+    }
+}
+
 pub async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
     match node
         .context
