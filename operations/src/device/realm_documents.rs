@@ -23,9 +23,11 @@ use aruna_core::auth::revocation_live;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DEVICE_REALM_MARKER_KEYSPACE;
+use aruna_core::keyspaces::{DEVICE_GROUP_MEMBERSHIP_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE};
 use aruna_core::metadata::MetadataAuthToken;
-use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId, SyncRefusal};
+use aruna_core::structs::{
+    Actor, AuthContext, DeviceGroupMembership, RealmConfigDocument, RealmId, SyncRefusal,
+};
 use aruna_core::types::{Key, UserId, Value};
 use aruna_core::util::unix_timestamp_secs;
 use rand::seq::SliceRandom;
@@ -34,7 +36,7 @@ use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
-use crate::metadata::protocol::{MetadataTransportMessage, RealmDocuments};
+use crate::metadata::protocol::{MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments};
 use crate::mutate_realm_placement::node_kind;
 
 /// Attempts in which every answering peer served a copy the marker does not
@@ -252,11 +254,12 @@ async fn ask_realm(context: &Arc<DriverContext>, plan: &FetchPlan) -> Selection 
 /// Decodes one answer and keeps it only if it is this realm's configuration.
 /// The clock it carries is trimmed to the nodes that configuration names, so a
 /// peer cannot inflate the marker with origins the realm does not have.
-fn accept(documents: RealmDocuments, realm_id: RealmId) -> Option<Accepted> {
+fn accept(mut documents: RealmDocuments, realm_id: RealmId) -> Option<Accepted> {
     let config = RealmConfigDocument::from_bytes(&documents.realm_config).ok()?;
     if config.realm_id != realm_id {
         return None;
     }
+    documents.groups.truncate(MAX_DEVICE_GROUPS);
     let clock = trim_clock(&documents.clock, &realm_origins(&config));
     Some(Accepted {
         documents,
@@ -371,9 +374,11 @@ async fn install_documents(
         user_id: plan.owner,
     };
     let stored_owner = read_bytes(context, owner_target.clone()).await;
+    let stored_groups = installed_memberships(context, plan.realm_id).await;
     let unchanged = stored_config.as_deref() == Some(bytes.as_slice())
         && stored_authorization.as_deref() == accepted.documents.realm_authorization.as_deref()
-        && stored_owner.as_deref() == accepted.documents.owner.as_deref();
+        && stored_owner.as_deref() == accepted.documents.owner.as_deref()
+        && stored_groups == accepted.documents.groups;
     if unchanged {
         // Nothing but the marker moves: writing the documents again would
         // re-register every realm peer on every beat for a copy this device
@@ -418,6 +423,17 @@ async fn install_documents(
             Value::from(owner),
         ));
     }
+    // The memberships go to their own keyspace, never to AUTH_KEYSPACE: a device
+    // holds no group authorization and defers every permission to its ingress.
+    let Ok(group_bytes) = postcard::to_allocvec(&accepted.documents.groups) else {
+        warn!("The fetched group memberships could not be stored");
+        return false;
+    };
+    writes.push((
+        DEVICE_GROUP_MEMBERSHIP_KEYSPACE.to_string(),
+        Key::from(plan.realm_id.as_bytes().to_vec()),
+        Value::from(group_bytes),
+    ));
     if !write_batch(context, writes).await {
         return false;
     }
@@ -449,6 +465,29 @@ fn keep_revocations(fetched: &mut RealmConfigDocument, installed: &RealmConfigDo
             fetched.revoked_tokens.push(entry.clone());
         }
     }
+}
+
+/// The group memberships a realm node last projected onto this device. Display
+/// only: a device holds no group authorization document, so this is never an
+/// input to a permission decision.
+pub async fn installed_memberships(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+) -> Vec<DeviceGroupMembership> {
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(bytes), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DEVICE_GROUP_MEMBERSHIP_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    postcard::from_bytes(&bytes).unwrap_or_default()
 }
 
 /// What the copy this device holds was accepted at. An absent marker reads as
@@ -562,6 +601,7 @@ mod tests {
                 .expect("config encodes"),
             realm_authorization: None,
             owner: None,
+            groups: Vec::new(),
             clock: clock(seen),
         };
         accept(documents, realm()).expect("the answer is this realm's")

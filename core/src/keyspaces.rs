@@ -140,6 +140,11 @@ pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 /// back, and it is never replicated.
 pub const DEVICE_REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
 
+/// The groups a device's owner belongs to, as a realm node projected them,
+/// keyed by realm id. Display only and never replicated: a device holds no
+/// group authorization and defers every permission decision to its ingress.
+pub const DEVICE_GROUP_MEMBERSHIP_KEYSPACE: &str = "device_group_memberships";
+
 /// The one row a device keeps about its exchange with the realm: when the realm
 /// last answered, when the last pass finished, and whether one is in flight.
 pub const DEVICE_SYNC_STATE_KEYSPACE: &str = "device_sync_state";

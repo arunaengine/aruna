@@ -10,7 +10,7 @@ use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::structs::{Actor, RealmNodeKind, User};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::auth::realm_token_revoked;
-use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::device::realm_documents::{fetch_realm_documents, installed_memberships};
 use aruna_operations::driver::drive;
 use aruna_operations::read_user_document::ReadUserDocumentOperation;
 use aruna_operations::revoke_token::{
@@ -18,7 +18,8 @@ use aruna_operations::revoke_token::{
 };
 
 use topology::{
-    TestNode, TestResult, Topology, read_realm_config, replicate_config, spawn_node, write,
+    TestNode, TestResult, Topology, read_group_auth, read_group_record, read_realm_config,
+    replicate_config, spawn_node, write,
 };
 
 const MANAGEMENT_NODES: usize = 2;
@@ -117,6 +118,44 @@ async fn device_fetches_owner() -> TestResult<()> {
     )
     .await?;
     assert_eq!(fetched, owner);
+    Ok(())
+}
+
+#[tokio::test]
+async fn device_fetches_groups() -> TestResult<()> {
+    // Group documents replicate on a plane devices are excluded from, so the
+    // fetched projection is the only way the owner's groups reach a device.
+    let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = join_device(&realm).await?;
+    assert!(
+        installed_memberships(&device.context, realm.realm_id)
+            .await
+            .is_empty(),
+        "the device must hold no group before it fetches anything"
+    );
+
+    assert!(
+        fetch_realm_documents(&device.context, FETCH_BUDGET).await,
+        "a realm node must serve the device the realm documents"
+    );
+
+    let memberships = installed_memberships(&device.context, realm.realm_id).await;
+    let projected: Vec<_> = memberships
+        .iter()
+        .map(|membership| membership.group_id)
+        .collect();
+    assert_eq!(projected, vec![group_id]);
+    let roles: Vec<&str> = memberships[0]
+        .roles
+        .iter()
+        .map(|role| role.name.as_str())
+        .collect();
+    assert_eq!(roles, vec!["admin"], "only the owner's own roles reach it");
+
+    // A display projection must never give a device group authorization.
+    assert!(read_group_auth(&device, group_id).await?.is_none());
+    assert!(read_group_record(&device, group_id).await?.is_none());
     Ok(())
 }
 

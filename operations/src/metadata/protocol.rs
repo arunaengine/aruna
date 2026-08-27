@@ -11,10 +11,10 @@ use aruna_core::metadata::{
     MetadataProfileValidationStatus, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, PathClaimRecord,
-    PersistentIdFailure, PersistentIdMapping, PlacementPolicy, PlacementPolicyDocument,
-    PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor, SyncPageLimit, SyncPullAck,
-    SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
+    DeviceGroupMembership, Group, GroupAuthorizationDocument, MetadataRegistryRecord,
+    PathClaimRecord, PersistentIdFailure, PersistentIdMapping, PlacementPolicy,
+    PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor,
+    SyncPageLimit, SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -454,6 +454,11 @@ pub struct GraphState {
     pub findings: u32,
 }
 
+/// The most group memberships a serving node projects into one device's copy.
+/// A device displays its owner's groups; it never mirrors a realm-scale
+/// membership list, and the bound is what keeps this answer small.
+pub const MAX_DEVICE_GROUPS: usize = 256;
+
 /// The realm-wide documents as the serving node stores them. The copies a
 /// device installs from them are never published again: they are a read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +470,10 @@ pub struct RealmDocuments {
     /// the device as it does on a realm node. Absent while the serving node
     /// holds none.
     pub owner: Option<Vec<u8>>,
+    /// The owner's own group memberships, projected by the serving node and
+    /// capped at [`MAX_DEVICE_GROUPS`]. Display only: a device is excluded from
+    /// the admin document plane and holds no group authorization document.
+    pub groups: Vec<DeviceGroupMembership>,
     /// What the serving node had applied when it made this copy. A device
     /// refuses a copy that has seen less than the one it already holds.
     pub clock: AdminDocumentClock,

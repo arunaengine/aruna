@@ -1374,7 +1374,7 @@ pub async fn write(
     }
 }
 
-async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
+pub async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
     match node
         .context
         .storage_handle
@@ -1392,7 +1392,7 @@ async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Option<V
     }
 }
 
-async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
+pub async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
     match node
         .context
         .storage_handle

@@ -25,9 +25,9 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_key, metadata_create_acceptance_key,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, JobId, MetadataRegistryRecord,
-    MintPersistentIdSpec, Permission, PersistentIdFailure, PersistentIdMapping, PlacementRef,
-    RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
+    Actor, AuthContext, DeviceGroupMembership, Group, GroupAuthorizationDocument, JobId,
+    MetadataRegistryRecord, MintPersistentIdSpec, Permission, PersistentIdFailure,
+    PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -54,7 +54,9 @@ use crate::document_sync_outbox::{
     new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
 };
 use crate::driver::{DriverContext, drive};
+use crate::get_group::{GetGroupConfig, GetGroupOperation};
 use crate::get_metadata_document::load_metadata_record_by_document;
+use crate::list_groups::ListGroupOperation;
 use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     MetadataApiError, MetadataRoCrateExportView, ensure_record_readable, export_metadata_rocrate,
@@ -65,7 +67,7 @@ use crate::metadata::handle::{
 };
 use crate::metadata::profile_validation::{current_validation_status, revalidate_current};
 use crate::metadata::protocol::{
-    GraphState, MetadataAuthToken, MetadataReadError, MetadataTransportMessage,
+    GraphState, MAX_DEVICE_GROUPS, MetadataAuthToken, MetadataReadError, MetadataTransportMessage,
     MetadataWriteAuthError, PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
     RealmDocuments,
 };
@@ -2343,8 +2345,44 @@ async fn read_realm_documents(
         realm_config,
         realm_authorization,
         owner,
+        groups: device_group_memberships(context, auth.user_id).await,
         clock: applied_clock(context, realm_id).await,
     })
+}
+
+/// The caller's own group memberships, projected for a device that holds none.
+/// A read that fails yields an empty list: this projection is for display and
+/// must not cost the device the realm configuration it is judged by.
+async fn device_group_memberships(
+    context: &Arc<DriverContext>,
+    user_id: UserId,
+) -> Vec<DeviceGroupMembership> {
+    let groups = match drive(ListGroupOperation::new(), context.as_ref()).await {
+        Ok(groups) => groups,
+        Err(error) => {
+            warn!(error = %error, "Failed to list groups for a device");
+            return Vec::new();
+        }
+    };
+    let mut memberships = Vec::new();
+    for Group { group_id, .. } in groups {
+        if memberships.len() >= MAX_DEVICE_GROUPS {
+            break;
+        }
+        let read = drive(
+            GetGroupOperation::new(GetGroupConfig { group_id }),
+            context.as_ref(),
+        )
+        .await;
+        let Ok((group, auth_doc)) = read else {
+            warn!(%group_id, "Failed to read a group for a device");
+            continue;
+        };
+        if let Some(membership) = DeviceGroupMembership::project(&group, &auth_doc, user_id) {
+            memberships.push(membership);
+        }
+    }
+    memberships
 }
 
 /// What this node has applied to the realm configuration, as the reducer keeps

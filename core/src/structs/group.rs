@@ -37,6 +37,44 @@ pub fn group_owner_index_prefix(owner: UserId) -> Vec<u8> {
     owner.to_storage_key()
 }
 
+/// One group a device's owner belongs to, projected by a realm node for a
+/// device that holds no group documents. Display only: it is never read as
+/// authorization input.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct DeviceGroupMembership {
+    pub group_id: GroupId,
+    pub realm_id: RealmId,
+    pub display_name: String,
+    /// The projected user's own roles, ordered by role id.
+    pub roles: Vec<Role>,
+}
+
+impl DeviceGroupMembership {
+    /// One user's own view of a group, or `None` when they hold no role in it.
+    pub fn project(
+        group: &Group,
+        auth_doc: &GroupAuthorizationDocument,
+        user_id: UserId,
+    ) -> Option<Self> {
+        let mut roles: Vec<Role> = auth_doc
+            .roles
+            .values()
+            .filter(|role| role.assigned_users.contains(&user_id))
+            .cloned()
+            .collect();
+        if roles.is_empty() {
+            return None;
+        }
+        roles.sort_by_key(|role| role.role_id);
+        Some(DeviceGroupMembership {
+            group_id: group.group_id,
+            realm_id: group.realm_id,
+            display_name: group.display_name.clone(),
+            roles,
+        })
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct GroupAuthorizationDocument {
     pub group_id: GroupId,
