@@ -100,12 +100,14 @@ The desktop app writes these keys for the node it supervises:
 
 In the local-only profile the Docker builder registers no workspace endpoint and
 skips the container-reachable `S3_PUBLIC_URL` and non-loopback `S3_ADDRESS`
-requirements: a device stages files and exposes no S3 listener a container could
-reach. Apptainer is unchanged and still needs its delegated cgroup root.
+requirements: a device stages files, and the S3 listener it binds for its owner
+is loopback-only, so no container can reach it and file staging under
+`ARUNA_COMPUTE_LOCAL_ONLY=1` is unaffected. Apptainer is unchanged and still
+needs its delegated cgroup root.
 
 A local run stages its inputs as files into the node-local workspace bucket
 `ws-<jobid>`. It refuses mounted inputs, `workspace.mode` `none` and Direct-S3
-staging, all of which need an S3 endpoint the device does not expose, and
+staging, all of which need an S3 endpoint a container could reach, and
 `workspace.mode` `existing`.
 
 Where an output lands depends on the surface. `POST /jobs/` declares workspace

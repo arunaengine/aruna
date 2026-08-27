@@ -708,8 +708,8 @@ async fn bind_servers(
     )
     .await?;
 
-    // A device profile leaves S3_HOST and S3_ADDRESS unset and serves no S3
-    // endpoint; the config layer keeps the pair whole.
+    // A device serves S3 only where S3_HOST and S3_ADDRESS are configured; the
+    // desktop shell sets both to loopback by default, and the pair stays whole.
     let s3_handle = match (config.s3_address.as_deref(), config.s3_host.as_deref()) {
         (Some(s3_address), Some(s3_host)) => {
             let s3_server = S3Server::new(
