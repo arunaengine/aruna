@@ -100,12 +100,10 @@ fn relay_route(
         return None;
     }
     let matched = matched?;
+    let path = matched.strip_prefix(API_PREFIX).unwrap_or(matched);
     RELAYED_ROUTES
         .iter()
-        .find(|(route_method, route)| {
-            method.as_str() == *route_method
-                && (matched == *route || matched == format!("{API_PREFIX}{route}"))
-        })
+        .find(|(route_method, route)| method.as_str() == *route_method && path == *route)
         .map(|(_, route)| *route)
 }
 
