@@ -7,15 +7,16 @@ use aruna_core::keyspaces::{
     SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::structs::{
-    EntryState, FolderMode, FolderState, RealmId, RemoteBinding, SyncActionRecord, SyncBase,
-    SyncedFolder,
+    AuthContext, EntryState, FolderMode, FolderState, RealmId, RemoteBinding, SyncActionRecord,
+    SyncBase, SyncPageLimit, SyncRefusal, SyncedFolder,
 };
 use aruna_core::types::{GroupId, Key, NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::get_realm_config::GetRealmConfigOperation;
 use crate::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
 };
@@ -24,6 +25,7 @@ use super::repository::{
     MAX_SYNCED_FOLDERS, SyncUpload, abort_txn, commit_txn, delete_rows, folder_entry, folder_key,
     key_path, read_value, scan_folder, scan_folders, scan_page, start_txn, write_rows,
 };
+use super::{ReconcileFolderError, request_versions};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BindFolderInput {
@@ -51,6 +53,14 @@ pub enum FolderError {
     NotFound,
     #[error("the device store is unavailable")]
     Unavailable,
+    #[error("node {0} is not a realm server")]
+    NotRealmNode(NodeId),
+    #[error("the bucket \"{bucket}\" does not exist on node {node}")]
+    RemoteBucketMissing { node: NodeId, bucket: String },
+    #[error("access to bucket \"{bucket}\" is forbidden")]
+    RemoteForbidden { bucket: String },
+    #[error("node {node} is unreachable: {reason}")]
+    RemoteUnreachable { node: NodeId, reason: String },
     #[error(transparent)]
     Offer(#[from] OfferedDirectoryError),
 }
@@ -91,7 +101,31 @@ pub async fn bind_folder(
     {
         return Err(FolderError::BucketBound(local_bucket));
     }
-    offer_directory(
+    let config = drive(GetRealmConfigOperation::new(input.realm_id), context)
+        .await
+        .map_err(|_| FolderError::Unavailable)?;
+    let eligible = config
+        .sync_eligible_node_ids()
+        .map_err(|_| FolderError::Unavailable)?;
+    if !eligible.contains(&input.remote.node_id) {
+        return Err(FolderError::NotRealmNode(input.remote.node_id));
+    }
+    request_versions(
+        context,
+        input.remote.node_id,
+        AuthContext {
+            user_id: input.user_id,
+            realm_id: input.realm_id,
+            path_restrictions: None,
+        },
+        input.remote.bucket.clone(),
+        input.remote.prefix.clone(),
+        None,
+        SyncPageLimit::new(1),
+    )
+    .await
+    .map_err(|error| map_remote_error(error, &input.remote))?;
+    let sweep = offer_directory(
         context,
         OfferDirectoryInput {
             bucket: local_bucket.clone(),
@@ -116,10 +150,38 @@ pub async fn bind_folder(
         created_by: input.user_id,
         created_at_ms: unix_timestamp_millis(),
         last_reconcile_ms: None,
+        last_error: None,
+        last_error_at_ms: None,
+        observed_files: sweep.files as u64,
         list_cursor: None,
     };
     store_folder(context, &folder).await?;
     Ok(folder)
+}
+
+fn map_remote_error(error: ReconcileFolderError, remote: &RemoteBinding) -> FolderError {
+    match error {
+        ReconcileFolderError::Refused(SyncRefusal::NotFound) => FolderError::RemoteBucketMissing {
+            node: remote.node_id,
+            bucket: remote.bucket.clone(),
+        },
+        ReconcileFolderError::Refused(SyncRefusal::Unauthorized | SyncRefusal::Forbidden) => {
+            FolderError::RemoteForbidden {
+                bucket: remote.bucket.clone(),
+            }
+        }
+        ReconcileFolderError::Unreachable(reason) => FolderError::RemoteUnreachable {
+            node: remote.node_id,
+            reason,
+        },
+        ReconcileFolderError::Refused(refusal) => FolderError::RemoteUnreachable {
+            node: remote.node_id,
+            reason: format!("{refusal:?}"),
+        },
+        ReconcileFolderError::Unavailable
+        | ReconcileFolderError::Sweep(_)
+        | ReconcileFolderError::Decide(_) => FolderError::Unavailable,
+    }
 }
 
 /// The device-local bucket a folder is observed as. The owner never names it:
@@ -467,6 +529,9 @@ mod tests {
             created_by: UserId::new(Ulid::from_bytes([4u8; 16]), realm()),
             created_at_ms: 1,
             last_reconcile_ms: None,
+            last_error: None,
+            last_error_at_ms: None,
+            observed_files: 0,
             list_cursor: None,
         }
     }
