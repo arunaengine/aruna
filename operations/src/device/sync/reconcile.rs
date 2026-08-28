@@ -407,7 +407,9 @@ impl ReconcileFolderOperation {
             .get(index)
             .and_then(Option::as_ref)
             .is_some_and(|queued| {
-                queued.deleted == upload.deleted && queued.local_version == upload.local_version
+                matches!(&queued.state, UploadState::Pending { .. })
+                    && queued.deleted == upload.deleted
+                    && queued.local_version == upload.local_version
             })
         {
             return Ok(false);
@@ -694,7 +696,11 @@ impl ReconcileFolderOperation {
         self.queued
             .get(index)
             .and_then(Option::as_ref)
-            .is_some_and(|queued| !queued.deleted && queued.local_version == Some(version))
+            .is_some_and(|queued| {
+                matches!(&queued.state, UploadState::Pending { .. })
+                    && !queued.deleted
+                    && queued.local_version == Some(version)
+            })
     }
 
     /// Paths the recorded stat no longer vouches for: it moved, it was never
@@ -793,6 +799,9 @@ mod tests {
             created_by: UserId::new(Ulid::from_bytes([4u8; 16]), realm_id),
             created_at_ms: 1,
             last_reconcile_ms: None,
+            last_error: None,
+            last_error_at_ms: None,
+            observed_files: 0,
             list_cursor: None,
         }
     }
@@ -1011,6 +1020,29 @@ mod tests {
             assert!(plan.downloads.is_empty(), "no second conflicted copy");
             assert_eq!(plan.uploads, 0);
         }
+    }
+
+    #[test]
+    fn requeues_failed_upload() {
+        // A permanent refusal may become valid after the remote bucket appears.
+        let local = observed("5-1-1-1");
+        let queued = SyncUpload {
+            folder_id: folder().folder_id,
+            relative: "paper.txt".to_string(),
+            deleted: false,
+            fingerprint: local.fingerprint.clone(),
+            blake3: Some([5u8; 32]),
+            size: local.size,
+            local_version: local.version_id,
+            queued_at_ms: 1,
+            state: UploadState::Failed {
+                reason: "NotFound".to_string(),
+                retryable: false,
+            },
+        };
+        let (operation, base) = operation(Some(local), None, None);
+        let plan = run_queued(operation, base, Some(queued));
+        assert_eq!(plan.uploads, 1);
     }
 
     #[test]

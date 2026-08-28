@@ -108,7 +108,7 @@ async fn list_device_transfers(
             for (path, base) in entries {
                 if !matches!(
                     base.entry,
-                    EntryState::RemoteNew | EntryState::RemoteChanged
+                    EntryState::RemoteNew | EntryState::RemoteChanged | EntryState::Error { .. }
                 ) {
                     continue;
                 }

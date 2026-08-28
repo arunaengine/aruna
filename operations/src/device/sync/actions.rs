@@ -143,7 +143,7 @@ async fn replace_entry(
         .ok_or(ActionError::NoRemoteVersion)?;
     let blob = fetch_remote(context, folder, relative, version)
         .await
-        .ok_or(ActionError::RemoteUnavailable)?;
+        .map_err(|_| ActionError::RemoteUnavailable)?;
     let outcome = drive(
         MaterializeEntryOperation::new(MaterializeInput {
             folder: folder.clone(),

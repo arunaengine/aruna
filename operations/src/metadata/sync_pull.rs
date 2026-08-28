@@ -18,7 +18,7 @@ use aruna_core::structs::{
     SyncVersionPage, VersionKey, VersionedObjectArn, blob_object_permission_path,
 };
 use aruna_core::types::{GroupId, NodeId};
-use tracing::debug;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive, routing_snapshot};
@@ -58,6 +58,7 @@ pub async fn serve_sync_pull(
     else {
         return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
     };
+    let bucket = target_bucket.clone();
     let result = apply_pull(
         context,
         peer,
@@ -72,6 +73,9 @@ pub async fn serve_sync_pull(
         },
     )
     .await;
+    if let Err(refusal) = &result {
+        warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(refusal), "Refused a synced-folder pull");
+    }
     MetadataTransportMessage::ForwardedSyncPull { result }
 }
 
@@ -433,8 +437,30 @@ pub async fn serve_list_versions(
     else {
         return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
     };
-    let result = list_heads(context, peer, auth_token, bucket, prefix, cursor, limit).await;
+    let result = list_heads(
+        context,
+        peer,
+        auth_token,
+        bucket.clone(),
+        prefix,
+        cursor,
+        limit,
+    )
+    .await;
+    if let Err(refusal) = &result {
+        warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(refusal), "Refused a synced-folder listing");
+    }
     MetadataTransportMessage::ForwardedVersions { result }
+}
+
+fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
+    match refusal {
+        SyncRefusal::Unauthorized => "unauthorized",
+        SyncRefusal::Forbidden => "forbidden",
+        SyncRefusal::NotFound => "not_found",
+        SyncRefusal::Invalid(_) => "invalid",
+        SyncRefusal::Unavailable => "unavailable",
+    }
 }
 
 async fn list_heads(

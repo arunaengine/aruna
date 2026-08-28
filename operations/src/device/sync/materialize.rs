@@ -11,6 +11,7 @@ use std::sync::Arc;
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal, StorageEvent};
+use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
@@ -30,7 +31,7 @@ use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 
 use super::reconcile::Download;
-use super::repository::{action_entry, base_entry};
+use super::repository::{action_entry, base_entry, base_key, read_value, write_rows};
 
 /// What one materialization did to the folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,8 +388,11 @@ pub(crate) async fn fetch_remote(
     folder: &SyncedFolder,
     relative: &str,
     version: Ulid,
-) -> Option<BackendStream<Result<Bytes, StreamError>>> {
-    let net_handle = context.net_handle.as_ref()?;
+) -> Result<BackendStream<Result<Bytes, StreamError>>, String> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or_else(|| "the network handle is unavailable".to_string())?;
     let realm_id = *net_handle.realm_id();
     let source = VersionedObjectArn::new(
         realm_id,
@@ -397,7 +401,7 @@ pub(crate) async fn fetch_remote(
         folder.remote.remote_key(relative),
         version,
     )
-    .ok()?;
+    .map_err(|error| error.to_string())?;
     let request = BaoReadRequest {
         auth_context: AuthContext {
             user_id: folder.created_by,
@@ -412,11 +416,13 @@ pub(crate) async fn fetch_remote(
         known_refs: Vec::new(),
     };
     match managed_read(context, folder.remote.node_id, request).await {
-        Ok(BaoReadOutput::Stream { blob, .. }) => Some(blob),
-        Ok(BaoReadOutput::Metadata { .. }) => None,
+        Ok(BaoReadOutput::Stream { blob, .. }) => Ok(blob),
+        Ok(BaoReadOutput::Metadata { .. }) => {
+            Err("the remote version returned no bytes".to_string())
+        }
         Err(error) => {
             debug!(relative = %relative, error = %error, "Could not read the remote version");
-            None
+            Err(error.to_string())
         }
     }
 }
@@ -430,10 +436,15 @@ pub async fn apply_downloads(
 ) -> usize {
     let mut applied = 0usize;
     for download in downloads {
-        let Some(blob) =
-            fetch_remote(context, folder, &download.relative, download.remote_version).await
-        else {
-            continue;
+        let blob = match fetch_remote(context, folder, &download.relative, download.remote_version)
+            .await
+        {
+            Ok(blob) => blob,
+            Err(message) => {
+                record_fetch_error(context, folder, &download, message.clone()).await;
+                warn!(relative = %download.relative, message = %message, "Could not fetch the folder entry");
+                continue;
+            }
         };
         let outcome = drive(
             MaterializeEntryOperation::new(MaterializeInput {
@@ -469,4 +480,39 @@ pub async fn apply_downloads(
         }
     }
     applied
+}
+
+async fn record_fetch_error(
+    context: &Arc<DriverContext>,
+    folder: &SyncedFolder,
+    download: &Download,
+    message: String,
+) {
+    let Some(bytes) = read_value(
+        context,
+        SYNC_BASE_KEYSPACE,
+        base_key(folder.folder_id, &download.relative),
+        None,
+    )
+    .await
+    else {
+        warn!(relative = %download.relative, "Could not read the failed download row");
+        return;
+    };
+    let Ok(base) = SyncBase::from_bytes(&bytes) else {
+        warn!(relative = %download.relative, "Could not decode the failed download row");
+        return;
+    };
+    let base = SyncBase {
+        entry: EntryState::Error { reason: message },
+        synced_at_ms: unix_timestamp_millis(),
+        ..base
+    };
+    let Ok(row) = base_entry(folder.folder_id, &download.relative, &base) else {
+        warn!(relative = %download.relative, "Could not encode the failed download row");
+        return;
+    };
+    if !write_rows(context, vec![row], None).await {
+        warn!(relative = %download.relative, "Could not store the failed download row");
+    }
 }
