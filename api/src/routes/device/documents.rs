@@ -148,6 +148,11 @@ async fn list_documents(
 **Errors**
 - 409 when the document still has edits this device has not published, or when the device already keeps the maximum number of documents offline.
 - 503 when the realm has not served the document to this device yet."#,
+    request_body(
+        content = SelectDocumentRequest,
+        description = "Whether the document is kept offline on this device",
+        example = json!({ "selected": true })
+    ),
     params(("document_id" = String, Path, description = "Metadata document ULID, for example 01JDOCUMENT0123456789ABCDE")),
     responses(
         (status = 200, description = "The document's selection on this device", body = DeviceDocument,
