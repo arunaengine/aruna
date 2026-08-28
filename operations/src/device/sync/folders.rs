@@ -17,6 +17,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
 };
@@ -34,6 +35,7 @@ pub struct BindFolderInput {
     pub root: String,
     pub group_id: GroupId,
     pub remote: RemoteBinding,
+    pub create_bucket: bool,
     pub mode: FolderMode,
     pub propagate_deletes: bool,
     pub realm_id: RealmId,
@@ -59,6 +61,8 @@ pub enum FolderError {
     RemoteBucketMissing { node: NodeId, bucket: String },
     #[error("access to bucket \"{bucket}\" is forbidden")]
     RemoteForbidden { bucket: String },
+    #[error("cannot bind bucket \"{bucket}\": {reason}")]
+    RemoteBucketConflict { bucket: String, reason: String },
     #[error("node {node} is unreachable: {reason}")]
     RemoteUnreachable { node: NodeId, reason: String },
     #[error(transparent)]
@@ -110,14 +114,43 @@ pub async fn bind_folder(
     if !eligible.contains(&input.remote.node_id) {
         return Err(FolderError::NotRealmNode(input.remote.node_id));
     }
+    let auth = AuthContext {
+        user_id: input.user_id,
+        realm_id: input.realm_id,
+        path_restrictions: None,
+    };
+    if input.create_bucket {
+        let metadata = context
+            .metadata_handle
+            .as_ref()
+            .ok_or(FolderError::Unavailable)?;
+        let creation = metadata
+            .request_forwarded_write(
+                input.remote.node_id,
+                MetadataTransportMessage::ForwardCreateBucket {
+                    auth_token: aruna_core::metadata::MetadataAuthToken::internal(auth.clone()),
+                    bucket: input.remote.bucket.clone(),
+                    group_id: input.group_id,
+                },
+            )
+            .await
+            .map_err(|error| ReconcileFolderError::Unreachable(error.to_string()));
+        let creation = match creation {
+            Ok(MetadataTransportMessage::ForwardedBucketCreated { result }) => {
+                result.map_err(ReconcileFolderError::Refused)
+            }
+            Ok(other) => Err(ReconcileFolderError::Unreachable(format!(
+                "unexpected metadata response: {}",
+                crate::metadata::transport_message_kind(&other)
+            ))),
+            Err(error) => Err(error),
+        };
+        creation.map_err(|error| map_remote_error(error, &input.remote))?;
+    }
     request_versions(
         context,
         input.remote.node_id,
-        AuthContext {
-            user_id: input.user_id,
-            realm_id: input.realm_id,
-            path_restrictions: None,
-        },
+        auth,
         input.remote.bucket.clone(),
         input.remote.prefix.clone(),
         None,
@@ -168,6 +201,12 @@ fn map_remote_error(error: ReconcileFolderError, remote: &RemoteBinding) -> Fold
         ReconcileFolderError::Refused(SyncRefusal::Unauthorized | SyncRefusal::Forbidden) => {
             FolderError::RemoteForbidden {
                 bucket: remote.bucket.clone(),
+            }
+        }
+        ReconcileFolderError::Refused(SyncRefusal::Invalid(reason)) => {
+            FolderError::RemoteBucketConflict {
+                bucket: remote.bucket.clone(),
+                reason,
             }
         }
         ReconcileFolderError::Unreachable(reason) => FolderError::RemoteUnreachable {

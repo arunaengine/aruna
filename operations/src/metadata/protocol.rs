@@ -438,6 +438,14 @@ pub enum MetadataTransportMessage {
     ForwardedApplyBatch {
         result: Result<Box<MetadataRegistryRecord>, SyncRefusal>,
     },
+    ForwardCreateBucket {
+        auth_token: MetadataAuthToken,
+        bucket: String,
+        group_id: GroupId,
+    },
+    ForwardedBucketCreated {
+        result: Result<(), SyncRefusal>,
+    },
 }
 
 /// One document as a holder serves it to a device.

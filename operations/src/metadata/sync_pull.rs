@@ -127,7 +127,7 @@ async fn apply_pull(
 /// the target object is the whole authority, exactly as it is when the same
 /// owner writes through S3. A device can therefore publish into any path its
 /// owner may already write, and nothing more.
-async fn authorize_peer(
+pub(crate) async fn authorize_peer(
     context: &Arc<DriverContext>,
     peer: NodeId,
     auth_token: aruna_core::metadata::MetadataAuthToken,
@@ -217,7 +217,7 @@ async fn ensure_write(
 /// The same boundary the equivalent S3 request passes: RBAC first, then the
 /// realm and group request policies. A pull is an ordinary write by the owner,
 /// so a policy that denies their put or delete denies this too.
-async fn authorize_pull(
+pub(crate) async fn authorize_pull(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
     path: String,
@@ -453,7 +453,7 @@ pub async fn serve_list_versions(
     MetadataTransportMessage::ForwardedVersions { result }
 }
 
-fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
+pub(crate) fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
     match refusal {
         SyncRefusal::Unauthorized => "unauthorized",
         SyncRefusal::Forbidden => "forbidden",

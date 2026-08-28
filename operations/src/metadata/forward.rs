@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::AdminDocumentReducerState;
@@ -25,11 +25,11 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_key, metadata_create_acceptance_key,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, JobId, MetadataRegistryRecord,
-    MintPersistentIdSpec, Permission, PersistentIdFailure, PersistentIdMapping, PlacementRef,
-    RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
+    Actor, AuthContext, BucketInfo, Group, GroupAuthorizationDocument, JobId,
+    MetadataRegistryRecord, MintPersistentIdSpec, Permission, PersistentIdFailure,
+    PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
 };
-use aruna_core::types::UserId;
+use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
 use futures_util::StreamExt;
@@ -81,6 +81,8 @@ use crate::request_policy::PolicyRequestExtras;
 use crate::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
+use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
+use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document,
@@ -2668,6 +2670,105 @@ async fn run_device_batch(
                 SyncRefusal::Unavailable
             }
         })
+}
+
+pub(crate) async fn apply_bucket_create(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::ForwardCreateBucket {
+        auth_token,
+        bucket,
+        group_id,
+    } = message
+    else {
+        return reject("unexpected bucket create message");
+    };
+    let result = create_remote_bucket(context, peer, auth_token, &bucket, group_id).await;
+    if let Err(refusal) = &result {
+        warn!(
+            %peer,
+            %bucket,
+            kind = super::sync_pull::refusal_kind(refusal),
+            "Refused a forwarded bucket creation"
+        );
+    }
+    MetadataTransportMessage::ForwardedBucketCreated { result }
+}
+
+async fn create_remote_bucket(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+    bucket: &str,
+    group_id: GroupId,
+) -> Result<(), SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = super::sync_pull::authorize_peer(context, peer, auth_token).await?;
+    if auth.realm_id != realm_id {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    super::sync_pull::authorize_pull(
+        context,
+        &auth,
+        aruna_core::structs::blob_bucket_permission_path(
+            realm_id,
+            group_id,
+            net_handle.node_id(),
+            bucket,
+        ),
+        Permission::WRITE,
+        "s3.CreateBucket",
+    )
+    .await?;
+
+    let created = drive(
+        CreateBucketOperation::new(
+            bucket.to_string(),
+            BucketInfo {
+                group_id,
+                created_at: SystemTime::now(),
+                created_by: auth.user_id,
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+            },
+        ),
+        context.as_ref(),
+    )
+    .await
+    .and_then(|result| result.transpose());
+    match created {
+        Ok(Some(_)) => Ok(()),
+        Err(CreateBucketError::BucketAlreadyExists) => {
+            match drive(
+                GetBucketInfoOperation::new(bucket.to_string()),
+                context.as_ref(),
+            )
+            .await
+            .and_then(|result| result.transpose())
+            {
+                Ok(Some(info)) if info.group_id == group_id => Ok(()),
+                Ok(Some(_)) => Err(SyncRefusal::Invalid(format!(
+                    "bucket \"{bucket}\" belongs to another group"
+                ))),
+                Ok(None) | Err(_) => Err(SyncRefusal::Unavailable),
+            }
+        }
+        Ok(None) | Err(_) => Err(SyncRefusal::Unavailable),
+    }
 }
 
 /// Originates a group create requested by a device. Authority is the caller's

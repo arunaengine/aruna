@@ -1912,6 +1912,10 @@ impl MetadataHandle {
                 })
                 .await
             }
+            create @ MetadataTransportMessage::ForwardCreateBucket { .. } => {
+                Box::pin(async { super::forward::apply_bucket_create(context, peer, create).await })
+                    .await
+            }
             fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
                 Box::pin(async {
                     super::forward::serve_realm_documents(context, peer, fetch).await
@@ -1970,6 +1974,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedGroupCreateConflict { .. }
             | MetadataTransportMessage::ForwardedSyncPull { .. }
             | MetadataTransportMessage::ForwardedVersions { .. }
+            | MetadataTransportMessage::ForwardedBucketCreated { .. }
             | MetadataTransportMessage::FetchedRealmDocuments { .. }
             | MetadataTransportMessage::FetchedGraphState { .. }
             | MetadataTransportMessage::ForwardedApplyBatch { .. }
@@ -4951,6 +4956,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
         MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
         MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
+        MetadataTransportMessage::ForwardCreateBucket { .. } => "forward_create_bucket",
+        MetadataTransportMessage::ForwardedBucketCreated { .. } => "forwarded_bucket_created",
         MetadataTransportMessage::FetchRealmDocuments { .. } => "fetch_realm_documents",
         MetadataTransportMessage::FetchedRealmDocuments { .. } => "fetched_realm_documents",
         MetadataTransportMessage::FetchGraphState { .. } => "fetch_graph_state",

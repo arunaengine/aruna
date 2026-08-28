@@ -59,6 +59,9 @@ pub struct BindFolderRequest {
     /// Realm node that holds the remote bucket.
     pub remote_node_id: String,
     pub remote_bucket: String,
+    /// Create the remote bucket on the realm node before binding it.
+    #[serde(default)]
+    pub create_bucket: bool,
     /// Key prefix inside the remote bucket. Empty binds the whole bucket.
     #[serde(default)]
     pub remote_prefix: String,
@@ -175,7 +178,8 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         FolderError::NotFound => ServerError::NotFound,
         FolderError::TooManyFolders(_)
         | FolderError::RootOverlaps(_)
-        | FolderError::BucketBound(_) => ServerError::Conflict(error.to_string()),
+        | FolderError::BucketBound(_)
+        | FolderError::RemoteBucketConflict { .. } => ServerError::Conflict(error.to_string()),
         FolderError::NotRealmNode(_) | FolderError::RemoteBucketMissing { .. } => {
             ServerError::BadRequestReason(error.to_string())
         }
@@ -259,6 +263,7 @@ async fn folder_detail(
 
 **Behavior**
 - The device-local bucket is derived from the folder id, so the owner never names it and it cannot collide with a bucket they already use.
+- `create_bucket` creates a missing remote bucket through the node plane before the existing listing probe.
 - The directory is walked once and every file becomes one read-only object of that bucket; no byte is copied into this node's blob store.
 - `two_way` syncs both directions. `upload_only` never writes to disk and replaces the earlier offered-directory model.
 - Local data always wins locally: a file is replaced automatically only while its fingerprint and its blake3 still equal the recorded synced base. Everything else is preserved and reported, the incoming version lands beside it as a conflicted copy, and replacing or removing local bytes is an explicit action.
@@ -271,7 +276,7 @@ async fn folder_detail(
 **Errors**
 - 400 when the root is unusable, the target is not a realm server, or the bucket is missing.
 - 403 when the remote bucket refuses the owner.
-- 409 when the root overlaps a bound folder.
+- 409 when the root overlaps a bound folder or the bucket belongs to another group.
 - 502 when the remote realm node is unreachable."#,
     request_body(
         content = BindFolderRequest,
@@ -281,6 +286,7 @@ async fn folder_detail(
             "group_id": "01JGROUP0123456789ABCDEFGH",
             "remote_node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
             "remote_bucket": "lab-data",
+            "create_bucket": true,
             "remote_prefix": "ada",
             "mode": "two_way",
             "propagate_deletes": true
@@ -317,7 +323,7 @@ async fn folder_detail(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 409, description = "The root overlaps a bound folder", body = ErrorResponse),
+        (status = 409, description = "The root overlaps a bound folder, or the bucket belongs to another group", body = ErrorResponse),
         (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
         (status = 503, description = "The device sync service or realm configuration is unavailable", body = ErrorResponse)
     ),
@@ -345,6 +351,7 @@ async fn bind_synced_folder(
                 bucket: request.remote_bucket,
                 prefix: request.remote_prefix,
             },
+            create_bucket: request.create_bucket,
             mode: match request.mode {
                 Some(super::dto::FolderModeName::UploadOnly) => FolderMode::UploadOnly,
                 _ => FolderMode::TwoWay,
@@ -1131,6 +1138,11 @@ mod tests {
             missing.to_string(),
             format!("the bucket \"test\" does not exist on node {node}")
         );
+        let conflict = map_folder_error(FolderError::RemoteBucketConflict {
+            bucket: "test".to_string(),
+            reason: "bucket \"test\" belongs to another group".to_string(),
+        });
+        assert_eq!(conflict.status_code(), StatusCode::CONFLICT);
         let remote = RemoteBinding {
             node_id: node,
             bucket: "test".to_string(),
