@@ -28,6 +28,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
@@ -279,6 +280,110 @@ async fn syncs_both_directions() -> TestResult<()> {
             .entry,
         EntryState::RemoteDeleted { .. }
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn creates_remote_bucket() -> TestResult<()> {
+    // A create-enabled bind must create on the realm node before syncing either direction.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+
+    let folder = bind_folder(
+        &device.context,
+        BindFolderInput {
+            folder_id: Ulid::generate(),
+            root: root.path().to_string_lossy().to_string(),
+            group_id,
+            remote: RemoteBinding {
+                node_id: server.node_id(),
+                bucket: REMOTE_BUCKET.to_string(),
+                prefix: String::new(),
+            },
+            create_bucket: true,
+            mode: FolderMode::TwoWay,
+            propagate_deletes: true,
+            realm_id: realm.realm_id,
+            node_id: device.node_id(),
+            user_id: realm.user_id,
+        },
+    )
+    .await?;
+    let bucket = drive(
+        GetBucketInfoOperation::new(REMOTE_BUCKET.to_string()),
+        &server.context,
+    )
+    .await?
+    .ok_or("bucket lookup did not finish")??;
+    assert_eq!(bucket.group_id, group_id);
+
+    let plan = reconcile_folder(&device.context, &folder).await?;
+    assert_eq!(plan.uploads, 1);
+    await_uploads(&realm).await?;
+    assert_eq!(
+        read_object(&realm, &server.context, group_id, "note.txt").await?,
+        b"from the device"
+    );
+
+    put_object(
+        &realm,
+        &server.context,
+        group_id,
+        "shared.txt",
+        b"from the realm",
+    )
+    .await?;
+    reconcile_folder(&device.context, &folder).await?;
+    assert_eq!(
+        std::fs::read(root.path().join("shared.txt"))?,
+        b"from the realm"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn refuses_foreign_bucket() -> TestResult<()> {
+    // A create-enabled bind must not adopt a same-named bucket from another group.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let foreign_group = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, foreign_group, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+
+    let error = bind_folder(
+        &device.context,
+        BindFolderInput {
+            folder_id: Ulid::generate(),
+            root: root.path().to_string_lossy().to_string(),
+            group_id,
+            remote: RemoteBinding {
+                node_id: server.node_id(),
+                bucket: REMOTE_BUCKET.to_string(),
+                prefix: String::new(),
+            },
+            create_bucket: true,
+            mode: FolderMode::TwoWay,
+            propagate_deletes: true,
+            realm_id: realm.realm_id,
+            node_id: device.node_id(),
+            user_id: realm.user_id,
+        },
+    )
+    .await
+    .expect_err("a bucket from another group must be refused");
+    assert_eq!(
+        error,
+        FolderError::RemoteBucketConflict {
+            bucket: REMOTE_BUCKET.to_string(),
+            reason: format!("bucket \"{REMOTE_BUCKET}\" belongs to another group"),
+        }
+    );
     Ok(())
 }
 

@@ -6,14 +6,21 @@ mod topology;
 
 use std::collections::{HashMap, HashSet};
 
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmNodeKind, User};
+use aruna_core::structs::{
+    Actor, Group, GroupAuthorizationDocument, NodeUrls, RealmNodeKind, User,
+};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::auth::realm_token_revoked;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::drive;
 use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::node_info::{read_node_info_documents, seed_node_info_document};
 use aruna_operations::read_user_document::ReadUserDocumentOperation;
+use aruna_operations::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
 use aruna_operations::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
@@ -21,7 +28,7 @@ use ulid::Ulid;
 
 use topology::{
     TestNode, TestResult, Topology, read_group_auth, read_group_record, read_realm_auth,
-    read_realm_config, replicate_config, spawn_node, write,
+    read_realm_config, replicate_config, spawn_node, wait_for_convergence, write,
 };
 
 const MANAGEMENT_NODES: usize = 2;
@@ -182,6 +189,71 @@ async fn device_fetches_groups() -> TestResult<()> {
         realm_auth,
         "the realm authorization row is not a group row"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn device_fetches_nodes() -> TestResult<()> {
+    // One device document beat must install every realm node's advertised urls.
+    let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
+    let node_ids = realm.config.sync_eligible_node_ids()?;
+    let mut expected = HashMap::new();
+    for (index, node) in realm.nodes.iter().enumerate() {
+        let urls = NodeUrls {
+            api: Some(format!("https://api-{index}.example.test")),
+            s3: Some(format!("https://s3-{index}.example.test")),
+        };
+        expected.insert(node.node_id(), urls.clone());
+        seed_node_info_document(node.context.as_ref(), node.node_id(), realm.realm_id, urls)
+            .await
+            .map_err(std::io::Error::other)?;
+        drive(
+            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+                realm_id: realm.realm_id,
+                local_node_id: node.node_id(),
+                excluded_peers: Vec::new(),
+                documents: vec![DocumentSyncTarget::NodeInfo {
+                    realm_id: realm.realm_id,
+                    node_id: node.node_id(),
+                }],
+                allow_genesis: true,
+            }),
+            node.context.as_ref(),
+        )
+        .await?;
+    }
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "node info documents did not converge before the device beat",
+        || async {
+            let mut missing = 0;
+            for node in &realm.nodes {
+                let documents = read_node_info_documents(node.context.as_ref(), &node_ids)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                missing += node_ids.len().saturating_sub(documents.len());
+            }
+            Ok(missing)
+        },
+    )
+    .await?;
+
+    let device = join_device(&realm).await?;
+    assert!(
+        fetch_realm_documents(&device.context, FETCH_BUDGET).await,
+        "the device beat must fetch the realm documents"
+    );
+    let documents = read_node_info_documents(device.context.as_ref(), &node_ids)
+        .await
+        .map_err(std::io::Error::other)?;
+    assert_eq!(documents.len(), node_ids.len());
+    for (node_id, urls) in expected {
+        assert_eq!(
+            documents
+                .get(&node_id)
+                .map(|document| document.urls.clone()),
+            Some(urls)
+        );
+    }
     Ok(())
 }
 
