@@ -154,6 +154,10 @@ pub struct SubmitExecutionRequest {
     pub command: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_cores: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -943,6 +947,10 @@ on that bucket and that it belongs to the same group.
             "env": {
                 "FASTQC_THREADS": "2"
             },
+            "tags": {
+                "aruna-engine.org/label/accelerator": "gpu"
+            },
+            "workdir": "/work",
             "cpu_cores": 2,
             "ram_bytes": 4294967296_i64,
             "max_walltime_ms": 3600000,
@@ -1069,11 +1077,11 @@ pub async fn submit_job(
         group_id,
         name: None,
         description: None,
-        tags: BTreeMap::new(),
+        tags: request.tags,
         image: request.image,
         entrypoint: request.entrypoint,
         command: request.command,
-        workdir: None,
+        workdir: request.workdir,
         env: request.env,
         resources: ComputeResources {
             cpu_cores: request.cpu_cores,
@@ -2913,6 +2921,8 @@ mod tests {
             entrypoint: None,
             command: vec!["true".to_string()],
             env: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            workdir: None,
             cpu_cores: None,
             ram_bytes: None,
             max_walltime_ms: None,
@@ -3076,6 +3086,8 @@ mod tests {
                 entrypoint: None,
                 command: vec!["true".to_string()],
                 env: BTreeMap::new(),
+                tags: BTreeMap::new(),
+                workdir: None,
                 cpu_cores: None,
                 ram_bytes: Some(ram_bytes),
                 max_walltime_ms: None,
