@@ -186,19 +186,20 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
     }
 }
 
-fn map_reconcile_error(error: ReconcileFolderError, node: NodeId, bucket: &str) -> ServerError {
+fn map_reconcile_error(error: ReconcileFolderError, remote: &RemoteBinding) -> ServerError {
+    let reason = error.describe(remote);
     match error {
         ReconcileFolderError::Sweep(error) => map_offer_error(error),
-        ReconcileFolderError::Refused(SyncRefusal::NotFound) => ServerError::BadRequestReason(
-            format!("the bucket \"{bucket}\" does not exist on node {node}"),
-        ),
+        ReconcileFolderError::Refused(SyncRefusal::NotFound) => {
+            ServerError::BadRequestReason(reason)
+        }
         ReconcileFolderError::Refused(SyncRefusal::Unauthorized | SyncRefusal::Forbidden) => {
             ServerError::Forbidden
         }
-        ReconcileFolderError::Unreachable(reason) => {
-            ServerError::BadGatewayReason(format!("node {node} is unreachable: {reason}"))
-        }
-        other => ServerError::ServiceUnavailableReason(other.to_string()),
+        ReconcileFolderError::Unreachable(_) => ServerError::BadGatewayReason(reason),
+        ReconcileFolderError::Refused(_)
+        | ReconcileFolderError::Decide(_)
+        | ReconcileFolderError::Unavailable => ServerError::ServiceUnavailableReason(reason),
     }
 }
 
@@ -721,9 +722,7 @@ async fn sync_folder(
     }
     aruna_operations::device::sync::reconcile_folder(&context, &folder)
         .await
-        .map_err(|error| {
-            map_reconcile_error(error, folder.remote.node_id, &folder.remote.bucket)
-        })?;
+        .map_err(|error| map_reconcile_error(error, &folder.remote))?;
     let folder = read_bound(&context, folder_id)
         .await
         .map_err(map_folder_error)?;
@@ -1079,7 +1078,7 @@ mod tests {
         map_reconcile_error, parse_hash,
     };
     use crate::routes::device::dto::hex_hash;
-    use aruna_core::structs::SyncRefusal;
+    use aruna_core::structs::{RemoteBinding, SyncRefusal};
     use aruna_core::types::NodeId;
     use aruna_operations::device::sync::ReconcileFolderError;
     use aruna_operations::device::sync::actions::ActionError;
@@ -1132,10 +1131,14 @@ mod tests {
             missing.to_string(),
             format!("the bucket \"test\" does not exist on node {node}")
         );
+        let remote = RemoteBinding {
+            node_id: node,
+            bucket: "test".to_string(),
+            prefix: String::new(),
+        };
         let sync = map_reconcile_error(
             ReconcileFolderError::Refused(SyncRefusal::NotFound),
-            node,
-            "test",
+            &remote,
         );
         assert_eq!(sync.status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(sync.to_string(), missing.to_string());

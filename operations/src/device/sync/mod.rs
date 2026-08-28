@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    AuthContext, FolderState, Observed, RemoteHead, SyncListCursor, SyncPageLimit, SyncRefusal,
-    SyncVersionPage, SyncedFolder,
+    AuthContext, FolderState, Observed, RemoteBinding, RemoteHead, SyncListCursor, SyncPageLimit,
+    SyncRefusal, SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::NodeId;
@@ -67,6 +67,25 @@ pub enum ReconcileFolderError {
     Decide(#[from] ReconcileError),
     #[error("the folder sync is unavailable")]
     Unavailable,
+}
+
+impl ReconcileFolderError {
+    /// The owner-facing reason, naming the remote the folder is bound to.
+    pub fn describe(&self, remote: &RemoteBinding) -> String {
+        match self {
+            Self::Refused(SyncRefusal::NotFound) => format!(
+                "the bucket \"{}\" does not exist on node {}",
+                remote.bucket, remote.node_id
+            ),
+            Self::Refused(SyncRefusal::Unauthorized | SyncRefusal::Forbidden) => {
+                format!("access to bucket \"{}\" is forbidden", remote.bucket)
+            }
+            Self::Unreachable(reason) => {
+                format!("node {} is unreachable: {reason}", remote.node_id)
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Reconciles every active folder once.
@@ -186,7 +205,7 @@ pub async fn reconcile_folder(
             Ok(plan)
         }
         Err(error) => {
-            stored.last_error = Some(error.to_string());
+            stored.last_error = Some(error.describe(&folder.remote));
             stored.last_error_at_ms = Some(now_ms);
             if let Err(store_error) = store_folder(context, &stored).await {
                 warn!(folder = %folder.folder_id, reason = %store_error, "Could not store the folder error");

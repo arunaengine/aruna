@@ -432,7 +432,13 @@ async fn recovers_missing_bucket() -> TestResult<()> {
     let failed = read_bound(&device.context, folder.folder_id).await?;
     assert_eq!(
         failed.last_error.as_deref(),
-        Some(error.to_string().as_str())
+        Some(error.describe(&folder.remote).as_str())
+    );
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|m| m.contains(REMOTE_BUCKET))
     );
     assert!(failed.last_error_at_ms.is_some());
     assert_eq!(failed.observed_files, 1);

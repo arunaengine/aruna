@@ -164,7 +164,7 @@ impl From<SyncStatus> for DeviceSyncStatus {
                     "pendingUploads": 1,
                     "unsyncedFiles": 0,
                     "conflicts": 0,
-                    "lastError": "the bucket \"lab-data\" does not exist on the selected node"
+                    "lastError": "the bucket \"lab-data\" does not exist on node k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga"
                 }]
             })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),

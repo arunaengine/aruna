@@ -168,13 +168,10 @@ pub fn dataset_row(
     pending_uploads: usize,
 ) -> DatasetRow {
     let mut unsynced_files = 0usize;
-    let mut in_sync = 0u64;
     let mut conflicts = 0usize;
     for base in bases {
         if base.synced.is_none() {
             unsynced_files += 1;
-        } else {
-            in_sync += 1;
         }
         if matches!(
             base.entry,
@@ -184,8 +181,7 @@ pub fn dataset_row(
         }
     }
     if bases.is_empty() {
-        unsynced_files =
-            usize::try_from(folder.observed_files.saturating_sub(in_sync)).unwrap_or(usize::MAX);
+        unsynced_files = usize::try_from(folder.observed_files).unwrap_or(usize::MAX);
     }
     DatasetRow {
         folder_id: folder.folder_id,
