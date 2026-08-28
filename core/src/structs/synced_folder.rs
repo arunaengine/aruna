@@ -94,6 +94,9 @@ pub struct SyncedFolder {
     pub created_by: UserId,
     pub created_at_ms: u64,
     pub last_reconcile_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_error_at_ms: Option<u64>,
+    pub observed_files: u64,
     /// Where the next pass resumes listing the realm heads. A folder larger
     /// than one pass converges over several, and a pass never decides about
     /// keys it did not list.
@@ -975,6 +978,9 @@ mod tests {
             created_by: UserId::new(Ulid::from_bytes([4u8; 16]), realm_id),
             created_at_ms: 7,
             last_reconcile_ms: None,
+            last_error: None,
+            last_error_at_ms: None,
+            observed_files: 0,
             list_cursor: None,
         };
         assert_eq!(

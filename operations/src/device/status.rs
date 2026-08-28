@@ -84,6 +84,7 @@ pub struct DatasetRow {
     pub pending_uploads: usize,
     pub unsynced_files: usize,
     pub conflicts: usize,
+    pub last_error: Option<String>,
 }
 
 /// Everything the Sync view shows.
@@ -167,10 +168,13 @@ pub fn dataset_row(
     pending_uploads: usize,
 ) -> DatasetRow {
     let mut unsynced_files = 0usize;
+    let mut in_sync = 0u64;
     let mut conflicts = 0usize;
     for base in bases {
         if base.synced.is_none() {
             unsynced_files += 1;
+        } else {
+            in_sync += 1;
         }
         if matches!(
             base.entry,
@@ -179,6 +183,10 @@ pub fn dataset_row(
             conflicts += 1;
         }
     }
+    if bases.is_empty() {
+        unsynced_files =
+            usize::try_from(folder.observed_files.saturating_sub(in_sync)).unwrap_or(usize::MAX);
+    }
     DatasetRow {
         folder_id: folder.folder_id,
         label: folder.root.clone(),
@@ -186,6 +194,7 @@ pub fn dataset_row(
         pending_uploads,
         unsynced_files,
         conflicts,
+        last_error: folder.last_error.clone(),
     }
 }
 
@@ -430,6 +439,9 @@ mod tests {
             created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([5u8; 32])),
             created_at_ms: 1,
             last_reconcile_ms: None,
+            last_error: None,
+            last_error_at_ms: None,
+            observed_files: 0,
             list_cursor: None,
         }
     }
@@ -485,7 +497,9 @@ mod tests {
 
     #[test]
     fn reports_folder_backlog() {
-        let folder = folder(FolderState::Active);
+        let mut folder = folder(FolderState::Active);
+        folder.observed_files = 4;
+        folder.last_error = Some("remote unavailable".to_string());
         let bases = vec![
             base(true, EntryState::InSync),
             base(false, EntryState::LocalNew),
@@ -503,6 +517,10 @@ mod tests {
         assert_eq!(row.pending_uploads, 2);
         assert_eq!(row.state, "active");
         assert_eq!(pending_total(&[], &[row]), 3);
+
+        let empty = dataset_row(&folder, &[], 0);
+        assert_eq!(empty.unsynced_files, 4);
+        assert_eq!(empty.last_error.as_deref(), Some("remote unavailable"));
     }
 
     #[test]

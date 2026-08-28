@@ -60,6 +60,8 @@ pub struct DeviceSyncDataset {
     pub pending_uploads: usize,
     pub unsynced_files: usize,
     pub conflicts: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -106,6 +108,7 @@ impl From<DatasetRow> for DeviceSyncDataset {
             pending_uploads: row.pending_uploads,
             unsynced_files: row.unsynced_files,
             conflicts: row.conflicts,
+            last_error: row.last_error,
         }
     }
 }
@@ -160,7 +163,8 @@ impl From<SyncStatus> for DeviceSyncStatus {
                     "state": "active",
                     "pendingUploads": 1,
                     "unsyncedFiles": 0,
-                    "conflicts": 0
+                    "conflicts": 0,
+                    "lastError": "the bucket \"lab-data\" does not exist on the selected node"
                 }]
             })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),

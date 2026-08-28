@@ -18,8 +18,10 @@ use crate::server_state::ServerState;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, AuthContext, FolderMode, FolderState, RemoteBinding,
+    SyncRefusal,
 };
 use aruna_core::types::{Key, NodeId};
+use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
@@ -174,8 +176,29 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         FolderError::TooManyFolders(_)
         | FolderError::RootOverlaps(_)
         | FolderError::BucketBound(_) => ServerError::Conflict(error.to_string()),
+        FolderError::NotRealmNode(_) | FolderError::RemoteBucketMissing { .. } => {
+            ServerError::BadRequestReason(error.to_string())
+        }
+        FolderError::RemoteForbidden { .. } => ServerError::Forbidden,
+        FolderError::RemoteUnreachable { .. } => ServerError::BadGatewayReason(error.to_string()),
         FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
         FolderError::Offer(offer) => map_offer_error(offer),
+    }
+}
+
+fn map_reconcile_error(error: ReconcileFolderError, node: NodeId, bucket: &str) -> ServerError {
+    match error {
+        ReconcileFolderError::Sweep(error) => map_offer_error(error),
+        ReconcileFolderError::Refused(SyncRefusal::NotFound) => ServerError::BadRequestReason(
+            format!("the bucket \"{bucket}\" does not exist on node {node}"),
+        ),
+        ReconcileFolderError::Refused(SyncRefusal::Unauthorized | SyncRefusal::Forbidden) => {
+            ServerError::Forbidden
+        }
+        ReconcileFolderError::Unreachable(reason) => {
+            ServerError::BadGatewayReason(format!("node {node} is unreachable: {reason}"))
+        }
+        other => ServerError::ServiceUnavailableReason(other.to_string()),
     }
 }
 
@@ -245,8 +268,10 @@ async fn folder_detail(
 - Roots must not nest.
 
 **Errors**
-- 400 when the root does not exist, cannot be read, or holds too many files.
-- 409 when the root overlaps a bound folder."#,
+- 400 when the root is unusable, the target is not a realm server, or the bucket is missing.
+- 403 when the remote bucket refuses the owner.
+- 409 when the root overlaps a bound folder.
+- 502 when the remote realm node is unreachable."#,
     request_body(
         content = BindFolderRequest,
         description = "Local directory and the realm prefix to bind it to",
@@ -276,6 +301,7 @@ async fn folder_detail(
                 "propagate_deletes": true,
                 "state": "active",
                 "counters": {
+                    "observed": 131,
                     "in_sync": 128,
                     "uploading": 2,
                     "conflicts": 1,
@@ -286,12 +312,13 @@ async fn folder_detail(
                 "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             })),
-        (status = 400, description = "Malformed ids, or an unusable directory", body = ErrorResponse),
+        (status = 400, description = "Malformed ids, an unusable directory, a non-realm target, or a missing remote bucket", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
+        (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The root overlaps a bound folder", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
+        (status = 503, description = "The device sync service or realm configuration is unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -361,7 +388,10 @@ async fn bind_synced_folder(
                 "mode": "two_way",
                 "propagate_deletes": true,
                 "state": "active",
+                "last_error": "the bucket \"lab-data\" does not exist on node k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                "last_error_at_ms": 1775748192000_i64,
                 "counters": {
+                    "observed": 131,
                     "in_sync": 128,
                     "uploading": 2,
                     "conflicts": 1,
@@ -422,6 +452,7 @@ async fn list_synced_folders(
                 "propagate_deletes": true,
                 "state": "active",
                 "counters": {
+                    "observed": 131,
                     "in_sync": 128,
                     "uploading": 2,
                     "conflicts": 1,
@@ -533,6 +564,7 @@ async fn unbind_synced_folder(
                 "propagate_deletes": true,
                 "state": "paused",
                 "counters": {
+                    "observed": 131,
                     "in_sync": 128,
                     "uploading": 2,
                     "conflicts": 1,
@@ -589,6 +621,7 @@ async fn pause_folder(
                 "propagate_deletes": true,
                 "state": "active",
                 "counters": {
+                    "observed": 131,
                     "in_sync": 128,
                     "uploading": 2,
                     "conflicts": 1,
@@ -649,6 +682,7 @@ async fn resume_folder(
                 "propagate_deletes": true,
                 "state": "active",
                 "counters": {
+                    "observed": 131,
                     "in_sync": 128,
                     "uploading": 2,
                     "conflicts": 1,
@@ -659,11 +693,12 @@ async fn resume_folder(
                 "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             })),
-        (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
+        (status = 400, description = "Malformed folder id, an unusable local directory, or a missing remote bucket", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
+        (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is paused", body = ErrorResponse),
+        (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
         (status = 503, description = "The folder could not be reconciled right now", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -686,8 +721,8 @@ async fn sync_folder(
     }
     aruna_operations::device::sync::reconcile_folder(&context, &folder)
         .await
-        .ok_or_else(|| {
-            ServerError::ServiceUnavailableReason("the folder could not be reconciled".to_string())
+        .map_err(|error| {
+            map_reconcile_error(error, folder.remote.node_id, &folder.remote.bucket)
         })?;
     let folder = read_bound(&context, folder_id)
         .await
@@ -927,6 +962,7 @@ fn action_kind(action: EntryAction) -> ActionKind {
                 "propagate_deletes": true,
                 "state": "active",
                 "counters": {
+                    "observed": 131,
                     "in_sync": 128,
                     "uploading": 2,
                     "conflicts": 1,
@@ -1039,10 +1075,15 @@ async fn list_folder_actions(
 #[cfg(test)]
 mod tests {
     use super::{
-        FolderError, ServerError, folder_name, map_action_error, map_folder_error, parse_hash,
+        FolderError, ServerError, folder_name, map_action_error, map_folder_error,
+        map_reconcile_error, parse_hash,
     };
     use crate::routes::device::dto::hex_hash;
+    use aruna_core::structs::SyncRefusal;
+    use aruna_core::types::NodeId;
+    use aruna_operations::device::sync::ReconcileFolderError;
     use aruna_operations::device::sync::actions::ActionError;
+    use axum::http::StatusCode;
 
     #[test]
     fn round_trips_hashes() {
@@ -1080,5 +1121,29 @@ mod tests {
             map_action_error(ActionError::RemoteUnavailable),
             ServerError::ServiceUnavailableReason(_)
         ));
+
+        let node = NodeId::from_bytes(&[3u8; 32]).expect("node id");
+        let missing = map_folder_error(FolderError::RemoteBucketMissing {
+            node,
+            bucket: "test".to_string(),
+        });
+        assert_eq!(missing.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing.to_string(),
+            format!("the bucket \"test\" does not exist on node {node}")
+        );
+        let sync = map_reconcile_error(
+            ReconcileFolderError::Refused(SyncRefusal::NotFound),
+            node,
+            "test",
+        );
+        assert_eq!(sync.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(sync.to_string(), missing.to_string());
+        let target = map_folder_error(FolderError::NotRealmNode(node));
+        assert_eq!(target.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            target.to_string(),
+            format!("node {node} is not a realm server")
+        );
     }
 }

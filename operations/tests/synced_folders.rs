@@ -8,23 +8,29 @@ mod topology;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, BucketInfo, EntryState, FolderMode, RemoteBinding,
-    RoutingSnapshot, SyncBase,
+    RoutingSnapshot, SyncBase, SyncRefusal,
 };
 use aruna_core::types::GroupId;
+use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, bind_folder, list_entries, list_transfers,
+    BindFolderInput, FolderError, bind_folder, list_entries, list_transfers, read_bound,
 };
 use aruna_operations::device::sync::outbox::drain_sync_outbox;
 use aruna_operations::device::sync::reconcile_folder;
+use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
+use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, wait_for_convergence};
 use ulid::Ulid;
@@ -237,9 +243,7 @@ async fn syncs_both_directions() -> TestResult<()> {
     std::fs::write(root.path().join("note.txt"), b"from the device")?;
     let folder = bind(&realm, root.path(), group_id).await?;
 
-    let plan = reconcile_folder(&device.context, &folder)
-        .await
-        .ok_or("the first pass must reconcile")?;
+    let plan = reconcile_folder(&device.context, &folder).await?;
     assert_eq!(plan.uploads, 1);
     await_uploads(&realm).await?;
     assert_eq!(
@@ -255,18 +259,14 @@ async fn syncs_both_directions() -> TestResult<()> {
         b"from the realm",
     )
     .await?;
-    reconcile_folder(&device.context, &folder)
-        .await
-        .ok_or("the second pass must reconcile")?;
+    reconcile_folder(&device.context, &folder).await?;
     assert_eq!(
         std::fs::read(root.path().join("shared.txt"))?,
         b"from the realm"
     );
 
     delete_object(&realm, &server.context, group_id, "note.txt").await?;
-    reconcile_folder(&device.context, &folder)
-        .await
-        .ok_or("the third pass must reconcile")?;
+    reconcile_folder(&device.context, &folder).await?;
     assert_eq!(
         std::fs::read(root.path().join("note.txt"))?,
         b"from the device",
@@ -296,9 +296,7 @@ async fn resolves_conflicts() -> TestResult<()> {
     let file = root.path().join("paper.txt");
     std::fs::write(&file, b"first")?;
     let folder = bind(&realm, root.path(), group_id).await?;
-    reconcile_folder(&device.context, &folder)
-        .await
-        .ok_or("the first pass must reconcile")?;
+    reconcile_folder(&device.context, &folder).await?;
     await_uploads(&realm).await?;
 
     // Both sides move before the next pass.
@@ -311,9 +309,7 @@ async fn resolves_conflicts() -> TestResult<()> {
         b"the realm's edit",
     )
     .await?;
-    reconcile_folder(&device.context, &folder)
-        .await
-        .ok_or("the conflict pass must reconcile")?;
+    reconcile_folder(&device.context, &folder).await?;
 
     assert_eq!(std::fs::read(&file)?, b"the owner's own edit");
     let base = entry_of(&device.context, folder.folder_id, "paper.txt").await?;
@@ -357,5 +353,145 @@ async fn resolves_conflicts() -> TestResult<()> {
     let replayed = apply_action(&device.context, action).await?;
     assert_eq!(replayed.outcome, ActionOutcome::Stale);
     assert_eq!(std::fs::read(&file)?, b"the realm's edit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn refuses_invalid_remotes() -> TestResult<()> {
+    // Binding validates both realm membership and remote bucket existence.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    let root = tempfile::tempdir()?;
+    let input = |node_id| BindFolderInput {
+        folder_id: Ulid::generate(),
+        root: root.path().to_string_lossy().to_string(),
+        group_id,
+        remote: RemoteBinding {
+            node_id,
+            bucket: REMOTE_BUCKET.to_string(),
+            prefix: String::new(),
+        },
+        mode: FolderMode::TwoWay,
+        propagate_deletes: true,
+        realm_id: realm.realm_id,
+        node_id: device.node_id(),
+        user_id: realm.user_id,
+    };
+
+    let missing = bind_folder(&device.context, input(server.node_id()))
+        .await
+        .expect_err("the missing remote bucket is refused");
+    assert_eq!(
+        missing,
+        FolderError::RemoteBucketMissing {
+            node: server.node_id(),
+            bucket: REMOTE_BUCKET.to_string(),
+        }
+    );
+    assert_eq!(
+        missing.to_string(),
+        format!(
+            "the bucket \"{REMOTE_BUCKET}\" does not exist on node {}",
+            server.node_id()
+        )
+    );
+
+    assert_eq!(
+        bind_folder(&device.context, input(device.node_id()))
+            .await
+            .expect_err("a user node is not a realm server"),
+        FolderError::NotRealmNode(device.node_id())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovers_missing_bucket() -> TestResult<()> {
+    // A missing bucket records the pass, then a recreated bucket revives its upload.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+    let folder = bind(&realm, root.path(), group_id).await?;
+
+    drive(
+        DeleteBucketOperation::new(REMOTE_BUCKET.to_string()),
+        &server.context,
+    )
+    .await?
+    .ok_or("bucket deletion did not finish")??;
+    let error = reconcile_folder(&device.context, &folder)
+        .await
+        .expect_err("the missing bucket is reported");
+    assert_eq!(error, ReconcileFolderError::Refused(SyncRefusal::NotFound));
+    let failed = read_bound(&device.context, folder.folder_id).await?;
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some(error.to_string().as_str())
+    );
+    assert!(failed.last_error_at_ms.is_some());
+    assert_eq!(failed.observed_files, 1);
+    assert_eq!(failed.last_reconcile_ms, folder.last_reconcile_ms);
+
+    let sweep = offer_directory(
+        &device.context,
+        OfferDirectoryInput {
+            bucket: folder.local_bucket.clone(),
+            root: folder.root.clone(),
+            group_id,
+            realm_id: realm.realm_id,
+            node_id: device.node_id(),
+            user_id: realm.user_id,
+        },
+    )
+    .await?;
+    let local = sweep.observed.first().ok_or("the local file is observed")?;
+    let upload = SyncUpload {
+        folder_id: folder.folder_id,
+        relative: local.relative.clone(),
+        deleted: false,
+        fingerprint: local.fingerprint.clone(),
+        blake3: None,
+        size: local.size,
+        local_version: Some(local.version_id),
+        queued_at_ms: 1,
+        state: UploadState::Failed {
+            reason: "NotFound".to_string(),
+            retryable: false,
+        },
+    };
+    let (key_space, key, value) = upload_entry(&upload)?;
+    let stored = device
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        stored,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let plan = reconcile_folder(&device.context, &failed).await?;
+    assert_eq!(plan.uploads, 1);
+    let recovered = read_bound(&device.context, folder.folder_id).await?;
+    assert_eq!(recovered.last_error, None);
+    assert_eq!(recovered.last_error_at_ms, None);
+    assert_eq!(recovered.observed_files, 1);
+    await_uploads(&realm).await?;
+    assert_eq!(
+        read_object(&realm, &server.context, group_id, "note.txt").await?,
+        b"from the device"
+    );
     Ok(())
 }

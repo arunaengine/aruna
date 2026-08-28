@@ -104,6 +104,7 @@ pub struct RemoteBindingView {
 /// How much of a folder still needs attention.
 #[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct FolderCountersView {
+    pub observed: u64,
     pub in_sync: usize,
     pub uploading: usize,
     pub conflicts: usize,
@@ -131,6 +132,10 @@ pub struct SyncedFolderView {
     pub counters: FolderCountersView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_reconcile_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at_ms: Option<u64>,
     pub created_at_ms: u64,
 }
 
@@ -327,6 +332,7 @@ pub fn folder_view(folder: SyncedFolder, counters: FolderCounters) -> SyncedFold
         state,
         message,
         counters: FolderCountersView {
+            observed: folder.observed_files,
             in_sync: counters.in_sync,
             uploading: counters.uploading,
             conflicts: counters.conflicts,
@@ -335,6 +341,8 @@ pub fn folder_view(folder: SyncedFolder, counters: FolderCounters) -> SyncedFold
             errors: counters.errors,
         },
         last_reconcile_ms: folder.last_reconcile_ms,
+        last_error: folder.last_error,
+        last_error_at_ms: folder.last_error_at_ms,
         created_at_ms: folder.created_at_ms,
     }
 }
@@ -413,6 +421,10 @@ pub fn download_view(
     key: String,
     base: &SyncBase,
 ) -> DeviceTransfer {
+    let (state, attempts, message) = match &base.entry {
+        EntryState::Error { reason } => (TransferState::Failed, 1, Some(reason.clone())),
+        _ => (TransferState::Queued, 0, None),
+    };
     DeviceTransfer {
         id: format!("{folder_id}:{path}"),
         direction: TransferDirection::Download,
@@ -420,15 +432,46 @@ pub fn download_view(
         path,
         bucket,
         key,
-        state: TransferState::Queued,
+        state,
         bytes_total: base
             .remote
             .as_ref()
             .map(|side| side.size)
             .unwrap_or_default(),
         bytes_done: 0,
-        attempts: 0,
+        attempts,
         next_attempt_ms: None,
-        message: None,
+        message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_download_error() {
+        // A failed remote read must not remain indistinguishable from queued work.
+        let base = SyncBase {
+            synced: None,
+            local_version_id: None,
+            synced_at_ms: 1,
+            entry: EntryState::Error {
+                reason: "remote read failed".to_string(),
+            },
+            pending_at: None,
+            local: None,
+            remote: None,
+        };
+        let transfer = download_view(
+            "folder".to_string(),
+            "notes.txt".to_string(),
+            "bucket".to_string(),
+            "notes.txt".to_string(),
+            &base,
+        );
+        assert_eq!(transfer.state, TransferState::Failed);
+        assert_eq!(transfer.attempts, 1);
+        assert_eq!(transfer.message.as_deref(), Some("remote read failed"));
     }
 }

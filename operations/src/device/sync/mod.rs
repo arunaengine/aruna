@@ -18,21 +18,24 @@ use std::time::Duration;
 
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    AuthContext, FolderState, Observed, RemoteHead, SyncListCursor, SyncPageLimit, SyncedFolder,
+    AuthContext, FolderState, Observed, RemoteHead, SyncListCursor, SyncPageLimit, SyncRefusal,
+    SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_tasks::TaskHandle;
-use tracing::{debug, warn};
+use thiserror::Error;
+use tracing::warn;
 
 use crate::device::drain::DrainOutcome;
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::staging::offered_directory::OfferDirectoryInput;
+use crate::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
 
 use folders::{list_folders, store_folder};
 use materialize::apply_downloads;
-use reconcile::{ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
+use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
 use repository::SYNC_PAGE_SIZE;
 
 pub use outbox::{
@@ -52,6 +55,20 @@ pub const RECONCILE_CONTINUE_AFTER: Duration = Duration::from_millis(250);
 /// several passes instead of building one unbounded listing.
 const MAX_REMOTE_HEADS: usize = 16_384;
 
+#[derive(Debug, Error, PartialEq)]
+pub enum ReconcileFolderError {
+    #[error(transparent)]
+    Sweep(#[from] OfferedDirectoryError),
+    #[error("the realm node refused the folder sync: {0:?}")]
+    Refused(SyncRefusal),
+    #[error("the realm node is unreachable: {0}")]
+    Unreachable(String),
+    #[error("could not decide the folder: {0}")]
+    Decide(#[from] ReconcileError),
+    #[error("the folder sync is unavailable")]
+    Unavailable,
+}
+
 /// Reconciles every active folder once.
 pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
     if context.net_handle.is_none() {
@@ -66,8 +83,10 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
             continue;
         }
         match reconcile_folder(context, &folder).await {
-            Some(plan) => work |= plan.uploads > 0 || plan.truncated,
-            None => debug!(folder = %folder.folder_id, "Could not reconcile the folder"),
+            Ok(plan) => work |= plan.uploads > 0 || plan.truncated,
+            Err(error) => {
+                warn!(folder = %folder.folder_id, reason = %error, "Could not reconcile the folder")
+            }
         }
     }
     match work {
@@ -81,86 +100,100 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
 pub async fn reconcile_folder(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
-) -> Option<ReconcilePlan> {
-    let net_handle = context.net_handle.as_ref()?;
-    let sweep = crate::staging::offered_directory::offer_directory(
-        context,
-        OfferDirectoryInput {
-            bucket: folder.local_bucket.clone(),
-            root: folder.root.clone(),
-            group_id: folder.group_id,
-            realm_id: *net_handle.realm_id(),
-            node_id: net_handle.node_id(),
-            user_id: folder.created_by,
-        },
-    )
-    .await
-    .inspect_err(|error| warn!(folder = %folder.folder_id, error = %error, "Folder sweep failed"))
-    .ok()?;
+) -> Result<ReconcilePlan, ReconcileFolderError> {
+    let mut stored = folder.clone();
+    let result: Result<_, ReconcileFolderError> = async {
+        let net_handle = context
+            .net_handle
+            .as_ref()
+            .ok_or(ReconcileFolderError::Unavailable)?;
+        let sweep = crate::staging::offered_directory::offer_directory(
+            context,
+            OfferDirectoryInput {
+                bucket: folder.local_bucket.clone(),
+                root: folder.root.clone(),
+                group_id: folder.group_id,
+                realm_id: *net_handle.realm_id(),
+                node_id: net_handle.node_id(),
+                user_id: folder.created_by,
+            },
+        )
+        .await?;
+        stored.observed_files = sweep.files as u64;
 
-    let local: BTreeMap<String, Observed> = sweep
-        .observed
-        .into_iter()
-        .map(|file| {
-            (
-                file.relative,
-                Observed {
-                    fingerprint: file.fingerprint,
-                    size: file.size,
-                    blake3: None,
-                    modified_at_ms: file.modified_at_ms,
-                    version_id: Some(file.version_id),
-                    stat: file.stat,
-                },
-            )
-        })
-        .collect();
-    let view = match folder.mode {
-        aruna_core::structs::FolderMode::UploadOnly => RemoteView::default(),
-        aruna_core::structs::FolderMode::TwoWay => fetch_heads(context, folder).await?,
-    };
-
-    let mut keys: Vec<String> = local
-        .keys()
-        .chain(view.heads.keys())
-        .filter(|key| view.covers(key))
-        .cloned()
-        .collect();
-    keys.sort();
-    keys.dedup();
-    let mut plan = ReconcilePlan {
-        truncated: view.next_cursor.is_some(),
-        ..ReconcilePlan::default()
-    };
-    for chunk in keys.chunks(SYNC_PAGE_SIZE) {
-        let page = ReconcileInput {
-            folder: folder.clone(),
-            local: subset(&local, chunk),
-            remote: subset(&view.heads, chunk),
-            now_ms: unix_timestamp_millis(),
+        let local: BTreeMap<String, Observed> = sweep
+            .observed
+            .into_iter()
+            .map(|file| {
+                (
+                    file.relative,
+                    Observed {
+                        fingerprint: file.fingerprint,
+                        size: file.size,
+                        blake3: None,
+                        modified_at_ms: file.modified_at_ms,
+                        version_id: Some(file.version_id),
+                        stat: file.stat,
+                    },
+                )
+            })
+            .collect();
+        let view = match folder.mode {
+            aruna_core::structs::FolderMode::UploadOnly => RemoteView::default(),
+            aruna_core::structs::FolderMode::TwoWay => fetch_heads(context, folder).await?,
         };
-        match crate::driver::drive(ReconcileFolderOperation::new(page), context).await {
-            Ok(page) => plan.absorb(page),
-            Err(error) => {
-                warn!(folder = %folder.folder_id, error = %error, "Could not decide a folder page");
-                return None;
+
+        let mut keys: Vec<String> = local
+            .keys()
+            .chain(view.heads.keys())
+            .filter(|key| view.covers(key))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let mut plan = ReconcilePlan {
+            truncated: view.next_cursor.is_some(),
+            ..ReconcilePlan::default()
+        };
+        for chunk in keys.chunks(SYNC_PAGE_SIZE) {
+            let page = ReconcileInput {
+                folder: folder.clone(),
+                local: subset(&local, chunk),
+                remote: subset(&view.heads, chunk),
+                now_ms: unix_timestamp_millis(),
+            };
+            let page = crate::driver::drive(ReconcileFolderOperation::new(page), context).await?;
+            plan.absorb(page);
+        }
+        apply_downloads(context, folder, std::mem::take(&mut plan.downloads)).await;
+        Ok((plan, view.next_cursor))
+    }
+    .await;
+
+    let now_ms = unix_timestamp_millis();
+    match result {
+        Ok((plan, list_cursor)) => {
+            stored.last_reconcile_ms = Some(now_ms);
+            stored.last_error = None;
+            stored.last_error_at_ms = None;
+            stored.list_cursor = list_cursor;
+            store_folder(context, &stored)
+                .await
+                .map_err(|_| ReconcileFolderError::Unavailable)?;
+            if plan.uploads > 0 {
+                arm_timer(context, TaskKey::DrainSyncUploadOutbox).await;
             }
+            Ok(plan)
+        }
+        Err(error) => {
+            stored.last_error = Some(error.to_string());
+            stored.last_error_at_ms = Some(now_ms);
+            if let Err(store_error) = store_folder(context, &stored).await {
+                warn!(folder = %folder.folder_id, reason = %store_error, "Could not store the folder error");
+            }
+            Err(error)
         }
     }
-    apply_downloads(context, folder, std::mem::take(&mut plan.downloads)).await;
-    let _ = store_folder(
-        context,
-        &SyncedFolder {
-            last_reconcile_ms: Some(unix_timestamp_millis()),
-            list_cursor: view.next_cursor,
-            ..folder.clone()
-        },
-    )
-    .await;
-    if plan.uploads > 0 {
-        arm_timer(context, TaskKey::DrainSyncUploadOutbox).await;
-    }
-    Some(plan)
 }
 
 fn subset<T: Clone>(source: &BTreeMap<String, T>, keys: &[String]) -> BTreeMap<String, T> {
@@ -204,9 +237,15 @@ fn close_window(view: &mut RemoteView, next: Option<SyncListCursor>) {
 
 /// Every current head under the folder's bound prefix, as bounded pages served
 /// by the folder's realm node with the owner's authority.
-async fn fetch_heads(context: &Arc<DriverContext>, folder: &SyncedFolder) -> Option<RemoteView> {
-    let metadata = context.metadata_handle.as_ref()?;
-    let realm_id = *context.net_handle.as_ref()?.realm_id();
+async fn fetch_heads(
+    context: &Arc<DriverContext>,
+    folder: &SyncedFolder,
+) -> Result<RemoteView, ReconcileFolderError> {
+    let realm_id = *context
+        .net_handle
+        .as_ref()
+        .ok_or(ReconcileFolderError::Unavailable)?
+        .realm_id();
     let auth = AuthContext {
         user_id: folder.created_by,
         realm_id,
@@ -221,21 +260,16 @@ async fn fetch_heads(context: &Arc<DriverContext>, folder: &SyncedFolder) -> Opt
     };
     let mut cursor = folder.list_cursor.clone();
     loop {
-        let message = MetadataTransportMessage::ForwardListVersions {
-            auth_token: MetadataAuthToken::internal(auth.clone()),
-            bucket: folder.remote.bucket.clone(),
-            prefix: folder.remote.prefix.clone(),
+        let page = request_versions(
+            context,
+            folder.remote.node_id,
+            auth.clone(),
+            folder.remote.bucket.clone(),
+            folder.remote.prefix.clone(),
             cursor,
-            limit: SyncPageLimit::default(),
-        };
-        let reply = metadata
-            .request_forwarded_write(folder.remote.node_id, message)
-            .await
-            .ok()?;
-        let MetadataTransportMessage::ForwardedVersions { result: Ok(page) } = reply else {
-            debug!(folder = %folder.folder_id, "The realm node refused the folder listing");
-            return None;
-        };
+            SyncPageLimit::default(),
+        )
+        .await?;
         let (page_heads, next) = page.into_parts();
         for head in page_heads {
             view.boundary = Some(head.relative.clone());
@@ -245,15 +279,53 @@ async fn fetch_heads(context: &Arc<DriverContext>, folder: &SyncedFolder) -> Opt
         // the boundary keeps this pass from judging the keys it never saw.
         if view.heads.len() >= MAX_REMOTE_HEADS {
             close_window(&mut view, next);
-            return Some(view);
+            return Ok(view);
         }
         match next {
             Some(next) => cursor = Some(next),
             None => {
                 close_window(&mut view, None);
-                return Some(view);
+                return Ok(view);
             }
         }
+    }
+}
+
+pub(super) async fn request_versions(
+    context: &Arc<DriverContext>,
+    node_id: NodeId,
+    auth: AuthContext,
+    bucket: String,
+    prefix: String,
+    cursor: Option<SyncListCursor>,
+    limit: SyncPageLimit,
+) -> Result<SyncVersionPage, ReconcileFolderError> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(ReconcileFolderError::Unavailable)?;
+    let reply = metadata
+        .request_forwarded_write(
+            node_id,
+            MetadataTransportMessage::ForwardListVersions {
+                auth_token: MetadataAuthToken::internal(auth),
+                bucket,
+                prefix,
+                cursor,
+                limit,
+            },
+        )
+        .await
+        .map_err(|error| ReconcileFolderError::Unreachable(error.to_string()))?;
+    match reply {
+        MetadataTransportMessage::ForwardedVersions { result: Ok(page) } => Ok(page),
+        MetadataTransportMessage::ForwardedVersions {
+            result: Err(refusal),
+        } => Err(ReconcileFolderError::Refused(refusal)),
+        other => Err(ReconcileFolderError::Unreachable(format!(
+            "unexpected metadata response: {}",
+            crate::metadata::transport_message_kind(&other)
+        ))),
     }
 }
 
