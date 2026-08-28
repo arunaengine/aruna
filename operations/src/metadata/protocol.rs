@@ -11,7 +11,7 @@ use aruna_core::metadata::{
     MetadataProfileValidationStatus, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, PathClaimRecord,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeInfoDocument, PathClaimRecord,
     PersistentIdFailure, PersistentIdMapping, PlacementPolicy, PlacementPolicyDocument,
     PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor, SyncPageLimit, SyncPullAck,
     SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
@@ -491,6 +491,9 @@ pub struct RealmDocuments {
     /// order and capped at [`MAX_DEVICE_GROUPS`]. The device caches them, so
     /// its local checks are the realm's rules; it still publishes nothing.
     pub groups: Vec<DeviceGroupDocuments>,
+    /// Stored advertisements for the configuration's sync-eligible nodes, in
+    /// node-id order. Devices are excluded.
+    pub node_infos: Vec<NodeInfoDocument>,
     /// The api urls the realm's management nodes published, in node-id order. A
     /// device holds no peer node-info document, so a management-only route has
     /// no target there without this list.

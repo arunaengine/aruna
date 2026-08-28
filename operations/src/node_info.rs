@@ -1003,7 +1003,7 @@ async fn replicate_node_info(
     .map_err(|error| format!("node info replication failed: {error}"))
 }
 
-async fn write_node_info_document(
+pub(crate) async fn write_node_info_document(
     storage: &StorageHandle,
     document: &NodeInfoDocument,
 ) -> Result<(), String> {

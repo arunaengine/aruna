@@ -2345,11 +2345,23 @@ async fn read_realm_documents(
         },
     )
     .await?;
+    let node_ids = config
+        .sync_eligible_node_ids()
+        .map_err(|_| SyncRefusal::Unavailable)?;
+    let node_infos = read_node_info_documents(context, &node_ids)
+        .await
+        .map_err(|error| {
+            warn!(%error, "Failed to read the node info documents for a device");
+            SyncRefusal::Unavailable
+        })?
+        .into_values()
+        .collect();
     Ok(RealmDocuments {
         realm_config,
         realm_authorization,
         owner,
         groups: device_group_documents(context, auth.user_id).await,
+        node_infos,
         management_urls: management_urls(context, &config).await,
         clock: applied_clock(context, realm_id).await,
     })

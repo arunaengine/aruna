@@ -29,8 +29,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, RealmConfigDocument, RealmId,
-    SyncRefusal,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, NodeInfoDocument, RealmConfigDocument,
+    RealmId, SyncRefusal,
 };
 use aruna_core::types::{GroupId, Key, UserId, Value};
 use aruna_core::util::unix_timestamp_secs;
@@ -44,6 +44,7 @@ use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
 use crate::mutate_realm_placement::node_kind;
+use crate::node_info::{read_node_info_document, write_node_info_document};
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker itself is treated as the wrong one. A marker can
@@ -386,6 +387,9 @@ async fn install_documents(
     let stored_owner = read_bytes(context, owner_target.clone()).await;
     let stored_groups = installed_group_docs(context).await;
     let stored_urls = installed_management_urls(context, plan.realm_id).await;
+    if !install_node_infos(context, &accepted.documents.node_infos).await {
+        return false;
+    }
     let unchanged = stored_config.as_deref() == Some(bytes.as_slice())
         && stored_authorization.as_deref() == accepted.documents.realm_authorization.as_deref()
         && stored_owner.as_deref() == accepted.documents.owner.as_deref()
@@ -611,6 +615,32 @@ pub async fn install_group_docs(
     write_batch(context, writes.to_vec()).await
 }
 
+async fn install_node_infos(context: &Arc<DriverContext>, documents: &[NodeInfoDocument]) -> bool {
+    for document in documents {
+        match read_node_info_document(&context.storage_handle, document.node_id).await {
+            Ok(Some(stored)) if stored == *document => continue,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    node_id = %document.node_id,
+                    %error,
+                    "Failed to read a fetched node info document"
+                );
+                return false;
+            }
+        }
+        if let Err(error) = write_node_info_document(&context.storage_handle, document).await {
+            warn!(
+                node_id = %document.node_id,
+                %error,
+                "Failed to install a fetched node info document"
+            );
+            return false;
+        }
+    }
+    true
+}
+
 /// The management api urls a realm node last served this device, in the order
 /// it served them. A device holds no peer node-info document, so relaying a
 /// management-only route has no other target.
@@ -747,6 +777,7 @@ mod tests {
             realm_authorization: None,
             owner: None,
             groups: Vec::new(),
+            node_infos: Vec::new(),
             management_urls: Vec::new(),
             clock: clock(seen),
         };
