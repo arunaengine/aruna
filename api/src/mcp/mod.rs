@@ -186,7 +186,7 @@ pub(crate) async fn authorize_self(
     let request = aruna_operations::request_policy::policy_request_with(
         &format!("/{realm_id}/u/{}", auth.user_id),
         &permission,
-        Some(&auth.user_id),
+        Some(auth),
         extras,
     );
     aruna_operations::request_policy::enforce_policies(&state.get_ctx(), realm_id, &request)

@@ -615,6 +615,10 @@ async fn metadata_probe(
         .map_err(server_error)
 }
 
+fn metadata_group_path(server: &McpServer, group_id: Ulid) -> String {
+    format!("/{}/g/{group_id}/meta/**", server.state.get_realm_id())
+}
+
 async fn authorize_summary(
     server: &McpServer,
     auth: &AuthContext,
