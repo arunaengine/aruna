@@ -13,7 +13,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, MatchedPath, Request, State};
-use axum::http::{HeaderName, HeaderValue, Method, Uri, header};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::collections::BTreeMap;
@@ -128,6 +128,7 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
 
     // Targets are tried in order, but only a failure that provably predates
     // processing may move a non-idempotent request on to the next target.
+    let mut unknown = None;
     for target in targets.iter().take(RELAY_TARGET_LIMIT) {
         let url = relay_url(target, &uri);
         let mut outgoing = RELAY_CLIENT
@@ -141,6 +142,9 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
             outgoing = outgoing.header(header::CONTENT_TYPE, content_type.clone());
         }
         match outgoing.send().await {
+            Ok(response) if may_try_response(route, response.status()) => {
+                unknown = Some((url, response));
+            }
             Ok(response) => return relayed_response(route, &url, response).await,
             Err(error) => {
                 let is_connect = error.is_connect();
@@ -152,6 +156,10 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
         }
     }
 
+    if let Some((url, response)) = unknown {
+        return relayed_response(route, &url, response).await;
+    }
+
     warn!(route, "No management node answered a relayed route");
     ServerError::NoManagementNode.into_response()
 }
@@ -161,6 +169,19 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
 /// any processing; later failures are only safe to repeat for an idempotent method.
 fn may_try_next(method: &Method, is_connect: bool) -> bool {
     is_connect || method == Method::GET
+}
+
+/// Whether a node-local enrollment miss may be tried on the next target.
+fn may_try_response(route: &str, status: StatusCode) -> bool {
+    matches!(
+        (route, status),
+        (
+            "/admin/onboarding/secrets/{id}"
+                | "/onboarding/secrets/{id}/status"
+                | "/users/me/devices/{id}",
+            StatusCode::NOT_FOUND
+        ) | ("/onboarding/bootstrap", StatusCode::UNAUTHORIZED)
+    )
 }
 
 /// Published api urls are bare origins (`API_PUBLIC_URL`), so the nest comes
@@ -271,7 +292,10 @@ fn peer_management_urls(
 
 #[cfg(test)]
 mod tests {
-    use super::{API_PREFIX, RELAYED_ROUTES, may_try_next, relay_route, relay_targets, relay_url};
+    use super::{
+        API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, relay_route, relay_targets,
+        relay_url,
+    };
     use crate::error::{ErrorResponse, ServerError};
     use axum::body::to_bytes;
     use axum::http::{Method, StatusCode, Uri};
@@ -370,6 +394,30 @@ mod tests {
     fn connect_failure_advances() {
         assert!(may_try_next(&Method::POST, true));
         assert!(may_try_next(&Method::GET, true));
+    }
+
+    #[test]
+    fn enrollment_miss_advances() {
+        assert!(may_try_response(
+            "/admin/onboarding/secrets/{id}",
+            StatusCode::NOT_FOUND
+        ));
+        assert!(may_try_response(
+            "/onboarding/secrets/{id}/status",
+            StatusCode::NOT_FOUND
+        ));
+        assert!(may_try_response(
+            "/users/me/devices/{id}",
+            StatusCode::NOT_FOUND
+        ));
+        assert!(may_try_response(
+            "/onboarding/bootstrap",
+            StatusCode::UNAUTHORIZED
+        ));
+        assert!(!may_try_response(
+            "/admin/onboarding/secrets",
+            StatusCode::NOT_FOUND
+        ));
     }
 
     #[test]
