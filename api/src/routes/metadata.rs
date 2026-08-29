@@ -3151,7 +3151,7 @@ pub(crate) fn forwarded_auth_token(
 
 pub(crate) fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
-        MetadataError::InvalidInput(_) => ServerError::BadRequest,
+        MetadataError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
         MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
         MetadataError::ProfileValidation(findings) => {
             ServerError::MetadataProfileValidation(findings)
