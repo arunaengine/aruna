@@ -126,14 +126,21 @@ fn extract_account_id(id_token: &str) -> Option<String> {
 }
 
 pub(super) fn static_models() -> Vec<ProviderModel> {
-    ["gpt-5.4", "gpt-5.3-codex", "gpt-5"]
-        .into_iter()
-        .map(|id| ProviderModel {
-            id: id.to_string(),
-            display_name: None,
-            static_model: true,
-        })
-        .collect()
+    [
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gpt-5",
+    ]
+    .into_iter()
+    .map(|id| ProviderModel {
+        id: id.to_string(),
+        display_name: None,
+        static_model: true,
+    })
+    .collect()
 }
 
 async fn exchange_tokens(
@@ -230,7 +237,7 @@ pub async fn start_login(
         headers: SealedS3Secret::empty(),
         secret: SealedS3Secret::empty(),
         models: static_models().into_iter().map(|model| model.id).collect(),
-        default_model: Some("gpt-5.4".to_string()),
+        default_model: Some("gpt-5.6-sol".to_string()),
         created_at: now,
         status: AssistantProviderStatus::PendingLogin,
         token_obtained_at: None,

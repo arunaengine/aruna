@@ -9,12 +9,11 @@ use axum::response::{IntoResponse, Response};
 use rmcp::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{CallToolResult, ContentBlock};
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
     StreamableHttpServerConfig, StreamableHttpService,
 };
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -54,10 +53,6 @@ impl ServerHandler for McpServer {
                 .build(),
         )
         .with_server_info(Implementation::new("aruna", env!("CARGO_PKG_VERSION")))
-    }
-
-    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
     }
 
     async fn list_resources(
@@ -208,7 +203,6 @@ pub fn router(state: Arc<ServerState>, cors: &CorsConfig, api_public_url: Option
         .with_allowed_hosts(allowed_hosts(api_public_url))
         .with_allowed_origins(cors.mcp_origins())
         .with_max_request_body_bytes(MCP_BODY_LIMIT)
-        .with_stateless_protocol_metadata_required(true)
         .with_cancellation_token(state.shutdown_token());
     let handler_state = state.clone();
     let service: StreamableHttpService<McpServer, NeverSessionManager> = StreamableHttpService::new(

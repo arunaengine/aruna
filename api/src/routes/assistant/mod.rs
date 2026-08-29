@@ -549,7 +549,12 @@ pub async fn get_models(
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let provider = load_provider(&state, auth.user_id, provider_id).await?;
     let models = if provider.kind == AssistantProviderKind::Chatgpt {
-        chatgpt::static_models()
+        // The backend list is not a published contract; the static set covers a refusal.
+        let provider = chatgpt::fresh_provider(&state, provider).await?;
+        match proxy::fetch_models(&state, &provider).await {
+            Ok(models) if !models.is_empty() => models,
+            _ => chatgpt::static_models(),
+        }
     } else {
         proxy::fetch_models(&state, &provider).await?
     };

@@ -22,7 +22,10 @@ fn normalized_path(path: &str) -> String {
 fn allowed_path(kind: AssistantProviderKind, method: &Method, path: &str) -> bool {
     let path = normalized_path(path);
     if method == Method::GET {
-        return path == "/v1/models" && kind != AssistantProviderKind::Chatgpt;
+        return match kind {
+            AssistantProviderKind::Chatgpt => path == "/models",
+            _ => path == "/v1/models",
+        };
     }
     if method != Method::POST {
         return false;
@@ -268,19 +271,30 @@ pub async fn proxy_get(
     proxy_request(state, auth, provider_id, path, request).await
 }
 
+/// `data` is the OpenAI shape; `models` with `slug` is what the ChatGPT backend serves.
 #[derive(Deserialize)]
 struct ModelList {
     #[serde(default)]
     data: Vec<ModelItem>,
+    #[serde(default)]
+    models: Vec<ModelItem>,
 }
 
 #[derive(Deserialize)]
 struct ModelItem {
+    #[serde(default, alias = "slug")]
     id: String,
     #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     name: Option<String>,
+}
+
+fn models_path(kind: AssistantProviderKind) -> &'static str {
+    match kind {
+        AssistantProviderKind::Chatgpt => "/models",
+        _ => "/v1/models",
+    }
 }
 
 fn text_model(id: &str) -> bool {
@@ -307,7 +321,7 @@ pub(super) async fn fetch_models(
         state,
         provider,
         Method::GET,
-        "/v1/models",
+        models_path(provider.kind),
         &HeaderMap::new(),
         Vec::new(),
     )
@@ -323,7 +337,8 @@ pub(super) async fn fetch_models(
     Ok(payload
         .data
         .into_iter()
-        .filter(|model| text_model(&model.id))
+        .chain(payload.models)
+        .filter(|model| !model.id.is_empty() && text_model(&model.id))
         .map(|model| ProviderModel {
             id: model.id,
             display_name: model.display_name.or(model.name),
