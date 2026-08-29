@@ -1,9 +1,9 @@
 //! Edits the owner makes on this device's own replicas.
 //!
-//! The edit is applied to the local graph first and queued afterwards, so the
-//! owner sees the result immediately and the realm receives exactly the change
-//! set that produced it. Nothing here decides realm authority: the holder
-//! re-checks the owner's permission when the drain forwards the batch.
+//! The edit is planned against the local graph, queued, and then merged, so a
+//! queue failure leaves the graph unchanged and the realm receives exactly the
+//! change set the device applies. Nothing here decides realm authority: the
+//! holder re-checks the owner's permission when the drain forwards the batch.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +11,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::events::Event;
 use aruna_core::metadata::{
-    MetadataApplyRoCrateRequest, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability, MetadataUpsertEntityRequest,
+    MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::task::{TaskEvent, TaskKey};
@@ -74,7 +73,7 @@ pub async fn apply_local_edit(
     })?;
     let draft_id = Ulid::generate();
     let actor = device_edit_actor(node_id, draft_id);
-    let batch = merge_locally(context, &record, &authored, actor).await?;
+    let batch = plan_local(context, &record, &authored, actor).await?;
     let entry = IntakeEntry::edit(draft_id, owner, &record, batch.clone(), authored);
     drive(
         EnqueueDraftOperation::new(EnqueueDraftInput { entry }),
@@ -88,8 +87,7 @@ pub async fn apply_local_edit(
             DeviceEditError::Unavailable
         }
     })?;
-    // The queue is durable first, so a crash before this leaves work to replay
-    // rather than an edit the realm never hears about.
+    merge_local(context, &batch).await?;
     request_persist(context).await;
 
     let mut edited = replica.clone();
@@ -123,9 +121,8 @@ fn authored_source(mutation: UpdateMetadataDocumentMutation) -> Option<MetadataB
     }
 }
 
-/// Applies the submission to the local graph under this edit's own actor, and
-/// answers with the change set craqle committed.
-async fn merge_locally(
+/// Plans the submission under this edit's actor without changing the graph.
+async fn plan_local(
     context: &Arc<DriverContext>,
     record: &MetadataRegistryRecord,
     authored: &MetadataBatchSource,
@@ -135,49 +132,15 @@ async fn merge_locally(
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    let graph_iri = record.graph_iri.clone();
-    let deterministic_actor = Some(actor);
-    // WAL-only durability: the publishing engine ignores the explicit actor and
-    // would publish into a topic no device can join. Crash safety comes from
-    // replaying the queued batch instead.
-    let effect = match authored {
-        MetadataBatchSource::ReplaceRoCrate { jsonld } => MetadataEffect::ApplyRoCrate {
-            request: MetadataApplyRoCrateRequest {
-                graph_iri,
-                jsonld: jsonld.clone(),
-                policy: MetadataGraphPolicy {
-                    public: record.public,
-                    permission_paths: vec![record.permission_path.clone()],
-                }
-                .normalized(),
-                durability: MetadataRequestDurability::WalAlreadyDurable,
-                deterministic_actor,
-            },
-        },
-        MetadataBatchSource::UpsertDataEntity { jsonld } => MetadataEffect::UpsertDataEntity {
-            request: MetadataUpsertEntityRequest {
-                graph_iri,
-                jsonld: jsonld.clone(),
-                durability: MetadataRequestDurability::WalAlreadyDurable,
-                deterministic_actor,
-            },
-        },
-        MetadataBatchSource::UpsertContextualEntity { jsonld } => {
-            MetadataEffect::UpsertContextualEntity {
-                request: MetadataUpsertEntityRequest {
-                    graph_iri,
-                    jsonld: jsonld.clone(),
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor,
-                },
-            }
-        }
-    };
-    match metadata.send_metadata_effect(effect).await {
-        Event::Metadata(
-            MetadataEvent::ApplyRoCrateResult { batch, .. }
-            | MetadataEvent::EntityUpsertResult { batch, .. },
-        ) => Ok(batch),
+    match metadata
+        .send_metadata_effect(MetadataEffect::PlanBatch {
+            graph_iri: record.graph_iri.clone(),
+            actor,
+            source: authored.clone(),
+        })
+        .await
+    {
+        Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => Ok(batch),
         Event::Metadata(MetadataEvent::Error {
             error: MetadataError::InvalidInput(message),
             ..
@@ -187,7 +150,31 @@ async fn merge_locally(
             ..
         }) => Err(DeviceEditError::Invalid(format!("{violations:?}"))),
         other => {
-            warn!(document_id = %record.document_id, event = ?other, "An offline edit did not apply");
+            warn!(document_id = %record.document_id, event = ?other, "An offline edit could not be planned");
+            Err(DeviceEditError::Unavailable)
+        }
+    }
+}
+
+/// Applies a durably queued batch to the device's local graph.
+async fn merge_local(
+    context: &Arc<DriverContext>,
+    batch: &MetadataBatch,
+) -> Result<(), DeviceEditError> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(DeviceEditError::Unavailable)?;
+    match metadata
+        .send_metadata_effect(MetadataEffect::MergeBatch {
+            graph_iri: batch.graph_iri.clone(),
+            batch: batch.clone(),
+        })
+        .await
+    {
+        Event::Metadata(MetadataEvent::BatchMerged { .. }) => Ok(()),
+        other => {
+            warn!(event = ?other, "A queued offline edit did not apply");
             Err(DeviceEditError::Unavailable)
         }
     }
@@ -291,12 +278,23 @@ pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_edit_actor, replays_edit};
-    use crate::device::repository::{IntakeEntry, IntakeKind, IntakeState};
-    use aruna_core::metadata::{MetadataBatch, MetadataBatchSource};
+    use super::{DeviceEditError, apply_local_edit, device_edit_actor, replays_edit};
+    use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
+    use crate::device::repository::{
+        IntakeEntry, IntakeKind, IntakeState, MAX_INTAKE_ENTRIES, intake_entry,
+    };
+    use crate::driver::DriverContext;
+    use crate::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::metadata::{
+        MetadataBatch, MetadataBatchSource, MetadataCreateCrateRequest, MetadataEffect,
+        MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
+    };
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_core::types::UserId;
     use craqle::VectorClock;
+    use std::sync::Arc;
     use ulid::Ulid;
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -360,6 +358,117 @@ mod tests {
         );
         entry.state = state;
         entry
+    }
+
+    #[tokio::test]
+    async fn queue_preserves_graph() {
+        // Planning must not expose an edit that cannot enter the durable queue.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(
+            dir.path().join("storage").to_str().expect("storage path"),
+        )
+        .unwrap();
+        let metadata = MetadataHandle::new_with_options(
+            dir.path().join("metadata"),
+            node(1),
+            storage.clone(),
+            None,
+            None,
+            None,
+            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+        )
+        .unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: Some(metadata),
+            task_handle: None,
+            compute_handle: None,
+        });
+        let record = record();
+        assert!(matches!(
+            context
+                .metadata_handle
+                .as_ref()
+                .unwrap()
+                .send_metadata_effect(MetadataEffect::CreateCrate {
+                    request: MetadataCreateCrateRequest {
+                        graph_iri: record.graph_iri.clone(),
+                        name: "Notes".to_string(),
+                        description: "Offline notes".to_string(),
+                        date_published: "2026-08-29".to_string(),
+                        license: None,
+                        policy: MetadataGraphPolicy {
+                            public: false,
+                            permission_paths: vec![record.permission_path.clone()],
+                        },
+                        durability: MetadataRequestDurability::Durable,
+                        deterministic_actor: Some([1u8; 32]),
+                    },
+                })
+                .await,
+            Event::Metadata(MetadataEvent::CreateCrateResult { .. })
+        ));
+        let owner = UserId::local(Ulid::generate(), record.realm_id);
+        for _ in 0..MAX_INTAKE_ENTRIES {
+            let entry = IntakeEntry::new(
+                Ulid::generate(),
+                owner,
+                record.group_id,
+                "queued".to_string(),
+                false,
+                "{}".to_string(),
+            );
+            let (key_space, key, value) = intake_entry(&entry).unwrap();
+            assert!(matches!(
+                context
+                    .storage_handle
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space,
+                        key,
+                        value,
+                        txn_id: None,
+                    })
+                    .await,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+        let mut replica = ReplicaRecord::new(
+            record.document_id,
+            record.group_id,
+            record.document_path.clone(),
+            ReplicaOrigin::Realm,
+        );
+        replica.record = Some(Box::new(record.clone()));
+        let metadata = context.metadata_handle.as_ref().unwrap();
+        let before = metadata
+            .export_rocrate_jsonld(record.graph_iri.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            apply_local_edit(
+                &context,
+                owner,
+                node(1),
+                &replica,
+                crate::update_metadata_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
+                    jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
+                },
+            )
+            .await,
+            Err(DeviceEditError::QueueFull {
+                limit: MAX_INTAKE_ENTRIES
+            })
+        );
+        assert_eq!(
+            metadata
+                .export_rocrate_jsonld(record.graph_iri.clone())
+                .await
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
