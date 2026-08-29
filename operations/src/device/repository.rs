@@ -78,6 +78,7 @@ pub enum IntakeState {
     Failed {
         reason: String,
         retryable: bool,
+        document_id: Option<Ulid>,
     },
 }
 
@@ -146,10 +147,42 @@ impl IntakeEntry {
             IntakeKind::Edit { document_id, .. } => Some(*document_id),
             IntakeKind::Create => match &self.state {
                 IntakeState::Publishing { document_id, .. }
-                | IntakeState::Published { document_id } => Some(*document_id),
-                IntakeState::Pending { .. } | IntakeState::Failed { .. } => None,
+                | IntakeState::Published { document_id }
+                | IntakeState::Failed {
+                    document_id: Some(document_id),
+                    ..
+                } => Some(*document_id),
+                IntakeState::Pending { .. }
+                | IntakeState::Failed {
+                    document_id: None, ..
+                } => None,
             },
         }
+    }
+
+    /// Re-arms a retryable failure for an explicit owner-requested sync.
+    pub fn retry_failed(&self, now_ms: u64) -> Option<IntakeState> {
+        if !matches!(
+            self.state,
+            IntakeState::Failed {
+                retryable: true,
+                ..
+            }
+        ) {
+            return None;
+        }
+        Some(match self.document_id() {
+            Some(document_id) => IntakeState::Publishing {
+                document_id,
+                due_at_ms: now_ms,
+                attempts: 0,
+            },
+            None => IntakeState::Pending {
+                due_at_ms: now_ms,
+                attempts: 0,
+                last_error: None,
+            },
+        })
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -339,7 +372,36 @@ mod tests {
         entry.state = IntakeState::Failed {
             reason: "denied".to_string(),
             retryable: false,
+            document_id: None,
         };
         assert!(!entry.is_due(u64::MAX));
+        assert!(entry.retry_failed(1_000).is_none());
+        entry.state = IntakeState::Failed {
+            reason: "unreachable".to_string(),
+            retryable: true,
+            document_id: None,
+        };
+        assert!(matches!(
+            entry.retry_failed(1_000),
+            Some(IntakeState::Pending {
+                due_at_ms: 1_000,
+                attempts: 0,
+                ..
+            })
+        ));
+        let document_id = Ulid::generate();
+        entry.state = IntakeState::Failed {
+            reason: "unreachable".to_string(),
+            retryable: true,
+            document_id: Some(document_id),
+        };
+        assert!(matches!(
+            entry.retry_failed(1_000),
+            Some(IntakeState::Publishing {
+                document_id: retried,
+                due_at_ms: 1_000,
+                attempts: 0,
+            }) if retried == document_id
+        ));
     }
 }

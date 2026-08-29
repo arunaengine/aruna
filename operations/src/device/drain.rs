@@ -129,7 +129,11 @@ async fn read_page(
 /// Stores `next` only while the entry still carries the state the scan read.
 /// A delete committed in between therefore wins instead of the entry coming
 /// back as `Publishing`.
-async fn claim_state(context: &Arc<DriverContext>, entry: &IntakeEntry, next: IntakeState) -> bool {
+pub(super) async fn claim_state(
+    context: &Arc<DriverContext>,
+    entry: &IntakeEntry,
+    next: IntakeState,
+) -> bool {
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -339,6 +343,7 @@ async fn publish_entry(
         Err(error) if permanent(&error) => IntakeState::Failed {
             reason: error.to_string(),
             retryable: false,
+            document_id: None,
         },
         // An unknown outcome keeps the minted id, so the retry is the same
         // create rather than a second document.
@@ -364,6 +369,7 @@ async fn publish_edit(
         return IntakeState::Failed {
             reason: "not an edit".to_string(),
             retryable: false,
+            document_id: None,
         };
     };
     match apply_batch_routed(
@@ -386,6 +392,7 @@ async fn publish_edit(
         Err(error) if permanent(&error) => IntakeState::Failed {
             reason: error.to_string(),
             retryable: false,
+            document_id: Some(*document_id),
         },
         Err(error) => publishing_retry(*document_id, claim.attempts, error.to_string()),
     }
@@ -419,6 +426,7 @@ fn retry_state(attempts: u32, reason: String) -> IntakeState {
         return IntakeState::Failed {
             reason,
             retryable: true,
+            document_id: None,
         };
     }
     IntakeState::Pending {
@@ -435,6 +443,7 @@ fn publishing_retry(document_id: Ulid, attempts: u32, reason: String) -> IntakeS
         return IntakeState::Failed {
             reason: format!("{reason} (document id {document_id})"),
             retryable: true,
+            document_id: Some(document_id),
         };
     }
     IntakeState::Publishing {
@@ -578,13 +587,15 @@ mod tests {
             publishing_retry(document_id, MAX_INTAKE_ATTEMPTS, "unreachable".to_string()),
             IntakeState::Failed {
                 retryable: true,
+                document_id: Some(kept),
                 ..
-            }
+            } if kept == document_id
         ));
         assert!(matches!(
             retry_state(MAX_INTAKE_ATTEMPTS, "no placement".to_string()),
             IntakeState::Failed {
                 retryable: true,
+                document_id: None,
                 ..
             }
         ));
@@ -630,6 +641,7 @@ mod tests {
             state: IntakeState::Failed {
                 reason: "parked".to_string(),
                 retryable: true,
+                document_id: None,
             },
             ..entry.clone()
         };

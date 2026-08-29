@@ -22,6 +22,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
+use super::drain::claim_state;
 use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
 use super::repository::{IntakeEntry, IntakeState, scan_intake};
 use super::sync::folders::{list_folders, list_transfers};
@@ -246,6 +247,7 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
     if state.run_active(now) {
         return false;
     }
+    requeue_intake(context, now).await;
     state.run_started_ms = Some(now);
     write_sync_state(context, &state).await;
     for key in [
@@ -257,6 +259,15 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
         arm(context, key).await;
     }
     true
+}
+
+async fn requeue_intake(context: &Arc<DriverContext>, now_ms: u64) {
+    for entry in read_intake_entries(context).await {
+        let Some(state) = entry.retry_failed(now_ms) else {
+            continue;
+        };
+        claim_state(context, &entry, state).await;
+    }
 }
 
 async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
@@ -391,6 +402,7 @@ async fn read_bases(context: &Arc<DriverContext>, folder_id: Ulid) -> Vec<SyncBa
 mod tests {
     use super::*;
     use crate::device::replica::ReplicaOrigin;
+    use crate::device::repository::intake_entry;
     use aruna_core::structs::{FolderMode, RealmId, RemoteBinding};
     use aruna_core::types::UserId;
 
@@ -540,5 +552,58 @@ mod tests {
         assert!(!stale.realm_reachable(now));
         assert!(!stale.run_active(now));
         assert!(!DeviceSyncState::default().realm_reachable(now));
+    }
+
+    #[tokio::test]
+    async fn retries_explicit_sync() {
+        // An owner-requested run re-arms retryable failures only.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let document_id = Ulid::generate();
+        let retryable = draft(IntakeState::Failed {
+            reason: "unreachable".to_string(),
+            retryable: true,
+            document_id: Some(document_id),
+        });
+        let permanent = draft(IntakeState::Failed {
+            reason: "denied".to_string(),
+            retryable: false,
+            document_id: None,
+        });
+        for entry in [&retryable, &permanent] {
+            let (key_space, key, value) = intake_entry(entry).unwrap();
+            assert!(matches!(
+                context
+                    .storage_handle
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space,
+                        key,
+                        value,
+                        txn_id: None,
+                    })
+                    .await,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+
+        assert!(start_sync_run(&context).await);
+        let entries = read_intake_entries(&context).await;
+        assert!(entries.iter().any(|entry| matches!(
+            entry.state,
+            IntakeState::Publishing {
+                document_id: retried,
+                attempts: 0,
+                ..
+            } if retried == document_id
+        )));
+        assert!(entries.iter().any(|entry| entry.state == permanent.state));
     }
 }

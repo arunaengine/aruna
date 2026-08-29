@@ -117,8 +117,13 @@ impl From<IntakeEntry> for DeviceDraft {
                 draft.status = "published".to_string();
                 draft.document_id = Some(document_id.to_string());
             }
-            IntakeState::Failed { reason, retryable } => {
+            IntakeState::Failed {
+                reason,
+                retryable,
+                document_id,
+            } => {
                 draft.status = "failed".to_string();
+                draft.document_id = document_id.map(|id| id.to_string());
                 draft.last_error = Some(reason);
                 draft.retryable = Some(retryable);
             }
@@ -452,6 +457,7 @@ mod tests {
         source.state = IntakeState::Failed {
             reason: "denied".to_string(),
             retryable: false,
+            document_id: None,
         };
         let failed: DeviceDraft = source.into();
         assert_eq!(failed.status, "failed");

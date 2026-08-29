@@ -491,6 +491,7 @@ mod tests {
         assert!(!replays_edit(&edit(IntakeState::Failed {
             reason: "denied".to_string(),
             retryable: false,
+            document_id: Some(record().document_id),
         })));
 
         let create = IntakeEntry::new(

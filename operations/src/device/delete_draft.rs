@@ -304,6 +304,7 @@ mod tests {
         entry.state = IntakeState::Failed {
             reason: "group is gone".to_string(),
             retryable: false,
+            document_id: None,
         };
         store(&context, &entry).await;
         assert!(

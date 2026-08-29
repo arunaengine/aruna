@@ -353,6 +353,7 @@ mod tests {
         let failed = entry(IntakeState::Failed {
             reason: "denied".to_string(),
             retryable: false,
+            document_id: Some(replica.document_id),
         });
 
         assert_eq!(document_state(&replica, &[]), DocumentState::Synced);
