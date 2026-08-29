@@ -1578,7 +1578,8 @@ pub async fn delete_metadata_document(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     run_delete_metadata_document(
         &ctx,
         Actor {
@@ -1980,7 +1981,8 @@ pub async fn replace_metadata_rocrate(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -2090,7 +2092,8 @@ pub async fn add_metadata_data_entity(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -2197,7 +2200,8 @@ pub async fn add_metadata_contextual_entity(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -2713,7 +2717,9 @@ pub async fn metadata_references(
     Ok((StatusCode::OK, Json(map_references_response(execution))))
 }
 
-fn map_references_response(execution: MetadataReferencesExecution) -> MetadataReferencesResponse {
+pub(crate) fn map_references_response(
+    execution: MetadataReferencesExecution,
+) -> MetadataReferencesResponse {
     MetadataReferencesResponse {
         references: execution
             .references
@@ -2980,13 +2986,13 @@ fn map_preflight_response(
     }
 }
 
-fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
+pub(crate) fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     MetaResourceId::parse(document_id)
         .map(|id| id.as_ulid())
         .map_err(|_| ServerError::BadRequest)
 }
 
-async fn run_list_metadata_documents(
+pub(crate) async fn run_list_metadata_documents(
     state: &ServerState,
     auth: Option<AuthContext>,
     query: ListMetadataQuery,
@@ -3066,7 +3072,7 @@ fn format_timestamp_ms(timestamp_ms: u64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
 }
 
-fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {
+pub(crate) fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {
     if !value.is_object() {
         return Err(ServerError::BadRequest);
     }
@@ -3086,7 +3092,7 @@ fn serialize_jsonld_entity(value: &Value) -> ServerResult<String> {
 /// A write that could neither be applied locally nor forwarded to a holder is a
 /// loud failure: the caller is told it was not accepted, rather than being
 /// answered `201` for a record that can never replicate.
-fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
+pub(crate) fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
     match error {
         MetadataWriteError::Unauthorized => ServerError::Unauthorized,
         MetadataWriteError::Forbidden => ServerError::Forbidden,
@@ -3100,7 +3106,7 @@ fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
     }
 }
 
-pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerError {
+pub(crate) fn map_create_error(error: CreateMetadataDocumentError) -> ServerError {
     match error {
         CreateMetadataDocumentError::MetadataError(metadata_error) => {
             map_metadata_error(metadata_error)
@@ -3123,7 +3129,7 @@ pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerErro
     }
 }
 
-fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
+pub(crate) fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
     match error {
         UpdateMetadataDocumentError::DocumentNotFound => ServerError::NotFound,
         UpdateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
@@ -3143,7 +3149,7 @@ pub(crate) fn forwarded_auth_token(
         .map_err(map_metadata_api_error)
 }
 
-fn map_metadata_error(error: MetadataError) -> ServerError {
+pub(crate) fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
         MetadataError::InvalidInput(_) => ServerError::BadRequest,
         MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
@@ -3180,7 +3186,7 @@ pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<Metadata
     })
 }
 
-fn bearer_token_to_string(
+pub(crate) fn bearer_token_to_string(
     bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
 ) -> Option<String> {
     bearer_token.map(|carrier| carrier.as_str().to_string())
@@ -3199,20 +3205,23 @@ async fn ensure_record_writable(
     state: &ServerState,
     auth: &AuthContext,
     record: &MetadataRegistryRecord,
+    extras: PolicyRequestExtras,
 ) -> ServerResult<()> {
-    ensure_permission(
+    crate::auth::ensure_permission_with(
         state,
-        auth.clone(),
+        auth,
         record.permission_path.clone(),
         Permission::WRITE,
+        extras,
     )
     .await
 }
 
-async fn local_write_record(
+pub(crate) async fn local_write_record(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
+    extras: PolicyRequestExtras,
 ) -> ServerResult<Option<MetadataRegistryRecord>> {
     let context = state.get_ctx();
     if !run_origin_holds_document(
@@ -3238,7 +3247,7 @@ async fn local_write_record(
                 return Err(ServerError::InternalError(error.to_string()));
             }
         };
-    ensure_record_writable(state, auth, &record).await?;
+    ensure_record_writable(state, auth, &record, extras).await?;
     Ok(Some(record))
 }
 
@@ -3256,7 +3265,7 @@ async fn ensure_permission(
     crate::auth::ensure_permission(state, &auth, path, required_permission).await
 }
 
-async fn load_metadata_record_by_document(
+pub(crate) async fn load_metadata_record_by_document(
     state: &ServerState,
     document_id: Ulid,
 ) -> ServerResult<MetadataRegistryRecord> {
@@ -3284,7 +3293,7 @@ fn map_rocrate_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCra
     }
 }
 
-fn map_rocrate_export_response(
+pub(crate) fn map_rocrate_export_response(
     export: ExportMetadataRoCrateResult,
     params: &MetadataRoCrateExportParams,
     view: MetadataRoCrateView,
@@ -3435,7 +3444,7 @@ fn rewrite_identifier_value(
     }
 }
 
-fn map_query_results(
+pub(crate) fn map_query_results(
     results: MetadataQueryResults,
     fanout_stats: MetadataFanoutStats,
 ) -> ServerResult<MetadataQueryResponse> {

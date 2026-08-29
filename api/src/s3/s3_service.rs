@@ -681,6 +681,22 @@ impl ArunaS3Service {
         emit_resource_watch_event(self.state.as_ref(), event).await;
     }
 
+    pub(crate) async fn complete_put(
+        &self,
+        auth: AuthContext,
+        group_id: ulid::Ulid,
+        bucket: String,
+        key: String,
+        version_id: ulid::Ulid,
+        size_bytes: u64,
+    ) {
+        let actor = auth.user_id;
+        self.queue_live_version_replication(auth, bucket.clone(), key.clone(), version_id, false)
+            .await;
+        self.emit_data_uploaded_watch(actor, group_id, bucket, key, size_bytes)
+            .await;
+    }
+
     /// Deviates from AWS S3 by returning the true full-object MD5 hex as the
     /// multipart ETag, without the AWS `-<partCount>` suffix. AWS derives its
     /// multipart ETag from the concatenated part digests, so its value is opaque
@@ -718,20 +734,15 @@ impl ArunaS3Service {
             Some(result.part_count),
         ));
 
-        let watch_actor = replication_auth.user_id;
-        let watch_bucket = replication_bucket.clone();
-        let watch_key = replication_key.clone();
-        let watch_size = result.location.blob_size;
-        self.queue_live_version_replication(
+        self.complete_put(
             replication_auth,
+            group_id,
             replication_bucket,
             replication_key,
             result.version_id,
-            false,
+            result.location.blob_size,
         )
         .await;
-        self.emit_data_uploaded_watch(watch_actor, group_id, watch_bucket, watch_key, watch_size)
-            .await;
 
         Ok(S3Response::new(output))
     }
@@ -762,20 +773,15 @@ impl ArunaS3Service {
             checksum_request.checksum_type.clone(),
             None,
         ));
-        let watch_actor = replication_auth.user_id;
-        let watch_bucket = replication_bucket.clone();
-        let watch_key = replication_key.clone();
-        let watch_size = result.location.blob_size;
-        self.queue_live_version_replication(
+        self.complete_put(
             replication_auth,
+            group_id,
             replication_bucket,
             replication_key,
             result.version_id,
-            false,
+            result.location.blob_size,
         )
         .await;
-        self.emit_data_uploaded_watch(watch_actor, group_id, watch_bucket, watch_key, watch_size)
-            .await;
 
         Ok(S3Response::new(output))
     }

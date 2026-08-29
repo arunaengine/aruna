@@ -336,19 +336,7 @@ pub type ServerResult<T> = Result<T, ServerError>;
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let code = self.error_code();
-        let message = self.public_message();
-
-        let mut body = ErrorResponse::new(&message).with_code(code);
-        if let ServerError::MetadataValidation(violations) = &self {
-            body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
-        }
-        if let ServerError::MetadataProfileValidation(findings) = &self {
-            body = body.with_findings(findings.iter().cloned().map(Into::into).collect());
-        }
-        if let ServerError::ComputeQuotaDenied(denied) = &self {
-            body = body.with_quota((*denied).into());
-        }
+        let body = self.response_body();
 
         let mut response = (status, Json(body)).into_response();
         if matches!(
@@ -368,6 +356,20 @@ impl IntoResponse for ServerError {
 }
 
 impl ServerError {
+    pub(crate) fn response_body(&self) -> ErrorResponse {
+        let mut body = ErrorResponse::new(self.public_message()).with_code(self.error_code());
+        if let ServerError::MetadataValidation(violations) = self {
+            body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
+        }
+        if let ServerError::MetadataProfileValidation(findings) = self {
+            body = body.with_findings(findings.iter().cloned().map(Into::into).collect());
+        }
+        if let ServerError::ComputeQuotaDenied(denied) = self {
+            body = body.with_quota((*denied).into());
+        }
+        body
+    }
+
     pub(crate) fn status_code(&self) -> StatusCode {
         match self {
             ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,

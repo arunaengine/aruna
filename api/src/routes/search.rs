@@ -736,6 +736,19 @@ pub async fn unified_search(
     Query(params): Query<SearchParams>,
 ) -> ServerResult<(StatusCode, Json<SearchResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
+    Ok((
+        StatusCode::OK,
+        Json(run_unified(&state, &auth, bearer, params).await?),
+    ))
+}
+
+pub(crate) async fn run_unified(
+    state: &ServerState,
+    auth: &AuthContext,
+    bearer: Option<String>,
+    params: SearchParams,
+) -> ServerResult<SearchResponse> {
     let types = parse_search_types(params.types.as_deref())?;
     if let Some(cursor) = params.cursor.as_deref() {
         if types.count() != 1 {
@@ -760,12 +773,10 @@ pub async fn unified_search(
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
-    let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
-
     let (documents, buckets, groups, users) = tokio::join!(
         run_documents(
-            &state,
-            &auth,
+            state,
+            auth,
             types.documents,
             &q,
             bearer.clone(),
@@ -775,27 +786,17 @@ pub async fn unified_search(
             params.cursor.clone(),
             params.mode.clone(),
         ),
-        run_buckets(&state, &auth, types.buckets, &q, bearer, limit),
-        run_groups(
-            &state,
-            &auth,
-            types.groups,
-            &q,
-            limit,
-            params.cursor.clone()
-        ),
-        run_users(&state, &auth, types.users, &q, limit, params.cursor.clone()),
+        run_buckets(state, auth, types.buckets, &q, bearer, limit),
+        run_groups(state, auth, types.groups, &q, limit, params.cursor.clone()),
+        run_users(state, auth, types.users, &q, limit, params.cursor.clone()),
     );
 
-    Ok((
-        StatusCode::OK,
-        Json(SearchResponse {
-            documents: documents?,
-            buckets: buckets?,
-            groups: groups?,
-            users: users?,
-        }),
-    ))
+    Ok(SearchResponse {
+        documents: documents?,
+        buckets: buckets?,
+        groups: groups?,
+        users: users?,
+    })
 }
 
 async fn run_buckets(

@@ -23,6 +23,7 @@ use aruna_operations::jobs::service::{
     read_report_routed,
 };
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use axum::body::Body;
@@ -36,15 +37,14 @@ use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
-};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
@@ -72,7 +72,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_job_artifact, head_job_artifact))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct ExecutionInputRequest {
     pub bucket: String,
     pub key: String,
@@ -93,7 +93,9 @@ pub struct ExecutionInputRequest {
 
 /// Per-input composition mode. `exact_reference` requires `version_id`,
 /// `floating_reference` rejects it.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum InputModeRequest {
     #[default]
@@ -102,7 +104,9 @@ pub enum InputModeRequest {
     ExactReference,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CollisionPolicyRequest {
     #[default]
@@ -111,7 +115,7 @@ pub enum CollisionPolicyRequest {
     KeepExisting,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct ExecutionOutputRequest {
     /// Absolute container path captured after the task exits.
     pub container_path: String,
@@ -119,7 +123,7 @@ pub struct ExecutionOutputRequest {
     pub dest_key: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceModeRequest {
     Temporary,
@@ -127,7 +131,7 @@ pub enum WorkspaceModeRequest {
     Existing,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct WorkspaceRequest {
     pub mode: WorkspaceModeRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,7 +140,17 @@ pub struct WorkspaceRequest {
 
 /// Where a submission runs. `local` is served by a user device only, and runs
 /// the job on that machine for its owner.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionTarget {
     #[default]
@@ -144,7 +158,7 @@ pub enum ExecutionTarget {
     Local,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct SubmitExecutionRequest {
     pub group_id: String,
     pub image: String,
@@ -402,11 +416,11 @@ fn rfc3339(ms: u64) -> String {
         .unwrap_or_default()
 }
 
-fn job_status_response(record: &JobRecord) -> JobStatusResponse {
+pub(crate) fn job_status_response(record: &JobRecord) -> JobStatusResponse {
     job_view_response(&JobStatusView::from(record))
 }
 
-fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
+pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
     JobStatusResponse {
         job_id: job.job_id.to_string(),
         kind: job.kind.name().to_string(),
@@ -499,7 +513,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
     }
 }
 
-fn bind_output_routes(
+pub(crate) fn bind_output_routes(
     result: &mut Option<serde_json::Value>,
     outputs: &[JobOutputResponse],
 ) -> Result<(), JobRouteError> {
@@ -512,7 +526,7 @@ fn bind_output_routes(
     Ok(())
 }
 
-fn parse_state(value: &str) -> ServerResult<JobState> {
+pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
     match value {
         "queued" => Ok(JobState::Queued),
         "claimed" => Ok(JobState::Claimed),
@@ -543,7 +557,7 @@ fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
     }
 }
 
-fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
+pub(crate) fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
     cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
 }
 
@@ -655,6 +669,7 @@ async fn validate_existing_workspace(
     auth: &AuthContext,
     group_id: Ulid,
     bucket: &str,
+    extras: PolicyRequestExtras,
 ) -> ServerResult<()> {
     let info = match drive(
         GetBucketInfoOperation::new(bucket.to_string()),
@@ -670,11 +685,12 @@ async fn validate_existing_workspace(
     if info.group_id != group_id {
         return Err(ServerError::BadRequest);
     }
-    ensure_permission(
+    crate::auth::ensure_permission_with(
         state,
         auth,
         blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
         Permission::WRITE,
+        extras,
     )
     .await
 }
@@ -1017,6 +1033,24 @@ pub async fn submit_job(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SubmitExecutionRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
+    let (status, response) = submit_execution(
+        state.as_ref(),
+        auth,
+        bearer,
+        request,
+        PolicyRequestExtras::rest(),
+    )
+    .await?;
+    Ok((status, Json(response)))
+}
+
+pub(crate) async fn submit_execution(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    bearer: Option<ValidatedArunaBearerTokenCarrier>,
+    request: SubmitExecutionRequest,
+    extras: PolicyRequestExtras,
+) -> ServerResult<(StatusCode, SubmitJobResponse)> {
     let target = request.target.unwrap_or_default();
     let auth = match target {
         ExecutionTarget::Realm => require_unrestricted_realm_auth(&state, auth)?,
@@ -1036,15 +1070,16 @@ pub async fn submit_job(
         return Err(ServerError::BadRequest);
     }
     let output_prefixes = validate_output_prefixes(request.output_prefixes)?;
-    ensure_permission(
-        &state,
+    crate::auth::ensure_permission_with(
+        state,
         &auth,
         blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
         Permission::WRITE,
+        extras.clone(),
     )
     .await?;
     if let Some(bucket) = workspace_bucket.as_deref() {
-        validate_existing_workspace(&state, &auth, group_id, bucket).await?;
+        validate_existing_workspace(state, &auth, group_id, bucket, extras).await?;
     }
 
     if request.inputs.len() > MAX_PLAN_INPUTS || request.outputs.len() > MAX_EXECUTION_OUTPUTS {
@@ -1099,7 +1134,7 @@ pub async fn submit_job(
     };
     let accepted = match target {
         ExecutionTarget::Local => {
-            local_submit(&state, &auth, spec, request.idempotency_key, workspace_mode).await?
+            local_submit(state, &auth, spec, request.idempotency_key, workspace_mode).await?
         }
         ExecutionTarget::Realm => {
             let result = submit_external_job(
@@ -1128,12 +1163,12 @@ pub async fn submit_job(
     } else {
         StatusCode::OK
     };
-    let urls = job_urls(&state, accepted.job_id).await?;
+    let urls = job_urls(state, accepted.job_id).await?;
     // The accepting holder's canonical binding is the alias it answered with;
     // a later merge may move it, which the status surface then reports.
     Ok((
         status,
-        Json(SubmitJobResponse {
+        SubmitJobResponse {
             job_id: accepted.job_id.to_string(),
             created: accepted.created,
             submission_id: accepted.submission_id,
@@ -1141,7 +1176,7 @@ pub async fn submit_job(
             state: accepted.state,
             origin_node_url: urls.owner_node_url,
             status_url: urls.status_url,
-        }),
+        },
     ))
 }
 
