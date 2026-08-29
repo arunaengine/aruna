@@ -32,7 +32,7 @@ use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, NodeInfoDocument, RealmConfigDocument,
     RealmId, SyncRefusal,
 };
-use aruna_core::types::{GroupId, Key, UserId, Value};
+use aruna_core::types::{Key, UserId, Value};
 use aruna_core::util::unix_timestamp_secs;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -466,7 +466,6 @@ async fn install_documents(
     if !write_batch(context, writes).await {
         return false;
     }
-    prune_groups(context, &stored_groups, &accepted.documents.groups).await;
     // The peer set and the node kinds this device enforces follow the copy it
     // just installed, exactly as they follow a synced one on a realm node.
     if let Some(net_handle) = context.net_handle.as_ref()
@@ -560,49 +559,6 @@ fn group_doc_writes(
             Value::from(documents.authorization.to_bytes(actor).ok()?),
         ),
     ])
-}
-
-/// Drops the groups the realm no longer lists for this owner. Both rows key by
-/// group id; the realm authorization row shares AUTH_KEYSPACE but keys by realm
-/// id, so it can never be named here.
-async fn prune_groups(
-    context: &Arc<DriverContext>,
-    stored: &[DeviceGroupDocuments],
-    fetched: &[DeviceGroupDocuments],
-) {
-    let kept: BTreeSet<GroupId> = fetched
-        .iter()
-        .map(|documents| documents.group.group_id)
-        .collect();
-    let mut deletes = Vec::new();
-    for group_id in stored
-        .iter()
-        .map(|documents| documents.group.group_id)
-        .filter(|group_id| !kept.contains(group_id))
-    {
-        for target in [
-            DocumentSyncTarget::Group { group_id },
-            DocumentSyncTarget::GroupAuthorization { group_id },
-        ] {
-            deletes.push((target.storage_keyspace().to_string(), target.storage_key()));
-        }
-    }
-    if deletes.is_empty() {
-        return;
-    }
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })
-        .await;
-    if !matches!(
-        event,
-        Event::Storage(StorageEvent::BatchDeleteResult { .. })
-    ) {
-        warn!(event = ?event, "Failed to drop the groups this device no longer holds");
-    }
 }
 
 /// Writes one group's documents where every local read already looks for them,
@@ -1005,10 +961,10 @@ mod tests {
         );
     }
 
-    // A group the realm no longer lists for this owner leaves the device, and
-    // the realm authorization row that shares its keyspace must survive it.
+    // An unversioned group snapshot cannot prove that an absent group was
+    // removed rather than still replicating to the serving node.
     #[tokio::test]
-    async fn prunes_dropped_groups() {
+    async fn keeps_unlisted_groups() {
         let (_dir, context) = device(&config(&[1])).await;
         let actor = owner_actor();
         let kept = group_docs(1, "kept");
@@ -1044,7 +1000,10 @@ mod tests {
             install_documents(&context, &plan, answer_groups(&[1], vec![kept.clone()]), 0).await
         );
 
-        assert_eq!(installed_group_docs(&context).await, vec![kept]);
+        assert_eq!(
+            installed_group_docs(&context).await,
+            vec![kept, dropped.clone()]
+        );
         assert!(
             read_bytes(
                 &context,
@@ -1053,7 +1012,7 @@ mod tests {
                 }
             )
             .await
-            .is_none()
+            .is_some()
         );
         assert_eq!(
             read_bytes(&context, realm_auth).await,
