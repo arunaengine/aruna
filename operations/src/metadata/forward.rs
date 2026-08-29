@@ -130,6 +130,7 @@ const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 const METADATA_READ_FANOUT_LIMIT: usize = 8;
 const METADATA_READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
+const DEVICE_GROUP_SCAN_PAGE: usize = 10_000;
 
 /// Route for a write against `placement`, from the local node's point of view.
 ///
@@ -2433,36 +2434,48 @@ async fn device_group_documents(
     context: &Arc<DriverContext>,
     user_id: UserId,
 ) -> Vec<DeviceGroupDocuments> {
-    let groups = match drive(ListGroupOperation::new(), context.as_ref()).await {
-        Ok(groups) => groups,
-        Err(error) => {
-            warn!(error = %error, "Failed to list groups for a device");
-            return Vec::new();
-        }
-    };
     let mut documents = Vec::new();
-    for Group { group_id, .. } in groups {
-        if documents.len() >= MAX_DEVICE_GROUPS {
-            break;
-        }
-        let read = drive(
-            GetGroupOperation::new(GetGroupConfig { group_id }),
+    let mut offset = 0usize;
+    loop {
+        let groups = match drive(
+            ListGroupOperation::with_pagination(DEVICE_GROUP_SCAN_PAGE, offset),
             context.as_ref(),
         )
-        .await;
-        let Ok((group, authorization)) = read else {
-            warn!(%group_id, "Failed to read a group for a device");
-            continue;
+        .await
+        {
+            Ok(groups) => groups,
+            Err(error) => {
+                warn!(error = %error, "Failed to list groups for a device");
+                return Vec::new();
+            }
         };
-        if !holds_any_role(&authorization, user_id) {
-            continue;
+        let page_len = groups.len();
+        for Group { group_id, .. } in groups {
+            let read = drive(
+                GetGroupOperation::new(GetGroupConfig { group_id }),
+                context.as_ref(),
+            )
+            .await;
+            let Ok((group, authorization)) = read else {
+                warn!(%group_id, "Failed to read a group for a device");
+                continue;
+            };
+            if !holds_any_role(&authorization, user_id) {
+                continue;
+            }
+            documents.push(DeviceGroupDocuments {
+                group,
+                authorization,
+            });
+            if documents.len() >= MAX_DEVICE_GROUPS {
+                return documents;
+            }
         }
-        documents.push(DeviceGroupDocuments {
-            group,
-            authorization,
-        });
+        if page_len < DEVICE_GROUP_SCAN_PAGE {
+            return documents;
+        }
+        offset = offset.saturating_add(page_len);
     }
-    documents
 }
 
 /// Whether the owner holds a role in this group. A device caches its owner's
@@ -3781,6 +3794,82 @@ mod tests {
             revision.merged,
             Some(MetadataMergedRevision { jsonld, findings: 2 }) if jsonld == "candidate"
         ));
+    }
+
+    #[tokio::test]
+    async fn finds_later_membership() {
+        // The only matching group sits just beyond the legacy default page.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let member = UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);
+        let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: member,
+            realm_id,
+        };
+        let mut writes = Vec::with_capacity((DEVICE_GROUP_SCAN_PAGE + 1) * 2);
+        for seed in 1..=DEVICE_GROUP_SCAN_PAGE + 1 {
+            let group_id = Ulid::from(seed as u128);
+            let group = Group {
+                display_name: seed.to_string(),
+                group_id,
+                realm_id,
+                roles: Default::default(),
+                owner: other,
+            };
+            let authorization = GroupAuthorizationDocument::new_default_group_doc(
+                if seed > DEVICE_GROUP_SCAN_PAGE {
+                    member
+                } else {
+                    other
+                },
+                realm_id,
+                group_id,
+            );
+            for (target, bytes) in [
+                (
+                    DocumentSyncTarget::Group { group_id },
+                    group.to_bytes(&actor).unwrap(),
+                ),
+                (
+                    DocumentSyncTarget::GroupAuthorization { group_id },
+                    authorization.to_bytes(&actor).unwrap(),
+                ),
+            ] {
+                writes.push((
+                    target.storage_keyspace().to_string(),
+                    target.storage_key(),
+                    aruna_core::types::Value::from(bytes),
+                ));
+            }
+        }
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+
+        let documents = device_group_documents(&context, member).await;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].group.group_id,
+            Ulid::from((DEVICE_GROUP_SCAN_PAGE + 1) as u128)
+        );
     }
 
     #[test]
