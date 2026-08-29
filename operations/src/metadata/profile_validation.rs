@@ -8,7 +8,8 @@ use aruna_core::keyspaces::METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
     MetadataProfileValidationSeverity, MetadataProfileValidationState,
-    MetadataProfileValidationStatus, MetadataValidationViolation, is_rocrate_specification,
+    MetadataProfileValidationStatus, MetadataRawRevision, MetadataValidationViolation,
+    is_rocrate_specification,
 };
 use aruna_core::storage_entries::{
     metadata_profile_validation_status_key, metadata_profile_validation_status_write_entry,
@@ -568,7 +569,11 @@ pub async fn revalidate_current(
             "metadata raw revision has no dataset digest to fence on".to_string(),
         ));
     };
-    let mut status = assess_submission(context, record.document_id, &raw.jsonld).await?;
+    let merged = merged_jsonld(&raw).map(str::to_owned);
+    let mut status = match merged.as_deref() {
+        Some(jsonld) => assess_render(context, record.document_id, jsonld).await,
+        None => assess_submission(context, record.document_id, &raw.jsonld).await?,
+    };
     status.dataset_revision = raw.winning_event_id;
     status.dataset_digest = Some(digest);
     let mut owner = context
@@ -589,11 +594,12 @@ pub async fn revalidate_current(
             .await,
     )
     .map_err(map_registry_error)?;
-    let fenced_digest = load_raw_revision(context, record.document_id, Some(txn_id))
+    let fenced_raw = load_raw_revision(context, record.document_id, Some(txn_id))
         .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?
-        .and_then(|raw| raw.dataset_digest);
-    if fenced.is_none() || fenced_digest != Some(digest) {
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let fenced_digest = fenced_raw.as_ref().and_then(|raw| raw.dataset_digest);
+    let fenced_merged = fenced_raw.as_ref().and_then(merged_jsonld);
+    if fenced.is_none() || fenced_digest != Some(digest) || fenced_merged != merged.as_deref() {
         let _ = context
             .storage_handle
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -638,6 +644,10 @@ pub async fn revalidate_current(
             "unexpected profile revalidation commit: {other:?}"
         ))),
     }
+}
+
+fn merged_jsonld(raw: &MetadataRawRevision) -> Option<&str> {
+    raw.merged.as_ref().map(|merged| merged.jsonld.as_str())
 }
 
 async fn resolve_registered_profile(
@@ -971,6 +981,23 @@ mod tests {
             severity: EncodedTerm(format!("<{SH}{severity}>")),
             messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn selects_merged_candidate() {
+        let mut raw = MetadataRawRevision {
+            jsonld: "displayed".to_string(),
+            winning_event_id: Ulid::nil(),
+            context_digest: [0u8; 32],
+            dataset_digest: Some([1u8; 32]),
+            merged: None,
+        };
+        assert!(merged_jsonld(&raw).is_none());
+        raw.merged = Some(aruna_core::metadata::MetadataMergedRevision {
+            jsonld: "candidate".to_string(),
+            findings: 1,
+        });
+        assert_eq!(merged_jsonld(&raw), Some("candidate"));
     }
 
     #[test]
