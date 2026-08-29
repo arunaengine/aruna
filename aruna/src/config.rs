@@ -82,6 +82,7 @@ pub struct Config {
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
     pub desktop_cors: bool,
+    pub mcp_enabled: bool,
     pub portal_csp_extra_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
     pub max_concurrent_uni_streams: Option<u64>,
@@ -392,6 +393,7 @@ pub struct Settings {
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
     pub desktop_cors: bool,
+    pub mcp_enabled: bool,
     pub portal_csp_extra_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
     pub additional_relay_urls: Vec<String>,
@@ -517,6 +519,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .unwrap_or(aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE);
     let cors_allowed_origins = parse_list_env("CORS_ALLOWED_ORIGINS");
     let desktop_cors = desktop_cors_env();
+    let mcp_enabled = mcp_env()?;
     let portal_csp_extra_origins = parse_list_env("PORTAL_CSP_EXTRA_ORIGINS");
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
@@ -599,6 +602,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         max_http_body_size,
         cors_allowed_origins,
         desktop_cors,
+        mcp_enabled,
         portal_csp_extra_origins,
         p2p_socket_addr,
         additional_relay_urls,
@@ -651,6 +655,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         max_http_body_size,
         cors_allowed_origins,
         desktop_cors,
+        mcp_enabled,
         portal_csp_extra_origins,
         p2p_socket_addr,
         additional_relay_urls,
@@ -789,6 +794,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
             max_http_body_size,
             cors_allowed_origins,
             desktop_cors,
+            mcp_enabled,
             portal_csp_extra_origins,
             p2p_socket_addr,
             max_concurrent_uni_streams,
@@ -1112,6 +1118,20 @@ fn assistant_proxy_env() -> Result<bool, SetupError> {
             "ASSISTANT_PROXY",
             value,
             "expected enabled or disabled",
+        )),
+    }
+}
+
+fn mcp_env() -> Result<bool, SetupError> {
+    const KEY: &str = "MCP";
+    match dotenvy::var(KEY).ok().as_deref().map(normalize_env_value) {
+        None => Ok(true),
+        Some(value) if value == "enabled" => Ok(true),
+        Some(value) if value == "disabled" => Ok(false),
+        Some(value) => Err(invalid_config_value(
+            KEY,
+            value,
+            "expected one of: enabled, disabled",
         )),
     }
 }

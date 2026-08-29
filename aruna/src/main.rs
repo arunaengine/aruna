@@ -698,7 +698,8 @@ async fn bind_servers(
         cors: cors.clone(),
     };
     let server = Server::new(state.clone(), server_config)
-        .with_api_public_url(config.api_public_url.clone());
+        .with_api_public_url(config.api_public_url.clone())
+        .with_mcp_enabled(config.mcp_enabled);
 
     let portal_handle = bind_portal(
         &config.portal,

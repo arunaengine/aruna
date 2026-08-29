@@ -137,6 +137,7 @@ pub struct PortalRuntimeState {
 pub struct InterfaceRuntimeState {
     pub rest: Option<RestInterfaceRuntime>,
     pub s3: Option<S3InterfaceRuntime>,
+    pub mcp: Option<McpInterfaceRuntime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +153,12 @@ pub struct RestInterfaceRuntime {
 pub struct S3InterfaceRuntime {
     pub bind_address: SocketAddr,
     pub base_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpInterfaceRuntime {
+    pub bind_address: SocketAddr,
+    pub url: String,
 }
 
 impl ServerState {
@@ -395,6 +402,17 @@ impl ServerState {
             bind_address,
             base_url: client_base_url_from_advertised_host(advertised_host, bind_address),
         });
+    }
+
+    pub async fn register_mcp_interface(&self) {
+        let mut interface_state = self.interface_state.write().await;
+        interface_state.mcp = interface_state
+            .rest
+            .as_ref()
+            .map(|rest| McpInterfaceRuntime {
+                bind_address: rest.bind_address,
+                url: format!("{}/mcp", rest.base_url),
+            });
     }
 
     pub async fn interface_state(&self) -> InterfaceRuntimeState {

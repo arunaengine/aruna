@@ -257,6 +257,8 @@ pub struct DatabaseServiceStatus {
 pub struct InterfaceServicesStatus {
     pub rest: InterfaceStatus,
     pub s3: InterfaceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<InterfaceStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1081,6 +1083,9 @@ pub async fn get_realm_info(
     if !realm_authenticated {
         interfaces.rest.bind = None;
         interfaces.s3.bind = None;
+        if let Some(mcp) = interfaces.mcp.as_mut() {
+            mcp.bind = None;
+        }
     }
 
     let metadata_replication = RealmMetadataReplicationResponse {
@@ -2104,6 +2109,11 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
                 url: None,
             },
         },
+        mcp: interface_runtime.mcp.map(|mcp| InterfaceStatus {
+            status: ServiceStatus::Available,
+            bind: Some(mcp.bind_address.to_string()),
+            url: Some(mcp.url),
+        }),
     }
 }
 
@@ -2244,6 +2254,9 @@ pub async fn get_info(
     if !realm {
         interfaces.rest.bind = None;
         interfaces.s3.bind = None;
+        if let Some(mcp) = interfaces.mcp.as_mut() {
+            mcp.bind = None;
+        }
     }
 
     let mut response = InfoResponse {
@@ -2639,6 +2652,7 @@ mod tests {
                     bind: Some("0.0.0.0:1337".to_string()),
                     url: Some("http://127.0.0.1:1337".to_string()),
                 },
+                mcp: None,
             }
         );
         assert!(

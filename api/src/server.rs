@@ -33,6 +33,7 @@ pub struct Server {
     state: Arc<ServerState>,
     config: ServerConfig,
     api_public_url: Option<String>,
+    mcp_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,7 @@ impl Server {
             state,
             config,
             api_public_url: None,
+            mcp_enabled: true,
         }
     }
 
@@ -55,6 +57,12 @@ impl Server {
         self.api_public_url = api_public_url;
         self
     }
+
+    pub fn with_mcp_enabled(mut self, mcp_enabled: bool) -> Self {
+        self.mcp_enabled = mcp_enabled;
+        self
+    }
+
     pub fn build_router(&self) -> Router {
         // Build the main API router
         let api_v1 = Router::new()
@@ -69,6 +77,13 @@ impl Server {
             .merge(swagger_ui())
             .layer(from_fn(redirect_swagger))
             .layer(from_fn(baseline_security_headers));
+        if self.mcp_enabled {
+            router = router.merge(crate::mcp::router(
+                self.state.clone(),
+                &self.config.cors,
+                self.api_public_url.as_deref(),
+            ));
+        }
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
         }
@@ -96,6 +111,9 @@ impl Server {
         self.state
             .register_rest_interface_with_public_url(bound_addr, self.api_public_url.as_deref())
             .await;
+        if self.mcp_enabled {
+            self.state.register_mcp_interface().await;
+        }
         let abort_requests = CancellationToken::new();
         let request_abort = abort_requests.clone();
         let _abort_requests = abort_requests.drop_guard();

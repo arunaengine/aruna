@@ -108,6 +108,22 @@ impl CorsConfig {
             .collect()
     }
 
+    pub(crate) fn mcp_origins(&self) -> Vec<String> {
+        if self.allow_any {
+            return Vec::new();
+        }
+        let desktop: &[&str] = if self.allow_desktop {
+            &DESKTOP_ORIGINS
+        } else {
+            &[]
+        };
+        self.allowed_origins
+            .iter()
+            .cloned()
+            .chain(desktop.iter().map(|origin| (*origin).to_string()))
+            .collect()
+    }
+
     pub fn rest_layer(&self) -> Option<CorsLayer> {
         let allow_origin = if self.allow_any {
             AllowOrigin::any()
@@ -130,7 +146,14 @@ impl CorsConfig {
                     Method::HEAD,
                     Method::OPTIONS,
                 ])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    HeaderName::from_static("mcp-method"),
+                    HeaderName::from_static("mcp-name"),
+                    HeaderName::from_static("mcp-protocol-version"),
+                    HeaderName::from_static("mcp-session-id"),
+                ])
                 // The portal is always cross-origin now, so its retry backoff
                 // and download filenames depend on these being readable.
                 .expose_headers([header::CONTENT_DISPOSITION, header::RETRY_AFTER])

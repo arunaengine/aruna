@@ -8,6 +8,7 @@ pub mod csp;
 mod download;
 pub mod error;
 pub mod forwarded;
+pub mod mcp;
 pub mod openapi;
 pub mod ops;
 pub mod portal;
