@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCAN_DIRS: &[&str] = &["src/routes", "src/s3"];
+const SCAN_DIRS: &[&str] = &["src/mcp", "src/routes", "src/s3"];
 const PATTERNS: &[&str] = &[
     "send_effect",
     "send_storage_effect",
