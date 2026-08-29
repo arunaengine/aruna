@@ -82,12 +82,13 @@ struct Accepted {
     clock: AdminDocumentClock,
 }
 
-/// The best of what the peers answered: one copy that covers the marker, or the
-/// furthest copy they all agreed on below it.
+/// The best of what the peers answered: one copy that covers the marker, or a
+/// copy two peers agreed on below it.
 #[derive(Default)]
 struct Selection {
     current: Option<Accepted>,
     behind: Option<Accepted>,
+    candidates: Vec<Accepted>,
 }
 
 impl Selection {
@@ -99,12 +100,19 @@ impl Selection {
             self.current = Some(accepted);
             return true;
         }
-        let further = self
-            .behind
-            .as_ref()
-            .is_none_or(|best| covers(&accepted.clock, &best.clock, &origins));
-        if further {
-            self.behind = Some(accepted);
+        let agreed = self.candidates.iter().any(|candidate| {
+            candidate.clock == accepted.clock && candidate.documents == accepted.documents
+        });
+        if agreed {
+            let further = self
+                .behind
+                .as_ref()
+                .is_none_or(|best| covers(&accepted.clock, &best.clock, &origins));
+            if further {
+                self.behind = Some(accepted);
+            }
+        } else {
+            self.candidates.push(accepted);
         }
         false
     }
@@ -855,11 +863,15 @@ mod tests {
             clock(&[(1, 6)])
         );
 
-        // Every peer below the marker: the furthest of them is the candidate.
+        // Different older answers do not corroborate one another.
         let mut agreed = Selection::default();
         assert!(!agreed.offer(answer(&[1, 2], &[(1, 2)]), &installed));
         assert!(!agreed.offer(answer(&[1, 2], &[(1, 4)]), &installed));
         assert!(agreed.current.is_none());
+        assert!(agreed.behind.is_none());
+
+        // Two peers returning the same bundle may repair an inflated marker.
+        assert!(!agreed.offer(answer(&[1, 2], &[(1, 4)]), &installed));
         assert_eq!(
             agreed.behind.expect("a candidate to re-base on").clock,
             clock(&[(1, 4)])
