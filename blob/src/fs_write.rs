@@ -341,7 +341,13 @@ pub(crate) async fn sweep_spool(root: &str) -> usize {
     let Ok(root) = canonical_root(root).await else {
         return 0;
     };
-    let Ok(mut reader) = tokio::fs::read_dir(root.join(SPOOL_DIR)).await else {
+    let Ok(spool) = jailed_ancestor(&root, Path::new(SPOOL_DIR)).await else {
+        return 0;
+    };
+    if spool != root.join(SPOOL_DIR) {
+        return 0;
+    }
+    let Ok(mut reader) = tokio::fs::read_dir(spool).await else {
         return 0;
     };
     let now = std::time::SystemTime::now();
@@ -377,14 +383,10 @@ async fn spool_file(
     root: &str,
     blob: BackendStream<Result<Bytes, StreamError>>,
 ) -> Result<Spooled, String> {
-    let parent = canonical_root(root)
+    let relative = format!("{SPOOL_DIR}/{}", Ulid::generate());
+    let (_, path) = jailed_target(root, &relative)
         .await
-        .map_err(|error| error.to_string())?
-        .join(SPOOL_DIR);
-    tokio::fs::create_dir_all(&parent)
-        .await
-        .map_err(|error| error.to_string())?;
-    let path = parent.join(Ulid::generate().to_string());
+        .map_err(|event| format!("spool path refused: {event:?}"))?;
     match write_temp(&path, blob).await {
         Ok(spooled) => Ok(spooled),
         Err(error) => {
@@ -922,6 +924,27 @@ mod tests {
         assert_eq!(sweep_spool(&path).await, 1);
         assert!(spool.join("in-flight").exists());
         assert!(!spool.join("leftover").exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_linked_spool() {
+        // Reserved bookkeeping must never follow an owner-created symlink.
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        tokio::fs::create_dir(root.path().join(".aruna"))
+            .await
+            .unwrap();
+        age_spool(&outside.path().join("stale")).await;
+        std::os::unix::fs::symlink(outside.path(), root.path().join(SPOOL_DIR)).unwrap();
+
+        assert_eq!(sweep_spool(&path).await, 0);
+        assert!(outside.path().join("stale").exists());
+        assert!(matches!(
+            write_guarded(&path, "note.txt", &WriteGuard::MustNotExist, body(b"new")).await,
+            LocalFileEvent::Error { .. }
+        ));
+        assert!(!outside.path().join("note.txt").exists());
     }
 
     // The trash and the write spool are this node's bookkeeping and live in the
