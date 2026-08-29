@@ -22,6 +22,21 @@ session record retains `revoked: true` for listing, while the replicated set is 
 stops the token on every realm node. `GET /api/v1/users/token` keeps its `{ "token": ... }` response
 and records the issued bearer as a `portal` session.
 
+## Portal provider boundary
+
+The portal has three provider paths:
+
+- Claude BYOK calls Claude directly from the browser. The user-supplied key is kept in
+  `sessionStorage` and never sent through an Aruna provider route.
+- OpenAI-compatible BYOK calls the configured endpoint directly from the browser. The official
+  OpenAI preset uses Responses; local and custom roots may select Responses or Chat Completions.
+- Codex device login remains node-managed, sealed, and proxied because the production Codex
+  endpoint blocks browser origins.
+
+Direct BYOK keys never pass through provider routes or Aruna storage. Direct local HTTP endpoints
+require loopback CSP/CORS admission (`localhost`, `127.0.0.1`, or `::1`); arbitrary LAN HTTP is not
+admitted. The node provider API documented below remains a separate contract.
+
 ## Assistant providers
 
 Provider routes require an unrestricted realm bearer and are self-scoped under
