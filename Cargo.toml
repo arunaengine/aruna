@@ -141,6 +141,7 @@ rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = [
     "json",
     "rustls",
+    "stream",
 ] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 rustls = { version = "0.23.42", features = ["ring"] }
@@ -183,6 +184,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 ulid = { version = "3.0.0", features = ["serde"] }
 unicode-normalization = "0.1.25"
 url = "2.5.8"
+uuid = { version = "1.24.1", features = ["v4"] }
 utoipa = { version = "5.5.0", features = [
     "chrono",
     "axum_extras",

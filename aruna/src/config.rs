@@ -109,6 +109,7 @@ pub struct Config {
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub realm_description: String,
     pub portal: PortalConfig,
+    pub assistant_proxy: bool,
     pub startup_mode: StartupMode,
     pub node_state: PersistedNodeState,
     pub node_labels: BTreeMap<String, String>,
@@ -410,6 +411,7 @@ pub struct Settings {
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub realm_description: String,
     pub portal: PortalConfig,
+    pub assistant_proxy: bool,
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
@@ -566,6 +568,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .filter(|value| !value.trim().is_empty());
     let oidc_providers = load_oidc_providers_from_env()?;
     let portal = portal_config_env()?;
+    let assistant_proxy = assistant_proxy_env()?;
     // The SPA is served from another origin than the API, so it cannot reach a
     // relative API path and needs the advertised one.
     if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
@@ -614,6 +617,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         oidc_providers,
         realm_description,
         portal,
+        assistant_proxy,
         node_labels,
         node_location,
         node_weight,
@@ -665,6 +669,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         oidc_providers,
         realm_description,
         portal,
+        assistant_proxy,
         node_labels,
         node_location,
         node_weight,
@@ -810,6 +815,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
             oidc_providers,
             realm_description,
             portal,
+            assistant_proxy,
             startup_mode,
             node_state,
             node_labels,
@@ -1093,6 +1099,21 @@ fn desktop_cors_env() -> bool {
             .as_str(),
         "off" | "false" | "0" | "no"
     )
+}
+
+fn assistant_proxy_env() -> Result<bool, SetupError> {
+    let Some(value) = optional_nonempty_env("ASSISTANT_PROXY")? else {
+        return Ok(true);
+    };
+    match normalize_env_value(&value).as_str() {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(invalid_config_value(
+            "ASSISTANT_PROXY",
+            value,
+            "expected enabled or disabled",
+        )),
+    }
 }
 
 /// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
@@ -1965,10 +1986,10 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        S3ServerTimeouts, SetupError, fjall_persist_policy_env, load, load_oidc_providers_from_env,
-        normalize_root, outermost_roots, parse_node_labels_env, persist_node_state,
-        portal_config_env, read_settings, rocrate_limits_env, validate_public_url,
-        validate_s3_profile, validate_wipe_roots,
+        S3ServerTimeouts, SetupError, assistant_proxy_env, fjall_persist_policy_env, load,
+        load_oidc_providers_from_env, normalize_root, outermost_roots, parse_node_labels_env,
+        persist_node_state, portal_config_env, read_settings, rocrate_limits_env,
+        validate_public_url, validate_s3_profile, validate_wipe_roots,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
@@ -2373,6 +2394,33 @@ mod tests {
                 ..
             }
         ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn assistant_proxy_defaults() {
+        let _guard = env_lock().lock().await;
+        let key = "ASSISTANT_PROXY";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::remove_var(key) };
+
+        assert!(assistant_proxy_env().unwrap());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn assistant_proxy_modes() {
+        let _guard = env_lock().lock().await;
+        let key = "ASSISTANT_PROXY";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "disabled") };
+        assert!(!assistant_proxy_env().unwrap());
+        unsafe { std::env::set_var(key, "enabled") };
+        assert!(assistant_proxy_env().unwrap());
+        unsafe { std::env::set_var(key, "sometimes") };
+        assert!(assistant_proxy_env().is_err());
 
         restore_env(previous);
     }

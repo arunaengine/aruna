@@ -674,6 +674,7 @@ async fn bind_servers(
     .await
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
+    .with_assistant_proxy(config.assistant_proxy)
     .with_s3_mounts(s3_mounts_available)
     .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(

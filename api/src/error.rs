@@ -24,6 +24,8 @@ pub enum ServerError {
     Unimplemented,
     #[error("Not found")]
     NotFound,
+    #[error("Feature disabled")]
+    FeatureDisabled(&'static str),
     #[error("Unauthorized")]
     Unauthorized,
     #[error("Forbidden")]
@@ -369,7 +371,7 @@ impl ServerError {
     pub(crate) fn status_code(&self) -> StatusCode {
         match self {
             ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-            ServerError::NotFound => StatusCode::NOT_FOUND,
+            ServerError::NotFound | ServerError::FeatureDisabled(_) => StatusCode::NOT_FOUND,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -403,6 +405,7 @@ impl ServerError {
         match self {
             ServerError::Unimplemented => "Not implemented".to_string(),
             ServerError::NotFound => "Not found".to_string(),
+            ServerError::FeatureDisabled(code) => (*code).to_string(),
             ServerError::Unauthorized => "Not authorized".to_string(),
             ServerError::Forbidden => "Forbidden".to_string(),
             ServerError::InternalError(_) => "Internal error".to_string(),

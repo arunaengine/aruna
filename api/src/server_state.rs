@@ -43,6 +43,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -93,6 +94,10 @@ pub struct ServerState {
     device_wipe: Option<Arc<DeviceWipe>>,
     // Management api urls the management-route relay re-issues against.
     management_urls: Arc<RwLock<ManagementUrlCache>>,
+    assistant_proxy: bool,
+    assistant_client: Option<reqwest::Client>,
+    chatgpt_issuer: String,
+    chatgpt_base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -203,6 +208,14 @@ impl ServerState {
             shutdown_token: CancellationToken::new(),
             device_wipe: None,
             management_urls: Arc::new(RwLock::new(ManagementUrlCache::default())),
+            assistant_proxy: true,
+            assistant_client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .ok(),
+            chatgpt_issuer: "https://auth.openai.com".to_string(),
+            chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         };
         state.persist_trusted_realms().await;
         state
@@ -321,6 +334,34 @@ impl ServerState {
         &self.credential_seal_key
     }
 
+    pub fn with_assistant_proxy(mut self, enabled: bool) -> Self {
+        self.assistant_proxy = enabled;
+        self
+    }
+
+    pub fn assistant_proxy(&self) -> bool {
+        self.assistant_proxy
+    }
+
+    pub fn assistant_client(&self) -> Option<&reqwest::Client> {
+        self.assistant_client.as_ref()
+    }
+
+    pub fn chatgpt_issuer(&self) -> &str {
+        &self.chatgpt_issuer
+    }
+
+    pub fn chatgpt_base_url(&self) -> &str {
+        &self.chatgpt_base_url
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_chatgpt_urls(mut self, issuer: String, base_url: String) -> Self {
+        self.chatgpt_issuer = issuer;
+        self.chatgpt_base_url = base_url;
+        self
+    }
+
     pub fn node_capabilities(&self) -> &NodeCapabilities {
         &self.node_capabilities
     }
@@ -412,6 +453,10 @@ impl ServerState {
 
     pub fn is_management_node(&self) -> bool {
         matches!(self.node_capabilities, NodeCapabilities::Management { .. })
+    }
+
+    pub fn is_user_node(&self) -> bool {
+        matches!(self.node_capabilities, NodeCapabilities::User { .. })
     }
 
     pub(crate) fn management_url_cache(&self) -> &Arc<RwLock<ManagementUrlCache>> {
