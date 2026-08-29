@@ -18,8 +18,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataCreateEventRecord, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataMaterializationState, MetadataProfileValidationStatus,
-    MetadataQueryResults, MetadataRawRevision, raw_context_digest,
+    MetadataEvent, MetadataMaterializationState, MetadataMergedRevision,
+    MetadataProfileValidationStatus, MetadataQueryResults, MetadataRawRevision, raw_context_digest,
 };
 use aruna_core::storage_entries::{
     admin_document_reducer_state_key, metadata_create_acceptance_key,
@@ -394,22 +394,33 @@ async fn device_export(
             jsonld: replica.displayed_jsonld,
             record,
         }),
-        MetadataRoCrateExportView::Raw => Ok(ExportMetadataRoCrateResult::Raw {
-            raw: MetadataRawView {
-                revision: MetadataRawRevision {
-                    context_digest: raw_context_digest(&replica.displayed_jsonld)
-                        .unwrap_or_default(),
-                    jsonld: replica.displayed_jsonld,
-                    winning_event_id: record.last_event_id,
-                    dataset_digest: replica.dataset_digest,
-                    merged: None,
+        MetadataRoCrateExportView::Raw => {
+            let merged = if replica.findings > 0 {
+                Some(
+                    handle
+                        .export_rocrate_jsonld(record.graph_iri.clone())
+                        .await
+                        .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+                )
+            } else {
+                None
+            };
+            Ok(ExportMetadataRoCrateResult::Raw {
+                raw: MetadataRawView {
+                    revision: device_raw_revision(
+                        &replica.displayed_jsonld,
+                        replica.dataset_digest,
+                        replica.findings,
+                        record.last_event_id,
+                        merged,
+                    ),
+                    projection_state: MetadataMaterializationState::Materialized,
+                    projected_event_id: Some(record.last_event_id),
                 },
-                projection_state: MetadataMaterializationState::Materialized,
-                projected_event_id: Some(record.last_event_id),
-            },
-            dataset_digest: replica.dataset_digest,
-            record,
-        }),
+                dataset_digest: replica.dataset_digest,
+                record,
+            })
+        }
         MetadataRoCrateExportView::Summary => Ok(ExportMetadataRoCrateResult::Summary {
             jsonld: handle
                 .export_rocrate_summary_jsonld(record.graph_iri.clone())
@@ -429,6 +440,22 @@ async fn device_export(
                 .map_err(|_| MetadataApiError::ServiceUnavailable)?,
             record,
         }),
+    }
+}
+
+fn device_raw_revision(
+    displayed_jsonld: &str,
+    dataset_digest: Option<[u8; 32]>,
+    findings: u32,
+    winning_event_id: Ulid,
+    merged_jsonld: Option<String>,
+) -> MetadataRawRevision {
+    MetadataRawRevision {
+        context_digest: raw_context_digest(displayed_jsonld).unwrap_or_default(),
+        jsonld: displayed_jsonld.to_string(),
+        winning_event_id,
+        dataset_digest,
+        merged: merged_jsonld.map(|jsonld| MetadataMergedRevision { jsonld, findings }),
     }
 }
 
@@ -3699,6 +3726,7 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::replica::ReplicaOrigin;
     use aruna_core::metadata::{
         MetadataProfileValidationCompleteness, MetadataProfileValidationState,
     };
@@ -3725,6 +3753,34 @@ mod tests {
             stale_reason: None,
             dataset_digest: None,
         }
+    }
+
+    #[test]
+    fn raw_includes_candidate() {
+        let document_id = Ulid::generate();
+        let mut replica = ReplicaRecord::new(
+            document_id,
+            Ulid::generate(),
+            "notes".to_string(),
+            ReplicaOrigin::Realm,
+        );
+        replica.displayed_jsonld = "displayed".to_string();
+        replica.dataset_digest = Some([3u8; 32]);
+        replica.findings = 2;
+        let revision = device_raw_revision(
+            &replica.displayed_jsonld,
+            replica.dataset_digest,
+            replica.findings,
+            Ulid::from_bytes([4u8; 16]),
+            Some("candidate".to_string()),
+        );
+
+        assert_eq!(revision.jsonld, "displayed");
+        assert_eq!(revision.dataset_digest, Some([3u8; 32]));
+        assert!(matches!(
+            revision.merged,
+            Some(MetadataMergedRevision { jsonld, findings: 2 }) if jsonld == "candidate"
+        ));
     }
 
     #[test]
