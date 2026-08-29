@@ -98,6 +98,7 @@ async fn policy_fixture(expression: Option<&str>) -> PolicyFixture {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         },
         node_id,
         group_id,
@@ -123,6 +124,7 @@ fn pull_request(deleted: bool) -> PullRequest {
             user_id: UserId::local(Ulid::from_bytes([5; 16]), RealmId::from_bytes([4u8; 32])),
             realm_id: RealmId::from_bytes([4u8; 32]),
             path_restrictions: None,
+            session: None,
         }),
         source: VersionedObjectArn::new(
             RealmId::from_bytes([4u8; 32]),

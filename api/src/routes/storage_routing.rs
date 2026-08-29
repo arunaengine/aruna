@@ -864,11 +864,13 @@ pub(crate) mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             other_auth: AuthContext {
                 user_id: other_user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             group_id,
             bucket,

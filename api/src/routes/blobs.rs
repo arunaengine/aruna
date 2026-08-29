@@ -1146,6 +1146,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

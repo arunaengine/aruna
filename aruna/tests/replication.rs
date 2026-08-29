@@ -1663,6 +1663,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
                     pattern: format!("{group_root}/{bucket}/scoped/**"),
                     permission: Permission::WRITE,
                 }]),
+                session: None,
             },
             bucket.to_string(),
             scoped_key.to_string(),

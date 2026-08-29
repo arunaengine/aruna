@@ -269,6 +269,7 @@ async fn fetch_heads(
         user_id: folder.created_by,
         realm_id,
         path_restrictions: None,
+        session: None,
     };
     let mut view = RemoteView {
         resume_after: folder

@@ -825,6 +825,7 @@ impl DeleteObjectOperation {
                 user_id: self.input.deleted_by,
                 realm_id: self.input.realm_id,
                 path_restrictions: self.restrictions.clone(),
+                session: None,
             },
             self.input.bucket.clone(),
             self.input.key.clone(),

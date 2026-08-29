@@ -195,6 +195,7 @@ async fn evaluate_watch_scope(
             user_id: owner,
             realm_id,
             path_restrictions: None,
+            session: None,
         },
         permission_path,
         operation,
@@ -254,6 +255,7 @@ pub async fn authorize_forwarded_watch(
         user_id: owner,
         realm_id,
         path_restrictions: None,
+        session: None,
     };
     evaluate_permission_path(
         context,
@@ -320,7 +322,7 @@ async fn evaluate_permission_path(
         &policy_request_with(
             &permission_path,
             &Permission::READ,
-            Some(&auth_context.user_id),
+            Some(&auth_context),
             PolicyRequestExtras::operation(operation),
         ),
     )
@@ -359,6 +361,7 @@ pub async fn evaluate_watch_event_authorization(
             user_id: owner,
             realm_id: event.realm_id,
             path_restrictions: None,
+            session: None,
         },
         permission_path,
         WATCH_DELIVERY_OPERATION,
@@ -440,6 +443,7 @@ pub async fn evaluate_watch_notification_authorization(
             user_id: recipient,
             realm_id: recipient.realm_id,
             path_restrictions: None,
+            session: None,
         },
         permission_path,
         WATCH_LIST_OPERATION,
@@ -1250,6 +1254,7 @@ mod tests {
             user_id: owner,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         assert!(matches!(

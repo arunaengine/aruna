@@ -22,6 +22,7 @@ pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentIdSpec) -> JobR
         user_id: spec.minted_by,
         realm_id,
         path_restrictions: None,
+        session: None,
     });
     match mint_pid_routed(
         &ctx.driver,

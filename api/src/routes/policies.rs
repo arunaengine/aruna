@@ -4,7 +4,7 @@ use crate::routes::groups::refuse_group_edit;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyDecision, PolicyFunctions, PolicyKind, PolicyRequest,
+    CompiledPolicySet, PolicyDecision, PolicyFunctions, PolicyKind, PolicyRequest, PolicySession,
     PolicyTraceEntry, RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
 use aruna_core::structs::{Actor, AuthContext, Permission};
@@ -63,7 +63,7 @@ pub struct PolicyBody {
     #[serde(default)]
     pub when: Option<String>,
     /// CEL expression over `path`, `permission`, `user`, `anonymous`,
-    /// `operation`, `params`, `headers`, `body`.
+    /// `operation`, `params`, `headers`, `body`, `request.session`.
     pub expression: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -146,6 +146,9 @@ pub struct DryRunRequest {
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub body: Option<serde_json::Value>,
+    /// Hypothetical session exposed as `request.session`.
+    #[serde(default)]
+    pub session: Option<PolicySessionInput>,
     /// Ad hoc policies to try; when absent the requested scope is evaluated.
     #[serde(default)]
     pub candidate_policies: Option<Vec<PolicyBody>>,
@@ -154,6 +157,14 @@ pub struct DryRunRequest {
     pub scope: Option<String>,
     #[serde(default)]
     pub group_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PolicySessionInput {
+    pub sid: String,
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -890,6 +901,8 @@ scopes each additionally checked as if they were read directly.
   and the first match ends evaluation.
 - An expression that errors or does not return a boolean also denies, so a broken policy fails
   closed.
+- Session-aware policies use `request.session.sid`, `request.session.kind`, and
+  `request.session.label`; absent sessions expose empty values.
 - The response reports whether the request would be denied, which scope and policy decided it, and a
   trace of every policy considered up to that point."#,
     request_body(
@@ -967,6 +980,11 @@ pub async fn dry_run_policy(
         params: request.params.clone().unwrap_or_default(),
         headers: request.headers.clone().unwrap_or_default(),
         body: request.body.clone(),
+        session: request.session.as_ref().map(|session| PolicySession {
+            sid: session.sid.clone(),
+            kind: session.kind.clone(),
+            label: session.label.clone(),
+        }),
     };
 
     let scopes = dry_run_scopes(&state, &auth, &request).await?;
@@ -1138,6 +1156,7 @@ mod tests {
                 user_id: admin_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             actor,
             realm_id,
@@ -1230,6 +1249,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([77; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let result = set_group_policies(
             State(fx.state.clone()),
@@ -1273,6 +1293,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([78; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let result = validate_policy(
             State(fx.state.clone()),
@@ -1302,6 +1323,7 @@ mod tests {
                 params: None,
                 headers: None,
                 body: None,
+                session: None,
                 candidate_policies: Some(vec![PolicyBody {
                     policy_id: None,
                     name: "dry-run".to_string(),
@@ -1338,6 +1360,7 @@ mod tests {
                 params: None,
                 headers: None,
                 body: None,
+                session: None,
                 candidate_policies: Some(vec![PolicyBody {
                     policy_id: None,
                     name: "huge".to_string(),
@@ -1420,6 +1443,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([77; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let result = set_realm_policies(
             State(fx.state.clone()),

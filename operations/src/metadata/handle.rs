@@ -6973,7 +6973,7 @@ async fn resolve_graph_visibility_scope(
     )
     .await
     .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let policy_user = auth_context.as_ref().map(|auth| auth.user_id);
+    let policy_auth = auth_context.as_ref();
     let records = Arc::new(
         records
             .iter()
@@ -6984,7 +6984,7 @@ async fn resolve_graph_visibility_scope(
                         evaluator
                             .evaluate(&crate::metadata::api::metadata_read_request(
                                 &record.permission_path,
-                                policy_user.as_ref(),
+                                policy_auth,
                             ))
                             .is_ok()
                     })
@@ -8116,6 +8116,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: Some(restrictions),
+            session: None,
         };
         let (_dir, storage) = auth_storage();
         persist_realm_config(&storage, realm_id, &[peer]).await;
@@ -8528,6 +8529,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

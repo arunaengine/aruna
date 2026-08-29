@@ -513,6 +513,7 @@ impl AuthProvider {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned) else {
             return Ok((self.group_data_path(user_access.group_id), auth_context));

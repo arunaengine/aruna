@@ -343,6 +343,7 @@ async fn prepare_reference(
         user_id: relationship.created_by,
         realm_id: relationship.source.realm_id,
         path_restrictions: None,
+        session: None,
     };
     let path = blob_object_permission_path(
         relationship.source.realm_id,

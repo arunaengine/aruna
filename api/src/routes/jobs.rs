@@ -2250,6 +2250,7 @@ mod tests {
             user_id,
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         })
     }
 
@@ -2261,6 +2262,7 @@ mod tests {
                 pattern: "/realm/g/group/data/**".to_string(),
                 permission: Permission::READ,
             }]),
+            session: None,
         })
     }
 

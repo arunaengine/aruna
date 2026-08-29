@@ -1266,6 +1266,7 @@ mod tests {
                 user_id,
                 realm_id: realm,
                 path_restrictions: None,
+                session: None,
             },
             actor,
             realm_id: realm,
@@ -1477,6 +1478,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([77u8; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let (_, Json(resp)) = unified_search(
             State(fx.state.clone()),
@@ -1646,6 +1648,7 @@ mod tests {
             user_id: viewer,
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let section = run_groups(&fx.state, &viewer_auth, true, "alpha", 1, None)
             .await
@@ -1689,6 +1692,7 @@ mod tests {
             user_id: viewer,
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let section = run_groups(&fx.state, &viewer_auth, true, "alpha", 1, None)
             .await
@@ -1783,6 +1787,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id(9)),
             realm_id: realm_id(9),
             path_restrictions: None,
+            session: None,
         };
         assert_ne!(foreign.realm_id, fx.realm_id);
         let wrong_realm = unified_search(

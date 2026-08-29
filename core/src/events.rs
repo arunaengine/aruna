@@ -76,6 +76,9 @@ pub enum SubOperationEvent {
         result: Result<GroupRoutingInputs, String>,
     },
     NotificationsEmitted,
+    TokenRevoked {
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, PartialEq)]

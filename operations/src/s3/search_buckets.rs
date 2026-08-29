@@ -383,7 +383,7 @@ fn policy_allows(
     let request = policy_request_with(
         &path,
         &Permission::READ,
-        Some(&input.auth.user_id),
+        Some(&input.auth),
         PolicyRequestExtras::operation("s3.ListBuckets"),
     );
     evaluators
@@ -456,6 +456,7 @@ mod tests {
                 user_id: UserId::nil(realm_id),
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[10u8; 32]).public(),
@@ -676,6 +677,7 @@ mod tests {
                     user_id: outsider,
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 realm_id,
                 node_id,

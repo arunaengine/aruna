@@ -194,6 +194,8 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
             user_id: user.user_id,
             realm_id: config.realm_id,
             node_capabilities: config.node_capabilities,
+
+            session: None,
         })?,
         &driver_ctx,
     )
@@ -968,6 +970,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

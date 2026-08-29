@@ -234,6 +234,7 @@ async fn answers_by_alias() {
         user_id: user(),
         realm_id: REALM,
         path_restrictions: None,
+        session: None,
     };
 
     let status = family_status(&ctx, &auth, family.job_id)
@@ -247,6 +248,7 @@ async fn answers_by_alias() {
         user_id: aruna_core::types::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
         realm_id: REALM,
         path_restrictions: None,
+        session: None,
     };
     assert!(matches!(
         family_status(&ctx, &stranger, family.job_id).await,

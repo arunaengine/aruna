@@ -1,3 +1,4 @@
+mod assistant_provider;
 mod backends;
 mod binding_directory;
 mod blob;
@@ -38,7 +39,9 @@ mod sync_quarantine;
 mod sync_relationship;
 mod synced_folder;
 mod usage;
+mod user_session;
 
+pub use assistant_provider::*;
 pub use backends::*;
 pub use binding_directory::*;
 pub use blob::*;
@@ -77,3 +80,4 @@ pub use sync_quarantine::*;
 pub use sync_relationship::*;
 pub use synced_folder::*;
 pub use usage::*;
+pub use user_session::*;

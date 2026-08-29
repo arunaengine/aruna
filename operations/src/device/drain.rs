@@ -294,6 +294,7 @@ async fn publish_entry(
         user_id: entry.owner,
         realm_id,
         path_restrictions: None,
+        session: None,
     };
     if matches!(entry.kind, IntakeKind::Edit { .. }) {
         return publish_edit(context, realm_id, entry, claim, auth).await;

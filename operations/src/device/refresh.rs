@@ -149,6 +149,7 @@ async fn ask_holders(
         user_id: plan.owner,
         realm_id: plan.realm_id,
         path_restrictions: None,
+        session: None,
     };
     for holder in holders_for(plan, document_id) {
         let message = MetadataTransportMessage::FetchGraphState {

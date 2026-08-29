@@ -23,6 +23,7 @@ pub const KNOWN_POLICY_VARIABLES: &[&str] = &[
     "params",
     "headers",
     "body",
+    "request",
 ];
 
 /// Built-in CEL functions and macros always available to a policy expression.
@@ -101,6 +102,15 @@ pub struct PolicyRequest {
     pub headers: BTreeMap<String, String>,
     /// Already-parsed request body; `None` becomes the CEL `null`.
     pub body: Option<serde_json::Value>,
+    /// Session identity, absent for anonymous and unbound legacy requests.
+    pub session: Option<PolicySession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySession {
+    pub sid: String,
+    pub kind: String,
+    pub label: String,
 }
 
 impl PolicyRequest {
@@ -115,6 +125,7 @@ impl PolicyRequest {
             params: BTreeMap::new(),
             headers: BTreeMap::new(),
             body: None,
+            session: None,
         }
     }
 }
@@ -335,6 +346,22 @@ impl CompiledPolicySet {
         context.add_variable_from_value("user", request.user.clone());
         context.add_variable_from_value("anonymous", request.user.is_empty());
         context.add_variable_from_value("operation", request.operation.clone());
+        let session = request.session.clone().unwrap_or(PolicySession {
+            sid: String::new(),
+            kind: String::new(),
+            label: String::new(),
+        });
+        let request_value = serde_json::json!({
+            "session": {
+                "sid": session.sid,
+                "kind": session.kind,
+                "label": session.label,
+            }
+        });
+        context.add_variable_from_value(
+            "request",
+            cel_interpreter::to_value(&request_value).unwrap_or(Value::Null),
+        );
         if self.needs_params {
             let _ = context.add_variable("params", &request.params);
             let _ = context.add_variable("headers", &request.headers);
@@ -648,6 +675,19 @@ mod tests {
             evaluate_policies(&policies, &request("/realm/g/abc/data/x", "read", "u")),
             PolicyDecision::Allowed
         );
+    }
+
+    #[test]
+    fn denies_assistant_session() {
+        let policies = [policy("request.session.kind == 'assistant'")];
+        let mut request = request("/realm/data", "read", "u");
+        request.session = Some(PolicySession {
+            sid: Ulid::from_bytes([8; 16]).to_string(),
+            kind: "assistant".to_string(),
+            label: String::new(),
+        });
+
+        assert!(evaluate_policies(&policies, &request).is_denied());
     }
 
     #[test]

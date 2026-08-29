@@ -168,6 +168,7 @@ fn auth(context: &TestContext) -> AuthContext {
         user_id: context.user_id,
         realm_id: context.realm_id,
         path_restrictions: None,
+        session: None,
     }
 }
 

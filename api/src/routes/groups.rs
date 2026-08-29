@@ -1929,6 +1929,7 @@ mod tests {
             user_id,
             realm_id: user_id.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -1996,6 +1997,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

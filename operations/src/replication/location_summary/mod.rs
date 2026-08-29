@@ -54,6 +54,7 @@ pub(super) mod fixtures {
             user_id: UserId::nil(realm_id()),
             realm_id: realm_id(),
             path_restrictions: None,
+            session: None,
         }
     }
 

@@ -148,6 +148,7 @@ impl AddUserToRealmRolesOperation {
             user_id: self.input.actor.user_id,
             realm_id: self.input.actor.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

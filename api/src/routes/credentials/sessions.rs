@@ -451,6 +451,7 @@ mod tests {
             user_id: member,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let stranger_auth = AuthContext {
             user_id: stranger,

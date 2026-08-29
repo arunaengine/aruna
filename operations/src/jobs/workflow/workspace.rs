@@ -73,6 +73,7 @@ pub async fn ensure_group_write(
                 user_id: record.created_by,
                 realm_id: record.created_by.realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: blob_group_permission_path(record.created_by.realm_id, spec.group_id, node_id),
             required_permission: Permission::WRITE,
@@ -125,6 +126,7 @@ pub async fn ensure_workspace_bucket(
                     user_id: record.created_by,
                     realm_id: record.created_by.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 path: blob_bucket_permission_path(
                     record.created_by.realm_id,
@@ -356,6 +358,7 @@ pub async fn prepare_mounts(
                     user_id: record.created_by,
                     realm_id: record.created_by.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 path: blob_object_permission_path(
                     record.created_by.realm_id,
@@ -717,6 +720,7 @@ async fn put_file_output(
                     user_id: record.created_by,
                     realm_id: record.created_by.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 path: blob_object_permission_path(
                     record.created_by.realm_id,
@@ -886,6 +890,7 @@ async fn replicate_output(
         user_id: record.created_by,
         realm_id: record.created_by.realm_id,
         path_restrictions: None,
+        session: None,
     };
     let source =
         SourceAuthorization::load(context, auth.clone(), spec.group_id, record.owner_node_id)
@@ -1113,6 +1118,7 @@ async fn device_source(
             user_id: record.created_by,
             realm_id,
             path_restrictions: None,
+            session: None,
         },
         realm_id,
         target: BaoReadTarget::ExactVersion(VersionedObjectArn {
@@ -1214,6 +1220,7 @@ async fn stage_one_input(
                     user_id: record.created_by,
                     realm_id: record.created_by.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 path: blob_object_permission_path(
                     record.created_by.realm_id,

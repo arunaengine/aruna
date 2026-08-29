@@ -556,6 +556,7 @@ mod tests {
                     user_id: base.created_by,
                     realm_id: RealmId([1u8; 32]),
                     path_restrictions: None,
+                    session: None,
                 },
                 source: ImportRoCrateSource::Upload {
                     upload_id: Ulid::from_bytes([3u8; 16]),

@@ -407,6 +407,7 @@ pub(crate) async fn fetch_remote(
             user_id: folder.created_by,
             realm_id,
             path_restrictions: None,
+            session: None,
         },
         realm_id,
         target: BaoReadTarget::ExactVersion(source),

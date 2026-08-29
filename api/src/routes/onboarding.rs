@@ -225,7 +225,7 @@ async fn enforce_enrollment_policies(
     let request = policy_request_with(
         &format!("/{realm_id}/onboarding/devices"),
         &Permission::WRITE,
-        Some(&auth.user_id),
+        Some(auth),
         PolicyRequestExtras::operation(ENROLL_DEVICE_OPERATION),
     );
     // Fail closed: a denial and unreadable policy state both refuse.
@@ -1297,6 +1297,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(
@@ -1408,6 +1409,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(
@@ -1448,6 +1450,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let deny = RequestPolicy {
             policy_id: Ulid::generate(),
@@ -1540,6 +1543,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(
@@ -1597,6 +1601,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(
@@ -1633,6 +1638,7 @@ mod tests {
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 path_restrictions: None,
+                session: None,
             })),
             Path(enrollment_id.clone()),
         )
@@ -1670,6 +1676,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             })),
             Path(Ulid::generate().to_string()),
         )
@@ -1688,6 +1695,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(
@@ -1781,6 +1789,7 @@ mod tests {
                 user_id,
                 realm_id: RealmId::from_bytes([31u8; 32]),
                 path_restrictions: None,
+                session: None,
             })),
             Json(request()),
         )
@@ -1803,6 +1812,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: Some(Vec::new()),
+                session: None,
             })),
             Json(CreateOnboardingSecretRequest {
                 seed_url: "http://127.0.0.1:3000".to_string(),
@@ -1892,6 +1902,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(
@@ -1928,6 +1939,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             })),
         )
         .await
@@ -1945,6 +1957,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let finalizing_id = Ulid::generate();
@@ -2019,6 +2032,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(
@@ -2107,6 +2121,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(created)) = create_onboarding_secret(

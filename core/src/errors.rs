@@ -219,6 +219,8 @@ pub enum ConversionError {
     InvalidLength(String),
     #[error("Invalid UserId")]
     InvalidUserId,
+    #[error("Invalid session claim")]
+    InvalidSessionClaim,
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
     #[error(transparent)]

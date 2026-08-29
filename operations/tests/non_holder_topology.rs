@@ -285,6 +285,7 @@ async fn cap_stays_local() -> TestResult<()> {
             user_id: realm.user_id,
             realm_id: realm.realm_id,
             path_restrictions: None,
+            session: None,
         },
         source: ImportRoCrateSource::Upload {
             upload_id: Ulid::from_bytes([seed; 16]),
@@ -997,6 +998,7 @@ async fn document_export_routes() -> TestResult<()> {
         user_id: realm.user_id,
         realm_id: realm.realm_id,
         path_restrictions: None,
+        session: None,
     };
     let internal = export_routed(
         &realm,

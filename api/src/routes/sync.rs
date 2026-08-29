@@ -1469,6 +1469,7 @@ mod tests {
             user_id: relationship.created_by,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         (storage_dir, state, auth, relationship)
     }

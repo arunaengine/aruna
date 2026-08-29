@@ -320,6 +320,7 @@ impl GetObjectOperation {
             user_id: self.input.user_identity,
             realm_id: self.input.user_identity.realm_id,
             path_restrictions: self.restrictions.clone(),
+            session: None,
         }
     }
 
@@ -1347,6 +1348,7 @@ async fn routed_blob(
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             realm_id,
             target: BaoReadTarget::Blake3(blake3),

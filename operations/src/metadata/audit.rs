@@ -1778,6 +1778,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             format!("/{realm_id}/g/{group_id}/admin"),
         )

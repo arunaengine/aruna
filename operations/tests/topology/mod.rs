@@ -233,6 +233,7 @@ impl Topology {
             user_id: self.user_id,
             realm_id: self.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -254,6 +255,7 @@ impl Topology {
             user_id,
             realm_id: self.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -321,6 +323,8 @@ impl Topology {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

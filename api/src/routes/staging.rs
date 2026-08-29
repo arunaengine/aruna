@@ -2334,6 +2334,7 @@ mod tests {
                     pattern: bucket_path,
                     permission: Permission::READ,
                 }]),
+                session: None,
             },
             auth_with_source_read: AuthContext {
                 user_id: user_with_source_read,
@@ -2348,6 +2349,7 @@ mod tests {
                         permission: Permission::READ,
                     },
                 ]),
+                session: None,
             },
             auth_without_source_read: AuthContext {
                 user_id: user_without_source_read,
@@ -2356,6 +2358,7 @@ mod tests {
                     pattern: target_path,
                     permission: Permission::WRITE,
                 }]),
+                session: None,
             },
         }
     }

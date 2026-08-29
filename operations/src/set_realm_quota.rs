@@ -530,6 +530,7 @@ mod tests {
             user_id: actor.user_id,
             realm_id: actor.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

@@ -2564,6 +2564,7 @@ mod tests {
                     user_id: owner,
                     realm_id: RealmId([1u8; 32]),
                     path_restrictions: None,
+                    session: None,
                 },
                 source: ImportRoCrateSource::Upload {
                     upload_id: Ulid::from_bytes([3u8; 16]),

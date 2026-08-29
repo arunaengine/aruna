@@ -617,6 +617,7 @@ async fn authorize_submitter(
         user_id: spec.created_by,
         realm_id: spec.realm_id,
         path_restrictions: None,
+        session: None,
     };
     authorize(
         context,

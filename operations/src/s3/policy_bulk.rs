@@ -1168,6 +1168,7 @@ mod tests {
             user_id: fixture.user_id,
             realm_id: fixture.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

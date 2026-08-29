@@ -1975,6 +1975,7 @@ async fn authenticate_tes(
             user_id: access.user_identity,
             realm_id: access.user_identity.realm_id,
             path_restrictions: access.path_restrictions,
+            session: None,
         }),
     )
     .map_err(TesError::from_server)?;
@@ -2224,6 +2225,7 @@ mod tests {
             user_id,
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         })
     }
 
@@ -3332,6 +3334,7 @@ mod tests {
             user_id,
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         })
     }
 

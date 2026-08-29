@@ -1153,6 +1153,7 @@ async fn family_cancel(
         user_id,
         realm_id: user_id.realm_id,
         path_restrictions: None,
+        session: None,
     };
     let published = cancel_family(context, &auth, job_id, auth_token).await?;
     Some(match published {
@@ -1570,6 +1571,7 @@ mod tests {
                     user_id: owner,
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 source: ImportRoCrateSource::Upload {
                     upload_id: Ulid::from_bytes([4u8; 16]),

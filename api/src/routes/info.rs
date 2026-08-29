@@ -2532,6 +2532,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -2658,6 +2659,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(response)) = get_info(State(state.clone()), Extension(Some(member))).await;
@@ -2801,6 +2803,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), state.get_realm_id()),
             realm_id: state.get_realm_id(),
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -3081,6 +3084,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -3174,6 +3178,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), local_state.get_realm_id()),
             realm_id: local_state.get_realm_id(),
             path_restrictions: None,
+            session: None,
         };
         assert!(matches!(
             get_realm_placement(State(local_state), Extension(Some(local_auth))).await,
@@ -3192,6 +3197,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         assert!(matches!(
             get_realm_placement(State(state), Extension(Some(stranger))).await,
@@ -3604,6 +3610,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let body = RealmQuotaConfig::from(QuotaConfig::default());
 
@@ -3621,6 +3628,7 @@ mod tests {
             user_id: admin,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.default_group_quota_bytes = Some(4096);
@@ -3954,6 +3962,7 @@ mod tests {
             user_id: admin,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.warn_threshold_percent = 0;
@@ -3989,6 +3998,7 @@ mod tests {
             user_id: admin,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.max_devices_per_user = Some(0);
@@ -4011,6 +4021,7 @@ mod tests {
             user_id: admin,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         for body in [
             RealmQuotaConfig {

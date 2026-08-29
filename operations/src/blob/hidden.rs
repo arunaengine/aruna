@@ -910,6 +910,7 @@ mod tests {
                     user_id: UserId::nil(realm),
                     realm_id: realm,
                     path_restrictions: None,
+                    session: None,
                 },
                 document_id: Ulid::from_bytes([2u8; 16]),
                 limits: RoCrateLimits::default(),

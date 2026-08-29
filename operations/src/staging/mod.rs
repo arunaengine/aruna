@@ -82,6 +82,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::NotificationsEmitted => {
                 "Event::SubOperation(SubOperationEvent::NotificationsEmitted)".to_string()
             }
+            SubOperationEvent::TokenRevoked { .. } => {
+                "Event::SubOperation(SubOperationEvent::TokenRevoked)".to_string()
+            }
         },
         Event::Task(_) => "Event::Task".to_string(),
         Event::Search() => "Event::Search".to_string(),

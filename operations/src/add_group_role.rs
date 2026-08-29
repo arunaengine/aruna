@@ -1141,6 +1141,7 @@ pub mod test {
             user_id: actor.user_id,
             realm_id: actor.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -1193,6 +1194,7 @@ pub mod test {
                     user_id,
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 actor: actor.clone(),
                 realm_id,
@@ -1233,6 +1235,7 @@ pub mod test {
                     user_id,
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 actor: actor.clone(),
                 realm_id,
@@ -1272,6 +1275,7 @@ pub mod test {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             actor,
             realm_id,
@@ -1319,6 +1323,7 @@ pub mod test {
                     user_id,
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 actor: actor.clone(),
                 realm_id,
@@ -1361,6 +1366,7 @@ pub mod test {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let actor = Actor {
             node_id,

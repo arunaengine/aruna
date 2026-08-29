@@ -905,17 +905,14 @@ pub async fn list_visible_metadata_documents(
     )
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let policy_user = request.auth.as_ref().map(|auth| auth.user_id);
+    let policy_auth = request.auth.as_ref();
     let record_visible = |record: &MetadataRegistryRecord| {
         permissions.record_visible(record)
             && evaluators
                 .get(&(record.realm_id, record.group_id))
                 .is_some_and(|evaluator| {
                     evaluator
-                        .evaluate(&metadata_read_request(
-                            &record.permission_path,
-                            policy_user.as_ref(),
-                        ))
+                        .evaluate(&metadata_read_request(&record.permission_path, policy_auth))
                         .is_ok()
                 })
     };
@@ -1631,7 +1628,7 @@ pub(crate) async fn local_path_candidates(
     )
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let policy_user = auth.map(|auth| auth.user_id);
+    let policy_auth = auth;
     let mut candidates = records
         .into_iter()
         .map(|record| {
@@ -1647,10 +1644,7 @@ pub(crate) async fn local_path_candidates(
                     .get(&(record.realm_id, record.group_id))
                     .is_some_and(|evaluator| {
                         evaluator
-                            .evaluate(&metadata_read_request(
-                                &record.permission_path,
-                                policy_user.as_ref(),
-                            ))
+                            .evaluate(&metadata_read_request(&record.permission_path, policy_auth))
                             .is_ok()
                     });
             let record = visible.then_some(record);
@@ -3844,12 +3838,12 @@ async fn ensure_record_materialized_for_graph_read(
 /// shared by the single-record and bulk visibility seams.
 pub(crate) fn metadata_read_request(
     permission_path: &str,
-    user: Option<&aruna_core::UserId>,
+    auth: Option<&AuthContext>,
 ) -> aruna_core::request_policy::PolicyRequest {
     crate::request_policy::policy_request_with(
         permission_path,
         &Permission::READ,
-        user,
+        auth,
         crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
     )
 }
@@ -3867,7 +3861,7 @@ pub(crate) async fn ensure_record_readable(
         let request = crate::request_policy::policy_request_with(
             &record.permission_path,
             &Permission::READ,
-            auth.map(|auth| &auth.user_id),
+            auth,
             crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
         );
         let result = match txn_id {
@@ -3921,7 +3915,7 @@ pub(crate) async fn can_read_record(
             &crate::request_policy::policy_request_with(
                 &record.permission_path,
                 &Permission::READ,
-                auth.map(|auth| &auth.user_id),
+                auth,
                 crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
             ),
         )
@@ -3966,9 +3960,8 @@ async fn ensure_permission(
     if auth.realm_id != realm_id {
         return Err(MetadataApiError::Forbidden);
     }
-    let auth_user = auth.user_id;
     let config = CheckPermissionsConfig {
-        auth_context: auth,
+        auth_context: auth.clone(),
         path: path.clone(),
         required_permission: required_permission.clone(),
     };
@@ -3993,7 +3986,7 @@ async fn ensure_permission(
     let request = crate::request_policy::policy_request_with(
         &path,
         &required_permission,
-        Some(&auth_user),
+        Some(&auth),
         crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
     );
     match txn_id {
@@ -6897,6 +6890,7 @@ mod tests {
             user_id,
             realm_id: TEST_REALM_ID,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -7211,6 +7205,7 @@ mod tests {
             user_id: foreign_user,
             realm_id: foreign_realm,
             path_restrictions: None,
+            session: None,
         };
 
         let listed = list_visible_metadata_documents(

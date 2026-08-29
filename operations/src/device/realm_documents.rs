@@ -216,6 +216,7 @@ async fn build_plan(
             user_id: owner,
             realm_id,
             path_restrictions: None,
+            session: None,
         },
         peers,
         marker: installed_marker(context, realm_id).await,
@@ -879,6 +880,7 @@ mod tests {
                 user_id: UserId::nil(realm()),
                 realm_id: realm(),
                 path_restrictions: None,
+                session: None,
             },
             peers: Vec::new(),
             marker: RealmMarker {
@@ -991,6 +993,7 @@ mod tests {
                 user_id: UserId::nil(realm()),
                 realm_id: realm(),
                 path_restrictions: None,
+                session: None,
             },
             peers: Vec::new(),
             marker: RealmMarker::default(),

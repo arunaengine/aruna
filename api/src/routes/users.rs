@@ -6,12 +6,11 @@ use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
-    Role, User,
+    Role, SessionKind, User,
 };
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
-use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::delete_onboarding_secret::{
     DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
 };
@@ -41,6 +40,7 @@ use aruna_operations::remove_device_node::{
 };
 use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_operations::session::{CreateSessionConfig, CreateSessionOperation};
 use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -301,24 +301,26 @@ fn map_inspect_onboarding_error(error: InspectOnboardingSecretError) -> ServerEr
 
 const USER_TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
-async fn issue_user_token(
+async fn issue_portal_session(
     state: &Arc<ServerState>,
     user_id: UserId,
-    expiry: Option<u64>,
+    expiry: u64,
 ) -> ServerResult<String> {
-    drive(
-        CreateTokenOperation::new(CreateTokenConfig {
+    let created = drive(
+        CreateSessionOperation::new(CreateSessionConfig {
             time: now_timestamp(),
             expiry,
             user_id,
             realm_id: state.get_realm_id(),
             node_capabilities: state.node_capabilities().clone(),
-        })
-        .map_err(|err| ServerError::InternalError(err.to_string()))?,
+            kind: SessionKind::Portal,
+            label: None,
+        }),
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    Ok(created.token.expose().to_string())
 }
 
 async fn ensure_canonical_user_token_subject(
@@ -450,6 +452,7 @@ async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
         user_id,
         realm_id: state.get_realm_id(),
         path_restrictions: None,
+        session: None,
     };
     if let Err(error) = state.claim_initial_realm_admin(&auth_context).await {
         error!(error = %error, "Failed to claim initial realm admin after user registration");
@@ -663,6 +666,7 @@ on behalf of somebody else.
 
 **Behavior**
 - The issued token is a realm bearer credential valid for 24 hours.
+- The issued token is recorded on this node as a listable `portal` session.
 - It is returned only in this response and is not retrievable afterwards, so a lost token has to
   be reissued here.
 
@@ -712,8 +716,10 @@ async fn get_token(
         }
     };
 
-    let expiry = Some(now_timestamp() + USER_TOKEN_EXPIRY_SECONDS);
-    let token = issue_user_token(&state, user_id, expiry).await?;
+    let expiry = now_timestamp()
+        .checked_add(USER_TOKEN_EXPIRY_SECONDS)
+        .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
+    let token = issue_portal_session(&state, user_id, expiry).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
 }
@@ -1943,6 +1949,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -2362,6 +2370,7 @@ mod tests {
             user_id: node.realm_admin_id,
             realm_id: node.realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let rename = |name: &str| super::UpdateUserRequest {
@@ -2458,6 +2467,7 @@ mod tests {
             user_id: node.realm_admin_id,
             realm_id: node.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let query = || {
             axum::extract::Query(super::ListUsersQuery {
@@ -2609,6 +2619,8 @@ mod tests {
                 realm_id: foreign_realm_id,
                 node_capabilities: NodeCapabilities::management_node(foreign_realm_signing_key)
                     .unwrap(),
+
+                session: None,
             })
             .unwrap(),
             node.context.as_ref(),
@@ -2819,6 +2831,7 @@ mod resolve_tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -3050,6 +3063,7 @@ mod device_tests {
             user_id,
             realm_id: user_id.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

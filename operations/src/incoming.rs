@@ -360,7 +360,7 @@ async fn bao_policy(
                 let request = policy_request_with(
                     &path,
                     &Permission::READ,
-                    Some(&request.auth_context.user_id),
+                    Some(&request.auth_context),
                     PolicyRequestExtras::operation("s3.GetObject"),
                 );
                 let evaluator = evaluators
@@ -1304,6 +1304,7 @@ mod tests {
                 pattern: "/source/**".to_string(),
                 permission: Permission::READ,
             }]),
+            session: None,
         };
         let mut manifest = VersionReplicationManifest {
             bucket: "bucket".to_string(),
@@ -1369,6 +1370,7 @@ mod tests {
             user_id: UserId::nil(foreign_realm),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         assert_eq!(
             manifest_policy(&context, realm_id, node_id, &manifest)

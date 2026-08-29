@@ -154,6 +154,8 @@ fn mint_token(signing_key: &SigningKey, realm_id: RealmId, user_id: UserId) -> (
         iat: now,
         exp: expires_at,
         jti: Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
         restrictions: None,
         issuer_pubkey: None,
         delegation_signature: None,

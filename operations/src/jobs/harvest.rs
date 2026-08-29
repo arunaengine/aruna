@@ -539,6 +539,7 @@ fn internal_token(created_by: aruna_core::types::UserId, realm_id: RealmId) -> M
         user_id: created_by,
         realm_id,
         path_restrictions: None,
+        session: None,
     })
 }
 

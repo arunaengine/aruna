@@ -826,6 +826,7 @@ mod tests {
             user_id: user,
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         })
     }
 
@@ -837,6 +838,7 @@ mod tests {
                 pattern: "/**".to_string(),
                 permission: Permission::READ,
             }]),
+            session: None,
         })
     }
 

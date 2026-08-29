@@ -436,6 +436,7 @@ mod tests {
                 user_id: UserId::nil(realm_id()),
                 realm_id: realm_id(),
                 path_restrictions: None,
+                session: None,
             },
             local_node_id: node_id(),
             now_ms: 1_000,

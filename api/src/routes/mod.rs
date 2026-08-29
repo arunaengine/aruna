@@ -7,6 +7,7 @@ use std::sync::Arc;
 use utoipa::openapi::{Components, OpenApi};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
+pub mod assistant;
 pub mod audit;
 pub mod blobs;
 pub mod compute;
@@ -30,6 +31,7 @@ pub mod placement;
 pub mod policies;
 pub mod rocrate_import;
 pub mod search;
+pub mod sessions;
 pub mod staging;
 pub mod storage_deletion;
 pub mod storage_routing;
@@ -44,6 +46,7 @@ pub mod users;
 fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .merge(audit::router())
+        .merge(assistant::router())
         .merge(info::router())
         .merge(onboarding::router())
         .merge(blobs::router())
@@ -70,6 +73,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(policies::router())
         .merge(search::router())
+        .merge(sessions::router())
         .merge(tes::router())
         .merge(tokens::router())
         .merge(users::router())
@@ -100,8 +104,8 @@ pub fn rest_openapi() -> OpenApi {
 }
 
 /// Registers documented handlers under a runtime template that differs from the
-/// documented path. Only the DRS catch-all object id and the TES `:cancel`
-/// action suffix need it; both are asserted by `preserves_route_inventory`.
+/// documented path. Catch-all ids and the TES `:cancel` suffix use it; all are
+/// asserted by `preserves_route_inventory`.
 fn routes_at(
     mut router: OpenApiRouter<Arc<ServerState>>,
     path: &str,
@@ -146,7 +150,9 @@ mod tests {
         ("DELETE", "/notifications/watches/{id}"),
         ("DELETE", "/pid/{document_id}"),
         ("DELETE", "/users/credentials/{access_key_id}"),
+        ("DELETE", "/users/assistant/providers/{id}"),
         ("DELETE", "/users/me/devices/{id}"),
+        ("DELETE", "/users/sessions/{session_id}"),
         ("GET", "/admin/compute/config"),
         ("GET", "/admin/compute/snapshots"),
         ("GET", "/admin/onboarding/secrets"),
@@ -233,10 +239,14 @@ mod tests {
         ("GET", "/staging/jobs/{job_id}"),
         ("GET", "/staging/references"),
         ("GET", "/users"),
+        ("GET", "/users/assistant/providers"),
+        ("GET", "/users/assistant/providers/{id}/models"),
+        ("GET", "/users/assistant/providers/{id}/proxy/{*path}"),
         ("GET", "/users/credentials"),
         ("GET", "/users/info"),
         ("GET", "/users/me/devices"),
         ("GET", "/users/search"),
+        ("GET", "/users/sessions"),
         ("GET", "/users/token"),
         ("GET", "/users/{id}"),
         ("HEAD", "/jobs/{job_id}/artifacts/rocrate"),
@@ -244,6 +254,7 @@ mod tests {
         ("PATCH", "/data/sync-relationships/{id}"),
         ("PATCH", "/info/realm/placement"),
         ("PATCH", "/users/info"),
+        ("PATCH", "/users/assistant/providers/{id}"),
         ("PATCH", "/users/{id}"),
         ("POST", "/admin/compute/drain"),
         ("POST", "/admin/onboarding/secrets"),
@@ -312,6 +323,12 @@ mod tests {
         ("POST", "/staging/jobs"),
         ("POST", "/users/credentials"),
         ("POST", "/users/register"),
+        ("POST", "/users/assistant/providers"),
+        ("POST", "/users/assistant/providers/chatgpt/login"),
+        ("POST", "/users/assistant/providers/{id}/login/poll"),
+        ("POST", "/users/assistant/providers/{id}/proxy/{*path}"),
+        ("POST", "/users/assistant/providers/{id}/test"),
+        ("POST", "/users/sessions"),
         ("POST", "/users/resolve"),
         ("POST", "/users/s3-sessions"),
         ("POST", "/users/s3-sessions/{access_key_id}/refresh"),
@@ -329,7 +346,7 @@ mod tests {
         ("PUT", "/policies/realm"),
     ];
 
-    /// Documented path to the runtime template that serves it. DRS object ids
+    /// Documented path to the runtime template that serves it. Catch-all ids
     /// span segments and TES cancel carries its action suffix inside `{id}`.
     const PATH_ALIASES: &[(&str, &str)] = &[
         (
@@ -339,6 +356,10 @@ mod tests {
         (
             "/ga4gh/tes/v1/tasks/{id}:cancel",
             "/ga4gh/tes/v1/tasks/{id}",
+        ),
+        (
+            "/users/assistant/providers/{id}/proxy/{path}",
+            "/users/assistant/providers/{id}/proxy/{*path}",
         ),
     ];
 

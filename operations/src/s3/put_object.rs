@@ -956,6 +956,7 @@ impl PutObjectOperation {
                 user_id: self.config.user_id,
                 realm_id: self.config.realm_id,
                 path_restrictions: self.restrictions.clone(),
+                session: None,
             },
             self.config.request.bucket.clone(),
             self.config.request.key.clone(),

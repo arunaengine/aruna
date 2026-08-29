@@ -1040,7 +1040,7 @@ async fn check_read_txn(
     let request = policy_request_with(
         path,
         &Permission::READ,
-        Some(&spec.auth_context.user_id),
+        Some(&spec.auth_context),
         PolicyRequestExtras::operation("s3.GetObject"),
     );
     match evaluator.evaluate(&request) {
@@ -1177,7 +1177,7 @@ fn alias_allowed(
     let request = policy_request_with(
         path,
         &Permission::READ,
-        Some(&spec.auth_context.user_id),
+        Some(&spec.auth_context),
         PolicyRequestExtras::operation("s3.GetObject"),
     );
     match evaluator.evaluate(&request) {
@@ -3108,6 +3108,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             document_id: Ulid::from_bytes([91; 16]),
             limits: RoCrateLimits::default(),
@@ -3281,6 +3282,7 @@ mod tests {
                     user_id: UserId::nil(realm_id),
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 document_id: Ulid::from_bytes([seed; 16]),
                 limits: RoCrateLimits::default(),
@@ -3531,6 +3533,7 @@ mod tests {
                 user_id: UserId::nil(realm_id),
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             document_id: Ulid::from_bytes([seed.saturating_add(8); 16]),
             limits: limits.clone(),

@@ -1315,6 +1315,7 @@ mod tests {
                 pattern: format!("/{realm_id}/g/**"),
                 permission: Permission::READ,
             }]),
+            session: None,
         };
         let token = MetadataAuthToken::internal(auth);
         let bytes = postcard::to_allocvec(&token).unwrap();

@@ -297,6 +297,7 @@ impl ArunaS3Service {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
                 path_restrictions: None,
+                session: None,
             },
             &bucket_path,
             &Permission::READ,
@@ -544,6 +545,7 @@ impl ArunaS3Service {
                     user_id: user_access.user_identity,
                     realm_id: user_access.user_identity.realm_id,
                     path_restrictions: user_access.path_restrictions.clone(),
+                    session: None,
                 },
                 &blob_bucket_permission_path(
                     self.realm_id,
@@ -565,6 +567,7 @@ impl ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         });
         request_sync_mirror_create(
             &self.state,
@@ -1584,6 +1587,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
@@ -1709,6 +1713,7 @@ impl S3 for ArunaS3Service {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
                 path_restrictions: user_access.path_restrictions.clone(),
+                session: None,
             }
         } else {
             AuthContext::anonymous(self.realm_id)
@@ -1767,6 +1772,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let conditions = copy_source_conditions(
             req.input.copy_source_if_match.as_ref(),
@@ -2062,6 +2068,7 @@ impl S3 for ArunaS3Service {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
                 path_restrictions: user_access.path_restrictions.clone(),
+                session: None,
             }
         } else {
             AuthContext::anonymous(self.realm_id)
@@ -2171,6 +2178,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let completed_parts = req
             .input
@@ -3018,6 +3026,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
@@ -3102,6 +3111,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let bucket = req.input.bucket;
 
@@ -3152,7 +3162,7 @@ impl S3 for ArunaS3Service {
             let policy_request = aruna_operations::request_policy::policy_request_with(
                 &object_path,
                 &Permission::WRITE,
-                Some(&replication_auth.user_id),
+                Some(&replication_auth),
                 extras.clone(),
             );
             if !allowed || policy_evaluator.evaluate(&policy_request).is_err() {
@@ -3690,6 +3700,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         write_storage_value(
@@ -3908,6 +3919,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let checksum_request = UploadChecksumRequest {
             expected: Vec::new(),
@@ -3983,6 +3995,7 @@ mod tests {
             user_id: anonymous,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let checksum_request = UploadChecksumRequest {
             expected: Vec::new(),

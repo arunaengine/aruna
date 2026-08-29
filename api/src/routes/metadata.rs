@@ -4424,6 +4424,7 @@ mod tests {
             user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let stranger_result = get_metadata_document(
             State(test.state.clone()),
@@ -5529,6 +5530,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         SearchPaginationCluster {
             auth,
@@ -6375,11 +6377,13 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let denied_auth = AuthContext {
             user_id: denied_user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         create_test_metadata_document(
             remote.state.clone(),
@@ -6824,6 +6828,7 @@ mod tests {
             user_id: foreign_user,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let visible = create_linking_doc(
@@ -7102,6 +7107,7 @@ mod tests {
             user_id: foreign_user,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let w3id = preflight_w3id([32u8; 32]);
         let visible_id = create_linking_doc(
@@ -7406,6 +7412,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -7519,6 +7527,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             group_id,
             state,
@@ -7653,6 +7662,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             group_id,
             state,

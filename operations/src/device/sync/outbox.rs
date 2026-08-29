@@ -112,6 +112,7 @@ async fn forward_upload(
         user_id: folder.created_by,
         realm_id: source.realm_id,
         path_restrictions: None,
+        session: None,
     };
     let message = MetadataTransportMessage::ForwardSyncPull {
         auth_token: MetadataAuthToken::internal(auth),

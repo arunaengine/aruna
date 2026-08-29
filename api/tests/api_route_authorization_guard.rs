@@ -369,6 +369,21 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "public GA4GH TES service-info discovery",
     ),
     (
+        "sessions.rs",
+        "create_session",
+        "self-scoped: creates a bearer only for the unrestricted caller",
+    ),
+    (
+        "sessions.rs",
+        "delete_session",
+        "self-scoped: the operation hides records owned by another user",
+    ),
+    (
+        "sessions.rs",
+        "list_sessions",
+        "self-scoped: the owner index is keyed by the caller",
+    ),
+    (
         "users.rs",
         "get_token",
         "self-scoped: the token is minted for the authenticated identity",

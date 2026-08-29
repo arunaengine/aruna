@@ -502,6 +502,7 @@ mod tests {
                 user_id: actor.user_id,
                 realm_id: actor.realm_id,
                 path_restrictions: None,
+                session: None,
             },
             policy,
             created_at_ms: 1_700_000_000_000,

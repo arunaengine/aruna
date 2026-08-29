@@ -705,7 +705,7 @@ impl IncomingBaoReadOperation {
         let request = policy_request_with(
             path,
             &Permission::READ,
-            Some(&self.request.auth_context.user_id),
+            Some(&self.request.auth_context),
             PolicyRequestExtras::operation("s3.GetObject"),
         );
         let realm_set = match CompiledPolicySet::compile(&realm.request_policies) {
@@ -1488,6 +1488,7 @@ mod tests {
                 user_id: UserId::nil(realm_id),
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             realm_id,
             target: BaoReadTarget::ExactVersion(

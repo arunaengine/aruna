@@ -180,6 +180,7 @@ mod test {
                     user_id: admin_id,
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 realm_id,
                 actor: actor.clone(),
@@ -236,6 +237,7 @@ mod test {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         assert!(check(stranger.clone(), data_path.clone(), Permission::READ).await);
 
@@ -249,6 +251,7 @@ mod test {
                         user_id: admin_id,
                         realm_id,
                         path_restrictions: None,
+                        session: None,
                     },
                     realm_id,
                     actor: actor.clone(),
@@ -351,6 +354,7 @@ mod test {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!(
                 "/{}/g/{}/meta/{}",
@@ -372,6 +376,7 @@ mod test {
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!(
                 "/{}/g/{}/data/{}",
@@ -393,6 +398,7 @@ mod test {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!(
                 "/{}/g/{}/data/{}",
@@ -432,6 +438,7 @@ mod test {
                 user_id: reader,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!(
                 "/{}/g/{}/meta/{}",
@@ -460,6 +467,7 @@ mod test {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             realm_id,
             actor: Actor {
@@ -487,6 +495,7 @@ mod test {
                 user_id: denied_user,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!(
                 "/{}/g/{}/meta/{}",
@@ -507,6 +516,7 @@ mod test {
                 user_id: denied_user,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!("/{}/admin/roles/{}", realm_id, Ulid::generate().to_string()),
             required_permission: Permission::READ,
@@ -522,6 +532,7 @@ mod test {
                 user_id: admin_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!("/{}/admin/roles/{}", realm_id, Ulid::generate().to_string()),
             required_permission: Permission::WRITE,
@@ -564,6 +575,7 @@ mod test {
                 user_id: new_admin,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: format!("/{}/admin/roles/{}", realm_id, Ulid::generate().to_string()),
             required_permission: Permission::WRITE,

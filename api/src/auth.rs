@@ -981,6 +981,8 @@ mod test {
                 user_id,
                 realm_id,
                 node_capabilities: capabilities,
+
+                session: None,
             })
             .unwrap(),
             &driver_ctx,
@@ -1438,6 +1440,7 @@ mod test {
             user_id,
             realm_id,
             node_capabilities: capabilities,
+            session: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let management_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1480,6 +1483,7 @@ mod test {
             user_id,
             realm_id,
             node_capabilities: capabilities,
+            session: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1620,6 +1624,7 @@ mod test {
                 user_id: unknown_user,
                 realm_id,
                 node_capabilities: capabilities.clone(),
+                session: None,
             })
             .unwrap(),
             &driver_ctx,
@@ -1732,6 +1737,7 @@ mod test {
             user_id,
             realm_id,
             node_capabilities: capabilities.clone(),
+            session: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let management_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1776,6 +1782,8 @@ mod test {
             user_id,
             realm_id,
             node_capabilities: capabilities,
+
+            session: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let management_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1825,6 +1833,8 @@ mod test {
             user_id,
             realm_id,
             node_capabilities: capabilities,
+
+            session: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1860,6 +1870,7 @@ mod test {
             user_id,
             realm_id,
             node_capabilities: capabilities,
+            session: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1894,6 +1905,7 @@ mod test {
             user_id,
             realm_id: RealmId([0u8; 32]),
             node_capabilities: capabilities,
+            session: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1915,6 +1927,8 @@ mod test {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -2048,6 +2062,8 @@ mod test {
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 node_capabilities: capabilities,
+
+                session: None,
             })
             .unwrap(),
             &driver_ctx,

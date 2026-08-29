@@ -324,6 +324,8 @@ pub(crate) async fn create_bearer_token(
             user_id,
             realm_id,
             node_capabilities,
+
+            session: None,
         })?,
         context,
     )
@@ -342,6 +344,8 @@ pub(crate) fn sign_scoped_bearer_token(
         iat: now,
         exp: now + 600,
         jti: Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
         restrictions: Some(path_restrictions),
         issuer_pubkey: None,
         delegation_signature: None,

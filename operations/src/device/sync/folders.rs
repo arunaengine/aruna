@@ -118,6 +118,7 @@ pub async fn bind_folder(
         user_id: input.user_id,
         realm_id: input.realm_id,
         path_restrictions: None,
+        session: None,
     };
     if input.create_bucket {
         let metadata = context

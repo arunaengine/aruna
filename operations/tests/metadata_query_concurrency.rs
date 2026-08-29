@@ -677,11 +677,13 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
         user_id: member,
         realm_id: REALM,
         path_restrictions: None,
+        session: None,
     };
     let outsider_auth = AuthContext {
         user_id: aruna_core::UserId::local(Ulid::generate(), REALM),
         realm_id: REALM,
         path_restrictions: None,
+        session: None,
     };
 
     let anonymous = query_names_as(&harness, None).await?;
