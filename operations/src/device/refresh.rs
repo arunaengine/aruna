@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::events::Event;
-use aruna_core::metadata::{MetadataAuthToken, MetadataEffect, MetadataEvent};
+use aruna_core::metadata::{
+    MetadataAuthToken, MetadataClockRelation, MetadataEffect, MetadataEvent,
+    compare_metadata_clocks,
+};
 use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, SyncRefusal};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -202,6 +205,7 @@ async fn install_state(
     };
     let graph_iri = state.record.graph_iri.clone();
     let clock = state.snapshot.clock.clone();
+    let preserve_display = local_is_ahead(&replica.local_clock, &clock);
     match metadata
         .send_metadata_effect(MetadataEffect::InstallSnapshot {
             graph_iri: graph_iri.clone(),
@@ -218,8 +222,10 @@ async fn install_state(
     replica.local_clock.merge(&clock);
     replica.realm_clock = clock;
     replica.last_synced_ms = Some(unix_timestamp_millis());
-    replica.displayed_jsonld = state.displayed_jsonld;
-    replica.dataset_digest = state.dataset_digest;
+    if !preserve_display {
+        replica.displayed_jsonld = state.displayed_jsonld;
+        replica.dataset_digest = state.dataset_digest;
+    }
     replica.group_id = state.record.group_id;
     replica.document_path = state.record.document_path.clone();
     replica.graph_iri = graph_iri;
@@ -231,4 +237,31 @@ async fn install_state(
         _ => ReplicaState::Invalid,
     };
     store_replica(context, replica).await
+}
+
+fn local_is_ahead(local: &craqle::VectorClock, remote: &craqle::VectorClock) -> bool {
+    matches!(
+        compare_metadata_clocks(local, remote),
+        MetadataClockRelation::LocalAhead | MetadataClockRelation::Concurrent
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_is_ahead;
+    use craqle::{ActorId, VectorClock};
+
+    #[test]
+    fn detects_local_ahead() {
+        let mut local = VectorClock::default();
+        local.advance(ActorId::from_bytes([1u8; 32]), 2);
+        let mut remote = VectorClock::default();
+        remote.advance(ActorId::from_bytes([1u8; 32]), 1);
+        assert!(local_is_ahead(&local, &remote));
+        assert!(!local_is_ahead(&remote, &local));
+
+        remote.advance(ActorId::from_bytes([2u8; 32]), 1);
+        assert!(local_is_ahead(&local, &remote));
+        assert!(!local_is_ahead(&local, &local));
+    }
 }
