@@ -13,7 +13,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, MatchedPath, Request, State};
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::collections::BTreeMap;
@@ -201,17 +201,15 @@ fn relay_url(target: &str, uri: &Uri) -> String {
 
 async fn relayed_response(route: &'static str, url: &str, response: reqwest::Response) -> Response {
     let status = response.status();
-    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let headers = relayed_headers(response.headers());
     match response.bytes().await {
         Ok(body) => {
             debug!(route, relay_target = %url, status = status.as_u16(), "Relayed a management route");
             let mut relayed = (status, body).into_response();
-            match content_type {
-                Some(content_type) => relayed
-                    .headers_mut()
-                    .insert(header::CONTENT_TYPE, content_type),
-                None => relayed.headers_mut().remove(header::CONTENT_TYPE),
-            };
+            relayed.headers_mut().remove(header::CONTENT_TYPE);
+            for (name, value) in headers {
+                relayed.headers_mut().insert(name, value);
+            }
             relayed
         }
         Err(error) => {
@@ -219,6 +217,18 @@ async fn relayed_response(route: &'static str, url: &str, response: reqwest::Res
             ServerError::BadGateway.into_response()
         }
     }
+}
+
+fn relayed_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
+    [&header::CONTENT_TYPE, &header::RETRY_AFTER]
+        .into_iter()
+        .filter_map(|name| {
+            headers
+                .get(name)
+                .cloned()
+                .map(|value| (name.clone(), value))
+        })
+        .collect()
 }
 
 /// Cached management targets; a stale window triggers a realm-config read, and
@@ -294,11 +304,11 @@ fn peer_management_urls(
 mod tests {
     use super::{
         API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, relay_route, relay_targets,
-        relay_url,
+        relay_url, relayed_headers,
     };
     use crate::error::{ErrorResponse, ServerError};
     use axum::body::to_bytes;
-    use axum::http::{Method, StatusCode, Uri};
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
     use axum::response::IntoResponse;
 
     #[test]
@@ -418,6 +428,18 @@ mod tests {
             "/admin/onboarding/secrets",
             StatusCode::NOT_FOUND
         ));
+    }
+
+    #[test]
+    fn keeps_retry_after() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+        headers.insert(header::SET_COOKIE, HeaderValue::from_static("secret=value"));
+
+        assert_eq!(
+            relayed_headers(&headers),
+            vec![(header::RETRY_AFTER, HeaderValue::from_static("7"))]
+        );
     }
 
     #[test]
