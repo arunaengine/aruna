@@ -384,9 +384,10 @@ mod tests {
     use futures_util::stream;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Notify, mpsc};
     use ulid::Ulid;
 
     struct Observed {
@@ -745,6 +746,82 @@ mod tests {
             assert_eq!(value["store"], false);
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn serializes_token_refresh() {
+        // The timeout detects a lost single-flight wakeup, not refresh performance.
+        tokio::time::timeout(Duration::from_secs(30), refresh_scenario())
+            .await
+            .expect("refresh single-flight must not deadlock");
+    }
+
+    async fn refresh_scenario() {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let response_refreshes = refreshes.clone();
+        let response_entered = entered.clone();
+        let response_release = release.clone();
+        let router = Router::new().route(
+            "/oauth/token",
+            post(move || {
+                let refreshes = response_refreshes.clone();
+                let entered = response_entered.clone();
+                let release = response_release.clone();
+                async move {
+                    refreshes.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    Json(serde_json::json!({"access_token":"new-access"}))
+                }
+            }),
+        );
+        let (base_url, handle) = spawn_mock(router).await;
+        let (_dir, state, auth) = setup_state().await;
+        let state = Arc::new(state.with_chatgpt_urls(base_url.clone(), base_url.clone()));
+        let mut provider = make_provider(
+            &state,
+            &auth,
+            AssistantProviderKind::Chatgpt,
+            base_url,
+            None,
+        );
+        let mut secret = provider.open_secret(state.credential_seal_key()).unwrap();
+        secret.access_token = Some(Secret::new("old-access"));
+        secret.refresh_token = Some(Secret::new("refresh-token"));
+        secret.account_id = Some(Secret::new("account-id"));
+        provider.token_obtained_at = Some(0);
+        let provider = drive(
+            CreateProviderOperation::new(
+                provider,
+                secret,
+                AssistantHeaders(BTreeMap::new()),
+                state.credential_seal_key().clone(),
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let first_state = state.clone();
+        let first_provider = provider.clone();
+        let first = tokio::spawn(async move {
+            super::super::chatgpt::fresh_provider(&first_state, first_provider).await
+        });
+        entered.notified().await;
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            super::super::chatgpt::fresh_provider(&second_state, provider).await
+        });
+        tokio::task::yield_now().await;
+        release.notify_waiters();
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(first.secret, second.secret);
         handle.abort();
     }
 

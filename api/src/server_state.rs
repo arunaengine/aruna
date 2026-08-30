@@ -39,13 +39,13 @@ use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use utoipa::ToSchema;
@@ -161,6 +161,7 @@ pub struct ServerState {
     management_urls: Arc<RwLock<ManagementUrlCache>>,
     assistant_proxy: bool,
     assistant_client: Option<reqwest::Client>,
+    chatgpt_refresh_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     chatgpt_issuer: String,
     chatgpt_base_url: String,
 }
@@ -290,6 +291,7 @@ impl ServerState {
             management_urls: Arc::new(RwLock::new(ManagementUrlCache::default())),
             assistant_proxy: true,
             assistant_client: assistant_client.build().ok(),
+            chatgpt_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             chatgpt_issuer: "https://auth.openai.com".to_string(),
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         };
@@ -421,6 +423,17 @@ impl ServerState {
 
     pub fn assistant_client(&self) -> Option<&reqwest::Client> {
         self.assistant_client.as_ref()
+    }
+
+    pub(crate) async fn chatgpt_lock(&self, provider_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.chatgpt_refresh_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(provider_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(provider_id.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     pub fn chatgpt_issuer(&self) -> &str {

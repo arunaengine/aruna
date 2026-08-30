@@ -408,12 +408,26 @@ pub async fn poll_login(
 
 pub(super) async fn refresh_provider(
     state: &ServerState,
-    mut provider: AssistantProvider,
+    provider: AssistantProvider,
 ) -> ServerResult<AssistantProvider> {
-    let expected = provider.clone();
+    let prior_obtained = provider.token_obtained_at;
+    let prior_secret = provider
+        .open_secret(state.credential_seal_key())
+        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+    let refresh_lock = state.chatgpt_lock(&provider.provider_id).await;
+    let _guard = refresh_lock.lock().await;
+    let mut provider = load_provider(state, provider.user_id, provider.provider_id).await?;
     let mut secret = provider
         .open_secret(state.credential_seal_key())
         .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+    if provider.token_obtained_at != prior_obtained
+        || secret.access_token != prior_secret.access_token
+        || secret.refresh_token != prior_secret.refresh_token
+        || secret.account_id != prior_secret.account_id
+    {
+        return Ok(provider);
+    }
+    let expected = provider.clone();
     let refresh_token = secret.refresh_token.as_ref().ok_or_else(|| {
         ServerError::BadRequestReason("ChatGPT refresh token is unavailable".to_string())
     })?;
