@@ -1863,6 +1863,7 @@ impl JobRetryPolicy {
 pub struct EffectiveResources {
     pub cpu_cores: u32,
     pub ram_bytes: u64,
+    /// Zero is the absence of a disk request, not a zero-byte ceiling.
     pub disk_bytes: u64,
     pub max_walltime_ms: u64,
     pub preemptible: bool,

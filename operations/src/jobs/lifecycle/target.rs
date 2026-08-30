@@ -447,7 +447,10 @@ fn materialize_local(
     }
     payload.resources.cpu_cores = Some(spec.resources.cpu_cores);
     payload.resources.ram_bytes = Some(spec.resources.ram_bytes);
-    payload.resources.disk_bytes = Some(spec.resources.disk_bytes);
+    // A sealed disk of zero is the absence of a request, not a zero-byte
+    // ceiling: sealing it as `Some(0)` is a spec every backend refuses.
+    payload.resources.disk_bytes =
+        (spec.resources.disk_bytes > 0).then_some(spec.resources.disk_bytes);
     payload.resources.max_walltime_ms = Some(spec.resources.max_walltime_ms);
     payload.resources.preemptible = spec.resources.preemptible;
     payload.executor_constraint = Some(intent.target.executor_kind.clone());
@@ -932,6 +935,29 @@ mod tests {
         );
         assert_eq!(payload.executor_constraint, Some("docker".to_string()));
         assert_eq!(record.retention_ms, spec.retention_ms);
+    }
+
+    #[test]
+    fn disk_stays_none() {
+        // A request without a disk ceiling seals zero, which no backend accepts
+        // as a container limit.
+        let family = Family::new([8u8; 32]);
+        let mut spec = family.spec();
+        spec.resources.disk_bytes = 0;
+        let launch = family.launch(&spec, family.holder.public(), 0);
+
+        let record = materialize_local(
+            &spec,
+            &launch,
+            JobId::from_bytes([10u8; 16]),
+            family.target.public(),
+            4_000,
+        )
+        .expect("launch materializes");
+        let JobPayload::Execution(payload) = record.payload else {
+            panic!("expected execution payload");
+        };
+        assert_eq!(payload.resources.disk_bytes, None);
     }
 
     #[test]
