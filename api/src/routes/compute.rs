@@ -139,9 +139,6 @@ pub struct DepartureBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ComputeSnapshotsResponse {
-    /// Always true: totals merge replicated snapshots, so a partition may
-    /// overshoot a cap before it converges.
-    pub approximate: bool,
     pub operator_draining: bool,
     pub nodes: Vec<NodeSnapshotBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -533,7 +530,6 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
     ),
     responses(
         (status = 200, description = "The snapshots this node has replicated, all approximate", body = ComputeSnapshotsResponse, example = json!({
-            "approximate": true,
             "operator_draining": false,
             "nodes": [
                 {
@@ -650,7 +646,6 @@ pub async fn get_compute_snapshots(
             truncated: report.truncated,
         });
     Ok(Json(ComputeSnapshotsResponse {
-        approximate: true,
         operator_draining: read_operator_drain(&context)
             .await
             .map_err(ServerError::InternalError)?,

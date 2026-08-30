@@ -205,7 +205,6 @@ pub struct StageBatchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct SubmitStagingJobResponse {
     pub job_id: String,
-    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -534,8 +533,8 @@ WRITE on each target key or target prefix. Nothing is authorized later while the
   referenced yet.
 - Unlike the blocking endpoint there is no cap on the number of items, and no request-side prefix
   expansion happens: prefixes are stored and walked by the job.
-- There is no idempotency key, so every call creates a new job, `created` is always true, and
-  resubmitting the same body stages the same objects a second time.
+- There is no idempotency key, so resubmitting the same body creates another job and stages the same
+  objects a second time.
 - Progress and completion are observed by reading the job by its id.
 
 **Limits**
@@ -568,11 +567,10 @@ unavailable job placement binding or an unhealthy structured id clock is a 503 c
     responses(
         (
             status = 202,
-            description = "The job is durably queued on this node; `created` is always true because staging jobs are never deduplicated",
+            description = "The job is durably queued on this node",
             body = SubmitStagingJobResponse,
             example = json!({
-                "job_id": "01JJOB0123456789ABCDEFGHJ",
-                "created": true
+                "job_id": "01JJOB0123456789ABCDEFGHJ"
             })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path or prefix is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
@@ -692,7 +690,6 @@ pub async fn submit_staging(
         StatusCode::ACCEPTED,
         Json(SubmitStagingJobResponse {
             job_id: result.job_id.to_string(),
-            created: result.created,
         }),
     ))
 }

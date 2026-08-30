@@ -330,8 +330,6 @@ pub struct JobFamilyResponse {
     pub outputs: Vec<JobOutputResponse>,
     pub revision: u64,
     pub projection_digest: String,
-    /// Always true: the family is replicated, so this is one node's view.
-    pub eventually_consistent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub responder_node_id: Option<String>,
     /// The family holds more records than one projection may reduce.
@@ -543,7 +541,6 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
         outputs,
         revision: report.revision,
         projection_digest: hex32(&report.digest),
-        eventually_consistent: true,
         responder_node_id: report.responder.map(|node| node.to_string()),
         partial: report.partial,
         locally_exhausted: report.locally_exhausted,
@@ -1411,7 +1408,6 @@ cannot be reached is a retryable 503."#,
                     ],
                     "revision": 7,
                     "projection_digest": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f",
-                    "eventually_consistent": true,
                     "responder_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
                     "partial": false,
                     "locally_exhausted": false,
@@ -2259,7 +2255,6 @@ mod tests {
         assert_eq!(response.logical_state, "indeterminate");
         assert!(response.locally_exhausted);
         assert!(response.partial);
-        assert!(response.eventually_consistent);
         assert_eq!(
             response.responder_node_id.as_deref(),
             Some(&*node_id().to_string())

@@ -618,7 +618,6 @@ pub struct MetadataReferenceEntry {
 #[derive(Debug, Clone)]
 pub struct MetadataReferencesExecution {
     pub references: Vec<MetadataReferenceEntry>,
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2253,7 +2252,6 @@ pub async fn references_metadata(
         let entry = resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?;
         return Ok(MetadataReferencesExecution {
             references: entry.into_iter().collect(),
-            next_cursor: None,
         });
     }
 
@@ -2319,10 +2317,7 @@ pub async fn references_metadata(
         references.push(entry);
     }
 
-    Ok(MetadataReferencesExecution {
-        references,
-        next_cursor: None,
-    })
+    Ok(MetadataReferencesExecution { references })
 }
 
 struct ResolvedPreflightTargets {

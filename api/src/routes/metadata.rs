@@ -513,10 +513,6 @@ pub struct MetadataReferenceItem {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataReferencesResponse {
     pub references: Vec<MetadataReferenceItem>,
-    /// Reserved for pagination. Always `null` in v1: results are capped at
-    /// `limit` and continuation is not yet supported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2637,8 +2633,7 @@ referencing document is simply omitted.
   document's summary is returned as a single predicate-less entry.
 
 **Limits**
-- Results are capped at `limit` and there is no continuation: `next_cursor` is always absent in
-  this version."#,
+- Results are capped at `limit` and there is no continuation."#,
     params(
         ("iri" = String, Query, description = "Referenced object IRI to find backlinks for, such as a document graph IRI or any IRI appearing as a triple object. Must be a valid absolute IRI"),
         ("predicate" = Option<String>, Query, description = "Optional exact predicate IRI filter, such as http://schema.org/conformsTo. Must be a valid absolute IRI and is matched exactly"),
@@ -2726,7 +2721,6 @@ pub(crate) fn map_references_response(
             .into_iter()
             .map(map_reference_entry)
             .collect(),
-        next_cursor: execution.next_cursor,
     }
 }
 
@@ -6767,7 +6761,6 @@ mod tests {
         );
         assert_eq!(entry.title.as_deref(), Some("Alpha"));
         assert!(!entry.subject_iris.is_empty());
-        assert!(response.next_cursor.is_none());
     }
 
     #[tokio::test]
@@ -6950,7 +6943,6 @@ mod tests {
         .await
         .unwrap();
         assert!(response.references.is_empty());
-        assert!(response.next_cursor.is_none());
     }
 
     #[tokio::test]
