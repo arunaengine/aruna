@@ -4,7 +4,9 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::connectors::ApiSourceConnectorKind;
-use crate::routes::jobs::map_submit_error;
+use crate::routes::jobs::{
+    decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
+};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
@@ -1167,25 +1169,6 @@ fn format_job_time(timestamp_ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
         .map(|timestamp| timestamp.to_rfc3339())
         .unwrap_or_default()
-}
-
-fn decode_job_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
-    match cursor {
-        Some(cursor) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
-            if bytes.len() != 24 {
-                return Err(ServerError::BadRequest);
-            }
-            Ok(Some(bytes))
-        }
-        None => Ok(None),
-    }
-}
-
-fn encode_job_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
-    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
 }
 
 fn decode_reference_cursor(

@@ -2,6 +2,7 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission_with, require_unrestricted_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::jobs::{decode_cursor, encode_cursor};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -29,8 +30,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use futures_util::stream;
@@ -229,25 +228,6 @@ fn record_watch_creation_denial(state: &ServerState, reason: WatchAuthorizationM
         reason = reason.as_str(),
         "Notification watch creation denied"
     );
-}
-
-fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
-    match cursor {
-        Some(cursor) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
-            if bytes.len() != 24 {
-                return Err(ServerError::BadRequest);
-            }
-            Ok(Some(bytes))
-        }
-        None => Ok(None),
-    }
-}
-
-fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
-    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
 }
 
 fn notification_response(record: &NotificationRecord) -> NotificationResponse {
@@ -1320,6 +1300,8 @@ mod tests {
     use aruna_operations::notifications::routing::route_watch_event;
     use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
     use aruna_storage::storage::FjallStorage;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use byteview::ByteView;
     use std::time::SystemTime;
     use tempfile::TempDir;

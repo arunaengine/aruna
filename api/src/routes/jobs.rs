@@ -592,7 +592,7 @@ pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
     }
 }
 
-fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
+pub(crate) fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
     match cursor {
         Some(cursor) => {
             let bytes = URL_SAFE_NO_PAD
