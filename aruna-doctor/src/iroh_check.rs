@@ -461,6 +461,7 @@ mod tests {
                         bind: None,
                         url: None,
                     },
+                    mcp: None,
                 },
             },
             warnings: Vec::new(),
