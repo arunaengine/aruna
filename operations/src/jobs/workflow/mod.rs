@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_compute::ExecutorBackend;
-use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
     FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest, S3Mount,
@@ -1878,7 +1877,7 @@ async fn capture_or_park(
         max_bytes_per_stream: default_limits.inline_tail_bytes,
         ..default_limits
     };
-    match backend.fetch_logs(fence, &limits, &NullSink).await {
+    match backend.fetch_logs(fence, &limits).await {
         Ok(logs) => Some(logs),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Container log capture failed");
@@ -1914,7 +1913,6 @@ mod tests {
     };
     use crate::jobs::workflow::workspace::mint_workspace_credential;
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-    use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
         ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination,
@@ -2040,7 +2038,6 @@ mod tests {
             &self,
             _context: &FenceContext,
             _limits: &LogLimits,
-            _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
             if self.logs_fail.load(Ordering::Relaxed) {
                 return Err(BackendError::Api("log stream truncated".to_string()));

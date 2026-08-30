@@ -163,7 +163,6 @@ fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::logs::LogSink;
     use crate::executor::{BackendCaps, ExecutorBackend, WorkerSite};
     use aruna_core::compute::{
         AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
@@ -246,7 +245,6 @@ mod tests {
             &self,
             _context: &FenceContext,
             _limits: &LogLimits,
-            _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
             unimplemented!()
         }

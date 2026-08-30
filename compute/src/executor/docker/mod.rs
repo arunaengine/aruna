@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
-    CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogStream, LogTails,
+    CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogTails,
     MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, OutputMatcher,
     ReconcileEvidence, ResumePoint, StagingMode, TaskInput, TaskOutput, TaskSpec,
     TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
@@ -33,7 +33,7 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
 use super::config::DockerConfig;
-use super::logs::{BoundedTail, LogSink};
+use super::logs::BoundedTail;
 use super::staging::StageLayout;
 use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
 
@@ -1379,7 +1379,6 @@ impl ExecutorBackend for DockerBackend {
         &self,
         context: &FenceContext,
         limits: &LogLimits,
-        sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
         validate_control(self.daemon_lock.read(context)?, context)?;
         let attempt = &context.attempt;
@@ -1400,11 +1399,9 @@ impl ExecutorBackend for DockerBackend {
             use bollard::container::LogOutput;
             match item.map_err(|e| classify(&e))? {
                 LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                    sink.write(LogStream::Stdout, &message);
                     stdout.push(&message);
                 }
                 LogOutput::StdErr { message } => {
-                    sink.write(LogStream::Stderr, &message);
                     stderr.push(&message);
                 }
                 LogOutput::StdIn { .. } => {}

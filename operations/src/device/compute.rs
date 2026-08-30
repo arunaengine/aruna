@@ -549,7 +549,6 @@ mod tests {
             &self,
             _context: &FenceContext,
             _limits: &aruna_core::compute::LogLimits,
-            _sink: &dyn aruna_compute::executor::logs::LogSink,
         ) -> Result<aruna_core::compute::LogTails, BackendError> {
             unimplemented!()
         }

@@ -7,10 +7,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_OUTPUT_MATCHES,
-    MAX_TRANSFER_BYTES, NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
-    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
-    normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
+    NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
+    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -39,7 +38,7 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
 use super::config::{KubernetesConfig, MAX_NODE_SELECTOR_ENTRIES};
-use super::logs::{BoundedTail, LogSink};
+use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, digest_pinned};
 
@@ -1084,7 +1083,6 @@ impl ExecutorBackend for KubernetesBackend {
         &self,
         context: &FenceContext,
         limits: &LogLimits,
-        sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
         let stored = self
             .markers()
@@ -1118,7 +1116,6 @@ impl ExecutorBackend for KubernetesBackend {
                 .map_err(kube_error)?
                 .into_bytes()
         };
-        sink.write(LogStream::Stdout, &bytes);
         let mut tail = BoundedTail::new(limits.max_bytes_per_stream);
         tail.push(&bytes);
         Ok(LogTails {
@@ -2153,7 +2150,6 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
-    use crate::executor::logs::NullSink;
 
     fn context() -> FenceContext {
         FenceContext {
@@ -2810,7 +2806,7 @@ mod tests {
         };
 
         let tails = backend
-            .fetch_logs(&context(), &LogLimits::default(), &NullSink)
+            .fetch_logs(&context(), &LogLimits::default())
             .await
             .unwrap();
 
