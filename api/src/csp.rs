@@ -271,9 +271,7 @@ pub(crate) async fn baseline_security_headers(request: Request, next: Next) -> R
 /// generated theme stylesheet.
 fn content_security_policy(origins: &ResolvedOrigins) -> String {
     let connect_src = directive(
-        &format!(
-            "connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN} {LOCAL_MODEL_ORIGINS}"
-        ),
+        &format!("connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN} {LOCAL_MODEL_ORIGINS}"),
         &origins.connect,
     );
     let img_src = directive("img-src 'self' data: blob:", &origins.img);

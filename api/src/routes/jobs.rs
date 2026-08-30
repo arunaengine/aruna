@@ -1053,8 +1053,8 @@ pub(crate) async fn submit_execution(
 ) -> ServerResult<(StatusCode, SubmitJobResponse)> {
     let target = request.target.unwrap_or_default();
     let auth = match target {
-        ExecutionTarget::Realm => require_unrestricted_realm_auth(&state, auth)?,
-        ExecutionTarget::Local => local_auth(&state, auth).await?,
+        ExecutionTarget::Realm => require_unrestricted_realm_auth(state, auth)?,
+        ExecutionTarget::Local => local_auth(state, auth).await?,
     };
     let group_id = Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
     let (workspace_mode, workspace_bucket) = workspace_request(request.workspace)?;
