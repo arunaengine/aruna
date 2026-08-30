@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 
 const BOUNDARIES: &[&str] = &[
     "authorize_tool",
+    "enforce_policies",
     "ensure_permission",
     "request_authorization::authorize",
+    "submit_execution",
 ];
 const TOOL_COUNT: usize = 22;
 
@@ -62,10 +64,10 @@ fn tool_names(source: &str) -> BTreeSet<String> {
             .chars()
             .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
             .collect::<String>();
+        rest = &rest[function + 3 + name.len()..];
         if !name.is_empty() {
             names.insert(name);
         }
-        rest = &rest[function + 3 + name.len()..];
     }
     names
 }

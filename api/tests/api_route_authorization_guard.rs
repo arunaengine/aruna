@@ -6,11 +6,13 @@ const ROUTES_DIR: &str = "src/routes";
 const METHODS: &[&str] = &[
     "any", "delete", "get", "head", "options", "patch", "post", "put", "trace",
 ];
-/// The one REST authorization boundary. `ensure_permission` also matches
-/// `ensure_permission_with` and the `metadata` module wrapper around it.
+/// REST authorization boundaries. `ensure_permission` also matches
+/// `ensure_permission_with` and the `metadata` module wrapper around it;
+/// `require_owner` is the user-node device plane's owner gate.
 const BOUNDARY: &[&str] = &[
     "ensure_permission",
     "permission_granted",
+    "require_owner",
     "request_authorization::authorize",
 ];
 
@@ -21,46 +23,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "credentials.rs",
         "list_s3_credentials",
         "self-scoped: only credentials whose identity is the caller",
-    ),
-    (
-        "device.rs",
-        "delete_draft",
-        "device plane: require_owner binds the caller to this node's enrolled owner",
-    ),
-    (
-        "device.rs",
-        "get_draft",
-        "device plane: require_owner binds the caller to this node's enrolled owner",
-    ),
-    (
-        "device.rs",
-        "list_drafts",
-        "device plane: require_owner binds the caller to this node's enrolled owner",
-    ),
-    (
-        "device.rs",
-        "list_offers",
-        "device plane: require_owner binds the caller to this node's enrolled owner",
-    ),
-    (
-        "device.rs",
-        "preview_draft",
-        "device plane: nothing stored is read beyond the realm-public Profile",
-    ),
-    (
-        "device.rs",
-        "queue_draft",
-        "device plane: the queued create is authorized by the holder at drain time",
-    ),
-    (
-        "device.rs",
-        "wipe_device",
-        "device plane: erases only this node, after require_owner and an id confirmation",
-    ),
-    (
-        "device_compute.rs",
-        "get_device_compute",
-        "device plane: require_owner binds the caller to this node's enrolled owner",
     ),
     (
         "drs.rs",
@@ -320,13 +282,18 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "sessions.rs",
-        "create_s3_session",
-        "realm bearer, explicit group membership and WRITE on the group node-local data path checked via authorize_credential_issuance",
+        "create_session",
+        "self-scoped: creates a bearer only for the unrestricted caller",
     ),
     (
         "sessions.rs",
-        "refresh_s3_session",
-        "realm bearer, explicit group membership and WRITE on the group node-local data path checked via authorize_credential_issuance",
+        "delete_session",
+        "self-scoped: the operation hides records owned by another user",
+    ),
+    (
+        "sessions.rs",
+        "list_sessions",
+        "self-scoped: the owner index is keyed by the caller",
     ),
     (
         "staging.rs",
@@ -367,21 +334,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "tes.rs",
         "service_info",
         "public GA4GH TES service-info discovery",
-    ),
-    (
-        "sessions.rs",
-        "create_session",
-        "self-scoped: creates a bearer only for the unrestricted caller",
-    ),
-    (
-        "sessions.rs",
-        "delete_session",
-        "self-scoped: the operation hides records owned by another user",
-    ),
-    (
-        "sessions.rs",
-        "list_sessions",
-        "self-scoped: the owner index is keyed by the caller",
     ),
     (
         "users.rs",
