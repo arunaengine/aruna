@@ -301,10 +301,11 @@ fn map_inspect_onboarding_error(error: InspectOnboardingSecretError) -> ServerEr
 
 const USER_TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
-async fn issue_portal_session(
+async fn issue_user_session(
     state: &Arc<ServerState>,
     user_id: UserId,
     expiry: u64,
+    kind: SessionKind,
 ) -> ServerResult<String> {
     let created = drive(
         CreateSessionOperation::new(CreateSessionConfig {
@@ -313,7 +314,7 @@ async fn issue_portal_session(
             user_id,
             realm_id: state.get_realm_id(),
             node_capabilities: state.node_capabilities().clone(),
-            kind: SessionKind::Portal,
+            kind,
             label: None,
         }),
         &state.get_ctx(),
@@ -666,7 +667,8 @@ on behalf of somebody else.
 
 **Behavior**
 - The issued token is a realm bearer credential valid for 24 hours.
-- The issued token is recorded on this node as a listable `portal` session.
+- The issued token preserves a bound Aruna session's kind; OIDC and legacy unbound callers receive
+  a `portal` session.
 - It is returned only in this response and is not retrievable afterwards, so a lost token has to
   be reissued here.
 
@@ -692,13 +694,17 @@ async fn get_token(
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
-    let user_id = match auth {
+    let (user_id, kind) = match auth {
         Some(aruna_ctx) => {
             if aruna_ctx.path_restrictions.is_some() {
                 return Err(ServerError::Forbidden);
             }
             ensure_canonical_user_token_subject(&state, aruna_ctx.user_id).await?;
-            aruna_ctx.user_id
+            let kind = aruna_ctx
+                .session
+                .as_ref()
+                .map_or(SessionKind::Portal, |session| session.kind);
+            (aruna_ctx.user_id, kind)
         }
         None => {
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
@@ -712,14 +718,14 @@ async fn get_token(
             )
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
-            user.user_id
+            (user.user_id, SessionKind::Portal)
         }
     };
 
     let expiry = now_timestamp()
         .checked_add(USER_TOKEN_EXPIRY_SECONDS)
         .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
-    let token = issue_portal_session(&state, user_id, expiry).await?;
+    let token = issue_user_session(&state, user_id, expiry, kind).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
 }
@@ -1756,8 +1762,9 @@ async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> Ser
 #[cfg(test)]
 mod tests {
     use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
-    use crate::auth::OidcValidator;
+    use crate::auth::{OidcValidator, handle_token};
     use crate::error::ErrorResponse;
+    use crate::routes::sessions::{CreateSessionRequest, CreateSessionResponse};
     use crate::server::Server;
     use crate::server::ServerConfig;
     use crate::server_state::ServerState;
@@ -1772,7 +1779,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission,
-        RealmConfigDocument, RealmId, TokenClaims, User, oidc_subject_key,
+        RealmConfigDocument, RealmId, SessionKind, TokenClaims, User, oidc_subject_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::announce_realm_presence::{
@@ -2675,6 +2682,53 @@ mod tests {
         assert_eq!(token_response.status(), StatusCode::OK);
         let body: GetTokenResponse = token_response.json().await.unwrap();
         assert!(!body.token.is_empty());
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_kind() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+        let (_registered, portal_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-123",
+            "Alice",
+            None,
+        )
+        .await;
+        let created = reqwest::Client::new()
+            .post(format!("{}/api/v1/users/sessions", node.base_url))
+            .bearer_auth(&portal_token)
+            .json(&CreateSessionRequest {
+                kind: "assistant".to_string(),
+                label: None,
+                expires_in_seconds: Some(600),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let assistant: CreateSessionResponse = created.json().await.unwrap();
+
+        let refreshed = reqwest::Client::new()
+            .get(format!("{}/api/v1/users/token", node.base_url))
+            .bearer_auth(&assistant.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let refreshed: GetTokenResponse = refreshed.json().await.unwrap();
+        let claims = handle_token(&node.state, &refreshed.token).await.unwrap();
+        assert_eq!(claims.session_kind, Some(SessionKind::Assistant));
 
         node.server_task.abort();
         node.net.shutdown().await;
