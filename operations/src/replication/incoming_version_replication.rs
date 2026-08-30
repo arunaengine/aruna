@@ -1703,15 +1703,11 @@ impl IncomingVersionReplicationOperation {
         };
 
         self.state = IncomingVersionReplicationState::RegisterBlobInDht;
-        let effect = match dht_registration_effect(
-            blake3_hash,
-            self.local_realm_id,
-            self.local_node_id,
-            &self.rocrate_limits,
-        ) {
-            Ok(effect) => effect,
-            Err(_) => return self.send_apply_complete(),
-        };
+        let effect =
+            match dht_registration_effect(blake3_hash, self.local_realm_id, &self.rocrate_limits) {
+                Ok(effect) => effect,
+                Err(_) => return self.send_apply_complete(),
+            };
         smallvec![effect]
     }
 

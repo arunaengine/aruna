@@ -703,11 +703,8 @@ impl OperationsTaskHandler {
         ) {
             return;
         }
-        let operation = RefreshBlobHoldersOperation::new(
-            *net_handle.realm_id(),
-            net_handle.node_id(),
-            self.rocrate_limits.clone(),
-        );
+        let operation =
+            RefreshBlobHoldersOperation::new(*net_handle.realm_id(), self.rocrate_limits.clone());
         if let Err(error) = drive(operation, self.context.as_ref()).await {
             warn!(task_id = ?TaskKey::RefreshBlobHolders, error = %error, "Failed to refresh blob holders");
             self.reschedule_timer(

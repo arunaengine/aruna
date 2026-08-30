@@ -1219,12 +1219,7 @@ impl PutObjectOperation {
             return self.continue_after_dht_registration();
         };
         self.state = PutObjectState::RegisterBlobInDht;
-        match dht_registration_effect(
-            blake3_hash,
-            self.config.realm_id,
-            self.config.node_id,
-            &self.rocrate_limits,
-        ) {
+        match dht_registration_effect(blake3_hash, self.config.realm_id, &self.rocrate_limits) {
             Ok(effect) => smallvec![effect],
             Err(_) => self.continue_after_dht_registration(),
         }
