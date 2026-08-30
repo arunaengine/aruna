@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFunctions};
+use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
@@ -716,13 +716,8 @@ impl IncomingBaoReadOperation {
             Ok(set) => set,
             Err(_) => return self.continue_policy(false),
         };
-        self.policy_current = matches!(
-            realm_set.evaluate(&request, &PolicyFunctions::default()),
-            PolicyDecision::Allowed
-        ) && matches!(
-            group_set.evaluate(&request, &PolicyFunctions::default()),
-            PolicyDecision::Allowed
-        );
+        self.policy_current = matches!(realm_set.evaluate(&request), PolicyDecision::Allowed)
+            && matches!(group_set.evaluate(&request), PolicyDecision::Allowed);
         let Some(txn_id) = self.txn_id else {
             return self.continue_policy(self.policy_current);
         };

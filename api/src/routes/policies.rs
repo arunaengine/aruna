@@ -4,8 +4,8 @@ use crate::routes::groups::refuse_group_edit;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyDecision, PolicyFunctions, PolicyKind, PolicyRequest, PolicySession,
-    PolicyTraceEntry, RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
+    CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,
+    RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
@@ -863,11 +863,7 @@ pub async fn validate_policy(
     // Validation compiles caller-supplied CEL; restrict it to policy authors.
     require_config_read(&state, &auth).await?;
     let _ = parse_kind(&request.kind)?;
-    let analysis = analyze_policy_source(
-        request.when.as_deref(),
-        &request.expression,
-        &PolicyFunctions::default(),
-    );
+    let analysis = analyze_policy_source(request.when.as_deref(), &request.expression);
     Ok((
         StatusCode::OK,
         Json(ValidatePolicyResponse {
@@ -989,7 +985,6 @@ pub async fn dry_run_policy(
 
     let scopes = dry_run_scopes(&state, &auth, &request).await?;
 
-    let functions = PolicyFunctions::default();
     let mut trace = Vec::new();
     let mut response = DryRunResponse {
         denied: false,
@@ -1001,7 +996,7 @@ pub async fn dry_run_policy(
     for (label, policies) in scopes {
         let set = CompiledPolicySet::compile(&policies)
             .map_err(|error| ServerError::BadRequestMessage(error.reason))?;
-        let traced = set.evaluate_traced(&policy_request, &functions);
+        let traced = set.evaluate_traced(&policy_request);
         for entry in traced.trace {
             trace.push(ScopedTraceEntry {
                 scope: label.clone(),

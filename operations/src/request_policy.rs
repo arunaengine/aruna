@@ -6,8 +6,8 @@ use crate::driver::{DriverContext, drive};
 use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyFunctions, PolicyRequest,
-    PolicySession, RequestPolicy, policy_set_hash,
+    CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
+    RequestPolicy, policy_set_hash,
 };
 use aruna_core::structs::{AuthContext, RealmId};
 use aruna_core::types::{GroupId, TxnId};
@@ -320,7 +320,7 @@ fn decide(
     request: &PolicyRequest,
     scope: &str,
 ) -> Result<(), PolicyEnforcementError> {
-    match set.evaluate(request, &PolicyFunctions::default()) {
+    match set.evaluate(request) {
         PolicyDecision::Allowed => Ok(()),
         PolicyDecision::Denied {
             policy_id,
