@@ -1,7 +1,7 @@
 use super::data::{WriteObjectInput, write_text};
 use super::{
-    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, internal_error,
-    request_auth, server_error, tool_extras,
+    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
+    parse_ulid, request_auth, server_error, tool_extras,
 };
 use aruna_core::compute::runtimes::{QUICK_RUNTIMES, QuickRuntime, quick_runtime};
 use aruna_core::structs::{JobPayload, Permission, blob_group_permission_path};
@@ -66,42 +66,81 @@ pub struct RuntimesOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RunScriptInput {
+    /// Owning group's bare 26-character ULID, for example
+    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Call `list_groups` for the ids the caller
+    /// may use; the caller needs write permission on the group.
     pub group_id: String,
+    /// Name of an existing bucket in that group, for example `project-data`.
+    /// It serves as the run workspace: the script is staged under
+    /// `.aruna/scripts/<run id>/` and outputs are written back into it. Call
+    /// `list_buckets` for readable names.
     pub bucket: String,
+    /// Runtime id from `list_runtimes`: `python-uv`, `deno`, or `bash`.
     pub runtime: String,
+    /// Full source text of the script, for example
+    /// `print("hello from aruna")`. It is stored as the runtime's file name and
+    /// executed from the container's `/work` directory.
     pub script: String,
+    /// Packages to resolve before the run: PyPI requirements for `python-uv`
+    /// such as `httpx>=0.27`, npm specifications for `deno` such as `chalk@5`.
+    /// `bash` refuses any. A non-empty list opens container network access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<Vec<String>>,
+    /// Objects staged into the container next to the script. The script itself
+    /// is added automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<crate::routes::jobs::ExecutionInputRequest>>,
+    /// Container paths written back into `bucket` after the run. Omit when the
+    /// script only prints to stdout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<crate::routes::jobs::ExecutionOutputRequest>>,
+    /// Whole CPU cores reserved. Defaults to 1; `0` is refused and the group's
+    /// compute quota may cap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_cores: Option<u32>,
+    /// RAM reserved in bytes, for example `1073741824` for 1 GiB. Defaults to
+    /// 1 GiB; `0` and anything above 9223372036854775807 are refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_bytes: Option<u64>,
+    /// Wall-clock limit in milliseconds, for example `600000` for ten minutes.
+    /// Defaults to 86400000, one day; the group's compute quota may cap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_walltime_ms: Option<u64>,
+    /// `realm` (the default) admits the run into the realm; `local` runs it on
+    /// this machine and is served by a user device node only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<crate::routes::jobs::ExecutionTarget>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SubmitJobInput {
+    /// The complete native execution request. `group_id` and `image` are
+    /// required; every other field has a default. Prefer `run_script` for a
+    /// plain Python, Deno, or Bash script.
     pub spec: crate::routes::jobs::SubmitExecutionRequest,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GetJobInput {
+    /// The job's bare 26-character ULID, for example
+    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Read it from the `job_id` returned by
+    /// `run_script` or `submit_job`, or from a `list_jobs` entry.
     pub id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListJobsInput {
+    /// Optional filter: keep only jobs submitted for this group's bare
+    /// 26-character ULID. Call `list_groups` for the ids the caller may use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
+    /// Optional filter on the job state. One of `queued`, `claimed`,
+    /// `preparing`, `ready`, `running`, `cancelling`, `indeterminate`,
+    /// `succeeded`, `failed`, or `cancelled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Maximum number of jobs to return, newest first. Defaults to 50 and is
+    /// capped at 200. Only the first page is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
@@ -121,7 +160,7 @@ pub(crate) fn toolset() -> rmcp::handler::server::router::tool::ToolRouter<McpSe
 #[tool_router(router = compute_router)]
 impl McpServer {
     #[tool(
-        description = "List the pinned Aruna quick-run runtimes",
+        description = "List the pinned quick-run runtimes that run_script accepts. Each entry carries the runtime id, its container image, the script file name it writes, the content type, and a starter template. Call this before run_script to choose a runtime id and to see which runtimes resolve dependencies. Takes no arguments.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -140,7 +179,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Stage and submit a Python, Deno, or Bash script with bounded resources",
+        description = "Stage one script into an existing bucket and submit it as a container job, returning job_id and the state at accept. Use it for plain Python, Deno, or Bash work, and submit_job when a specific image, entrypoint, or workspace mode is needed. The script is written under `.aruna/scripts/<run id>/` in `bucket`, which also serves as the run workspace, so the caller needs write permission on that bucket and on the group. Poll get_job with the returned job_id for state, result, and log tails.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn run_script(
@@ -197,14 +236,14 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(server_error)?;
+        .map_err(submit_error)?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
     }
 
     #[tool(
-        description = "Submit the full native Aruna execution request shape",
+        description = "Submit the complete native execution request: image, command, environment, resources, staged inputs, captured outputs, and workspace mode. Use run_script instead for a plain Python, Deno, or Bash script. Returns job_id, whether this call created the job, and the family state at accept. Poll get_job with job_id; a replay under the same idempotency_key returns the existing job rather than a second one.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_job(
@@ -222,14 +261,14 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(server_error)?;
+        .map_err(submit_error)?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
     }
 
     #[tool(
-        description = "Get an owned job's state, timestamps, result, and bounded log tails",
+        description = "Read one owned job by id: state, attempts, timestamps, progress, result, workspace bucket, and the bounded stdout and stderr tails the result carries. Use list_jobs to find an id and this tool to follow one run. The states queued, claimed, preparing, ready, running, and cancelling are still in flight, while succeeded, failed, and cancelled are terminal and indeterminate means the outcome is not yet proven. Poll it rather than assuming a submission finished.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -249,12 +288,12 @@ impl McpServer {
             tool_extras("get_job", &input)?,
         )
         .await?;
-        let job_id = crate::routes::jobs::parse_job_id(&input.id).map_err(server_error)?;
+        let job_id = parse_job(&input.id)?;
         let response =
             if let Some(report) = family_report(&self.state.get_ctx(), &auth, job_id).await {
                 let report = report
                     .map_err(crate::routes::jobs::map_job_route)
-                    .map_err(server_error)?;
+                    .map_err(job_error)?;
                 let mut response = crate::routes::jobs::job_view_response(&report.job);
                 let family = crate::routes::jobs::family_response(&report);
                 crate::routes::jobs::bind_output_routes(&mut response.result, &family.outputs)
@@ -272,7 +311,7 @@ impl McpServer {
                 )
                 .await
                 .map_err(crate::routes::jobs::map_job_route)
-                .map_err(server_error)?;
+                .map_err(job_error)?;
                 let mut response = crate::routes::jobs::job_view_response(&routed.job);
                 response.run_crate = routed.run_crate;
                 response
@@ -283,7 +322,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "List the authenticated user's jobs with optional group, state, and limit filters",
+        description = "List the caller's own jobs on this node, newest first, with optional group, state, and limit filters. Each entry carries job_id, kind, state, attempts, timestamps, progress, and any error, but never the run crate or the family detail; call get_job for those. Only the first page is returned, at most 200 entries. Use it to recover a job_id that was not kept from the submission.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -301,7 +340,11 @@ impl McpServer {
             .group_id
             .as_deref()
             .map(|group_id| {
-                Ulid::from_string(group_id).map_err(|_| bad_request("invalid group_id"))
+                parse_ulid(
+                    "group_id",
+                    group_id,
+                    "call list_groups for the ids the caller may use, or omit it to list every owned job",
+                )
             })
             .transpose()?;
         match group_id {
@@ -322,12 +365,7 @@ impl McpServer {
             }
             None => compute_probe(self, &auth, Permission::READ, extras).await?,
         }
-        let state_filter = input
-            .state
-            .as_deref()
-            .map(crate::routes::jobs::parse_state)
-            .transpose()
-            .map_err(server_error)?;
+        let state_filter = input.state.as_deref().map(parse_job_state).transpose()?;
         let limit = input
             .limit
             .filter(|limit| *limit > 0)
@@ -361,7 +399,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Request cancellation of an owned job",
+        description = "Request cancellation of one owned job and return its current view. Cancellation is a request, not an immediate stop: an in-flight job moves to cancelling and reaches cancelled once the executor confirms. A job already in a terminal state comes back unchanged. Poll get_job for the settled state.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -381,7 +419,7 @@ impl McpServer {
             tool_extras("cancel_job", &input)?,
         )
         .await?;
-        let job_id = crate::routes::jobs::parse_job_id(&input.id).map_err(server_error)?;
+        let job_id = parse_job(&input.id)?;
         let outcome = cancel_job_routed(
             &self.state.get_ctx(),
             &self.state.jobs_runtime(),
@@ -392,10 +430,10 @@ impl McpServer {
         )
         .await
         .map_err(crate::routes::jobs::map_job_route)
-        .map_err(server_error)?;
+        .map_err(job_error)?;
         let job = match outcome {
             RoutedCancelOutcome::NotFound => {
-                return Err(server_error(crate::error::ServerError::NotFound));
+                return Err(job_error(crate::error::ServerError::NotFound));
             }
             RoutedCancelOutcome::AlreadyTerminal(job) | RoutedCancelOutcome::Requested(job) => job,
         };
@@ -416,6 +454,57 @@ fn request_bearer(
         .flatten()
 }
 
+/// The REST parser answers a malformed job id with "Not found", which reads to
+/// a caller as a missing job rather than a wrong argument.
+fn parse_job(id: &str) -> Result<aruna_core::structs::JobId, CallToolResult> {
+    crate::routes::jobs::parse_job_id(id).map_err(|_| {
+        bad_request(
+            "id must be a 26-character job ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; read job_id \
+             from run_script, submit_job, or a list_jobs entry",
+        )
+    })
+}
+
+fn parse_job_state(value: &str) -> Result<aruna_core::structs::JobState, CallToolResult> {
+    crate::routes::jobs::parse_state(value).map_err(|_| {
+        bad_request(
+            "state must be one of queued, claimed, preparing, ready, running, cancelling, \
+             indeterminate, succeeded, failed, or cancelled",
+        )
+    })
+}
+
+fn job_error(error: crate::error::ServerError) -> CallToolResult {
+    match error {
+        crate::error::ServerError::NotFound => explained(
+            error,
+            "no job with that id belongs to the caller on this node; call list_jobs for visible ids",
+        ),
+        crate::error::ServerError::Forbidden => {
+            explained(error, "the caller does not own that job")
+        }
+        error => server_error(error),
+    }
+}
+
+/// The submit route refuses several argument shapes with a bare "Bad request".
+fn submit_error(error: crate::error::ServerError) -> CallToolResult {
+    match error {
+        crate::error::ServerError::BadRequest => explained(
+            error,
+            "check group_id as a 26-character ULID, a non-blank image, cpu_cores above 0, \
+             ram_bytes between 1 and 9223372036854775807, unique input container_path and output \
+             dest_key values, an existing same-group bucket for workspace mode `existing`, and an \
+             empty output_prefixes list",
+        ),
+        crate::error::ServerError::Forbidden => explained(
+            error,
+            "the caller needs write permission on the group and on the workspace bucket",
+        ),
+        error => server_error(error),
+    }
+}
+
 async fn compute_probe(
     server: &McpServer,
     auth: &aruna_core::structs::AuthContext,
@@ -428,8 +517,21 @@ async fn compute_probe(
 }
 
 fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallToolResult> {
-    let runtime = quick_runtime(&input.runtime)
-        .ok_or_else(|| bad_request("runtime must be python-uv, deno, or bash"))?;
+    parse_ulid(
+        "group_id",
+        &input.group_id,
+        "call list_groups for the ids the caller may use",
+    )?;
+    let runtime = quick_runtime(&input.runtime).ok_or_else(|| {
+        let ids = QUICK_RUNTIMES
+            .iter()
+            .map(|runtime| runtime.id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bad_request(format!(
+            "runtime must be one of {ids}; call list_runtimes for the full entries"
+        ))
+    })?;
     let dependencies = input
         .dependencies
         .unwrap_or_default()
@@ -438,7 +540,10 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
         .filter(|dependency| !dependency.is_empty())
         .collect::<Vec<_>>();
     if runtime.id == "bash" && !dependencies.is_empty() {
-        return Err(bad_request("bash does not support dependency declarations"));
+        return Err(bad_request(
+            "the bash runtime resolves no dependencies; omit dependencies or choose the python-uv \
+             or deno runtime",
+        ));
     }
     let prefix = format!(".aruna/scripts/{run_id}");
     let script_key = format!("{prefix}/{}", runtime.file);

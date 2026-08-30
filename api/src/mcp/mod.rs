@@ -180,6 +180,31 @@ pub(crate) fn bad_request(message: impl std::fmt::Display) -> CallToolResult {
     ))
 }
 
+/// REST answers a tool caller with bare text such as "Not found" or "Bad
+/// request". The status code is kept while the message gains the reason.
+pub(crate) fn explained(
+    error: crate::error::ServerError,
+    reason: impl std::fmt::Display,
+) -> CallToolResult {
+    let mut body = error.response_body();
+    body.error = format!("{}: {reason}", body.error);
+    error_result(body)
+}
+
+/// Group ids are the bare canonical ULID form, unlike a user id, which is
+/// `<ulid>@<realm>`.
+pub(crate) fn parse_ulid(
+    field: &str,
+    value: &str,
+    source: &str,
+) -> Result<ulid::Ulid, CallToolResult> {
+    ulid::Ulid::from_string(value).map_err(|_| {
+        bad_request(format!(
+            "{field} must be a 26-character ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; {source}"
+        ))
+    })
+}
+
 pub(crate) async fn authorize_tool(
     state: &ServerState,
     auth: &aruna_core::structs::AuthContext,
@@ -329,6 +354,73 @@ mod tests {
                 check_schema(entry, label);
             }
         }
+    }
+
+    fn collect_missing(schema: &Value, path: &str, missing: &mut Vec<String>) {
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, property) in properties {
+                let description = property.get("description").and_then(Value::as_str);
+                if description.is_none_or(|text| text.trim().is_empty()) {
+                    missing.push(format!("{path}.{name}"));
+                }
+            }
+        }
+        for keyword in ["$defs", "definitions"] {
+            let Some(entries) = schema.get(keyword).and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, entry) in entries {
+                collect_missing(entry, &format!("{path}/{name}"), missing);
+            }
+        }
+    }
+
+    fn error_body(result: rmcp::model::CallToolResult) -> Value {
+        result
+            .structured_content
+            .expect("a tool error carries the structured body")
+    }
+
+    #[test]
+    fn errors_carry_reasons() {
+        // "Bad request" and "Not found" alone leave the caller nothing to fix.
+        let body =
+            error_body(super::parse_ulid("group_id", "nope", "call list_groups").unwrap_err());
+        assert_eq!(body["code"], "Bad request");
+        let text = body["error"].as_str().unwrap_or_default();
+        assert!(text.contains("group_id"), "{text}");
+        assert!(text.contains("26-character ULID"), "{text}");
+        assert!(text.contains("call list_groups"), "{text}");
+
+        let body = error_body(super::explained(
+            crate::error::ServerError::NotFound,
+            "call list_buckets",
+        ));
+        assert_eq!(body["code"], "Not found");
+        let text = body["error"].as_str().unwrap_or_default();
+        assert_eq!(text, "Not found: call list_buckets");
+    }
+
+    #[test]
+    fn inputs_are_described() {
+        // Without a per-property description the calling model guesses id
+        // formats, path shapes, and bounds, and the tool answers Bad request.
+        let mut missing = Vec::new();
+        for tool in all_tools() {
+            let name = tool.name.as_ref();
+            assert!(
+                tool.description
+                    .as_ref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{name} has no tool description"
+            );
+            let input = Value::Object((*tool.input_schema).clone());
+            collect_missing(&input, name, &mut missing);
+        }
+        assert!(
+            missing.is_empty(),
+            "MCP input properties without a description: {missing:?}"
+        );
     }
 
     #[test]

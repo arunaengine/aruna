@@ -74,8 +74,13 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct ExecutionInputRequest {
+    /// Source bucket holding the object, for example `project-data`.
     pub bucket: String,
+    /// Source object key inside `bucket`, for example `inputs/reads.fastq.gz`.
+    /// A relative key without a leading slash and without `..` segments.
     pub key: String,
+    /// Exact object version to stage. Required by `exact_reference` mode and
+    /// refused by `floating_reference` mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
     /// Realm node holding this object. Only a `local` run accepts it: the named
@@ -83,10 +88,15 @@ pub struct ExecutionInputRequest {
     /// then required. A realm run refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_node_id: Option<String>,
+    /// Destination key inside the workspace bucket, for example `reads.fastq.gz`.
+    /// Must not be empty and must be unique across the declared inputs.
     pub dest_key: String,
-    /// Absolute container path; defaults to `/inputs/<dest_key>`.
+    /// Absolute container path; defaults to `/inputs/<dest_key>`. It must be
+    /// absolute, must not be `/`, must carry no `.` or `..` component, and must
+    /// be unique across the declared inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_path: Option<String>,
+    /// Composition mode; defaults to `snapshot`.
     #[serde(default)]
     pub mode: InputModeRequest,
 }
@@ -104,6 +114,8 @@ pub enum InputModeRequest {
     ExactReference,
 }
 
+/// How a claimed destination key is resolved. `reject` refuses the submission,
+/// `replace` lets the later declaration win, and `keep_existing` keeps the first.
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema,
 )]
@@ -117,12 +129,17 @@ pub enum CollisionPolicyRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct ExecutionOutputRequest {
-    /// Absolute container path captured after the task exits.
+    /// Absolute container path captured after the task exits, for example
+    /// `/work/result.json`. Must be unique across the declared outputs.
     pub container_path: String,
-    /// Destination key inside the workspace bucket.
+    /// Destination key inside the workspace bucket, for example
+    /// `results/result.json`. Must not be empty and must be unique.
     pub dest_key: String,
 }
 
+/// Where a run's staged inputs and captured outputs live. `temporary` discards
+/// the workspace after the run, `kept` retains it in a new bucket, and
+/// `existing` reuses the named bucket.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceModeRequest {
@@ -133,7 +150,11 @@ pub enum WorkspaceModeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct WorkspaceRequest {
+    /// `temporary` discards the workspace after the run, `kept` retains it in a
+    /// new bucket, and `existing` reuses the named bucket.
     pub mode: WorkspaceModeRequest,
+    /// Required by `existing` mode and refused by the other two. The bucket must
+    /// exist, belong to the same group, and be writable by the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
 }
@@ -160,39 +181,68 @@ pub enum ExecutionTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct SubmitExecutionRequest {
+    /// Owning group's bare 26-character ULID, for example
+    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. The caller needs write permission on it.
     pub group_id: String,
+    /// OCI image the task runs, for example `docker.io/library/python:3.13-slim`.
+    /// Must not be blank.
     pub image: String,
+    /// Replaces the image ENTRYPOINT. Omit to keep the image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
+    /// Argument vector appended after the entrypoint, for example
+    /// `["python", "/work/script.py"]`. Defaults to empty.
     #[serde(default)]
     pub command: Vec<String>,
+    /// Environment variables for the task. Defaults to empty.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Scheduling tags. `aruna-engine.org/label/<key>` demands a matching target
+    /// label, at most 16 of them. The workspace tags of that namespace are
+    /// reserved and refused. Defaults to empty.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// Absolute working directory inside the container, for example `/work`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// Whole CPU cores reserved. Defaults to 1; `0` is refused and the group's
+    /// compute quota may cap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_cores: Option<u32>,
+    /// RAM reserved in bytes, for example `1073741824` for 1 GiB. Defaults to
+    /// 1 GiB; `0` and anything above 9223372036854775807 are refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_bytes: Option<u64>,
+    /// Wall-clock limit in milliseconds, for example `600000` for ten minutes.
+    /// Defaults to 86400000, one day; the group's compute quota may cap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_walltime_ms: Option<u64>,
+    /// Optional executor selector. Leave unset unless the realm documents one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_constraint: Option<String>,
+    /// Objects staged into the container before the run, at most 512.
     #[serde(default)]
     pub inputs: Vec<ExecutionInputRequest>,
+    /// Container paths captured into the workspace bucket after the run, at
+    /// most 1024.
     #[serde(default)]
     pub outputs: Vec<ExecutionOutputRequest>,
     #[serde(default)]
     /// Workspace prefixes to inventory at completion. Only objects this
     /// execution itself wrote under a prefix are reported: a version another
-    /// writer produced is never attributed to this job.
+    /// writer produced is never attributed to this job. This route declares no
+    /// file outputs, so a non-empty list is refused; leave it empty.
     pub output_prefixes: Vec<String>,
+    /// How a destination key already claimed by another declared input or by an
+    /// object in the workspace bucket is resolved. Defaults to `reject`.
     #[serde(default)]
     pub collision_policy: CollisionPolicyRequest,
+    /// Caller-chosen key that makes a resubmission return the same job instead
+    /// of starting a second one. A different request under a used key is a 409.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Where staged inputs and captured outputs live. Absent means a kept
+    /// workspace in a new bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRequest>,
     /// `realm` (the default) admits the job into the realm; `local` runs it on

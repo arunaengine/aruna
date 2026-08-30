@@ -1,6 +1,6 @@
 use super::context::member_groups;
 use super::{
-    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, internal_error,
+    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     request_auth, server_error, tool_extras,
 };
 use aruna_core::stream::BackendStream;
@@ -49,11 +49,21 @@ pub struct BucketsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListObjectsInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. Three
+    /// to 63 characters of lowercase letters, digits, dots, and hyphens. Call
+    /// `list_buckets` for the readable names; this is not an `s3://` URL and
+    /// carries no key.
     pub bucket: String,
+    /// Optional key prefix filter, for example `reads/2026/`. Matched literally
+    /// from the start of the key, with no wildcards and no leading slash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// Opaque continuation token copied verbatim from the `next_cursor` of a
+    /// previous `list_objects` answer for the same bucket and prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Maximum number of objects to return. Defaults to 100 and is clamped to
+    /// the range 1 to 200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
@@ -77,10 +87,19 @@ pub struct ObjectsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadObjectInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. Call
+    /// `list_buckets` for the readable names; this is not an `s3://` URL.
     pub bucket: String,
+    /// Object key inside the bucket, for example `reads/sample.fastq.gz`.
+    /// Relative, with no leading slash, no `..` segment, and no control
+    /// character. Call `list_objects` for the keys in a bucket.
     pub key: String,
+    /// Byte offset to start reading from. Defaults to 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
+    /// Maximum number of bytes to return. Defaults to 1048576, which is also
+    /// the maximum; a value outside 1 to 1048576 is refused. The answer sets
+    /// `truncated` when the object continues past this window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
 }
@@ -98,9 +117,18 @@ pub struct ReadObjectOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WriteObjectInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. It
+    /// must already exist and the caller needs write permission on it.
     pub bucket: String,
+    /// Object key inside the bucket, for example `notes/summary.md`. Relative,
+    /// with no leading slash, no `..` segment, and no control character. An
+    /// existing key is replaced with a new version.
     pub key: String,
+    /// The full UTF-8 body to store, at most 1048576 bytes. This tool writes
+    /// text only; binary content must go through the S3 surface.
     pub text: String,
+    /// MIME type recorded for the object, for example `application/json`.
+    /// Defaults to `text/plain; charset=utf-8`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
 }
@@ -114,6 +142,7 @@ pub struct WriteObjectOutput {
     pub content_type: String,
 }
 
+/// Which section of the unified search to query.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchKind {
@@ -136,7 +165,14 @@ impl SearchKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchInput {
+    /// Search text, at least two characters after trimming. Matched as a
+    /// substring for buckets, groups, and users, and as a full-text query over
+    /// name, description, keywords, and identifier for documents. Plain terms
+    /// only: boolean operators, quotes, and wildcards are stripped.
     pub q: String,
+    /// Restrict the answer to one section: `documents`, `buckets`, `groups`, or
+    /// `users`. Omit to search all four. Each section returns at most ten hits,
+    /// and the users section is present only for a caller with admin read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<SearchKind>,
 }
@@ -153,7 +189,7 @@ pub(crate) fn toolset() -> rmcp::handler::server::router::tool::ToolRouter<McpSe
 #[tool_router(router = data_router)]
 impl McpServer {
     #[tool(
-        description = "List data buckets readable by the authenticated user on this node",
+        description = "List the buckets on this node that the caller may read, each with its name, owning group_id, and creation time. Call it first to obtain the bucket name that list_objects, read_object, write_object, and run_script require. Buckets are node-local, so a name absent here may still exist on another node. Takes no arguments.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -207,7 +243,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "List up to 200 objects in an Aruna bucket with optional prefix and cursor",
+        description = "List objects in one bucket, each with key, size, etag, last_modified, content_type, and whether it is a reference. Call list_buckets first for a valid bucket name. Narrow the answer with a key prefix, and follow next_cursor for the next page. Use read_object to fetch the text of one key.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -235,7 +271,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(server_error)?;
+        .map_err(|error| object_error(error, "read"))?;
         let cursor = input.cursor.as_deref().map(decode_cursor).transpose()?;
         let limit = input.limit.unwrap_or(100).clamp(1, 200);
         let result = drive(
@@ -316,7 +352,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Read a bounded UTF-8 text range from an Aruna object",
+        description = "Read a bounded UTF-8 text window from one object and return the text with its offset, byte count, content type, and a truncated flag. Call list_objects for a valid key. Use offset and max_bytes to walk a large object; the window is at most 1 MiB. An object that is not valid UTF-8 is refused, so this tool cannot fetch binary content.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -334,7 +370,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Write at most 1 MiB of UTF-8 text to an Aruna object",
+        description = "Write at most 1 MiB of UTF-8 text to one object and return the bucket, key, new version_id, size, and content type. The bucket must already exist and the caller needs write permission on it; call list_buckets for names. The whole body is replaced, creating a new version of an existing key, so read_object first when appending. Use create_dataset for RO-Crate metadata rather than storing it as an object.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn write_object(
@@ -348,7 +384,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Search Aruna documents, buckets, groups, and users through the unified search service",
+        description = "Search across documents, buckets, groups, and users in one call and return the matching sections, each with its hits and paging state. Use it to find something by name when no id is known; use search_datasets for a metadata search that also filters by Profile conformance and group. Document hits carry document_id for get_dataset, bucket hits carry the bucket name for list_objects, and group hits carry group_id. A section the caller may not read is omitted rather than refused.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -403,14 +439,23 @@ impl McpServer {
     }
 }
 
+/// Bucket names are node-local, so a caller needs to be told to look at this
+/// node's list rather than assume the bucket is elsewhere.
+fn missing_bucket() -> CallToolResult {
+    explained(
+        crate::error::ServerError::NotFound,
+        "no bucket with that name exists on this node; call list_buckets for readable names, and \
+         pass the bare bucket name without an s3:// prefix or a key",
+    )
+}
+
 pub(crate) async fn read_text(
     server: &McpServer,
     auth: &AuthContext,
     input: ReadObjectInput,
     extras: aruna_operations::request_policy::PolicyRequestExtras,
 ) -> Result<ReadObjectOutput, CallToolResult> {
-    crate::s3::util::validate_object_key(&input.key)
-        .map_err(|error| bad_request(error.to_string()))?;
+    validate_key(&input.key)?;
     let max_bytes = bounded_bytes(input.max_bytes)?;
     let offset = input.offset.unwrap_or(0);
     let bucket_info = server.bucket_info(&input.bucket).await?;
@@ -428,7 +473,7 @@ pub(crate) async fn read_text(
         extras,
     )
     .await
-    .map_err(server_error)?;
+    .map_err(|error| object_error(error, "read"))?;
     let range = if offset == 0 {
         None
     } else {
@@ -480,7 +525,8 @@ pub(crate) async fn read_text(
     let byte_count = bytes.len();
     let text = String::from_utf8(bytes).map_err(|_| {
         bad_request(format!(
-            "object is not UTF-8 text; content type is {content_type}"
+            "the object is not UTF-8 text and its content type is {content_type}; this tool \
+             returns text only, so fetch binary content through the S3 surface"
         ))
     })?;
     Ok(ReadObjectOutput {
@@ -500,12 +546,14 @@ pub(crate) async fn write_text(
     input: WriteObjectInput,
     extras: aruna_operations::request_policy::PolicyRequestExtras,
 ) -> Result<WriteObjectOutput, CallToolResult> {
-    crate::s3::util::validate_object_key(&input.key)
-        .map_err(|error| bad_request(error.to_string()))?;
+    validate_key(&input.key)?;
     let size = input.text.len();
     if size > MAX_TEXT_BYTES {
         return Err(server_error(crate::error::ServerError::PayloadTooLarge(
-            format!("text exceeds {MAX_TEXT_BYTES} bytes"),
+            format!(
+                "text is {size} bytes and this tool stores at most {MAX_TEXT_BYTES}; split the \
+                 content across keys or upload it through the S3 surface"
+            ),
         )));
     }
     let bucket_info = server.bucket_info(&input.bucket).await?;
@@ -523,7 +571,7 @@ pub(crate) async fn write_text(
         extras,
     )
     .await
-    .map_err(server_error)?;
+    .map_err(|error| object_error(error, "write"))?;
     let content_type = input
         .content_type
         .clone()
@@ -604,22 +652,48 @@ pub(crate) async fn write_text(
     })
 }
 
+fn object_error(error: crate::error::ServerError, action: &str) -> CallToolResult {
+    match error {
+        crate::error::ServerError::Forbidden => explained(
+            error,
+            format!(
+                "the caller holds no {action} permission there; call list_buckets for the \
+                 buckets it may use"
+            ),
+        ),
+        error => server_error(error),
+    }
+}
+
+/// The S3 key rule reads as an opaque `InvalidArgument`; a tool caller needs the
+/// shape a key must have.
+fn validate_key(key: &str) -> Result<(), CallToolResult> {
+    crate::s3::util::validate_object_key(key).map_err(|error| {
+        bad_request(format!(
+            "key is not a valid object key ({}); pass a relative key such as \
+             reads/sample.fastq.gz, with no leading slash, no `..` segment, and no control \
+             character, and call list_objects for existing keys",
+            error.message().unwrap_or_default()
+        ))
+    })
+}
+
 fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
     let max_bytes = max_bytes.unwrap_or(MAX_TEXT_BYTES);
     if !(1..=MAX_TEXT_BYTES).contains(&max_bytes) {
         return Err(bad_request(format!(
-            "max_bytes must be between 1 and {MAX_TEXT_BYTES}"
+            "max_bytes must be between 1 and {MAX_TEXT_BYTES}; omit it to read the full {MAX_TEXT_BYTES} byte window"
         )));
     }
     Ok(max_bytes)
 }
 
 fn decode_cursor(cursor: &str) -> Result<ListObjectsV2ContinuationToken, CallToolResult> {
-    let bytes = STANDARD
-        .decode(cursor)
-        .map_err(|_| bad_request("invalid object cursor"))?;
-    ListObjectsV2ContinuationToken::from_bytes(&bytes)
-        .map_err(|_| bad_request("invalid object cursor"))
+    const REASON: &str = "cursor must be a next_cursor value copied verbatim from a previous \
+                          list_objects answer for the same bucket and prefix; omit it to start at \
+                          the first page";
+    let bytes = STANDARD.decode(cursor).map_err(|_| bad_request(REASON))?;
+    ListObjectsV2ContinuationToken::from_bytes(&bytes).map_err(|_| bad_request(REASON))
 }
 
 fn encode_cursor(cursor: &ListObjectsV2ContinuationToken) -> Result<String, CallToolResult> {
@@ -643,7 +717,7 @@ async fn authorize_search(
 
 fn map_bucket_error(error: GetBucketInfoError) -> CallToolResult {
     match error {
-        GetBucketInfoError::NotFound => server_error(crate::error::ServerError::NotFound),
+        GetBucketInfoError::NotFound => missing_bucket(),
         GetBucketInfoError::StorageError(error) => internal_error(error),
         GetBucketInfoError::ConversionError(error) => internal_error(error),
         GetBucketInfoError::InvalidStateEvent {
@@ -662,10 +736,15 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         GetObjectError::NoSuchKey
         | GetObjectError::NoSuchVersion
         | GetObjectError::DeleteMarker
-        | GetObjectError::HistoricalReferenceUnavailable => {
-            server_error(crate::error::ServerError::NotFound)
-        }
-        error @ GetObjectError::InvalidRange => bad_request(error),
+        | GetObjectError::HistoricalReferenceUnavailable => explained(
+            crate::error::ServerError::NotFound,
+            "the bucket holds no readable object under that key; call list_objects for the keys \
+             it does hold",
+        ),
+        error @ GetObjectError::InvalidRange => bad_request(format!(
+            "{error} offset must be below the object size; call list_objects for the size and \
+             read from offset 0 for a fresh read"
+        )),
         error @ (GetObjectError::ReferenceSourceChanged
         | GetObjectError::ReferenceAdvanceExhausted) => {
             server_error(crate::error::ServerError::Conflict(error.to_string()))

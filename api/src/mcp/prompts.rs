@@ -16,10 +16,17 @@ pub(crate) async fn list_prompts(
         Some("Create a valid Aruna dataset through validation, repair, and durable creation"),
         Some(vec![
             PromptArgument::new("group_id")
-                .with_description("Aruna group ULID that will own the dataset")
+                .with_description(
+                    "Bare 26-character ULID of the group that will own the dataset, for example \
+                     01JZ8Y6T0K4W7M2N9Q5R3S8V1X. Call the list_groups tool for the ids the caller \
+                     may use.",
+                )
                 .with_required(true),
             PromptArgument::new("profile_id")
-                .with_description("Optional Aruna Profile document id")
+                .with_description(
+                    "Optional bare 26-character ULID of a Profile document from the list_profiles \
+                     tool. When given, the crate must conform to that Profile's SHACL rules.",
+                )
                 .with_required(false),
         ]),
     )]))
@@ -31,14 +38,23 @@ pub(crate) async fn get_prompt(
     _context: RequestContext<RoleServer>,
 ) -> Result<GetPromptResponse, ErrorData> {
     if request.name != PROMPT_NAME {
-        return Err(ErrorData::invalid_params("prompt not found", None));
+        return Err(ErrorData::invalid_params(
+            format!("unknown prompt; this server offers only `{PROMPT_NAME}`"),
+            None,
+        ));
     }
     let arguments = request.arguments.unwrap_or_default();
     let group_id = arguments
         .get("group_id")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ErrorData::invalid_params("group_id is required", None))?;
+        .ok_or_else(|| {
+            ErrorData::invalid_params(
+                "group_id is required and must be a bare 26-character ULID such as \
+                 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; call the list_groups tool for a valid id",
+                None,
+            )
+        })?;
     let profile = arguments
         .get("profile_id")
         .and_then(serde_json::Value::as_str)
