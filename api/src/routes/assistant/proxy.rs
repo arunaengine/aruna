@@ -331,7 +331,20 @@ pub(super) async fn fetch_models(
             "provider models request failed".to_string(),
         ));
     }
-    let payload = response.json::<ModelList>().await.map_err(|_| {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            ServerError::BadGatewayReason("provider models response failed".to_string())
+        })?;
+        if chunk.len() > PROXY_BODY_LIMIT.saturating_sub(body.len()) {
+            return Err(ServerError::BadGatewayReason(
+                "provider models response exceeds 4 MiB".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let payload = serde_json::from_slice::<ModelList>(&body).map_err(|_| {
         ServerError::BadGatewayReason("provider models response is invalid".to_string())
     })?;
     Ok(payload
@@ -364,7 +377,7 @@ mod tests {
     use aruna_storage::storage::FjallStorage;
     use axum::body::Bytes;
     use axum::response::IntoResponse;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use futures_util::stream;
     use std::collections::BTreeMap;
@@ -485,6 +498,36 @@ mod tests {
         assert!(!text_model("text-embedding-3-small"));
         assert!(!text_model("gpt-image-1"));
         assert!(text_model("gpt-5.4"));
+    }
+
+    #[tokio::test]
+    async fn bounds_model_response() {
+        let router = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                let chunks = stream::iter([
+                    Ok::<_, std::io::Error>(Bytes::from(vec![b' '; PROXY_BODY_LIMIT])),
+                    Ok(Bytes::from_static(b"x")),
+                ]);
+                Response::new(Body::from_stream(chunks))
+            }),
+        );
+        let (base_url, handle) = spawn_mock(router).await;
+        let (_dir, state, auth) = setup_state().await;
+        let provider = make_provider(
+            &state,
+            &auth,
+            AssistantProviderKind::OpenaiCompatible,
+            base_url,
+            None,
+        );
+
+        let error = fetch_models(&state, &provider).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::BadGatewayReason(message) if message.contains("exceeds")
+        ));
+        handle.abort();
     }
 
     #[tokio::test]
