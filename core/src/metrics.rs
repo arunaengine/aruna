@@ -1,14 +1,9 @@
-//! Per-node Prometheus metrics registry and its extension point.
+//! Per-node Prometheus metrics registry.
 //!
 //! Each node owns one [`NodeMetrics`]. The registry is instance-scoped rather
 //! than process-global so the integration harness can run several full nodes in
-//! one process without their counters merging. In-flight feature branches attach
-//! their own metrics after merge via [`NodeMetrics::register`] /
-//! [`NodeMetrics::register_source`] without touching this module.
+//! one process without their counters merging.
 
-use std::sync::Arc;
-
-use futures::future::BoxFuture;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
@@ -150,17 +145,9 @@ struct BuildInfoLabels {
     version: String,
 }
 
-/// A scrape-time metrics contributor. `refresh` runs before each `/metrics`
-/// encode so probes that must `await` storage can update their gauges; the
-/// sync `Collector` trait cannot express those awaits.
-pub trait MetricsSource: Send + Sync {
-    fn refresh(&self) -> BoxFuture<'_, ()>;
-}
-
 /// Owns a node's Prometheus registry and the built-in request metrics.
 pub struct NodeMetrics {
     registry: RwLock<Registry>,
-    sources: RwLock<Vec<Arc<dyn MetricsSource>>>,
     pub http_requests: Family<RequestLabels, Counter>,
     pub http_request_duration: Family<RouteLabels, Histogram>,
     node_started: Gauge,
@@ -204,7 +191,6 @@ impl NodeMetrics {
 
         Self {
             registry: RwLock::new(registry),
-            sources: RwLock::new(Vec::new()),
             http_requests,
             http_request_duration,
             node_started,
@@ -239,10 +225,6 @@ impl NodeMetrics {
         );
     }
 
-    pub async fn register_source(&self, source: Arc<dyn MetricsSource>) {
-        self.sources.write().await.push(source);
-    }
-
     /// Register a scrape-time [`Collector`] that emits its metrics synchronously
     /// on each encode (used for const counters read from a live snapshot).
     pub async fn register_collector(&self, collector: impl Collector) {
@@ -252,12 +234,8 @@ impl NodeMetrics {
             .register_collector(Box::new(collector));
     }
 
-    /// Refresh every scrape-time source, then encode the registry as text.
+    /// Encodes the registry as Prometheus text.
     pub async fn render(&self) -> String {
-        let sources = self.sources.read().await.clone();
-        for source in &sources {
-            source.refresh().await;
-        }
         let registry = self.registry.read().await;
         let mut buffer = String::new();
         encode(&mut buffer, &registry)
@@ -274,7 +252,6 @@ impl Default for NodeMetrics {
 
 impl std::fmt::Debug for NodeMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The scrape sources are trait objects that do not implement Debug.
         f.debug_struct("NodeMetrics").finish_non_exhaustive()
     }
 }
@@ -282,7 +259,6 @@ impl std::fmt::Debug for NodeMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[tokio::test]
     async fn render_includes_builtin_metrics() {
@@ -344,39 +320,6 @@ mod tests {
             .register("custom_gauge", "late", gauge.clone())
             .await;
         assert!(metrics.render().await.contains("aruna_custom_gauge 7"));
-    }
-
-    #[tokio::test]
-    async fn sources_refresh_before_encode() {
-        struct CountingSource {
-            calls: Arc<AtomicU64>,
-            gauge: Gauge,
-        }
-        impl MetricsSource for CountingSource {
-            fn refresh(&self) -> BoxFuture<'_, ()> {
-                Box::pin(async move {
-                    let next = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-                    self.gauge.set(next as i64);
-                })
-            }
-        }
-
-        let metrics = NodeMetrics::new();
-        let gauge: Gauge = Gauge::default();
-        metrics
-            .register("refreshes", "refresh count", gauge.clone())
-            .await;
-        let calls = Arc::new(AtomicU64::new(0));
-        metrics
-            .register_source(Arc::new(CountingSource {
-                calls: calls.clone(),
-                gauge,
-            }))
-            .await;
-
-        assert!(metrics.render().await.contains("aruna_refreshes 1"));
-        assert!(metrics.render().await.contains("aruna_refreshes 2"));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
