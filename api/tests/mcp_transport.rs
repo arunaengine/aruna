@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -16,7 +18,7 @@ use aruna_core::keyspaces::{
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::{
     Actor, Backend, BackendConfig, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
-    RealmConfigDocument, RealmId, User,
+    RealmId, User,
 };
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::claim_initial_realm_admin::{
@@ -48,7 +50,7 @@ struct Fixture {
     _root: TempDir,
     state: Arc<ServerState>,
     actor: Actor,
-    group_id: Ulid,
+    _group_id: Ulid,
     token: String,
     net: NetHandle,
 }
@@ -211,6 +213,7 @@ async fn setup_fixture() -> Fixture {
             user_id,
             realm_id,
             node_capabilities: capabilities,
+            session: None,
         })
         .unwrap(),
         &context,
@@ -221,7 +224,7 @@ async fn setup_fixture() -> Fixture {
         _root: root,
         state,
         actor,
-        group_id,
+        _group_id: group_id,
         token,
         net,
     }
