@@ -26,6 +26,27 @@ mod resources;
 
 const MCP_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
+/// A bare `serde_json::Value` carries the JSON Schema `true`, which MCP clients
+/// reject wherever a schema object is required. This wrapper serializes
+/// identically and declares an object schema instead.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub struct JsonPayload(pub serde_json::Value);
+
+impl rmcp::schemars::JsonSchema for JsonPayload {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "JsonPayload".into()
+    }
+
+    fn json_schema(_: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        rmcp::schemars::json_schema!({ "type": "object", "additionalProperties": true })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct McpServer {
     pub(crate) state: Arc<ServerState>,
@@ -265,4 +286,74 @@ fn auth_error(status: StatusCode) -> Response {
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    fn all_tools() -> Vec<rmcp::model::Tool> {
+        let mut router = super::context::toolset();
+        router.merge(super::compute::toolset());
+        router.merge(super::data::toolset());
+        router.merge(super::metadata::toolset());
+        router.list_all()
+    }
+
+    fn is_schema_object(value: &Value) -> bool {
+        value.as_object().is_some_and(|object| {
+            ["type", "$ref", "anyOf", "oneOf", "allOf", "enum", "const"]
+                .iter()
+                .any(|key| object.contains_key(*key))
+        })
+    }
+
+    fn check_schema(schema: &Value, label: &str) {
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, property) in properties {
+                assert!(
+                    is_schema_object(property),
+                    "{label} property {name} is not a schema object: {property}"
+                );
+            }
+        }
+        for keyword in ["$defs", "definitions"] {
+            let Some(entries) = schema.get(keyword).and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, entry) in entries {
+                assert!(
+                    is_schema_object(entry),
+                    "{label} {keyword} {name} is not a schema object: {entry}"
+                );
+                check_schema(entry, label);
+            }
+        }
+    }
+
+    #[test]
+    fn schemas_are_objects() {
+        // The portal MCP client validates tools/list and drops every tool when
+        // one schema is not an object schema.
+        for tool in all_tools() {
+            let name = tool.name.as_ref();
+            let input = Value::Object((*tool.input_schema).clone());
+            assert_eq!(
+                input.get("type").and_then(Value::as_str),
+                Some("object"),
+                "{name} inputSchema is not type object: {input}"
+            );
+            check_schema(&input, &format!("{name} inputSchema"));
+            let Some(output) = tool.output_schema else {
+                continue;
+            };
+            let output = Value::Object((*output).clone());
+            assert_eq!(
+                output.get("type").and_then(Value::as_str),
+                Some("object"),
+                "{name} outputSchema is not type object: {output}"
+            );
+            check_schema(&output, &format!("{name} outputSchema"));
+        }
+    }
 }

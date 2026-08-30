@@ -1,7 +1,7 @@
 use super::data::{ReadObjectInput, read_text};
 use super::{
-    McpServer, authorize_tool, bad_request, empty_extras, internal_error, request_auth,
-    server_error, tool_extras,
+    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, internal_error,
+    request_auth, server_error, tool_extras,
 };
 use aruna_core::StructuredId;
 use aruna_core::structs::{
@@ -51,14 +51,14 @@ pub struct DatasetSearchInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ValidateInput {
-    pub rocrate: Value,
+    pub rocrate: JsonPayload,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CreateDatasetInput {
     pub group_id: String,
     pub path: String,
-    pub rocrate: Value,
+    pub rocrate: JsonPayload,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public: Option<bool>,
 }
@@ -66,7 +66,7 @@ pub struct CreateDatasetInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReplaceDatasetInput {
     pub id: String,
-    pub rocrate: Value,
+    pub rocrate: JsonPayload,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public: Option<bool>,
 }
@@ -104,7 +104,7 @@ impl McpServer {
     pub async fn list_profiles(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         metadata_probe(self, &auth, "list_profiles", empty_extras("list_profiles")).await?;
         let response = crate::routes::metadata::run_list_metadata_documents(
@@ -134,9 +134,9 @@ impl McpServer {
             )
             .await?;
         }
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -151,7 +151,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<IdInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let bearer = request_bearer(&parts);
         let (record, crate_value) = load_raw(self, &auth, bearer, &input, "get_profile").await?;
@@ -188,10 +188,10 @@ impl McpServer {
                 turtle.push(artifact.text);
             }
         }
-        Ok(Json(json!({
+        Ok(Json(JsonPayload(json!({
             "profile": crate_value,
             "shacl_turtle": turtle,
-        })))
+        }))))
     }
 
     #[tool(
@@ -206,7 +206,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<DatasetSearchInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("search_datasets", &input)?;
         let group_id = input
@@ -260,9 +260,9 @@ impl McpServer {
             nodes_failed: result.fanout_stats.nodes_failed,
             truncated: result.truncated,
         };
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -277,11 +277,11 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<IdInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let (_, value) =
             load_raw(self, &auth, request_bearer(&parts), &input, "get_dataset").await?;
-        Ok(Json(value))
+        Ok(Json(JsonPayload(value)))
     }
 
     #[tool(
@@ -296,7 +296,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ValidateInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         metadata_probe(
             self,
@@ -305,16 +305,16 @@ impl McpServer {
             tool_extras("validate_dataset", &input)?,
         )
         .await?;
-        let jsonld = crate::routes::metadata::serialize_jsonld_object(&input.rocrate)
+        let jsonld = crate::routes::metadata::serialize_jsonld_object(&input.rocrate.0)
             .map_err(server_error)?;
         let preview = preview_submission(&self.state.get_ctx(), &jsonld)
             .await
             .map_err(crate::routes::metadata::map_metadata_error)
             .map_err(server_error)?;
         let response = crate::routes::metadata::ProfileValidationPreviewResponse::from(preview);
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -325,7 +325,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<CreateDatasetInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("create_dataset", &input)?;
         let group_id = crate::auth::parse_group_id(&input.group_id).map_err(server_error)?;
@@ -333,7 +333,7 @@ impl McpServer {
         if path.is_empty() {
             return Err(bad_request("dataset path must not be empty"));
         }
-        let jsonld = crate::routes::metadata::serialize_jsonld_object(&input.rocrate)
+        let jsonld = crate::routes::metadata::serialize_jsonld_object(&input.rocrate.0)
             .map_err(server_error)?;
         let ctx = self.state.get_ctx();
         let realm = load_realm_config(ctx.as_ref(), self.state.get_realm_id())
@@ -428,7 +428,9 @@ impl McpServer {
         )
         .await;
         let summary = crate::routes::metadata::MetadataDocumentSummary::from(&record);
-        Ok(Json(serde_json::to_value(summary).map_err(internal_error)?))
+        Ok(Json(JsonPayload(
+            serde_json::to_value(summary).map_err(internal_error)?,
+        )))
     }
 
     #[tool(
@@ -439,11 +441,11 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ReplaceDatasetInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let document_id =
             crate::routes::metadata::parse_document_id(&input.id).map_err(server_error)?;
-        let jsonld = crate::routes::metadata::serialize_jsonld_object(&input.rocrate)
+        let jsonld = crate::routes::metadata::serialize_jsonld_object(&input.rocrate.0)
             .map_err(server_error)?;
         let extras = tool_extras("replace_dataset", &input)?;
         let record = crate::routes::metadata::local_write_record(
@@ -475,7 +477,9 @@ impl McpServer {
         .map_err(crate::routes::metadata::map_metadata_write_error)
         .map_err(server_error)?;
         let summary = crate::routes::metadata::MetadataDocumentSummary::from(&updated);
-        Ok(Json(serde_json::to_value(summary).map_err(internal_error)?))
+        Ok(Json(JsonPayload(
+            serde_json::to_value(summary).map_err(internal_error)?,
+        )))
     }
 
     #[tool(
@@ -490,7 +494,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<SparqlInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("sparql_query", &input)?;
         let bearer = request_bearer(&parts).map(|carrier| carrier.as_str().to_string());
@@ -547,9 +551,9 @@ impl McpServer {
         let response =
             crate::routes::metadata::map_query_results(execution.results, execution.fanout_stats)
                 .map_err(server_error)?;
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -564,7 +568,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ReferencesInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         metadata_probe(
             self,
@@ -588,9 +592,9 @@ impl McpServer {
         .map_err(crate::routes::metadata::map_metadata_api_error)
         .map_err(server_error)?;
         let response = crate::routes::metadata::map_references_response(execution);
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 }
 

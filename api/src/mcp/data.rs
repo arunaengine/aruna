@@ -1,7 +1,7 @@
 use super::context::member_groups;
 use super::{
-    McpServer, authorize_tool, bad_request, empty_extras, internal_error, request_auth,
-    server_error, tool_extras,
+    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, internal_error,
+    request_auth, server_error, tool_extras,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -143,7 +143,7 @@ pub struct SearchInput {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SearchOutput {
-    pub results: serde_json::Value,
+    pub results: JsonPayload,
 }
 
 pub(crate) fn toolset() -> rmcp::handler::server::router::tool::ToolRouter<McpServer> {
@@ -386,7 +386,9 @@ impl McpServer {
         .await
         .map_err(server_error)?;
         let results = serde_json::to_value(response).map_err(internal_error)?;
-        Ok(Json(SearchOutput { results }))
+        Ok(Json(SearchOutput {
+            results: JsonPayload(results),
+        }))
     }
 
     async fn bucket_info(&self, bucket: &str) -> Result<BucketInfo, CallToolResult> {

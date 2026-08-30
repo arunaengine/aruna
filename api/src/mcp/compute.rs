@@ -1,7 +1,7 @@
 use super::data::{WriteObjectInput, write_text};
 use super::{
-    McpServer, authorize_tool, bad_request, empty_extras, internal_error, request_auth,
-    server_error, tool_extras,
+    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, internal_error,
+    request_auth, server_error, tool_extras,
 };
 use aruna_core::compute::runtimes::{QUICK_RUNTIMES, QuickRuntime, quick_runtime};
 use aruna_core::structs::{JobPayload, Permission, blob_group_permission_path};
@@ -14,7 +14,6 @@ use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
@@ -148,7 +147,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<RunScriptInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("run_script", &input)?;
         let run_id = Ulid::generate().to_string();
@@ -199,9 +198,9 @@ impl McpServer {
         )
         .await
         .map_err(server_error)?;
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -212,7 +211,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<SubmitJobInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("submit_job", &input)?;
         let (_, response) = crate::routes::jobs::submit_execution(
@@ -224,9 +223,9 @@ impl McpServer {
         )
         .await
         .map_err(server_error)?;
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -241,7 +240,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<GetJobInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         compute_probe(
             self,
@@ -278,9 +277,9 @@ impl McpServer {
                 response.run_crate = routed.run_crate;
                 response
             };
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -295,7 +294,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ListJobsInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("list_jobs", &input)?;
         let group_id = input
@@ -356,9 +355,9 @@ impl McpServer {
                 .collect(),
             next_cursor: crate::routes::jobs::encode_cursor(next_cursor),
         };
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 
     #[tool(
@@ -373,7 +372,7 @@ impl McpServer {
         &self,
         Extension(parts): Extension<http::request::Parts>,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<GetJobInput>,
-    ) -> Result<Json<Value>, CallToolResult> {
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         compute_probe(
             self,
@@ -401,9 +400,9 @@ impl McpServer {
             RoutedCancelOutcome::AlreadyTerminal(job) | RoutedCancelOutcome::Requested(job) => job,
         };
         let response = crate::routes::jobs::job_view_response(&job);
-        Ok(Json(
+        Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
-        ))
+        )))
     }
 }
 
@@ -510,9 +509,11 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
         .iter()
         .map(|(key, value)| ((*key).to_string(), format!("{WORKDIR}/{value}")))
         .collect();
-    let tags = (!dependencies.is_empty())
-        .then(|| BTreeMap::from([(NETWORK_TAG.to_string(), "open".to_string())]))
-        .unwrap_or_default();
+    let tags = if dependencies.is_empty() {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([(NETWORK_TAG.to_string(), "open".to_string())])
+    };
     Ok(ScriptPlan {
         script_key,
         script_text,
