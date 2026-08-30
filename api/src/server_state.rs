@@ -37,9 +37,10 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +55,70 @@ pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 pub(crate) const DOWNLOAD_SLOTS: usize = 256;
+
+#[derive(Debug)]
+struct PublicDns;
+
+impl Resolve for PublicDns {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect::<Vec<_>>();
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|address| !public_address(address.ip()))
+            {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "assistant provider DNS resolved to a non-public address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
+pub(crate) fn public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => public_ipv4(address),
+        IpAddr::V6(address) => public_ipv6(address),
+    }
+}
+
+fn public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, d] = address.octets();
+    !(a == 0
+        || address.is_private()
+        || (a == 100 && b & 0xc0 == 0x40)
+        || address.is_loopback()
+        || address.is_link_local()
+        || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+        || address.is_documentation()
+        || (a == 198 && b & 0xfe == 18)
+        || address.is_multicast()
+        || a & 0xf0 == 0xf0)
+}
+
+fn public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    // Server-side providers use currently assigned global unicast space only.
+    segments[0] & 0xe000 == 0x2000
+        && !matches!(segments, [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..])
+        && !matches!(segments, [0x2002, ..])
+        && !(matches!(segments, [0x2001, b, ..] if b < 0x200)
+            && !(u128::from_be_bytes(address.octets())
+                == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                || u128::from_be_bytes(address.octets())
+                    == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                || matches!(segments, [0x2001, 3, ..] | [0x2001, 4, 0x112, ..])
+                || matches!(segments, [0x2001, b, ..] if (0x20..=0x3f).contains(&b))))
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerState {
     // Contains neccessary drivers for request handling
@@ -192,6 +257,14 @@ impl ServerState {
             .as_ref()
             .map(|net| net.credential_seal_key())
             .unwrap_or_else(CredentialSealKey::random);
+        let assistant_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none());
+        let assistant_client = if matches!(&node_capabilities, NodeCapabilities::User { .. }) {
+            assistant_client
+        } else {
+            assistant_client.no_proxy().dns_resolver(PublicDns)
+        };
         let state = Self {
             driver_ctx,
             realm_id,
@@ -216,11 +289,7 @@ impl ServerState {
             device_wipe: None,
             management_urls: Arc::new(RwLock::new(ManagementUrlCache::default())),
             assistant_proxy: true,
-            assistant_client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .ok(),
+            assistant_client: assistant_client.build().ok(),
             chatgpt_issuer: "https://auth.openai.com".to_string(),
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         };
@@ -798,9 +867,10 @@ fn client_host_from_ip(ip: std::net::IpAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RestInterfaceRuntime, client_base_url_from_advertised_host,
-        client_base_url_from_bind_address,
+        PublicDns, RestInterfaceRuntime, client_base_url_from_advertised_host,
+        client_base_url_from_bind_address, public_address,
     };
+    use reqwest::dns::Resolve;
 
     #[test]
     fn rest_runtime_uses_public_url() {
@@ -811,6 +881,33 @@ mod tests {
         assert_eq!(
             runtime.api_base_url,
             "https://api.node-1.v3.aruna-engine.org/api/v1"
+        );
+    }
+
+    #[test]
+    fn classifies_public_addresses() {
+        assert!(public_address("8.8.8.8".parse().unwrap()));
+        assert!(public_address("2001:4860:4860::8888".parse().unwrap()));
+        for address in [
+            "127.0.0.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "::1",
+            "fc00::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!public_address(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_rejects_localhost() {
+        assert!(
+            PublicDns
+                .resolve("localhost".parse().unwrap())
+                .await
+                .is_err()
         );
     }
 

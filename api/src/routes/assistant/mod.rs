@@ -26,7 +26,6 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use ulid::Ulid;
 use url::{Host, Url};
@@ -147,26 +146,6 @@ fn parse_provider_kind(kind: &str) -> ServerResult<AssistantProviderKind> {
     }
 }
 
-fn private_ipv4(address: Ipv4Addr) -> bool {
-    address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || address.is_broadcast()
-        || address.is_documentation()
-}
-
-fn private_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    address.is_loopback()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80
-        || address.to_ipv4_mapped().is_some_and(private_ipv4)
-}
-
 pub(super) fn validate_base_url(state: &ServerState, input: &str) -> ServerResult<String> {
     validate_url_mode(input, state.is_user_node())
 }
@@ -199,8 +178,8 @@ fn validate_url_mode(input: &str, user_node: bool) -> ServerResult<String> {
                     ));
                 }
             }
-            Some(Host::Ipv4(address)) if !private_ipv4(address) => {}
-            Some(Host::Ipv6(address)) if !private_ipv6(address) => {}
+            Some(Host::Ipv4(address)) if crate::server_state::public_address(address.into()) => {}
+            Some(Host::Ipv6(address)) if crate::server_state::public_address(address.into()) => {}
             _ => {
                 return Err(ServerError::BadRequestReason(
                     "server nodes require a public base_url host".to_string(),
