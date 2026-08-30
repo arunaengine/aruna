@@ -21,8 +21,8 @@ use aruna_core::structs::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -185,13 +185,9 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn current_timestamp_ms() -> u64 {
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
-    }
-
     fn updated_record(&self, mut record: MetadataRegistryRecord) -> MetadataRegistryRecord {
         record.public = self.config.public;
-        record.updated_at_ms = Self::current_timestamp_ms();
+        record.updated_at_ms = unix_timestamp_millis();
         record
     }
 
@@ -324,7 +320,7 @@ impl UpdateMetadataDocumentOperation {
         let Some(event) = self.update_event.as_ref() else {
             return Err(UpdateMetadataDocumentError::MissingTransaction);
         };
-        let now = Self::current_timestamp_ms();
+        let now = unix_timestamp_millis();
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.

@@ -16,7 +16,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::TxnId;
-use chrono::Utc;
+use aruna_core::util::unix_timestamp_millis as now_ms;
 use craqle::{CrateViolation, ShaclValidationResult};
 use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxttl::NQuadsParser;
@@ -959,10 +959,6 @@ fn unavailable_error(code: &str, message: &str, revision: Option<Ulid>) -> Metad
         profile_revision: revision,
         completeness: MetadataProfileValidationCompleteness::Incomplete,
     }])
-}
-
-fn now_ms() -> u64 {
-    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
 #[cfg(test)]

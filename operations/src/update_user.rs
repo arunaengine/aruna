@@ -25,9 +25,9 @@ use aruna_core::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
     validate_user_attribute_value,
 };
+use aruna_core::util::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
-use chrono::Utc;
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -661,10 +661,6 @@ impl Operation for UpdateUserOperation {
             _ => smallvec![],
         }
     }
-}
-
-fn current_timestamp_ms() -> u64 {
-    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
 fn local_user_document_sync_change(

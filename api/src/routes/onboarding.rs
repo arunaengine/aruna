@@ -12,6 +12,7 @@ use aruna_core::structs::{
     AuthContext, NodeCapabilities, Permission, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
     StaticRealmEndpoint,
 };
+use aruna_core::util::unix_timestamp_secs as now_timestamp;
 use aruna_operations::bootstrap_onboarding_finalize::{
     BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
     bootstrap_onboarding_finalize,
@@ -940,10 +941,6 @@ fn declared_endpoints(config: &RealmConfigDocument, joiner: &str) -> Vec<StaticR
         })
         .cloned()
         .collect()
-}
-
-fn now_timestamp() -> u64 {
-    chrono::Utc::now().timestamp().max(0) as u64
 }
 
 fn map_consume_error(error: ConsumeOnboardingSecretError) -> ServerError {

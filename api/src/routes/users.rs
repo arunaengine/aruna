@@ -8,6 +8,7 @@ use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
     Role, SessionKind, User,
 };
+use aruna_core::util::unix_timestamp_secs as now_timestamp;
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
@@ -273,10 +274,6 @@ impl From<User> for RegisterUserResponse {
             id: value.user_id.to_string(),
         }
     }
-}
-
-fn now_timestamp() -> u64 {
-    chrono::Utc::now().timestamp().max(0) as u64
 }
 
 fn map_consume_onboarding_error(error: ConsumeOnboardingSecretError) -> ServerError {

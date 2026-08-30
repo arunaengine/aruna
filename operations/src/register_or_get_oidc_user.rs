@@ -17,9 +17,9 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::util::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
-use chrono::Utc;
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -549,10 +549,6 @@ fn apply_admin_reducer_operation(
     };
     state.apply(&event)?;
     Ok(event)
-}
-
-fn current_timestamp_ms() -> u64 {
-    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
 fn initial_user_document_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentSyncChange {

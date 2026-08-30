@@ -25,8 +25,8 @@ use aruna_core::structs::{
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
 use aruna_core::types::{Effects, GroupId, TxnId, Value};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{MetaResourceId, StructuredId};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -242,10 +242,6 @@ impl CreateMetadataDocumentOperation {
         )
     }
 
-    fn current_timestamp_ms() -> u64 {
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
-    }
-
     fn holder_node_ids(
         &self,
         config: Option<&RealmConfigDocument>,
@@ -292,7 +288,7 @@ impl CreateMetadataDocumentOperation {
         holder_node_ids: Vec<NodeId>,
         placement: PlacementRef,
     ) -> MetadataRegistryRecord {
-        let now = Self::current_timestamp_ms();
+        let now = unix_timestamp_millis();
         MetadataRegistryRecord {
             realm_id: self.config.actor.realm_id,
             group_id: self.config.group_id,
