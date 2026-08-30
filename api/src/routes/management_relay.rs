@@ -46,9 +46,11 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/onboarding/secrets"),
     ("GET", "/info/realm/placement"),
     ("GET", "/onboarding/secrets/{id}/status"),
+    ("GET", "/users/token"),
     ("PATCH", "/info/realm/placement"),
     ("POST", "/admin/onboarding/secrets"),
     ("POST", "/onboarding/bootstrap"),
+    ("POST", "/users/sessions"),
     ("PUT", "/admin/compute/config"),
     ("PUT", "/info/realm/quota"),
     ("PUT", "/policies/realm"),
@@ -325,6 +327,14 @@ mod tests {
                 false
             ),
             Some("/admin/onboarding/secrets/{id}")
+        );
+        assert_eq!(
+            relay_route(&Method::GET, Some("/api/v1/users/token"), false, false),
+            Some("/users/token")
+        );
+        assert_eq!(
+            relay_route(&Method::POST, Some("/api/v1/users/sessions"), false, false),
+            Some("/users/sessions")
         );
         // Node-local admin routes stay on the node they were called on.
         assert_eq!(
