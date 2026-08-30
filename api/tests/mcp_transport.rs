@@ -312,7 +312,19 @@ async fn mcp_transport_contract() {
             CallToolRequestParams::new("validate_dataset").with_arguments(arguments(json!({
                 "rocrate": {
                     "@context": "https://w3id.org/ro/crate/1.3/context",
-                    "@graph": []
+                    "@graph": [
+                        {
+                            "@id": "ro-crate-metadata.json",
+                            "@type": "CreativeWork",
+                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.3" },
+                            "about": { "@id": "./" }
+                        },
+                        {
+                            "@id": "./",
+                            "@type": "Dataset",
+                            "name": "Incomplete dataset"
+                        }
+                    ]
                 }
             }))),
         )
