@@ -1,4 +1,4 @@
-use super::index::{decode_index, encode_index, owner_key};
+use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
 use crate::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::compute::Secret;
@@ -38,7 +38,8 @@ enum CreateSessionState {
     Init,
     StartTransaction,
     ReadOwnerIndex,
-    ReadSession { index: BTreeSet<String> },
+    ReadSessions { index: BTreeSet<String> },
+    DeleteStale { index: BTreeSet<String> },
     WriteSession,
     CommitTransaction,
     Finish,
@@ -57,6 +58,10 @@ pub enum CreateSessionError {
     InvalidExpiry,
     #[error("session id collision")]
     IdCollision,
+    #[error("session owner index is inconsistent")]
+    IndexInconsistent,
+    #[error("active session limit reached")]
+    LimitReached,
     #[error("session operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]
@@ -174,33 +179,101 @@ impl CreateSessionOperation {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected("owner index read", event);
         };
-        let mut index = match decode_index(value.as_ref()) {
+        let index = match decode_index(value.as_ref()) {
             Ok(index) => index,
             Err(error) => return self.emit_error(error.into()),
         };
-        if !index.insert(self.sid.clone()) {
+        if index.contains(&self.sid) {
             return self.emit_error(CreateSessionError::IdCollision);
         }
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
-        self.state = CreateSessionState::ReadSession {
+        let mut reads = index
+            .iter()
+            .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.as_bytes().into()))
+            .collect::<Vec<_>>();
+        reads.push((
+            USER_SESSION_KEYSPACE.to_string(),
+            self.sid.as_bytes().into(),
+        ));
+        self.state = CreateSessionState::ReadSessions {
             index: index.clone(),
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SESSION_KEYSPACE.to_string(),
-            key: self.sid.as_bytes().into(),
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
             txn_id: Some(txn_id),
         })]
     }
 
-    fn handle_session(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected("session read", event);
+    fn handle_sessions(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected("session records read", event);
         };
-        if value.is_some() {
-            return self.emit_error(CreateSessionError::IdCollision);
+        if values.len() != index.len() + 1 {
+            return self.emit_error(CreateSessionError::IndexInconsistent);
         }
+        let mut active = BTreeSet::new();
+        let mut stale = BTreeSet::new();
+        let mut pending_seen = false;
+        for (key, value) in values {
+            if key.as_ref() == self.sid.as_bytes() {
+                if pending_seen || value.is_some() {
+                    return self.emit_error(CreateSessionError::IdCollision);
+                }
+                pending_seen = true;
+                continue;
+            }
+            let Some(value) = value else {
+                return self.emit_error(CreateSessionError::IndexInconsistent);
+            };
+            let session = match UserSession::from_bytes(value.as_ref()) {
+                Ok(session) => session,
+                Err(error) => return self.emit_error(error.into()),
+            };
+            if session.user_id != self.config.user_id
+                || session.sid.as_bytes() != key.as_ref()
+                || !index.contains(&session.sid)
+            {
+                return self.emit_error(CreateSessionError::IndexInconsistent);
+            }
+            if session.revoked || session.expires_at <= self.config.time {
+                stale.insert(session.sid);
+            } else {
+                active.insert(session.sid);
+            }
+        }
+        if !pending_seen || active.len() + stale.len() != index.len() {
+            return self.emit_error(CreateSessionError::IndexInconsistent);
+        }
+        if active.len() >= MAX_USER_SESSIONS {
+            return self.emit_error(CreateSessionError::LimitReached);
+        }
+        active.insert(self.sid.clone());
+        if stale.is_empty() {
+            return self.write_session(active);
+        }
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(StorageError::TransactionNotFound.into());
+        };
+        self.state = CreateSessionState::DeleteStale { index: active };
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes: stale
+                .into_iter()
+                .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.as_bytes().into()))
+                .collect(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_deleted(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.unexpected("stale sessions deleted", event);
+        };
+        self.write_session(index)
+    }
+
+    fn write_session(&mut self, index: BTreeSet<String>) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
@@ -283,7 +356,8 @@ impl Operation for CreateSessionOperation {
             CreateSessionState::Init => self.start(),
             CreateSessionState::StartTransaction => self.handle_started(event),
             CreateSessionState::ReadOwnerIndex => self.handle_index(event),
-            CreateSessionState::ReadSession { index } => self.handle_session(event, index),
+            CreateSessionState::ReadSessions { index } => self.handle_sessions(event, index),
+            CreateSessionState::DeleteStale { index } => self.handle_deleted(event, index),
             CreateSessionState::WriteSession => self.handle_written(event),
             CreateSessionState::CommitTransaction => self.handle_committed(event),
             CreateSessionState::Finish | CreateSessionState::Error => smallvec![],
@@ -313,6 +387,48 @@ impl Operation for CreateSessionOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::keys::generate_signing_key;
+
+    fn session_config() -> CreateSessionConfig {
+        let signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        CreateSessionConfig {
+            time: 100,
+            expiry: 200,
+            user_id: UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            realm_id,
+            node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
+            kind: SessionKind::Portal,
+            label: None,
+        }
+    }
+
+    fn session_record(
+        config: &CreateSessionConfig,
+        sid: String,
+        expires_at: u64,
+        revoked: bool,
+    ) -> UserSession {
+        UserSession {
+            sid,
+            user_id: config.user_id,
+            kind: SessionKind::Portal,
+            label: None,
+            created_at: 1,
+            expires_at,
+            token_hash: "a".repeat(64),
+            revoked,
+        }
+    }
+
+    fn begin_read(operation: &mut CreateSessionOperation, index: &BTreeSet<String>, txn_id: TxnId) {
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: owner_key(operation.config.user_id),
+            value: Some(encode_index(index).unwrap()),
+        }));
+    }
 
     #[test]
     fn bounds_parent_expiry() {
@@ -322,5 +438,99 @@ mod tests {
             bound_session_expiry(100, Some(0), 500),
             Err(CreateSessionError::InvalidExpiry)
         );
+    }
+
+    #[test]
+    fn prunes_stale_sessions() {
+        let config = session_config();
+        let expired_sid = Ulid::from_parts(1, 1).to_string();
+        let revoked_sid = Ulid::from_parts(2, 2).to_string();
+        let pending_sid = Ulid::from_parts(3, 3).to_string();
+        let index = BTreeSet::from([expired_sid.clone(), revoked_sid.clone()]);
+        let mut operation =
+            CreateSessionOperation::new_with_sid(config.clone(), pending_sid.clone());
+        let txn_id = Ulid::from_bytes([6; 16]);
+        begin_read(&mut operation, &index, txn_id);
+
+        let deleted = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    expired_sid.as_bytes().into(),
+                    Some(
+                        session_record(&config, expired_sid.clone(), 99, false)
+                            .to_bytes()
+                            .unwrap()
+                            .into(),
+                    ),
+                ),
+                (
+                    revoked_sid.as_bytes().into(),
+                    Some(
+                        session_record(&config, revoked_sid.clone(), 200, true)
+                            .to_bytes()
+                            .unwrap()
+                            .into(),
+                    ),
+                ),
+                (pending_sid.as_bytes().into(), None),
+            ],
+        }));
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = deleted.as_slice()
+        else {
+            panic!("stale session records must be deleted");
+        };
+        assert_eq!(
+            deletes
+                .iter()
+                .map(|(_, key)| key.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([expired_sid.as_bytes().into(), revoked_sid.as_bytes().into()])
+        );
+
+        let written = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice() else {
+            panic!("the new session and bounded index must be written together");
+        };
+        let stored_index = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == USER_SESSION_OWNER_KEYSPACE)
+            .map(|(_, _, value)| value)
+            .unwrap();
+        assert_eq!(
+            decode_index(Some(stored_index)).unwrap(),
+            BTreeSet::from([pending_sid])
+        );
+    }
+
+    #[test]
+    fn rejects_session_limit() {
+        let config = session_config();
+        let pending_sid = Ulid::from_parts(1_000, 1_000).to_string();
+        let mut index = BTreeSet::new();
+        let mut values = Vec::new();
+        for value in 0..MAX_USER_SESSIONS {
+            let sid = Ulid::from_parts(value as u64, value as u128).to_string();
+            index.insert(sid.clone());
+            values.push((
+                sid.as_bytes().into(),
+                Some(
+                    session_record(&config, sid, 200, false)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                ),
+            ));
+        }
+        values.push((pending_sid.as_bytes().into(), None));
+        let mut operation = CreateSessionOperation::new_with_sid(config, pending_sid);
+        begin_read(&mut operation, &index, Ulid::from_bytes([6; 16]));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateSessionError::LimitReached)
+        ));
     }
 }

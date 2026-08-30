@@ -86,6 +86,9 @@ fn map_create_error(error: CreateSessionError) -> ServerError {
         CreateSessionError::InvalidExpiry => {
             ServerError::BadRequestReason("session expiry is invalid".to_string())
         }
+        CreateSessionError::LimitReached => {
+            ServerError::Conflict("active session limit reached".to_string())
+        }
         error => ServerError::InternalError(error.to_string()),
     }
 }
@@ -114,13 +117,14 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
     path = "/users/sessions",
     tag = "sessions",
     summary = "Create a user bearer session",
-    description = "Creates a self-scoped bearer session. Bound assistant and API sessions can create only their own kind. The lifetime is capped by the caller's remaining lifetime and 24 hours. The token is shown only once.",
+    description = "Creates a self-scoped bearer session. Bound assistant and API sessions can create only their own kind. The lifetime is capped by the caller's remaining lifetime and 24 hours. Expired and revoked history is pruned before enforcing a limit of 256 active sessions. The token is shown only once.",
     request_body = CreateSessionRequest,
     responses(
         (status = 201, description = "Session created", body = CreateSessionResponse),
         (status = 400, description = "Invalid kind or lifetime", body = ErrorResponse),
         (status = 401, description = "No usable bearer token", body = ErrorResponse),
-        (status = 403, description = "Restricted or foreign bearer token", body = ErrorResponse)
+        (status = 403, description = "Restricted or foreign bearer token", body = ErrorResponse),
+        (status = 409, description = "Active session limit reached", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

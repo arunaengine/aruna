@@ -40,7 +40,7 @@ use aruna_operations::remove_device_node::{
 };
 use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
-use aruna_operations::session::{CreateSessionConfig, CreateSessionOperation};
+use aruna_operations::session::{CreateSessionConfig, CreateSessionError, CreateSessionOperation};
 use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -320,7 +320,12 @@ async fn issue_user_session(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| match err {
+        CreateSessionError::LimitReached => {
+            ServerError::Conflict("active session limit reached".to_string())
+        }
+        error => ServerError::InternalError(error.to_string()),
+    })?;
     Ok(created.token.expose().to_string())
 }
 
@@ -669,6 +674,7 @@ on behalf of somebody else.
 - The issued token is a realm bearer credential valid for 24 hours.
 - The issued token preserves a bound Aruna session's kind; OIDC and legacy unbound callers receive
   a `portal` session.
+- Issuance prunes expired and revoked session history and refuses when 256 active sessions remain.
 - It is returned only in this response and is not retrievable afterwards, so a lost token has to
   be reissued here.
 
@@ -685,7 +691,8 @@ an alias rather than the canonical user of that OIDC subject."#,
         ),
         (status = 400, description = "Not produced by this operation; a request that cannot be authenticated is answered with 401 or 403 instead", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented, the OIDC token failed validation, or this node knows no user for the presented identity", body = ErrorResponse),
-        (status = 403, description = "The presented access token carries path restrictions, or its subject is an alias of the canonical user of that OIDC subject", body = ErrorResponse)
+        (status = 403, description = "The presented access token carries path restrictions, or its subject is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 409, description = "Active session limit reached", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
