@@ -22,6 +22,11 @@ Context:
 
 - `whoami`: Return the caller id, display name when available, realm roles, and group roles.
 - `list_groups`: List the caller's groups and assigned roles.
+- `get_group`: Read one realm group by id with its display name and full role list.
+- `list_group_members`: List a group's members and the roles that assign them.
+- `get_group_usage`: Read a group's local and realm-wide storage usage, document counts, and quota status.
+- `get_realm_info`: Describe the realm, its nodes, OIDC providers, quota configuration, and endpoints.
+- `get_node_info`: Describe this node's version, capabilities, addresses, and service status.
 
 Data:
 
@@ -69,7 +74,9 @@ Every tool authorization supplies `request.operation = "mcp:<tool>"`, string-val
 request.operation.startsWith("mcp:")
 ```
 
-The MCP layer does not grant access. Each tool also uses the permission and canonical path used by the corresponding REST or S3 operation.
+The MCP layer does not grant access. Each tool also uses the permission and canonical path used by the corresponding REST or S3 operation. Directory reads such as `whoami`, `list_groups`, `get_group`, `list_group_members`, `get_group_usage`, `get_realm_info`, and `get_node_info` carry no permission path in REST either, so they are gated by the realm request policies and by the membership rule the route enforces itself.
+
+Every tool declares an `outputSchema` of `type: "object"`. Tools that return a REST response shape declare a permissive object schema rather than the response type, because that shape is not generated from a schema.
 
 ## Client configuration
 

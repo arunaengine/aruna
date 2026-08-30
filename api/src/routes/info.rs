@@ -1066,6 +1066,13 @@ pub async fn get_realm_info(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<RealmInfoResponse>)> {
+    Ok((StatusCode::OK, Json(run_realm_info(&state, auth).await?)))
+}
+
+pub(crate) async fn run_realm_info(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> ServerResult<RealmInfoResponse> {
     let config = drive(
         GetRealmConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1079,7 +1086,7 @@ pub async fn get_realm_info(
     })?;
     let realm_authenticated = auth.is_some_and(|auth| auth.realm_id == state.get_realm_id());
 
-    let mut interfaces = interface_services_status(&state).await;
+    let mut interfaces = interface_services_status(state).await;
     if !realm_authenticated {
         interfaces.rest.bind = None;
         interfaces.s3.bind = None;
@@ -1111,9 +1118,9 @@ pub async fn get_realm_info(
         nodes_configured: u64::try_from(config.nodes.len()).ok(),
     });
 
-    let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
+    let node_info_docs = load_node_info_documents_best_effort(state, &config).await;
     let mut management_urls = management_urls(
-        &state,
+        state,
         &config,
         &node_info_docs,
         interfaces.rest.url.as_deref(),
@@ -1125,7 +1132,7 @@ pub async fn get_realm_info(
     }
 
     let (discovery, nodes, quota) = if realm_authenticated {
-        let present_nodes = load_realm_presence_best_effort(&state).await;
+        let present_nodes = load_realm_presence_best_effort(state).await;
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
         let contacts = state
@@ -1135,7 +1142,7 @@ pub async fn get_realm_info(
             .map(MetadataHandle::peer_contacts)
             .unwrap_or_default();
         let nodes = map_realm_nodes(
-            &state,
+            state,
             &config,
             present_nodes,
             node_info_docs,
@@ -1151,31 +1158,28 @@ pub async fn get_realm_info(
         (None, Vec::new(), None)
     };
 
-    Ok((
-        StatusCode::OK,
-        Json(RealmInfoResponse {
-            realm_id: config.realm_id.to_string(),
-            description: config.description,
-            metadata_replication,
-            oidc_providers: config
-                .oidc_providers
-                .into_iter()
-                .map(|provider| RealmOidcProviderResponse {
-                    id: provider.id,
-                    issuer: provider.issuer,
-                    audience: provider.audience,
-                    discovery_url: provider.discovery_url,
-                })
-                .collect(),
-            public_overview,
-            is_management_node: state.is_management_node(),
-            management_urls,
-            discovery,
-            nodes,
-            quota,
-            interfaces,
-        }),
-    ))
+    Ok(RealmInfoResponse {
+        realm_id: config.realm_id.to_string(),
+        description: config.description,
+        metadata_replication,
+        oidc_providers: config
+            .oidc_providers
+            .into_iter()
+            .map(|provider| RealmOidcProviderResponse {
+                id: provider.id,
+                issuer: provider.issuer,
+                audience: provider.audience,
+                discovery_url: provider.discovery_url,
+            })
+            .collect(),
+        public_overview,
+        is_management_node: state.is_management_node(),
+        management_urls,
+        discovery,
+        nodes,
+        quota,
+        interfaces,
+    })
 }
 
 /// Every management node of the realm with the api url it published, in
@@ -2246,11 +2250,15 @@ pub async fn get_info(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> (StatusCode, Json<InfoResponse>) {
-    let access = info_access(&state, auth.as_ref()).await;
+    (StatusCode::OK, Json(run_node_info(&state, auth).await))
+}
+
+pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>) -> InfoResponse {
+    let access = info_access(state, auth.as_ref()).await;
     let realm = access != InfoAccess::Public;
     let admin = access == InfoAccess::Admin;
 
-    let mut interfaces = interface_services_status(&state).await;
+    let mut interfaces = interface_services_status(state).await;
     if !realm {
         interfaces.rest.bind = None;
         interfaces.s3.bind = None;
@@ -2280,7 +2288,7 @@ pub async fn get_info(
     };
 
     if !realm {
-        return (StatusCode::OK, Json(response));
+        return response;
     }
 
     let ctx = state.get_ctx();
@@ -2337,7 +2345,7 @@ pub async fn get_info(
                     io: info.timeouts.control_plane_io_timeout.as_secs(),
                     transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
                 }),
-                backends: backend_statuses(&state, info.backends).await,
+                backends: backend_statuses(state, info.backends).await,
             },
             None => BlobServiceStatus {
                 status: ServiceStatus::NotConfigured,
@@ -2357,7 +2365,7 @@ pub async fn get_info(
         response.warnings = warnings;
     }
 
-    (StatusCode::OK, Json(response))
+    response
 }
 
 /// Maps a live peer connection to its wire form. `last_error` leaks internal

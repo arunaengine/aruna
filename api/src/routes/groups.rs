@@ -713,19 +713,27 @@ pub async fn get_group(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = parse_group_id(&group_id)?;
-    let (group, auth_doc) = load_group(&state, group_id).await?;
-    let is_member = is_group_member(&auth_doc, auth.user_id);
     Ok((
         StatusCode::OK,
-        Json(GroupInfoResponse {
-            display_name: group.display_name,
-            group_id: group.group_id.to_string(),
-            realm_id: group.realm_id.to_string(),
-            roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
-        }),
+        Json(run_get_group(&state, auth, &group_id).await?),
     ))
+}
+
+pub(crate) async fn run_get_group(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    group_id: &str,
+) -> ServerResult<GroupInfoResponse> {
+    let auth = require_realm_auth(state, auth)?;
+    let group_id = parse_group_id(group_id)?;
+    let (group, auth_doc) = load_group(state, group_id).await?;
+    let is_member = is_group_member(&auth_doc, auth.user_id);
+    Ok(GroupInfoResponse {
+        display_name: group.display_name,
+        group_id: group.group_id.to_string(),
+        realm_id: group.realm_id.to_string(),
+        roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
+    })
 }
 
 fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
@@ -842,16 +850,27 @@ pub async fn get_group_usage(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<crate::routes::info::UsageResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = parse_group_id(&group_id)?;
-    let (_, auth_doc) = load_group(&state, group_id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(run_group_usage(&state, auth, &group_id).await?),
+    ))
+}
+
+pub(crate) async fn run_group_usage(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    group_id: &str,
+) -> ServerResult<crate::routes::info::UsageResponse> {
+    let auth = require_realm_auth(state, auth)?;
+    let group_id = parse_group_id(group_id)?;
+    let (_, auth_doc) = load_group(state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
         return Err(ServerError::Forbidden);
     }
 
-    let local = crate::routes::info::load_usage_counters(&state, usage_group_key(group_id)).await?;
+    let local = crate::routes::info::load_usage_counters(state, usage_group_key(group_id)).await?;
     let realm = crate::routes::info::load_realm_usage(
-        &state,
+        state,
         aruna_operations::usage_stats::RealmUsageScope::Group(group_id),
     )
     .await?;
@@ -885,7 +904,7 @@ pub async fn get_group_usage(
             realm_group_logical_bytes,
         ));
     }
-    Ok((StatusCode::OK, Json(response)))
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -940,9 +959,20 @@ pub async fn list_group_members(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupMembersResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = parse_group_id(&group_id)?;
-    let (_, auth_doc) = load_group(&state, group_id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(run_group_members(&state, auth, &group_id).await?),
+    ))
+}
+
+pub(crate) async fn run_group_members(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    group_id: &str,
+) -> ServerResult<GroupMembersResponse> {
+    let auth = require_realm_auth(state, auth)?;
+    let group_id = parse_group_id(group_id)?;
+    let (_, auth_doc) = load_group(state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
         return Err(ServerError::Forbidden);
     }
@@ -963,7 +993,7 @@ pub async fn list_group_members(
         }
     }
 
-    let names = resolve_member_names(&state, roles_by_user.keys().copied().collect()).await;
+    let names = resolve_member_names(state, roles_by_user.keys().copied().collect()).await;
     let mut members: Vec<GroupMemberResponse> = roles_by_user
         .into_iter()
         .map(|(user_id, mut roles)| {
@@ -977,7 +1007,7 @@ pub async fn list_group_members(
         .collect();
     members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
 
-    Ok((StatusCode::OK, Json(GroupMembersResponse { members })))
+    Ok(GroupMembersResponse { members })
 }
 
 /// Best-effort name lookup: a resolve failure leaves every member unnamed
