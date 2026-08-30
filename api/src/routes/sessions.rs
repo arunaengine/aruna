@@ -114,7 +114,7 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
     path = "/users/sessions",
     tag = "sessions",
     summary = "Create a user bearer session",
-    description = "Creates a self-scoped bearer session. The lifetime is capped by the caller's remaining lifetime and 24 hours. The token is shown only once.",
+    description = "Creates a self-scoped bearer session. Bound assistant and API sessions can create only their own kind. The lifetime is capped by the caller's remaining lifetime and 24 hours. The token is shown only once.",
     request_body = CreateSessionRequest,
     responses(
         (status = 201, description = "Session created", body = CreateSessionResponse),
@@ -133,6 +133,13 @@ pub async fn create_session(
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let kind = parse_session_kind(&request.kind)?;
+    if auth
+        .session
+        .as_ref()
+        .is_some_and(|parent| parent.kind != SessionKind::Portal && parent.kind != kind)
+    {
+        return Err(ServerError::Forbidden);
+    }
     let now = unix_timestamp_secs();
     let expiry = bound_session_expiry(now, request.expires_in_seconds, bearer.expires_at_secs())
         .map_err(map_create_error)?;
@@ -235,7 +242,7 @@ mod tests {
     use crate::auth::handle_token;
     use crate::error::TokenError;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{NodeCapabilities, RealmId};
+    use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef};
     use aruna_core::types::UserId;
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::DriverContext;
@@ -318,8 +325,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_kind_change() {
+        let (_dir, state, mut auth) = setup_state().await;
+        auth.session = Some(SessionRef {
+            sid: Ulid::generate().to_string(),
+            kind: SessionKind::Assistant,
+        });
+        let error = create_session(
+            State(state),
+            Extension(Some(auth)),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "parent",
+            ))),
+            Json(CreateSessionRequest {
+                kind: "portal".to_string(),
+                label: None,
+                expires_in_seconds: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn revoked_token_rejected() {
-        let (_dir, state, auth) = setup_state().await;
+        let (_dir, state, mut auth) = setup_state().await;
+        auth.session = Some(SessionRef {
+            sid: Ulid::generate().to_string(),
+            kind: SessionKind::Portal,
+        });
         let (_, Json(created)) = create_session(
             State(state.clone()),
             Extension(Some(auth.clone())),
