@@ -283,10 +283,11 @@ pub(super) async fn load_provider(
 pub(super) async fn save_provider(
     state: &ServerState,
     user_id: aruna_core::UserId,
+    expected: AssistantProvider,
     provider: AssistantProvider,
 ) -> ServerResult<AssistantProvider> {
     drive(
-        UpdateProviderOperation::new(provider, user_id),
+        UpdateProviderOperation::new(provider, expected, user_id),
         &state.get_ctx(),
     )
     .await
@@ -298,6 +299,9 @@ fn map_store_error(error: ProviderStoreError) -> ServerError {
         ProviderStoreError::NotFound => ServerError::NotFound,
         ProviderStoreError::IdCollision => {
             ServerError::Conflict("provider id collision".to_string())
+        }
+        ProviderStoreError::Stale => {
+            ServerError::Conflict("provider changed concurrently".to_string())
         }
         error => ServerError::InternalError(error.to_string()),
     }
@@ -428,7 +432,8 @@ pub async fn create_provider(
         (status = 400, body = ErrorResponse),
         (status = 401, body = ErrorResponse),
         (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse)
+        (status = 404, body = ErrorResponse),
+        (status = 409, description = "Provider changed concurrently", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -442,6 +447,7 @@ pub async fn patch_provider(
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let request: PatchProviderRequest = parse_json(request).await?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
+    let expected = provider.clone();
     if let Some(label) = request.label {
         provider.label = label;
     }
@@ -470,7 +476,7 @@ pub async fn patch_provider(
         .seal_secret(state.credential_seal_key(), &secret)
         .and_then(|_| provider.seal_headers(state.credential_seal_key(), &headers))
         .map_err(|_| ServerError::InternalError("provider seal failed".to_string()))?;
-    let provider = save_provider(&state, auth.user_id, provider).await?;
+    let provider = save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((StatusCode::OK, Json(provider_summary(&provider))))
 }
 
@@ -515,6 +521,7 @@ pub async fn delete_provider(
         (status = 401, body = ErrorResponse),
         (status = 403, body = ErrorResponse),
         (status = 404, body = ErrorResponse),
+        (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
         (status = 502, body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

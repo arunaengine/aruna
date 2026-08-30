@@ -284,6 +284,7 @@ pub async fn start_login(
         (status = 401, body = ErrorResponse),
         (status = 403, body = ErrorResponse),
         (status = 404, body = ErrorResponse),
+        (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
         (status = 502, body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -296,6 +297,7 @@ pub async fn poll_login(
     ensure_enabled(&state)?;
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
+    let expected = provider.clone();
     if provider.kind != AssistantProviderKind::Chatgpt {
         return Err(ServerError::NotFound);
     }
@@ -395,7 +397,7 @@ pub async fn poll_login(
     provider
         .seal_secret(state.credential_seal_key(), &secret)
         .map_err(|_| ServerError::InternalError("provider seal failed".to_string()))?;
-    save_provider(&state, auth.user_id, provider).await?;
+    save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((
         StatusCode::OK,
         Json(LoginPollResponse {
@@ -408,6 +410,7 @@ pub(super) async fn refresh_provider(
     state: &ServerState,
     mut provider: AssistantProvider,
 ) -> ServerResult<AssistantProvider> {
+    let expected = provider.clone();
     let mut secret = provider
         .open_secret(state.credential_seal_key())
         .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
@@ -449,7 +452,7 @@ pub(super) async fn refresh_provider(
     provider
         .seal_secret(state.credential_seal_key(), &secret)
         .map_err(|_| ServerError::InternalError("provider seal failed".to_string()))?;
-    save_provider(state, provider.user_id, provider).await
+    save_provider(state, provider.user_id, expected, provider).await
 }
 
 pub(super) async fn fresh_provider(

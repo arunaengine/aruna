@@ -234,6 +234,7 @@ async fn proxy_request(
         (status = 401, body = ErrorResponse),
         (status = 403, body = ErrorResponse),
         (status = 404, body = ErrorResponse),
+        (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
         (status = 502, body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -258,6 +259,7 @@ pub async fn proxy_post(
         (status = 401, body = ErrorResponse),
         (status = 403, body = ErrorResponse),
         (status = 404, body = ErrorResponse),
+        (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
         (status = 502, body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

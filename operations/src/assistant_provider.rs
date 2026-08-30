@@ -47,6 +47,8 @@ pub enum ProviderStoreError {
     IdCollision,
     #[error("provider owner index is inconsistent")]
     IndexInconsistent,
+    #[error("provider changed concurrently")]
+    Stale,
     #[error("provider operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]
@@ -574,6 +576,7 @@ enum UpdateProviderState {
 #[derive(Debug, PartialEq)]
 pub struct UpdateProviderOperation {
     provider: AssistantProvider,
+    expected: AssistantProvider,
     user_id: UserId,
     txn_id: Option<TxnId>,
     state: UpdateProviderState,
@@ -581,9 +584,10 @@ pub struct UpdateProviderOperation {
 }
 
 impl UpdateProviderOperation {
-    pub fn new(provider: AssistantProvider, user_id: UserId) -> Self {
+    pub fn new(provider: AssistantProvider, expected: AssistantProvider, user_id: UserId) -> Self {
         Self {
             provider,
+            expected,
             user_id,
             txn_id: None,
             state: UpdateProviderState::Init,
@@ -647,6 +651,9 @@ impl Operation for UpdateProviderOperation {
                 {
                     return self.fail(ProviderStoreError::NotFound);
                 }
+                if current != self.expected {
+                    return self.fail(ProviderStoreError::Stale);
+                }
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(StorageError::TransactionNotFound);
                 };
@@ -698,6 +705,9 @@ impl Operation for UpdateProviderOperation {
             Some(Err(error)) if error == ProviderStoreError::NotFound.to_string() => {
                 Err(ProviderStoreError::NotFound)
             }
+            Some(Err(error)) if error == ProviderStoreError::Stale.to_string() => {
+                Err(ProviderStoreError::Stale)
+            }
             Some(Err(error)) => Err(ProviderStoreError::UnexpectedEvent {
                 state: "Error".to_string(),
                 expected: "provider update",
@@ -713,6 +723,53 @@ impl Operation for UpdateProviderOperation {
             .map_or_else(smallvec::SmallVec::new, |txn_id| {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::credential_seal::SealedS3Secret;
+    use aruna_core::structs::{AssistantProviderKind, AssistantProviderStatus, RealmId};
+
+    #[test]
+    fn rejects_stale_update() {
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let provider_id = Ulid::from_bytes([5; 16]).to_string();
+        let expected = AssistantProvider {
+            provider_id: provider_id.clone(),
+            user_id,
+            kind: AssistantProviderKind::Openai,
+            label: "Original".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            headers: SealedS3Secret::empty(),
+            secret: SealedS3Secret::empty(),
+            models: Vec::new(),
+            default_model: None,
+            created_at: 1,
+            status: AssistantProviderStatus::Ready,
+            token_obtained_at: None,
+            login_expires_at: None,
+            login_interval_seconds: None,
+        };
+        let mut replacement = expected.clone();
+        replacement.label = "Replacement".to_string();
+        let mut current = expected.clone();
+        current.models.push("concurrent-model".to_string());
+        let mut operation = UpdateProviderOperation::new(replacement, expected, user_id);
+        let txn_id = Ulid::from_bytes([6; 16]);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: provider_id.as_bytes().into(),
+            value: Some(current.to_bytes().unwrap().into()),
+        }));
+
+        assert!(matches!(
+            operation.finalize(),
+            Err(ProviderStoreError::Stale)
+        ));
     }
 }
 
