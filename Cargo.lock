@@ -252,6 +252,7 @@ dependencies = [
  "byteview",
  "chrono",
  "crypto_box",
+ "dirs",
  "dotenvy",
  "ed25519-dalek 3.0.0",
  "flate2",

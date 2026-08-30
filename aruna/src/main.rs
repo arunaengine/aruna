@@ -652,12 +652,7 @@ async fn bind_servers(
             // A wipe erases what these roots hold, so an unsafe one fails the
             // start rather than the erasure, and what it erases is the
             // normalized path, never the one that hid it.
-            let roots = aruna::config::validate_wipe_roots(
-                &roots,
-                std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .as_deref(),
-            )?;
+            let roots = aruna::config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
             Some(Arc::new(DeviceWipe::new(roots, unsupported)))
         }
         false => None,
