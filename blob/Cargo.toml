@@ -26,7 +26,6 @@ md5 = { workspace = true }
 opendal = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
-rustix = { workspace = true }
 serde = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
@@ -35,6 +34,12 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ulid = { workspace = true }
+
+[target.'cfg(not(windows))'.dependencies]
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

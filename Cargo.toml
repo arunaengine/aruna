@@ -198,6 +198,7 @@ utoipa = { version = "5.5.0", features = [
 ] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 zeroize = "1.9.0"
 zip = { version = "8.6.0", default-features = false }
 

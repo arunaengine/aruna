@@ -428,6 +428,7 @@ async fn write_temp(
 /// that were displaced are identified afterwards. Only bytes that match the
 /// guard are discarded; anything else is put back, and if even that fails the
 /// owner's bytes are moved aside rather than lost.
+#[cfg(not(windows))]
 async fn exchange_guarded(
     spool: &Path,
     target: &Path,
@@ -462,7 +463,44 @@ async fn exchange_guarded(
     }
 }
 
+#[cfg(windows)]
+async fn exchange_guarded(
+    spool: &Path,
+    target: &Path,
+    blake3: &[u8; 32],
+) -> Result<(), PlaceError> {
+    let Ok(link) = tokio::fs::symlink_metadata(target).await else {
+        return Err(PlaceError::Refused(LocalFileRefusal::Missing));
+    };
+    if !link.is_file() {
+        return Err(PlaceError::Refused(LocalFileRefusal::NotRegular));
+    }
+    let backup = spool.with_file_name(format!("{}.displaced", Ulid::generate()));
+    if let Err(error) = replace_file(target, spool, &backup) {
+        if backup.exists() {
+            let _ = rescue_displaced(&backup, target).await;
+        }
+        return Err(PlaceError::Failed(error.to_string()));
+    }
+    let displaced = match hash_stable(&backup).await {
+        Ok((_, hash, _)) => &hash == blake3,
+        Err(_) => false,
+    };
+    if displaced {
+        let _ = tokio::fs::remove_file(&backup).await;
+        return Ok(());
+    }
+    match replace_file(target, &backup, spool) {
+        Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
+        Err(_) => match rescue_displaced(&backup, target).await {
+            Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
+            Err(error) => Err(error),
+        },
+    }
+}
+
 /// Swaps two existing paths in one step. Neither file is ever destroyed.
+#[cfg(not(windows))]
 fn exchange(left: &Path, right: &Path) -> Result<(), PlaceError> {
     rustix::fs::renameat_with(
         rustix::fs::CWD,
@@ -472,6 +510,42 @@ fn exchange(left: &Path, right: &Path) -> Result<(), PlaceError> {
         rustix::fs::RenameFlags::EXCHANGE,
     )
     .map_err(|error| PlaceError::Failed(error.to_string()))
+}
+
+#[cfg(windows)]
+fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replacement = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let backup = backup
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
+            target.as_ptr(),
+            replacement.as_ptr(),
+            backup.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Puts bytes that could not be swapped back beside their own path, so a failed
@@ -525,6 +599,7 @@ async fn hash_stable(path: &Path) -> Result<(String, [u8; 32], u64), StagingSour
 }
 
 /// Publishes a spooled file only where nothing exists, in one atomic step.
+#[cfg(not(windows))]
 fn place_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
     match rustix::fs::renameat_with(
         rustix::fs::CWD,
@@ -542,6 +617,11 @@ fn place_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
         }
         Err(error) => Err(PlaceError::Failed(error.to_string())),
     }
+}
+
+#[cfg(windows)]
+fn place_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
+    link_new(source, target)
 }
 
 fn link_new(source: &Path, target: &Path) -> Result<(), PlaceError> {

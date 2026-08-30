@@ -370,6 +370,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid 3.0.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
