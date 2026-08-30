@@ -56,7 +56,8 @@ keys, custom header values, access tokens, refresh tokens, or ChatGPT account id
 
 `GET /{id}/models` requests `/v1/models` for API providers and removes model ids containing
 `embed`, `whisper`, `tts`, `image`, `dall-e`, `audio`, `moderation`, or `realtime`. ChatGPT returns
-the backend's model list when it answers, else the static set `gpt-5.6-sol`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5`. `POST /{id}/test` performs the same
+the backend's model list when it answers, else the static set `gpt-5.6-sol`, `gpt-5.6-luna`,
+`gpt-5.6-terra`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5`. `POST /{id}/test` performs the same
 models request, or checks ChatGPT token freshness, and returns only an `ok` flag and a safe message.
 
 On server nodes a provider URL must use HTTPS and a public host. Loopback, private, link-local,
