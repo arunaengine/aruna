@@ -1359,9 +1359,12 @@ mod route_tests {
         assert_eq!(delegated.status_code(), StatusCode::FORBIDDEN);
 
         let mgmt = setup_with(NodeCapabilities::management_node(realm_key()).unwrap()).await;
-        let no_plane = list_synced_folders(State(mgmt.state.clone()), Extension(Some(owner_auth(&mgmt))))
-            .await
-            .unwrap_err();
+        let no_plane = list_synced_folders(
+            State(mgmt.state.clone()),
+            Extension(Some(owner_auth(&mgmt))),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(no_plane.status_code(), StatusCode::NOT_FOUND);
     }
 
@@ -1402,10 +1405,12 @@ mod route_tests {
     #[tokio::test]
     async fn lists_folders() {
         let fixture = setup().await;
-        let Json(empty) =
-            list_synced_folders(State(fixture.state.clone()), Extension(Some(owner_auth(&fixture))))
-                .await
-                .unwrap();
+        let Json(empty) = list_synced_folders(
+            State(fixture.state.clone()),
+            Extension(Some(owner_auth(&fixture))),
+        )
+        .await
+        .unwrap();
         assert!(empty.folders.is_empty());
 
         let id = Ulid::from_bytes([20u8; 16]);
@@ -1414,10 +1419,12 @@ mod route_tests {
             folder_entry(&sample_folder(id, &fixture, "/data", FolderState::Active)).unwrap(),
         )
         .await;
-        let Json(listed) =
-            list_synced_folders(State(fixture.state.clone()), Extension(Some(owner_auth(&fixture))))
-                .await
-                .unwrap();
+        let Json(listed) = list_synced_folders(
+            State(fixture.state.clone()),
+            Extension(Some(owner_auth(&fixture))),
+        )
+        .await
+        .unwrap();
         assert_eq!(listed.folders.len(), 1);
         assert_eq!(listed.folders[0].folder_id, id.to_string());
     }
@@ -1537,8 +1544,13 @@ mod route_tests {
         let deleting = Ulid::from_bytes([26u8; 16]);
         seed_row(
             &fixture.state,
-            folder_entry(&sample_folder(deleting, &fixture, "/other", FolderState::Deleting))
-                .unwrap(),
+            folder_entry(&sample_folder(
+                deleting,
+                &fixture,
+                "/other",
+                FolderState::Deleting,
+            ))
+            .unwrap(),
         )
         .await;
         let refused = pause_folder(
@@ -1618,7 +1630,11 @@ mod route_tests {
         .unwrap_err();
         assert_eq!(bad_cursor.status_code(), StatusCode::BAD_REQUEST);
 
-        seed_row(&fixture.state, base_entry(id, "notes.txt", &sample_base()).unwrap()).await;
+        seed_row(
+            &fixture.state,
+            base_entry(id, "notes.txt", &sample_base()).unwrap(),
+        )
+        .await;
         let Json(page) = list_folder_entries(
             State(fixture.state.clone()),
             Extension(Some(owner_auth(&fixture))),
@@ -1700,7 +1716,11 @@ mod route_tests {
             State(fixture.state.clone()),
             Extension(Some(owner_auth(&fixture))),
             Path("bad".to_string()),
-            Json(request(EntryAction::ReplaceLocal, ActionScopeName::AllPending, "data")),
+            Json(request(
+                EntryAction::ReplaceLocal,
+                ActionScopeName::AllPending,
+                "data",
+            )),
         )
         .await
         .unwrap_err();
@@ -1711,7 +1731,11 @@ mod route_tests {
             State(fixture.state.clone()),
             Extension(Some(owner_auth(&fixture))),
             Path(id.to_string()),
-            Json(request(EntryAction::KeepLocal, ActionScopeName::AllPending, "data")),
+            Json(request(
+                EntryAction::KeepLocal,
+                ActionScopeName::AllPending,
+                "data",
+            )),
         )
         .await
         .unwrap_err();
@@ -1721,7 +1745,11 @@ mod route_tests {
             State(fixture.state.clone()),
             Extension(Some(owner_auth(&fixture))),
             Path(id.to_string()),
-            Json(request(EntryAction::ReplaceLocal, ActionScopeName::Entry, "data")),
+            Json(request(
+                EntryAction::ReplaceLocal,
+                ActionScopeName::Entry,
+                "data",
+            )),
         )
         .await
         .unwrap_err();
@@ -1731,7 +1759,11 @@ mod route_tests {
             State(fixture.state.clone()),
             Extension(Some(owner_auth(&fixture))),
             Path(id.to_string()),
-            Json(request(EntryAction::ReplaceLocal, ActionScopeName::AllPending, "data")),
+            Json(request(
+                EntryAction::ReplaceLocal,
+                ActionScopeName::AllPending,
+                "data",
+            )),
         )
         .await
         .unwrap_err();
@@ -1739,15 +1771,24 @@ mod route_tests {
 
         seed_row(
             &fixture.state,
-            folder_entry(&sample_folder(id, &fixture, "/home/ada/data", FolderState::Active))
-                .unwrap(),
+            folder_entry(&sample_folder(
+                id,
+                &fixture,
+                "/home/ada/data",
+                FolderState::Active,
+            ))
+            .unwrap(),
         )
         .await;
         let wrong_confirm = act_on_folder(
             State(fixture.state.clone()),
             Extension(Some(owner_auth(&fixture))),
             Path(id.to_string()),
-            Json(request(EntryAction::ReplaceLocal, ActionScopeName::AllPending, "wrong")),
+            Json(request(
+                EntryAction::ReplaceLocal,
+                ActionScopeName::AllPending,
+                "wrong",
+            )),
         )
         .await
         .unwrap_err();
@@ -1780,7 +1821,11 @@ mod route_tests {
         .unwrap_err();
         assert_eq!(bad_cursor.status_code(), StatusCode::BAD_REQUEST);
 
-        seed_row(&fixture.state, action_entry(&sample_action(id, fixture.owner)).unwrap()).await;
+        seed_row(
+            &fixture.state,
+            action_entry(&sample_action(id, fixture.owner)).unwrap(),
+        )
+        .await;
         let Json(page) = list_folder_actions(
             State(fixture.state.clone()),
             Extension(Some(owner_auth(&fixture))),

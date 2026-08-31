@@ -670,7 +670,10 @@ mod tests {
         let local = view.local.unwrap();
         assert_eq!(local.size, 10);
         assert_eq!(local.fingerprint.as_deref(), Some("fp"));
-        assert_eq!(local.blake3.as_deref(), Some(hex_hash(&[0xabu8; 32]).as_str()));
+        assert_eq!(
+            local.blake3.as_deref(),
+            Some(hex_hash(&[0xabu8; 32]).as_str())
+        );
         let remote = view.remote.unwrap();
         assert_eq!(remote.size, 20);
         assert!(remote.blake3.is_none());

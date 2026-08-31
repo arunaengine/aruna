@@ -513,7 +513,9 @@ mod route_tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{DEVICE_MANAGEMENT_URL_KEYSPACE, REALM_CONFIG_KEYSPACE};
-    use aruna_core::structs::{Actor, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::{
+        Actor, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_storage::FjallStorage;
@@ -555,7 +557,9 @@ mod route_tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes(
-            SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes(),
+            SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .to_bytes(),
         );
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
@@ -615,10 +619,15 @@ mod route_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().fallback(|| async {
-            ([(header::CONTENT_TYPE, "application/json")], "{\"relayed\":true}")
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                "{\"relayed\":true}",
+            )
         });
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service()).await.unwrap();
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
         });
         (format!("http://{address}"), handle)
     }
