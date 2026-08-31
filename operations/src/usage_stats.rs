@@ -1916,6 +1916,33 @@ mod tests {
     }
 
     #[test]
+    fn credit_skips_group() {
+        // A copy is shared by every group referencing it and both the reclaim
+        // debit and the rebuild recount key it by hash, so the group row that
+        // feeds the group usage endpoint stays logical-only.
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let blake3 = hash_on_shard((usage_global_shard_index(group_id) + 1) % 64);
+
+        let update = UsageCounterUpdate::with_stored(
+            group_id,
+            UsageDelta {
+                objects: 1,
+                logical_bytes: 10,
+                ..Default::default()
+            },
+            StoredDelta::new(blake3, BackendRef::node_default(), 1, 10),
+        );
+
+        let (_, group) = update
+            .entries
+            .iter()
+            .find(|(key, _)| *key == usage_group_key(group_id))
+            .expect("group entry");
+        assert_eq!(group.objects, 1);
+        assert_eq!((group.stored_blobs, group.stored_bytes), (0, 0));
+    }
+
+    #[test]
     fn credit_merges_shard() {
         // One key must carry both halves when the hash shard is the group shard.
         let group_id = Ulid::from_bytes([1u8; 16]);

@@ -1790,8 +1790,14 @@ fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
 pub struct UsageResponse {
     pub buckets: u64,
     pub objects: u64,
-    pub stored_blobs: u64,
-    pub stored_bytes: u64,
+    /// Physical blob copies this node holds. Copies are content-addressed and
+    /// shared between the groups referencing them, so they are attributed to the
+    /// node, never to a group: the group usage endpoint omits this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_blobs: Option<u64>,
+    /// Bytes those copies occupy. Omitted wherever `stored_blobs` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
     pub logical_bytes: u64,
     pub referenced_bytes: u64,
     pub realm: UsageTotals,
@@ -1864,8 +1870,10 @@ impl GroupQuotaStatus {
 pub struct UsageTotals {
     pub buckets: u64,
     pub objects: u64,
-    pub stored_blobs: u64,
-    pub stored_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_blobs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
     pub logical_bytes: u64,
     pub referenced_bytes: u64,
 }
@@ -1875,10 +1883,20 @@ impl From<UsageCounters> for UsageTotals {
         Self {
             buckets: counters.buckets,
             objects: counters.objects,
-            stored_blobs: counters.stored_blobs,
-            stored_bytes: counters.stored_bytes,
+            stored_blobs: Some(counters.stored_blobs),
+            stored_bytes: Some(counters.stored_bytes),
             logical_bytes: counters.logical_bytes,
             referenced_bytes: counters.referenced_bytes,
+        }
+    }
+}
+
+impl UsageTotals {
+    fn without_stored(counters: UsageCounters) -> Self {
+        Self {
+            stored_blobs: None,
+            stored_bytes: None,
+            ..Self::from(counters)
         }
     }
 }
@@ -1888,8 +1906,8 @@ impl UsageResponse {
         Self {
             buckets: local.buckets,
             objects: local.objects,
-            stored_blobs: local.stored_blobs,
-            stored_bytes: local.stored_bytes,
+            stored_blobs: Some(local.stored_blobs),
+            stored_bytes: Some(local.stored_bytes),
             logical_bytes: local.logical_bytes,
             referenced_bytes: local.referenced_bytes,
             realm: realm.into(),
@@ -1898,6 +1916,18 @@ impl UsageResponse {
             profile_count: None,
             process_run_count: None,
             quota: None,
+        }
+    }
+
+    /// Group scope. Physical copies are content-addressed and shared between
+    /// groups, so the counters carry no group dimension and the `stored_*`
+    /// fields are omitted instead of reported as an unattributed zero.
+    pub fn for_group(local: UsageCounters, realm: UsageCounters) -> Self {
+        Self {
+            stored_blobs: None,
+            stored_bytes: None,
+            realm: UsageTotals::without_stored(realm),
+            ..Self::new(local, realm)
         }
     }
 }
@@ -1933,6 +1963,9 @@ views.
   node's replicated usage snapshot, so it is eventually consistent: a node whose snapshot has not
   arrived or has not refreshed yet is simply not part of the sum, which can make the total lag
   reality after a burst of writes.
+- `stored_blobs` and `stored_bytes` count physical, content-addressed blob copies. A copy is shared
+  by every group referencing it, so it is attributed to this node and its backend, never to a group;
+  the group usage endpoint therefore omits both fields.
 - `metadata_documents` counts the realm's live metadata documents, excluding lifecycle-deleted ones,
   and is deliberately unfiltered by what the caller may read.
 - It is omitted, never zeroed, when this node has no metadata subsystem or the count cannot be
@@ -2477,7 +2510,7 @@ mod tests {
         RealmNodeConnectionStatus, RealmNodeKindInfo, RealmPlacementBinding,
         RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
         RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
-        get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
+        UsageResponse, get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
         map_mutate_realm_placement_error, map_realm_nodes, map_set_realm_quota_error,
         mutate_realm_placement, presence_nodes, set_realm_quota,
     };
@@ -2492,7 +2525,7 @@ mod tests {
     use aruna_core::keyspaces::GROUP_KEYSPACE;
     use aruna_core::structs::{
         Actor, AuthContext, DocumentClass, Group, NodeCapabilities, PlacementScope, QuotaConfig,
-        RealmId,
+        RealmId, UsageCounters,
     };
     use aruna_operations::allocate_handle::{HandleAllocationError, allocate_placement_binding};
     use aruna_operations::claim_initial_realm_admin::{
@@ -4193,5 +4226,43 @@ mod tests {
             .find(|node| node.kind != RealmNodeKindInfo::User)
             .unwrap();
         assert_eq!(infra.last_seen_ms, None, "only devices report contact");
+    }
+
+    fn usage_counters() -> UsageCounters {
+        UsageCounters {
+            buckets: 1,
+            objects: 2,
+            stored_blobs: 2,
+            stored_bytes: 20,
+            logical_bytes: 20,
+            referenced_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn usage_reports_stored() {
+        let body = serde_json::to_value(UsageResponse::new(usage_counters(), usage_counters()))
+            .expect("serialized");
+        assert_eq!(body["stored_blobs"], 2);
+        assert_eq!(body["stored_bytes"], 20);
+        assert_eq!(body["realm"]["stored_blobs"], 2);
+    }
+
+    #[test]
+    fn group_omits_stored() {
+        // Physical copies carry no group dimension, so the group scope must omit
+        // them instead of reporting the counter row's structural zero.
+        let response = UsageResponse::for_group(usage_counters(), usage_counters());
+        assert_eq!(response.stored_blobs, None);
+        assert_eq!(response.realm.stored_bytes, None);
+
+        let body = serde_json::to_value(&response).expect("serialized");
+        let fields = body.as_object().expect("object");
+        assert_eq!(fields["objects"], 2);
+        assert!(!fields.contains_key("stored_blobs"));
+        assert!(!fields.contains_key("stored_bytes"));
+        let realm = body["realm"].as_object().expect("object");
+        assert!(!realm.contains_key("stored_blobs"));
+        assert!(!realm.contains_key("stored_bytes"));
     }
 }

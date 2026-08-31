@@ -789,6 +789,9 @@ a realm administrator who is not a member is forbidden.
 **Behavior**
 - The flat counters report what this node stores for the group, while `realm` reports the realm-wide
   totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes.
+- `stored_blobs` and `stored_bytes` are omitted, from the flat counters and from `realm`: a physical
+  blob copy is content-addressed and shared by every group referencing it, so it is counted per node
+  and per storage backend only, and `/info/usage` reports those node-wide figures.
 - `dataset_count`, `profile_count` and `process_run_count` are exact lifecycle-live
   metadata-document counts for this group when this node's metadata subsystem can answer; all three
   are omitted together when it cannot.
@@ -815,8 +818,6 @@ a realm administrator who is not a member is forbidden.
             example = json!({
                 "buckets": 3,
                 "objects": 1284,
-                "stored_blobs": 1190,
-                "stored_bytes": 87412338176_i64,
                 "logical_bytes": 91002113024_i64,
                 "referenced_bytes": 91002113024_i64,
                 "dataset_count": 37,
@@ -825,8 +826,6 @@ a realm administrator who is not a member is forbidden.
                 "realm": {
                     "buckets": 5,
                     "objects": 2048,
-                    "stored_blobs": 1902,
-                    "stored_bytes": 140733193388_i64,
                     "logical_bytes": 152882105100_i64,
                     "referenced_bytes": 152882105100_i64
                 },
@@ -878,7 +877,7 @@ pub(crate) async fn run_group_usage(
     // The QuotaGate enforces against the group's realm-wide logical_bytes, so the
     // warning threshold is evaluated against the same counter.
     let realm_group_logical_bytes = realm.logical_bytes;
-    let mut response = crate::routes::info::UsageResponse::new(local, realm);
+    let mut response = crate::routes::info::UsageResponse::for_group(local, realm);
     match count_group_documents_by_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
         Ok(Some(counts)) => {
             response.dataset_count = Some(counts.dataset_count);
