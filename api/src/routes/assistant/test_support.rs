@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
 use aruna_core::types::UserId;

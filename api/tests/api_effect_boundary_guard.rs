@@ -123,6 +123,12 @@ fn scan_file(manifest_dir: &Path, path: &Path) -> Vec<GuardMatch> {
         .to_string_lossy()
         .replace('\\', "/");
 
+    // A whole file gated `#![cfg(test)]` is test-only, so its helpers may use the
+    // scanned tokens the same way an inline `#[cfg(test)]` module may.
+    if contents.lines().any(|line| line.trim() == "#![cfg(test)]") {
+        return Vec::new();
+    }
+
     let mut matches = Vec::new();
     let mut pending_cfg_test = false;
     let mut test_module_depth = None;
