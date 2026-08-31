@@ -43,6 +43,11 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+/// Bounded retries for an SSI conflict on the metadata commit. Concurrent
+/// writes in one group contend on the shared usage counters, which is a
+/// refused transaction, not a failed request.
+const CONFLICT_RETRIES: u8 = 4;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum PutObjectState {
     Init,
@@ -172,6 +177,7 @@ pub struct PutObjectOperation {
     state: PutObjectState,
     config: PutObjectConfig,
     txn_id: Option<Ulid>,
+    conflicts: u8,
     version_id: Option<Ulid>,
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
@@ -214,6 +220,7 @@ impl PutObjectOperation {
             state: PutObjectState::Init,
             config,
             txn_id: None,
+            conflicts: 0,
             version_id,
             written_location: None,
             cleanup_location: None,
@@ -1161,6 +1168,11 @@ impl PutObjectOperation {
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.txn_id = None;
+                if matches!(error, StorageError::TransactionConflict)
+                    && self.conflicts < CONFLICT_RETRIES
+                {
+                    return self.restart_after_conflict();
+                }
                 if error.proves_no_commit() {
                     return self.cleanup_failed_write(PutObjectError::StorageError(error));
                 }
@@ -1168,6 +1180,25 @@ impl PutObjectOperation {
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
+    }
+
+    /// A refused commit discarded its writes, so only the metadata segment
+    /// reopens: the blob is already on the backend and the version id is kept,
+    /// so the retry stays the same write instead of re-reading the body.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.txn_id = None;
+        self.existing_pointer = None;
+        self.was_live = false;
+        self.new_blob = false;
+        self.cleanup_location = None;
+        self.usage_update = None;
+        self.quota_gate = None;
+        self.output = None;
+        self.state = PutObjectState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     /// A commit whose outcome is unknown may already own these bytes, so they go
@@ -2178,7 +2209,61 @@ mod test {
     }
 
     #[test]
-    fn commit_transaction_conflict_deletes_written_blob_and_returns_conflict() {
+    fn retries_commit_conflict() {
+        // Concurrent writes contend on the usage counters; the streamed blob
+        // stays put and only the metadata transaction reopens.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+        let location = test_location(op.config.user_id);
+        let version_id = Ulid::generate();
+
+        op.state = PutObjectState::CommitTransaction;
+        op.txn_id = Some(Ulid::generate());
+        op.version_id = Some(version_id);
+        op.written_location = Some(location.clone());
+        op.cleanup_location = Some(location.clone());
+        op.new_blob = true;
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+        assert_eq!(op.state, PutObjectState::StartTransaction);
+        assert!(op.txn_id.is_none());
+        assert_eq!(op.written_location, Some(location.clone()));
+        assert_eq!(op.cleanup_location, None);
+        assert!(!op.new_blob);
+        // The retry must stay the same write, not mint a second version.
+        assert_eq!(op.version_id, Some(version_id));
+
+        let retry_txn = Ulid::generate();
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: retry_txn,
+        }));
+        assert_eq!(op.state, PutObjectState::CheckPurgeFence);
+        assert_eq!(op.txn_id, Some(retry_txn));
+
+        op.state = PutObjectState::CommitTransaction;
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: retry_txn,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation {
+                id: location.ulid
+            })]
+        );
+    }
+
+    #[test]
+    fn conflict_exhausts_retries() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
         let node_id = iroh::SecretKey::generate().public();
@@ -2190,9 +2275,20 @@ mod test {
         op.txn_id = Some(txn_id);
         op.written_location = Some(location.clone());
 
-        let effects = op.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }));
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        };
+        for _ in 0..super::CONFLICT_RETRIES {
+            assert!(matches!(
+                op.step(conflict()).as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            ));
+            op.state = PutObjectState::CommitTransaction;
+        }
+
+        let effects = op.step(conflict());
 
         let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
             panic!("expected blob cleanup")

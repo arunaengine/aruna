@@ -23,6 +23,10 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+/// Bounded retries for an SSI conflict on the part commit. A refused
+/// transaction is contention, not a failed request.
+const CONFLICT_RETRIES: u8 = 4;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum UploadPartState {
     Init,
@@ -107,6 +111,7 @@ pub struct UploadPartOperation {
     state: UploadPartState,
     input: UploadPartInput,
     txn_id: Option<TxnId>,
+    conflicts: u8,
     written_location: Option<BackendLocation>,
     replaced_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
@@ -122,6 +127,7 @@ impl UploadPartOperation {
             state: UploadPartState::Init,
             input,
             txn_id: None,
+            conflicts: 0,
             written_location: None,
             replaced_location: None,
             rollback_location: None,
@@ -636,6 +642,9 @@ impl UploadPartOperation {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
         self.txn_id = None;
+        if matches!(error, StorageError::TransactionConflict) && self.conflicts < CONFLICT_RETRIES {
+            return self.restart_after_conflict();
+        }
         if error.proves_no_commit() {
             return self.cleanup_failed_write(UploadPartError::StorageError(error));
         }
@@ -658,6 +667,19 @@ impl UploadPartOperation {
                 part_number: self.input.part_number,
             },
         })
+    }
+
+    /// A refused commit discarded its writes, so only the part record segment
+    /// reopens: the part bytes are already on the backend and must not be
+    /// streamed again.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.txn_id = None;
+        self.replaced_location = None;
+        self.state = UploadPartState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 }
 
@@ -1119,10 +1141,51 @@ mod test {
     }
 
     #[test]
-    fn conflict_deletes_part() {
+    fn retries_commit_conflict() {
+        // The part bytes stay staged; only the record transaction reopens.
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        let location = op.written_location.clone().unwrap();
+        op.state = UploadPartState::CommitTransaction;
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+        assert_eq!(op.state, UploadPartState::StartTransaction);
+        assert!(op.txn_id.is_none());
+        assert_eq!(op.written_location, Some(location.clone()));
+
+        let retry_txn = TxnId::from_bytes([4u8; 16]);
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: retry_txn,
+        }));
+        assert_eq!(op.state, UploadPartState::CheckPurgeFence);
+
+        op.state = UploadPartState::CommitTransaction;
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: retry_txn,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation {
+                id: location.ulid
+            })]
+        );
+    }
+
+    #[test]
+    fn conflict_exhausts_retries() {
         let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
         op.state = UploadPartState::CommitTransaction;
         op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+        op.conflicts = CONFLICT_RETRIES;
 
         let effects = op.step(Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
@@ -1147,6 +1210,7 @@ mod test {
         let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
         op.state = UploadPartState::CommitTransaction;
         op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+        op.conflicts = CONFLICT_RETRIES;
 
         op.step(Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
