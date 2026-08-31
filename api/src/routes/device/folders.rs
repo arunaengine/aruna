@@ -1164,7 +1164,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
+mod test_routes {
     use super::*;
     use crate::routes::device::dto::FolderStateName;
     use aruna_core::UserId;

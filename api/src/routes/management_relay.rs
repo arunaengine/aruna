@@ -504,7 +504,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
+mod test_routes {
     use std::sync::Arc;
 
     use super::{RELAY_HOP_HEADER, relay_middleware};
