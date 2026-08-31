@@ -39,8 +39,9 @@ pub struct ExecutionChain {
 }
 
 /// Resolves the receipt chain of one local job, if a target admitted it here.
+/// A job with no reservation is purely local and has no chain at all.
 pub async fn execution_chain(context: &DriverContext, job_id: JobId) -> Option<ExecutionChain> {
-    let reservation = job_reservation(context, job_id).await.ok()??;
+    let reservation = local_reservation(context, job_id).await?;
     chain_for(
         context,
         reservation.logical_job_id,
@@ -49,21 +50,82 @@ pub async fn execution_chain(context: &DriverContext, job_id: JobId) -> Option<E
     .await
 }
 
+/// The chain of one local job's exact execution. The reservation is what maps
+/// the local physical job row to the logical alias family records are keyed by,
+/// so a caller holding only the physical id must resolve through it.
+pub async fn chain_of_attempt(
+    context: &DriverContext,
+    job_id: JobId,
+    execution_id: Ulid,
+) -> Option<ExecutionChain> {
+    let reservation = local_reservation(context, job_id).await?;
+    if reservation.execution_id != execution_id {
+        warn!(
+            job_id = %job_id,
+            execution_id = %execution_id,
+            reserved = %reservation.execution_id,
+            "Attempt does not hold the reserved execution; the chain stays unresolved"
+        );
+        return None;
+    }
+    chain_for(context, reservation.logical_job_id, execution_id).await
+}
+
+/// The reservation one local job holds. `None` without a warning is the purely
+/// local case; a read that failed is reported instead of read as absence.
+async fn local_reservation(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Option<super::reservation::ExecutionReservation> {
+    match job_reservation(context, job_id).await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Execution reservation read failed");
+            None
+        }
+    }
+}
+
 /// The chain of one exact execution id, used where the attempt control already
-/// names it.
+/// names it. `job_id` is the logical alias, never a local physical job id.
 pub async fn chain_for(
     context: &DriverContext,
     job_id: JobId,
     execution_id: Ulid,
 ) -> Option<ExecutionChain> {
-    let family = family_of_alias(context, job_id).await.ok()??;
-    let receipt = receipt_of(context, family, execution_id).await?;
+    let family = match family_of_alias(context, job_id).await {
+        Ok(Some(family)) => family,
+        Ok(None) => {
+            warn!(
+                job_id = %job_id,
+                execution_id = %execution_id,
+                "No job family alias for this job; the execution chain is unresolvable"
+            );
+            return None;
+        }
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Job family alias read failed");
+            return None;
+        }
+    };
+    let Some(receipt) = receipt_of(context, family, execution_id).await else {
+        warn!(
+            job_id = %job_id,
+            execution_id = %execution_id,
+            "No receipt for this execution in its family"
+        );
+        return None;
+    };
+    let digest = receipt
+        .digest()
+        .inspect_err(|error| warn!(error = %error, "Execution receipt digest failed"))
+        .ok()?;
     Some(ExecutionChain {
         family,
         execution_id,
         executor_node_id: receipt.executor_node_id,
         spec_digest: receipt.spec_digest,
-        receipt_digest: receipt.digest().ok()?,
+        receipt_digest: digest,
         job_id: receipt.job_id,
     })
 }
@@ -117,18 +179,35 @@ pub async fn publish_state(
     observed_at_ms: u64,
 ) -> bool {
     let Some(net) = context.net_handle.as_ref() else {
+        warn!(
+            job_id = %chain.job_id,
+            execution_id = %chain.execution_id,
+            "Execution update needs a net handle; publication abandoned"
+        );
         return false;
     };
     let local = net.node_id();
     if chain.executor_node_id != local {
+        warn!(
+            job_id = %chain.job_id,
+            execution_id = %chain.execution_id,
+            executor = %chain.executor_node_id,
+            "Only the receipted executor may publish this execution"
+        );
         return false;
     }
     // The chain is extended only from evidence proven complete: the receipt
     // that authorized it, plus every stored update of this execution.
     let Some(receipt) = receipt_of(context, chain.family, chain.execution_id).await else {
+        warn!(
+            job_id = %chain.job_id,
+            execution_id = %chain.execution_id,
+            "Execution receipt is no longer readable; publication deferred"
+        );
         return false;
     };
     let Ok(root) = receipt.digest() else {
+        warn!(execution_id = %chain.execution_id, "Execution receipt digest failed");
         return false;
     };
     let records = match load_kind_complete(context, chain.family, JobRecordKind::Update).await {
@@ -151,7 +230,11 @@ pub async fn publish_state(
         return true;
     }
     let Some((sequence, previous)) = chain_tip(&mine, root) else {
-        warn!(execution_id = %chain.execution_id, "Execution update chain is not contiguous");
+        warn!(
+            job_id = %chain.job_id,
+            execution_id = %chain.execution_id,
+            "Execution update chain is not contiguous"
+        );
         return false;
     };
     let update = ExecutionUpdate {
@@ -178,6 +261,7 @@ pub async fn publish_state(
         }
     };
     let Ok(frame) = JobRecordFrame::new(envelope) else {
+        warn!(execution_id = %chain.execution_id, "Execution update exceeds the record bounds");
         return false;
     };
     let appended = drive(
@@ -209,11 +293,21 @@ pub async fn publish_state(
             true
         }
         Ok(outcome) => {
-            warn!(admission = ?outcome.admission, "Execution update was not admitted");
+            warn!(
+                job_id = %chain.job_id,
+                execution_id = %chain.execution_id,
+                admission = ?outcome.admission,
+                "Execution update was not admitted"
+            );
             false
         }
         Err(error) => {
-            warn!(error = %error, "Execution update append failed");
+            warn!(
+                job_id = %chain.job_id,
+                execution_id = %chain.execution_id,
+                error = %error,
+                "Execution update append failed"
+            );
             false
         }
     }
@@ -239,7 +333,31 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
     let Some(state) = terminal_state(record) else {
         return true;
     };
-    let Some(chain) = execution_chain(context, record.job_id).await else {
+    let reservation = match job_reservation(context, record.job_id).await {
+        Ok(Some(reservation)) => reservation,
+        // No reservation is a purely local execution: it owes nothing here.
+        Ok(None) => return true,
+        Err(error) => {
+            warn!(
+                job_id = %record.job_id,
+                error = %error,
+                "Execution reservation read failed; terminal publication deferred"
+            );
+            return false;
+        }
+    };
+    let Some(chain) = chain_for(
+        context,
+        reservation.logical_job_id,
+        reservation.execution_id,
+    )
+    .await
+    else {
+        warn!(
+            job_id = %record.job_id,
+            execution_id = %reservation.execution_id,
+            "Terminal publication deferred: the receipt chain is unresolved"
+        );
         return false;
     };
     let result = PhysicalExecutionResult {

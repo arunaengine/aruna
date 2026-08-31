@@ -6,7 +6,7 @@ use aruna_core::structs::{
 };
 use tracing::{debug, warn};
 
-use super::lifecycle::updates::chain_for;
+use super::lifecycle::updates::chain_of_attempt;
 use super::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError,
 };
@@ -36,7 +36,7 @@ pub async fn seal_outputs(
     // A receipted execution binds the real chain: the replicated identity, the
     // sealed spec digest, and the target's own receipt. Without a receipt this
     // is a purely local execution and the documented local stand-ins apply.
-    let chain = chain_for(context, record.job_id, control.execution_id).await;
+    let chain = chain_of_attempt(context, record.job_id, control.execution_id).await;
     let receipted = chain.is_some();
     if let Some(sealed) = sealed_record(context, record.job_id, control, &outputs, net.node_id())
         .await?
@@ -58,7 +58,9 @@ pub async fn seal_outputs(
         request_digest: chain
             .map(|chain| chain.family.request_digest)
             .unwrap_or(request_digest),
-        job_id: record.job_id,
+        // The receipt names the logical job; the local physical id addresses
+        // nothing in the family and would fail the receipt evidence check.
+        job_id: chain.map_or(record.job_id, |chain| chain.job_id),
         executor_node_id: net.node_id(),
         spec_digest: chain
             .map(|chain| chain.spec_digest)
