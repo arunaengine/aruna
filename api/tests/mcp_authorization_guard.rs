@@ -9,7 +9,7 @@ const BOUNDARIES: &[&str] = &[
     "request_authorization::authorize",
     "submit_execution",
 ];
-const TOOL_COUNT: usize = 27;
+const TOOL_COUNT: usize = 28;
 
 #[test]
 fn tools_reach_authorize() {
@@ -27,7 +27,13 @@ fn tools_reach_authorize() {
         }
         tools.extend(tool_names(source));
     }
-    assert_eq!(tools.len(), TOOL_COUNT, "MCP tool inventory changed");
+    assert_eq!(
+        tools.len(),
+        TOOL_COUNT,
+        "MCP tool inventory changed: found {} tools, expected {TOOL_COUNT}. \
+         Update TOOL_COUNT and confirm every new tool reaches authorization.",
+        tools.len(),
+    );
     let unguarded = tools
         .iter()
         .filter(|tool| !is_guarded(tool, &bodies, &mut BTreeSet::new()))
