@@ -518,6 +518,8 @@ async fn invalid_replace_preserves_the_last_revision_and_is_retryable()
     )
     .await?;
     drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
+    // A replace plans its batch against the local graph, so it must be applied.
+    process_metadata_materialization_batch(test.context.as_ref()).await?;
     let tag = profile_public_iri(profile_id);
 
     let error = update_metadata_document(

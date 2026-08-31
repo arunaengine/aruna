@@ -17,8 +17,9 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
-    MetadataDocumentLifecycleRecord, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
+    MetadataBatchSource, MetadataCreateEventPayload, MetadataCreateEventRecord,
+    MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataEffect, MetadataEvent,
+    MetadataGraphLifecycleRecord,
 };
 use aruna_core::storage_entries::{
     metadata_create_event_write_entry, metadata_document_lifecycle_revision_change,
@@ -46,6 +47,7 @@ use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::{
     project_metadata_create_events, replay_metadata_event_log,
 };
@@ -304,7 +306,10 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     let refreshed_event: MetadataCreateEventRecord = postcard::from_bytes(&refreshed_event)?;
     assert!(matches!(
         refreshed_event.payload,
-        MetadataCreateEventPayload::UpsertDataEntity { .. }
+        MetadataCreateEventPayload::ApplyBatch {
+            authored: MetadataBatchSource::UpsertDataEntity { .. },
+            ..
+        }
     ));
 
     shutdown_nodes(nodes).await;
@@ -464,9 +469,11 @@ async fn seed_and_update(
     )
     .await?
     .record;
-    // Origin runs no auto loop: project the create into the local index (so the
-    // update can read it) and publish it to the holders, both by hand.
+    // Origin runs no auto loop: project the create into the local index, apply
+    // it to the local graph (the update plans its batch against that graph) and
+    // publish it to the holders, all by hand.
     replay_metadata_event_log(nodes[0].context.as_ref()).await?;
+    process_metadata_materialization_batch(nodes[0].context.as_ref()).await?;
     drain_until_empty(&nodes[0]).await?;
 
     let config = drive(
@@ -577,7 +584,10 @@ async fn assert_update_reaches(
     let event: MetadataCreateEventRecord = postcard::from_bytes(&event)?;
     assert!(matches!(
         event.payload,
-        MetadataCreateEventPayload::UpsertDataEntity { .. }
+        MetadataCreateEventPayload::ApplyBatch {
+            authored: MetadataBatchSource::UpsertDataEntity { .. },
+            ..
+        }
     ));
     assert!(
         replacement_node
