@@ -1,5 +1,7 @@
 mod chatgpt;
 mod proxy;
+#[cfg(test)]
+mod test_support;
 
 use chatgpt::{__path_poll_login, __path_start_login, poll_login, start_login};
 use proxy::{__path_proxy_get, __path_proxy_post, proxy_get, proxy_post};

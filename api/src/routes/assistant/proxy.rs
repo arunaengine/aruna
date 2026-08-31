@@ -422,19 +422,14 @@ pub(super) async fn fetch_models(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{setup_state, spawn_mock};
     use super::*;
     use crate::server_state::ServerState;
     use aruna_core::compute::Secret;
     use aruna_core::credential_seal::SealedS3Secret;
-    use aruna_core::structs::{
-        AssistantHeaders, AssistantProviderSecret, AssistantProviderStatus, NodeCapabilities,
-        RealmId,
-    };
-    use aruna_core::types::UserId;
+    use aruna_core::structs::{AssistantHeaders, AssistantProviderSecret, AssistantProviderStatus};
     use aruna_operations::assistant_provider::CreateProviderOperation;
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::FjallStorage;
+    use aruna_operations::driver::drive;
     use axum::body::Bytes;
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
@@ -443,55 +438,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tempfile::TempDir;
-    use tokio::net::TcpListener;
     use tokio::sync::{Notify, mpsc};
     use ulid::Ulid;
 
     struct Observed {
         headers: HeaderMap,
         body: Bytes,
-    }
-
-    async fn setup_state() -> (TempDir, ServerState, AuthContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let realm_id = RealmId::from_bytes([3; 32]);
-        let user_id = UserId::local(Ulid::from_bytes([4; 16]), realm_id);
-        let state = ServerState::new(
-            context,
-            realm_id,
-            iroh::SecretKey::generate().public(),
-            NodeCapabilities::user_node(realm_id).unwrap(),
-            false,
-            None,
-            JobsRuntime::new(),
-        )
-        .await;
-        let auth = AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        };
-        (dir, state, auth)
-    }
-
-    async fn spawn_mock(router: Router) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        (format!("http://{address}"), handle)
     }
 
     fn make_provider(
