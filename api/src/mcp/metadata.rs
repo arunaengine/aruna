@@ -935,3 +935,153 @@ fn artifact_location(value: &str) -> Option<(String, String)> {
     let key = segments.collect::<Vec<_>>().join("/");
     (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ServerError;
+
+    fn body(result: CallToolResult) -> Value {
+        assert_eq!(result.is_error, Some(true));
+        result
+            .structured_content
+            .expect("a tool error carries the structured body")
+    }
+
+    #[test]
+    fn parse_document_reasons() {
+        // A bare "Bad request" leaves the model unable to fix the id shape.
+        let text = body(parse_document("not-a-ulid").unwrap_err());
+        assert_eq!(text["code"], "Bad request");
+        assert!(
+            text["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("26-character ULID")
+        );
+        assert!(parse_document(&Ulid::generate().to_string()).is_ok());
+    }
+
+    #[test]
+    fn rocrate_rejects_array() {
+        let text = body(rocrate_json(&json!([{ "@id": "./" }])).unwrap_err());
+        assert_eq!(text["code"], "Bad request");
+        assert!(
+            text["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("@graph")
+        );
+        assert!(rocrate_json(&json!({ "@context": {}, "@graph": [] })).is_ok());
+    }
+
+    #[test]
+    fn document_error_maps() {
+        assert_eq!(
+            body(document_error(ServerError::NotFound))["code"],
+            "Not found"
+        );
+        let forbidden = body(document_error(ServerError::Forbidden));
+        assert_eq!(forbidden["code"], "Forbidden");
+        assert!(
+            forbidden["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("visible to its group")
+        );
+    }
+
+    #[test]
+    fn update_error_maps() {
+        let missing = body(update_error(ServerError::NotFound));
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("create_dataset")
+        );
+        let forbidden = body(update_error(ServerError::Forbidden));
+        assert!(
+            forbidden["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("write permission")
+        );
+    }
+
+    #[test]
+    fn query_error_scoping() {
+        // The single-pattern restriction only applies to the realm-wide form.
+        let scoped = body(query_error(ServerError::BadRequest, true));
+        assert!(
+            !scoped["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("single triple pattern")
+        );
+        let wide = body(query_error(ServerError::BadRequest, false));
+        assert!(
+            wide["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("single triple pattern")
+        );
+        assert_eq!(
+            body(query_error(ServerError::NotFound, true))["code"],
+            "Not found"
+        );
+    }
+
+    #[test]
+    fn search_reference_errors() {
+        assert!(
+            body(search_error(ServerError::BadRequest))["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("conforms_to")
+        );
+        assert!(
+            body(references_error(ServerError::BadRequest))["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("absolute IRI")
+        );
+    }
+
+    #[test]
+    fn collects_turtle() {
+        let crate_value = json!({
+            "@graph": [
+                { "encodingFormat": "text/turtle", "text": "@prefix ex: <x> ." },
+                { "encodingFormat": "text/turtle", "text": "@prefix ex: <x> ." },
+                { "encodingFormat": "text/turtle", "contentUrl": "s3://rules/shapes.ttl" }
+            ]
+        });
+        let mut turtle = Vec::new();
+        let mut urls = Vec::new();
+        collect_turtle(&crate_value, &mut turtle, &mut urls);
+        assert_eq!(turtle, vec!["@prefix ex: <x> .".to_string()]);
+        assert_eq!(urls, vec!["s3://rules/shapes.ttl".to_string()]);
+    }
+
+    #[test]
+    fn artifact_location_schemes() {
+        assert_eq!(
+            artifact_location("s3://bucket/path/shapes.ttl"),
+            Some(("bucket".to_string(), "path/shapes.ttl".to_string()))
+        );
+        assert_eq!(
+            artifact_location("https://host/bucket/nested/key.ttl"),
+            Some(("bucket".to_string(), "nested/key.ttl".to_string()))
+        );
+        assert_eq!(artifact_location("s3://bucket/"), None);
+        assert_eq!(artifact_location("ftp://host/bucket/key"), None);
+    }
+
+    #[test]
+    fn resource_id_reads() {
+        assert_eq!(resource_id(&json!("s3://a/b")), Some("s3://a/b"));
+        assert_eq!(resource_id(&json!({ "@id": "s3://a/b" })), Some("s3://a/b"));
+        assert_eq!(resource_id(&json!({ "other": 1 })), None);
+    }
+}
