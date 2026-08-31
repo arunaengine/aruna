@@ -17,7 +17,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::{PathRestriction, S3Session};
+use aruna_core::structs::{PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session};
 use aruna_core::types::{GroupId, Key, UserId, Value};
 use byteview::ByteView;
 use rand::distr::Alphanumeric;
@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 pub const MAX_GROUP_SESSIONS: usize = 4;
 pub const PURGE_BATCH: usize = 256;
@@ -48,8 +49,6 @@ pub enum S3SessionError {
     InvalidAccessKey,
     #[error("session expiry is invalid")]
     InvalidExpiry,
-    #[error("active session limit reached")]
-    LimitReached,
     #[error("session index is inconsistent")]
     IndexInconsistent,
     #[error("session not found")]
@@ -86,7 +85,6 @@ impl S3SessionError {
             self,
             Self::InvalidAccessKey
                 | Self::InvalidExpiry
-                | Self::LimitReached
                 | Self::NotFound
                 | Self::InvalidToken
                 | Self::Expired
@@ -163,6 +161,16 @@ fn expiry_parts(key: &[u8]) -> Option<(u64, String)> {
     let seconds = u64::from_be_bytes(key.get(..8)?.try_into().ok()?);
     let access_key = std::str::from_utf8(key.get(8..)?).ok()?.to_string();
     S3Session::valid_access_key(&access_key).then_some((seconds, access_key))
+}
+
+/// Issue order of a session: the time-ordered ULID in its access key, then expiry.
+fn session_age(session: &S3Session) -> (u128, SystemTime) {
+    let issued = session
+        .access_key
+        .strip_prefix(S3_SESSION_ACCESS_PREFIX)
+        .and_then(|key_id| key_id.parse::<Ulid>().ok())
+        .map_or(0, u128::from);
+    (issued, session.expiry)
 }
 
 fn generate_secret(length: usize) -> Secret {
@@ -286,6 +294,25 @@ mod tests {
             path_restrictions: None,
             issued_by,
         }
+    }
+
+    async fn owner_index(
+        context: &DriverContext,
+        user: UserId,
+        group: GroupId,
+    ) -> BTreeSet<String> {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+                key: owner_key(user, group),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            panic!("owner index read failed");
+        };
+        decode_index(value.as_ref()).unwrap()
     }
 
     #[test]
@@ -505,18 +532,22 @@ mod tests {
                 .all(|credential| credential.access_key != session.access_key_id)
         );
 
+        let mut issued = vec![session.access_key_id];
         for _ in 1..MAX_GROUP_SESSIONS {
-            drive(
-                CreateS3SessionOperation::new(
-                    session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
-                    CredentialSealKey::derive(&[7u8; 32]),
-                ),
-                &context,
-            )
-            .await
-            .unwrap();
+            issued.push(
+                drive(
+                    CreateS3SessionOperation::new(
+                        session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
+                        CredentialSealKey::derive(&[7u8; 32]),
+                    ),
+                    &context,
+                )
+                .await
+                .unwrap()
+                .access_key_id,
+            );
         }
-        let error = drive(
+        let extra = drive(
             CreateS3SessionOperation::new(
                 session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
                 CredentialSealKey::derive(&[7u8; 32]),
@@ -524,7 +555,90 @@ mod tests {
             &context,
         )
         .await
-        .unwrap_err();
-        assert_eq!(error, S3SessionError::LimitReached);
+        .unwrap();
+
+        let index = owner_index(&context, user, group).await;
+        assert_eq!(index.len(), MAX_GROUP_SESSIONS);
+        assert!(index.contains(&extra.access_key_id));
+        let evicted = issued
+            .iter()
+            .filter(|access_key| !index.contains(*access_key))
+            .collect::<Vec<_>>();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(
+            drive(GetS3SessionOperation::new(evicted[0].clone()), &context)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn evicts_oldest_session() {
+        // Issue order comes from the access key ULID, here inverse to expiry order.
+        let (_directory, context) = test_context();
+        let user = UserId::local(Ulid::from_bytes([2u8; 16]), RealmId::from_bytes([1u8; 32]));
+        let group = Ulid::from_bytes([3u8; 16]);
+        let seal_key = CredentialSealKey::derive(&[7u8; 32]);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut issued = Vec::new();
+        for step in 0..MAX_GROUP_SESSIONS as u64 {
+            let ttl = Duration::from_secs(3_600 - step * 600);
+            issued.push(
+                drive(
+                    CreateS3SessionOperation::with_key(
+                        session_config(user, group, now, now + ttl, [4u8; 32]),
+                        Ulid::from_parts(1_000 + step, u128::from(step)).to_string(),
+                        seal_key.clone(),
+                    ),
+                    &context,
+                )
+                .await
+                .unwrap()
+                .access_key_id,
+            );
+        }
+
+        let extra = drive(
+            CreateS3SessionOperation::with_key(
+                session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
+                Ulid::from_parts(2_000, 9).to_string(),
+                seal_key,
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let index = owner_index(&context, user, group).await;
+        assert_eq!(index.len(), MAX_GROUP_SESSIONS);
+        assert!(index.contains(&extra.access_key_id));
+        assert!(!index.contains(&issued[0]));
+        assert!(issued[1..].iter().all(|key| index.contains(key)));
+        assert_eq!(
+            drive(GetS3SessionOperation::new(issued[0].clone()), &context)
+                .await
+                .unwrap(),
+            None
+        );
+        let expiry = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 16,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = expiry else {
+            panic!("expiry iteration failed");
+        };
+        let keys = values
+            .iter()
+            .filter_map(|(key, _)| expiry_parts(key.as_ref()).map(|(_, access_key)| access_key))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys.len(), MAX_GROUP_SESSIONS);
+        assert!(!keys.contains(&issued[0]));
     }
 }

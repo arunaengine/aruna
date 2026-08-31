@@ -76,7 +76,8 @@ and WRITE capability under the effective bearer restrictions on that group's nod
 - The group is always taken from `group_id` and is never inferred from membership order.
 - The returned access key, signing secret and session token are accepted only by the issuing node.
 - Expiry is the earlier of one hour from issuance and the current bearer expiry.
-- Sessions are stored outside the long-lived credential list and limit."#,
+- Sessions are stored outside the long-lived credential list and limit.
+- At most four sessions are kept per user and group; a further exchange evicts the oldest one."#,
     request_body(
         content = CreateS3SessionRequest,
         description = "The explicitly selected group; group_id is required.",
@@ -111,8 +112,7 @@ and WRITE capability under the effective bearer restrictions on that group's nod
         ),
         (status = 400, description = "group_id is not a ULID", body = ErrorResponse),
         (status = 401, description = "The bearer token is absent, invalid, expired, or has no remaining lifetime", body = ErrorResponse),
-        (status = 403, description = "The caller is not a group member or lacks effective WRITE capability", body = ErrorResponse),
-        (status = 409, description = "The per-user/group active session bound has been reached", body = ErrorResponse)
+        (status = 403, description = "The caller is not a group member or lacks effective WRITE capability", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -331,9 +331,6 @@ async fn session_response(
 
 fn map_create_error(error: S3SessionError) -> ServerError {
     match error {
-        S3SessionError::LimitReached => {
-            ServerError::Conflict("active session limit reached".to_string())
-        }
         S3SessionError::InvalidExpiry => ServerError::Unauthorized,
         error => ServerError::InternalError(error.to_string()),
     }
