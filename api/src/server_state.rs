@@ -551,6 +551,15 @@ impl ServerState {
             .ok_or(OidcError::ProviderNotFound)
     }
 
+    /// Peer contacts from the metadata plane; empty while it is not wired.
+    pub fn peer_contacts(&self) -> aruna_operations::metadata::PeerContacts {
+        self.get_ctx()
+            .metadata_handle
+            .as_ref()
+            .map(aruna_operations::metadata::MetadataHandle::peer_contacts)
+            .unwrap_or_default()
+    }
+
     pub fn is_management_node(&self) -> bool {
         matches!(self.node_capabilities, NodeCapabilities::Management { .. })
     }

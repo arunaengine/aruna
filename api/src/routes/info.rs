@@ -20,8 +20,8 @@ use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::{
     GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
+use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
-use aruna_operations::metadata::{MetadataHandle, PeerContacts};
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
     drive_realm_placement_mutation,
@@ -1135,12 +1135,7 @@ pub(crate) async fn run_realm_info(
         let present_nodes = load_realm_presence_best_effort(state).await;
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
-        let contacts = state
-            .get_ctx()
-            .metadata_handle
-            .as_ref()
-            .map(MetadataHandle::peer_contacts)
-            .unwrap_or_default();
+        let contacts = state.peer_contacts();
         let nodes = map_realm_nodes(
             state,
             &config,
