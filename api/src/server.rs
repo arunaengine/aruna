@@ -74,9 +74,7 @@ impl Server {
         let mut router = Router::new()
             .nest("/api/v1", api_v1)
             .layer(DefaultBodyLimit::max(self.config.max_http_body_size))
-            .merge(swagger_ui())
-            .layer(from_fn(redirect_swagger))
-            .layer(from_fn(baseline_security_headers));
+            .merge(swagger_ui());
         if self.mcp_enabled {
             router = router.merge(crate::mcp::router(
                 self.state.clone(),
@@ -84,6 +82,11 @@ impl Server {
                 self.api_public_url.as_deref(),
             ));
         }
+        // After every merge: a merge swaps the fallback in unwrapped, so the
+        // redirect and headers must be layered over the final router.
+        let mut router = router
+            .layer(from_fn(redirect_swagger))
+            .layer(from_fn(baseline_security_headers));
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
         }
@@ -249,6 +252,72 @@ mod tests {
         let _second = router.clone().oneshot(request()).await.unwrap();
         let third = router.oneshot(request()).await.unwrap();
         assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn mcp_root_redirects() {
+        // The MCP router's guards are route layers: they must never claim the
+        // merged fallback, or `/` answers 401 instead of the swagger redirect.
+        use crate::server_state::ServerState;
+        use aruna_core::structs::{NodeCapabilities, RealmId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let driver_ctx = Arc::new(aruna_operations::driver::DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::user_node(realm_id).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+
+        let router = Server::new(
+            state,
+            ServerConfig {
+                http_addr: "127.0.0.1:0".parse().unwrap(),
+                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                cors: crate::cors::CorsConfig::default(),
+            },
+        )
+        .with_mcp_enabled(true)
+        .build_router();
+
+        let root = router
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::TEMPORARY_REDIRECT);
+
+        let unknown = router
+            .oneshot(
+                Request::builder()
+                    .uri("/definitely-missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

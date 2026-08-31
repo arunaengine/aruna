@@ -259,16 +259,16 @@ pub fn router(state: Arc<ServerState>, cors: &CorsConfig, api_public_url: Option
 
     Router::new()
         .nest_service("/mcp", service)
-        .layer(from_fn_with_state(state.clone(), mcp_auth))
-        .layer(from_fn_with_state(
+        .route_layer(from_fn_with_state(state.clone(), mcp_auth))
+        .route_layer(from_fn_with_state(
             state.clone(),
             crate::rate_limit::principal_middleware,
         ))
-        .layer(from_fn_with_state(
+        .route_layer(from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
         ))
-        .layer(from_fn_with_state(
+        .route_layer(from_fn_with_state(
             state,
             crate::telemetry::request_tracing_middleware,
         ))
