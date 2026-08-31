@@ -402,8 +402,9 @@ async fn device_skips_materialization() {
     .expect_err("the input is not materialized here");
 
     // The realm node resolves the input against its own objects, so it stops at
-    // the absent one instead of reaching forwarding.
-    let SubmitJobError::PlacementUnavailable(reason) = refused else {
+    // the absent one instead of reaching forwarding. A definitive miss is the
+    // submitter's error, not a retryable placement failure.
+    let SubmitJobError::InvalidWorkspace(reason) = refused else {
         panic!("a realm node must refuse an input it does not hold");
     };
     assert!(
