@@ -134,7 +134,7 @@ async fn device_fetches_owner() -> TestResult<()> {
 async fn device_fetches_groups() -> TestResult<()> {
     // Group documents replicate on a plane devices are excluded from, so the
     // fetch is the only way the owner's groups reach a device. They land in the
-    // keyspaces the ordinary reads use, and a group the realm drops leaves.
+    // keyspaces the ordinary reads use.
     let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let device = join_device(&realm).await?;
@@ -170,8 +170,8 @@ async fn device_fetches_groups() -> TestResult<()> {
         vec![group_id]
     );
 
-    // A group the realm no longer lists for this owner leaves the device on the
-    // next fetch, and the realm authorization row sharing AUTH_KEYSPACE stays.
+    // An unversioned snapshot cannot prove a group the answer omits was removed
+    // rather than still replicating, so a group the realm does not list stays.
     let realm_auth = read_realm_auth(&device, realm.realm_id).await?;
     assert!(realm_auth.is_some());
     let stale = cache_stale_group(&realm, &device).await?;
@@ -181,8 +181,8 @@ async fn device_fetches_groups() -> TestResult<()> {
         "a realm node must serve the device the realm documents"
     );
 
-    assert!(read_group_record(&device, stale).await?.is_none());
-    assert!(read_group_auth(&device, stale).await?.is_none());
+    assert!(read_group_record(&device, stale).await?.is_some());
+    assert!(read_group_auth(&device, stale).await?.is_some());
     assert!(read_group_record(&device, group_id).await?.is_some());
     assert_eq!(
         read_realm_auth(&device, realm.realm_id).await?,
