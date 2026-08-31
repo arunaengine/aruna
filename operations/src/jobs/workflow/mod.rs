@@ -40,7 +40,9 @@ use super::store::{
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::reservation::job_reservation;
-use crate::jobs::lifecycle::updates::{publish_progress, publish_terminal};
+use crate::jobs::lifecycle::updates::{
+    SETTLE_RETRY_AFTER, publish_progress, publish_terminal, schedule_terminal_settle,
+};
 use crate::placement_policy::subject::read_local_subject;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
@@ -1579,8 +1581,25 @@ async fn cleanup_and_crate(context: &DriverContext, job_id: JobId, record: Optio
     log_compute_summary(&record);
     // A receipted execution publishes its terminal state and frees its exact
     // reservation here; a purely local job publishes nothing.
-    Box::pin(publish_terminal(context, &record)).await;
+    if !Box::pin(publish_terminal(context, &record)).await {
+        arm_terminal_settle(context, job_id).await;
+    }
     finalize_followups(context, job_id).await;
+}
+
+/// Hands a deferred terminal publication to the settle task. The reservation
+/// row keeps the obligation durable until that retry succeeds.
+async fn arm_terminal_settle(context: &DriverContext, job_id: JobId) {
+    let Some(task_handle) = context.task_handle.as_ref() else {
+        warn!(job_id = %job_id, "Terminal publication deferred with no task handle to retry it");
+        return;
+    };
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+        .send_effect(schedule_terminal_settle(SETTLE_RETRY_AFTER))
+        .await
+    {
+        warn!(job_id = %job_id, message = %message, "Failed to arm the terminal settle retry");
+    }
 }
 
 fn log_compute_summary(record: &JobRecord) {

@@ -156,7 +156,11 @@ async fn reservation_snapshot(
     ctx: &DriverContext,
     epoch: AdvertisementEpoch,
 ) -> Result<ComputeReservationSnapshot, String> {
-    crate::jobs::lifecycle::updates::settle_terminals(ctx).await?;
+    // A pending terminal obligation is retried by its own task; it must never
+    // stop this node from publishing its info document.
+    if let Err(error) = crate::jobs::lifecycle::updates::settle_terminals(ctx).await {
+        warn!(error = %error, "Terminal job settlement failed during the node-info snapshot");
+    }
     let mut reserved = ResourceTotals::default();
     for record in read_reservations(ctx).await? {
         reserved.add(&record.resources);

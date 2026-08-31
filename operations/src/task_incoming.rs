@@ -85,6 +85,7 @@ use crate::driver::{DriverContext, drive};
 use crate::group_backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::lifecycle::outbox::{OUTBOX_RETRY_AFTER, drain_family_outbox};
+use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, settle_terminals};
 use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
@@ -2393,6 +2394,23 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// Retries the terminal publications receipted executions still owe. The
+    /// reservation row keeps the obligation durable, so the retry re-arms until
+    /// every one of them is published and its capacity released.
+    async fn settle_job_terminals(&self) {
+        let pending = match settle_terminals(self.context.as_ref()).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::SettleJobTerminals, error = %error, "Failed to settle terminal job publications");
+                true
+            }
+        };
+        if pending {
+            self.reschedule_timer(TaskKey::SettleJobTerminals, SETTLE_RETRY_AFTER)
+                .await;
+        }
+    }
+
     /// Runs every witness round whose persisted deadline has elapsed.
     async fn drain_job_witness_queue(&self) {
         let now_ms = unix_timestamp_millis();
@@ -2925,6 +2943,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainJobWitnessQueue => {
                 self.drain_job_witness_queue().await;
+            }
+            TaskKey::SettleJobTerminals => {
+                self.settle_job_terminals().await;
             }
             TaskKey::ReconcileSyncedFolders => {
                 let after = match crate::device::sync::reconcile_folders(&self.context).await {

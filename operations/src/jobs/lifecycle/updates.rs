@@ -5,12 +5,15 @@
 //! a state or forge a terminal result, and terminal success may only name an
 //! output record that is already durable.
 
-use aruna_core::effects::JobRecordFrame;
+use std::time::Duration;
+
+use aruna_core::effects::{Effect, JobRecordFrame};
 use aruna_core::structs::{
     ExecutionReceipt, ExecutionUpdate, JobErrorKind, JobFamilyId, JobFamilyRecord, JobId,
     JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
     PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
 };
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
 use tracing::{debug, warn};
@@ -36,6 +39,17 @@ pub struct ExecutionChain {
     pub spec_digest: [u8; 32],
     pub receipt_digest: [u8; 32],
     pub job_id: JobId,
+}
+
+/// Spacing between retries of a terminal publication that stayed pending.
+pub const SETTLE_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Asks the settle task to retry the terminal obligations still held here.
+pub fn schedule_terminal_settle(after: Duration) -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::SettleJobTerminals,
+        after,
+    })
 }
 
 /// Resolves the receipt chain of one local job, if a target admitted it here.
@@ -380,8 +394,10 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
 }
 
 /// Retries terminal publication and capacity release for every durable local
-/// terminal execution that still has a reservation.
-pub async fn settle_terminals(context: &DriverContext) -> Result<(), String> {
+/// terminal execution that still has a reservation. `true` means at least one
+/// obligation stayed pending, so the caller must run this again.
+pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
+    let mut pending = false;
     for reservation in held_reservations(context).await? {
         let Some(record) =
             read_job_record(&context.storage_handle, reservation.job_id, None).await?
@@ -389,13 +405,15 @@ pub async fn settle_terminals(context: &DriverContext) -> Result<(), String> {
             continue;
         };
         if record.is_settled() && !publish_terminal(context, &record).await {
-            return Err(format!(
-                "terminal obligation for execution {} remains pending",
-                reservation.execution_id
-            ));
+            warn!(
+                job_id = %reservation.job_id,
+                execution_id = %reservation.execution_id,
+                "Terminal obligation remains pending; the reservation stays held"
+            );
+            pending = true;
         }
     }
-    Ok(())
+    Ok(pending)
 }
 
 fn terminal_state(record: &JobRecord) -> Option<PhysicalExecutionState> {
