@@ -250,7 +250,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "ahash 0.8.12",
  "aruna-blob",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "aruna-core",
  "aruna-net",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "rustix",
  "serde_json",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "ahash 0.8.12",
  "aruna",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.41"
+version = "3.0.0-alpha.66"
 dependencies = [
  "aruna-core",
  "async-trait",
