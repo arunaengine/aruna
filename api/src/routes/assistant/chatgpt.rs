@@ -546,10 +546,17 @@ mod tests {
     #[test]
     fn static_model_efforts() {
         for model in static_models() {
-            assert_eq!(
-                model.reasoning_efforts,
-                ["minimal", "low", "medium", "high", "xhigh"]
-            );
+            if model.id.starts_with("gpt-5.6") {
+                assert_eq!(
+                    model.reasoning_efforts,
+                    ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+                );
+            } else {
+                assert_eq!(
+                    model.reasoning_efforts,
+                    ["minimal", "low", "medium", "high", "xhigh"]
+                );
+            }
         }
     }
 }
