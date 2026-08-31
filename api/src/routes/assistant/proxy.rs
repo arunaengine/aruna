@@ -393,6 +393,7 @@ pub(super) async fn fetch_models(
         .chain(payload.models)
         .filter(|model| !model.id.is_empty() && text_model(&model.id))
         .map(|model| ProviderModel {
+            reasoning_efforts: super::reasoning_efforts(provider.kind, &model.id),
             id: model.id,
             display_name: model.display_name.or(model.name),
             static_model: false,

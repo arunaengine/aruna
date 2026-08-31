@@ -112,6 +112,26 @@ pub struct ProviderModel {
     pub display_name: Option<String>,
     #[serde(rename = "static")]
     pub static_model: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
+}
+
+/// Reasoning levels a model family accepts; empty leaves the client its own
+/// fallback. Codex gpt-5.x take xhigh; generic OpenAI reasoning models take three.
+pub(super) fn reasoning_efforts(kind: AssistantProviderKind, id: &str) -> Vec<String> {
+    let levels: &[&str] = match kind {
+        AssistantProviderKind::Chatgpt if id.starts_with("gpt-5") => {
+            &["minimal", "low", "medium", "high", "xhigh"]
+        }
+        AssistantProviderKind::Chatgpt => &[],
+        _ if is_openai_reasoning(id) => &["low", "medium", "high"],
+        _ => &[],
+    };
+    levels.iter().map(|level| level.to_string()).collect()
+}
+
+fn is_openai_reasoning(id: &str) -> bool {
+    id.starts_with("o3") || id.starts_with("o4") || id.starts_with("gpt-5")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -255,6 +275,7 @@ pub(super) fn provider_summary(provider: &AssistantProvider) -> ProviderSummary 
             .models
             .iter()
             .map(|id| ProviderModel {
+                reasoning_efforts: reasoning_efforts(provider.kind, id),
                 id: id.clone(),
                 display_name: None,
                 static_model: provider.kind == AssistantProviderKind::Chatgpt,
@@ -353,7 +374,7 @@ fn provider_base_url(
                     "kind": "openai",
                     "label": "OpenAI",
                     "base_url": "https://api.openai.com",
-                    "models": [{"id": "gpt-5", "static": false}],
+                    "models": [{"id": "gpt-5", "static": false, "reasoning_efforts": ["low", "medium", "high"]}],
                     "default_model": "gpt-5",
                     "created_at": "2026-04-09T12:00:00Z",
                     "status": "ready"
@@ -422,7 +443,7 @@ pub async fn list_providers(
                 "kind": "openai",
                 "label": "OpenAI",
                 "base_url": "https://api.openai.com",
-                "models": [{"id": "gpt-5", "static": false}],
+                "models": [{"id": "gpt-5", "static": false, "reasoning_efforts": ["low", "medium", "high"]}],
                 "default_model": "gpt-5",
                 "created_at": "2026-04-09T12:00:00Z",
                 "status": "ready"
@@ -522,7 +543,7 @@ pub async fn create_provider(
                 "kind": "openai",
                 "label": "OpenAI (team)",
                 "base_url": "https://api.openai.com",
-                "models": [{"id": "gpt-5", "static": false}],
+                "models": [{"id": "gpt-5", "static": false, "reasoning_efforts": ["low", "medium", "high"]}],
                 "default_model": "gpt-5",
                 "created_at": "2026-04-09T12:00:00Z",
                 "status": "ready"
@@ -639,8 +660,10 @@ pub async fn delete_provider(
         (status = 200, description = "The models the provider reports", body = ProviderModelsResponse,
             example = json!({
                 "models": [
-                    {"id": "gpt-5", "display_name": "GPT-5", "static": false},
-                    {"id": "gpt-5.4", "static": false}
+                    {"id": "gpt-5", "display_name": "GPT-5", "static": false,
+                        "reasoning_efforts": ["low", "medium", "high"]},
+                    {"id": "gpt-5.4", "static": false,
+                        "reasoning_efforts": ["low", "medium", "high"]}
                 ]
             })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -782,5 +805,48 @@ mod tests {
 
         assert!(!body.contains("secret-key"));
         assert!(!body.contains("secret-account"));
+    }
+
+    #[test]
+    fn efforts_by_family() {
+        assert_eq!(
+            reasoning_efforts(AssistantProviderKind::Chatgpt, "gpt-5.6-sol"),
+            ["minimal", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            reasoning_efforts(AssistantProviderKind::Openai, "gpt-5"),
+            ["low", "medium", "high"]
+        );
+        assert!(reasoning_efforts(AssistantProviderKind::Chatgpt, "o3-mini").is_empty());
+        assert!(reasoning_efforts(AssistantProviderKind::Anthropic, "claude-3").is_empty());
+    }
+
+    #[test]
+    fn efforts_round_trip() {
+        let response = ProviderModelsResponse {
+            models: vec![
+                ProviderModel {
+                    id: "gpt-5.6-sol".to_string(),
+                    display_name: None,
+                    static_model: true,
+                    reasoning_efforts: vec!["minimal".to_string(), "xhigh".to_string()],
+                },
+                ProviderModel {
+                    id: "text-embedding-3-small".to_string(),
+                    display_name: None,
+                    static_model: false,
+                    reasoning_efforts: Vec::new(),
+                },
+            ],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["models"][0]["reasoning_efforts"],
+            serde_json::json!(["minimal", "xhigh"])
+        );
+        assert!(json["models"][1].get("reasoning_efforts").is_none());
+        let parsed: ProviderModelsResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.models[0].reasoning_efforts, ["minimal", "xhigh"]);
+        assert!(parsed.models[1].reasoning_efforts.is_empty());
     }
 }

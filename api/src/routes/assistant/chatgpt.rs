@@ -137,6 +137,7 @@ pub(super) fn static_models() -> Vec<ProviderModel> {
     ]
     .into_iter()
     .map(|id| ProviderModel {
+        reasoning_efforts: super::reasoning_efforts(AssistantProviderKind::Chatgpt, id),
         id: id.to_string(),
         display_name: None,
         static_model: true,
@@ -534,11 +535,21 @@ pub(super) async fn fresh_provider(
 
 #[cfg(test)]
 mod tests {
-    use super::extract_account_id;
+    use super::{extract_account_id, static_models};
 
     #[test]
     fn extracts_account_id() {
         let token = "aaa.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xIn19.bbb";
         assert_eq!(extract_account_id(token).as_deref(), Some("acct_1"));
+    }
+
+    #[test]
+    fn static_model_efforts() {
+        for model in static_models() {
+            assert_eq!(
+                model.reasoning_efforts,
+                ["minimal", "low", "medium", "high", "xhigh"]
+            );
+        }
     }
 }
