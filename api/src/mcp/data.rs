@@ -804,3 +804,125 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         PutObjectError::PutObjectFailed => internal_error("object write failed"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        assert_eq!(result.is_error, Some(true));
+        result
+            .structured_content
+            .expect("a tool error carries the structured body")
+    }
+
+    #[test]
+    fn key_rejects_traversal() {
+        let text = body(validate_key("../secret").unwrap_err());
+        assert_eq!(text["code"], "Bad request");
+        assert!(
+            text["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("relative key")
+        );
+        assert!(validate_key("reads/sample.fastq.gz").is_ok());
+    }
+
+    #[test]
+    fn bounded_bytes_range() {
+        assert_eq!(bounded_bytes(None).unwrap(), MAX_TEXT_BYTES);
+        assert_eq!(bounded_bytes(Some(1024)).unwrap(), 1024);
+        assert!(bounded_bytes(Some(0)).is_err());
+        assert!(bounded_bytes(Some(MAX_TEXT_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn cursor_rejects_garbage() {
+        // Non base64 and well-formed base64 that is not a token both refuse.
+        let text = body(decode_cursor("!not base64!").unwrap_err());
+        assert!(
+            text["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("next_cursor")
+        );
+        assert!(decode_cursor("Zm9v").is_err());
+    }
+
+    #[test]
+    fn object_error_forbidden() {
+        let forbidden = body(object_error(crate::error::ServerError::Forbidden, "write"));
+        assert!(
+            forbidden["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("write permission")
+        );
+        assert_eq!(
+            body(object_error(crate::error::ServerError::NotFound, "read"))["code"],
+            "Not found"
+        );
+    }
+
+    #[test]
+    fn bucket_error_maps() {
+        assert!(
+            body(map_bucket_error(GetBucketInfoError::NotFound))["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("list_buckets")
+        );
+        assert_eq!(
+            body(map_bucket_error(GetBucketInfoError::GetBucketInfoFailed))["code"],
+            "Internal error"
+        );
+    }
+
+    #[test]
+    fn get_error_categories() {
+        assert_eq!(
+            body(map_get_error(GetObjectError::NoSuchKey))["code"],
+            "Not found"
+        );
+        assert_eq!(
+            body(map_get_error(GetObjectError::InvalidRange))["code"],
+            "Bad request"
+        );
+        assert_eq!(
+            body(map_get_error(GetObjectError::GovernedUnavailable))["code"],
+            "Forbidden"
+        );
+        assert_eq!(
+            body(map_get_error(GetObjectError::ReferenceSourceChanged))["code"],
+            "Conflict"
+        );
+    }
+
+    #[test]
+    fn put_error_categories() {
+        assert_eq!(
+            body(map_put_error(PutObjectError::MissingBody))["code"],
+            "Bad request"
+        );
+        assert_eq!(
+            body(map_put_error(PutObjectError::QuotaExceeded {
+                limit: 10,
+                usage: 20
+            }))["code"],
+            "Conflict"
+        );
+        assert_eq!(
+            body(map_put_error(PutObjectError::PutObjectFailed))["code"],
+            "Internal error"
+        );
+    }
+
+    #[test]
+    fn search_kind_names() {
+        assert_eq!(SearchKind::Documents.as_str(), "documents");
+        assert_eq!(SearchKind::Buckets.as_str(), "buckets");
+        assert_eq!(SearchKind::Groups.as_str(), "groups");
+        assert_eq!(SearchKind::Users.as_str(), "users");
+    }
+}
