@@ -3031,6 +3031,7 @@ pub async fn references_preflight(
                 score: 0.0,
                 title: reference.title,
                 snippet: None,
+                subject_types: Vec::new(),
             })
             .collect();
         node_results.push(NodeSearchResult {
@@ -7907,6 +7908,7 @@ mod tests {
                 score: 0.0,
                 title: format!("Document {index}"),
                 snippet: None,
+                subject_types: Vec::new(),
             })
             .collect::<Vec<_>>();
         let mut watermark = None;

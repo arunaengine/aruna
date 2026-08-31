@@ -69,7 +69,7 @@ use super::query_cache::{
 };
 use super::repository::{iter_registry_effect, parse_registry_iter};
 use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
-use super::search_enrichment::{hit_snippet, hit_title};
+use super::search_enrichment::{hit_snippet, hit_title, hit_types};
 use super::summary_cache::summary_cache;
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
@@ -5211,6 +5211,7 @@ fn metadata_search_hit_from_craqle(
         score: hit.score,
         title,
         snippet,
+        subject_types: hit_types(properties),
     }
 }
 
@@ -6433,6 +6434,7 @@ async fn search_candidate_graphs(
                 document_id: record.document_id.to_string(),
                 group_id: record.group_id.to_string(),
                 title: hit_title(&properties, &record.document_path, &subject_iri),
+                subject_types: hit_types(&properties),
                 document_path: record.document_path,
                 graph_iri: record.graph_iri,
                 subject_iri,

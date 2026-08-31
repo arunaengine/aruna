@@ -839,6 +839,9 @@ pub struct MetadataSearchHit {
     pub score: f32,
     pub title: String,
     pub snippet: Option<String>,
+    /// `rdf:type` IRIs of the matched subject, so a caller can tell a file
+    /// entity from the dataset it belongs to. Capped by the answering node.
+    pub subject_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -681,7 +681,8 @@ than one type or with `types=buckets`, which has no continuation token."#,
                             "subject_iri": "https://node.example.test/api/v1/metadata/01JMETADATA0123456789ABCDE#root",
                             "score": 4.5,
                             "title": "RNA-seq reference run",
-                            "snippet": "reference run of the RNA-seq pipeline"
+                            "snippet": "reference run of the RNA-seq pipeline",
+                            "subject_types": ["http://schema.org/Dataset"]
                         }
                     ],
                     "next_cursor": "eyJ3IjoiMDFKTUVUQURBVEEwMTIzNDU2Nzg5QUJDREUifQ",
@@ -1024,7 +1025,7 @@ mod tests {
     use crate::error::ServerError;
     use crate::routes::metadata::{
         CreateMetadataRequest, CreateMetadataScaffoldRequest, MetadataQueryMode,
-        create_metadata_document,
+        ReplaceMetadataRoCrateRequest, create_metadata_document, replace_metadata_rocrate,
     };
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -1046,6 +1047,7 @@ mod tests {
     };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use axum::extract::Path;
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
     use std::time::SystemTime;
@@ -1276,8 +1278,8 @@ mod tests {
         }
     }
 
-    async fn create_doc(fx: &Fixture, group_id: Ulid, path: &str, name: &str) {
-        let _ = create_metadata_document(
+    async fn create_doc(fx: &Fixture, group_id: Ulid, path: &str, name: &str) -> String {
+        let (_, Json(response)) = create_metadata_document(
             State(fx.state.clone()),
             Extension(Some(fx.auth.clone())),
             Extension(None),
@@ -1292,6 +1294,49 @@ mod tests {
                     public: true,
                 },
             )),
+        )
+        .await
+        .unwrap();
+        response.summary.document_id
+    }
+
+    // Replaces the scaffolded crate with a root dataset that owns one file
+    // entity, so search sees two subjects under one document.
+    async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
+        let rocrate = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": format!("https://w3id.org/aruna/{document_id}")}
+                },
+                {
+                    "@id": format!("https://w3id.org/aruna/{document_id}"),
+                    "@type": "Dataset",
+                    "name": name,
+                    "description": "desc",
+                    "datePublished": "2026-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "hasPart": [{"@id": "./data/reef.csv"}]
+                },
+                {
+                    "@id": "./data/reef.csv",
+                    "@type": "File",
+                    "name": format!("{name}-part")
+                }
+            ]
+        });
+        let _ = replace_metadata_rocrate(
+            State(fx.state.clone()),
+            Extension(Some(fx.auth.clone())),
+            Extension(None),
+            Path(document_id.to_string()),
+            Json(ReplaceMetadataRoCrateRequest {
+                rocrate,
+                public: Some(true),
+            }),
         )
         .await
         .unwrap();
@@ -1739,6 +1784,51 @@ mod tests {
         assert_eq!(second.hits.len(), 1);
         assert_eq!(second.hits[0].user_id, fx.users[1].to_string());
         assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn documents_carry_subject_types() {
+        // Root and file entity match as separate subjects of one document, so
+        // only subject_types tells a file hit apart from a dataset hit.
+        let fx = setup().await;
+        let document_id = create_doc(&fx, fx.groups[0], "datasets/reef", "epsilon-reef").await;
+        // The crate can only be replaced once its graph is materialized.
+        drain_projection(&fx.state).await;
+        attach_file(&fx, &document_id, "epsilon-reef").await;
+        drain_projection(&fx.state).await;
+        flush_search(&fx.state).await;
+
+        let documents = search(
+            &fx,
+            SearchParams {
+                types: Some("documents".to_string()),
+                mode: Some(MetadataQueryMode::Local),
+                ..params("epsilon")
+            },
+        )
+        .await
+        .unwrap()
+        .documents
+        .unwrap();
+        let root = documents
+            .hits
+            .iter()
+            .find(|hit| hit.title == "epsilon-reef")
+            .expect("root dataset hit");
+        assert_eq!(
+            root.subject_types,
+            vec!["http://schema.org/Dataset".to_string()]
+        );
+        let file = documents
+            .hits
+            .iter()
+            .find(|hit| hit.subject_iri.ends_with("reef.csv"))
+            .expect("file entity hit");
+        assert_eq!(
+            file.subject_types,
+            vec!["http://schema.org/MediaObject".to_string()]
+        );
+        assert_eq!(file.document_id, document_id);
     }
 
     #[tokio::test]

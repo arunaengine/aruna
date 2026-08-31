@@ -237,9 +237,9 @@ pub struct SearchPage {
 }
 
 /// Deduplicate hits on `(graph_iri, subject_iri)` keeping the highest quantized
-/// score (smallest `document_id` on ties), preserving title/snippet from whichever
-/// copy carries them, and order by score descending with a `(graph_iri,
-/// subject_iri)` tie-break for a stable total order.
+/// score (smallest `document_id` on ties), preserving title, snippet and subject
+/// types from whichever copy carries them, and order by score descending with a
+/// `(graph_iri, subject_iri)` tie-break for a stable total order.
 pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
     let mut deduped: HashMap<(String, String), MetadataSearchHit> = HashMap::new();
     for hit in hits {
@@ -256,9 +256,17 @@ pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit>
                     if winner.snippet.is_none() {
                         winner.snippet = existing.snippet.take();
                     }
+                    if winner.subject_types.is_empty() {
+                        winner.subject_types = std::mem::take(&mut existing.subject_types);
+                    }
                     *existing = winner;
-                } else if existing.snippet.is_none() {
-                    existing.snippet = hit.snippet;
+                } else {
+                    if existing.snippet.is_none() {
+                        existing.snippet = hit.snippet;
+                    }
+                    if existing.subject_types.is_empty() {
+                        existing.subject_types = hit.subject_types;
+                    }
                 }
             }
             None => {
@@ -446,6 +454,7 @@ mod tests {
             score,
             title: subject.to_string(),
             snippet: None,
+            subject_types: Vec::new(),
         }
     }
 
@@ -690,6 +699,28 @@ mod tests {
         let merged = merge_search_hits(vec![top, low]);
         assert_eq!(merged[0].score, 0.9);
         assert_eq!(merged[0].snippet.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn merge_keeps_subject_types() {
+        // Only the node that described the subject knows its rdf:type IRIs.
+        let types = vec!["http://schema.org/MediaObject".to_string()];
+        let bare = hit("01A", "./file.txt", 0.9);
+        let mut typed = hit("01A", "./file.txt", 0.4);
+        typed.subject_types = types.clone();
+        assert_eq!(
+            merge_search_hits(vec![bare.clone(), typed.clone()])[0].subject_types,
+            types
+        );
+
+        let mut winner = hit("01B", "./file.txt", 0.9);
+        winner.subject_types = types.clone();
+        let mut loser = hit("01B", "./file.txt", 0.4);
+        loser.subject_types = vec!["http://schema.org/Dataset".to_string()];
+        assert_eq!(
+            merge_search_hits(vec![loser, winner])[0].subject_types,
+            types
+        );
     }
 
     #[test]

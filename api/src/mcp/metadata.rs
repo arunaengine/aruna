@@ -257,7 +257,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Search visible dataset metadata by free text, exact conformance IRI, and group, returning ranked hits with document_id, document_path, graph_iri, subject_iri, title, and snippet. Give q, conforms_to, or both; an empty q with no conforms_to is refused. Pass a hit's document_id to get_dataset for the full crate. Use search when the target may be a bucket, group, or user instead.",
+        description = "Search visible dataset metadata by free text, exact conformance IRI, and group, returning ranked hits with document_id, document_path, graph_iri, subject_iri, subject_types, title, and snippet. One hit is one matched RDF subject, so a crate's root dataset and its file entities match separately and subject_types carries the subject's rdf:type IRIs. Give q, conforms_to, or both; an empty q with no conforms_to is refused. Pass a hit's document_id to get_dataset for the full crate. Use search when the target may be a bucket, group, or user instead.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

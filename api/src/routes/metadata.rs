@@ -456,6 +456,10 @@ pub struct MetadataSearchHitResponse {
     /// Query-relevant text excerpt, populated by the answering node. Absent when
     /// the resource has no indexed literals to window.
     pub snippet: Option<String>,
+    /// `rdf:type` IRIs of the matched subject, at most eight, so a file entity
+    /// can be told apart from the dataset it belongs to. Empty when the
+    /// answering node knows no named type for it.
+    pub subject_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2497,6 +2501,8 @@ so an anonymous request returns fewer documents.
   reported as `truncated`; `next_cursor` is null once the results are exhausted.
 - Hits come from each node's own index, so a document whose write was only just accepted may not
   be findable yet.
+- One hit is one matched RDF subject, so a crate's root dataset and its file entities match
+  separately; `subject_types` carries that subject's `rdf:type` IRIs to tell them apart.
 - `conforms_to` matches the RO-Crate 1.2 and 1.3 specification IRIs and the RO-Crate community
   profiles under `https://w3id.org/ro/wfrun/` and
   `https://w3id.org/workflowhub/workflow-ro-crate/` exactly, without treating them as registered
@@ -2535,7 +2541,19 @@ so an anonymous request returns fewer documents.
                                     "subject_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
                                     "score": 0.87,
                                     "title": "Proteomics Run 42",
-                                    "snippet": "Metadata record for LC-MS run 42"
+                                    "snippet": "Metadata record for LC-MS run 42",
+                                    "subject_types": ["http://schema.org/Dataset"]
+                                },
+                                {
+                                    "document_id": "01JMETADATA0123456789ABCDE",
+                                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                                    "document_path": "datasets/proteomics/run-42",
+                                    "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                    "subject_iri": "./raw/run-42.mzML",
+                                    "score": 0.52,
+                                    "title": "run-42.mzML",
+                                    "snippet": "LC-MS run 42 raw spectra",
+                                    "subject_types": ["http://schema.org/MediaObject"]
                                 }
                             ],
                             "next_cursor": "eyJmIjoiMDFKIn0.c2lnbmF0dXJl",
@@ -2558,7 +2576,8 @@ so an anonymous request returns fewer documents.
                                     "subject_iri": "https://w3id.org/aruna/01JMETADATA9876543210ZYXWV",
                                     "score": 0.41,
                                     "title": "Proteomics Profile",
-                                    "snippet": null
+                                    "snippet": null,
+                                    "subject_types": ["http://schema.org/Dataset"]
                                 }
                             ],
                             "next_cursor": null,
@@ -3484,6 +3503,7 @@ pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitRespons
         score: hit.score,
         title: hit.title,
         snippet: hit.snippet,
+        subject_types: hit.subject_types,
     }
 }
 
@@ -3960,6 +3980,38 @@ mod tests {
             "snippet should window the matched query term: {:?}",
             dataset_hit.snippet
         );
+        assert_eq!(
+            dataset_hit.subject_types,
+            vec!["http://schema.org/Dataset".to_string()]
+        );
+
+        let (_, Json(parts)) = search_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: "file".to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        // A file entity matches as its own subject, so only its rdf:type tells
+        // it apart from the dataset it belongs to.
+        let file_hit = parts
+            .hits
+            .iter()
+            .find(|hit| hit.subject_iri.ends_with("file-1.txt"))
+            .expect("file entity matches as its own subject");
+        assert_eq!(
+            file_hit.subject_types,
+            vec!["http://schema.org/MediaObject".to_string()]
+        );
+        assert_eq!(file_hit.document_id, document_id);
 
         let (_, Json(conforming)) = search_metadata(
             State(test.state.clone()),
