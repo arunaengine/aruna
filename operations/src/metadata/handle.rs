@@ -3423,11 +3423,12 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     let effect_name = metadata_effect_kind(&effect);
     let auth = AllowAllAuthorizer;
     let graph_iri = effect_graph_iri(&effect);
-    let reads_existing_graph = matches!(
+    let needs_existing_graph = matches!(
         effect,
         MetadataEffect::ExportRoCrate { .. }
             | MetadataEffect::ExportRoCrateSummary { .. }
             | MetadataEffect::ExportRoCratePage { .. }
+            | MetadataEffect::PlanBatch { .. }
     );
     let persist_document_sync_after_success = metadata_effect_persists_document_sync(&effect);
     let deferred_persist_after_success = metadata_effect_defers_persist(&effect);
@@ -4024,10 +4025,10 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         (_, Some(error)) => MetadataEvent::Error { graph_iri, error },
         (Ok(event), None) => event,
         (Err(error), None) => {
-            // Craqle has no public typed missing-graph error on the export
-            // path, so probe graph existence to distinguish a pending
-            // materialization from a genuine backend failure.
-            let error = if reads_existing_graph
+            // Craqle has no public typed missing-graph error, so probe graph
+            // existence to distinguish a materialization that has not caught up
+            // (retryable, 503) from a genuine backend failure.
+            let error = if needs_existing_graph
                 && graph_iri
                     .as_deref()
                     .is_some_and(|iri| matches!(node.contains_graph(&GraphId::new(iri)), Ok(false)))
@@ -7691,6 +7692,33 @@ mod tests {
             .collect::<Vec<_>>();
         quads.sort();
         quads
+    }
+
+    #[tokio::test]
+    async fn plan_needs_graph() {
+        // A graph this node has not materialized yet is a lagging replica, so
+        // planning defers instead of rejecting the change set for good.
+        let (_storage_dir, storage) = auth_storage();
+        let (_metadata_dir, handle) = memory_handle(storage);
+
+        let event = handle
+            .send_metadata_effect(MetadataEffect::PlanBatch {
+                graph_iri: "urn:test:orset:absent".to_string(),
+                actor: [7u8; 32],
+                source: MetadataBatchSource::UpsertDataEntity {
+                    jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#
+                        .to_string(),
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Metadata(MetadataEvent::Error {
+                error: MetadataError::GraphNotFound,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
