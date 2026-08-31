@@ -257,7 +257,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Search visible dataset metadata by free text, exact conformance IRI, and group, returning ranked hits with document_id, document_path, graph_iri, subject_iri, subject_types, title, and snippet. One hit is one matched RDF subject, so a crate's root dataset and its file entities match separately and subject_types carries the subject's rdf:type IRIs. Give q, conforms_to, or both; an empty q with no conforms_to is refused. Pass a hit's document_id to get_dataset for the full crate. Use search when the target may be a bucket, group, or user instead.",
+        description = "Search visible dataset metadata by free text, exact conformance IRI, and group, returning ranked hits with document_id, document_path, graph_iri, subject_iri, subject_types, title, and snippet. One hit is one matched RDF subject, so a crate's root dataset and its file entities match separately and subject_types carries the subject's rdf:type IRIs. Give q, conforms_to, or both; an empty q with no conforms_to is refused. Pass a hit's document_id to get_dataset for the full crate. Use search when the target may be a bucket, group, or user instead, and count_datasets to count the caller's datasets rather than paging hits, since this returns at most 100 ranked hits, not a total.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -540,7 +540,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Run a read-only SPARQL SELECT or ASK query over visible metadata, or over one document when document_id is given, and return the solutions or the boolean with the fan-out counters. Use search_datasets for plain text lookup and this tool for questions about relationships between entities. Without document_id the query fans out across realm nodes and must be an ASK or a SELECT DISTINCT over a single triple pattern with no OFFSET; with document_id it runs locally without that restriction. At most 10000 rows are returned and the query is cut off after ten seconds.",
+        description = "Run a read-only SPARQL SELECT or ASK query over visible metadata, or over one document when document_id is given, and return the solutions or the boolean with the fan-out counters. Use search_datasets for plain text lookup and this tool only for questions the typed tools cannot answer, such as relationships between entities. Do not use it to count datasets or documents: count_datasets returns the caller's dataset, Profile, and process-run totals, get_group_usage one group's counts, and get_realm_info the realm-wide document count. Without document_id the query fans out across realm nodes and must be an ASK or a SELECT DISTINCT over a single triple pattern with no OFFSET; with document_id it runs locally without that restriction. At most 10000 rows are returned and the query is cut off after ten seconds.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
