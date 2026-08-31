@@ -227,18 +227,25 @@ async fn drains_past_terminal() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(drain_intake(&user_node.context).await, DrainOutcome::More);
 
-    for draft_id in pending {
-        let drained = drive(
-            InspectDraftOperation::new(draft_id),
-            user_node.context.as_ref(),
-        )
-        .await?;
-        assert!(
-            matches!(drained.state, IntakeState::Published { .. }),
-            "a draft behind the first page did not publish: {:?}",
-            drained.state
-        );
-    }
+    // A forward whose outcome was ambiguous is retried after a backoff, so the
+    // tail converges over passes. A scan that never paged reaches no draft
+    // behind the first page in any number of them.
+    wait_for_convergence("a draft behind the first page did not publish", || async {
+        drain_intake(&user_node.context).await;
+        let mut unpublished = 0;
+        for draft_id in &pending {
+            let drained = drive(
+                InspectDraftOperation::new(*draft_id),
+                user_node.context.as_ref(),
+            )
+            .await?;
+            if !matches!(drained.state, IntakeState::Published { .. }) {
+                unpublished += 1;
+            }
+        }
+        Ok::<usize, Box<dyn std::error::Error>>(unpublished)
+    })
+    .await?;
 
     shutdown(nodes).await;
     Ok(())
