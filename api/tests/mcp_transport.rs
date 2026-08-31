@@ -36,10 +36,11 @@ use axum::http::{HeaderValue, header};
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
+use rmcp::service::RunningService;
 use rmcp::transport::{
     StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
 };
-use rmcp::{ClientLifecycleMode, ClientServiceExt};
+use rmcp::{ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -50,7 +51,7 @@ struct Fixture {
     _root: TempDir,
     state: Arc<ServerState>,
     actor: Actor,
-    _group_id: Ulid,
+    group_id: Ulid,
     token: String,
     net: NetHandle,
 }
@@ -224,7 +225,7 @@ async fn setup_fixture() -> Fixture {
         _root: root,
         state,
         actor,
-        _group_id: group_id,
+        group_id,
         token,
         net,
     }
@@ -232,6 +233,68 @@ async fn setup_fixture() -> Fixture {
 
 fn arguments(value: Value) -> serde_json::Map<String, Value> {
     value.as_object().unwrap().clone()
+}
+
+type ServerTask = tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>;
+
+async fn start_server(state: Arc<ServerState>) -> (String, CancellationToken, ServerTask) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(
+        Server::new(
+            state,
+            ServerConfig {
+                http_addr: address,
+                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                cors: CorsConfig::default(),
+            },
+        )
+        .run_with_listener(listener, shutdown.clone()),
+    );
+    (format!("http://{address}/mcp"), shutdown, task)
+}
+
+async fn connect(url: &str, token: &str) -> RunningService<RoleClient, ClientInfo> {
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(url.to_string())
+            .auth_header(token.to_string()),
+    );
+    ClientInfo::default()
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .unwrap()
+}
+
+async fn call(
+    client: &RunningService<RoleClient, ClientInfo>,
+    tool: &str,
+    args: Value,
+) -> rmcp::model::CallToolResult {
+    let request = match args {
+        Value::Null => CallToolRequestParams::new(tool.to_string()),
+        value => CallToolRequestParams::new(tool.to_string()).with_arguments(arguments(value)),
+    };
+    client.call_tool(request).await.unwrap()
+}
+
+fn is_error(result: &rmcp::model::CallToolResult) -> bool {
+    result.is_error == Some(true)
+}
+
+fn code(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|body| body.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[tokio::test]
@@ -394,5 +457,216 @@ async fn mcp_transport_contract() {
     client.cancel().await.unwrap();
     shutdown.cancel();
     server_task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn context_tools_directory() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+    let group = fixture.group_id.to_string();
+
+    let groups = call(&client, "list_groups", Value::Null).await;
+    assert!(!is_error(&groups));
+    let listed = groups.structured_content.as_ref().unwrap();
+    assert_eq!(listed["groups"][0]["group_id"], json!(group));
+
+    let counts = call(&client, "count_datasets", Value::Null).await;
+    assert!(!is_error(&counts));
+    assert_eq!(
+        counts.structured_content.as_ref().unwrap()["total"]["dataset_count"],
+        json!(0)
+    );
+
+    assert!(!is_error(
+        &call(&client, "get_realm_info", Value::Null).await
+    ));
+    assert!(!is_error(
+        &call(&client, "get_node_info", Value::Null).await
+    ));
+    assert!(!is_error(
+        &call(&client, "get_group", json!({ "group_id": group })).await
+    ));
+    assert!(!is_error(
+        &call(&client, "list_group_members", json!({ "group_id": group })).await
+    ));
+    assert!(!is_error(
+        &call(&client, "get_group_usage", json!({ "group_id": group })).await
+    ));
+
+    let bad = call(&client, "get_group", json!({ "group_id": "not-a-ulid" })).await;
+    assert!(is_error(&bad));
+    assert_eq!(code(&bad), "Bad request");
+    let missing = call(
+        &client,
+        "get_group",
+        json!({ "group_id": ulid::Ulid::generate().to_string() }),
+    )
+    .await;
+    assert!(is_error(&missing));
+    assert_eq!(code(&missing), "Not found");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn data_guard_keys() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let buckets = call(&client, "list_buckets", Value::Null).await;
+    assert!(!is_error(&buckets));
+    let names = buckets.structured_content.as_ref().unwrap()["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["bucket"].as_str())
+        .any(|name| name == "mcp-data");
+    assert!(names, "the owned bucket is listed");
+
+    let listed = call(&client, "list_objects", json!({ "bucket": "mcp-data" })).await;
+    assert!(!is_error(&listed));
+
+    let missing = call(&client, "list_objects", json!({ "bucket": "absent" })).await;
+    assert!(is_error(&missing));
+    assert_eq!(code(&missing), "Not found");
+
+    let no_key = call(
+        &client,
+        "read_object",
+        json!({ "bucket": "mcp-data", "key": "nope.txt" }),
+    )
+    .await;
+    assert!(is_error(&no_key));
+    assert_eq!(code(&no_key), "Not found");
+
+    let traversal = call(
+        &client,
+        "read_object",
+        json!({ "bucket": "mcp-data", "key": "../escape" }),
+    )
+    .await;
+    assert!(is_error(&traversal));
+    assert_eq!(code(&traversal), "Bad request");
+
+    let bad_window = call(
+        &client,
+        "read_object",
+        json!({ "bucket": "mcp-data", "key": "notes.txt", "max_bytes": 0 }),
+    )
+    .await;
+    assert!(is_error(&bad_window));
+    assert_eq!(code(&bad_window), "Bad request");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn metadata_explains_refusals() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+    let group = fixture.group_id.to_string();
+    let unknown = ulid::Ulid::generate().to_string();
+
+    let bad_id = call(&client, "get_dataset", json!({ "id": "nope" })).await;
+    assert!(is_error(&bad_id));
+    assert_eq!(code(&bad_id), "Bad request");
+
+    let absent = call(&client, "get_dataset", json!({ "id": unknown })).await;
+    assert!(is_error(&absent));
+    assert_eq!(code(&absent), "Not found");
+
+    let not_profile = call(&client, "get_profile", json!({ "id": unknown })).await;
+    assert!(is_error(&not_profile));
+    assert_eq!(code(&not_profile), "Not found");
+
+    let bad_iri = call(&client, "find_references", json!({ "iri": "not-an-iri" })).await;
+    assert!(is_error(&bad_iri));
+    assert_eq!(code(&bad_iri), "Bad request");
+
+    let empty_query = call(&client, "search_datasets", json!({ "q": "" })).await;
+    assert!(is_error(&empty_query));
+    assert_eq!(code(&empty_query), "Bad request");
+
+    let bad_group = call(
+        &client,
+        "create_dataset",
+        json!({ "group_id": "nope", "path": "datasets/x", "rocrate": { "@graph": [] } }),
+    )
+    .await;
+    assert!(is_error(&bad_group));
+    assert_eq!(code(&bad_group), "Bad request");
+
+    let empty_path = call(
+        &client,
+        "create_dataset",
+        json!({ "group_id": group, "path": "///", "rocrate": { "@graph": [] } }),
+    )
+    .await;
+    assert!(is_error(&empty_path));
+    assert_eq!(code(&empty_path), "Bad request");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn compute_validates_input() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+    let group = fixture.group_id.to_string();
+
+    let runtimes = call(&client, "list_runtimes", Value::Null).await;
+    assert!(!is_error(&runtimes));
+    assert!(
+        runtimes.structured_content.as_ref().unwrap()["runtimes"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+    );
+
+    let jobs = call(&client, "list_jobs", json!({})).await;
+    assert!(!is_error(&jobs));
+
+    let bad_job = call(&client, "get_job", json!({ "id": "nope" })).await;
+    assert!(is_error(&bad_job));
+    assert_eq!(code(&bad_job), "Bad request");
+
+    let bad_state = call(&client, "list_jobs", json!({ "state": "flying" })).await;
+    assert!(is_error(&bad_state));
+    assert_eq!(code(&bad_state), "Bad request");
+
+    let bad_cancel = call(&client, "cancel_job", json!({ "id": "nope" })).await;
+    assert!(is_error(&bad_cancel));
+    assert_eq!(code(&bad_cancel), "Bad request");
+
+    let bad_runtime = call(
+        &client,
+        "run_script",
+        json!({
+            "group_id": group,
+            "bucket": "mcp-data",
+            "runtime": "ruby",
+            "script": "print('x')"
+        }),
+    )
+    .await;
+    assert!(is_error(&bad_runtime));
+    assert_eq!(code(&bad_runtime), "Bad request");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
     fixture.net.shutdown().await;
 }
