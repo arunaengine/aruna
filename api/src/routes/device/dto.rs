@@ -648,6 +648,79 @@ mod tests {
     }
 
     #[test]
+    fn projects_entry_sides() {
+        // A populated entry projects both observed sides, hashes hex-encoded.
+        let mut base = base_with(EntryState::LocalChanged);
+        base.local = Some(EntrySide {
+            size: 10,
+            modified_at_ms: Some(5),
+            fingerprint: Some("fp".to_string()),
+            blake3: Some([0xabu8; 32]),
+            version_id: None,
+        });
+        base.remote = Some(EntrySide {
+            size: 20,
+            modified_at_ms: None,
+            fingerprint: None,
+            blake3: None,
+            version_id: Some(Ulid::from_bytes([2u8; 16])),
+        });
+        let view = entry_view("data.bin".to_string(), base);
+        assert_eq!(view.state, EntryStateName::LocalChanged);
+        let local = view.local.unwrap();
+        assert_eq!(local.size, 10);
+        assert_eq!(local.fingerprint.as_deref(), Some("fp"));
+        assert_eq!(local.blake3.as_deref(), Some(hex_hash(&[0xabu8; 32]).as_str()));
+        let remote = view.remote.unwrap();
+        assert_eq!(remote.size, 20);
+        assert!(remote.blake3.is_none());
+        assert_eq!(
+            remote.version_id,
+            Some(Ulid::from_bytes([2u8; 16]).to_string())
+        );
+    }
+
+    #[test]
+    fn projects_deleting_folder() {
+        let node = iroh::PublicKey::from_bytes(
+            &ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap();
+        let folder = SyncedFolder {
+            folder_id: Ulid::generate(),
+            root: "/home/user/data".to_string(),
+            local_bucket: "device-bucket".to_string(),
+            group_id: Ulid::generate(),
+            remote: RemoteBinding {
+                node_id: node,
+                bucket: "realm-bucket".to_string(),
+                prefix: String::new(),
+            },
+            mode: FolderMode::TwoWay,
+            propagate_deletes: false,
+            state: FolderState::Deleting,
+            created_by: aruna_core::UserId::local(
+                Ulid::generate(),
+                aruna_core::structs::RealmId::from_bytes([5u8; 32]),
+            ),
+            created_at_ms: 7,
+            last_reconcile_ms: Some(9),
+            last_error: None,
+            last_error_at_ms: None,
+            observed_files: 0,
+            list_cursor: None,
+        };
+        let view = folder_view(folder, FolderCounters::default());
+        assert_eq!(view.state, FolderStateName::Deleting);
+        assert_eq!(view.mode, FolderModeName::TwoWay);
+        assert!(view.message.is_none());
+        assert!(!view.propagate_deletes);
+        assert_eq!(view.last_reconcile_ms, Some(9));
+    }
+
+    #[test]
     fn hex_hash_lowercase() {
         let mut bytes = [0u8; 32];
         bytes[0] = 0xab;
