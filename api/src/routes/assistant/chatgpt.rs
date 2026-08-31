@@ -181,13 +181,41 @@ async fn exchange_tokens(
     path = "/users/assistant/providers/chatgpt/login",
     tag = "assistant",
     summary = "Start ChatGPT device login",
-    request_body(content = StartLoginRequest, description = "Optional provider label"),
+    description = r#"Starts a ChatGPT device login and registers the provider in a pending state.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- The node asks the ChatGPT issuer for a device code and returns the user code together with the
+  URL to enter it at; the browser step happens outside Aruna.
+- The provider record is created right away with status `pending`, the fixed model set this node
+  knows and `gpt-5.6-sol` as its default model.
+- The device code and its identifier are sealed with the provider and never reach the response.
+- The login is completed by polling `POST /users/assistant/providers/{id}/login/poll`; nothing here
+  waits for the user.
+- `label` falls back to `ChatGPT` when it is omitted or blank.
+
+**Limits**
+- The login window is the one the issuer dictates, 15 minutes when it names none.
+- `interval_seconds` is the shortest polling interval the issuer accepts."#,
+    request_body(
+        content = StartLoginRequest,
+        description = "Optional provider label",
+        example = json!({"label": "ChatGPT"})
+    ),
     responses(
-        (status = 201, body = ChatgptLoginResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
+        (status = 201, description = "Login started; the pending provider exists from here on", body = ChatgptLoginResponse,
+            example = json!({
+                "provider_id": "01JCNCTR0123456789ABCDEFGH",
+                "user_code": "ABCD-EFGH",
+                "verification_url": "https://auth.openai.com/codex/device",
+                "interval_seconds": 5,
+                "expires_at": "2026-04-09T12:15:00Z"
+            })),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse),
-        (status = 502, body = ErrorResponse)
+        (status = 502, description = "The ChatGPT issuer was unreachable or refused the device login", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -278,14 +306,29 @@ pub async fn start_login(
     path = "/users/assistant/providers/{id}/login/poll",
     tag = "assistant",
     summary = "Poll ChatGPT device login",
-    params(("id" = String, Path)),
+    description = r#"Reports how far a ChatGPT device login has come, and completes it once it has.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- `status` is `pending` while the user has not confirmed the code, `ready` once the tokens are
+  sealed into the provider, `denied` when the user declined, and `expired` after the window closed.
+- On the first `ready` the tokens and the account id are sealed, the device code is dropped and the
+  provider becomes usable; a provider that is already ready answers without asking the issuer.
+- A provider of another kind is not a login and reads as 404, as does one of another user.
+- Nothing here retries on its own: the caller polls until it sees a terminal status.
+
+**Limits**
+- Poll no faster than the `interval_seconds` the login route returned."#,
+    params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
-        (status = 200, body = LoginPollResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "How far the login has come", body = LoginPollResponse,
+            example = json!({"status": "pending"})),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "No such ChatGPT provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
-        (status = 502, body = ErrorResponse)
+        (status = 502, description = "The ChatGPT issuer was unreachable or answered unusably", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

@@ -332,10 +332,35 @@ fn provider_base_url(
     path = "/users/assistant/providers",
     tag = "assistant",
     summary = "List assistant providers",
+    description = r#"Lists the assistant providers the calling user registered on this node.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- Providers are stored per user on the node that registered them, so the listing is node-local and
+  is not replicated to the realm's other nodes.
+- API keys, ChatGPT tokens and custom headers stay sealed: a summary carries only the label, the
+  base URL, the known model ids and the status.
+- `status` is `ready` once the provider can serve a request, and `pending` while a ChatGPT device
+  login is still open.
+- A model marked `static` is one this node knows without asking the provider.
+- The listing is not paged; a user holds few providers by construction."#,
     responses(
-        (status = 200, body = ListProvidersResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
+        (status = 200, description = "The user's providers on this node", body = ListProvidersResponse,
+            example = json!({
+                "providers": [{
+                    "provider_id": "01JCNCTR0123456789ABCDEFGH",
+                    "kind": "openai",
+                    "label": "OpenAI",
+                    "base_url": "https://api.openai.com",
+                    "models": [{"id": "gpt-5", "static": false}],
+                    "default_model": "gpt-5",
+                    "created_at": "2026-04-09T12:00:00Z",
+                    "status": "ready"
+                }]
+            })),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -360,12 +385,51 @@ pub async fn list_providers(
     path = "/users/assistant/providers",
     tag = "assistant",
     summary = "Create an assistant provider",
-    request_body = CreateProviderRequest,
+    description = r#"Registers an assistant provider for the calling user and seals its credentials.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- `kind` picks the wire dialect: `anthropic`, `openai`, `openrouter` or `openai_compatible`.
+  `chatgpt` is refused here because that kind is registered by the device login route.
+- `base_url` defaults to the kind's official origin and is required for `openai_compatible`; a
+  trailing slash is trimmed off.
+- `api_key` and `headers` are stored sealed and are never returned by any endpoint.
+- `models` keeps only the ids the portal sends back; display names are dropped.
+- The record is written on the node serving the request and is not replicated to the realm.
+
+**Limits**
+- The request body is capped at 4 MiB.
+- At most 64 custom headers are accepted, and authentication and hop-by-hop header names are
+  refused among them.
+- `base_url` must be an HTTP origin without credentials, query or fragment. A server node also
+  requires https and a public host, while a user node may name a loopback or private address."#,
+    request_body(
+        content = CreateProviderRequest,
+        description = "Provider kind and label, the credentials to seal, and the models the portal already fetched",
+        example = json!({
+            "kind": "openai",
+            "label": "OpenAI",
+            "api_key": "EXAMPLE-API-KEY-PLACEHOLDER",
+            "models": [{"id": "gpt-5"}],
+            "default_model": "gpt-5"
+        })
+    ),
     responses(
-        (status = 201, body = ProviderSummary),
-        (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
+        (status = 201, description = "Provider registered; the sealed credentials are not echoed back", body = ProviderSummary,
+            example = json!({
+                "provider_id": "01JCNCTR0123456789ABCDEFGH",
+                "kind": "openai",
+                "label": "OpenAI",
+                "base_url": "https://api.openai.com",
+                "models": [{"id": "gpt-5", "static": false}],
+                "default_model": "gpt-5",
+                "created_at": "2026-04-09T12:00:00Z",
+                "status": "ready"
+            })),
+        (status = 400, description = "Unknown kind, missing or invalid base URL, or a refused custom header", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -425,14 +489,48 @@ pub async fn create_provider(
     path = "/users/assistant/providers/{id}",
     tag = "assistant",
     summary = "Update an assistant provider",
-    params(("id" = String, Path)),
-    request_body = PatchProviderRequest,
+    description = r#"Updates one assistant provider, changing only the fields the request carries.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- An omitted field keeps its stored value; `api_key` replaces the sealed key and `headers` replaces
+  the whole stored header set rather than merging into it.
+- A new `base_url` is validated exactly as it is at registration, so a server node keeps requiring a
+  public https origin.
+- The write is conditional on the record this request read, so a concurrent change is refused with
+  409 instead of overwriting it.
+- The response is the same summary the listing returns, and no secret is echoed back.
+
+**Limits**
+- The request body is capped at 4 MiB.
+- At most 64 custom headers are accepted, and authentication and hop-by-hop header names are
+  refused among them."#,
+    params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
+    request_body(
+        content = PatchProviderRequest,
+        description = "The fields to change; an omitted field is left as it is",
+        example = json!({
+            "label": "OpenAI (team)",
+            "default_model": "gpt-5"
+        })
+    ),
     responses(
-        (status = 200, body = ProviderSummary),
-        (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "The updated provider", body = ProviderSummary,
+            example = json!({
+                "provider_id": "01JCNCTR0123456789ABCDEFGH",
+                "kind": "openai",
+                "label": "OpenAI (team)",
+                "base_url": "https://api.openai.com",
+                "models": [{"id": "gpt-5", "static": false}],
+                "default_model": "gpt-5",
+                "created_at": "2026-04-09T12:00:00Z",
+                "status": "ready"
+            })),
+        (status = 400, description = "Invalid base URL or a refused custom header", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -485,12 +583,21 @@ pub async fn patch_provider(
     path = "/users/assistant/providers/{id}",
     tag = "assistant",
     summary = "Delete an assistant provider",
-    params(("id" = String, Path)),
+    description = r#"Deletes one assistant provider together with the credentials sealed for it.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- The provider record, its sealed secret and its sealed headers are removed in one write.
+- A provider of another user is not visible here and reads as 404, as does an unknown id.
+- The deletion is node-local, like the registration it removes; nothing is revoked upstream, so a
+  ChatGPT login stays valid at the issuer until it expires there."#,
+    params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
-        (status = 204),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse)
+        (status = 204, description = "Provider deleted"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -515,14 +622,32 @@ pub async fn delete_provider(
     path = "/users/assistant/providers/{id}/models",
     tag = "assistant",
     summary = "List provider models",
-    params(("id" = String, Path)),
+    description = r#"Asks the provider itself which models it serves and returns the text ones.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- The node reads the provider's own model listing with the sealed credentials; the result is
+  returned as it is read and is not stored on the provider record.
+- Embedding, audio, image, moderation and realtime model ids are filtered out, so only models a
+  chat request can use remain.
+- A ChatGPT provider refreshes its login first and falls back to the fixed set this node knows when
+  the backend list is unusable, because that list is not a published contract.
+- A model marked `static` came from that fixed set rather than from the provider."#,
+    params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
-        (status = 200, body = ProviderModelsResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "The models the provider reports", body = ProviderModelsResponse,
+            example = json!({
+                "models": [
+                    {"id": "gpt-5", "display_name": "GPT-5", "static": false},
+                    {"id": "gpt-5.4", "static": false}
+                ]
+            })),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
-        (status = 502, body = ErrorResponse)
+        (status = 502, description = "The provider was unreachable or answered unusably", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -552,12 +677,26 @@ pub async fn get_models(
     path = "/users/assistant/providers/{id}/test",
     tag = "assistant",
     summary = "Test an assistant provider",
-    params(("id" = String, Path)),
+    description = r#"Checks whether the stored credentials still reach the provider.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- The node performs the same model listing the models route performs, and a ChatGPT provider is
+  checked by refreshing its login instead.
+- The verdict is reported in the body: a reachable provider answers `ok` true, and any failure
+  answers `ok` false with a fixed message.
+- The upstream reason is deliberately not passed on, so a failing check says only that the provider
+  did not answer usably.
+- A failed check answers 200 as well; only a missing provider or a refused caller changes the
+  status."#,
+    params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
-        (status = 200, body = ProviderTestResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse)
+        (status = 200, description = "The verdict of the check", body = ProviderTestResponse,
+            example = json!({"ok": true, "message": "Provider is ready"})),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

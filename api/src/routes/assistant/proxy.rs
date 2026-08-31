@@ -227,15 +227,37 @@ async fn proxy_request(
     path = "/users/assistant/providers/{id}/proxy/{path}",
     tag = "assistant",
     summary = "Proxy a provider request",
-    params(("id" = String, Path), ("path" = String, Path)),
+    description = r#"Forwards one chat request to the provider and streams its answer back unchanged.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- Only the kind's chat path is forwarded: `/v1/messages` for `anthropic`, `/v1/chat/completions` or
+  `/v1/responses` for the OpenAI-shaped kinds, and `/responses` for `chatgpt`. Any other path is a
+  404, so this is not a general proxy.
+- The sealed credentials are attached here; a caller sends none, and authentication and hop-by-hop
+  headers are stripped from the request and from the answer.
+- A ChatGPT body is rewritten with `store` set to false, so the conversation is not retained
+  upstream.
+- A ChatGPT request whose access token expired refreshes the login once and retries; the retry's
+  answer is the one returned.
+- The upstream status, headers and body are streamed through as they arrive, so a streaming answer
+  stays a streaming answer.
+
+**Limits**
+- The request body is capped at 4 MiB."#,
+    params(
+        ("id" = String, Path, description = "Provider id, as a 26-character ULID"),
+        ("path" = String, Path, description = "Upstream path to forward, one of the chat paths the provider kind allows")
+    ),
     responses(
         (status = 200, description = "Upstream response streamed unchanged"),
-        (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse),
+        (status = 400, description = "The body is not JSON a ChatGPT request can carry, or the provider credentials are incomplete", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "No such provider for this user, a path this kind does not allow, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
-        (status = 502, body = ErrorResponse)
+        (status = 502, description = "The provider was unreachable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -253,14 +275,30 @@ pub async fn proxy_post(
     path = "/users/assistant/providers/{id}/proxy/{path}",
     tag = "assistant",
     summary = "Proxy a provider models request",
-    params(("id" = String, Path), ("path" = String, Path)),
+    description = r#"Forwards the provider's own model listing and streams its answer back unchanged.
+
+**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+
+**Behavior**
+- Only the kind's model path is forwarded: `/models` for `chatgpt` and `/v1/models` for every other
+  kind. Any other path is a 404, so this is not a general proxy.
+- The sealed credentials are attached here; a caller sends none, and authentication and hop-by-hop
+  headers are stripped from the request and from the answer.
+- A ChatGPT request whose access token expired refreshes the login once and retries; the retry's
+  answer is the one returned.
+- The upstream status, headers and body are streamed through unchanged, so the answer is the
+  provider's own shape rather than the filtered list the models route returns."#,
+    params(
+        ("id" = String, Path, description = "Provider id, as a 26-character ULID"),
+        ("path" = String, Path, description = "Upstream path to forward, the model path the provider kind allows")
+    ),
     responses(
         (status = 200, description = "Upstream response streamed unchanged"),
-        (status = 401, body = ErrorResponse),
-        (status = 403, body = ErrorResponse),
-        (status = 404, body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "No such provider for this user, a path this kind does not allow, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
-        (status = 502, body = ErrorResponse)
+        (status = 502, description = "The provider was unreachable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
