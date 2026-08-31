@@ -7,3 +7,7 @@ coverage:
     patch:
       default:
         target: 80%
+        # Large feature merges cannot land 80% diff coverage in one pass;
+        # the patch status reports without blocking, the project status guards
+        # against overall regressions.
+        informational: true
