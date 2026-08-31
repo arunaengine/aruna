@@ -117,9 +117,13 @@ pub struct ProviderModel {
 }
 
 /// Reasoning levels a model family accepts; empty leaves the client its own
-/// fallback. Codex gpt-5.x take xhigh; generic OpenAI reasoning models take three.
+/// fallback. The Codex gpt-5.6 flagships add max and ultra; older Codex gpt-5.x
+/// stop at xhigh; generic OpenAI reasoning models take three.
 pub(super) fn reasoning_efforts(kind: AssistantProviderKind, id: &str) -> Vec<String> {
     let levels: &[&str] = match kind {
+        AssistantProviderKind::Chatgpt if id.starts_with("gpt-5.6") => {
+            &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+        }
         AssistantProviderKind::Chatgpt if id.starts_with("gpt-5") => {
             &["minimal", "low", "medium", "high", "xhigh"]
         }
@@ -811,6 +815,10 @@ mod tests {
     fn efforts_by_family() {
         assert_eq!(
             reasoning_efforts(AssistantProviderKind::Chatgpt, "gpt-5.6-sol"),
+            ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            reasoning_efforts(AssistantProviderKind::Chatgpt, "gpt-5.5"),
             ["minimal", "low", "medium", "high", "xhigh"]
         );
         assert_eq!(
