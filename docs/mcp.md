@@ -24,10 +24,11 @@ Context:
 
 - `whoami`: Return the caller id, display name when available, realm roles, and group roles.
 - `list_groups`: List the caller's groups and assigned roles. It supplies the `group_id` the write tools need.
+- `count_datasets`: Count the caller's dataset, Profile, and process-run documents across every group in one call, with a per-group breakdown. It answers "how many datasets do I have" without further calls.
 - `get_group`: Read one realm group by ULID with its display name and full role list.
 - `list_group_members`: List a group's members and the roles that assign them. Membership required.
-- `get_group_usage`: Read a group's local and realm-wide storage usage, document counts, and quota status. Membership required.
-- `get_realm_info`: Describe the realm, its nodes, OIDC providers, quota configuration, and endpoints.
+- `get_group_usage`: Read a group's local and realm-wide storage usage, exact dataset, Profile, and process-run counts, and quota status. Membership required.
+- `get_realm_info`: Describe the realm, its nodes, OIDC providers, quota configuration, endpoints, and a public overview whose `live_datasets` is the realm-wide live document count.
 - `get_node_info`: Describe this node's version, capabilities, addresses, and service status.
 
 Data:
@@ -47,7 +48,7 @@ Metadata:
 - `validate_dataset`: Preview structural and Profile validation without writing anything.
 - `create_dataset`: Create a document from an RO-Crate at a `group/path` document path.
 - `replace_dataset`: Replace a document's whole RO-Crate and optional visibility.
-- `sparql_query`: Run a SELECT or ASK query over one document, or over all visible metadata when it is an ASK or a single-pattern SELECT DISTINCT.
+- `sparql_query`: Run a SELECT or ASK query over one document, or over all visible metadata when it is an ASK or a single-pattern SELECT DISTINCT. Use it only for what the typed tools cannot answer, not to count datasets or documents.
 - `find_references`: Find visible metadata documents that reference an absolute IRI. Default 25, at most 100.
 
 Compute:
@@ -76,7 +77,7 @@ Every tool authorization supplies `request.operation = "mcp:<tool>"`, string-val
 request.operation.startsWith("mcp:")
 ```
 
-The MCP layer does not grant access. Each tool also uses the permission and canonical path used by the corresponding REST or S3 operation. Directory reads such as `whoami`, `list_groups`, `get_group`, `list_group_members`, `get_group_usage`, `get_realm_info`, and `get_node_info` carry no permission path in REST either, so they are gated by the realm request policies and by the membership rule the route enforces itself.
+The MCP layer does not grant access. Each tool also uses the permission and canonical path used by the corresponding REST or S3 operation. Directory reads such as `whoami`, `list_groups`, `count_datasets`, `get_group`, `list_group_members`, `get_group_usage`, `get_realm_info`, and `get_node_info` carry no permission path in REST either, so they are gated by the realm request policies and by the membership rule the route enforces itself.
 
 Every tool declares an `outputSchema` of `type: "object"`. Tools that return a REST response shape declare a permissive object schema rather than the response type, because that shape is not generated from a schema.
 
