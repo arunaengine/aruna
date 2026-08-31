@@ -328,6 +328,25 @@ struct ModelItem {
     display_name: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    supported_parameters: Vec<String>,
+}
+
+/// OpenRouter advertises reasoning support per model; the Off/Low/Medium/High
+/// set maps to a thinking budget. Other kinds keep the family catalog.
+fn model_efforts(kind: AssistantProviderKind, model: &ModelItem) -> Vec<String> {
+    if kind == AssistantProviderKind::Openrouter
+        && model
+            .supported_parameters
+            .iter()
+            .any(|param| param == "reasoning")
+    {
+        return ["off", "low", "medium", "high"]
+            .iter()
+            .map(|level| level.to_string())
+            .collect();
+    }
+    super::reasoning_efforts(kind, &model.id)
 }
 
 fn models_path(kind: AssistantProviderKind) -> &'static str {
@@ -393,7 +412,7 @@ pub(super) async fn fetch_models(
         .chain(payload.models)
         .filter(|model| !model.id.is_empty() && text_model(&model.id))
         .map(|model| ProviderModel {
-            reasoning_efforts: super::reasoning_efforts(provider.kind, &model.id),
+            reasoning_efforts: model_efforts(provider.kind, &model),
             id: model.id,
             display_name: model.display_name.or(model.name),
             static_model: false,
@@ -540,6 +559,27 @@ mod tests {
         assert!(!text_model("text-embedding-3-small"));
         assert!(!text_model("gpt-image-1"));
         assert!(text_model("gpt-5.4"));
+    }
+
+    #[test]
+    fn openrouter_reasoning_param() {
+        let listed = ModelItem {
+            id: "z-ai/glm".to_string(),
+            display_name: None,
+            name: None,
+            supported_parameters: vec!["reasoning".to_string()],
+        };
+        let plain = ModelItem {
+            id: "z-ai/glm".to_string(),
+            display_name: None,
+            name: None,
+            supported_parameters: Vec::new(),
+        };
+        assert_eq!(
+            model_efforts(AssistantProviderKind::Openrouter, &listed),
+            ["off", "low", "medium", "high"]
+        );
+        assert!(model_efforts(AssistantProviderKind::Openrouter, &plain).is_empty());
     }
 
     #[tokio::test]

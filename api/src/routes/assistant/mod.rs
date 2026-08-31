@@ -117,8 +117,8 @@ pub struct ProviderModel {
 }
 
 /// Reasoning levels a model family accepts; empty leaves the client its own
-/// fallback. The Codex gpt-5.6 flagships add max and ultra; older Codex gpt-5.x
-/// stop at xhigh; generic OpenAI reasoning models take three.
+/// fallback. Codex gpt-5.6 flagships add max and ultra, older gpt-5.x stop at
+/// xhigh, generic OpenAI models take three, Anthropic maps to off/low/medium/high.
 pub(super) fn reasoning_efforts(kind: AssistantProviderKind, id: &str) -> Vec<String> {
     let levels: &[&str] = match kind {
         AssistantProviderKind::Chatgpt if id.starts_with("gpt-5.6") => {
@@ -128,6 +128,11 @@ pub(super) fn reasoning_efforts(kind: AssistantProviderKind, id: &str) -> Vec<St
             &["minimal", "low", "medium", "high", "xhigh"]
         }
         AssistantProviderKind::Chatgpt => &[],
+        // Haiku models have no extended thinking.
+        AssistantProviderKind::Anthropic if id.contains("claude") && !id.contains("haiku") => {
+            &["off", "low", "medium", "high"]
+        }
+        AssistantProviderKind::Anthropic => &[],
         _ if is_openai_reasoning(id) => &["low", "medium", "high"],
         _ => &[],
     };
@@ -825,8 +830,12 @@ mod tests {
             reasoning_efforts(AssistantProviderKind::Openai, "gpt-5"),
             ["low", "medium", "high"]
         );
+        assert_eq!(
+            reasoning_efforts(AssistantProviderKind::Anthropic, "claude-sonnet-4"),
+            ["off", "low", "medium", "high"]
+        );
         assert!(reasoning_efforts(AssistantProviderKind::Chatgpt, "o3-mini").is_empty());
-        assert!(reasoning_efforts(AssistantProviderKind::Anthropic, "claude-3").is_empty());
+        assert!(reasoning_efforts(AssistantProviderKind::Anthropic, "claude-3-5-haiku").is_empty());
     }
 
     #[test]
