@@ -536,11 +536,38 @@ pub(super) async fn fresh_provider(
 #[cfg(test)]
 mod tests {
     use super::{extract_account_id, static_models};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct IntervalWrapper {
+        #[serde(deserialize_with = "super::deserialize_interval")]
+        interval: u64,
+    }
 
     #[test]
     fn extracts_account_id() {
         let token = "aaa.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xIn19.bbb";
         assert_eq!(extract_account_id(token).as_deref(), Some("acct_1"));
+    }
+
+    #[test]
+    fn account_id_missing() {
+        assert_eq!(extract_account_id("only-one-segment"), None);
+        assert_eq!(extract_account_id("aaa.notbase64!.bbb"), None);
+    }
+
+    #[test]
+    fn parses_interval_forms() {
+        let from_string: IntervalWrapper =
+            serde_json::from_value(serde_json::json!({ "interval": "7" })).unwrap();
+        assert_eq!(from_string.interval, 7);
+        let from_number: IntervalWrapper =
+            serde_json::from_value(serde_json::json!({ "interval": 3 })).unwrap();
+        assert_eq!(from_number.interval, 3);
+        // An unexpected shape falls back to the issuer's minimum poll interval.
+        let from_other: IntervalWrapper =
+            serde_json::from_value(serde_json::json!({ "interval": true })).unwrap();
+        assert_eq!(from_other.interval, 5);
     }
 
     #[test]
