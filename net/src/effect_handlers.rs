@@ -30,6 +30,9 @@ const PRESENCE_MAX_STALE: Duration = Duration::from_secs(60);
 /// A stale reader gives up this long before its own deadline, so a refresh that
 /// cannot finish still yields the snapshot instead of an expired read.
 const PRESENCE_ANSWER_MARGIN: Duration = Duration::from_millis(250);
+/// Puts carry no driver deadline so an accepted store still finishes. This
+/// bounds only the caller's wait, well above the driver's own RPC budget.
+const PUT_ANSWER_DEADLINE: Duration = Duration::from_secs(180);
 
 /// Everything a net effect needs besides the effect itself.
 pub struct NetEffectContext {
@@ -257,16 +260,28 @@ async fn handle_dht_effect(ctx: &NetEffectContext, effect: DhtEffect) -> NetEven
                 ttl_secs = ttl.as_secs(),
                 "Starting DHT put"
             );
-            match dht.put(&key, realm_id, value, ttl).await {
-                Ok(stats) => NetEvent::Dht(DhtEvent::PutComplete {
+            match tokio::time::timeout(PUT_ANSWER_DEADLINE, dht.put(&key, realm_id, value, ttl))
+                .await
+            {
+                Ok(Ok(stats)) => NetEvent::Dht(DhtEvent::PutComplete {
                     key,
                     remote_attempt_count: stats.remote_attempt_count,
                     remote_store_count: stats.remote_store_count,
                 }),
-                Err(error) => {
+                Ok(Err(error)) => {
                     warn!(key = %hex_prefix(key.as_bytes()), error = %error, "DHT put failed");
                     NetEvent::Dht(DhtEvent::Error {
                         error: DhtError::StoreFailed(error.to_string()),
+                    })
+                }
+                Err(_) => {
+                    warn!(
+                        key = %hex_prefix(key.as_bytes()),
+                        timeout_ms = PUT_ANSWER_DEADLINE.as_millis() as u64,
+                        "Timed out waiting for a DHT put"
+                    );
+                    NetEvent::Dht(DhtEvent::Error {
+                        error: DhtError::StoreFailed("timed out waiting for a DHT put".to_string()),
                     })
                 }
             }

@@ -105,6 +105,9 @@ struct HiddenReservation {
     storage_path: Option<String>,
     writer: Option<opendal::Writer>,
     uncertain: bool,
+    /// A writer future a timeout dropped mid-poll leaves opendal's retry layer
+    /// in a bad state, so the writer must never be polled again.
+    abandoned: bool,
 }
 
 impl HiddenReservation {
@@ -117,6 +120,7 @@ impl HiddenReservation {
             storage_path: None,
             writer: None,
             uncertain: false,
+            abandoned: false,
         }
     }
 
@@ -150,6 +154,10 @@ impl HiddenReservation {
 
     fn mark_uncertain(&mut self) {
         self.uncertain = true;
+    }
+
+    fn mark_abandoned(&mut self) {
+        self.abandoned = true;
     }
 
     async fn fail(&mut self, error: BlobError) -> BlobEvent {
@@ -187,54 +195,46 @@ impl HiddenReservation {
     }
 
     async fn abort(&mut self) -> Result<(), BlobError> {
+        let handler = self.handler.clone();
+        let operator = self.operator.clone();
+        let storage_path = self.storage_path.clone();
+        let abandoned = self.abandoned;
         let cleanup = if self.writer.is_some() {
-            let aborted = {
-                let Some(writer) = self.writer.as_mut() else {
-                    return Err(BlobError::DeleteError(
-                        "hidden writer is missing".to_string(),
-                    ));
-                };
-                self.handler.abort_writer(writer).await
-            };
-            // Backends without writer abort (fs) leave the known-partial object
-            // at its final path; deleting it is the equivalent cleanup. Other
-            // abort failures stay uncertain and must not delete.
-            let cleanup = match aborted {
-                Ok(()) => Ok(()),
-                Err(BlobError::CleanupUnsupported) => {
-                    match (self.operator.as_ref(), self.storage_path.as_deref()) {
-                        (Some(operator), Some(path)) => {
-                            self.handler.delete_path(operator, path).await
-                        }
-                        _ => Err(BlobError::CleanupUnsupported),
-                    }
-                }
-                Err(error) => Err(error),
-            };
+            let cleanup = handler
+                .clean_partial(
+                    self.writer.as_mut(),
+                    abandoned,
+                    operator.as_ref(),
+                    storage_path.as_deref(),
+                )
+                .await;
             if cleanup.is_ok() {
                 self.writer = None;
             }
             cleanup
-        } else if !self.uncertain
-            && let (Some(operator), Some(storage_path)) =
-                (self.operator.as_ref(), self.storage_path.as_deref())
-        {
-            self.handler.delete_path(operator, storage_path).await
+        } else if !self.uncertain {
+            handler
+                .clean_partial(None, abandoned, operator.as_ref(), storage_path.as_deref())
+                .await
         } else {
             Ok(())
         };
-        cleanup?;
-        let Some(key) = self.key.lock().ok().and_then(|key| key.clone()) else {
-            return Ok(());
+        // Capacity is released even when the partial object could not be
+        // removed, so a failed cleanup cannot strand the reservation; the
+        // leftover object is the reclaim sweep's to collect.
+        let released = match self.key.lock().ok().and_then(|key| key.clone()) {
+            Some(key) if !self.uncertain => {
+                let released = handler.release_hidden(&key).await;
+                if released.is_ok()
+                    && let Ok(mut current) = self.key.lock()
+                {
+                    *current = None;
+                }
+                released
+            }
+            _ => Ok(()),
         };
-        if self.uncertain {
-            return Ok(());
-        }
-        self.handler.release_hidden(&key).await?;
-        if let Ok(mut current) = self.key.lock() {
-            *current = None;
-        }
-        Ok(())
+        cleanup.and(released)
     }
 
     fn key_slot(&self) -> Arc<StdMutex<Option<HiddenBlobKey>>> {
@@ -261,16 +261,24 @@ impl Drop for HiddenReservation {
             return;
         };
         let key = self.key.lock().ok().and_then(|key| key.clone());
-        let writer = self.writer.take();
+        let mut writer = self.writer.take();
+        let operator = self.operator.clone();
+        let storage_path = self.storage_path.clone();
+        let abandoned = self.abandoned;
         let uncertain = self.uncertain;
         runtime.spawn(async move {
-            let cleanup = match writer {
-                Some(mut writer) => handler.abort_writer(&mut writer).await,
-                None => Ok(()),
-            };
-            if let Err(error) = cleanup {
+            // A failed cleanup must not strand the reservation, so the release
+            // below runs either way and the reclaim sweep collects the object.
+            if let Err(error) = handler
+                .clean_partial(
+                    writer.as_mut(),
+                    abandoned,
+                    operator.as_ref(),
+                    storage_path.as_deref(),
+                )
+                .await
+            {
                 tracing::error!(%error, "failed to clean cancelled hidden blob");
-                return;
             }
             if !uncertain
                 && let Some(key) = key
@@ -411,6 +419,7 @@ impl BlobHandler {
                         .await;
                 }
                 Err(()) => {
+                    reservation.mark_abandoned();
                     return reservation
                         .fail(BlobError::WriteError(
                             "blob write deadline expired".to_string(),
@@ -444,6 +453,7 @@ impl BlobHandler {
                     .await;
             }
             Err(()) => {
+                reservation.mark_abandoned();
                 return reservation
                     .fail_close(BlobError::WriteError(
                         "blob write deadline expired".to_string(),
@@ -555,6 +565,33 @@ impl BlobHandler {
             size: location.blob_size,
             location,
             blake3,
+        }
+    }
+
+    /// Removes the partial object a failed or cancelled write left behind. An
+    /// abandoned writer is never polled again, and backends without writer
+    /// abort (fs) keep the partial object at its final path, so deleting that
+    /// path is the equivalent cleanup.
+    pub(super) async fn clean_partial(
+        &self,
+        writer: Option<&mut opendal::Writer>,
+        abandoned: bool,
+        operator: Option<&Operator>,
+        storage_path: Option<&str>,
+    ) -> Result<(), BlobError> {
+        if let Some(writer) = writer
+            && !abandoned
+        {
+            match self.abort_writer(writer).await {
+                Ok(()) => return Ok(()),
+                // Other abort failures stay uncertain and must not delete.
+                Err(BlobError::CleanupUnsupported) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match (operator, storage_path) {
+            (Some(operator), Some(path)) => self.delete_path(operator, path).await,
+            _ => Ok(()),
         }
     }
 

@@ -15,8 +15,9 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, GROUP_STORAGE_BACKEND_KEYSPACE,
-    GROUP_STORAGE_BACKEND_SECRET_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB,
+    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -1869,6 +1870,140 @@ async fn write_cleanup_error() {
     };
     assert_eq!(actual, location);
     assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn abandoned_writer_deletes() {
+    // A writer whose future a timeout dropped must not be polled again, so the
+    // partial object is removed by path instead.
+    let context = setup_blob_handle(5).await;
+    let (operator, delete_calls) = failing_cleanup::operator_with_deletes();
+
+    let mut aborted = operator.writer("obj/aborted").await.unwrap();
+    let error = context
+        .blob_handle
+        .handler
+        .clean_partial(
+            Some(&mut aborted),
+            false,
+            Some(&operator),
+            Some("obj/aborted"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BlobError::DeleteError(_)));
+    assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let mut abandoned = operator.writer("obj/abandoned").await.unwrap();
+    let error = context
+        .blob_handle
+        .handler
+        .clean_partial(
+            Some(&mut abandoned),
+            true,
+            Some(&operator),
+            Some("obj/abandoned"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BlobError::DeleteError(_)));
+    assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unsupported_abort_deletes() {
+    // The fs backend refuses writer aborts, so cleanup must fall back to
+    // deleting the partial object rather than reporting a failure.
+    let context = setup_blob_handle(5).await;
+    let root = tempdir().unwrap();
+    let operator = crate::opendal::init_operator(
+        Backend::FileSystem,
+        HashMap::from([(
+            "root".to_string(),
+            root.path().to_str().unwrap().to_string(),
+        )]),
+        &crate::egress::EgressGuard::new(EgressPolicy::loopback()).unwrap(),
+    )
+    .unwrap();
+    let mut writer = operator.writer("obj/partial").await.unwrap();
+    writer.write(b"partial".to_vec()).await.unwrap();
+
+    assert_eq!(
+        context
+            .blob_handle
+            .handler
+            .clean_partial(
+                Some(&mut writer),
+                false,
+                Some(&operator),
+                Some("obj/partial")
+            )
+            .await,
+        Ok(())
+    );
+    assert!(operator.stat("obj/partial").await.is_err());
+}
+
+#[tokio::test]
+async fn cancelled_spool_releases() {
+    // A cancelled spool must release its bucket reservation even though the fs
+    // backend cannot abort the partial writer, so later writers are unaffected.
+    let context = setup_blob_handle(5).await;
+    let namespace = Ulid::from_bytes([11u8; 16]);
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = polls.clone();
+    let blob = BackendStream(Box::pin(futures::stream::poll_fn(move |_cx| match counter
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    {
+        0 => std::task::Poll::Ready(Some(Ok(bytes::Bytes::from_static(b"partial")))),
+        _ => std::task::Poll::Pending,
+    })));
+    let mut spool = Box::pin(context.blob_handle.handler.spool_hidden_blob(
+        namespace,
+        "cancelled.bin",
+        test_user_id(),
+        None,
+        None,
+        blob,
+    ));
+
+    // The second stream poll proves the writer is open and holds the first chunk.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while polls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+            assert!(futures::poll!(&mut spool).is_pending());
+        }
+    })
+    .await
+    .expect("spool must reach its second chunk");
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BLOB_HIDDEN_RESERVATION_KEYSPACE).await,
+        1
+    );
+
+    drop(spool);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while keyspace_count(&context.storage_handle, BLOB_HIDDEN_RESERVATION_KEYSPACE).await > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a cancelled spool must release its reservation");
+
+    let Event::Blob(BlobEvent::HiddenSpooled { .. }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace,
+            name: "cancelled.bin".to_string(),
+            created_by: test_user_id(),
+            max_bytes: None,
+            deadline: None,
+            blob: stream_from_bytes(b"partial"),
+        })
+        .await
+    else {
+        panic!("a later spool of the same content must succeed")
+    };
 }
 
 #[tokio::test]

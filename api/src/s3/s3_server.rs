@@ -42,7 +42,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{Instrument, error, info, trace};
+use tracing::{Instrument, error, info, trace, warn};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1227,7 +1227,8 @@ impl Service<Request<Incoming>> for WrappingService {
             s3s_request.extensions_mut().insert(local_lease.clone());
             activity.begin_request();
             let deadline_activity = Arc::new(ConnectionActivity::default());
-            let deadline = tokio::time::Instant::now() + timeouts.stream_lifetime;
+            let stream_lifetime = timeouts.stream_lifetime;
+            let deadline = tokio::time::Instant::now() + stream_lifetime;
             let deadline_task_activity = deadline_activity.clone();
             tokio::spawn(async move {
                 tokio::select! {
@@ -1236,6 +1237,13 @@ impl Service<Request<Incoming>> for WrappingService {
                         if !deadline_task_activity.is_cancelled()
                             && !deadline_task_activity.stopped.load(Ordering::Acquire)
                         {
+                            // The cancelled request returns without a completion
+                            // record, so this is its only trace.
+                            warn!(
+                                event = "s3.request.lifetime_expired",
+                                timeout_ms = stream_lifetime.as_millis() as u64,
+                                "Cancelling an S3 request that outlived its stream lifetime"
+                            );
                             deadline_task_activity.cancel();
                         }
                     }
