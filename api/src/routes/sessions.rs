@@ -117,24 +117,23 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
     path = "/access/sessions",
     tag = "access/sessions",
     summary = "Create a user bearer session",
-    description = r#"Creates a self-scoped bearer session and returns its token once.
+    description = r#"Creates a bearer session for the caller and returns its token once.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
-- The session carries the caller's own identity and nothing wider, so it grants no permission the
-  caller does not already hold.
-- A bound assistant or API session can create only its own kind, while a portal session and an
-  unbound token may create any kind.
-- The token is returned in this response only and cannot be recovered afterwards; the session
-  itself stays listable and revocable by its id.
+- The session carries the caller's own identity, so it grants no permission the caller does not
+  already hold.
+- A bound assistant or API session can create only its own kind; a portal session and an unbound
+  token may create any kind.
+- The token is returned in this response only; the session itself stays listable and revocable by
+  its id.
 - Sessions live on the node that issued them and are not replicated to the realm's other nodes.
 
 **Limits**
 - The lifetime is capped by the caller's own remaining lifetime and by 24 hours, which is also the
   default when `expires_in_seconds` is omitted.
-- Expired and revoked sessions are pruned first, and a user may hold at most 256 sessions after
-  that pruning."#,
+- A user may hold at most 256 sessions once expired and revoked ones are pruned."#,
     request_body(
         content = CreateSessionRequest,
         description = "Session kind, an optional label, and the requested lifetime in seconds",
@@ -153,10 +152,10 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
                 "token": "EXAMPLE-SESSION-TOKEN-PLACEHOLDER",
                 "expires_at": "2026-04-09T12:00:00Z"
             })),
-        (status = 400, description = "Invalid kind or lifetime", body = ErrorResponse),
-        (status = 401, description = "No usable bearer token", body = ErrorResponse),
-        (status = 403, description = "Restricted or foreign bearer token", body = ErrorResponse),
-        (status = 409, description = "Active session limit reached", body = ErrorResponse)
+        (status = 400, description = "Unknown session kind, or a lifetime outside the allowed range", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted, or belongs to another realm", body = ErrorResponse),
+        (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -212,13 +211,13 @@ pub async fn create_session(
     summary = "List user bearer sessions",
     description = r#"Lists the caller's own bearer sessions as this node stored them.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
 - Only sessions this node issued are listed, so a user with sessions on several nodes asks each of
   them separately.
 - `current` marks the session the request itself was authenticated with, and is false for a token
-  that is bound to no session.
+  bound to no session.
 - A revoked or expired session stays listed until the next session creation prunes it.
 - Tokens are never listed; a token is returned only by the creating request."#,
     responses(
@@ -234,8 +233,8 @@ pub async fn create_session(
                     "current": true
                 }]
             })),
-        (status = 401, description = "No usable bearer token", body = ErrorResponse),
-        (status = 403, description = "Restricted or foreign bearer token", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted, or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -261,21 +260,19 @@ pub async fn list_sessions(
     summary = "Revoke a user bearer session",
     description = r#"Revokes one of the caller's own bearer sessions on the node that issued it.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
 - Every token bound to the session is refused from here on, including the one the request itself
   was made with.
-- Revoking an already revoked session changes nothing and still answers 204, so a repeat is safe.
-- A session id that is not a ULID answers 204 as well, while a session belonging to another user
-  is not visible and answers 404.
+- Revoking an already revoked session, or an id that is not a ULID, still answers 204.
 - The revocation is node-local, like the session it ends."#,
     params(("session_id" = String, Path, description = "Session ULID")),
     responses(
-        (status = 204, description = "Session revoked or already absent"),
-        (status = 401, description = "No usable bearer token", body = ErrorResponse),
-        (status = 403, description = "Restricted or foreign bearer token", body = ErrorResponse),
-        (status = 404, description = "Session belongs to another user", body = ErrorResponse)
+        (status = 204, description = "Session revoked, or already revoked by an earlier call"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted, or belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "The session belongs to another user", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

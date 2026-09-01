@@ -263,59 +263,40 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
     post,
     path = "/access/onboarding/secrets",
     tag = "access/onboarding",
-    summary = "Mint a node enrollment secret",
-    description = r#"Mints a single-use enrollment secret that a joining node or device redeems to enter the realm.
+    summary = "Mint an onboarding secret",
+    description = r#"Mints a single-use onboarding secret that a joining node or device redeems to enter the realm.
 
-**Authentication**: `Management` and `Server` secrets need a bearer token of this realm with WRITE
-on the realm's onboarding admin path. A `User` secret is self-service: any authenticated member may
-mint one for itself, from an unrestricted token only. A management node serves the route, and every
-other node relays the call to one.
+**Authentication**: `Management` and `Server` secrets need a realm bearer token with WRITE on the
+realm's onboarding admin path. A `User` secret is self-service for any member holding an
+unrestricted token. A management node serves the route, and every other node relays the call to one.
 
 **Behavior**
-- The response carries the enrollment secret exactly once: the node stores only its hash, so a
-  secret that is lost cannot be recovered and must be revoked and minted again.
-- Treat the value like a credential, hand it to exactly one joiner, and expect it to be single-use.
-- `enrollment_id` names the enrollment this mint created and is the handle the status and revoke
-  routes take. It is not secret and the admin listing shows the same value, so a caller tracking
-  its own mint reads it here instead of diffing the listing against a concurrent one.
-- `mode` fixes what the joiner may become and is one of `Management`, `Server` or `User`. A
-  `Management` secret later lets the joiner receive the realm private key wrapped to its transport
-  key, so it is the most sensitive of the three.
-- A `User` secret enrolls an owner-bound device. Its owner is always the calling credential: the
-  request body cannot name one, so a device secret can never enroll a node for somebody else. A
-  path-restricted token cannot mint one, because the device carries the caller's whole identity.
-- Because self-service enrollment rests on no role grant, the realm's request policies are what an
-  administrator gates it with. A `User` mint is evaluated against them under the operation name
-  `onboarding.enroll_device` and the path `/{realm}/onboarding/devices`, so a realm deny policy on
-  that operation forbids device enrollment without touching any other route. Policy state that
-  cannot be read refuses the mint.
-- Every expired secret that is not already mid-enrollment is discarded before the new one is
-  created.
-
-- `seed_url` is the origin the joiner calls back, without any path: the joiner appends
-  `/api/v1/onboarding/bootstrap` to it itself. Leave it empty to have this node fill in its own
-  published REST origin, which is what a device mint from the portal does.
-- A `User` mint also returns `enroll_url`, the deep link a device app opens to claim the secret
-  without a copy and paste. Its shape is a contract both the desktop app and the portal wizard
-  parse: scheme `aruna`, host `enroll`, and the query keys `secret` (this very secret), `seed`
-  (the seed URL above) and `realm` (this realm's id). It is null for the other modes.
+- `onboarding_secret` is returned here and never again, because only its hash is stored: treat it
+  like a credential, hand it to exactly one joiner, and revoke and re-mint a lost one.
+- `enrollment_id` is the non-secret handle the status and revoke routes take.
+- `mode` fixes what the joiner may become. A `Management` secret later carries the realm private key
+  wrapped to the joiner's transport key, so it is the most sensitive of the three.
+- A `User` secret enrolls an owner-bound device whose owner is always the calling user; the body
+  cannot name one, and a path-restricted token cannot mint one at all.
+- Self-service device minting rests on no role grant, so the realm request policies gate it: a
+  `User` mint is evaluated under the operation `onboarding.enroll_device` and the path
+  `/{realm_id}/onboarding/devices`, and policy state that cannot be read refuses the mint.
+- `seed_url` is the origin the joiner calls back, without any path, since it appends
+  `/api/v1/access/onboarding/bootstrap` itself. Leave it empty to have this node fill in its own
+  published REST origin.
+- `enroll_url` is the deep link a device app opens to claim the secret without a copy and paste:
+  scheme `aruna`, host `enroll`, query keys `secret`, `seed` and `realm`. It is null for the other
+  modes.
+- Expired secrets that are not mid-enrollment are discarded before the new one is created.
 
 **Limits**
 - `expires_in_seconds` defaults to 3600 and is clamped to 60..=86400; `expires_at` is the resulting
   absolute expiry in Unix seconds.
-- A `User` mint is refused once the owner holds the realm's `max_devices_per_user` devices.
-  Enrolled devices and outstanding device secrets both occupy a slot, and a secret already claimed
-  by an enrolled device is charged once, through the realm configuration. A realm without that
-  quota set caps nothing.
-- The count is transactional per node, so two mints on this node cannot both pass it, and the cap
-  is checked again when the secret is redeemed. Two management nodes minting at the same time each
-  see only their own outstanding secrets: the redemption catches that once the first device is in
-  the replicated realm configuration, so concurrent redemptions on different nodes remain
-  best-effort.
-
-**Errors**: an owner at the device cap answers 409, and so does a mint that lost its transaction to
-a concurrent one, which is safe to retry. An empty `seed_url` on a node that publishes no REST
-interface answers 400. A realm policy that forbids enrollment answers 403."#,
+- A `User` mint is refused once the owner holds the realm's `max_devices_per_user` devices. Enrolled
+  devices and outstanding device secrets both occupy a slot, a secret already claimed by an enrolled
+  device is charged once, and a realm without that quota caps nothing.
+- The count is transactional per node and checked again at redemption, so two management nodes
+  minting at the same time each see only their own outstanding secrets and stay best effort."#,
     request_body(
         content = CreateOnboardingSecretRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
@@ -339,9 +320,9 @@ interface answers 400. A realm policy that forbids enrollment answers 403."#,
             })
         ),
         (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is path-restricted, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
-        (status = 409, description = "The owner already holds the realm's maximum number of devices, or a concurrent mint won the transaction; retry", body = crate::error::ErrorResponse),
+        (status = 409, description = "The owner is at the realm's device cap, or a concurrent mint won the transaction; retryable", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
         (status = 503, description = "Storage cleanup capacity is exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
@@ -466,25 +447,20 @@ fn enroll_url(secret: &str, seed_url: &str, realm_id: RealmId) -> ServerResult<S
     get,
     path = "/access/onboarding/secrets",
     tag = "access/onboarding",
-    summary = "List outstanding node enrollment secrets",
-    description = r#"Lists this management node's live and in-flight enrollment secrets as bookkeeping only.
+    summary = "List outstanding onboarding secrets",
+    description = r#"Lists this management node's live and in-flight onboarding secrets, soonest expiry first.
 
-**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path. A
-management node serves it, and every other node relays the call to one.
+**Authentication**: realm bearer token with WRITE on the realm's onboarding admin path. A management
+node serves it, and every other node relays the call to one.
 
 **Behavior**
-- Each entry carries the enrollment id, the mode, the owner a `User` secret is bound to, the
-  absolute expiry in Unix seconds and, once a joiner has claimed the secret, the node id it was
-  claimed by.
-- The secret value itself is never returned here, because only its hash was kept when it was
-  minted.
-- Expired secrets that are not mid-enrollment are discarded before the list is built, so the list
-  holds live and in-flight enrollments; entries are ordered by expiry, soonest first.
-- The list is this management node's local state, not a realm-wide fan-out."#,
+- The secret value itself is never returned, because only its hash was kept when it was minted.
+- Expired secrets that are not mid-enrollment are discarded before the list is built.
+- The list is this management node's own state, not a realm-wide fan-out."#,
     responses(
         (
             status = 200,
-            description = "Live and in-flight enrollment secrets, soonest expiry first",
+            description = "Live and in-flight onboarding secrets, soonest expiry first",
             body = ListOnboardingSecretsResponse,
             example = json!({
                 "secrets": [
@@ -505,7 +481,7 @@ management node serves it, and every other node relays the call to one.
                 ]
             })
         ),
-        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
@@ -537,26 +513,23 @@ pub async fn list_onboarding_secrets(
     delete,
     path = "/access/onboarding/secrets/{id}",
     tag = "access/onboarding",
-    summary = "Revoke a pending node enrollment secret",
+    summary = "Revoke a pending onboarding secret",
     description = r#"Deletes the enrollment record on this node, making the secret unredeemable from here on.
 
-**Authentication**: bearer token of this realm with WRITE on the realm's onboarding admin path. A
-management node serves it, and every other node relays the call to one.
+**Authentication**: realm bearer token with WRITE on the realm's onboarding admin path. A management
+node serves it, and every other node relays the call to one.
 
 **Behavior**
-- This is the remedy for a secret that leaked or was never used, and it is the only remedy, since
-  the secret value itself was never stored.
+- This is the only remedy for a secret that leaked or was never used, since the secret value itself
+  was never stored.
 - Revocation does not undo an enrollment that already completed: a node that finished bootstrapping
-  stays a member of the realm and has to be removed through the realm configuration instead.
-
-**Errors**: a secret that is already gone, expired and pruned or revoked by an earlier call,
-answers 404."#,
-    params(("id" = String, Path, description = "Enrollment id of the secret, the ULID reported when it was minted and by the list endpoint")),
+  stays a member of the realm and has to be removed through the realm configuration instead."#,
+    params(("id" = String, Path, description = "Enrollment id of the secret, as reported when it was minted and by the listing")),
     responses(
-        (status = 204, description = "Secret deleted and no longer redeemable; no response body"),
-        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 204, description = "Secret deleted and no longer redeemable"),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
-        (status = 404, description = "No enrollment secret with this id on this node", body = crate::error::ErrorResponse),
+        (status = 404, description = "No onboarding secret with this id on this node, including one an earlier call already revoked", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
@@ -584,27 +557,22 @@ pub async fn revoke_onboarding_secret(
     get,
     path = "/access/onboarding/secrets/{id}/status",
     tag = "access/onboarding",
-    summary = "Poll an enrollment secret's claim state",
-    description = r#"Reports whether an outstanding enrollment secret is still pending, already claimed or expired.
+    summary = "Poll an onboarding secret's claim state",
+    description = r#"Reports whether an outstanding onboarding secret is still pending, already claimed or expired.
 
-**Authentication**: bearer token of this realm. The owner a `User` secret is bound to may poll its
-own secret; every other caller needs WRITE on the realm's onboarding admin path. A management node
+**Authentication**: realm bearer token. The owner a `User` secret is bound to may poll its own
+secret; every other caller needs WRITE on the realm's onboarding admin path. A management node
 serves the route, and every other node relays the call to one.
 
 **Behavior**
-- This is the wizard's progress poll: mint a secret, hand it to the joiner, then watch this route
-  until `status` turns `claimed` and `claimed_node_id` names the node that redeemed it.
-- `pending` means the secret is live and unclaimed, `claimed` means a joiner has reserved,
-  finalized or consumed it, and `expired` means its lifetime ran out before any joiner claimed it.
+- This is the progress poll for an enrollment: watch it until `status` turns `claimed` and
+  `claimed_node_id` names the node that redeemed the secret.
+- `pending` means the secret is live and unclaimed, `claimed` means a joiner has reserved, finalized
+  or consumed it, and `expired` means its lifetime ran out before any joiner claimed it.
 - A claim outlives the secret's expiry: a secret claimed before it expired keeps reading `claimed`.
 - The secret value itself is never returned, because only its hash was kept when it was minted.
-- Nothing here is realm-wide: it is the claim state this management node recorded.
-
-**Errors**: an unknown, revoked or already pruned enrollment id answers 404, which is also what a
-caller sees after the enrollment finished and the record was cleaned up. A caller who is neither
-the secret's owner nor an onboarding administrator gets the same 404, so polling cannot be used to
-discover that somebody else's enrollment exists."#,
-    params(("id" = String, Path, description = "Enrollment id of the secret, the ULID reported when it was minted")),
+- Nothing here is realm-wide: it is the claim state this management node recorded."#,
+    params(("id" = String, Path, description = "Enrollment id of the secret, as reported when it was minted")),
     responses(
         (
             status = 200,
@@ -621,7 +589,7 @@ discover that somebody else's enrollment exists."#,
         ),
         (status = 400, description = "The enrollment id is not a ULID", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 404, description = "No enrollment secret with this id on this node, or the caller is neither its owner nor an onboarding administrator", body = crate::error::ErrorResponse),
+        (status = 404, description = "No onboarding secret with this id on this node, or the caller is neither its owner nor an onboarding administrator, so polling cannot reveal that somebody else's enrollment exists", body = crate::error::ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -674,46 +642,35 @@ pub async fn get_secret_status(
     post,
     path = "/access/onboarding/bootstrap",
     tag = "access/onboarding",
-    summary = "Redeem an enrollment secret and join the realm",
-    description = r#"Redeems an enrollment secret and returns the one-time material a joiner needs to enter the realm.
+    summary = "Redeem an onboarding secret and join the realm",
+    description = r#"Redeems an onboarding secret and returns the one-time material a joiner needs to enter the realm.
 
-**Authentication**: none; deliberately unauthenticated, because a joining node has no realm token
-yet. The enrollment secret plus a signature by the joiner's own node key are the credentials. A
-management node serves this route, and every other node relays the call to one.
+**Authentication**: none, deliberately, because a joining node has no realm token yet. The
+onboarding secret plus a signature by the joiner's own node key are the credentials. A management
+node serves this route, and every other node relays the call to one.
 
 **Behavior**
 - The secret is single-use and is consumed when enrollment finalizes, which also adds the joiner to
-  the realm configuration; a rejected attempt leaves the secret usable so an operator does not have
-  to mint a new one after a typo.
-- What must be sent depends on the mode the secret was minted for: a `Server` secret additionally
-  requires `issuer_public_key` and a matching `issuer_proof` and returns a delegation signature; a
+  the realm configuration; a rejected attempt leaves it usable, so a typo does not force a re-mint.
+- What must be sent depends on the mode the secret was minted for: a `Server` secret also requires
+  `issuer_public_key` and a matching `issuer_proof` and returns a delegation signature; a
   `Management` secret requires `transport_public_key` and returns the realm private key encrypted
-  to it, along with the nonce and the ephemeral public key needed to open it.
+  to it, with the nonce and ephemeral public key needed to open it.
 - A `User` secret needs neither: a device holds no realm key and no issuer delegation, and joins as
   an owner-bound member that never becomes a sync, holder or placement target.
 - Redeeming a `User` secret re-checks the owner's device cap against the realm configuration this
-  node has replicated, because the node that minted the secret only saw its own outstanding ones.
-  An owner already at the cap is refused with 409 and the secret stays unclaimed.
-- `mode` echoes what the secret was minted for, so a joiner can cross-check it against its own
-  copy. It reads `"Management"` or `"Server"` for the infrastructure modes, and for a device it is
-  the object `{"User": {"owner": ...}}` carrying the owner the secret was bound to.
-- The response always carries the realm id, the temporary endpoint to dial, a one-time sync ticket
-  the joiner uses to fetch the realm's core documents, and `realm_endpoints`.
-- `realm_endpoints` carries the realm's declared static discovery endpoints, kept only for nodes
-  that are configured, sync-eligible members. A joiner that cannot read the DHT, a device in
-  particular, dials them to reach the realm without discovery. It is a starting point, not the
-  realm membership, and a realm on dynamic discovery declares none, leaving the list empty.
-- `node_location`, `node_weight` and `node_labels` seed the joiner's placement entry and are
-  optional.
-- Everything returned here is one-time joining material and must never be logged or reused.
-
-**Errors**: an unknown, expired, already claimed or unmatched secret and a signature that does not
-verify are both refused with 401, without saying which of the two failed. A node that does not
-serve enrollment answers 403, and an owner already at the device cap answers 409, as does a
-redemption that lost its transaction to a concurrent one, which is safe to retry."#,
+  node has replicated, because the minting node only saw its own outstanding secrets. An owner
+  already at the cap is refused and the secret stays unclaimed.
+- `mode` echoes what the secret was minted for, so a joiner can cross-check it: `"Management"` or
+  `"Server"` for the infrastructure modes, and `{"User": {"owner": ...}}` for a device.
+- `realm_endpoints` carries the realm's declared static discovery endpoints, kept only for
+  configured, sync-eligible members. A joiner that cannot read the DHT, a device in particular,
+  dials them instead. It is a starting point, not the realm membership, and a realm on dynamic
+  discovery declares none.
+- Everything returned here is one-time joining material and must never be logged or reused."#,
     request_body(
         content = BootstrapOnboardingRequestDoc,
-        description = "The enrollment secret, the joiner's node id, its proof of possession of the node key, and any mode-specific key material",
+        description = "The onboarding secret, the joiner's node id, its proof of possession of the node key, and any mode-specific key material",
         example = json!({
             "onboarding_secret": "<onboarding-secret-shown-once>",
             "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
@@ -730,7 +687,7 @@ redemption that lost its transaction to a concurrent one, which is safe to retry
     responses(
         (
             status = 200,
-            description = "Enrollment finalized; joining material for the mode the secret was minted for. `addrs` entries are tagged transport addresses, either `Ip` or `Relay`",
+            description = "Enrollment finalized; one-time joining material for the mode the secret was minted for. `addrs` entries are tagged transport addresses, either `Ip` or `Relay`",
             body = BootstrapOnboardingResponseDoc,
             example = json!({
                 "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
@@ -760,9 +717,9 @@ redemption that lost its transaction to a concurrent one, which is safe to retry
             })
         ),
         (status = 400, description = "Malformed node id, key material or proof, or key material missing for the mode the secret was minted for", body = crate::error::ErrorResponse),
-        (status = 401, description = "Unknown, expired, already claimed or non-matching enrollment secret, or a proof that does not verify", body = crate::error::ErrorResponse),
-        (status = 403, description = "The secret was not minted for node enrollment", body = crate::error::ErrorResponse),
-        (status = 409, description = "The device's owner already holds the realm's maximum number of devices, or a concurrent enrollment won the transaction; retry", body = crate::error::ErrorResponse),
+        (status = 401, description = "Unknown, expired, already claimed or non-matching onboarding secret, or a proof that does not verify; which of the two failed is deliberately not said", body = crate::error::ErrorResponse),
+        (status = 403, description = "This node does not serve enrollment, or the secret was not minted for it", body = crate::error::ErrorResponse),
+        (status = 409, description = "The device's owner is at the realm's device cap, or a concurrent enrollment won the transaction; retryable", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
         (status = 503, description = "Storage cleanup capacity is exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     )
