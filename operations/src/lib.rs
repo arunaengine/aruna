@@ -100,6 +100,7 @@ pub mod sync_relationship;
 pub mod task_incoming;
 pub mod task_persistence;
 pub mod telemetry;
+pub mod update_group;
 pub mod update_metadata_document;
 pub mod update_user;
 pub mod usage_stats;

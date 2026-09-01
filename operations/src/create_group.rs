@@ -29,6 +29,7 @@ use tracing::{trace, warn};
 use ulid::Ulid;
 
 use crate::placement::placement_ref_for_target;
+use crate::update_group::MAX_GROUP_NAME_LEN;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -594,6 +595,8 @@ pub enum CreateGroupError {
     PlacementFenced,
     #[error("owned group limit reached ({limit})")]
     OwnedGroupLimitReached { limit: u32 },
+    #[error("group name must be non-empty and at most {MAX_GROUP_NAME_LEN} bytes")]
+    InvalidDisplayName,
     #[error("Creating Group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -611,6 +614,11 @@ impl Operation for CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.start", level = "debug", skip(self), fields(group_name = %self.config.display_name))]
     fn start(&mut self) -> Effects {
+        let trimmed = self.config.display_name.trim();
+        if trimmed.is_empty() || trimmed.len() > MAX_GROUP_NAME_LEN {
+            return self.fail(CreateGroupError::InvalidDisplayName);
+        }
+        self.config.display_name = trimmed.to_string();
         self.state = CreateGroupState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
