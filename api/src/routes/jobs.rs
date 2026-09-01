@@ -359,9 +359,9 @@ pub async fn job_urls(state: &ServerState, job_id: JobId) -> ServerResult<JobUrl
     let api_base_url = rest.api_base_url.trim_end_matches('/');
     Ok(JobUrls {
         owner_node_url: rest.api_base_url.clone(),
-        status_url: format!("{api_base_url}/jobs/{job_id}"),
-        report_url: format!("{api_base_url}/jobs/{job_id}/report"),
-        artifact_url: format!("{api_base_url}/jobs/{job_id}/artifacts/rocrate"),
+        status_url: format!("{api_base_url}/compute/jobs/{job_id}"),
+        report_url: format!("{api_base_url}/compute/jobs/{job_id}/report"),
+        artifact_url: format!("{api_base_url}/compute/jobs/{job_id}/artifacts/rocrate"),
     })
 }
 
@@ -2848,15 +2848,15 @@ mod tests {
         assert_eq!(urls.owner_node_url, "https://owner.example/api/v1");
         assert_eq!(
             urls.status_url,
-            format!("https://owner.example/api/v1/jobs/{job_id}")
+            format!("https://owner.example/api/v1/compute/jobs/{job_id}")
         );
         assert_eq!(
             urls.report_url,
-            format!("https://owner.example/api/v1/jobs/{job_id}/report")
+            format!("https://owner.example/api/v1/compute/jobs/{job_id}/report")
         );
         assert_eq!(
             urls.artifact_url,
-            format!("https://owner.example/api/v1/jobs/{job_id}/artifacts/rocrate")
+            format!("https://owner.example/api/v1/compute/jobs/{job_id}/artifacts/rocrate")
         );
     }
 
