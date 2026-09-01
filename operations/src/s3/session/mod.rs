@@ -1,13 +1,17 @@
 mod create;
 mod get;
+mod list;
 mod purge;
 mod refresh;
+mod revoke;
 mod touch;
 
 pub use create::{CreateS3SessionConfig, CreateS3SessionOperation};
 pub use get::GetS3SessionOperation;
+pub use list::ListS3SessionsOperation;
 pub use purge::{PurgeS3SessionsOperation, PurgeS3SessionsResult};
 pub use refresh::{RefreshS3SessionConfig, RefreshS3SessionOperation};
+pub use revoke::{RevokeS3SessionConfig, RevokeS3SessionOperation};
 pub use touch::{TouchS3SessionConfig, TouchS3SessionOperation};
 
 use crate::driver::{DriverContext, drive};
