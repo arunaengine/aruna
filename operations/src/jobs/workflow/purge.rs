@@ -1,8 +1,12 @@
 use std::collections::BTreeSet;
 
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::BLOB_DELETE_AUDIT_KEYSPACE;
 use aruna_core::structs::{
-    JobError, JobProgress, JobResultPayload, MultipartUpload, Permission, StoragePurgeCheckpoint,
-    StoragePurgeResult, StoragePurgeScope, StoragePurgeSpec, blob_object_permission_path,
+    BlobDeleteAuditKind, BlobDeleteAuditRecord, BlobPurgeScopeKind, JobError, JobProgress,
+    JobResultPayload, MultipartUpload, Permission, StoragePurgeCheckpoint, StoragePurgeResult,
+    StoragePurgeScope, StoragePurgeSpec, blob_delete_audit_key, blob_object_permission_path,
 };
 use aruna_core::util::unix_timestamp_millis;
 
@@ -160,6 +164,7 @@ async fn run_fenced_purge(
         false
     };
 
+    write_purge_audit(ctx, spec).await?;
     ctx.progress.set_current(total);
     Ok(StoragePurgeResult {
         scope: spec.scope.clone(),
@@ -169,6 +174,48 @@ async fn run_fenced_purge(
         bucket_deleted,
         emptiness_proven: true,
     })
+}
+
+fn purge_audit_record(spec: &StoragePurgeSpec, occurred_at_ms: u64) -> BlobDeleteAuditRecord {
+    let (scope, key) = match &spec.scope {
+        StoragePurgeScope::File { key, .. } => (BlobPurgeScopeKind::File, key.clone()),
+        StoragePurgeScope::Prefix { prefix, .. } => (BlobPurgeScopeKind::Prefix, prefix.clone()),
+        StoragePurgeScope::Bucket { .. } => (BlobPurgeScopeKind::Bucket, String::new()),
+    };
+    BlobDeleteAuditRecord {
+        realm_id: spec.auth_context.realm_id,
+        group_id: spec.group_id,
+        node_id: spec.node_id,
+        user_id: spec.auth_context.user_id,
+        kind: BlobDeleteAuditKind::Purge(scope),
+        bucket: spec.scope.bucket().to_string(),
+        key,
+        version_id: None,
+        occurred_at_ms,
+    }
+}
+
+/// Records the completed purge once. The job id is the record id, so a
+/// re-driven job overwrites its own row instead of adding a second one.
+async fn write_purge_audit(ctx: &JobContext, spec: &StoragePurgeSpec) -> Result<(), PurgeRunError> {
+    let record = purge_audit_record(spec, unix_timestamp_millis());
+    let value = record
+        .to_bytes()
+        .map_err(|error| JobError::retryable(format!("purge audit encode failed: {error}")))?;
+    match ctx
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BLOB_DELETE_AUDIT_KEYSPACE.to_string(),
+            key: blob_delete_audit_key(spec.group_id, ctx.job_id.as_ulid()).into(),
+            value: value.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        other => Err(JobError::retryable(format!("purge audit write failed: {other:?}")).into()),
+    }
 }
 
 async fn abort_uploads(
@@ -566,5 +613,75 @@ fn fence_error(error: PurgeFenceError) -> JobError {
         | PurgeFenceError::Busy
         | PurgeFenceError::Storage(_)
         | PurgeFenceError::Unexpected(_) => JobError::retryable(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::purge_audit_record;
+    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{
+        AuthContext, BlobDeleteAuditKind, BlobPurgeScopeKind, StoragePurgeScope, StoragePurgeSpec,
+    };
+    use aruna_core::types::UserId;
+    use ulid::Ulid;
+
+    fn spec(scope: StoragePurgeScope) -> StoragePurgeSpec {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        StoragePurgeSpec {
+            scope,
+            group_id: Ulid::from_bytes([2u8; 16]),
+            auth_context: AuthContext {
+                user_id: UserId::local(Ulid::from_bytes([3u8; 16]), realm_id),
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+        }
+    }
+
+    #[test]
+    fn audits_purge_scope() {
+        let file = purge_audit_record(
+            &spec(StoragePurgeScope::File {
+                bucket: "bucket".to_string(),
+                key: "reports/a.csv".to_string(),
+            }),
+            7,
+        );
+        assert_eq!(
+            file.kind,
+            BlobDeleteAuditKind::Purge(BlobPurgeScopeKind::File)
+        );
+        assert_eq!(file.bucket, "bucket");
+        assert_eq!(file.key, "reports/a.csv");
+        assert_eq!(file.version_id, None);
+        assert_eq!(file.occurred_at_ms, 7);
+
+        let prefix = purge_audit_record(
+            &spec(StoragePurgeScope::Prefix {
+                bucket: "bucket".to_string(),
+                prefix: "reports/".to_string(),
+            }),
+            8,
+        );
+        assert_eq!(
+            prefix.kind,
+            BlobDeleteAuditKind::Purge(BlobPurgeScopeKind::Prefix)
+        );
+        assert_eq!(prefix.key, "reports/");
+
+        let bucket = purge_audit_record(
+            &spec(StoragePurgeScope::Bucket {
+                bucket: "bucket".to_string(),
+            }),
+            9,
+        );
+        assert_eq!(
+            bucket.kind,
+            BlobDeleteAuditKind::Purge(BlobPurgeScopeKind::Bucket)
+        );
+        assert!(bucket.key.is_empty());
     }
 }
