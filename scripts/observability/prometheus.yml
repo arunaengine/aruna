@@ -4,8 +4,8 @@ global:
 
 # Only the application-native rules whose inputs this scrape actually ingests.
 # No-ready, restart-loop, and forced-shutdown alerts need Kubernetes or log
-# telemetry that is not scraped here; they stay manual checks in
-# docs/operational-recovery.md rather than inert rules.
+# telemetry that is not scraped here; they stay manual checks rather than
+# inert rules.
 rule_files:
   - aruna-alerts.yml
 

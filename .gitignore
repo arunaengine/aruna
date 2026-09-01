@@ -1,4 +1,5 @@
 target/
+docs/
 docker/
 .compose-data/
 .idea
@@ -6,6 +7,3 @@ docker/
 **/.env
 !.env.example
 docker/*
-demo/nextflow/.nextflow/
-demo/nextflow/.nextflow.log*
-demo/nextflow/work/
