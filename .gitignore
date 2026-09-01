@@ -7,3 +7,4 @@ docker/
 **/.env
 !.env.example
 docker/*
+portal*
