@@ -130,6 +130,19 @@ mod tests {
     }
 
     #[test]
+    fn matches_bare_prefix() {
+        // A group-wide metadata watch derives the path with a trailing slash.
+        assert!(permission_pattern_matches(
+            "/realm/g/abc/meta/**",
+            "/realm/g/abc/meta/"
+        ));
+        assert!(permission_pattern_matches(
+            "/realm/g/abc/**",
+            "/realm/g/abc/meta/"
+        ));
+    }
+
+    #[test]
     fn malformed_never_matches() {
         assert!(!permission_pattern_matches("/realm/[", "/realm/anything"));
     }

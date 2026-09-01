@@ -70,8 +70,9 @@ pub fn watch_permission_path(
             let remainder = path_prefix.strip_prefix("meta/")?;
             let (raw_group_id, document_path_prefix) = remainder.split_once('/')?;
             let group_id = Ulid::from_str(raw_group_id).ok()?;
-            if document_path_prefix.is_empty()
-                || group_id.is_nil()
+            // An empty document prefix is the group-wide watch: every dataset
+            // of the group, derived as the group's `meta/` permission path.
+            if group_id.is_nil()
                 || raw_group_id != group_id.to_string()
                 || MetadataRegistryRecord::normalize_document_path(document_path_prefix)
                     != document_path_prefix
@@ -1048,6 +1049,30 @@ mod tests {
         );
         metadata.path = format!("meta/{}/datasets/project", Ulid::from_bytes([8u8; 16]));
         assert!(watch_event_permission_path(&metadata).is_none());
+    }
+
+    #[test]
+    fn accepts_group_wide_prefix() {
+        // An empty document prefix watches every dataset of the group.
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        assert_eq!(
+            watch_permission_path(
+                realm_id,
+                &format!("meta/{group_id}/"),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            ),
+            Some(format!("/{realm_id}/g/{group_id}/meta/"))
+        );
+        assert!(
+            watch_permission_path(
+                realm_id,
+                &format!("meta/{group_id}"),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            )
+            .is_none(),
+            "the slash after the group stays mandatory"
+        );
     }
 
     #[test]
