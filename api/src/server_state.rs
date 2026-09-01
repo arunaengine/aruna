@@ -832,7 +832,7 @@ impl RestInterfaceRuntime {
         Self {
             bind_address,
             api_base_url: format!("{base_url}/api/v1"),
-            info_url: format!("{base_url}/api/v1/info"),
+            info_url: format!("{base_url}/api/v1/system/info"),
             swagger_ui_url: format!("{base_url}/swagger-ui"),
             base_url,
         }

@@ -337,7 +337,7 @@ async fn exchange_oidc_token(
 ) -> Result<String, CliError> {
     // This returns a user if it already exists
     let _response = client
-        .post(format!("{aruna_base_url}/api/v1/users/register"))
+        .post(format!("{aruna_base_url}/api/v1/access/users/register"))
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: None,
@@ -349,7 +349,7 @@ async fn exchange_oidc_token(
         .await?;
 
     let response = client
-        .get(format!("{aruna_base_url}/api/v1/users/token"))
+        .get(format!("{aruna_base_url}/api/v1/access/token"))
         .bearer_auth(oidc_token)
         .send()
         .await?
@@ -367,7 +367,7 @@ async fn exchange_bootstrap_token(
     onboarding_secret: String,
 ) -> Result<String, CliError> {
     let _response = client
-        .post(format!("{aruna_base_url}/api/v1/users/register"))
+        .post(format!("{aruna_base_url}/api/v1/access/users/register"))
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret),
@@ -379,7 +379,7 @@ async fn exchange_bootstrap_token(
         .await?;
 
     let response = client
-        .get(format!("{aruna_base_url}/api/v1/users/token"))
+        .get(format!("{aruna_base_url}/api/v1/access/token"))
         .bearer_auth(oidc_token)
         .send()
         .await?
@@ -1000,7 +1000,10 @@ mod tests {
         token: &str,
     ) -> Result<(), Box<dyn Error>> {
         let response = reqwest::Client::new()
-            .get(format!("{}/api/v1/admin/onboarding/secrets", node.base_url))
+            .get(format!(
+                "{}/api/v1/access/onboarding/secrets",
+                node.base_url
+            ))
             .bearer_auth(token)
             .send()
             .await?;
@@ -1013,7 +1016,10 @@ mod tests {
         token: &str,
     ) -> Result<reqwest::StatusCode, Box<dyn Error>> {
         let response = reqwest::Client::new()
-            .get(format!("{}/api/v1/admin/onboarding/secrets", node.base_url))
+            .get(format!(
+                "{}/api/v1/access/onboarding/secrets",
+                node.base_url
+            ))
             .bearer_auth(token)
             .send()
             .await?;

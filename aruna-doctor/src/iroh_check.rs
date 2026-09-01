@@ -506,7 +506,8 @@ mod tests {
             EndpointAddr::new(node_id).with_ip_addr("0.0.0.0:3001".parse().unwrap());
 
         let normalized =
-            normalize_endpoint_addr(endpoint_addr, "http://127.0.0.1:3000/api/v1/info").unwrap();
+            normalize_endpoint_addr(endpoint_addr, "http://127.0.0.1:3000/api/v1/system/info")
+                .unwrap();
 
         assert!(
             normalized
@@ -521,7 +522,7 @@ mod tests {
         let endpoint_addr = EndpointAddr::new(node_id).with_ip_addr("[::]:3001".parse().unwrap());
 
         let normalized =
-            normalize_endpoint_addr(endpoint_addr, "http://[::1]:3000/api/v1/info").unwrap();
+            normalize_endpoint_addr(endpoint_addr, "http://[::1]:3000/api/v1/system/info").unwrap();
 
         assert!(
             normalized
@@ -537,7 +538,8 @@ mod tests {
             EndpointAddr::new(node_id).with_ip_addr("0.0.0.0:3001".parse().unwrap());
 
         let error =
-            normalize_endpoint_addr(endpoint_addr, "https://node.example/api/v1/info").unwrap_err();
+            normalize_endpoint_addr(endpoint_addr, "https://node.example/api/v1/system/info")
+                .unwrap_err();
 
         assert!(matches!(
             error,
