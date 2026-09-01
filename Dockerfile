@@ -21,12 +21,13 @@ RUN mkdir -p /portal ${PORTAL_EMBED_DIR} && cp -r ${PORTAL_EMBED_DIR}/. /portal/
 
 FROM gcr.io/distroless/cc-debian13@sha256:ed7c407fd64eb0af9dddb9456b94cee188a40a7f53cf38c9836e1e9ae14fca02
 WORKDIR /run
-ARG PORTAL_MODE=disabled
 COPY --from=builder /build/target/release/aruna .
 COPY --from=builder /build/target/release/aruna-doctor .
 COPY --from=builder /build/target/bin/iroh-doctor .
 COPY --from=builder /portal/ /run/portal/
-ENV PORTAL_MODE=${PORTAL_MODE}
+# PORTAL_MODE is deliberately not baked in: a real env var would beat the
+# mounted /run/.env (dotenv never overrides process env), silently pinning
+# the portal off. PORTAL_DIR only points at the embedded copy.
 ENV PORTAL_DIR=/run/portal
 
 CMD [ "/run/aruna" ]
