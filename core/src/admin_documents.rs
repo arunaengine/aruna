@@ -288,6 +288,12 @@ pub enum AdminDocumentOperation {
     RealmConfigNodeRemoved {
         node_id: NodeId,
     },
+    /// Renames a group after creation. Only the label changes; the group id and
+    /// every permission path stay as they are (postcard append-only: new
+    /// variants only at the enum end).
+    GroupDisplayNameSet {
+        display_name: String,
+    },
 }
 
 #[cfg(test)]

@@ -1060,6 +1060,16 @@ impl AdminDocumentReducerState {
             }
             (
                 AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupDisplayNameSet { display_name },
+            ) => {
+                self.apply_group_field(
+                    event,
+                    GROUP_DISPLAY_NAME_PATH,
+                    Some(display_name.to_string()),
+                );
+            }
+            (
+                AdminDocumentTarget::Group { .. },
                 AdminDocumentOperation::GroupPoliciesSet { policies },
             ) => {
                 self.apply_group_field(event, GROUP_POLICIES_PATH, Some(policies_value(policies)));
@@ -2883,6 +2893,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
             GROUP_REALM_ID_PATH.to_string(),
             GROUP_OWNER_PATH.to_string(),
         ],
+        AdminDocumentOperation::GroupDisplayNameSet { .. } => {
+            vec![GROUP_DISPLAY_NAME_PATH.to_string()]
+        }
         AdminDocumentOperation::RealmConfigDescriptionSet { .. } => {
             vec![REALM_CONFIG_DESCRIPTION_PATH.to_string()]
         }
@@ -3746,6 +3759,29 @@ mod tests {
         )
     }
 
+    fn rename_group(
+        event_seed: u8,
+        origin_seed: u8,
+        origin_seq: u64,
+        display_name: &str,
+    ) -> AdminDocumentEvent {
+        // Every rename observes the create, so only renames conflict with renames.
+        let mut observed = AdminDocumentClock::default();
+        observed.advance(node(1), 1);
+        if origin_seq > 1 {
+            observed.advance(node(origin_seed), origin_seq - 1);
+        }
+        group_event(
+            event_seed,
+            node(origin_seed),
+            origin_seq,
+            observed,
+            AdminDocumentOperation::GroupDisplayNameSet {
+                display_name: display_name.to_string(),
+            },
+        )
+    }
+
     fn add_group_role(event_seed: u8, origin_seed: u8, role_id: RoleId) -> AdminDocumentEvent {
         group_event(
             event_seed,
@@ -4569,6 +4605,56 @@ mod tests {
                 .iter()
                 .any(|value| value.value.as_deref() == Some("Research"))
         );
+    }
+
+    #[test]
+    fn rename_replaces_created_name() {
+        let mut state = group_state();
+        state
+            .apply(&create_group(1, 1, "Engineering", realm_id()))
+            .unwrap();
+        state.apply(&rename_group(2, 1, 2, "Platform")).unwrap();
+
+        assert_eq!(
+            state.materialized_group_display_name().as_deref(),
+            Some("Platform")
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn older_rename_is_stale() {
+        // The second rename observes the first, so replaying the first loses.
+        let mut state = group_state();
+        state
+            .apply(&create_group(1, 1, "Engineering", realm_id()))
+            .unwrap();
+        let first = rename_group(2, 1, 2, "Platform");
+        let second = rename_group(3, 1, 3, "Infrastructure");
+        state.apply(&second).unwrap();
+        state.apply(&first).unwrap();
+
+        assert_eq!(
+            state.materialized_group_display_name().as_deref(),
+            Some("Infrastructure")
+        );
+    }
+
+    #[test]
+    fn concurrent_renames_conflict() {
+        let mut state = group_state();
+        state
+            .apply(&create_group(1, 1, "Engineering", realm_id()))
+            .unwrap();
+        state.apply(&rename_group(2, 2, 1, "Platform")).unwrap();
+        state.apply(&rename_group(3, 3, 1, "Research")).unwrap();
+
+        assert_eq!(state.materialized_group_display_name(), None);
+        let conflict = state
+            .conflicts
+            .get(GROUP_DISPLAY_NAME_PATH)
+            .expect("display name conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
     }
 
     #[test]

@@ -6262,9 +6262,10 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
             | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
             | AdminDocumentOperation::GroupPoliciesSet { .. }
+            | AdminDocumentOperation::GroupDisplayNameSet { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "group admin operation sync only supports group creation, role seeds, role creation/removal, role user assignment updates, and policy updates"
+            "group admin operation sync only supports group creation, renames, role seeds, role creation/removal, role user assignment updates, and policy updates"
                 .to_string(),
         ));
     }
@@ -8318,6 +8319,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
         | AdminDocumentOperation::GroupCreated { .. }
+        | AdminDocumentOperation::GroupDisplayNameSet { .. }
         | AdminDocumentOperation::GroupPoliciesSet { .. } => AdminOperationFamily::Group,
         AdminDocumentOperation::RealmRoleAdded { .. }
         | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
@@ -8457,6 +8459,7 @@ async fn validate_replicated_admin_event(
         }
         AdminDocumentOperation::GroupRoleAdded { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
+        | AdminDocumentOperation::GroupDisplayNameSet { .. }
         | AdminDocumentOperation::RealmRoleAdded { .. }
         | AdminDocumentOperation::RealmRoleCreated { .. }
         | AdminDocumentOperation::UserAttributeSet { .. }
@@ -9244,27 +9247,35 @@ async fn validate_group_admin_authority(
             "stored authorization identity does not match the group".to_string(),
         ));
     }
-    let path = match &event.op {
+    // Any one of these paths carries the authority; a rename is also open to a
+    // realm administrator who is not a member of the group.
+    let paths = match &event.op {
         AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
         | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. } => {
-            format!("/{realm_id}/g/{group_id}/admin/users/{user_id}")
+            vec![format!("/{realm_id}/g/{group_id}/admin/users/{user_id}")]
         }
         AdminDocumentOperation::GroupRoleAdded { .. }
         | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. } => {
-            format!("/{realm_id}/g/{group_id}/admin")
+            vec![format!("/{realm_id}/g/{group_id}/admin")]
         }
         AdminDocumentOperation::GroupPoliciesSet { .. } => {
-            format!("/{realm_id}/g/{group_id}/admin/config")
+            vec![format!("/{realm_id}/g/{group_id}/admin/config")]
         }
+        AdminDocumentOperation::GroupDisplayNameSet { .. } => vec![
+            format!("/{realm_id}/g/{group_id}/admin"),
+            format!("/{realm_id}/admin/groups"),
+        ],
         AdminDocumentOperation::GroupCreated { .. } => unreachable!(),
         _ => unreachable!("group authority only receives group operations"),
     };
-    let allowed = has_current_write_permission(
-        event.actor.user_id,
-        &path,
-        realm_auth.roles.values().chain(group_auth.roles.values()),
-    );
+    let allowed = paths.iter().any(|path| {
+        has_current_write_permission(
+            event.actor.user_id,
+            path,
+            realm_auth.roles.values().chain(group_auth.roles.values()),
+        )
+    });
     Ok(if allowed {
         AdminEventValidation::Accepted
     } else {
@@ -14137,6 +14148,156 @@ mod tests {
             .await
             .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn rename_updates_row() {
+        // A replicated rename re-materializes the stored group label.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([37; 32]);
+        let group_id = Ulid::from_parts(198, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(199, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(200, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Engineering".to_string(),
+                    owner: actor.user_id,
+                },
+            ),
+        )
+        .await
+        .expect("group create applies");
+
+        let mut observed = AdminDocumentClock::default();
+        observed.advance(actor.node_id, 1);
+        let mut rename = test_admin_event(
+            Ulid::from_parts(201, 1),
+            target,
+            &actor,
+            2,
+            AdminDocumentOperation::GroupDisplayNameSet {
+                display_name: "Platform".to_string(),
+            },
+        );
+        rename.observed = observed;
+        apply_admin_document_operation_to_storage(&storage, document_target, rename)
+            .await
+            .expect("rename applies");
+
+        assert_eq!(
+            read_group_doc(&storage, group_id).await.display_name,
+            "Platform"
+        );
+    }
+
+    #[tokio::test]
+    async fn admits_group_rename() {
+        let (_dir, storage) = test_storage();
+        let (realm_id, group_id, actor) = seed_rename_group(&storage, None).await;
+        assert_eq!(
+            validate_rename(&storage, realm_id, group_id, &actor).await,
+            AdminEventValidation::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_foreign_rename() {
+        // The stored group belongs to another realm, so its label is not ours.
+        let (_dir, storage) = test_storage();
+        let foreign = RealmId::from_bytes([39; 32]);
+        let (realm_id, group_id, actor) = seed_rename_group(&storage, Some(foreign)).await;
+        assert!(matches!(
+            validate_rename(&storage, realm_id, group_id, &actor).await,
+            AdminEventValidation::Rejected(_)
+        ));
+    }
+
+    /// Seeds a publisher-capable realm config plus one group owned by the actor.
+    /// `group_realm` overrides the realm the stored group claims.
+    async fn seed_rename_group(
+        storage: &StorageHandle,
+        group_realm: Option<RealmId>,
+    ) -> (RealmId, Ulid, Actor) {
+        let realm_id = RealmId::from_bytes([38; 32]);
+        let group_id = Ulid::from_parts(202, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(203, 1), realm_id),
+            realm_id,
+        );
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        let group = Group {
+            display_name: "Engineering".to_string(),
+            group_id,
+            realm_id: group_realm.unwrap_or(realm_id),
+            owner: actor.user_id,
+            roles: HashSet::new(),
+        };
+        storage_batch_write_to(
+            storage,
+            vec![
+                target_write_entry(
+                    DocumentSyncTarget::RealmConfig { realm_id },
+                    config.to_bytes(&actor).expect("config serializes").into(),
+                ),
+                (
+                    GROUP_KEYSPACE.to_string(),
+                    group_id.to_bytes().into(),
+                    group.to_bytes(&actor).expect("group serializes").into(),
+                ),
+            ],
+        )
+        .await
+        .expect("fixture writes");
+        (realm_id, group_id, actor)
+    }
+
+    async fn validate_rename(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        group_id: Ulid,
+        actor: &Actor,
+    ) -> AdminEventValidation {
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let placement = admin_test_placement();
+        let topic_id = document_target.sync_topic_id(realm_id, &placement);
+        let event = test_admin_event(
+            Ulid::from_parts(204, 1),
+            AdminDocumentTarget::Group { group_id },
+            actor,
+            1,
+            AdminDocumentOperation::GroupDisplayNameSet {
+                display_name: "Platform".to_string(),
+            },
+        );
+        validate_replicated_admin_event(
+            storage,
+            topic_id,
+            irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id)),
+            &document_target,
+            &event,
+            realm_id,
+            &placement,
+            &sign_as_origin(&event, &placement),
+            &mut ConfigValidationCache::default(),
+        )
+        .await
+        .expect("validation runs")
     }
 
     #[tokio::test]
