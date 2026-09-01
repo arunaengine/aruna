@@ -7,6 +7,7 @@ use super::s3_service::ArunaS3Service;
 use crate::cors::CorsConfig;
 use crate::error::S3ServerError;
 use crate::rate_limit::{LocalKey, LocalLease};
+use crate::s3::util::bucket_name_reason;
 use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
 use aruna_core::credential_seal::CredentialSealKey;
@@ -1061,6 +1062,9 @@ impl Service<Request<Incoming>> for WrappingService {
             .get(header::HOST)
             .and_then(|value| value.to_str().ok());
         let bucket = extract_bucket_name(host, &path, &self.domain);
+        // s3s rejects a malformed bucket at path parse without a message, which
+        // reaches clients as "UnknownError"; answer the violated rule instead.
+        let invalid_bucket = bucket.as_deref().and_then(bucket_name_reason);
         let origin_header = parts.headers.get(header::ORIGIN).cloned();
         let origin = origin_header
             .as_ref()
@@ -1336,6 +1340,16 @@ impl Service<Request<Incoming>> for WrappingService {
                 return Ok(response);
             }
 
+            if let Some(reason) = invalid_bucket {
+                drop(request_permit);
+                drop(s3s_request);
+                let response = invalid_bucket_response(reason)?;
+                let code = response.status().as_u16();
+                emit_request_completed(&span, "s3", code, started);
+                record_s3_request(&metrics, &method, code, "invalid_bucket", started.elapsed());
+                return Ok(response);
+            }
+
             let mut capture_permit = if delete_objects {
                 match capture_limit.try_acquire_owned() {
                     Ok(permit) => Some(permit),
@@ -1560,6 +1574,12 @@ fn oversized_delete_response() -> Result<HttpResponse, HttpError> {
     )
     .to_http_response()
     .map_err(|error| HttpError::new(Box::new(error)))
+}
+
+fn invalid_bucket_response(reason: &'static str) -> Result<HttpResponse, HttpError> {
+    s3_error!(InvalidBucketName, "{}", reason)
+        .to_http_response()
+        .map_err(|error| HttpError::new(Box::new(error)))
 }
 
 fn slow_down_response(retry_after: u64) -> HttpResponse {
