@@ -439,6 +439,7 @@ mod tests {
             },
             DocumentSyncEvent::AdminOperation {
                 target: DocumentSyncTarget::RealmConfig { realm_id },
+                origin_signature: iroh::Signature::from_bytes(&[0; 64]),
                 event: Box::new(admin_event()),
                 placement: PlacementRef::NIL,
             },

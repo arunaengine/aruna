@@ -1,5 +1,8 @@
-use crate::auth::{ensure_permission, permission_granted, require_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, ensure_permission, permission_granted, require_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::metadata::map_metadata_api_error;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
@@ -16,10 +19,15 @@ use aruna_operations::add_user_to_group::{
     AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
 };
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
+use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::metadata::api::forwarded_bearer;
+use aruna_operations::metadata::forward::{
+    ForwardGroupError, forward_group_create, is_user_origin,
+};
 use aruna_operations::metadata::stats::count_group_documents_by_purpose;
 use aruna_operations::remove_group_role::{
     RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
@@ -281,6 +289,21 @@ fn require_unrestricted(auth: Option<AuthContext>) -> ServerResult<AuthContext> 
     Ok(auth)
 }
 
+/// Refuses a group-document edit on a device. Every realm holder rejects an
+/// admin envelope a device originated, so applying it locally would answer the
+/// caller with success and then diverge; the action journal replaces this.
+pub(crate) async fn refuse_group_edit(state: &ServerState) -> ServerResult<()> {
+    let device = is_user_origin(&state.get_ctx(), state.get_realm_id(), state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?;
+    match device {
+        true => Err(ServerError::Conflict(
+            "group changes are made through the realm".to_string(),
+        )),
+        false => Ok(()),
+    }
+}
+
 fn actor_for(state: &ServerState, auth: &AuthContext) -> Actor {
     Actor {
         node_id: state.get_node_id(),
@@ -345,6 +368,9 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
   cap.
 - The caller becomes the owner and the only member of the new group's admin role, next to the
   default user and viewer roles.
+- On a user-kind node the create is forwarded to a ranked management or server peer under the
+  caller's own token, which is where the quota and the permission are then checked, and 503 is
+  returned when no eligible peer accepts it.
 - The write commits on this node and replicates to the rest of the realm afterwards, so another node
   may not list the group immediately."#,
     request_body(
@@ -390,13 +416,15 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
         (status = 400, description = "Request body is not a valid create-group document", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is confined to a path subset", body = ErrorResponse),
-        (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter may be retried unchanged", body = ErrorResponse)
+        (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter may be retried unchanged", body = ErrorResponse),
+        (status = 503, description = "No eligible realm peer accepted the create forwarded from a user-kind node; retryable, the response carries a Retry-After header", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn create_group(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateGroupRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
     let auth = require_unrestricted(auth)?;
@@ -405,6 +433,32 @@ pub async fn create_group(
     request_span.record("group_name", field::display(&request.name));
     if auth.realm_id != realm_id {
         return Err(ServerError::Forbidden);
+    }
+
+    let ctx = state.get_ctx();
+    // A device originates no realm administration, so the create travels to an
+    // ingress, which decides quota and permission under the caller's own token.
+    if is_user_origin(&ctx, realm_id, state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?
+    {
+        let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
+        let auth_token = forwarded_bearer(Some(caller_token.as_str()))
+            .map_err(map_metadata_api_error)?
+            .ok_or(ServerError::Unauthorized)?;
+        let forwarded = forward_group_create(&ctx, realm_id, auth_token, request.name)
+            .await
+            .map_err(|err| match err {
+                ForwardGroupError::Conflict(reason) => ServerError::Conflict(reason),
+                ForwardGroupError::Api(err) => map_metadata_api_error(err),
+            })?;
+        request_span.record("group_id", field::display(forwarded.0.group_id));
+        // Cached here so the new group answers on the next read instead of
+        // after the device's next realm-document fetch.
+        if !install_group_docs(&ctx, &actor_for(&state, &auth), &forwarded.0, &forwarded.1).await {
+            warn!(group_id = %forwarded.0.group_id, "Failed to cache a forwarded group locally");
+        }
+        return Ok((StatusCode::CREATED, Json(forwarded.into())));
     }
 
     let is_realm_admin = permission_granted(
@@ -659,19 +713,27 @@ pub async fn get_group(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = parse_group_id(&group_id)?;
-    let (group, auth_doc) = load_group(&state, group_id).await?;
-    let is_member = is_group_member(&auth_doc, auth.user_id);
     Ok((
         StatusCode::OK,
-        Json(GroupInfoResponse {
-            display_name: group.display_name,
-            group_id: group.group_id.to_string(),
-            realm_id: group.realm_id.to_string(),
-            roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
-        }),
+        Json(run_get_group(&state, auth, &group_id).await?),
     ))
+}
+
+pub(crate) async fn run_get_group(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    group_id: &str,
+) -> ServerResult<GroupInfoResponse> {
+    let auth = require_realm_auth(state, auth)?;
+    let group_id = parse_group_id(group_id)?;
+    let (group, auth_doc) = load_group(state, group_id).await?;
+    let is_member = is_group_member(&auth_doc, auth.user_id);
+    Ok(GroupInfoResponse {
+        display_name: group.display_name,
+        group_id: group.group_id.to_string(),
+        realm_id: group.realm_id.to_string(),
+        roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
+    })
 }
 
 fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
@@ -727,6 +789,9 @@ a realm administrator who is not a member is forbidden.
 **Behavior**
 - The flat counters report what this node stores for the group, while `realm` reports the realm-wide
   totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes.
+- `stored_blobs` and `stored_bytes` are omitted, from the flat counters and from `realm`: a physical
+  blob copy is content-addressed and shared by every group referencing it, so it is counted per node
+  and per storage backend only, and `/info/usage` reports those node-wide figures.
 - `dataset_count`, `profile_count` and `process_run_count` are exact lifecycle-live
   metadata-document counts for this group when this node's metadata subsystem can answer; all three
   are omitted together when it cannot.
@@ -753,8 +818,6 @@ a realm administrator who is not a member is forbidden.
             example = json!({
                 "buckets": 3,
                 "objects": 1284,
-                "stored_blobs": 1190,
-                "stored_bytes": 87412338176_i64,
                 "logical_bytes": 91002113024_i64,
                 "referenced_bytes": 91002113024_i64,
                 "dataset_count": 37,
@@ -763,8 +826,6 @@ a realm administrator who is not a member is forbidden.
                 "realm": {
                     "buckets": 5,
                     "objects": 2048,
-                    "stored_blobs": 1902,
-                    "stored_bytes": 140733193388_i64,
                     "logical_bytes": 152882105100_i64,
                     "referenced_bytes": 152882105100_i64
                 },
@@ -788,16 +849,27 @@ pub async fn get_group_usage(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<crate::routes::info::UsageResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = parse_group_id(&group_id)?;
-    let (_, auth_doc) = load_group(&state, group_id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(run_group_usage(&state, auth, &group_id).await?),
+    ))
+}
+
+pub(crate) async fn run_group_usage(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    group_id: &str,
+) -> ServerResult<crate::routes::info::UsageResponse> {
+    let auth = require_realm_auth(state, auth)?;
+    let group_id = parse_group_id(group_id)?;
+    let (_, auth_doc) = load_group(state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
         return Err(ServerError::Forbidden);
     }
 
-    let local = crate::routes::info::load_usage_counters(&state, usage_group_key(group_id)).await?;
+    let local = crate::routes::info::load_usage_counters(state, usage_group_key(group_id)).await?;
     let realm = crate::routes::info::load_realm_usage(
-        &state,
+        state,
         aruna_operations::usage_stats::RealmUsageScope::Group(group_id),
     )
     .await?;
@@ -805,7 +877,7 @@ pub async fn get_group_usage(
     // The QuotaGate enforces against the group's realm-wide logical_bytes, so the
     // warning threshold is evaluated against the same counter.
     let realm_group_logical_bytes = realm.logical_bytes;
-    let mut response = crate::routes::info::UsageResponse::new(local, realm);
+    let mut response = crate::routes::info::UsageResponse::for_group(local, realm);
     match count_group_documents_by_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
         Ok(Some(counts)) => {
             response.dataset_count = Some(counts.dataset_count);
@@ -831,7 +903,7 @@ pub async fn get_group_usage(
             realm_group_logical_bytes,
         ));
     }
-    Ok((StatusCode::OK, Json(response)))
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -886,9 +958,20 @@ pub async fn list_group_members(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupMembersResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = parse_group_id(&group_id)?;
-    let (_, auth_doc) = load_group(&state, group_id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(run_group_members(&state, auth, &group_id).await?),
+    ))
+}
+
+pub(crate) async fn run_group_members(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    group_id: &str,
+) -> ServerResult<GroupMembersResponse> {
+    let auth = require_realm_auth(state, auth)?;
+    let group_id = parse_group_id(group_id)?;
+    let (_, auth_doc) = load_group(state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
         return Err(ServerError::Forbidden);
     }
@@ -909,7 +992,7 @@ pub async fn list_group_members(
         }
     }
 
-    let names = resolve_member_names(&state, roles_by_user.keys().copied().collect()).await;
+    let names = resolve_member_names(state, roles_by_user.keys().copied().collect()).await;
     let mut members: Vec<GroupMemberResponse> = roles_by_user
         .into_iter()
         .map(|(user_id, mut roles)| {
@@ -923,7 +1006,7 @@ pub async fn list_group_members(
         .collect();
     members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
 
-    Ok((StatusCode::OK, Json(GroupMembersResponse { members })))
+    Ok(GroupMembersResponse { members })
 }
 
 /// Best-effort name lookup: a resolve failure leaves every member unnamed
@@ -1003,7 +1086,8 @@ for the user being added, so authority can be delegated per member.
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default user role to fall back on", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
-        (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse)
+        (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse),
+        (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1016,6 +1100,7 @@ pub async fn add_group_member(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let user_id = parse_member_user_id(&request.user_id)?;
+    refuse_group_edit(&state).await?;
 
     ensure_permission(
         &state,
@@ -1100,7 +1185,7 @@ removing anyone else requires WRITE on the group's administrative path for that 
         (status = 400, description = "Malformed group, user or role id, or a user id standing for everyone", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
-        (status = 409, description = "The removal would leave the group without an administrator", body = ErrorResponse)
+        (status = 409, description = "The removal would leave the group without an administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1118,6 +1203,7 @@ pub async fn remove_group_member(
         .as_deref()
         .map(|role_id| parse_role_id(role_id).map(|role_id| HashSet::from([role_id])))
         .transpose()?;
+    refuse_group_edit(&state).await?;
 
     // Self-leave via this endpoint needs no admin permission, matching the operation.
     if user_id != auth.user_id {
@@ -1171,7 +1257,7 @@ No group permission is required, because the token's own subject is the only use
     responses(
         (status = 204, description = "The caller no longer holds any role in the group; no response body is returned"),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 409, description = "The caller is the group's last administrator", body = ErrorResponse)
+        (status = 409, description = "The caller is the group's last administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1182,6 +1268,7 @@ pub async fn leave_group(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
+    refuse_group_edit(&state).await?;
 
     drive(
         RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
@@ -1254,7 +1341,8 @@ pub async fn leave_group(
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than read", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
-        (status = 404, description = "No such group on this node", body = ErrorResponse)
+        (status = 404, description = "No such group on this node", body = ErrorResponse),
+        (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1267,6 +1355,7 @@ pub async fn create_group_role(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let realm_id = state.get_realm_id();
+    refuse_group_edit(&state).await?;
 
     ensure_permission(
         &state,
@@ -1368,7 +1457,7 @@ pub async fn create_group_role(
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
         (status = 404, description = "No such role in this group, or the group is not present on this node", body = ErrorResponse),
-        (status = 409, description = "The built-in admin role cannot be deleted", body = ErrorResponse)
+        (status = 409, description = "The built-in admin role cannot be deleted, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1380,6 +1469,7 @@ pub async fn delete_group_role(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let role_id = parse_role_id(&role_id)?;
+    refuse_group_edit(&state).await?;
 
     ensure_permission(
         &state,
@@ -1755,9 +1845,11 @@ fn encode_object_token(token: ListObjectsV2ContinuationToken) -> ServerResult<St
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateGroupRequest, DataPathKind, DataPathsQuery, ListGroupsQuery, create_group, get_group,
-        get_group_usage, list_data_paths, list_group_members, list_groups,
+        AddGroupMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, ListGroupsQuery,
+        add_group_member, create_group, get_group, get_group_usage, list_data_paths,
+        list_group_members, list_groups,
     };
+    use crate::auth::ValidatedArunaBearerTokenCarrier;
     use crate::error::{ServerError, ServerResult};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
@@ -1772,11 +1864,12 @@ mod tests {
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmAuthorizationDocument, RealmId, Role, User, VersionKey, blob_bucket_permission_path,
-        blob_object_permission_path,
+        RealmAuthorizationDocument, RealmId, RealmNodeKind, Role, User, VersionKey,
+        blob_bucket_permission_path, blob_object_permission_path,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::driver::drive;
+    use aruna_operations::list_groups::ListGroupOperation;
     use aruna_storage::storage;
     use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
@@ -1865,6 +1958,7 @@ mod tests {
             user_id,
             realm_id: user_id.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -1886,7 +1980,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 iroh::SecretKey::generate().public(),
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -1910,14 +2004,16 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        // Policy loading fails closed without the realm config document.
+        // Policy loading fails closed without the realm config document, and a
+        // node the configuration does not name has no resolvable kind.
+        let mut config =
+            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(state.get_node_id(), RealmNodeKind::Management);
         store_bytes(
             &state,
             aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
             realm_id.as_bytes().to_vec(),
-            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .unwrap(),
+            config.to_bytes(&actor).unwrap(),
         )
         .await;
 
@@ -1930,6 +2026,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -1982,7 +2079,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -2023,12 +2120,98 @@ mod tests {
         create_group(
             State(state.clone()),
             Extension(Some(member_auth(user_id))),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "token",
+            ))),
             Json(CreateGroupRequest {
                 name: name.to_string(),
             }),
         )
         .await
         .map(|(status, _)| assert_eq!(status, StatusCode::CREATED))
+    }
+
+    #[tokio::test]
+    async fn device_refuses_member_add() {
+        // A local apply would enqueue an admin record every realm holder rejects,
+        // so the device must refuse instead of answering success and diverging.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        let error = add_group_member(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Path(Ulid::generate().to_string()),
+            Json(AddGroupMemberRequest {
+                user_id: admin.to_string(),
+                role_ids: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ServerError::Conflict(reason) if reason.contains("through the realm"))
+        );
+    }
+
+    #[tokio::test]
+    async fn device_forwards_create() {
+        // A user-kind node never creates locally: without a reachable ingress
+        // the create fails as unavailable and no group is stored.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        let error = new_group(&state, admin, "device").await.unwrap_err();
+        assert!(matches!(error, ServerError::ServiceUnavailable));
+        let groups = drive(ListGroupOperation::new(), &state.get_ctx())
+            .await
+            .unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_needs_token() {
+        // Forwarding carries the caller's own token; without one the device
+        // must refuse rather than act under its node identity.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        let error = create_group(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Extension(None),
+            Json(CreateGroupRequest {
+                name: "device".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Unauthorized));
     }
 
     #[tokio::test]

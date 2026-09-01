@@ -80,6 +80,9 @@ pub enum ApiSourceConnectorKind {
     Ftp,
     /// Rejected on registration and refused at use; readable on stored records only.
     ArunaNative,
+    /// A directory offered by a device, registered there and never here;
+    /// readable on stored records only.
+    LocalDirectory,
 }
 
 impl From<ApiSourceConnectorKind> for SourceConnectorKind {
@@ -90,6 +93,7 @@ impl From<ApiSourceConnectorKind> for SourceConnectorKind {
             ApiSourceConnectorKind::Webdav => SourceConnectorKind::Webdav,
             ApiSourceConnectorKind::Ftp => SourceConnectorKind::Ftp,
             ApiSourceConnectorKind::ArunaNative => SourceConnectorKind::ArunaNative,
+            ApiSourceConnectorKind::LocalDirectory => SourceConnectorKind::LocalDirectory,
         }
     }
 }
@@ -102,6 +106,7 @@ impl From<SourceConnectorKind> for ApiSourceConnectorKind {
             SourceConnectorKind::Webdav => ApiSourceConnectorKind::Webdav,
             SourceConnectorKind::Ftp => ApiSourceConnectorKind::Ftp,
             SourceConnectorKind::ArunaNative => ApiSourceConnectorKind::ArunaNative,
+            SourceConnectorKind::LocalDirectory => ApiSourceConnectorKind::LocalDirectory,
         }
     }
 }
@@ -1636,7 +1641,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -1650,11 +1655,13 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             other_auth: AuthContext {
                 user_id: other_user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             group_id,
             state,

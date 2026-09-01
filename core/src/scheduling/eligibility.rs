@@ -4,9 +4,7 @@
 
 use crate::compute::NetworkAccess;
 use crate::scheduling::facts::{PlanRequest, TargetCandidate};
-use crate::structs::{
-    PlacementDecision, PlacementPolicyRef, PlacementSubject, RealmNodeKind, evaluate_placement,
-};
+use crate::structs::{PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -15,7 +13,7 @@ use ulid::Ulid;
 pub enum RejectionVerdict {
     /// Realm or group authorization does not allow this request here.
     NotAuthorized,
-    /// Local and User nodes never take cross-node work.
+    /// User nodes never take cross-node work.
     NodeKind,
     Inactive,
     ComputeDraining,
@@ -74,10 +72,7 @@ pub fn screen(request: &PlanRequest, candidate: &TargetCandidate) -> Option<Reje
     if !candidate.group_allowed {
         return Some(RejectionVerdict::NotAuthorized);
     }
-    if matches!(
-        candidate.node_kind,
-        RealmNodeKind::Local | RealmNodeKind::User
-    ) {
+    if !candidate.node_kind.is_sync_eligible() {
         return Some(RejectionVerdict::NodeKind);
     }
     if !candidate.active {

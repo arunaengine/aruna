@@ -20,14 +20,9 @@ async-trait = { workspace = true }
 parking_lot = { workspace = true }
 postcard = { workspace = true, features = ["alloc"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
-bytes = { workspace = true }
-hex = { workspace = true }
-globset = { workspace = true }
-rand = { workspace = true }
+governor = { workspace = true }
 byteview = { workspace = true }
 futures = { workspace = true }
-n0-future = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 smallvec = { workspace = true }

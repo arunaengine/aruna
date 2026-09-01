@@ -147,6 +147,8 @@ pub fn make_request_span(
         status_code = field::Empty,
         user_id = field::Empty,
         realm_id = field::Empty,
+        session_id = field::Empty,
+        session_kind = field::Empty,
         group_id = field::Empty,
         group_name = field::Empty,
     );
@@ -162,10 +164,20 @@ pub fn record_auth_context(auth_ctx: Option<&AuthContext>) {
     if let Some(auth_ctx) = auth_ctx {
         span.record("user_id", field::display(auth_ctx.user_id));
         span.record("realm_id", field::display(&auth_ctx.realm_id));
+        if let Some(session) = &auth_ctx.session {
+            span.record("session_id", field::display(&session.sid));
+            span.record("session_kind", field::display(session.kind));
+        }
         trace!(
             event = "request.authenticated",
             user_id = %auth_ctx.user_id,
             realm_id = %auth_ctx.realm_id,
+            session_id = auth_ctx.session.as_ref().map_or("", |session| session.sid.as_str()),
+            session_kind = %auth_ctx
+                .session
+                .as_ref()
+                .map(|session| session.kind.to_string())
+                .unwrap_or_default(),
             "Resolved request authentication"
         );
     } else {

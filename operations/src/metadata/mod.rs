@@ -1,5 +1,6 @@
 pub mod api;
 pub mod audit;
+pub mod contact;
 pub mod forward;
 mod handle;
 mod iri_index;
@@ -17,6 +18,7 @@ mod search_cursor;
 mod search_enrichment;
 pub mod stats;
 mod summary_cache;
+pub mod sync_pull;
 pub mod timestamp_index;
 pub mod visibility_index;
 
@@ -27,6 +29,7 @@ use tracing::warn;
 
 use crate::driver::DriverContext;
 
+pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 pub(crate) use handle::{MetadataWritePeerError, transport_message_kind};
 pub use protocol::{

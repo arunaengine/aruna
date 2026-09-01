@@ -4,4 +4,5 @@ mod capacity;
 mod family_reads;
 mod report;
 mod scheduling;
+mod terminal;
 mod uncertain_commit;

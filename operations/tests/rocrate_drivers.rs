@@ -180,6 +180,7 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
             user_id: fixture.actor.user_id,
             realm_id: fixture.actor.realm_id,
             path_restrictions: None,
+            session: None,
         },
         document_id,
         limits: RoCrateLimits::default(),
@@ -835,6 +836,7 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
                 pattern: metadata_path,
                 permission: Permission::READ,
             }]),
+            session: None,
         },
         document_id,
         limits: RoCrateLimits::default(),
@@ -1580,6 +1582,7 @@ fn spec_with_source(
             user_id: fixture.actor.user_id,
             realm_id: fixture.actor.realm_id,
             path_restrictions: None,
+            session: None,
         },
         source,
         target: ImportRoCrateTarget {

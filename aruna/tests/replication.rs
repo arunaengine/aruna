@@ -111,9 +111,11 @@ struct ReplicationHarness {
 impl ReplicationHarness {
     async fn new(group_name: &str) -> TestResult<Self> {
         let seed = spawn_full_seed_node().await?;
-        let onboarding_secret =
-            create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Local)
-                .await?;
+        let onboarding_secret = create_onboarding_secret_via_http(
+            &seed,
+            aruna_core::onboarding::OnboardingMode::Server,
+        )
+        .await?;
         let joiner = spawn_full_joiner_node(&seed, onboarding_secret).await?;
 
         let seed_s3 = seed
@@ -1065,6 +1067,8 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             max_groups_per_user: Some(3),
             user_group_cap_overrides: Vec::new(),
             max_devices_per_user: None,
+            device_requests_per_minute: None,
+            device_concurrent_pulls: None,
         };
         let quota_response = reqwest::Client::new()
             .put(format!("{}/api/v1/info/realm/quota", harness.seed.base_url))
@@ -1659,6 +1663,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
                     pattern: format!("{group_root}/{bucket}/scoped/**"),
                     permission: Permission::WRITE,
                 }]),
+                session: None,
             },
             bucket.to_string(),
             scoped_key.to_string(),

@@ -9,10 +9,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_OUTPUT_MATCHES,
-    MAX_TRANSFER_BYTES, NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
-    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
-    normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
+    NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput,
+    TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::config::ApptainerConfig;
-use super::logs::{BoundedTail, LogSink};
+use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
 
@@ -433,12 +432,11 @@ impl ExecutorBackend for ApptainerBackend {
         &self,
         context: &FenceContext,
         limits: &LogLimits,
-        sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
         validate_control(self.state.read(context)?, context)?;
         let logs = self.state.attempt_dir(context).join("logs");
-        let stdout = read_log(&logs.join("stdout"), LogStream::Stdout, limits, sink).await?;
-        let stderr = read_log(&logs.join("stderr"), LogStream::Stderr, limits, sink).await?;
+        let stdout = read_log(&logs.join("stdout"), limits).await?;
+        let stderr = read_log(&logs.join("stderr"), limits).await?;
         Ok(LogTails {
             stdout: stdout.0,
             stderr: stderr.0,
@@ -944,12 +942,7 @@ fn repository_name(image: &str) -> &str {
     }
 }
 
-async fn read_log(
-    path: &Path,
-    stream: LogStream,
-    limits: &LogLimits,
-    sink: &dyn LogSink,
-) -> Result<(Vec<u8>, u64, bool), BackendError> {
+async fn read_log(path: &Path, limits: &LogLimits) -> Result<(Vec<u8>, u64, bool), BackendError> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -964,7 +957,6 @@ async fn read_log(
         if count == 0 {
             break;
         }
-        sink.write(stream, &buffer[..count]);
         tail.push(&buffer[..count]);
     }
     let total = tail.total();

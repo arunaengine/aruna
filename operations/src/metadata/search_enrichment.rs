@@ -6,8 +6,12 @@ const SCHEMA_NAME: &str = "http://schema.org/name";
 const SCHEMA_DESCRIPTION: &str = "http://schema.org/description";
 const SCHEMA_KEYWORDS: &str = "http://schema.org/keywords";
 const SCHEMA_IDENTIFIER: &str = "http://schema.org/identifier";
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 const SNIPPET_MAX_LEN: usize = 160;
+// Entities carry a handful of types; the cap keeps a pathological subject from
+// inflating a page.
+const HIT_TYPE_MAX: usize = 8;
 
 /// Human-readable title for a search hit. Always returns a non-empty string,
 /// falling back through the schema name, the document path or subject IRI.
@@ -35,6 +39,20 @@ pub(crate) fn hit_title(
         return subject_iri.to_string();
     }
     document_path.to_string()
+}
+
+/// The matched subject's `rdf:type` IRIs, in describe order and capped at
+/// [`HIT_TYPE_MAX`]. Empty when the subject carries no named type.
+pub(crate) fn hit_types(properties: &[(String, Term)]) -> Vec<String> {
+    properties
+        .iter()
+        .filter(|(property, _)| property == RDF_TYPE)
+        .filter_map(|(_, object)| match object {
+            Term::NamedNode(node) => Some(node.as_str().to_string()),
+            _ => None,
+        })
+        .take(HIT_TYPE_MAX)
+        .collect()
 }
 
 /// Query-relevant snippet windowed around the first matching token, or a prefix
@@ -221,6 +239,38 @@ mod tests {
     fn title_is_never_empty() {
         assert_eq!(hit_title(&[], "", ""), "");
         assert_eq!(hit_title(&[], "datasets/x", ""), "datasets/x");
+    }
+
+    #[test]
+    fn types_list_named_rdf_types() {
+        // A file entity must be distinguishable from the dataset it belongs to.
+        let properties = vec![
+            named(RDF_TYPE, "http://schema.org/MediaObject"),
+            named(RDF_TYPE, "http://schema.org/File"),
+            literal(SCHEMA_NAME, "reef_survey_2026.csv"),
+        ];
+        assert_eq!(
+            hit_types(&properties),
+            vec![
+                "http://schema.org/MediaObject".to_string(),
+                "http://schema.org/File".to_string(),
+            ]
+        );
+        assert_eq!(
+            hit_types(&[named(RDF_TYPE, "http://schema.org/Dataset")]),
+            vec!["http://schema.org/Dataset".to_string()]
+        );
+    }
+
+    #[test]
+    fn types_skip_literals_and_cap() {
+        let properties = vec![literal(RDF_TYPE, "Dataset"), literal(SCHEMA_NAME, "x")];
+        assert!(hit_types(&properties).is_empty());
+
+        let many = (0..HIT_TYPE_MAX + 3)
+            .map(|index| named(RDF_TYPE, &format!("http://example.org/T{index}")))
+            .collect::<Vec<_>>();
+        assert_eq!(hit_types(&many).len(), HIT_TYPE_MAX);
     }
 
     #[test]

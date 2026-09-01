@@ -219,9 +219,7 @@ impl SetRealmPoliciesOperation {
             self.config.actor.node_id,
             document_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(admin_event),
-            },
+            DocumentSyncOutboxEvent::admin(admin_event),
             placement,
             false,
         );
@@ -467,6 +465,7 @@ mod tests {
             user_id: actor.user_id,
             realm_id: actor.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

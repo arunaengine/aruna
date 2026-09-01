@@ -251,6 +251,8 @@ mod tests {
                 user_id,
                 realm_id,
                 node_capabilities: capabilities,
+
+                session: None,
             })
             .unwrap(),
             &ctx,
@@ -265,6 +267,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         })
     }
 
@@ -358,7 +361,7 @@ mod tests {
             ctx.clone(),
             realm_id,
             state.get_node_id(),
-            NodeCapabilities::local_node(realm_id).unwrap(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
             JobsRuntime::new(),
@@ -459,6 +462,7 @@ mod tests {
                 pattern: format!("/{realm_id}/g/**"),
                 permission: Permission::READ,
             }]),
+            session: None,
         });
 
         let error = revoke_token(
@@ -517,6 +521,8 @@ mod tests {
                 user_id: foreign_user,
                 realm_id: foreign_realm_id,
                 node_capabilities: foreign_capabilities,
+
+                session: None,
             })
             .unwrap(),
             &state.get_ctx(),
@@ -579,7 +585,7 @@ mod tests {
             state.get_ctx(),
             realm_id,
             state.get_node_id(),
-            NodeCapabilities::local_node(realm_id).unwrap(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
             JobsRuntime::new(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast contract test for the six public Just recipes. It never starts a real
+# Fast contract test for the seven public Just recipes. It never starts a real
 # service: stub binaries and fake prerequisite commands cover every path.
 set -uo pipefail
 
@@ -111,7 +111,11 @@ fi
 printf 'test-token\n'
 STUB
   printf '#!/usr/bin/env bash\nexit 0\n' >"$STUB_DIR/aruna"
-  printf '#!/usr/bin/env bash\nsleep 300\n' >"$STUB_DIR/aruna-alive"
+  # exec, so stopping the stub leaves no sleep behind.
+  printf '#!/usr/bin/env bash\nexec sleep 300\n' >"$STUB_DIR/aruna-alive"
+  # A node the stop script can see and stop: it keeps its own name as comm,
+  # which an env shebang would replace with bash, and leaves on SIGTERM.
+  printf '#!/bin/bash\ntrap "exit 0" TERM\nwhile :; do sleep 1; done\n' >"$STUB_DIR/aruna-node"
   chmod +x "$FAKE_BIN"/* "$STUB_DIR"/*
 }
 
@@ -189,15 +193,15 @@ test_recipe_list() {
       | sort \
       | tr '\n' ' '
   )"
-  check_eq "recipe list is exactly the six public recipes" \
-    "local local-cluster local-cluster-oidc local-new preview preview-no-oidc " "$names"
+  check_eq "recipe list is exactly the seven public recipes" \
+    "local local-cluster local-cluster-oidc local-new preview preview-no-oidc stop " "$names"
 }
 
 test_dry_runs() {
   local recipe
   local output
 
-  for recipe in local local-new local-cluster local-cluster-oidc preview preview-no-oidc; do
+  for recipe in local local-new local-cluster local-cluster-oidc preview preview-no-oidc stop; do
     if output="$(cd "$ROOT_DIR" && just --dry-run "$recipe" 2>&1)"; then
       pass "dry run of $recipe"
     else
@@ -218,6 +222,8 @@ test_dry_runs() {
   check_has "preview keeps keycloak" "$output" "--with-keycloak"
   output="$(cd "$ROOT_DIR" && just --dry-run preview-no-oidc 2>&1)"
   check_lacks "preview-no-oidc omits keycloak" "$output" "--with-keycloak"
+  output="$(cd "$ROOT_DIR" && just --dry-run stop 2>&1)"
+  check_has "stop runs the stop script" "$output" "bash scripts/local_cluster_stop.sh"
 }
 
 test_help_text() {
@@ -236,6 +242,56 @@ test_help_text() {
   check_has "cluster help documents --auto-portal-dir" "$output" "--auto-portal-dir"
   check_has "cluster help documents ops readiness" "$output" "/readyz"
   check_has "cluster help documents the deployment root" "$output" "ARUNA_TEST_DEPLOY_ROOT"
+  check_has "cluster help names the stop recipe" "$output" "just stop"
+
+  output="$(bash "$ROOT_DIR/scripts/local_cluster_stop.sh" --help 2>&1)"
+  check_has "stop help names the real script" "$output" "bash scripts/local_cluster_stop.sh"
+  check_has "stop help documents the deployment root" "$output" "ARUNA_TEST_DEPLOY_ROOT"
+  output="$(bash "$ROOT_DIR/scripts/local_cluster_stop.sh" --bogus 2>&1 || true)"
+  check_has "unknown stop argument is rejected" "$output" "unknown argument: --bogus"
+}
+
+test_stop_recipe() {
+  # A node named by its pid file is stopped, a foreign pid and a dead one are
+  # left alone, and Keycloak is taken down even when no node was running.
+  local output
+  local node_pid
+  local foreign_pid
+
+  rm -rf "$DEPLOY_ROOT"
+  mkdir -p "$DEPLOY_ROOT/node-1" "$DEPLOY_ROOT/node-2" "$DEPLOY_ROOT/node-3"
+  "$STUB_DIR/aruna-node" &
+  node_pid=$!
+  sleep 300 &
+  foreign_pid=$!
+  printf '%s\n' "$node_pid" >"$DEPLOY_ROOT/node-1/node-1.pid"
+  printf '%s\n' "$foreign_pid" >"$DEPLOY_ROOT/node-2/node-2.pid"
+  printf '%s\n' 2147483000 >"$DEPLOY_ROOT/node-3/node-3.pid"
+  : >"$DOCKER_LOG"
+
+  output="$(cd "$ROOT_DIR" && PATH="$FAKE_BIN:$PATH" DOCKER_LOG="$DOCKER_LOG" \
+    ARUNA_TEST_DEPLOY_ROOT="$DEPLOY_ROOT" ARUNA_TEST_DEPLOY_STOP_TIMEOUT_SECS=5 just stop 2>&1)"
+
+  if kill -0 "$node_pid" 2>/dev/null; then
+    fail "stop ends the node named by its pid file" "$output"
+    kill "$node_pid" 2>/dev/null || true
+  else
+    pass "stop ends the node named by its pid file"
+  fi
+  check_lacks "stop drops the pid file of a stopped node" "$(ls "$DEPLOY_ROOT/node-1")" "node-1.pid"
+  if kill -0 "$foreign_pid" 2>/dev/null; then
+    pass "stop leaves a reused pid alone"
+  else
+    fail "stop leaves a reused pid alone" "$output"
+  fi
+  kill "$foreign_pid" 2>/dev/null || true
+  check_has "stop names a reused pid" "$output" "not to a node"
+  check_has "stop reports a dead node" "$output" "already gone"
+  check_has "stop takes keycloak down" "$(cat "$DOCKER_LOG")" \
+    "compose --project-name aruna-test-deploy-oidc"
+  check_has "stop removes the keycloak volumes" "$(cat "$DOCKER_LOG")" "down --volumes"
+  wait "$node_pid" 2>/dev/null || true
+  wait "$foreign_pid" 2>/dev/null || true
 }
 
 test_input_rejection() {
@@ -341,6 +397,15 @@ test_argument_flow() {
   output="$(run_recipe preview-no-oidc "$PORTAL_FIXTURE" 2)"
   check_has "a portal path with spaces survives positionally" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
     "PORTAL_DIR='$PORTAL_FIXTURE'"
+
+  # Just hands named values over by position, so the swapped order arrives as
+  # --node-count portal_dir=P --portal-dir nodes=2 and must mean the same.
+  output="$(PORTAL_ARTIFACT_URL="http://127.0.0.1:1/portal.tar.gz" \
+    run_recipe preview-no-oidc nodes=2 "portal_dir=$PORTAL_FIXTURE")"
+  check_eq "swapped named values keep the node count" "2" "$(node_dir_count)"
+  check_lacks "swapped named values never download" "$(cat "$DOCTOR_LOG")" "portal update"
+  check_has "swapped named values reach the node env" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
+    "PORTAL_DIR='$PORTAL_FIXTURE'"
 }
 
 test_readiness_contract() {
@@ -413,6 +478,7 @@ mkdir -p "$COMPOSE_DATA_DIR"
 test_recipe_list
 test_dry_runs
 test_help_text
+test_stop_recipe
 test_input_rejection
 test_cleanup_guards
 test_preflight_paths

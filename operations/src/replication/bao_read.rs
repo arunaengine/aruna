@@ -1,5 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 
+use crate::connectors::resolver::{
+    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
+};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -8,15 +11,15 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFunctions};
+use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-    HashPathIndexKey, ManagedCopyKey, NodePlacementEntry, Permission, PlacementPolicyRef,
-    PlacementSubject, RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn,
-    blob_object_permission_path, storage_subject,
+    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
+    GroupAuthorizationDocument, HashPathIndexKey, ManagedCopyKey, NodePlacementEntry, Permission,
+    PlacementPolicyRef, PlacementSubject, RealmConfigDocument, RealmId, ResolvedSourceAccess,
+    VersionKey, VersionedObjectArn, blob_object_permission_path, storage_subject,
 };
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use bytes::Bytes;
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -34,6 +37,7 @@ use crate::placement_policy::{
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::mutate_realm_placement::node_kind;
 use crate::realm_peer::ensure_realm_peer;
 use crate::request_policy::{PolicyRequestExtras, policy_request_with};
 
@@ -75,6 +79,10 @@ pub enum BaoReadError {
     /// transition, so nothing governed may land here.
     #[error("this node is not a legal destination for governed data")]
     NoDestination,
+    /// A User node is never a governed destination, so policy-covered content
+    /// cannot be read here at all. Terminal and honest: retrying cannot help.
+    #[error("governed content is not available on a user node")]
+    GovernedUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,6 +318,9 @@ pub async fn managed_read(
     node_id: NodeId,
     mut request: BaoReadRequest,
 ) -> Result<BaoReadOutput, BaoReadError> {
+    if local_is_user(context, request.realm_id).await {
+        return device_read(context, node_id, request).await;
+    }
     // An admission stop is not decided here: `write_gate` below refuses once
     // the source has taught the refs that make this read a governed one.
     let destination = match gate_context(context, request.realm_id, now_ms()).await {
@@ -340,6 +351,56 @@ pub async fn managed_read(
     Err(BaoReadError::PolicyRequired { refs: taught })
 }
 
+/// One attempt with no destination at all. A device never admits governed data,
+/// so the challenge has no answer it could give: teaching it rules would only
+/// dress a refusal up as a negotiation.
+async fn device_read(
+    context: &DriverContext,
+    node_id: NodeId,
+    mut request: BaoReadRequest,
+) -> Result<BaoReadOutput, BaoReadError> {
+    request.destination = None;
+    device_answer(drive(BaoReadOperation::new(node_id, request), context).await)
+}
+
+/// Every placement answer is terminal here: a device can neither resolve a rule
+/// nor become a destination, so a retry would only repeat the same refusal.
+fn device_answer(
+    result: Result<BaoReadOutput, BaoReadError>,
+) -> Result<BaoReadOutput, BaoReadError> {
+    match result {
+        Err(BaoReadError::PolicyRequired { .. })
+        | Err(BaoReadError::PolicyDenied { .. })
+        | Err(BaoReadError::NoDestination)
+        | Err(BaoReadError::Gate(_)) => Err(BaoReadError::GovernedUnavailable),
+        other => other,
+    }
+}
+
+/// Whether this realm records the local node as an owner-bound User node.
+pub(crate) async fn local_is_user(context: &DriverContext, realm_id: RealmId) -> bool {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return false;
+    };
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = event
+    else {
+        return false;
+    };
+    RealmConfigDocument::from_bytes(&value).is_ok_and(|document| {
+        node_kind(&document, net_handle.node_id()).is_some_and(|kind| kind.owner().is_some())
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IncomingBaoReadResult {
     Served,
@@ -354,6 +415,7 @@ enum IncomingBaoReadState {
     ReadRealm,
     ReadExactVersion,
     ReadExactBucket,
+    ResolveSource,
     ReadPolicy,
     CheckPermission,
     ReadHashVersion,
@@ -411,6 +473,18 @@ pub struct IncomingBaoReadOperation {
     /// The requesting peer's placement as this realm records it. The challenge
     /// is decided against it, never against the subject the peer asserts.
     peer_placement: Option<NodePlacementEntry>,
+    /// The owner this node is bound to, when it is a device. A device holds one
+    /// person's files and never receives the group policy documents the realm
+    /// check needs, so its observations are served under the owner binding.
+    local_owner: Option<UserId>,
+    /// Whether the requesting peer is a sync-eligible realm node.
+    peer_is_infra: bool,
+    policy_allowed: bool,
+    /// The staging source an observation is served from, with the identity it
+    /// was observed under.
+    source_access: Option<ResolvedSourceAccess>,
+    source_size: Option<u64>,
+    source_fingerprint: Option<String>,
     now_ms: u64,
 }
 
@@ -451,6 +525,12 @@ impl IncomingBaoReadOperation {
             pending_location: None,
             gate: None,
             peer_placement: None,
+            local_owner: None,
+            peer_is_infra: false,
+            policy_allowed: false,
+            source_access: None,
+            source_size: None,
+            source_fingerprint: None,
             now_ms: 0,
         }
     }
@@ -560,8 +640,13 @@ impl IncomingBaoReadOperation {
         let Some(next) = self.policy_next else {
             return self.fail(BaoReadError::NotFinished);
         };
+        self.policy_allowed = allowed;
         if !allowed {
             return match next {
+                // A device never receives the group's policy documents, so this
+                // check cannot pass there. Its own observations are served under
+                // the owner binding instead, and to nobody else.
+                PolicyNext::Exact if self.serves_own_data() => self.read_exact_version(),
                 PolicyNext::Exact => self.send_refusal(BaoReadRefusal::ReadDenied),
                 PolicyNext::Hash => {
                     self.had_denial = true;
@@ -620,7 +705,7 @@ impl IncomingBaoReadOperation {
         let request = policy_request_with(
             path,
             &Permission::READ,
-            Some(&self.request.auth_context.user_id),
+            Some(&self.request.auth_context),
             PolicyRequestExtras::operation("s3.GetObject"),
         );
         let realm_set = match CompiledPolicySet::compile(&realm.request_policies) {
@@ -631,13 +716,8 @@ impl IncomingBaoReadOperation {
             Ok(set) => set,
             Err(_) => return self.continue_policy(false),
         };
-        self.policy_current = matches!(
-            realm_set.evaluate(&request, &PolicyFunctions::default()),
-            PolicyDecision::Allowed
-        ) && matches!(
-            group_set.evaluate(&request, &PolicyFunctions::default()),
-            PolicyDecision::Allowed
-        );
+        self.policy_current = matches!(realm_set.evaluate(&request), PolicyDecision::Allowed)
+            && matches!(group_set.evaluate(&request), PolicyDecision::Allowed);
         let Some(txn_id) = self.txn_id else {
             return self.continue_policy(self.policy_current);
         };
@@ -786,6 +866,7 @@ impl IncomingBaoReadOperation {
             IncomingBaoReadState::ReadRealm => "read_realm",
             IncomingBaoReadState::ReadExactVersion => "read_exact_version",
             IncomingBaoReadState::ReadExactBucket => "read_exact_bucket",
+            IncomingBaoReadState::ResolveSource => "resolve_source",
             IncomingBaoReadState::ReadPolicy => "read_policy",
             IncomingBaoReadState::CheckPermission => "check_permission",
             IncomingBaoReadState::ReadHashVersion => "read_hash_version",
@@ -804,6 +885,25 @@ impl IncomingBaoReadOperation {
         }
     }
 
+    /// Who this serve runs as. A User peer is owner-bound: it is admitted as a
+    /// realm member without internal trust, and the auth context is forced to
+    /// the owner its realm config names, so a device cannot read as anyone else
+    /// (D12). Every other kind keeps the internal-trust gate unchanged.
+    fn admit_peer(&mut self, document: &RealmConfigDocument) -> Option<BaoReadRefusal> {
+        let owner = node_kind(document, self.peer).and_then(|kind| kind.owner());
+        let internal_trust = owner.is_none();
+        if ensure_realm_peer(document, self.peer, self.request.realm_id, internal_trust).is_err() {
+            return Some(BaoReadRefusal::RealmPeerDenied);
+        }
+        if let Some(owner) = owner {
+            if self.request.auth_context.user_id != owner {
+                return Some(BaoReadRefusal::ReadDenied);
+            }
+            self.request.auth_context.user_id = owner;
+        }
+        None
+    }
+
     fn handle_realm(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected(event);
@@ -815,9 +915,13 @@ impl IncomingBaoReadOperation {
             Ok(document) => document,
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
-        if ensure_realm_peer(&document, self.peer, self.request.realm_id, true).is_err() {
-            return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
+        if let Some(refusal) = self.admit_peer(&document) {
+            return self.send_refusal(refusal);
         }
+        self.local_owner = node_kind(&document, self.local_node).and_then(|kind| kind.owner());
+        self.peer_is_infra = document
+            .sync_eligible_node_ids()
+            .is_ok_and(|ids| ids.contains(&self.peer));
         self.peer_placement = document.placement_entry(self.peer).cloned();
         match &self.request.target {
             BaoReadTarget::ExactVersion(target) => {
@@ -854,9 +958,15 @@ impl IncomingBaoReadOperation {
             Ok(version) => version,
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
+        self.version_refs = version.placement_policies.clone();
         let Some(blob_hash) = version.blob_hash().copied() else {
-            return self.send_refusal(BaoReadRefusal::NotFound);
+            return self.serve_observation(version);
         };
+        // A materialized copy is realm data: it is served only when the group's
+        // own policy check passed, exactly as before.
+        if !self.policy_allowed {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
         if self
             .request
             .expected_blake3
@@ -866,11 +976,84 @@ impl IncomingBaoReadOperation {
         }
         self.blob_hash = Some(blob_hash);
         self.location_key = version.location_key();
-        self.version_refs = version.placement_policies.clone();
         self.version_key = self
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.read_location()
+    }
+
+    /// Whether this node may answer out of its own observations at all: only a
+    /// device does, and only for its owner, to a realm node or the owner.
+    fn serves_own_data(&self) -> bool {
+        self.local_owner
+            .is_some_and(|owner| self.peer_is_infra || self.request.auth_context.user_id == owner)
+    }
+
+    /// Serves one version this node never materialized: a device streams the
+    /// owner's own file from the staging source, under the identity the
+    /// requester named and the fingerprint the observation recorded.
+    fn serve_observation(&mut self, version: BlobVersion) -> Effects {
+        // A realm node holds no observations, so it answers as it always did.
+        let Some(owner) = self.local_owner else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        if !(self.peer_is_infra || self.request.auth_context.user_id == owner) {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        let BlobVersionState::Reference {
+            cached_metadata,
+            source,
+            ..
+        } = version.state
+        else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        // A governed reference answers the destination challenge or nothing.
+        if !self.version_refs.is_empty() {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        // A probe would have to echo an identity this node has not verified.
+        if self.request.metadata_only {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        // The requester names the bytes it expects. Serving refuses anything
+        // that does not hash to them, so this node never streams a file under
+        // an identity it has not verified itself.
+        let Some(expected) = self.request.expected_blake3 else {
+            return self.send_refusal(BaoReadRefusal::HashMismatch);
+        };
+        // Without the observed fingerprint the adapter has nothing to re-check.
+        let Some(fingerprint) = cached_metadata.etag.clone() else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        self.blob_hash = Some(expected);
+        self.source_size = Some(cached_metadata.content_length);
+        self.source_fingerprint = Some(fingerprint);
+        self.version_key = self
+            .exact_target()
+            .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
+        self.state = IncomingBaoReadState::ResolveSource;
+        smallvec![resolve_version_source_binding_suboperation(
+            ResolveVersionSourceBindingInput { source },
+        )]
+    }
+
+    /// Announces an observation the same way a materialized copy is announced,
+    /// from the size the observation recorded rather than a blob location.
+    fn accept_observation(&mut self) -> Effects {
+        let (Some(blake3), Some(size)) = (self.blob_hash, self.source_size) else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let payload = match (VersionReplicationMessage::BaoReadAccepted { size, blake3 }).to_bytes()
+        {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = IncomingBaoReadState::SendAccepted;
+        smallvec![Effect::Blob(BlobEffect::SendMessage {
+            stream_id: self.stream_id,
+            payload,
+        })]
     }
 
     fn handle_exact_bucket(&mut self, event: Event) -> Effects {
@@ -1128,6 +1311,18 @@ impl Operation for IncomingBaoReadOperation {
             IncomingBaoReadState::ReadRealm => self.handle_realm(event),
             IncomingBaoReadState::ReadExactVersion => self.handle_exact_version(event),
             IncomingBaoReadState::ReadExactBucket => self.handle_exact_bucket(event),
+            IncomingBaoReadState::ResolveSource => match event {
+                Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                    result: Ok(access),
+                }) => {
+                    self.source_access = Some(access);
+                    self.accept_observation()
+                }
+                Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                    result: Err(_),
+                }) => self.send_refusal(BaoReadRefusal::NotFound),
+                other => self.unexpected(other),
+            },
             IncomingBaoReadState::ReadPolicy => self.handle_policy(event),
             IncomingBaoReadState::CheckPermission => self.handle_permission(event),
             IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
@@ -1153,10 +1348,25 @@ impl Operation for IncomingBaoReadOperation {
                         stream_id: self.stream_id,
                     })];
                 }
-                let Some(location) = self.location.clone() else {
+                let Some(expected_blake3) = self.blob_hash else {
                     return self.fail(BaoReadError::NotFinished);
                 };
-                let Some(expected_blake3) = self.blob_hash else {
+                if let Some(access) = self.source_access.clone() {
+                    let (Some(size), Some(fingerprint)) =
+                        (self.source_size, self.source_fingerprint.clone())
+                    else {
+                        return self.fail(BaoReadError::NotFinished);
+                    };
+                    self.state = IncomingBaoReadState::ServeRead;
+                    return smallvec![Effect::Blob(BlobEffect::ServeSourceRead {
+                        stream_id: self.stream_id,
+                        access,
+                        size,
+                        expected_blake3,
+                        fingerprint,
+                    })];
+                }
+                let Some(location) = self.location.clone() else {
                     return self.fail(BaoReadError::NotFinished);
                 };
                 self.state = IncomingBaoReadState::ServeRead;
@@ -1273,6 +1483,7 @@ mod tests {
                 user_id: UserId::nil(realm_id),
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             realm_id,
             target: BaoReadTarget::ExactVersion(
@@ -1355,6 +1566,158 @@ mod tests {
         };
         let value = location.to_bytes().unwrap().into();
         (location, value)
+    }
+
+    /// One observation of a local directory, as a device records it.
+    fn observation(size: u64, etag: Option<&str>) -> BlobVersion {
+        use aruna_core::structs::{
+            OFFERED_DIRECTORY_BUCKET, PortableSourceDescriptor, SourceConnectorKind,
+            SourceMetadata, StagingStrategy, VersionSourceBinding,
+        };
+        BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::LocalDirectory,
+                    public_config: HashMap::from([(
+                        OFFERED_DIRECTORY_BUCKET.to_string(),
+                        "folder-x".to_string(),
+                    )]),
+                    source_path: "path/file.txt".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: None,
+            },
+            SourceMetadata {
+                content_length: size,
+                content_type: None,
+                etag: etag.map(ToOwned::to_owned),
+                last_modified: None,
+                source_version: None,
+            },
+            SystemTime::UNIX_EPOCH,
+            UserId::nil(test_realm()),
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// A serve on a device, for its own owner, asked by realm infrastructure.
+    fn device_serve(hash: Option<[u8; 32]>) -> IncomingBaoReadOperation {
+        let local_node = node_from_seed(1);
+        let mut request = read_request(local_node, [4u8; 32]);
+        request.expected_blake3 = hash;
+        let mut operation = IncomingBaoReadOperation::new(
+            node_from_seed(2),
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            request,
+        );
+        operation.local_owner = Some(UserId::nil(test_realm()));
+        operation.peer_is_infra = true;
+        operation
+    }
+
+    #[test]
+    fn realm_refuses_observation() {
+        // A realm node holds no observations, so it answers as it always did.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.local_owner = None;
+        let effects = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::NotFound);
+    }
+
+    #[test]
+    fn device_refuses_stranger() {
+        // Neither infrastructure nor the owner: the entry is not even looked up.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.peer_is_infra = false;
+        operation.request.auth_context.user_id = UserId::local(Ulid::from(77u128), test_realm());
+        assert!(!operation.serves_own_data());
+        let effects = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+    }
+
+    #[test]
+    fn device_needs_hash() {
+        // Without a named identity this node would have to invent one.
+        let mut operation = device_serve(None);
+        let effects = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::HashMismatch);
+    }
+
+    #[test]
+    fn device_needs_fingerprint() {
+        // Without the observed fingerprint the adapter cannot re-check anything.
+        let mut operation = device_serve(Some([5u8; 32]));
+        let effects = operation.serve_observation(observation(5, None));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::NotFound);
+    }
+
+    #[test]
+    fn device_refuses_governed() {
+        // A governed reference answers the destination challenge or nothing.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.version_refs = vec![PlacementPolicyRef {
+            policy_id: Ulid::from(3u128),
+            digest: [2u8; 32],
+        }];
+        let effects = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+    }
+
+    #[test]
+    fn device_refuses_probe() {
+        // A metadata probe would echo an identity this node has not verified.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.request.metadata_only = true;
+        let effects = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+    }
+
+    #[test]
+    fn device_serves_file() {
+        let mut operation = device_serve(Some([5u8; 32]));
+        let effects = operation.serve_observation(observation(5, Some("5-1")));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        assert_eq!(operation.source_fingerprint.as_deref(), Some("5-1"));
+    }
+
+    #[test]
+    fn denied_keeps_blob() {
+        // A device may bypass the group check for its own observations, never
+        // for a materialized copy it holds.
+        let mut operation = device_serve(Some([4u8; 32]));
+        operation.policy_allowed = false;
+        let (location, _) = location_value([4u8; 32]);
+        let materialized = BlobVersion::materialized(
+            [4u8; 32],
+            location.backend.clone(),
+            SystemTime::UNIX_EPOCH,
+            UserId::nil(test_realm()),
+            None,
+        );
+        let value: byteview::ByteView = materialized.to_bytes().unwrap().into();
+        let effects = operation.handle_exact_version(Event::Storage(StorageEvent::ReadResult {
+            key: byteview::ByteView::from(vec![0u8]),
+            value: Some(value),
+        }));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+    }
+
+    #[test]
+    fn source_rejects_event() {
+        // An event the resolve state cannot explain must fail, not be ignored.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.state = super::IncomingBaoReadState::ResolveSource;
+        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(BaoReadError::Unexpected { .. })
+        ));
     }
 
     fn refusal_from(effects: &Effects) -> BaoReadRefusal {
@@ -1550,6 +1913,119 @@ mod tests {
         ));
     }
 
+    fn device_realm_value(peer: aruna_core::NodeId, owner: UserId) -> byteview::ByteView {
+        let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
+        config.ensure_node(peer, RealmNodeKind::User { owner });
+        postcard::to_allocvec(&config).unwrap().into()
+    }
+
+    fn device_operation(
+        local_node: aruna_core::NodeId,
+        peer: aruna_core::NodeId,
+        asserted: UserId,
+    ) -> IncomingBaoReadOperation {
+        let mut request = read_request(local_node, [4u8; 32]);
+        request.auth_context.user_id = asserted;
+        IncomingBaoReadOperation::new(peer, local_node, test_realm(), Ulid::from(9u128), request)
+    }
+
+    // A device is a realm member without internal trust: it is admitted, and the
+    // serve is authorized as the owner its realm config names.
+    #[test]
+    fn serves_device_owner() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let owner = UserId::new(Ulid::from(11u128), test_realm());
+        let mut operation = device_operation(local_node, peer, owner);
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(device_realm_value(peer, owner)),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        assert_eq!(operation.request.auth_context.user_id, owner);
+        // A device is never a placement destination, so nothing governed lands.
+        assert_eq!(operation.peer_placement, None);
+    }
+
+    #[test]
+    fn refuses_device_impersonation() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let owner = UserId::new(Ulid::from(11u128), test_realm());
+        let other = UserId::new(Ulid::from(12u128), test_realm());
+        let mut operation = device_operation(local_node, peer, other);
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(device_realm_value(peer, owner)),
+        }));
+
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+    }
+
+    // Governed content stays out of reach: the device claims no subject, so the
+    // destination challenge denies before a byte is offered.
+    #[test]
+    fn refuses_governed_device() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let owner = UserId::new(Ulid::from(11u128), test_realm());
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(21u128),
+            digest: [7u8; 32],
+        };
+        let mut operation = device_operation(local_node, peer, owner);
+        operation.request.known_refs = vec![policy_ref];
+        operation.version_refs = vec![policy_ref];
+        operation.peer_placement = None;
+
+        let (location, _) = location_value([4u8; 32]);
+        let effects = operation.challenge_destination(location);
+
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected a policy frame")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::PlacementPolicyDenied { .. }
+        ));
+    }
+
+    // A device gets one honest, terminal answer for governed content instead of
+    // a negotiation it can never finish.
+    #[test]
+    fn device_answer_terminal() {
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(31u128),
+            digest: [5u8; 32],
+        };
+        for error in [
+            BaoReadError::PolicyRequired {
+                refs: vec![policy_ref],
+            },
+            BaoReadError::PolicyDenied {
+                policy_ids: vec![policy_ref.policy_id],
+            },
+            BaoReadError::NoDestination,
+        ] {
+            assert_eq!(
+                super::device_answer(Err(error)),
+                Err(BaoReadError::GovernedUnavailable)
+            );
+        }
+        assert_eq!(
+            super::device_answer(Err(BaoReadError::Refused(BaoReadRefusal::NotFound))),
+            Err(BaoReadError::Refused(BaoReadRefusal::NotFound))
+        );
+    }
+
     #[test]
     fn rejects_unknown_peer() {
         let local_node = node_from_seed(1);
@@ -1601,29 +2077,6 @@ mod tests {
                 ..
             })] if *read_txn == txn_id
         ));
-    }
-
-    #[test]
-    fn rejects_user_peer() {
-        let local_node = node_from_seed(1);
-        let peer = node_from_seed(2);
-        let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
-        config.ensure_node(peer, RealmNodeKind::User);
-        let mut operation = IncomingBaoReadOperation::new(
-            peer,
-            local_node,
-            test_realm(),
-            Ulid::from(9u128),
-            read_request(local_node, [4u8; 32]),
-        );
-
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(postcard::to_allocvec(&config).unwrap().into()),
-        }));
-
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);
     }
 
     #[test]

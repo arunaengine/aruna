@@ -447,6 +447,8 @@ mod tests {
             iat,
             exp,
             jti: "token-id".to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

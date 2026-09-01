@@ -248,6 +248,7 @@ mod tests {
             user_id: user(realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         })
     }
 

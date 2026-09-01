@@ -154,6 +154,7 @@ impl AddRealmRoleOperation {
             user_id: self.input.actor.user_id,
             realm_id: self.input.actor.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -320,9 +321,7 @@ impl AddRealmRoleOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
                 aruna_core::structs::PlacementRef::NIL,
@@ -988,7 +987,7 @@ pub mod test {
                     record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
                         && matches!(
                             &record.event,
-                            DocumentSyncOutboxEvent::AdminOperation { event }
+                            DocumentSyncOutboxEvent::AdminOperation { event, .. }
                                 if event.target == target
                                     && matches!(
                                         &event.op,

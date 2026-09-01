@@ -102,7 +102,10 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         | BlobEffect::ServeRead { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ReleaseReservation { .. } => {}
         BlobEffect::DeleteHidden { key } => push(&mut ids, &key.backend),
-        BlobEffect::SpoolHidden { .. }
+        // An observation is served straight from the owner's filesystem, so it
+        // claims no tenant backend at all.
+        BlobEffect::ServeSourceRead { .. }
+        | BlobEffect::SpoolHidden { .. }
         | BlobEffect::ListHidden { .. }
         | BlobEffect::OpenConnection { .. }
         | BlobEffect::SendMessage { .. }

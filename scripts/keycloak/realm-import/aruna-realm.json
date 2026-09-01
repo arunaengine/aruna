@@ -20,7 +20,8 @@
       "serviceAccountsEnabled": false,
       "protocol": "openid-connect",
       "redirectUris": [
-        "*"
+        "*",
+        "aruna://auth/callback"
       ],
       "webOrigins": [
         "*"

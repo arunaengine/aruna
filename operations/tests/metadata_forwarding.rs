@@ -16,6 +16,7 @@ use aruna_core::document::{
     DocumentSyncTarget,
 };
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -33,20 +34,30 @@ use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_forward_document, mint_local_document,
 };
+use aruna_operations::device::drain::{DrainOutcome, drain_intake};
+use aruna_operations::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
+use aruna_operations::device::inspect_draft::InspectDraftOperation;
+use aruna_operations::device::repository::{
+    INTAKE_PAGE_SIZE, IntakeEntry, IntakeState, intake_entry,
+};
 use aruna_operations::document_sync_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, forward_token_revoke,
-    update_metadata_document_routed,
+    ForwardGroupError, MetadataWriteError, create_metadata_document_routed, forward_group_create,
+    forward_token_revoke, update_metadata_document_routed,
 };
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
-use aruna_operations::set_realm_policies::{SetRealmPoliciesConfig, SetRealmPoliciesOperation};
+use aruna_operations::set_realm_policies::{
+    SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
+};
 use aruna_operations::task_incoming::{OutboxDrainer, initialize_task_incoming};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -130,6 +141,159 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A draft queued on a device publishes when the drain runs.
+///
+/// The drain forwards with an internal token: the device vouches for its own
+/// owner instead of holding the owner's bearer credential. The holder admits
+/// that token only from an owner-bound peer whose configured owner is the user
+/// it vouches for, so this is the end-to-end proof of that gate as well as of
+/// the intake lifecycle.
+#[tokio::test]
+async fn device_drain_publishes() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let group_id = seed_group(&realm, &nodes).await?;
+
+    let entry = IntakeEntry::new(
+        Ulid::generate(),
+        realm.user_id,
+        group_id,
+        "datasets/forwarded".to_string(),
+        true,
+        draft_crate(),
+    );
+    drive(
+        EnqueueDraftOperation::new(EnqueueDraftInput {
+            entry: entry.clone(),
+        }),
+        user_node.context.as_ref(),
+    )
+    .await?;
+
+    assert_eq!(drain_intake(&user_node.context).await, DrainOutcome::More);
+
+    let drained = drive(
+        InspectDraftOperation::new(entry.draft_id),
+        user_node.context.as_ref(),
+    )
+    .await?;
+    let IntakeState::Published { document_id } = drained.state else {
+        return Err(format!("the queued draft did not publish: {:?}", drained.state).into());
+    };
+
+    let record = first_record(&nodes, document_id).await?;
+    assert_eq!(record.group_id, group_id);
+    let holders = resolve_shard_holders(&config, &record.placement);
+    assert!(!holders.contains(&user_node.net.node_id()));
+    wait_for_record_on_holders(&nodes, &holders, document_id).await?;
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+/// Terminal entries at the head of the queue must not starve the pending tail.
+///
+/// The scan pages, so a queue whose whole first page is published or parked
+/// still reaches the drafts behind it.
+#[tokio::test]
+async fn drains_past_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let group_id = seed_group(&realm, &nodes).await?;
+
+    let mut pending = Vec::new();
+    for index in 0..(INTAKE_PAGE_SIZE + 6) {
+        let mut entry = IntakeEntry::new(
+            Ulid::generate(),
+            realm.user_id,
+            group_id,
+            format!("datasets/queued-{index}"),
+            true,
+            draft_crate(),
+        );
+        if index <= INTAKE_PAGE_SIZE {
+            entry.state = IntakeState::Published {
+                document_id: Ulid::generate(),
+            };
+        } else {
+            pending.push(entry.draft_id);
+        }
+        let (key_space, key, value) = intake_entry(&entry)?;
+        write(user_node, &key_space, key.to_vec(), value.to_vec()).await?;
+    }
+    assert_eq!(pending.len(), 5);
+
+    assert_eq!(drain_intake(&user_node.context).await, DrainOutcome::More);
+
+    // A forward whose outcome was ambiguous is retried after a backoff, so the
+    // tail converges over passes. A scan that never paged reaches no draft
+    // behind the first page in any number of them.
+    wait_for_convergence("a draft behind the first page did not publish", || async {
+        drain_intake(&user_node.context).await;
+        let mut unpublished = 0;
+        for draft_id in &pending {
+            let drained = drive(
+                InspectDraftOperation::new(*draft_id),
+                user_node.context.as_ref(),
+            )
+            .await?;
+            if !matches!(drained.state, IntakeState::Published { .. }) {
+                unpublished += 1;
+            }
+        }
+        Ok::<usize, Box<dyn std::error::Error>>(unpublished)
+    })
+    .await?;
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+/// The smallest RO-Crate a create accepts, as the desktop would author it: the
+/// realm document id is minted at drain time, so the root is a local urn.
+fn draft_crate() -> String {
+    serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "urn:dataset:draft"}
+            },
+            {
+                "@id": "urn:dataset:draft",
+                "@type": "Dataset",
+                "name": "Queued Draft",
+                "description": "Authored while the realm was unreachable",
+                "datePublished": "2026-01-01",
+                "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+            }
+        ]
+    })
+    .to_string()
+}
+
+async fn first_record(
+    nodes: &[TestNode],
+    document_id: Ulid,
+) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        for node in nodes.iter().filter(|node| node.sync_eligible) {
+            if let Some(record) = registry_record(node, document_id).await? {
+                return Ok(record);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("the drained create never reached a holder".into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     let realm = Realm::new();
@@ -168,6 +332,74 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert!(!user_config.token_revoked(&hash, unix_timestamp_secs()));
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
+    // A device never originates a realm administrative event: the ingress it
+    // forwards to creates the group as itself, with the device owner as actor,
+    // and the group converges to every sync-eligible node.
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+
+    let (group, authorization) = forward_group_create(
+        &user_node.context,
+        realm.realm_id,
+        realm.bearer_token(),
+        "Device Group".to_string(),
+    )
+    .await?;
+    assert_eq!(group.owner, realm.user_id);
+    assert_eq!(group.realm_id, realm.realm_id);
+    assert_eq!(authorization.group_id, group.group_id);
+    wait_for_convergence("the forwarded group create did not converge", || async {
+        let mut pending = 0;
+        for node in nodes.iter().filter(|node| node.sync_eligible) {
+            if drive(
+                GetGroupOperation::new(GetGroupConfig {
+                    group_id: group.group_id,
+                }),
+                node.context.as_ref(),
+            )
+            .await
+            .is_err()
+            {
+                pending += 1;
+            }
+        }
+        Ok::<usize, Box<dyn std::error::Error>>(pending)
+    })
+    .await?;
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn foreign_token_refused() -> Result<(), Box<dyn std::error::Error>> {
+    // A device is owner-bound: a valid token for somebody else buys it nothing,
+    // while the same forward with its owner's token succeeds.
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let stranger = UserId::local(Ulid::generate(), realm.realm_id);
+
+    let error = forward_group_create(
+        &user_node.context,
+        realm.realm_id,
+        realm.token_for(stranger),
+        "Stranger Group".to_string(),
+    )
+    .await
+    .expect_err("a device must not forward another user's write");
+    assert!(
+        matches!(error, ForwardGroupError::Api(MetadataApiError::Forbidden)),
+        "unexpected forwarded group create error: {error}"
+    );
 
     shutdown(nodes).await;
     Ok(())
@@ -576,13 +808,21 @@ impl Realm {
     }
 
     fn bearer_token(&self) -> MetadataAuthToken {
+        self.token_for(self.user_id)
+    }
+
+    /// A valid realm token for any subject, which is what a stolen or borrowed
+    /// credential looks like to an ingress.
+    fn token_for(&self, user_id: UserId) -> MetadataAuthToken {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let claims = TokenClaims {
-            sub: self.user_id.to_string(),
+            sub: user_id.to_string(),
             iss: self.realm_id.to_string(),
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -630,6 +870,9 @@ async fn seed_group(realm: &Realm, nodes: &[TestNode]) -> Result<Ulid, Box<dyn s
     Ok(group.group_id)
 }
 
+/// Bounded retries for a realm-config write that lost its transaction.
+const POLICY_WRITE_ATTEMPTS: usize = 16;
+
 async fn set_write_policy(
     realm: &Realm,
     nodes: &[TestNode],
@@ -645,24 +888,41 @@ async fn set_write_policy(
     // Only the sync-eligible nodes are management members, and a realm-config
     // write on any other node is refused before it can diverge.
     for node in nodes.iter().filter(|node| node.sync_eligible) {
-        drive(
-            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
-                actor: Actor {
-                    node_id: node.net.node_id(),
-                    user_id: realm.user_id,
-                    realm_id: realm.realm_id,
-                },
-                auth_context: AuthContext {
-                    user_id: realm.user_id,
-                    realm_id: realm.realm_id,
-                    path_restrictions: None,
-                },
-                policies: vec![policy.clone()],
-                expected_hash: None,
-            }),
-            node.context.as_ref(),
-        )
-        .await?;
+        // Replication writes the same document, and losing that transaction is
+        // the retryable conflict the route reports as 409; the fixture retries
+        // it exactly as a caller would.
+        let mut attempts = 0;
+        loop {
+            let outcome = drive(
+                SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
+                    actor: Actor {
+                        node_id: node.net.node_id(),
+                        user_id: realm.user_id,
+                        realm_id: realm.realm_id,
+                    },
+                    auth_context: AuthContext {
+                        user_id: realm.user_id,
+                        realm_id: realm.realm_id,
+                        path_restrictions: None,
+                        session: None,
+                    },
+                    policies: vec![policy.clone()],
+                    expected_hash: None,
+                }),
+                node.context.as_ref(),
+            )
+            .await;
+            match outcome {
+                Ok(_) => break,
+                Err(SetRealmPoliciesError::StorageError(StorageError::TransactionConflict))
+                    if attempts < POLICY_WRITE_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     Ok(())
 }
@@ -710,6 +970,7 @@ async fn owner_can_write(realm: &Realm, node: &TestNode, path: String) -> bool {
                     user_id: realm.user_id,
                     realm_id: realm.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 path,
                 required_permission: Permission::WRITE,
@@ -904,7 +1165,9 @@ async fn install_realm_config(
         let kind = if node.sync_eligible {
             RealmNodeKind::Management
         } else {
-            RealmNodeKind::User
+            RealmNodeKind::User {
+                owner: realm.user_id,
+            }
         };
         config.ensure_node(node.net.node_id(), kind);
         config.seed_job_control(node.net.node_id(), band as u32);

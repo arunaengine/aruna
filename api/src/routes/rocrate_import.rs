@@ -826,6 +826,7 @@ mod tests {
             user_id: user,
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         })
     }
 
@@ -837,6 +838,7 @@ mod tests {
                 pattern: "/**".to_string(),
                 permission: Permission::READ,
             }]),
+            session: None,
         })
     }
 
@@ -1001,7 +1003,7 @@ mod tests {
                 ctx,
                 realm(),
                 node_id,
-                NodeCapabilities::local_node(realm()).unwrap(),
+                NodeCapabilities::user_node(realm()).unwrap(),
                 false,
                 None,
                 JobsRuntime::new(),
@@ -1089,7 +1091,7 @@ mod tests {
                 ctx,
                 realm(),
                 node_id,
-                NodeCapabilities::local_node(realm()).unwrap(),
+                NodeCapabilities::user_node(realm()).unwrap(),
                 false,
                 None,
                 JobsRuntime::new(),

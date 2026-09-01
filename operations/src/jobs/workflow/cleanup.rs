@@ -247,7 +247,6 @@ mod tests {
 
     use aruna_compute::ExecutorBackend;
     use aruna_compute::ExecutorRegistry;
-    use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
         ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
@@ -335,7 +334,6 @@ mod tests {
             &self,
             _context: &FenceContext,
             _limits: &LogLimits,
-            _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
             Err(BackendError::Unavailable("unused".to_string()))
         }

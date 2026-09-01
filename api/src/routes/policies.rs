@@ -1,10 +1,11 @@
 use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::groups::refuse_group_edit;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyDecision, PolicyFunctions, PolicyKind, PolicyRequest,
-    PolicyTraceEntry, RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
+    CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,
+    RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
@@ -62,7 +63,7 @@ pub struct PolicyBody {
     #[serde(default)]
     pub when: Option<String>,
     /// CEL expression over `path`, `permission`, `user`, `anonymous`,
-    /// `operation`, `params`, `headers`, `body`.
+    /// `operation`, `params`, `headers`, `body`, `request.session`.
     pub expression: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -145,6 +146,9 @@ pub struct DryRunRequest {
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub body: Option<serde_json::Value>,
+    /// Hypothetical session exposed as `request.session`.
+    #[serde(default)]
+    pub session: Option<PolicySessionInput>,
     /// Ad hoc policies to try; when absent the requested scope is evaluated.
     #[serde(default)]
     pub candidate_policies: Option<Vec<PolicyBody>>,
@@ -153,6 +157,14 @@ pub struct DryRunRequest {
     pub scope: Option<String>,
     #[serde(default)]
     pub group_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PolicySessionInput {
+    pub sid: String,
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -412,8 +424,8 @@ pub async fn get_realm_policies(
     summary = "Replace the realm's request policy set",
     description = r#"Replaces the realm's request policy set wholesale with the submitted list.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path, and only a
-management node serves it; every other node answers 403.
+**Authentication**: realm bearer token with WRITE on the realm configuration path. A management
+node serves it, and every other node relays the call to one.
 
 **Behavior**
 - Policies missing from the request are removed, an entry without a `policy_id` is given a fresh
@@ -465,10 +477,11 @@ management node serves it; every other node answers 403.
         ),
         (status = 400, description = "Unknown policy kind, malformed policy or hash, or a set that breaks the size or compile limits", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, the caller may not write the realm configuration, or this is not a management node", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller may not write the realm configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -649,7 +662,7 @@ pub async fn get_group_policies(
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not write this group's configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no authorization document for the group", body = ErrorResponse),
-        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse),
+        (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry, or this node is a device where group changes are made through the realm", body = ErrorResponse),
         (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -662,6 +675,7 @@ pub async fn set_group_policies(
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
+    refuse_group_edit(&state).await?;
     // Request policies live at this boundary; the operation only checks roles.
     require_group_admin(&state, &auth, group_id).await?;
 
@@ -849,11 +863,7 @@ pub async fn validate_policy(
     // Validation compiles caller-supplied CEL; restrict it to policy authors.
     require_config_read(&state, &auth).await?;
     let _ = parse_kind(&request.kind)?;
-    let analysis = analyze_policy_source(
-        request.when.as_deref(),
-        &request.expression,
-        &PolicyFunctions::default(),
-    );
+    let analysis = analyze_policy_source(request.when.as_deref(), &request.expression);
     Ok((
         StatusCode::OK,
         Json(ValidatePolicyResponse {
@@ -887,6 +897,8 @@ scopes each additionally checked as if they were read directly.
   and the first match ends evaluation.
 - An expression that errors or does not return a boolean also denies, so a broken policy fails
   closed.
+- Session-aware policies use `request.session.sid`, `request.session.kind`, and
+  `request.session.label`; absent sessions expose empty values.
 - The response reports whether the request would be denied, which scope and policy decided it, and a
   trace of every policy considered up to that point."#,
     request_body(
@@ -964,11 +976,15 @@ pub async fn dry_run_policy(
         params: request.params.clone().unwrap_or_default(),
         headers: request.headers.clone().unwrap_or_default(),
         body: request.body.clone(),
+        session: request.session.as_ref().map(|session| PolicySession {
+            sid: session.sid.clone(),
+            kind: session.kind.clone(),
+            label: session.label.clone(),
+        }),
     };
 
     let scopes = dry_run_scopes(&state, &auth, &request).await?;
 
-    let functions = PolicyFunctions::default();
     let mut trace = Vec::new();
     let mut response = DryRunResponse {
         denied: false,
@@ -980,7 +996,7 @@ pub async fn dry_run_policy(
     for (label, policies) in scopes {
         let set = CompiledPolicySet::compile(&policies)
             .map_err(|error| ServerError::BadRequestMessage(error.reason))?;
-        let traced = set.evaluate_traced(&policy_request, &functions);
+        let traced = set.evaluate_traced(&policy_request);
         for entry in traced.trace {
             trace.push(ScopedTraceEntry {
                 scope: label.clone(),
@@ -1121,7 +1137,7 @@ mod tests {
                 context,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -1135,6 +1151,7 @@ mod tests {
                 user_id: admin_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             actor,
             realm_id,
@@ -1227,6 +1244,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([77; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let result = set_group_policies(
             State(fx.state.clone()),
@@ -1270,6 +1288,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([78; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let result = validate_policy(
             State(fx.state.clone()),
@@ -1299,6 +1318,7 @@ mod tests {
                 params: None,
                 headers: None,
                 body: None,
+                session: None,
                 candidate_policies: Some(vec![PolicyBody {
                     policy_id: None,
                     name: "dry-run".to_string(),
@@ -1335,6 +1355,7 @@ mod tests {
                 params: None,
                 headers: None,
                 body: None,
+                session: None,
                 candidate_policies: Some(vec![PolicyBody {
                     policy_id: None,
                     name: "huge".to_string(),
@@ -1417,6 +1438,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([77; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let result = set_realm_policies(
             State(fx.state.clone()),

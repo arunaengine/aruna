@@ -13,6 +13,9 @@ pub enum SourceConnectorKind {
     Webdav,
     Ftp,
     ArunaNative,
+    /// A directory the owner offers from their own device. It resolves only on
+    /// that device, against a registration the device stores locally.
+    LocalDirectory,
 }
 
 impl SourceConnectorKind {
@@ -23,6 +26,7 @@ impl SourceConnectorKind {
             Self::Webdav => "webdav",
             Self::Ftp => "ftp",
             Self::ArunaNative => "aruna_native",
+            Self::LocalDirectory => "local_directory",
         }
     }
 }

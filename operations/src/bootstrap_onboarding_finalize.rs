@@ -134,23 +134,27 @@ pub async fn bootstrap_onboarding_finalize(
     .await?;
     let encoded_ticket = ticket.encode()?;
 
-    let onboarding_topics =
-        onboarding_sync_topics(&context, input.realm_id, input.node_id, &ticket).await?;
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(BootstrapOnboardingFinalizeError::NetHandleUnavailable)?;
-    // Shared realm topics may be created here (the issuer is a legitimate
-    // origin for them); shard topics are join-only — their genesis comes from
-    // the shard's rank-0 holder, so the joiner is only added as a member.
-    net_handle
-        .ensure_document_sync_topics(&onboarding_topics.shared, vec![input.node_id])
-        .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
-    let mut all_topics = onboarding_topics.shared;
-    all_topics.extend(onboarding_topics.shard);
-    net_handle
-        .allow_document_sync_peers(&all_topics, vec![input.node_id])
-        .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
+    // A device carries no sync responsibility, so enrolling one must not add it
+    // to any topic every realm node then dials for the rest of its life.
+    if onboarding_node_kind(reserved.mode).is_sync_eligible() {
+        let onboarding_topics =
+            onboarding_sync_topics(&context, input.realm_id, input.node_id, &ticket).await?;
+        let net_handle = context
+            .net_handle
+            .as_ref()
+            .ok_or(BootstrapOnboardingFinalizeError::NetHandleUnavailable)?;
+        // Shared realm topics may be created here (the issuer is a legitimate
+        // origin for them); shard topics are join-only, their genesis comes from
+        // the shard's rank-0 holder, so the joiner is only added as a member.
+        net_handle
+            .ensure_document_sync_topics(&onboarding_topics.shared, vec![input.node_id])
+            .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
+        let mut all_topics = onboarding_topics.shared;
+        all_topics.extend(onboarding_topics.shard);
+        net_handle
+            .allow_document_sync_peers(&all_topics, vec![input.node_id])
+            .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
+    }
 
     let consumed = drive(
         ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
@@ -241,12 +245,6 @@ async fn ensure_realm_node_once(
     mode: OnboardingMode,
     context: &DriverContext,
 ) -> Result<(), EnsureRealmConfigError> {
-    let kind = match mode {
-        OnboardingMode::Management => RealmNodeKind::Management,
-        OnboardingMode::Server => RealmNodeKind::Server,
-        OnboardingMode::Local => RealmNodeKind::Local,
-    };
-
     drive(
         EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
             actor: Actor {
@@ -255,7 +253,7 @@ async fn ensure_realm_node_once(
                 realm_id: input.realm_id,
             },
             target_node_id: input.node_id,
-            target_node_kind: kind,
+            target_node_kind: onboarding_node_kind(mode),
             default_metadata_replication_factor: DEFAULT_METADATA_REPLICATION_FACTOR,
             realm_description: String::new(),
             create_if_missing: false,
@@ -266,6 +264,15 @@ async fn ensure_realm_node_once(
     .await?;
 
     Ok(())
+}
+
+/// Membership kind an enrollment mode grants the joiner.
+fn onboarding_node_kind(mode: OnboardingMode) -> RealmNodeKind {
+    match mode {
+        OnboardingMode::Management => RealmNodeKind::Management,
+        OnboardingMode::Server => RealmNodeKind::Server,
+        OnboardingMode::User { owner } => RealmNodeKind::User { owner },
+    }
 }
 
 fn build_joiner_placement_entry(
@@ -379,7 +386,8 @@ async fn onboarding_sync_topics(
 mod tests {
     use super::{
         BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
-        bootstrap_onboarding_finalize, emit_node_onboarded_notification, onboarding_sync_topics,
+        bootstrap_onboarding_finalize, emit_node_onboarded_notification, onboarding_node_kind,
+        onboarding_sync_topics,
     };
     use crate::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -413,6 +421,25 @@ mod tests {
 
     const LOCAL_NODE_SECRET: [u8; 32] = [4u8; 32];
     const ONBOARDING_SECRET_EXPIRES_AT: u64 = 1_000;
+
+    #[test]
+    fn kind_follows_mode() {
+        // The admitter records the kind the secret was minted for; admitting a
+        // management joiner as a server would 403 it on every config mutation.
+        let owner = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
+        assert_eq!(
+            onboarding_node_kind(OnboardingMode::Management),
+            RealmNodeKind::Management
+        );
+        assert_eq!(
+            onboarding_node_kind(OnboardingMode::Server),
+            RealmNodeKind::Server
+        );
+        assert_eq!(
+            onboarding_node_kind(OnboardingMode::User { owner }),
+            RealmNodeKind::User { owner }
+        );
+    }
 
     struct FinalizeFixture {
         _tempdir: TempDir,
@@ -775,6 +802,68 @@ mod tests {
             .unwrap()
             .expect("issuer node-info topic admitted during finalize");
         assert!(state.members.contains(&irokle::PeerId::from_bytes(
+            *fixture.joiner_node_id.as_bytes()
+        )));
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn device_skips_topics() {
+        // A User-kind joiner is not sync eligible, so finalize must neither
+        // create a shared realm topic for it nor admit it to one.
+        let fixture = setup_finalize_fixture().await;
+        let (context, net_handle) = context_with_net(&fixture).await;
+        let owner = UserId::local(Ulid::generate(), fixture.realm_id);
+        let device_enrollment = Ulid::generate();
+        drive(
+            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+                record: OnboardingSecretRecord {
+                    enrollment_id: device_enrollment,
+                    secret_hash: "device".to_string(),
+                    mode: OnboardingMode::User { owner },
+                    purpose: OnboardingPurpose::NodeEnrollment,
+                    expires_at: ONBOARDING_SECRET_EXPIRES_AT,
+                    claimed_node_id: None,
+                },
+            }),
+            context.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let mut device_input = finalize_input(&fixture, fixture.joiner_node_id, 10);
+        device_input.enrollment_id = device_enrollment;
+        device_input.secret_hash = "device".to_string();
+        let device = bootstrap_onboarding_finalize(device_input, context.clone())
+            .await
+            .unwrap();
+        assert_eq!(device.mode, OnboardingMode::User { owner });
+
+        let shared_topic = DocumentSyncTarget::NodeInfo {
+            realm_id: fixture.realm_id,
+            node_id: fixture.local_node_id,
+        }
+        .sync_topic_id(fixture.realm_id, &aruna_core::structs::PlacementRef::NIL);
+        let storage = net_handle.document_sync_node().storage().clone();
+        assert!(storage.topic_state(&shared_topic).unwrap().is_none());
+
+        let server_node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let server =
+            bootstrap_onboarding_finalize(finalize_input(&fixture, server_node_id, 10), context)
+                .await
+                .unwrap();
+        assert_eq!(server.mode, OnboardingMode::Server);
+        let state = storage
+            .topic_state(&shared_topic)
+            .unwrap()
+            .expect("a server joiner still gets the shared topics");
+        assert!(
+            state
+                .members
+                .contains(&irokle::PeerId::from_bytes(*server_node_id.as_bytes()))
+        );
+        assert!(!state.members.contains(&irokle::PeerId::from_bytes(
             *fixture.joiner_node_id.as_bytes()
         )));
 

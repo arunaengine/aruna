@@ -32,6 +32,7 @@ HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) 
 WITH_KEYCLOAK=0
 AUTO_PORTAL_DIR=0
 AUTO_PORTAL_DOWNLOAD=0
+INTERRUPTED=0
 PIDS=()
 NODE_NAMES=()
 NODE_DIRS=()
@@ -62,6 +63,8 @@ Usage: bash scripts/local_cluster_deploy.sh [--with-keycloak] [--node-count N] [
 
 Behavior:
   default          Build the workspace in release mode and launch 3 local Aruna nodes.
+                   Ctrl-C, SIGTERM or a closed terminal stop them again; a deployment
+                   left behind is stopped with scripts/local_cluster_stop.sh (just stop).
   --with-keycloak  Start a local Keycloak instance and configure every node for OIDC.
   --node-count N   Launch N total Aruna nodes. Defaults to 3. Also --node-count=N.
   --portal-dir P   Serve the portal dist at P on every node's own portal port,
@@ -74,8 +77,8 @@ Behavior:
   --help, -h       Print this help and exit.
 
   Values may arrive in the Just parameter form, so --node-count nodes=2 and
-  --portal-dir portal_dir=P are accepted, and --portal-dir nodes=2 sets the
-  node count that `just preview nodes=2` intends.
+  --portal-dir portal_dir=P are accepted, and each flag also takes the other's
+  named value: `just preview nodes=2 portal_dir=P` hands them over swapped.
 
 Readiness:
   Every node is awaited on /readyz on its generated ops port. A 503 keeps
@@ -151,6 +154,15 @@ apply_portal_value() {
   esac
 }
 
+apply_node_value() {
+  local value=$1
+
+  case "$value" in
+    portal_dir=*) PORTAL_DIR="${value#portal_dir=}" ;;
+    *) NODE_COUNT="$(strip_named_value nodes "$value")" ;;
+  esac
+}
+
 require_flag() {
   local name=$1
   local value=$2
@@ -214,15 +226,20 @@ cleanup() {
       down --volumes >/dev/null 2>&1 || true
   fi
 
-  if [[ $status -ne 0 && $status -ne 130 ]]; then
+  if [[ "$INTERRUPTED" == "1" ]]; then
+    log "Stopped the deployment"
+  elif [[ $status -ne 0 ]]; then
     printf 'Deployment failed. Inspect logs in %s\n' "$DEPLOY_ROOT" >&2
   fi
 
   exit "$status"
 }
 
+# A requested stop is the deployment's normal end, not a failure: exit 0 so
+# `just preview` reports nothing after Ctrl-C.
 handle_signal() {
-  exit 130
+  INTERRUPTED=1
+  exit 0
 }
 
 assert_port_free() {
@@ -515,12 +532,14 @@ start_node() {
   local node_dir=$2
   local log_file="$node_dir/$name.log"
 
+  # Own session: a terminal Ctrl-C reaches the script alone, so the one
+  # SIGTERM cleanup sends is the node's first signal and it drains gracefully.
   (
     cd "$node_dir"
     if [[ -n "${RUST_LOG:-}" ]]; then
-      exec env -i PATH="$PATH" RUST_LOG="$RUST_LOG" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
+      exec setsid env -i PATH="$PATH" RUST_LOG="$RUST_LOG" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
     else
-      exec env -i PATH="$PATH" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
+      exec setsid env -i PATH="$PATH" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
     fi
   ) >"$log_file" 2>&1 &
 
@@ -669,10 +688,10 @@ while (($# > 0)); do
     --node-count)
       shift
       [[ $# -gt 0 ]] || die "missing value for --node-count"
-      NODE_COUNT="$(strip_named_value nodes "$1")"
+      apply_node_value "$1"
       ;;
     --node-count=*)
-      NODE_COUNT="$(strip_named_value nodes "${1#*=}")"
+      apply_node_value "${1#*=}"
       ;;
     --portal-dir)
       shift
@@ -734,7 +753,7 @@ mkdir -p "$(dirname -- "$DEPLOY_ROOT")"
 assert_removable "$DEPLOY_ROOT"
 
 trap cleanup EXIT
-trap handle_signal INT TERM
+trap handle_signal INT TERM HUP
 
 if [[ "$SKIP_BUILD" != "1" ]]; then
   require_command cargo

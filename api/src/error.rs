@@ -24,6 +24,8 @@ pub enum ServerError {
     Unimplemented,
     #[error("Not found")]
     NotFound,
+    #[error("Feature disabled")]
+    FeatureDisabled(&'static str),
     #[error("Unauthorized")]
     Unauthorized,
     #[error("Forbidden")]
@@ -32,6 +34,10 @@ pub enum ServerError {
     InternalError(String),
     #[error("{0}")]
     Conflict(String),
+    /// The bytes a caller acted on are no longer the bytes on disk. The local
+    /// data is preserved and the attempt is refused, never applied blindly.
+    #[error("{0}")]
+    PreconditionFailed(String),
     #[error("{0}")]
     JobPlanConflict(String),
     /// Standing compute quota refused a new admission; the typed reason is
@@ -61,6 +67,14 @@ pub enum ServerError {
     ServiceUnavailable,
     #[error("{0}")]
     ServiceUnavailableReason(String),
+    /// A management-only route reached a node that is not one, and no management
+    /// node answered the relay.
+    #[error("No management node is reachable")]
+    NoManagementNode,
+    /// A relayed request failed after the management node could already have
+    /// applied it, so it must not be re-sent to another node.
+    #[error("Relaying to a management node failed")]
+    RelayFailed,
 }
 
 #[derive(Debug, Error)]
@@ -322,24 +336,14 @@ pub type ServerResult<T> = Result<T, ServerError>;
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let code = self.error_code();
-        let message = self.public_message();
-
-        let mut body = ErrorResponse::new(&message).with_code(code);
-        if let ServerError::MetadataValidation(violations) = &self {
-            body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
-        }
-        if let ServerError::MetadataProfileValidation(findings) = &self {
-            body = body.with_findings(findings.iter().cloned().map(Into::into).collect());
-        }
-        if let ServerError::ComputeQuotaDenied(denied) = &self {
-            body = body.with_quota((*denied).into());
-        }
+        let body = self.response_body();
 
         let mut response = (status, Json(body)).into_response();
         if matches!(
             &self,
-            ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_)
+            ServerError::ServiceUnavailable
+                | ServerError::ServiceUnavailableReason(_)
+                | ServerError::NoManagementNode
         ) || matches!(&self, ServerError::MetadataProfileValidation(findings) if profile_validation_unavailable(findings))
         {
             response.headers_mut().insert(
@@ -352,16 +356,31 @@ impl IntoResponse for ServerError {
 }
 
 impl ServerError {
+    pub(crate) fn response_body(&self) -> ErrorResponse {
+        let mut body = ErrorResponse::new(self.public_message()).with_code(self.error_code());
+        if let ServerError::MetadataValidation(violations) = self {
+            body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
+        }
+        if let ServerError::MetadataProfileValidation(findings) = self {
+            body = body.with_findings(findings.iter().cloned().map(Into::into).collect());
+        }
+        if let ServerError::ComputeQuotaDenied(denied) = self {
+            body = body.with_quota((*denied).into());
+        }
+        body
+    }
+
     pub(crate) fn status_code(&self) -> StatusCode {
         match self {
             ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-            ServerError::NotFound => StatusCode::NOT_FOUND,
+            ServerError::NotFound | ServerError::FeatureDisabled(_) => StatusCode::NOT_FOUND,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Conflict(_)
             | ServerError::JobPlanConflict(_)
             | ServerError::ComputeQuotaDenied(_) => StatusCode::CONFLICT,
+            ServerError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::BadRequest
             | ServerError::ReservedLabel(_)
@@ -375,10 +394,12 @@ impl ServerError {
                     StatusCode::BAD_REQUEST
                 }
             }
-            ServerError::BadGateway | ServerError::BadGatewayReason(_) => StatusCode::BAD_GATEWAY,
-            ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ServerError::BadGateway
+            | ServerError::BadGatewayReason(_)
+            | ServerError::RelayFailed => StatusCode::BAD_GATEWAY,
+            ServerError::ServiceUnavailable
+            | ServerError::ServiceUnavailableReason(_)
+            | ServerError::NoManagementNode => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -386,12 +407,14 @@ impl ServerError {
         match self {
             ServerError::Unimplemented => "Not implemented".to_string(),
             ServerError::NotFound => "Not found".to_string(),
+            ServerError::FeatureDisabled(code) => (*code).to_string(),
             ServerError::Unauthorized => "Not authorized".to_string(),
             ServerError::Forbidden => "Forbidden".to_string(),
             ServerError::InternalError(_) => "Internal error".to_string(),
             ServerError::Conflict(_) => "Conflict".to_string(),
             ServerError::JobPlanConflict(_) => "JobPlanConflict".to_string(),
             ServerError::ComputeQuotaDenied(_) => "compute_quota_denied".to_string(),
+            ServerError::PreconditionFailed(_) => "Precondition failed".to_string(),
             ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
             ServerError::ReservedLabel(_) => "reserved_label".to_string(),
             ServerError::BadRequest
@@ -406,6 +429,8 @@ impl ServerError {
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 "Service unavailable".to_string()
             }
+            ServerError::NoManagementNode => "no_management_node".to_string(),
+            ServerError::RelayFailed => "relay_failed".to_string(),
         }
     }
 

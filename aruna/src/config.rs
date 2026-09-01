@@ -15,8 +15,9 @@ use aruna_core::structs::{
     Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, DynamicDiscoveryMethod,
     KIND_LABEL_KEY, LOCATION_LABEL_KEY, NodeBackendsConfig, NodeCapabilities, OidcProviderConfig,
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits,
-    STORAGE_CLASS_LABEL_PREFIX,
+    STORAGE_CLASS_LABEL_PREFIX, StaticRealmEndpoint,
 };
+use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
     DiscoveryMethod, IrohRuntimeConfig, RelayMethod, endpoint_addr_from_config_string,
@@ -80,6 +81,8 @@ pub struct Config {
     pub ops_socket_addr: SocketAddr,
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
+    pub desktop_cors: bool,
+    pub mcp_enabled: bool,
     pub portal_csp_extra_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
     pub max_concurrent_uni_streams: Option<u64>,
@@ -95,17 +98,19 @@ pub struct Config {
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
-    pub s3_host: String,
+    /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
+    pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
     pub rate_limits: RateLimitSettings,
-    pub s3_address: String,
+    pub s3_address: Option<String>,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub realm_description: String,
     pub portal: PortalConfig,
+    pub assistant_proxy: bool,
     pub startup_mode: StartupMode,
     pub node_state: PersistedNodeState,
     pub node_labels: BTreeMap<String, String>,
@@ -185,7 +190,21 @@ pub enum PersistedNodeIdentity {
         issuer_private_key_pem: String,
         delegation_signature: String,
     },
-    Local,
+    /// Owner-bound device. The owner is copied from the enrollment answer: a
+    /// device holds no realm state to read it back from before it has joined.
+    User {
+        owner: UserId,
+    },
+}
+
+impl PersistedNodeIdentity {
+    /// Owner of a device identity; `None` for infrastructure nodes.
+    pub fn owner(&self) -> Option<UserId> {
+        match self {
+            Self::User { owner } => Some(*owner),
+            Self::Management { .. } | Self::Server { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +289,11 @@ impl Config {
                 self.blob_transfer_idle_timeout_secs,
             ),
         }
+    }
+
+    /// Owner this node is enrolled for when it is a device; `None` otherwise.
+    pub fn device_owner(&self) -> Option<UserId> {
+        self.node_state.identity.owner()
     }
 
     /// Budget for the onboarding document sync and the placement wait built on
@@ -368,6 +392,8 @@ pub struct Settings {
     pub ops_socket_addr: SocketAddr,
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
+    pub desktop_cors: bool,
+    pub mcp_enabled: bool,
     pub portal_csp_extra_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
     pub additional_relay_urls: Vec<String>,
@@ -375,17 +401,19 @@ pub struct Settings {
     pub max_concurrent_bidi_streams: Option<u64>,
     pub document_sync_runtime: IrohRuntimeConfig,
     pub default_metadata_replication_factor: u32,
-    pub s3_host: String,
+    /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
+    pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
     pub rate_limits: RateLimitSettings,
-    pub s3_address: String,
+    pub s3_address: Option<String>,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub realm_description: String,
     pub portal: PortalConfig,
+    pub assistant_proxy: bool,
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
@@ -490,6 +518,8 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .transpose()?
         .unwrap_or(aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE);
     let cors_allowed_origins = parse_list_env("CORS_ALLOWED_ORIGINS");
+    let desktop_cors = desktop_cors_env();
+    let mcp_enabled = mcp_env()?;
     let portal_csp_extra_origins = parse_list_env("PORTAL_CSP_EXTRA_ORIGINS");
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
@@ -502,14 +532,26 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .transpose()?
         .unwrap_or(3)
         .max(1);
-    let s3_host = dotenvy::var("S3_HOST")?;
     let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
     let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
     let trusted_proxies = trusted_proxies_env()?;
     let rocrate_limits = rocrate_limits_env()?;
     let rate_limits = rate_limits_env()?;
-    let s3_address = dotenvy::var("S3_ADDRESS")?;
-    SocketAddr::from_str(&s3_address)?;
+    // A device profile runs without an S3 listener: unset or empty disables it,
+    // and half a pair is a misconfiguration. Which profile this is only becomes
+    // knowable with the node identity, so it is validated again there.
+    let (s3_host, s3_address) = match (
+        optional_nonempty_env("S3_HOST")?,
+        optional_nonempty_env("S3_ADDRESS")?,
+    ) {
+        (Some(host), Some(address)) => {
+            SocketAddr::from_str(&address)?;
+            (Some(host), Some(address))
+        }
+        (None, None) => (None, None),
+        (Some(_), None) => return Err(SetupError::MissingConfigValue("S3_ADDRESS")),
+        (None, Some(_)) => return Err(SetupError::MissingConfigValue("S3_HOST")),
+    };
     let node_labels = parse_node_labels_env()?;
     let node_location = dotenvy::var("ARUNA_NODE_LOCATION")
         .ok()
@@ -529,6 +571,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .filter(|value| !value.trim().is_empty());
     let oidc_providers = load_oidc_providers_from_env()?;
     let portal = portal_config_env()?;
+    let assistant_proxy = assistant_proxy_env()?;
     // The SPA is served from another origin than the API, so it cannot reach a
     // relative API path and needs the advertised one.
     if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
@@ -558,6 +601,8 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         ops_socket_addr,
         max_http_body_size,
         cors_allowed_origins,
+        desktop_cors,
+        mcp_enabled,
         portal_csp_extra_origins,
         p2p_socket_addr,
         additional_relay_urls,
@@ -576,6 +621,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         oidc_providers,
         realm_description,
         portal,
+        assistant_proxy,
         node_labels,
         node_location,
         node_weight,
@@ -608,6 +654,8 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         ops_socket_addr,
         max_http_body_size,
         cors_allowed_origins,
+        desktop_cors,
+        mcp_enabled,
         portal_csp_extra_origins,
         p2p_socket_addr,
         additional_relay_urls,
@@ -626,6 +674,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         oidc_providers,
         realm_description,
         portal,
+        assistant_proxy,
         node_labels,
         node_location,
         node_weight,
@@ -634,6 +683,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     let storage_handle =
         FjallStorage::open_with_persist_policy(&storage_path, fjall_persist_policy)?;
     let mut temporary_bootstrap_endpoint = None;
+    let mut enrollment_endpoints = Vec::new();
     let node_state = match load_persisted_node_state(&storage_handle).await? {
         Some(state) => state,
         None => {
@@ -648,6 +698,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
                     )
                     .await?;
                     temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
+                    enrollment_endpoints = bootstrapped.realm_endpoints;
                     bootstrapped.node_state
                 }
                 None => generate_initialized_node_state()?,
@@ -663,6 +714,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     if realm_id != node_state.realm_id {
         return Err(SetupError::PersistedNodeStateMismatch);
     }
+    validate_s3_profile(s3_address.as_deref(), &node_capabilities)?;
 
     let mut node_state = node_state;
     if matches!(node_state.status, PersistedNodeStatus::PendingOnboarding) {
@@ -686,6 +738,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
             )
             .await?;
             temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
+            enrollment_endpoints = onboarding_realm_endpoints(&response.realm_endpoints);
             node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
             persist_node_state(&storage_handle, &node_state).await?;
         }
@@ -711,6 +764,10 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     if let Some(endpoint) = temporary_bootstrap_endpoint {
         peer_endpoints.push(endpoint);
     }
+    // Appended after the bootstrap endpoint: the onboarding fetch keeps dialing
+    // the node that finalized the join, while the realm stays reachable without
+    // a discovery read once that endpoint goes away.
+    peer_endpoints.extend(enrollment_endpoints);
 
     Ok((
         Config {
@@ -736,6 +793,8 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
             ops_socket_addr,
             max_http_body_size,
             cors_allowed_origins,
+            desktop_cors,
+            mcp_enabled,
             portal_csp_extra_origins,
             p2p_socket_addr,
             max_concurrent_uni_streams,
@@ -762,6 +821,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
             oidc_providers,
             realm_description,
             portal,
+            assistant_proxy,
             startup_mode,
             node_state,
             node_labels,
@@ -1035,6 +1095,47 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .collect()
 }
 
+/// `DESKTOP_CORS` opts out of the always-on desktop origin admission.
+fn desktop_cors_env() -> bool {
+    !matches!(
+        dotenvy::var("DESKTOP_CORS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "false" | "0" | "no"
+    )
+}
+
+fn assistant_proxy_env() -> Result<bool, SetupError> {
+    let Some(value) = optional_nonempty_env("ASSISTANT_PROXY")? else {
+        return Ok(true);
+    };
+    match normalize_env_value(&value).as_str() {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(invalid_config_value(
+            "ASSISTANT_PROXY",
+            value,
+            "expected enabled or disabled",
+        )),
+    }
+}
+
+fn mcp_env() -> Result<bool, SetupError> {
+    const KEY: &str = "MCP";
+    match dotenvy::var(KEY).ok().as_deref().map(normalize_env_value) {
+        None => Ok(true),
+        Some(value) if value == "enabled" => Ok(true),
+        Some(value) if value == "disabled" => Ok(false),
+        Some(value) => Err(invalid_config_value(
+            KEY,
+            value,
+            "expected one of: enabled, disabled",
+        )),
+    }
+}
+
 /// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
 /// in `k=v,k2=v2` form. Rejects malformed pairs and every derived-only label,
 /// which the owning node stamps for itself.
@@ -1171,6 +1272,99 @@ pub async fn mark_onboarding_phase(
     persist_node_state(storage, &updated_state).await
 }
 
+/// Only a device may run without an S3 listener. An infrastructure node whose
+/// `S3_HOST`/`S3_ADDRESS` pair is accidentally absent must fail its start
+/// instead of coming up silently serving no S3 endpoint at all.
+fn validate_s3_profile(
+    s3_address: Option<&str>,
+    capabilities: &NodeCapabilities,
+) -> Result<(), SetupError> {
+    if s3_address.is_some() || matches!(capabilities, NodeCapabilities::User { .. }) {
+        return Ok(());
+    }
+    Err(SetupError::MissingConfigValue("S3_ADDRESS"))
+}
+
+/// Refuses a device profile whose wipe would take more than this node's own
+/// storage: the filesystem root, the owner's home, or the parent of another
+/// root is a configuration mistake this node must not start with.
+pub fn validate_wipe_roots(
+    roots: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> Result<Vec<std::path::PathBuf>, SetupError> {
+    // Without a home to compare against, no root can be shown to be safe.
+    let home = normalize_root(home.ok_or(SetupError::MissingConfigValue("HOME"))?);
+    let roots: Vec<std::path::PathBuf> = roots.iter().map(|root| normalize_root(root)).collect();
+    for root in &roots {
+        let refuse = |message: &str| SetupError::InvalidConfigValue {
+            key: "STORAGE_PATH",
+            value: root.display().to_string(),
+            message: message.to_string(),
+        };
+        if root.parent().is_none() {
+            return Err(refuse("a wipe root may not be the filesystem root"));
+        }
+        if home.starts_with(root) {
+            return Err(refuse("a wipe root may not contain a home directory"));
+        }
+        if roots
+            .iter()
+            .any(|other| other != root && other.starts_with(root))
+        {
+            return Err(refuse("a wipe root may not contain another wipe root"));
+        }
+    }
+    Ok(roots)
+}
+
+/// Drops every root that lies inside another: erasing the outer one takes it
+/// along, and the default layout keeps the blob store under the storage path.
+pub fn outermost_roots(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let normalized: Vec<std::path::PathBuf> =
+        roots.iter().map(|root| normalize_root(root)).collect();
+    let mut kept: Vec<std::path::PathBuf> = normalized
+        .iter()
+        .filter(|root| {
+            !normalized
+                .iter()
+                .any(|other| other != *root && root.starts_with(other))
+        })
+        .cloned()
+        .collect();
+    kept.sort();
+    kept.dedup();
+    kept
+}
+
+/// The path a wipe would really erase: absolute, and resolved where it exists,
+/// so a relative root or a link cannot hide what it covers.
+fn normalize_root(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    // `absolute` keeps `..` on POSIX and a path that does not exist yet cannot
+    // be canonicalized, so the components are folded here first: without it a
+    // root that climbs out of itself would be judged as the path that hid it.
+    let folded = fold_components(&absolute);
+    std::fs::canonicalize(&folded).unwrap_or(folded)
+}
+
+/// Resolves `.` and `..` lexically. It is not link-aware, which is why the
+/// canonical form still wins wherever the path exists.
+fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
+    let mut folded = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !folded.pop() {
+                    folded.push(component.as_os_str());
+                }
+            }
+            other => folded.push(other.as_os_str()),
+        }
+    }
+    folded
+}
+
 fn node_capabilities_from_state(
     node_state: &PersistedNodeState,
 ) -> Result<(RealmId, NodeCapabilities), SetupError> {
@@ -1210,9 +1404,9 @@ fn node_capabilities_from_state(
                 delegation_signature.clone(),
             )?,
         )),
-        PersistedNodeIdentity::Local => Ok((
+        PersistedNodeIdentity::User { .. } => Ok((
             node_state.realm_id,
-            NodeCapabilities::local_node(node_state.realm_id)?,
+            NodeCapabilities::user_node(node_state.realm_id)?,
         )),
     }
 }
@@ -1239,6 +1433,38 @@ fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
 struct BootstrappedNodeState {
     node_state: PersistedNodeState,
     temporary_bootstrap_endpoint: EndpointAddr,
+    realm_endpoints: Vec<EndpointAddr>,
+}
+
+/// Realm endpoints handed over at enrollment, so a joiner dials the realm
+/// without a discovery read of its own. An entry that does not parse, or whose
+/// address names another node, is dropped instead of failing the join.
+fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<EndpointAddr> {
+    endpoints
+        .iter()
+        .filter_map(
+            |endpoint| match endpoint_addr_from_config_string(&endpoint.endpoint_addr) {
+                Ok(endpoint_addr) if endpoint_addr.id.to_string() == endpoint.node_id => {
+                    Some(endpoint_addr)
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        node_id = %endpoint.node_id,
+                        "Enrollment endpoint address names a different node; ignoring it"
+                    );
+                    None
+                }
+                Err(message) => {
+                    tracing::warn!(
+                        node_id = %endpoint.node_id,
+                        %message,
+                        "Enrollment handed over an unusable realm endpoint; ignoring it"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 async fn bootstrap_onboarded_node_state(
@@ -1325,6 +1551,7 @@ async fn bootstrap_onboarded_node_state(
     let realm_id = response.realm_id()?;
     validate_bootstrap_response(&response, decoded_secret.mode, realm_id, node_id)?;
     let temporary_bootstrap_endpoint = response.temporary_bootstrap_endpoint.clone();
+    let realm_endpoints = onboarding_realm_endpoints(&response.realm_endpoints);
     let identity =
         match response.mode {
             OnboardingMode::Management => {
@@ -1381,11 +1608,16 @@ async fn bootstrap_onboarded_node_state(
                     SetupError::MissingOnboardingMaterial(OnboardingMode::Server),
                 )?,
             },
-            OnboardingMode::Local => PersistedNodeIdentity::Local,
+            // A device holds no realm or issuer key material: its authority is
+            // its owner's, carried by the membership record written at finalize.
+            // The owner is kept so the device can name it before that record
+            // reaches it.
+            OnboardingMode::User { owner } => PersistedNodeIdentity::User { owner },
         };
 
     Ok(BootstrappedNodeState {
         temporary_bootstrap_endpoint,
+        realm_endpoints,
         node_state: PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::PendingOnboarding,
@@ -1774,20 +2006,91 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        S3ServerTimeouts, fjall_persist_policy_env, load, load_oidc_providers_from_env,
-        parse_node_labels_env, persist_node_state, portal_config_env, read_settings,
-        rocrate_limits_env, validate_public_url,
+        S3ServerTimeouts, SetupError, assistant_proxy_env, fjall_persist_policy_env, load,
+        load_oidc_providers_from_env, normalize_root, outermost_roots, parse_node_labels_env,
+        persist_node_state, portal_config_env, read_settings, rocrate_limits_env,
+        validate_public_url, validate_s3_profile, validate_wipe_roots,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
-        DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
-        RoCrateLimits, StaticRealmEndpoint,
+        DynamicDiscoveryMethod, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RelayPolicy, RoCrateLimits, StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_to_config_string};
     use aruna_storage::{FjallPersistPolicy, FjallStorage};
     use std::sync::OnceLock;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    // A wipe erases the contents of every root it is given, so a root that
+    // holds the owner's home, another root, or the whole filesystem must fail
+    // the start instead of the erasure. The paths are deliberately ones no test
+    // machine has: the judgement may not depend on what exists.
+    #[test]
+    fn folds_nested_roots() {
+        // The blob store defaults to a directory under the storage path; the
+        // wipe visits the storage path once and never lists the nested one.
+        let home = std::env::temp_dir().join("aruna-wipe-home");
+        let store = home.join("data");
+        let blobs = store.join("blobstore");
+        let folded = outermost_roots(&[blobs.clone(), store.clone(), store.clone()]);
+        assert_eq!(folded, vec![normalize_root(&store)]);
+        assert!(validate_wipe_roots(&folded, Some(&home)).is_ok());
+    }
+
+    #[test]
+    fn refuses_unsafe_roots() {
+        let home = std::path::PathBuf::from("/nonexistent-aruna-test/ada");
+        let store = home.join(".aruna/store");
+        let blobs = home.join(".aruna/blobs");
+        assert_eq!(
+            validate_wipe_roots(&[store.clone(), blobs.clone()], Some(&home)).unwrap(),
+            vec![store.clone(), blobs.clone()]
+        );
+
+        for unsafe_root in [
+            std::path::PathBuf::from("/"),
+            home.clone(),
+            std::path::PathBuf::from("/nonexistent-aruna-test"),
+            home.join(".aruna"),
+            // The same directories, reached through paths that hide them.
+            home.join(".aruna/store/../.."),
+            home.join("./.aruna/./store/../../"),
+        ] {
+            assert!(
+                validate_wipe_roots(
+                    &[store.clone(), blobs.clone(), unsafe_root.clone()],
+                    Some(&home)
+                )
+                .is_err(),
+                "{} must be refused",
+                unsafe_root.display()
+            );
+        }
+        // A device that cannot say where its owner's home is cannot be judged.
+        assert!(matches!(
+            validate_wipe_roots(&[store], None),
+            Err(SetupError::MissingConfigValue("HOME"))
+        ));
+    }
+
+    // Only a device serves no S3 endpoint. An infrastructure node whose pair is
+    // accidentally absent must fail its start instead of coming up without one.
+    #[test]
+    fn devices_skip_s3() {
+        // A realm id is a verifying key, so it has to be one a device can hold.
+        let realm_id = RealmId::from_bytes(generate_signing_key().verifying_key().to_bytes());
+        let device = NodeCapabilities::user_node(realm_id).expect("device capabilities");
+        let management =
+            NodeCapabilities::management_node(generate_signing_key()).expect("management");
+
+        assert!(validate_s3_profile(None, &device).is_ok());
+        assert!(validate_s3_profile(Some("0.0.0.0:9000"), &management).is_ok());
+        assert!(matches!(
+            validate_s3_profile(None, &management),
+            Err(SetupError::MissingConfigValue("S3_ADDRESS"))
+        ));
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1989,6 +2292,51 @@ mod tests {
         restore_env(previous);
     }
 
+    #[tokio::test]
+    async fn s3_listener_optional() {
+        // Empty disables the listener; half a pair stays an error. Removal would
+        // prove nothing: `dotenvy::var` refills a removed key from the .env file.
+        let _guard = env_lock().lock().await;
+        let dir = tempdir().unwrap();
+        let vars = ["STORAGE_PATH", "SOCKET_ADDRESS", "S3_HOST", "S3_ADDRESS"];
+        let previous = vars
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        unsafe {
+            std::env::set_var("STORAGE_PATH", dir.path().to_str().unwrap());
+            std::env::set_var("SOCKET_ADDRESS", "127.0.0.1:0");
+            std::env::set_var("S3_HOST", "");
+            std::env::set_var("S3_ADDRESS", "");
+        }
+
+        let settings = read_settings().unwrap();
+        assert!(settings.s3_host.is_none());
+        assert!(settings.s3_address.is_none());
+
+        unsafe { std::env::set_var("S3_HOST", "127.0.0.1:0") };
+        assert!(matches!(
+            read_settings(),
+            Err(SetupError::MissingConfigValue("S3_ADDRESS"))
+        ));
+
+        unsafe {
+            std::env::set_var("S3_HOST", "");
+            std::env::set_var("S3_ADDRESS", "127.0.0.1:0");
+        }
+        assert!(matches!(
+            read_settings(),
+            Err(SetupError::MissingConfigValue("S3_HOST"))
+        ));
+
+        unsafe { std::env::set_var("S3_HOST", "127.0.0.1:0") };
+        let settings = read_settings().unwrap();
+        assert_eq!(settings.s3_host.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(settings.s3_address.as_deref(), Some("127.0.0.1:0"));
+
+        restore_env(previous);
+    }
+
     #[test]
     fn public_url_accepts_absolute_http_and_https_urls() {
         for value in [
@@ -2066,6 +2414,33 @@ mod tests {
                 ..
             }
         ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn assistant_proxy_defaults() {
+        let _guard = env_lock().lock().await;
+        let key = "ASSISTANT_PROXY";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::remove_var(key) };
+
+        assert!(assistant_proxy_env().unwrap());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn assistant_proxy_modes() {
+        let _guard = env_lock().lock().await;
+        let key = "ASSISTANT_PROXY";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "disabled") };
+        assert!(!assistant_proxy_env().unwrap());
+        unsafe { std::env::set_var(key, "enabled") };
+        assert!(assistant_proxy_env().unwrap());
+        unsafe { std::env::set_var(key, "sometimes") };
+        assert!(assistant_proxy_env().is_err());
 
         restore_env(previous);
     }
@@ -2538,6 +2913,34 @@ mod tests {
         assert!(super::realm_network_config(Some(&realm_config), local_node_id).is_err());
     }
 
+    #[test]
+    fn filters_enrollment_endpoints() {
+        // A malformed or mismatched hand-over entry is dropped, never fatal:
+        // the joiner still dials the endpoints that do parse.
+        let endpoint_node = iroh::SecretKey::from_bytes(&[51u8; 32]).public();
+        let other_node = iroh::SecretKey::from_bytes(&[52u8; 32]).public();
+        let endpoint_addr =
+            iroh::EndpointAddr::new(endpoint_node).with_ip_addr("127.0.0.1:3001".parse().unwrap());
+        let endpoints = vec![
+            StaticRealmEndpoint {
+                node_id: endpoint_node.to_string(),
+                endpoint_addr: endpoint_addr_to_config_string(&endpoint_addr),
+            },
+            StaticRealmEndpoint {
+                node_id: other_node.to_string(),
+                endpoint_addr: endpoint_addr_to_config_string(&endpoint_addr),
+            },
+            StaticRealmEndpoint {
+                node_id: endpoint_node.to_string(),
+                endpoint_addr: "not-an-endpoint".to_string(),
+            },
+        ];
+
+        let parsed = super::onboarding_realm_endpoints(&endpoints);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, endpoint_node);
+    }
+
     #[tokio::test]
     async fn extra_relays() {
         let _guard = env_lock().lock().await;
@@ -2597,14 +3000,17 @@ mod tests {
 
         let realm_signing_key = generate_signing_key();
         let net_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::Complete,
-            realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
+            realm_id,
             net_secret_key: net_signing_key.to_bytes(),
             onboarding_phase: None,
             onboarding_sync_ticket: None,
-            identity: PersistedNodeIdentity::Local,
+            identity: PersistedNodeIdentity::User {
+                owner: aruna_core::types::UserId::nil(realm_id),
+            },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);
@@ -2662,14 +3068,17 @@ mod tests {
 
         let realm_signing_key = generate_signing_key();
         let net_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::PendingOnboarding,
-            realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
+            realm_id,
             net_secret_key: net_signing_key.to_bytes(),
             onboarding_phase: Some(aruna_core::onboarding::OnboardingPhase::CoreDocumentsFetched),
             onboarding_sync_ticket: Some("already-fetched".to_string()),
-            identity: PersistedNodeIdentity::Local,
+            identity: PersistedNodeIdentity::User {
+                owner: aruna_core::types::UserId::nil(realm_id),
+            },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);

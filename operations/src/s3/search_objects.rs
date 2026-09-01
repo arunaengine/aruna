@@ -152,7 +152,7 @@ pub async fn search_local_objects(
             let request = policy_request_with(
                 &path,
                 &Permission::READ,
-                Some(&input.auth.user_id),
+                Some(&input.auth),
                 PolicyRequestExtras::rest(),
             );
             match evaluators
@@ -709,6 +709,7 @@ mod tests {
                     user_id: fixture.caller,
                     realm_id: fixture.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 "needle",
                 10,
@@ -754,6 +755,7 @@ mod tests {
                         pattern: allowed_path,
                         permission: Permission::READ,
                     }]),
+                    session: None,
                 },
                 "report-",
                 10,
@@ -786,6 +788,7 @@ mod tests {
                     user_id: fixture.owner,
                     realm_id: fixture.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 "state-",
                 10,
@@ -808,6 +811,7 @@ mod tests {
             user_id: fixture.owner,
             realm_id: fixture.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let as_of = SystemTime::now();
         let mut first_input = input(&fixture, auth.clone(), "page-", 2);

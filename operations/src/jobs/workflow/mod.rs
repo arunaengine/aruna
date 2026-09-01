@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_compute::ExecutorBackend;
-use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
     FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest, S3Mount,
@@ -41,7 +40,9 @@ use super::store::{
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::reservation::job_reservation;
-use crate::jobs::lifecycle::updates::{publish_progress, publish_terminal};
+use crate::jobs::lifecycle::updates::{
+    SETTLE_RETRY_AFTER, publish_progress, publish_terminal, schedule_terminal_settle,
+};
 use crate::placement_policy::subject::read_local_subject;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
@@ -1580,8 +1581,25 @@ async fn cleanup_and_crate(context: &DriverContext, job_id: JobId, record: Optio
     log_compute_summary(&record);
     // A receipted execution publishes its terminal state and frees its exact
     // reservation here; a purely local job publishes nothing.
-    Box::pin(publish_terminal(context, &record)).await;
+    if !Box::pin(publish_terminal(context, &record)).await {
+        arm_terminal_settle(context, job_id).await;
+    }
     finalize_followups(context, job_id).await;
+}
+
+/// Hands a deferred terminal publication to the settle task. The reservation
+/// row keeps the obligation durable until that retry succeeds.
+async fn arm_terminal_settle(context: &DriverContext, job_id: JobId) {
+    let Some(task_handle) = context.task_handle.as_ref() else {
+        warn!(job_id = %job_id, "Terminal publication deferred with no task handle to retry it");
+        return;
+    };
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+        .send_effect(schedule_terminal_settle(SETTLE_RETRY_AFTER))
+        .await
+    {
+        warn!(job_id = %job_id, message = %message, "Failed to arm the terminal settle retry");
+    }
 }
 
 fn log_compute_summary(record: &JobRecord) {
@@ -1878,7 +1896,7 @@ async fn capture_or_park(
         max_bytes_per_stream: default_limits.inline_tail_bytes,
         ..default_limits
     };
-    match backend.fetch_logs(fence, &limits, &NullSink).await {
+    match backend.fetch_logs(fence, &limits).await {
         Ok(logs) => Some(logs),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Container log capture failed");
@@ -1914,7 +1932,6 @@ mod tests {
     };
     use crate::jobs::workflow::workspace::mint_workspace_credential;
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-    use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
         ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination,
@@ -2040,7 +2057,6 @@ mod tests {
             &self,
             _context: &FenceContext,
             _limits: &LogLimits,
-            _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
             if self.logs_fail.load(Ordering::Relaxed) {
                 return Err(BackendError::Api("log stream truncated".to_string()));

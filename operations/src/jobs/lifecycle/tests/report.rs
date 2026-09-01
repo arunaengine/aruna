@@ -42,6 +42,7 @@ fn auth() -> AuthContext {
         user_id: user(),
         realm_id: REALM,
         path_restrictions: None,
+        session: None,
     }
 }
 
@@ -156,6 +157,7 @@ async fn audit_pages_records() {
         user_id: UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
         realm_id: REALM,
         path_restrictions: None,
+        session: None,
     };
     assert!(matches!(
         family_audit(

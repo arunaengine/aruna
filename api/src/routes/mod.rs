@@ -7,17 +7,21 @@ use std::sync::Arc;
 use utoipa::openapi::{Components, OpenApi};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
+pub mod assistant;
 pub mod audit;
 pub mod blobs;
 pub mod compute;
 pub mod connectors;
 pub mod credentials;
+pub mod device;
+pub mod device_compute;
 pub mod drs;
 pub mod group_backends;
 pub mod groups;
 pub mod info;
 pub mod job_audit;
 pub mod jobs;
+pub mod management_relay;
 pub mod metadata;
 pub mod notifications;
 pub mod oai;
@@ -27,6 +31,7 @@ pub mod placement;
 pub mod policies;
 pub mod rocrate_import;
 pub mod search;
+pub mod sessions;
 pub mod staging;
 pub mod storage_deletion;
 pub mod storage_routing;
@@ -41,6 +46,7 @@ pub mod users;
 fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .merge(audit::router())
+        .merge(assistant::router())
         .merge(info::router())
         .merge(onboarding::router())
         .merge(blobs::router())
@@ -54,6 +60,8 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(compute::router())
         .merge(connectors::router())
         .merge(credentials::router())
+        .merge(device::router())
+        .merge(device_compute::router())
         .merge(groups::router())
         .merge(jobs::router())
         .merge(job_audit::router())
@@ -65,6 +73,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(policies::router())
         .merge(search::router())
+        .merge(sessions::router())
         .merge(tes::router())
         .merge(tokens::router())
         .merge(users::router())
@@ -73,6 +82,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     let (router, _) = rest_api().split_for_parts();
     router
+        .layer(from_fn_with_state(
+            state.clone(),
+            management_relay::relay_middleware,
+        ))
         .layer(from_fn_with_state(
             state.clone(),
             crate::rate_limit::principal_middleware,
@@ -91,8 +104,8 @@ pub fn rest_openapi() -> OpenApi {
 }
 
 /// Registers documented handlers under a runtime template that differs from the
-/// documented path. Only the DRS catch-all object id and the TES `:cancel`
-/// action suffix need it; both are asserted by `preserves_route_inventory`.
+/// documented path. Catch-all ids and the TES `:cancel` suffix use it; all are
+/// asserted by `preserves_route_inventory`.
 fn routes_at(
     mut router: OpenApiRouter<Arc<ServerState>>,
     path: &str,
@@ -123,9 +136,12 @@ mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("DELETE", "/admin/devices/{node_id}"),
         ("DELETE", "/admin/onboarding/secrets/{id}"),
         ("DELETE", "/admin/sync-quarantine"),
         ("DELETE", "/data/sync-relationships/{id}"),
+        ("DELETE", "/device/drafts/{draft_id}"),
+        ("DELETE", "/device/folders/{folder_id}"),
         ("DELETE", "/groups/{group_id}/connectors/{connector_id}"),
         ("DELETE", "/groups/{group_id}/storage-backends/{backend_id}"),
         ("DELETE", "/groups/{id}/members/{user_id}"),
@@ -134,6 +150,9 @@ mod tests {
         ("DELETE", "/notifications/watches/{id}"),
         ("DELETE", "/pid/{document_id}"),
         ("DELETE", "/users/credentials/{access_key_id}"),
+        ("DELETE", "/users/assistant/providers/{id}"),
+        ("DELETE", "/users/me/devices/{id}"),
+        ("DELETE", "/users/sessions/{session_id}"),
         ("GET", "/admin/compute/config"),
         ("GET", "/admin/compute/snapshots"),
         ("GET", "/admin/onboarding/secrets"),
@@ -149,6 +168,16 @@ mod tests {
         ("GET", "/buckets/{bucket}/storage-routing"),
         ("GET", "/data/sync-relationships"),
         ("GET", "/data/sync-relationships/{id}"),
+        ("GET", "/device/compute"),
+        ("GET", "/device/documents"),
+        ("GET", "/device/drafts"),
+        ("GET", "/device/drafts/{draft_id}"),
+        ("GET", "/device/folders"),
+        ("GET", "/device/folders/{folder_id}"),
+        ("GET", "/device/folders/{folder_id}/actions"),
+        ("GET", "/device/folders/{folder_id}/entries"),
+        ("GET", "/device/sync/status"),
+        ("GET", "/device/transfers"),
         ("GET", "/ga4gh/drs/v1/download"),
         ("GET", "/ga4gh/drs/v1/objects/{*object_id}"),
         ("GET", "/ga4gh/drs/v1/service-info"),
@@ -197,6 +226,7 @@ mod tests {
         ("GET", "/notifications/unread"),
         ("GET", "/notifications/watches"),
         ("GET", "/oai"),
+        ("GET", "/onboarding/secrets/{id}/status"),
         ("GET", "/pid/{document_id}"),
         ("GET", "/profile/{document_id}"),
         ("GET", "/policies/effective"),
@@ -209,9 +239,14 @@ mod tests {
         ("GET", "/staging/jobs/{job_id}"),
         ("GET", "/staging/references"),
         ("GET", "/users"),
+        ("GET", "/users/assistant/providers"),
+        ("GET", "/users/assistant/providers/{id}/models"),
+        ("GET", "/users/assistant/providers/{id}/proxy/{*path}"),
         ("GET", "/users/credentials"),
         ("GET", "/users/info"),
+        ("GET", "/users/me/devices"),
         ("GET", "/users/search"),
+        ("GET", "/users/sessions"),
         ("GET", "/users/token"),
         ("GET", "/users/{id}"),
         ("HEAD", "/jobs/{job_id}/artifacts/rocrate"),
@@ -219,6 +254,7 @@ mod tests {
         ("PATCH", "/data/sync-relationships/{id}"),
         ("PATCH", "/info/realm/placement"),
         ("PATCH", "/users/info"),
+        ("PATCH", "/users/assistant/providers/{id}"),
         ("PATCH", "/users/{id}"),
         ("POST", "/admin/compute/drain"),
         ("POST", "/admin/onboarding/secrets"),
@@ -230,6 +266,16 @@ mod tests {
         ("POST", "/buckets/{bucket}/placement/runs"),
         ("POST", "/data/sync-relationships"),
         ("POST", "/data/sync-relationships/{id}/run"),
+        ("POST", "/device/drafts"),
+        ("POST", "/device/drafts/preview"),
+        ("POST", "/device/folders"),
+        ("POST", "/device/folders/{folder_id}/actions"),
+        ("POST", "/device/folders/{folder_id}/entries/{path}/actions"),
+        ("POST", "/device/folders/{folder_id}/pause"),
+        ("POST", "/device/folders/{folder_id}/resume"),
+        ("POST", "/device/folders/{folder_id}/sync"),
+        ("POST", "/device/sync/run"),
+        ("POST", "/device/wipe"),
         ("POST", "/ga4gh/drs/v1/objects"),
         ("POST", "/ga4gh/tes/v1/tasks"),
         ("POST", "/ga4gh/tes/v1/tasks/{id}"),
@@ -277,6 +323,12 @@ mod tests {
         ("POST", "/staging/jobs"),
         ("POST", "/users/credentials"),
         ("POST", "/users/register"),
+        ("POST", "/users/assistant/providers"),
+        ("POST", "/users/assistant/providers/chatgpt/login"),
+        ("POST", "/users/assistant/providers/{id}/login/poll"),
+        ("POST", "/users/assistant/providers/{id}/proxy/{*path}"),
+        ("POST", "/users/assistant/providers/{id}/test"),
+        ("POST", "/users/sessions"),
         ("POST", "/users/resolve"),
         ("POST", "/users/s3-sessions"),
         ("POST", "/users/s3-sessions/{access_key_id}/refresh"),
@@ -284,6 +336,7 @@ mod tests {
         ("PUT", "/admin/compute/config"),
         ("PUT", "/buckets/{bucket}/placement"),
         ("PUT", "/buckets/{bucket}/storage-routing"),
+        ("PUT", "/device/documents/{document_id}/selection"),
         ("PUT", "/groups/{group_id}/connectors/{connector_id}"),
         ("PUT", "/groups/{group_id}/storage-backends/{backend_id}"),
         ("PUT", "/groups/{group_id}/storage-routing"),
@@ -293,7 +346,7 @@ mod tests {
         ("PUT", "/policies/realm"),
     ];
 
-    /// Documented path to the runtime template that serves it. DRS object ids
+    /// Documented path to the runtime template that serves it. Catch-all ids
     /// span segments and TES cancel carries its action suffix inside `{id}`.
     const PATH_ALIASES: &[(&str, &str)] = &[
         (
@@ -303,6 +356,10 @@ mod tests {
         (
             "/ga4gh/tes/v1/tasks/{id}:cancel",
             "/ga4gh/tes/v1/tasks/{id}",
+        ),
+        (
+            "/users/assistant/providers/{id}/proxy/{path}",
+            "/users/assistant/providers/{id}/proxy/{*path}",
         ),
     ];
 

@@ -653,6 +653,7 @@ mod tests {
             kind: SourceEntryKind::Directory,
             size: None,
             modified: None,
+            stat: None,
         };
 
         let MappedEntry::Directory(directory) = map_source_entry(&root, entry).unwrap() else {
@@ -670,6 +671,7 @@ mod tests {
                 user_id: aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             group_id: Ulid::from_bytes([3; 16]),
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),

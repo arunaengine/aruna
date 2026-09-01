@@ -507,6 +507,7 @@ async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), Box
             user_id: fixture.actor.user_id,
             realm_id: fixture.actor.realm_id,
             path_restrictions: None,
+            session: None,
         })),
     )
     .await

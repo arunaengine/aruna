@@ -61,7 +61,8 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
         seed.context.as_ref(),
     )
     .await?;
-    let onboarding_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Local).await?;
+    let onboarding_secret =
+        create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
     let expected_user = read_user(seed.context.as_ref(), seed.user_id)
         .await
         .expect("seed user should exist");
@@ -131,6 +132,48 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
     .await?;
 
     shutdown_pair(joiner, seed).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_joiner_onboards() -> TestResult<()> {
+    // The second joiner is admitted to no shard topic while the first joiner's
+    // placement expansion is in flight, so its user documents cannot be pulled
+    // from the seed yet; onboarding must complete regardless.
+    let seed = spawn_seed_node().await?;
+    let _user = drive(
+        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+            actor: Actor {
+                node_id: seed.net.node_id(),
+                user_id: seed.user_id,
+                realm_id: seed.realm_id,
+            },
+            user_id: seed.user_id,
+            name: "Seed Admin".to_string(),
+            subject_id: seed.user_id.to_string(),
+            issuer: format!("issuer_of_{}", seed.user_id),
+        }),
+        seed.context.as_ref(),
+    )
+    .await?;
+
+    let first_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
+    let first = spawn_joiner_node(&seed, first_secret).await?;
+    let second_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
+    let second = spawn_joiner_node(&seed, second_secret).await?;
+
+    wait_for_realm_nodes(
+        &[
+            seed.context.as_ref(),
+            first.context.as_ref(),
+            second.context.as_ref(),
+        ],
+        &seed.realm_id,
+        3,
+    )
+    .await?;
+
+    tokio::join!(second.shutdown(), first.shutdown(), seed.shutdown());
     Ok(())
 }
 

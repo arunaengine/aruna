@@ -51,7 +51,7 @@ fn shared_targets(
 /// node-owned target names its node in the topic id, so only that node ever
 /// plans it; a realm-wide one is planned by every node and needs a single
 /// designated minter instead.
-fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
+pub(crate) fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
     matches!(
         target,
         DocumentSyncTarget::RealmConfig { .. } | DocumentSyncTarget::RealmAuthorization { .. }
@@ -721,6 +721,17 @@ async fn presence_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
+    // A user device reads the DHT to locate realm nodes but never announces
+    // itself as one; without a presence record nothing routes work to it.
+    if let RealmConfigLoad::Found(realm_config) = load_realm_config(context, config.realm_id).await
+        && !sync_eligible_node(&realm_config, config.node_id)
+    {
+        *pending = false;
+        return PhaseOutcome {
+            progress: true,
+            error: None,
+        };
+    }
     let result = crate::driver::drive(
         crate::announce_realm_presence::AnnounceRealmPresenceOperation::new(
             crate::announce_realm_presence::AnnounceRealmPresenceConfig {
@@ -1082,14 +1093,26 @@ fn plan_shard_groups(
         && shared_peers
             .iter()
             .all(|peer| node_id.as_bytes() < peer.as_bytes());
+    let device_local = !sync_eligible_node(config, node_id);
     for target in shared_targets(realm_id, node_id) {
+        let wide = realm_wide_target(&target);
+        // A device takes no part in the realm's own topics: it fetches the
+        // realm-wide documents as a routed read and mints the topics that are
+        // its own here, exchanged with nobody.
+        if device_local && wide {
+            continue;
+        }
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        let groups = if realm_wide_target(&target) && !realm_minter {
+        let groups = if wide && !realm_minter {
             &mut plan.shared_join_groups
         } else {
             &mut plan.shared_groups
         };
-        groups.entry(shared_peers.clone()).or_default().push(topic);
+        let peers = match device_local {
+            true => Vec::new(),
+            false => shared_peers.clone(),
+        };
+        groups.entry(peers).or_default().push(topic);
         plan.summary.shared_topics += 1;
     }
 
@@ -1278,12 +1301,14 @@ impl ShardPlan {
     /// Flattens the plan into a deterministic list of bounded work units.
     fn into_units(self) -> Vec<RestoreUnit> {
         let mut units = Vec::new();
+        // A unit without peers still has local work: its topics are ensured and
+        // minted here, and only the peer exchange is skipped.
         let mut push = |kind,
                         peers: Vec<NodeId>,
                         publishers: Vec<NodeId>,
                         retained: BTreeSet<NodeId>,
                         topics: Vec<_>| {
-            if peers.is_empty() || topics.is_empty() {
+            if topics.is_empty() {
                 return;
             }
             for chunk in topics.chunks(SHARD_RESTORE_CHUNK_TOPICS) {
@@ -1385,6 +1410,15 @@ async fn restore_shared(
         );
     }
     if to_ensure.is_empty() {
+        return outcome;
+    }
+    // A unit without peers holds topics this node is alone on: they are minted
+    // here and no peer joins their membership.
+    if unit.peers.is_empty() {
+        if let Err(error) = net_handle.ensure_local_topics(&to_ensure) {
+            warn!(error = %error, "Failed to mint this node's own shared topics");
+            outcome.fail_topics(to_ensure.iter().copied());
+        }
         return outcome;
     }
     if let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, unit.peers.clone()) {
@@ -1627,6 +1661,8 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
+    use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
     use aruna_core::structs::{
         Actor, PlacementOverride, PlacementStrategy, RealmNode, RealmNodeKind,
     };
@@ -1637,6 +1673,8 @@ mod tests {
     use tempfile::tempdir;
 
     const RECOVERY_TEST_GUARD: Duration = Duration::from_secs(5 * 60);
+    /// Real-time grace before a pass that published nothing counts as stuck.
+    const RECOVERY_PASS_GRACE: Duration = Duration::from_secs(5);
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -1670,7 +1708,12 @@ mod tests {
         ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         let (user, minter, follower) = (ids[0], ids[1], ids[2]);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
-        config.ensure_node(user, RealmNodeKind::User);
+        config.ensure_node(
+            user,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
         config.ensure_node(minter, RealmNodeKind::Server);
         config.ensure_node(follower, RealmNodeKind::Server);
 
@@ -1691,6 +1734,46 @@ mod tests {
         assert!(
             !mints_realm_topics(user),
             "a node outside the sync-eligible set is never the realm minter"
+        );
+    }
+
+    // A device may be offline for days, so it must never sit in a peer set the
+    // restore probes and syncs: those failures block the realm's own recovery.
+    // It is a separate best-effort push target instead.
+    #[test]
+    fn units_skip_devices() {
+        let realm_id = RealmId([7; 32]);
+        let (server, other, device) = (node(1), node(2), node(3));
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.ensure_node(server, RealmNodeKind::Server);
+        config.ensure_node(other, RealmNodeKind::Server);
+        config.ensure_node(
+            device,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+
+        for unit in plan_shard_groups(&config, server, realm_id, 0).into_units() {
+            assert!(
+                !unit.peers.contains(&device),
+                "{:?} targets a device",
+                unit.kind
+            );
+        }
+        // The device plans no realm-wide topic and reaches nobody with the ones
+        // that are its own.
+        let planned = plan_shard_groups(&config, device, realm_id, 0);
+        assert_eq!(
+            planned.summary.shared_topics,
+            SHARED_RESTORE_TOPIC_COUNT - 2
+        );
+        assert!(
+            planned
+                .into_units()
+                .iter()
+                .all(|unit| unit.peers.is_empty()),
+            "a device reaches no peer for its own topics"
         );
     }
 
@@ -1870,7 +1953,12 @@ mod tests {
         assert_rebind(&base, &rename, false);
 
         let mut add_user = base.clone();
-        add_user.ensure_node(node(4), RealmNodeKind::User);
+        add_user.ensure_node(
+            node(4),
+            RealmNodeKind::User {
+                owner: UserId::nil(RealmId([7; 32])),
+            },
+        );
         assert_rebind(&base, &add_user, false);
     }
 
@@ -2027,22 +2115,39 @@ mod tests {
         (status, cancelled, driver)
     }
 
-    /// Advances virtual time only while the driver sleeps between passes, so
-    /// deadlines guarding real work inside a pass can never fire spuriously.
-    async fn advance_quiet(status: &RecoveryStatus, step: Duration) {
-        tokio::task::yield_now().await;
-        if status.snapshot().state == RecoveryState::Degraded {
-            tokio::time::advance(step).await;
+    /// Holds virtual time still while a pass runs, so deadlines guarding real
+    /// work inside it cannot fire spuriously. A pass may itself wait on a
+    /// deadline, so the clock resumes once one has stalled for real seconds.
+    #[derive(Default)]
+    struct PassClock {
+        running_since: Option<std::time::Instant>,
+    }
+
+    impl PassClock {
+        async fn tick(&mut self, status: &RecoveryStatus, step: Duration) {
+            tokio::task::yield_now().await;
+            if status.snapshot().state == RecoveryState::Degraded {
+                self.running_since = None;
+                tokio::time::advance(step).await;
+                return;
+            }
+            let since = *self
+                .running_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= RECOVERY_PASS_GRACE {
+                tokio::time::advance(step).await;
+            }
         }
     }
 
     async fn wait_state(status: &RecoveryStatus, expected: RecoveryState) {
         let wait = async {
+            let mut clock = PassClock::default();
             loop {
                 if status.snapshot().state == expected {
                     return;
                 }
-                advance_quiet(status, Duration::from_millis(100)).await;
+                clock.tick(status, Duration::from_millis(100)).await;
             }
         };
         tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
@@ -2052,11 +2157,12 @@ mod tests {
 
     async fn wait_partial(status: &RecoveryStatus, target: u64) {
         let wait = async {
+            let mut clock = PassClock::default();
             loop {
                 if status.pass_total(RecoveryOutcome::Partial) >= target {
                     return;
                 }
-                advance_quiet(status, Duration::from_millis(100)).await;
+                clock.tick(status, Duration::from_millis(100)).await;
             }
         };
         tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
@@ -2068,13 +2174,14 @@ mod tests {
         let wait = async {
             let mut observed = 0;
             let mut previous = None;
+            let mut clock = PassClock::default();
             loop {
                 let partial = status.pass_total(RecoveryOutcome::Partial);
                 if partial <= observed || status.snapshot().state != RecoveryState::Degraded {
-                    advance_quiet(status, Duration::from_millis(100)).await;
+                    clock.tick(status, Duration::from_millis(100)).await;
                     continue;
                 }
-                advance_quiet(status, RECOVERY_RETRY_BASE / 2).await;
+                clock.tick(status, RECOVERY_RETRY_BASE / 2).await;
                 if status.snapshot().state == RecoveryState::Degraded
                     && status.pass_total(RecoveryOutcome::Partial) == partial
                 {
@@ -2104,6 +2211,62 @@ mod tests {
     async fn stop_node(node: RecoveryNode) {
         let _ = node.task_handle.shutdown(RECOVERY_RETRY_MAX).await;
         node.net.shutdown().await;
+    }
+
+    async fn presence_values(node: &RecoveryNode, realm_id: RealmId) -> Vec<DhtEntry> {
+        let event = node
+            .net
+            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+                key: aruna_core::keys::realm_presence_key(&realm_id),
+                realm_filter: Some(realm_id),
+                options: DhtGetOptions::exhaustive(RECOVERY_TEST_GUARD),
+            })))
+            .await;
+        match event {
+            Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => values,
+            _ => Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_skips_presence() {
+        // A User-kind node completes the presence phase without publishing; the
+        // same node publishes once the realm config makes it a Server.
+        let realm_id = RealmId([31u8; 32]);
+        let device = make_node(realm_id, 31).await;
+        let recovery = RecoveryConfig {
+            realm_id,
+            node_id: device.net.node_id(),
+            publish_full_usage: false,
+        };
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        config.ensure_node(
+            device.net.node_id(),
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+        save_config(&device, &config).await;
+
+        let mut pending = true;
+        let outcome = presence_phase(&device.context, &recovery, &mut pending).await;
+        assert!(outcome.progress);
+        assert!(outcome.error.is_none());
+        assert!(!pending);
+        assert!(presence_values(&device, realm_id).await.is_empty());
+
+        let mut promoted = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        promoted.ensure_node(device.net.node_id(), RealmNodeKind::Server);
+        save_config(&device, &promoted).await;
+
+        let mut pending = true;
+        let outcome = presence_phase(&device.context, &recovery, &mut pending).await;
+        assert!(outcome.progress);
+        assert!(!pending);
+        assert!(!presence_values(&device, realm_id).await.is_empty());
+
+        stop_node(device).await;
     }
 
     #[tokio::test]
@@ -2558,9 +2721,9 @@ mod tests {
         let self_id = node(1);
         let management = node(2);
         let server = node(3);
-        let local = node(4);
         let user = node(5);
-        let mut config = RealmConfigDocument::default_for_realm(RealmId([9; 32]), Vec::new());
+        let realm_id = RealmId([9; 32]);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.nodes = vec![
             RealmNode {
                 node_id: self_id.to_string(),
@@ -2572,7 +2735,9 @@ mod tests {
             },
             RealmNode {
                 node_id: user.to_string(),
-                kind: RealmNodeKind::User,
+                kind: RealmNodeKind::User {
+                    owner: UserId::nil(realm_id),
+                },
             },
             RealmNode {
                 node_id: "malformed-eligible-id".to_string(),
@@ -2582,15 +2747,11 @@ mod tests {
                 node_id: server.to_string(),
                 kind: RealmNodeKind::Server,
             },
-            RealmNode {
-                node_id: local.to_string(),
-                kind: RealmNodeKind::Local,
-            },
         ];
 
         assert_eq!(
             shared_topic_peers(&config, self_id),
-            vec![management, server, local]
+            vec![management, server]
         );
     }
 }

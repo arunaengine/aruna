@@ -1,6 +1,7 @@
 use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::OidcError;
 use crate::openapi::ApiDoc;
+use crate::routes::management_relay::ManagementUrlCache;
 use aruna_core::NodeId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::credential_seal::CredentialSealKey;
@@ -21,6 +22,7 @@ use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
 };
+use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::issue_onboarding_sync_ticket::{
@@ -35,13 +37,15 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use utoipa::ToSchema;
@@ -51,11 +55,75 @@ pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 pub(crate) const DOWNLOAD_SLOTS: usize = 256;
+
+#[derive(Debug)]
+struct PublicDns;
+
+impl Resolve for PublicDns {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect::<Vec<_>>();
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|address| !public_address(address.ip()))
+            {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "assistant provider DNS resolved to a non-public address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
+pub(crate) fn public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => public_ipv4(address),
+        IpAddr::V6(address) => public_ipv6(address),
+    }
+}
+
+fn public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, d] = address.octets();
+    !(a == 0
+        || address.is_private()
+        || (a == 100 && b & 0xc0 == 0x40)
+        || address.is_loopback()
+        || address.is_link_local()
+        || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+        || address.is_documentation()
+        || (a == 198 && b & 0xfe == 18)
+        || address.is_multicast()
+        || a & 0xf0 == 0xf0)
+}
+
+fn public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    // Server-side providers use currently assigned global unicast space only.
+    segments[0] & 0xe000 == 0x2000
+        && !matches!(segments, [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..])
+        && !matches!(segments, [0x2002, ..])
+        && !(matches!(segments, [0x2001, b, ..] if b < 0x200)
+            && !(u128::from_be_bytes(address.octets())
+                == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                || u128::from_be_bytes(address.octets())
+                    == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                || matches!(segments, [0x2001, 3, ..] | [0x2001, 4, 0x112, ..])
+                || matches!(segments, [0x2001, b, ..] if (0x20..=0x3f).contains(&b))))
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerState {
     // Contains neccessary drivers for request handling
     driver_ctx: Arc<DriverContext>,
-    // Capabilities defined as in spec: Membership, Server and Local node capabilities
+    // Capabilities defined as in spec: Management, Server and User node capabilities
     node_capabilities: NodeCapabilities,
     // Bounded TTL + LRU cache of trusted issuer decoding keys
     issuer_keys: Arc<IssuerKeyCache>,
@@ -87,6 +155,15 @@ pub struct ServerState {
     // Node shutdown token: long-lived response streams end when it fires, so
     // the ingress drain does not have to wait for client disconnects.
     shutdown_token: CancellationToken,
+    // Present only on a user node: the owner's local wipe latch.
+    device_wipe: Option<Arc<DeviceWipe>>,
+    // Management api urls the management-route relay re-issues against.
+    management_urls: Arc<RwLock<ManagementUrlCache>>,
+    assistant_proxy: bool,
+    assistant_client: Option<reqwest::Client>,
+    chatgpt_refresh_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    chatgpt_issuer: String,
+    chatgpt_base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -126,6 +203,7 @@ pub struct PortalRuntimeState {
 pub struct InterfaceRuntimeState {
     pub rest: Option<RestInterfaceRuntime>,
     pub s3: Option<S3InterfaceRuntime>,
+    pub mcp: Option<McpInterfaceRuntime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +219,12 @@ pub struct RestInterfaceRuntime {
 pub struct S3InterfaceRuntime {
     pub bind_address: SocketAddr,
     pub base_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpInterfaceRuntime {
+    pub bind_address: SocketAddr,
+    pub url: String,
 }
 
 impl ServerState {
@@ -174,6 +258,14 @@ impl ServerState {
             .as_ref()
             .map(|net| net.credential_seal_key())
             .unwrap_or_else(CredentialSealKey::random);
+        let assistant_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none());
+        let assistant_client = if matches!(&node_capabilities, NodeCapabilities::User { .. }) {
+            assistant_client
+        } else {
+            assistant_client.no_proxy().dns_resolver(PublicDns)
+        };
         let state = Self {
             driver_ctx,
             realm_id,
@@ -195,6 +287,13 @@ impl ServerState {
             rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
             download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
             shutdown_token: CancellationToken::new(),
+            device_wipe: None,
+            management_urls: Arc::new(RwLock::new(ManagementUrlCache::default())),
+            assistant_proxy: true,
+            assistant_client: assistant_client.build().ok(),
+            chatgpt_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            chatgpt_issuer: "https://auth.openai.com".to_string(),
+            chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         };
         state.persist_trusted_realms().await;
         state
@@ -203,6 +302,17 @@ impl ServerState {
     pub fn with_shutdown_token(mut self, token: CancellationToken) -> Self {
         self.shutdown_token = token;
         self
+    }
+
+    /// Hands the device plane the wipe latch the process erases through. Only a
+    /// user node is given one; without it `POST /device/wipe` is unavailable.
+    pub fn with_device_wipe(mut self, wipe: Arc<DeviceWipe>) -> Self {
+        self.device_wipe = Some(wipe);
+        self
+    }
+
+    pub fn device_wipe(&self) -> Option<&Arc<DeviceWipe>> {
+        self.device_wipe.as_ref()
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {
@@ -284,7 +394,7 @@ impl ServerState {
                 realm_verifying_key,
                 ..
             } => realm_verifying_key,
-            NodeCapabilities::Local {
+            NodeCapabilities::User {
                 realm_verifying_key,
             } => realm_verifying_key,
         }
@@ -300,6 +410,45 @@ impl ServerState {
 
     pub fn credential_seal_key(&self) -> &CredentialSealKey {
         &self.credential_seal_key
+    }
+
+    pub fn with_assistant_proxy(mut self, enabled: bool) -> Self {
+        self.assistant_proxy = enabled;
+        self
+    }
+
+    pub fn assistant_proxy(&self) -> bool {
+        self.assistant_proxy
+    }
+
+    pub fn assistant_client(&self) -> Option<&reqwest::Client> {
+        self.assistant_client.as_ref()
+    }
+
+    pub(crate) async fn chatgpt_lock(&self, provider_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.chatgpt_refresh_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(provider_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(provider_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    pub fn chatgpt_issuer(&self) -> &str {
+        &self.chatgpt_issuer
+    }
+
+    pub fn chatgpt_base_url(&self) -> &str {
+        &self.chatgpt_base_url
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_chatgpt_urls(mut self, issuer: String, base_url: String) -> Self {
+        self.chatgpt_issuer = issuer;
+        self.chatgpt_base_url = base_url;
+        self
     }
 
     pub fn node_capabilities(&self) -> &NodeCapabilities {
@@ -335,6 +484,17 @@ impl ServerState {
             bind_address,
             base_url: client_base_url_from_advertised_host(advertised_host, bind_address),
         });
+    }
+
+    pub async fn register_mcp_interface(&self) {
+        let mut interface_state = self.interface_state.write().await;
+        interface_state.mcp = interface_state
+            .rest
+            .as_ref()
+            .map(|rest| McpInterfaceRuntime {
+                bind_address: rest.bind_address,
+                url: format!("{}/mcp", rest.base_url),
+            });
     }
 
     pub async fn interface_state(&self) -> InterfaceRuntimeState {
@@ -391,8 +551,25 @@ impl ServerState {
             .ok_or(OidcError::ProviderNotFound)
     }
 
+    /// Peer contacts from the metadata plane; empty while it is not wired.
+    pub fn peer_contacts(&self) -> aruna_operations::metadata::PeerContacts {
+        self.get_ctx()
+            .metadata_handle
+            .as_ref()
+            .map(aruna_operations::metadata::MetadataHandle::peer_contacts)
+            .unwrap_or_default()
+    }
+
     pub fn is_management_node(&self) -> bool {
         matches!(self.node_capabilities, NodeCapabilities::Management { .. })
+    }
+
+    pub fn is_user_node(&self) -> bool {
+        matches!(self.node_capabilities, NodeCapabilities::User { .. })
+    }
+
+    pub(crate) fn management_url_cache(&self) -> &Arc<RwLock<ManagementUrlCache>> {
+        &self.management_urls
     }
 
     pub fn bootstrap_endpoint(&self) -> Option<EndpointAddr> {
@@ -712,9 +889,10 @@ fn client_host_from_ip(ip: std::net::IpAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RestInterfaceRuntime, client_base_url_from_advertised_host,
-        client_base_url_from_bind_address,
+        PublicDns, RestInterfaceRuntime, client_base_url_from_advertised_host,
+        client_base_url_from_bind_address, public_address,
     };
+    use reqwest::dns::Resolve;
 
     #[test]
     fn rest_runtime_uses_public_url() {
@@ -725,6 +903,33 @@ mod tests {
         assert_eq!(
             runtime.api_base_url,
             "https://api.node-1.v3.aruna-engine.org/api/v1"
+        );
+    }
+
+    #[test]
+    fn classifies_public_addresses() {
+        assert!(public_address("8.8.8.8".parse().unwrap()));
+        assert!(public_address("2001:4860:4860::8888".parse().unwrap()));
+        for address in [
+            "127.0.0.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "::1",
+            "fc00::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!public_address(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_rejects_localhost() {
+        assert!(
+            PublicDns
+                .resolve("localhost".parse().unwrap())
+                .await
+                .is_err()
         );
     }
 

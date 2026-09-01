@@ -55,7 +55,7 @@ pub fn admin_outbox_prefix(node_id: NodeId) -> Key {
 
 pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
     let mut bytes = outbox_prefix(&record.event).to_vec();
-    if let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event {
+    if let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event {
         bytes.extend_from_slice(event.origin_node_id.as_bytes());
         bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
     }
@@ -78,7 +78,7 @@ pub fn revocation_index_entry(record: &DocumentSyncOutboxRecord) -> (String, Key
 }
 
 fn revocation_index_key(record: &DocumentSyncOutboxRecord) -> Option<Key> {
-    let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event else {
+    let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event else {
         return None;
     };
     matches!(
@@ -447,47 +447,43 @@ mod tests {
     }
 
     fn user_admin_event(user_id: UserId, origin_seq: u64) -> DocumentSyncOutboxEvent {
-        DocumentSyncOutboxEvent::AdminOperation {
-            event: Box::new(AdminDocumentEvent {
-                event_id: Ulid::from_parts(1, u128::from(origin_seq)),
-                target: AdminDocumentTarget::User { user_id },
-                origin_node_id: node(1),
-                origin_seq,
-                observed: AdminDocumentClock::default(),
-                actor: Actor {
-                    node_id: node(1),
-                    user_id,
-                    realm_id: user_id.realm_id,
-                },
-                op: AdminDocumentOperation::UserNameSet {
-                    name: format!("user-{origin_seq}"),
-                },
-            }),
-        }
+        DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+            event_id: Ulid::from_parts(1, u128::from(origin_seq)),
+            target: AdminDocumentTarget::User { user_id },
+            origin_node_id: node(1),
+            origin_seq,
+            observed: AdminDocumentClock::default(),
+            actor: Actor {
+                node_id: node(1),
+                user_id,
+                realm_id: user_id.realm_id,
+            },
+            op: AdminDocumentOperation::UserNameSet {
+                name: format!("user-{origin_seq}"),
+            },
+        })
     }
 
     fn revocation_event(origin_seq: u64) -> DocumentSyncOutboxEvent {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let user_id = UserId::local(Ulid::from_parts(7, 1), realm_id);
-        DocumentSyncOutboxEvent::AdminOperation {
-            event: Box::new(AdminDocumentEvent {
-                event_id: Ulid::from_parts(2, u128::from(origin_seq)),
-                target: AdminDocumentTarget::RealmConfig { realm_id },
-                origin_node_id: node(1),
-                origin_seq,
-                observed: AdminDocumentClock::default(),
-                actor: Actor {
-                    node_id: node(1),
-                    user_id,
-                    realm_id,
-                },
-                op: AdminDocumentOperation::RealmConfigTokenRevoked {
-                    token_hash: aruna_core::auth::bearer_token_hash(&format!("token-{origin_seq}")),
-                    expires_at: 100,
-                    token_owner: user_id,
-                },
-            }),
-        }
+        DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+            event_id: Ulid::from_parts(2, u128::from(origin_seq)),
+            target: AdminDocumentTarget::RealmConfig { realm_id },
+            origin_node_id: node(1),
+            origin_seq,
+            observed: AdminDocumentClock::default(),
+            actor: Actor {
+                node_id: node(1),
+                user_id,
+                realm_id,
+            },
+            op: AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash(&format!("token-{origin_seq}")),
+                expires_at: 100,
+                token_owner: user_id,
+            },
+        })
     }
 
     fn placement(shard: u32) -> aruna_core::structs::PlacementRef {

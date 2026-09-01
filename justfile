@@ -16,8 +16,12 @@ local-cluster-oidc nodes="3":
 
 # Realm of N local nodes with Keycloak and the portal on its own port per node; prints every url and login.
 preview portal_dir=env_var_or_default("ARUNA_TEST_DEPLOY_PORTAL_DIR", "") nodes="3":
-	bash scripts/local_cluster_deploy.sh --with-keycloak --node-count {{nodes}} --auto-portal-dir --portal-dir "{{portal_dir}}"
+	bash scripts/local_cluster_deploy.sh --with-keycloak --node-count "{{nodes}}" --auto-portal-dir --portal-dir "{{portal_dir}}"
 
 # Same without Keycloak, so the portal runs in guest mode; prints every url and the admin credentials.
 preview-no-oidc portal_dir=env_var_or_default("ARUNA_TEST_DEPLOY_PORTAL_DIR", "") nodes="3":
-	bash scripts/local_cluster_deploy.sh --node-count {{nodes}} --auto-portal-dir --portal-dir "{{portal_dir}}"
+	bash scripts/local_cluster_deploy.sh --node-count "{{nodes}}" --auto-portal-dir --portal-dir "{{portal_dir}}"
+
+# Stops whatever a cluster recipe left running: the deploy script, every node by pid file, then Keycloak.
+stop:
+	bash scripts/local_cluster_stop.sh

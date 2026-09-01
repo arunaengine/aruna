@@ -248,9 +248,7 @@ impl CreateGroupOperation {
                 self.config.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event),
-                },
+                DocumentSyncOutboxEvent::admin(event),
                 placement,
                 true,
             )
@@ -988,7 +986,7 @@ mod test {
         let events = outbox_records
             .iter()
             .map(|record| match &record.event {
-                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
                 other => panic!("unexpected outbox event: {other:?}"),
             })
             .collect::<Vec<_>>();

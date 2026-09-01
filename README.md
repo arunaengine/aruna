@@ -34,6 +34,7 @@ Aruna is a federated peer-to-peer data management framework that enables organiz
 - **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering
 - **Built-in replication and synchronization**: Metadata and data are replicated across nodes with automatic conflict resolution.
 - **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting
+- **AI assistant tools**: Authenticated [MCP](docs/mcp.md) access to Aruna context, data, metadata, and compute operations.
 - **Easy deployment**: Run a node as a single binary or as a multi-cluster deployment.
 
 ## Architecture and Goals
@@ -125,6 +126,17 @@ Useful overrides:
 
 - `ARUNA_TEST_DEPLOY_BASE_PORT` shifts the entire local port range
 - `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` exits once the cluster is ready instead of keeping it running
+
+Ctrl-C stops the cluster again. A deployment that outlived its terminal is
+stopped with:
+
+```bash
+just stop
+```
+
+It interrupts a deploy script that still monitors the nodes, stops every node
+named by a pid file under `target/test-deploy/`, and removes the Keycloak
+compose project. Logs, `summary.txt` and `credentials.txt` stay in place.
 
 `just local-cluster-oidc` extends the same 3-node startup check with a local Keycloak instance.
 

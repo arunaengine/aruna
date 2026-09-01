@@ -369,6 +369,17 @@ pub struct MetadataRawRoCrateResponse {
     pub projected_event_id: Option<String>,
     pub context_digest: String,
     pub dataset_digest: Option<String>,
+    /// Present only while the merged graph fails profile validation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged: Option<MetadataMergedRoCrateResponse>,
+}
+
+/// The merged graph while it is invalid: what the editor opens to fix it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataMergedRoCrateResponse {
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+    pub findings: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -445,6 +456,10 @@ pub struct MetadataSearchHitResponse {
     /// Query-relevant text excerpt, populated by the answering node. Absent when
     /// the resource has no indexed literals to window.
     pub snippet: Option<String>,
+    /// `rdf:type` IRIs of the matched subject, at most eight, so a file entity
+    /// can be told apart from the dataset it belongs to. Empty when the
+    /// answering node knows no named type for it.
+    pub subject_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -502,10 +517,6 @@ pub struct MetadataReferenceItem {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataReferencesResponse {
     pub references: Vec<MetadataReferenceItem>,
-    /// Reserved for pagination. Always `null` in v1: results are capped at
-    /// `limit` and continuation is not yet supported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1567,7 +1578,8 @@ pub async fn delete_metadata_document(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     run_delete_metadata_document(
         &ctx,
         Actor {
@@ -1603,9 +1615,15 @@ unreadable one because both answer 404.
   export view.
 - The projected views (`full`, `summary`, `page`) require the document's graph to be materialized
   and answer 503 while a recently accepted write is still being projected.
-- The `raw` view returns the last accepted revision together with its winning event id,
+- The `raw` view returns the displayed revision together with the last event merged into it,
   projection state (`pending`, `materialized` or `failed`) and digests, so it is the view that can
   be read during that window.
+- Metadata graphs merge as OR-Sets, and only a valid crate is displayed. When the merged graph
+  fails profile validation the displayed revision stays at the last valid render and the `raw`
+  view also carries `merged` with the invalid render and its finding count, which is what an
+  editor opens so the owner can fix it.
+- The projected views (`full`, `summary`, `page`) render the merged graph, so they show the merged
+  state even while `merged` is present.
 - The pagination fields of the returned crate are only populated for the `page` view.
 - In the `summary` and `page` views the crate's root identifier is rewritten to a view-specific
   identifier carrying the requested view and cursor, so a partial crate is not mistaken for the
@@ -1963,7 +1981,8 @@ pub async fn replace_metadata_rocrate(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -2073,7 +2092,8 @@ pub async fn add_metadata_data_entity(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -2180,7 +2200,8 @@ pub async fn add_metadata_contextual_entity(
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = local_write_record(&state, &auth, document_id).await?;
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -2480,6 +2501,8 @@ so an anonymous request returns fewer documents.
   reported as `truncated`; `next_cursor` is null once the results are exhausted.
 - Hits come from each node's own index, so a document whose write was only just accepted may not
   be findable yet.
+- One hit is one matched RDF subject, so a crate's root dataset and its file entities match
+  separately; `subject_types` carries that subject's `rdf:type` IRIs to tell them apart.
 - `conforms_to` matches the RO-Crate 1.2 and 1.3 specification IRIs and the RO-Crate community
   profiles under `https://w3id.org/ro/wfrun/` and
   `https://w3id.org/workflowhub/workflow-ro-crate/` exactly, without treating them as registered
@@ -2518,7 +2541,19 @@ so an anonymous request returns fewer documents.
                                     "subject_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
                                     "score": 0.87,
                                     "title": "Proteomics Run 42",
-                                    "snippet": "Metadata record for LC-MS run 42"
+                                    "snippet": "Metadata record for LC-MS run 42",
+                                    "subject_types": ["http://schema.org/Dataset"]
+                                },
+                                {
+                                    "document_id": "01JMETADATA0123456789ABCDE",
+                                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                                    "document_path": "datasets/proteomics/run-42",
+                                    "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                    "subject_iri": "./raw/run-42.mzML",
+                                    "score": 0.52,
+                                    "title": "run-42.mzML",
+                                    "snippet": "LC-MS run 42 raw spectra",
+                                    "subject_types": ["http://schema.org/MediaObject"]
                                 }
                             ],
                             "next_cursor": "eyJmIjoiMDFKIn0.c2lnbmF0dXJl",
@@ -2541,7 +2576,8 @@ so an anonymous request returns fewer documents.
                                     "subject_iri": "https://w3id.org/aruna/01JMETADATA9876543210ZYXWV",
                                     "score": 0.41,
                                     "title": "Proteomics Profile",
-                                    "snippet": null
+                                    "snippet": null,
+                                    "subject_types": ["http://schema.org/Dataset"]
                                 }
                             ],
                             "next_cursor": null,
@@ -2616,8 +2652,7 @@ referencing document is simply omitted.
   document's summary is returned as a single predicate-less entry.
 
 **Limits**
-- Results are capped at `limit` and there is no continuation: `next_cursor` is always absent in
-  this version."#,
+- Results are capped at `limit` and there is no continuation."#,
     params(
         ("iri" = String, Query, description = "Referenced object IRI to find backlinks for, such as a document graph IRI or any IRI appearing as a triple object. Must be a valid absolute IRI"),
         ("predicate" = Option<String>, Query, description = "Optional exact predicate IRI filter, such as http://schema.org/conformsTo. Must be a valid absolute IRI and is matched exactly"),
@@ -2696,14 +2731,15 @@ pub async fn metadata_references(
     Ok((StatusCode::OK, Json(map_references_response(execution))))
 }
 
-fn map_references_response(execution: MetadataReferencesExecution) -> MetadataReferencesResponse {
+pub(crate) fn map_references_response(
+    execution: MetadataReferencesExecution,
+) -> MetadataReferencesResponse {
     MetadataReferencesResponse {
         references: execution
             .references
             .into_iter()
             .map(map_reference_entry)
             .collect(),
-        next_cursor: execution.next_cursor,
     }
 }
 
@@ -2963,13 +2999,13 @@ fn map_preflight_response(
     }
 }
 
-fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
+pub(crate) fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     MetaResourceId::parse(document_id)
         .map(|id| id.as_ulid())
         .map_err(|_| ServerError::BadRequest)
 }
 
-async fn run_list_metadata_documents(
+pub(crate) async fn run_list_metadata_documents(
     state: &ServerState,
     auth: Option<AuthContext>,
     query: ListMetadataQuery,
@@ -3049,7 +3085,7 @@ fn format_timestamp_ms(timestamp_ms: u64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
 }
 
-fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {
+pub(crate) fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {
     if !value.is_object() {
         return Err(ServerError::BadRequest);
     }
@@ -3069,7 +3105,7 @@ fn serialize_jsonld_entity(value: &Value) -> ServerResult<String> {
 /// A write that could neither be applied locally nor forwarded to a holder is a
 /// loud failure: the caller is told it was not accepted, rather than being
 /// answered `201` for a record that can never replicate.
-fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
+pub(crate) fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
     match error {
         MetadataWriteError::Unauthorized => ServerError::Unauthorized,
         MetadataWriteError::Forbidden => ServerError::Forbidden,
@@ -3083,7 +3119,7 @@ fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
     }
 }
 
-pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerError {
+pub(crate) fn map_create_error(error: CreateMetadataDocumentError) -> ServerError {
     match error {
         CreateMetadataDocumentError::MetadataError(metadata_error) => {
             map_metadata_error(metadata_error)
@@ -3106,7 +3142,7 @@ pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerErro
     }
 }
 
-fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
+pub(crate) fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
     match error {
         UpdateMetadataDocumentError::DocumentNotFound => ServerError::NotFound,
         UpdateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
@@ -3126,9 +3162,9 @@ pub(crate) fn forwarded_auth_token(
         .map_err(map_metadata_api_error)
 }
 
-fn map_metadata_error(error: MetadataError) -> ServerError {
+pub(crate) fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
-        MetadataError::InvalidInput(_) => ServerError::BadRequest,
+        MetadataError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
         MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
         MetadataError::ProfileValidation(findings) => {
             ServerError::MetadataProfileValidation(findings)
@@ -3163,7 +3199,7 @@ pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<Metadata
     })
 }
 
-fn bearer_token_to_string(
+pub(crate) fn bearer_token_to_string(
     bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
 ) -> Option<String> {
     bearer_token.map(|carrier| carrier.as_str().to_string())
@@ -3182,20 +3218,23 @@ async fn ensure_record_writable(
     state: &ServerState,
     auth: &AuthContext,
     record: &MetadataRegistryRecord,
+    extras: PolicyRequestExtras,
 ) -> ServerResult<()> {
-    ensure_permission(
+    crate::auth::ensure_permission_with(
         state,
-        auth.clone(),
+        auth,
         record.permission_path.clone(),
         Permission::WRITE,
+        extras,
     )
     .await
 }
 
-async fn local_write_record(
+pub(crate) async fn local_write_record(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
+    extras: PolicyRequestExtras,
 ) -> ServerResult<Option<MetadataRegistryRecord>> {
     let context = state.get_ctx();
     if !run_origin_holds_document(
@@ -3221,7 +3260,7 @@ async fn local_write_record(
                 return Err(ServerError::InternalError(error.to_string()));
             }
         };
-    ensure_record_writable(state, auth, &record).await?;
+    ensure_record_writable(state, auth, &record, extras).await?;
     Ok(Some(record))
 }
 
@@ -3239,7 +3278,7 @@ async fn ensure_permission(
     crate::auth::ensure_permission(state, &auth, path, required_permission).await
 }
 
-async fn load_metadata_record_by_document(
+pub(crate) async fn load_metadata_record_by_document(
     state: &ServerState,
     document_id: Ulid,
 ) -> ServerResult<MetadataRegistryRecord> {
@@ -3267,7 +3306,7 @@ fn map_rocrate_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCra
     }
 }
 
-fn map_rocrate_export_response(
+pub(crate) fn map_rocrate_export_response(
     export: ExportMetadataRoCrateResult,
     params: &MetadataRoCrateExportParams,
     view: MetadataRoCrateView,
@@ -3316,6 +3355,16 @@ fn map_rocrate_export_response(
             projected_event_id: raw.projected_event_id.map(|event_id| event_id.to_string()),
             context_digest: hex::encode(raw.revision.context_digest),
             dataset_digest: dataset_digest.map(hex::encode),
+            merged: raw
+                .revision
+                .merged
+                .map(|merged| {
+                    Ok::<_, ServerError>(MetadataMergedRoCrateResponse {
+                        rocrate: parse_jsonld(merged.jsonld)?,
+                        findings: merged.findings,
+                    })
+                })
+                .transpose()?,
         })),
     }
 }
@@ -3408,7 +3457,7 @@ fn rewrite_identifier_value(
     }
 }
 
-fn map_query_results(
+pub(crate) fn map_query_results(
     results: MetadataQueryResults,
     fanout_stats: MetadataFanoutStats,
 ) -> ServerResult<MetadataQueryResponse> {
@@ -3454,6 +3503,7 @@ pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitRespons
         score: hit.score,
         title: hit.title,
         snippet: hit.snippet,
+        subject_types: hit.subject_types,
     }
 }
 
@@ -3930,6 +3980,38 @@ mod tests {
             "snippet should window the matched query term: {:?}",
             dataset_hit.snippet
         );
+        assert_eq!(
+            dataset_hit.subject_types,
+            vec!["http://schema.org/Dataset".to_string()]
+        );
+
+        let (_, Json(parts)) = search_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: "file".to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        // A file entity matches as its own subject, so only its rdf:type tells
+        // it apart from the dataset it belongs to.
+        let file_hit = parts
+            .hits
+            .iter()
+            .find(|hit| hit.subject_iri.ends_with("file-1.txt"))
+            .expect("file entity matches as its own subject");
+        assert_eq!(
+            file_hit.subject_types,
+            vec!["http://schema.org/MediaObject".to_string()]
+        );
+        assert_eq!(file_hit.document_id, document_id);
 
         let (_, Json(conforming)) = search_metadata(
             State(test.state.clone()),
@@ -4397,6 +4479,7 @@ mod tests {
             user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let stranger_result = get_metadata_document(
             State(test.state.clone()),
@@ -5261,6 +5344,8 @@ mod tests {
             )),
         )
         .await;
+        // A device forwards only for the owner its realm config names, so
+        // another user's token is refused before any group check.
         assert!(matches!(denied, Err(ServerError::Forbidden)));
 
         let bearer = || {
@@ -5268,6 +5353,35 @@ mod tests {
                 test.valid_bearer_token.clone(),
             )))
         };
+
+        // The owner binding does not replace the group check: a group the owner
+        // holds no role in is still refused at the ingress.
+        let foreign_group = Ulid::generate();
+        install_group_documents(
+            &test.remote,
+            test.auth.realm_id,
+            test.denied_auth.user_id,
+            foreign_group,
+        )
+        .await;
+        let unpermitted = create_metadata_document(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            bearer(),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: foreign_group.to_string(),
+                    path: "datasets/user-unpermitted".to_string(),
+                    name: "User Unpermitted".to_string(),
+                    description: "Forwarded write into a foreign group".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: None,
+                    public: false,
+                },
+            )),
+        )
+        .await;
+        assert!(matches!(unpermitted, Err(ServerError::Forbidden)));
         let missing = MetaResourceId::from_parts(
             1,
             PlacementHandle::new(METADATA_HANDLE).unwrap(),
@@ -5471,6 +5585,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         SearchPaginationCluster {
             auth,
@@ -6303,18 +6418,27 @@ mod tests {
             .net
             .add_peer_addr(coordinator.net.endpoint_addr())
             .await;
-        install_distributed_realm_config(&nodes, realm_id, Some(coordinator.net.node_id())).await;
+        // The device forwards for the owner its realm config names, so the
+        // fixture binds it to the user whose token the writes carry.
+        install_distributed_realm_config(
+            &nodes,
+            realm_id,
+            Some((coordinator.net.node_id(), user_id)),
+        )
+        .await;
         install_metadata_auth_documents(&remote, realm_id, user_id, group_id).await;
 
         let auth = AuthContext {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let denied_auth = AuthContext {
             user_id: denied_user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         create_test_metadata_document(
             remote.state.clone(),
@@ -6393,7 +6517,7 @@ mod tests {
                 context,
                 realm_id,
                 net.node_id(),
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -6411,15 +6535,16 @@ mod tests {
     async fn install_distributed_realm_config(
         nodes: &[&DistributedMetadataNode],
         realm_id: RealmId,
-        user_node: Option<aruna_core::NodeId>,
+        user_node: Option<(aruna_core::NodeId, aruna_core::UserId)>,
     ) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         for (band, node) in nodes.iter().enumerate() {
-            let kind = if Some(node.net.node_id()) == user_node {
-                RealmNodeKind::User
-            } else {
-                RealmNodeKind::Server
+            let kind = match user_node {
+                Some((node_id, owner)) if node_id == node.net.node_id() => {
+                    RealmNodeKind::User { owner }
+                }
+                _ => RealmNodeKind::Server,
             };
             config.ensure_node(node.net.node_id(), kind);
             config.seed_job_control(node.net.node_id(), band as u32);
@@ -6456,25 +6581,41 @@ mod tests {
             user_id,
             realm_id,
         };
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "distributed-metadata-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: user_id,
-        };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let context = node.state.get_ctx();
-
         write_doc(
-            &context,
+            &node.state.get_ctx(),
             AUTH_KEYSPACE,
             (*realm_id.as_bytes()).into(),
             realm_auth.to_bytes(&actor).unwrap().into(),
         )
         .await;
+        install_group_documents(node, realm_id, user_id, group_id).await;
+    }
+
+    /// A group owned by `owner`, with its authorization document, so a caller
+    /// outside it is refused by the group check rather than by its absence.
+    async fn install_group_documents(
+        node: &DistributedMetadataNode,
+        realm_id: RealmId,
+        owner: aruna_core::UserId,
+        group_id: Ulid,
+    ) {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "distributed-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let context = node.state.get_ctx();
+
         write_doc(
             &context,
             AUTH_KEYSPACE,
@@ -6672,7 +6813,6 @@ mod tests {
         );
         assert_eq!(entry.title.as_deref(), Some("Alpha"));
         assert!(!entry.subject_iris.is_empty());
-        assert!(response.next_cursor.is_none());
     }
 
     #[tokio::test]
@@ -6742,6 +6882,7 @@ mod tests {
             user_id: foreign_user,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let visible = create_linking_doc(
@@ -6854,7 +6995,6 @@ mod tests {
         .await
         .unwrap();
         assert!(response.references.is_empty());
-        assert!(response.next_cursor.is_none());
     }
 
     #[tokio::test]
@@ -7020,6 +7160,7 @@ mod tests {
             user_id: foreign_user,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let w3id = preflight_w3id([32u8; 32]);
         let visible_id = create_linking_doc(
@@ -7324,6 +7465,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -7422,7 +7565,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -7437,6 +7580,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             group_id,
             state,
@@ -7556,7 +7700,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -7571,6 +7715,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             group_id,
             state,
@@ -7608,7 +7753,7 @@ mod tests {
                 }),
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),

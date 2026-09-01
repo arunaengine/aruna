@@ -886,6 +886,7 @@ fn relationship_job(
                     user_id: relationship.created_by,
                     realm_id: relationship.created_by.realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 replicate_delete_markers: relationship.replicate_deletes,
                 mode: ReplicationMode::Live,
@@ -1349,6 +1350,7 @@ async fn process_blob_replication_job(
             user_id: relationship.created_by,
             realm_id: relationship.created_by.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let source_auth_context = job_source_auth(job, &creator).clone();
         let source_authorization = match load_source_authorization(
@@ -2674,6 +2676,7 @@ mod tests {
             user_id: user(),
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -3276,6 +3279,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_parts(9, 9), realm()),
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         };
         let context = DriverContext {
             storage_handle: storage.clone(),
@@ -3367,6 +3371,7 @@ mod tests {
             user_id: relationship.created_by,
             realm_id: relationship.source.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let Err((SourceAuthorizationError::Denied, group_id)) = load_source_authorization(
             &context,
@@ -3894,6 +3899,7 @@ mod tests {
                 pattern: "**".to_string(),
                 permission: Permission::READ,
             }]),
+            session: None,
         };
         let skipped = relationship(6, 2, None, true);
         let mut included = relationship(7, 4, None, true);

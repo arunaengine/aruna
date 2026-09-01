@@ -370,6 +370,46 @@ impl AsyncSliceReader for OpenDalReader {
     }
 }
 
+/// Random-access reader over one regular file. A device serves its own
+/// observations from the owner's filesystem, so the bao encoder needs a reader
+/// that is not backed by the blob store at all.
+pub struct LocalFileReader {
+    file: tokio::fs::File,
+    size: u64,
+}
+
+impl LocalFileReader {
+    pub async fn open(path: &std::path::Path, size: u64) -> std::io::Result<Self> {
+        Ok(Self {
+            file: tokio::fs::File::open(path).await?,
+            size,
+        })
+    }
+}
+
+impl AsyncSliceReader for LocalFileReader {
+    /// A short read at the end of the file is allowed here, which is what
+    /// separates this from `read_exact_at`.
+    async fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        let readable = usize::try_from(self.size.saturating_sub(offset))
+            .unwrap_or(usize::MAX)
+            .min(len);
+        self.read_exact_at(offset, readable).await
+    }
+
+    async fn read_exact_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        self.file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut bs = vec![0u8; len];
+        self.file.read_exact(&mut bs).await?;
+        Ok(Bytes::from(bs))
+    }
+
+    async fn size(&mut self) -> std::io::Result<u64> {
+        Ok(self.size)
+    }
+}
+
 impl OpenDalReader {
     pub async fn new(
         operator: &Operator,

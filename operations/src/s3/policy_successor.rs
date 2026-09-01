@@ -925,6 +925,7 @@ mod tests {
                 user_id: user_id(),
                 realm_id: realm_id(),
                 path_restrictions: None,
+                session: None,
             },
             subject: subject(),
             resolved: BTreeMap::new(),

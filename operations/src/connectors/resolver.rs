@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 
-use aruna_core::effects::Effect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::SourceConnectorResolutionError;
-use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    ResolvedSourceAccess, ResolvedSourceConnector, SourceConnector, SourceConnectorKind,
-    StagingStrategy, VersionSourceBinding,
+    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory, ResolvedSourceAccess,
+    ResolvedSourceConnector, SourceConnector, SourceConnectorKind, StagingStrategy,
+    VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -47,6 +49,7 @@ enum ResolveSourceConnectorState {
 enum ResolveVersionSourceBindingState {
     Init,
     ReadSecret,
+    ReadOfferedDirectory,
     Finish,
     Error,
 }
@@ -176,6 +179,15 @@ impl ResolveVersionSourceBindingOperation {
             return smallvec![];
         }
 
+        if self.input.source.descriptor.kind == SourceConnectorKind::LocalDirectory {
+            let effect = match read_offered_effect(&self.input.source) {
+                Ok(effect) => effect,
+                Err(error) => return self.emit_error(error),
+            };
+            self.state = ResolveVersionSourceBindingState::ReadOfferedDirectory;
+            return smallvec![effect];
+        }
+
         let effect = match read_source_binding_secret_effect(&self.input.source, None) {
             Ok(effect) => effect,
             Err(error) => return self.emit_error(error),
@@ -187,6 +199,17 @@ impl ResolveVersionSourceBindingOperation {
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
         let access = match resolve_source_binding_access(&self.input.source, event) {
+            Ok(access) => access,
+            Err(error) => return self.emit_error(error),
+        };
+
+        self.state = ResolveVersionSourceBindingState::Finish;
+        self.output = Some(Ok(access));
+        smallvec![]
+    }
+
+    fn handle_offered_read(&mut self, event: Event) -> Effects {
+        let access = match resolve_offered_access(&self.input.source, event) {
             Ok(access) => access,
             Err(error) => return self.emit_error(error),
         };
@@ -251,6 +274,9 @@ impl Operation for ResolveVersionSourceBindingOperation {
         match self.state {
             ResolveVersionSourceBindingState::Init => self.handle_init(),
             ResolveVersionSourceBindingState::ReadSecret => self.handle_secret_read(event),
+            ResolveVersionSourceBindingState::ReadOfferedDirectory => {
+                self.handle_offered_read(event)
+            }
             ResolveVersionSourceBindingState::Finish => smallvec![],
             ResolveVersionSourceBindingState::Error => self.abort(),
         }
@@ -362,6 +388,13 @@ pub(crate) fn build_source_access_from_binding(
     if source.descriptor.kind == SourceConnectorKind::ArunaNative {
         return build_native_access(source);
     }
+    // An offered directory resolves only against this device's own registration,
+    // which needs a storage read, so the operation owns that path.
+    if source.descriptor.kind == SourceConnectorKind::LocalDirectory {
+        return Err(SourceConnectorResolutionError::UnsupportedConnectorKind(
+            SourceConnectorKind::LocalDirectory,
+        ));
+    }
 
     build_source_access(
         source.descriptor.kind,
@@ -422,6 +455,47 @@ fn build_native_access(
         config,
         path: source.descriptor.source_path.clone(),
         version: Some(version.to_string()),
+    })
+}
+
+/// Reads the device-local registration a local-directory binding names. The
+/// binding carries the offered bucket, never a path: the root exists only here.
+pub(crate) fn read_offered_effect(
+    source: &VersionSourceBinding,
+) -> Result<Effect, SourceConnectorResolutionError> {
+    if source.strategy != StagingStrategy::Reference || source.connector_id.is_some() {
+        return Err(SourceConnectorResolutionError::ResolveFailed);
+    }
+    validate_source_path(&source.descriptor.source_path, false)?;
+    let bucket = source
+        .descriptor
+        .public_config
+        .get(OFFERED_DIRECTORY_BUCKET)
+        .filter(|bucket| !bucket.is_empty())
+        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+    Ok(Effect::Storage(StorageEffect::Read {
+        key_space: OFFERED_DIRECTORY_KEYSPACE.to_string(),
+        key: bucket.as_bytes().into(),
+        txn_id: None,
+    }))
+}
+
+fn resolve_offered_access(
+    source: &VersionSourceBinding,
+    event: Event,
+) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        return Err(SourceConnectorResolutionError::ResolveFailed);
+    };
+    let Some(value) = value else {
+        return Err(SourceConnectorResolutionError::NotFound);
+    };
+    let record = OfferedDirectory::from_bytes(&value)?;
+    Ok(ResolvedSourceAccess::OpenDal {
+        kind: SourceConnectorKind::LocalDirectory,
+        config: HashMap::from([(OFFERED_DIRECTORY_ROOT.to_string(), record.root)]),
+        path: source.descriptor.source_path.clone(),
+        version: None,
     })
 }
 
@@ -879,6 +953,58 @@ mod tests {
         assert_eq!(
             build_source_access_from_binding(&source, None),
             Err(SourceConnectorResolutionError::ResolveFailed)
+        );
+    }
+
+    fn offered_binding(bucket: &str, connector_id: Option<Ulid>) -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: aruna_core::structs::PortableSourceDescriptor {
+                kind: SourceConnectorKind::LocalDirectory,
+                public_config: HashMap::from([(
+                    OFFERED_DIRECTORY_BUCKET.to_string(),
+                    bucket.to_string(),
+                )]),
+                source_path: "photos/one.jpg".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id,
+        }
+    }
+
+    // The root lives only in the device-local registration, so the sync builder
+    // must refuse the kind outright instead of inventing an access from it.
+    #[test]
+    fn offered_needs_registration() {
+        assert_eq!(
+            build_source_access_from_binding(&offered_binding("photos", None), None),
+            Err(SourceConnectorResolutionError::UnsupportedConnectorKind(
+                SourceConnectorKind::LocalDirectory
+            ))
+        );
+    }
+
+    #[test]
+    fn offered_read_rejects() {
+        assert!(read_offered_effect(&offered_binding("photos", Some(Ulid::generate()))).is_err());
+        assert!(read_offered_effect(&offered_binding("", None)).is_err());
+        assert!(read_offered_effect(&offered_binding("photos", None)).is_ok());
+    }
+
+    // A registration that is not there must not resolve to some other root.
+    #[test]
+    fn offered_missing_registration() {
+        assert_eq!(
+            resolve_offered_access(
+                &offered_binding("photos", None),
+                Event::Storage(StorageEvent::ReadResult {
+                    key: Vec::<u8>::new().into(),
+                    value: None,
+                })
+            ),
+            Err(SourceConnectorResolutionError::NotFound)
         );
     }
 }

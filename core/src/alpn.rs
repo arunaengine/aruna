@@ -4,6 +4,30 @@
 //! differ never negotiates the ALPN, so it fails the connection instead of
 //! decoding foreign bytes. There is no fallback ALPN and no downgrade.
 
+use crate::structs::RealmNodeKind;
+
+/// Which side of a connection is being judged. The same table answers all
+/// three, so a protocol that is one-directional for a node kind says so in one
+/// place instead of in three checks that can drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlpnRole {
+    /// A remote key dialing this node.
+    PeerInbound,
+    /// This node accepting the protocol for itself.
+    LocalServe,
+    /// This node dialing the protocol at someone else.
+    LocalDial,
+}
+
+impl AlpnRole {
+    /// Every role, so the matrix contract test covers all of them.
+    pub const ALL: [AlpnRole; 3] = [
+        AlpnRole::PeerInbound,
+        AlpnRole::LocalServe,
+        AlpnRole::LocalDial,
+    ];
+}
+
 /// Application Layer Protocol Negotiation identifiers for Aruna streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Alpn {
@@ -26,6 +50,43 @@ pub enum Alpn {
 }
 
 impl Alpn {
+    /// Every protocol, so a matrix or dispatch review can iterate all of them.
+    pub const ALL: [Alpn; 8] = [
+        Alpn::Dht,
+        Alpn::Bao,
+        Alpn::DocumentSync,
+        Alpn::Metadata,
+        Alpn::NativeReference,
+        Alpn::Notification,
+        Alpn::Shard,
+        Alpn::JobControl,
+    ];
+
+    /// The ALPN x node-kind allow matrix, consulted on both sides of every
+    /// connection. `None` is a key the realm config does not name: it keeps the
+    /// pre-matrix provisional behaviour and is bounded by admission instead.
+    ///
+    /// A `User` device speaks the read and forward surface only. Document sync
+    /// and shard exchange are realm infrastructure a device never touches in
+    /// any direction; job control it dials for its owner but never serves.
+    pub const fn permits(&self, kind: Option<&RealmNodeKind>, role: AlpnRole) -> bool {
+        match kind {
+            None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,
+            Some(RealmNodeKind::User { .. }) => match self {
+                Alpn::Dht
+                | Alpn::Bao
+                | Alpn::Metadata
+                | Alpn::NativeReference
+                | Alpn::Notification => true,
+                Alpn::DocumentSync | Alpn::Shard => false,
+                Alpn::JobControl => match role {
+                    AlpnRole::PeerInbound | AlpnRole::LocalDial => true,
+                    AlpnRole::LocalServe => false,
+                },
+            },
+        }
+    }
+
     pub const fn as_bytes(&self) -> &'static [u8] {
         match self {
             Alpn::Dht => b"aruna/dht/2",
@@ -101,6 +162,18 @@ mod tests {
             Alpn::from_bytes(Alpn::JobControl.as_bytes()),
             Some(Alpn::JobControl)
         );
+    }
+
+    #[test]
+    fn all_is_complete() {
+        // `ALL` drives the accept-matrix contract test; a missing or duplicated
+        // entry would leave a protocol unpinned.
+        let mut seen = std::collections::BTreeSet::new();
+        for alpn in Alpn::ALL {
+            assert_eq!(Alpn::from_bytes(alpn.as_bytes()), Some(alpn));
+            assert!(seen.insert(alpn));
+        }
+        assert_eq!(seen.len(), Alpn::ALL.len());
     }
 
     #[test]

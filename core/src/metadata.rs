@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use craqle::VectorClock;
+use craqle::{GraphReplicaSnapshot, VectorClock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -177,6 +177,38 @@ pub enum MetadataCreateEventPayload {
     UpsertContextualEntity {
         jsonld: String,
     },
+    /// An OR-Set change set fixed at the origin. Every holder materializes it
+    /// by merging `batch`; `authored` is kept for audit only.
+    ApplyBatch {
+        batch: MetadataBatch,
+        authored: MetadataBatchSource,
+    },
+}
+
+/// The author's submission behind a planned batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataBatchSource {
+    ReplaceRoCrate { jsonld: String },
+    UpsertDataEntity { jsonld: String },
+    UpsertContextualEntity { jsonld: String },
+}
+
+impl MetadataBatchSource {
+    pub fn jsonld(&self) -> &str {
+        match self {
+            Self::ReplaceRoCrate { jsonld }
+            | Self::UpsertDataEntity { jsonld }
+            | Self::UpsertContextualEntity { jsonld } => jsonld,
+        }
+    }
+
+    pub fn audit_operation(&self) -> MetadataAuditOperation {
+        match self {
+            Self::ReplaceRoCrate { .. } => MetadataAuditOperation::ReplaceRoCrate,
+            Self::UpsertDataEntity { .. } => MetadataAuditOperation::UpsertDataEntity,
+            Self::UpsertContextualEntity { .. } => MetadataAuditOperation::UpsertContextualEntity,
+        }
+    }
 }
 
 impl MetadataCreateEventPayload {
@@ -186,6 +218,7 @@ impl MetadataCreateEventPayload {
             Self::ReplaceRoCrate { .. } => MetadataAuditOperation::ReplaceRoCrate,
             Self::UpsertDataEntity { .. } => MetadataAuditOperation::UpsertDataEntity,
             Self::UpsertContextualEntity { .. } => MetadataAuditOperation::UpsertContextualEntity,
+            Self::ApplyBatch { authored, .. } => authored.audit_operation(),
         }
     }
 
@@ -195,6 +228,7 @@ impl MetadataCreateEventPayload {
             Self::ReplaceRoCrate { .. }
                 | Self::UpsertDataEntity { .. }
                 | Self::UpsertContextualEntity { .. }
+                | Self::ApplyBatch { .. }
         )
     }
 
@@ -205,6 +239,7 @@ impl MetadataCreateEventPayload {
             Self::ReplaceRoCrate { .. } => "replace_rocrate",
             Self::UpsertDataEntity { .. } => "upsert_data_entity",
             Self::UpsertContextualEntity { .. } => "upsert_contextual_entity",
+            Self::ApplyBatch { .. } => "apply_batch",
         }
     }
 }
@@ -221,10 +256,21 @@ pub struct MetadataCreateEventRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataRawRevision {
+    /// The displayed revision: the last render that passed profile validation.
     pub jsonld: String,
+    /// The last event whose merge is reflected in `jsonld`.
     pub winning_event_id: Ulid,
     pub context_digest: [u8; 32],
     pub dataset_digest: Option<[u8; 32]>,
+    pub merged: Option<MetadataMergedRevision>,
+}
+
+/// The merged graph render while it fails profile validation. The editor opens
+/// it so the owner can fix the document; export keeps serving the displayed one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataMergedRevision {
+    pub jsonld: String,
+    pub findings: u32,
 }
 
 pub const METADATA_RAW_EVENT_LIMIT: u32 = 1024;
@@ -291,50 +337,74 @@ struct MetadataRawContext<'a> {
     context: &'a serde_json::value::RawValue,
 }
 
+/// Digest of a crate's `@context`, binding a revision to the terms it was
+/// written against.
+pub fn raw_context_digest(jsonld: &str) -> Result<[u8; 32], MetadataError> {
+    let raw_context: MetadataRawContext = serde_json::from_str(jsonld)
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    Ok(*blake3::hash(raw_context.context.get().as_bytes()).as_bytes())
+}
+
+/// The crate text an event installs as the raw base, if it is a base event.
+///
+/// A batch event answers with its authored crate: the replay only serves a
+/// document until its first merge renders the graph.
+pub fn raw_base_jsonld(payload: &MetadataCreateEventPayload) -> Option<&str> {
+    match payload {
+        MetadataCreateEventPayload::RoCrate { jsonld }
+        | MetadataCreateEventPayload::ReplaceRoCrate { jsonld }
+        | MetadataCreateEventPayload::ApplyBatch {
+            authored: MetadataBatchSource::ReplaceRoCrate { jsonld },
+            ..
+        } => Some(jsonld),
+        _ => None,
+    }
+}
+
+/// The entity an event upserts onto the raw base, and whether the root links it.
+pub fn raw_upsert_entity(payload: &MetadataCreateEventPayload) -> Option<(&str, bool)> {
+    match payload {
+        MetadataCreateEventPayload::UpsertDataEntity { jsonld }
+        | MetadataCreateEventPayload::ApplyBatch {
+            authored: MetadataBatchSource::UpsertDataEntity { jsonld },
+            ..
+        } => Some((jsonld, true)),
+        MetadataCreateEventPayload::UpsertContextualEntity { jsonld }
+        | MetadataCreateEventPayload::ApplyBatch {
+            authored: MetadataBatchSource::UpsertContextualEntity { jsonld },
+            ..
+        } => Some((jsonld, false)),
+        _ => None,
+    }
+}
+
 pub fn resolve_raw_revision(
     events: &[MetadataCreateEventRecord],
 ) -> Result<Option<MetadataRawRevision>, MetadataError> {
     let Some(base) = events
         .iter()
-        .filter(|event| {
-            matches!(
-                event.payload,
-                MetadataCreateEventPayload::RoCrate { .. }
-                    | MetadataCreateEventPayload::ReplaceRoCrate { .. }
-            )
-        })
+        .filter(|event| raw_base_jsonld(&event.payload).is_some())
         .max_by_key(|event| (event.record.updated_at_ms, event.event_id))
     else {
         return Ok(None);
     };
-    let jsonld = match &base.payload {
-        MetadataCreateEventPayload::RoCrate { jsonld }
-        | MetadataCreateEventPayload::ReplaceRoCrate { jsonld } => jsonld,
-        _ => unreachable!(),
+    let Some(jsonld) = raw_base_jsonld(&base.payload) else {
+        return Ok(None);
     };
-    let raw_context: MetadataRawContext = serde_json::from_str(jsonld)
-        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
-    let context_digest = *blake3::hash(raw_context.context.get().as_bytes()).as_bytes();
+    let context_digest = raw_context_digest(jsonld)?;
     let mut document: serde_json::Value = serde_json::from_str(jsonld)
         .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
     let mut updates = events
         .iter()
         .filter(|event| {
-            event.event_id > base.event_id
-                && matches!(
-                    event.payload,
-                    MetadataCreateEventPayload::UpsertDataEntity { .. }
-                        | MetadataCreateEventPayload::UpsertContextualEntity { .. }
-                )
+            event.event_id > base.event_id && raw_upsert_entity(&event.payload).is_some()
         })
         .collect::<Vec<_>>();
     updates.sort_by_key(|event| event.event_id);
     let mut winning_event_id = base.event_id;
     for event in updates {
-        let (jsonld, link_root) = match &event.payload {
-            MetadataCreateEventPayload::UpsertDataEntity { jsonld } => (jsonld, true),
-            MetadataCreateEventPayload::UpsertContextualEntity { jsonld } => (jsonld, false),
-            _ => unreachable!(),
+        let Some((jsonld, link_root)) = raw_upsert_entity(&event.payload) else {
+            continue;
         };
         apply_raw_upsert(&mut document, jsonld, link_root)?;
         winning_event_id = event.event_id;
@@ -349,6 +419,7 @@ pub fn resolve_raw_revision(
         winning_event_id,
         context_digest,
         dataset_digest,
+        merged: None,
     }))
 }
 
@@ -768,6 +839,9 @@ pub struct MetadataSearchHit {
     pub score: f32,
     pub title: String,
     pub snippet: Option<String>,
+    /// `rdf:type` IRIs of the matched subject, so a caller can tell a file
+    /// entity from the dataset it belongs to. Capped by the answering node.
+    pub subject_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -953,6 +1027,26 @@ pub enum MetadataEffect {
     ContainsGraph {
         graph_iri: String,
     },
+    // Device replicas
+    GraphSnapshot {
+        graph_iri: String,
+    },
+    InstallSnapshot {
+        graph_iri: String,
+        snapshot: Box<GraphReplicaSnapshot>,
+    },
+    // OR-Set metadata graphs
+    /// Change set `source` would commit against the local graph, published as a
+    /// batch under `actor`. Plans only: the graph is not mutated.
+    PlanBatch {
+        graph_iri: String,
+        actor: [u8; 32],
+        source: MetadataBatchSource,
+    },
+    MergeBatch {
+        graph_iri: String,
+        batch: MetadataBatch,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1014,6 +1108,24 @@ pub enum MetadataEvent {
     ContainsGraphResult {
         graph_iri: String,
         exists: bool,
+    },
+    // Device replicas
+    GraphSnapshotResult {
+        graph_iri: String,
+        snapshot: Box<GraphReplicaSnapshot>,
+    },
+    SnapshotInstalled {
+        graph_iri: String,
+        applied: bool,
+    },
+    // OR-Set metadata graphs
+    BatchPlanned {
+        graph_iri: String,
+        batch: MetadataBatch,
+    },
+    BatchMerged {
+        graph_iri: String,
+        applied: bool,
     },
     Error {
         graph_iri: Option<String>,
@@ -1098,6 +1210,7 @@ pub enum MetadataProfileValidationState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataProfileValidationStatus {
     pub document_id: Ulid,
+    /// The last event merged into the validated render; display only.
     pub dataset_revision: Ulid,
     pub state: MetadataProfileValidationState,
     pub profile_id: Option<Ulid>,
@@ -1108,6 +1221,9 @@ pub struct MetadataProfileValidationStatus {
     pub findings: Vec<MetadataProfileValidationFinding>,
     pub completeness: MetadataProfileValidationCompleteness,
     pub stale_reason: Option<String>,
+    /// Digest of the validated render. Freshness is keyed by this, because a
+    /// merge can leave the displayed revision behind the newest event.
+    pub dataset_digest: Option<[u8; 32]>,
 }
 
 #[cfg(test)]

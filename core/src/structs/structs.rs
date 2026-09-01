@@ -9,6 +9,7 @@ use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use ulid::Ulid;
 
 pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> Result<String, ConversionError> {
     use base64::Engine;
@@ -66,6 +67,12 @@ pub struct TokenClaims {
     pub exp: u64,
     /// JWT ID: unique token identifier (ULID string).
     pub jti: String,
+    /// User session identifier (ULID string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// User session kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<SessionKind>,
     /// Path restrictions: List of (path_pattern, permission) pairs acting as a whitelist
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restrictions: Option<Vec<PathRestriction>>,
@@ -75,6 +82,30 @@ pub struct TokenClaims {
     /// Delegation signature: Realm signature over issuer_pubkey
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_signature: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Portal,
+    Assistant,
+    Api,
+}
+
+impl fmt::Display for SessionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Portal => "portal",
+            Self::Assistant => "assistant",
+            Self::Api => "api",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRef {
+    pub sid: String,
+    pub kind: SessionKind,
 }
 
 /// Path restriction for token scope.
@@ -109,10 +140,9 @@ pub enum NodeCapabilities {
         /// Realm signature over issuer_pubkey
         delegation_signature: String,
     },
-    Local {
-        //realm_pubkey: [u8; 32],
-        realm_verifying_key: [u8; 113],
-    },
+    /// Owner-bound device: it verifies realm signatures but holds no realm
+    /// signing key and no issuer delegation.
+    User { realm_verifying_key: [u8; 113] },
 }
 
 impl NodeCapabilities {
@@ -149,9 +179,9 @@ impl NodeCapabilities {
             realm_verifying_key,
         })
     }
-    pub fn local_node(realm_id: RealmId) -> Result<Self, ConversionError> {
+    pub fn user_node(realm_id: RealmId) -> Result<Self, ConversionError> {
         let realm_verifying_key = realm_id.to_pkcs8_pem_bytes()?;
-        Ok(NodeCapabilities::Local {
+        Ok(NodeCapabilities::User {
             realm_verifying_key,
         })
     }
@@ -162,6 +192,7 @@ pub struct AuthContext {
     pub user_id: UserId,
     pub realm_id: RealmId,
     pub path_restrictions: Option<Vec<PathRestriction>>,
+    pub session: Option<SessionRef>,
 }
 
 impl AuthContext {
@@ -173,6 +204,7 @@ impl AuthContext {
             user_id: UserId::nil(realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 }
@@ -187,11 +219,20 @@ impl TryFrom<TokenClaims> for AuthContext {
             return Err(ConversionError::InvalidUserId);
         }
         let path_restrictions = value.restrictions;
+        let session = match (value.sid, value.session_kind) {
+            (Some(sid), Some(kind)) => {
+                Ulid::from_string(&sid)?;
+                Some(SessionRef { sid, kind })
+            }
+            (None, None) => None,
+            _ => return Err(ConversionError::InvalidSessionClaim),
+        };
 
         Ok(Self {
             user_id,
             realm_id,
             path_restrictions,
+            session,
         })
     }
 }
@@ -230,7 +271,9 @@ pub struct User {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthContext, PathRestriction, Permission, TokenClaims, oidc_subject_key};
+    use super::{
+        AuthContext, PathRestriction, Permission, SessionKind, TokenClaims, oidc_subject_key,
+    };
     use crate::UserId;
     use crate::structs::RealmId;
     use ulid::Ulid;
@@ -270,6 +313,8 @@ mod tests {
             iat: 1,
             exp: 2,
             jti: "token-id".to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: Some(restrictions.clone()),
             issuer_pubkey: None,
             delegation_signature: None,
@@ -279,6 +324,28 @@ mod tests {
         assert_eq!(auth.user_id, user_id);
         assert_eq!(auth.realm_id, realm_id);
         assert_eq!(auth.path_restrictions, Some(restrictions));
+    }
+
+    #[test]
+    fn converts_session_claims() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let user_id = UserId::new(Ulid::from_bytes([9u8; 16]), realm_id);
+        let sid = Ulid::from_bytes([8u8; 16]).to_string();
+        let auth = AuthContext::try_from(TokenClaims {
+            sub: user_id.to_string(),
+            iss: realm_id.to_base64(),
+            iat: 1,
+            exp: 2,
+            jti: "token-id".to_string(),
+            sid: Some(sid.clone()),
+            session_kind: Some(SessionKind::Assistant),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+        })
+        .unwrap();
+
+        assert_eq!(auth.session.unwrap().sid, sid);
     }
 }
 

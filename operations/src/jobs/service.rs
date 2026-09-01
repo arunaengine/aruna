@@ -190,7 +190,9 @@ pub(crate) fn validate_execution(
 
 /// Submit a container execution job on behalf of `created_by`. The drain claims it
 /// and drives the fenced external attempt lifecycle. The idempotency key is
-/// namespaced per user, disjoint from internal obligation keys.
+/// namespaced per user, disjoint from internal obligation keys. `active_cap`
+/// bounds the user's unfinished execution jobs on this node inside the
+/// admitting transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
@@ -201,6 +203,7 @@ pub async fn submit_execution_job(
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<String>,
     retention_ms: u64,
+    active_cap: Option<u32>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
@@ -222,6 +225,7 @@ pub async fn submit_execution_job(
             retention_ms,
             workspace_mode,
             workspace_bucket,
+            active_cap,
         },
         job_id,
     )
@@ -247,6 +251,7 @@ pub async fn submit_staging_job(
             retention_ms,
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
+            active_cap: None,
         },
         job_id,
     )
@@ -280,6 +285,7 @@ pub async fn submit_storage_purge_job(
             retention_ms,
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
+            active_cap: None,
         },
         job_id,
     )
@@ -350,6 +356,7 @@ pub(crate) async fn submit_mint_local(
             retention_ms,
             workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
+            active_cap: None,
         },
         job_id,
     )
@@ -383,6 +390,7 @@ pub async fn submit_rocrate_import(
             retention_ms,
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
+            active_cap: None,
         },
         job_id,
     )
@@ -448,6 +456,7 @@ pub async fn submit_export_job(
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
             retention_ms,
+            active_cap: None,
         },
         job_id,
     )
@@ -1144,6 +1153,7 @@ async fn family_cancel(
         user_id,
         realm_id: user_id.realm_id,
         path_restrictions: None,
+        session: None,
     };
     let published = cancel_family(context, &auth, job_id, auth_token).await?;
     Some(match published {
@@ -1325,6 +1335,7 @@ mod tests {
             WorkspaceMode::Kept,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1352,6 +1363,7 @@ mod tests {
                 WorkspaceMode::Kept,
                 None,
                 1,
+                None,
             )
             .await,
             Err(SubmitJobError::TooManyOutputs { .. })
@@ -1559,6 +1571,7 @@ mod tests {
                     user_id: owner,
                     realm_id,
                     path_restrictions: None,
+                    session: None,
                 },
                 source: ImportRoCrateSource::Upload {
                     upload_id: Ulid::from_bytes([4u8; 16]),

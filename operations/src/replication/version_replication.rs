@@ -131,7 +131,7 @@ impl SourceAuthorization {
         let request = policy_request_with(
             &path,
             &Permission::READ,
-            Some(&self.auth_context.user_id),
+            Some(&self.auth_context),
             PolicyRequestExtras::operation("s3.GetObject"),
         );
         self.policies
@@ -2607,6 +2607,7 @@ mod tests {
             user_id: test_user_id(),
             realm_id: test_realm_id(),
             path_restrictions: None,
+            session: None,
         }
     }
 

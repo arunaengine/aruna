@@ -105,6 +105,7 @@ pub(crate) async fn apply_forwarded_policy(
             user_id: auth.user_id,
             realm_id,
             path_restrictions: auth.path_restrictions,
+            session: None,
         },
         policy: *policy,
         created_at_ms,

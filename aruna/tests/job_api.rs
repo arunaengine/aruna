@@ -65,7 +65,6 @@ async fn admin_job_flow() -> TestResult<()> {
             StatusCode::OK,
         )
         .await?;
-        assert_eq!(snapshots["approximate"], true);
         assert_eq!(snapshots["group"]["group_id"], group.group_id);
         assert_eq!(snapshots["group"]["quota"]["max_jobs"], 2);
 
@@ -176,7 +175,6 @@ async fn admin_job_flow() -> TestResult<()> {
             status["family"]["submission_id"],
             submitted["submission_id"]
         );
-        assert_eq!(status["family"]["eventually_consistent"], true);
 
         let audit_url = format!("{status_url}/audit");
         let audit = response_json(

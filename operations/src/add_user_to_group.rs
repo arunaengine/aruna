@@ -174,6 +174,7 @@ impl AddUserToGroupOperation {
             user_id: self.input.actor.user_id,
             realm_id: self.input.actor.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -366,9 +367,7 @@ impl AddUserToGroupOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -1090,7 +1089,7 @@ pub mod test {
         let events: Vec<_> = outbox_records
             .iter()
             .map(|record| match &record.event {
-                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
                 other => panic!("unexpected outbox event: {other:?}"),
             })
             .collect();
@@ -1233,7 +1232,7 @@ pub mod test {
         assert_eq!(outbox_records[0].placement, expected_placement);
         assert!(matches!(
             &outbox_records[0].event,
-            DocumentSyncOutboxEvent::AdminOperation { event }
+            DocumentSyncOutboxEvent::AdminOperation { event, .. }
                 if event.target == target
                     && matches!(
                         &event.op,

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCAN_DIRS: &[&str] = &["src/routes", "src/s3"];
+const SCAN_DIRS: &[&str] = &["src/mcp", "src/routes", "src/s3"];
 const PATTERNS: &[&str] = &[
     "send_effect",
     "send_storage_effect",
@@ -122,6 +122,12 @@ fn scan_file(manifest_dir: &Path, path: &Path) -> Vec<GuardMatch> {
         .unwrap_or_else(|err| panic!("failed to make {path:?} relative: {err}"))
         .to_string_lossy()
         .replace('\\', "/");
+
+    // A whole file gated `#![cfg(test)]` is test-only, so its helpers may use the
+    // scanned tokens the same way an inline `#[cfg(test)]` module may.
+    if contents.lines().any(|line| line.trim() == "#![cfg(test)]") {
+        return Vec::new();
+    }
 
     let mut matches = Vec::new();
     let mut pending_cfg_test = false;

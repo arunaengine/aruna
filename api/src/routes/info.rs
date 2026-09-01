@@ -14,11 +14,13 @@ use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, Request
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::allocate_handle::{HandleAllocationError, provision_metadata_binding};
+use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::{
     GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
+use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
@@ -98,7 +100,7 @@ pub struct NodeStatus {
 pub enum NodeCapabilityKind {
     Management,
     Server,
-    Local,
+    User,
 }
 
 impl From<&aruna_core::structs::NodeCapabilities> for NodeCapabilityKind {
@@ -106,7 +108,7 @@ impl From<&aruna_core::structs::NodeCapabilities> for NodeCapabilityKind {
         match capabilities {
             aruna_core::structs::NodeCapabilities::Management { .. } => Self::Management,
             aruna_core::structs::NodeCapabilities::Server { .. } => Self::Server,
-            aruna_core::structs::NodeCapabilities::Local { .. } => Self::Local,
+            aruna_core::structs::NodeCapabilities::User { .. } => Self::User,
         }
     }
 }
@@ -255,6 +257,8 @@ pub struct DatabaseServiceStatus {
 pub struct InterfaceServicesStatus {
     pub rest: InterfaceStatus,
     pub s3: InterfaceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<InterfaceStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -283,6 +287,12 @@ pub struct RealmInfoResponse {
     /// to omit the whole extension without changing the rest of the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_overview: Option<RealmPublicOverview>,
+    /// True on a management node, the only kind that mints enrollments and
+    /// issues the realm's credentials. Public.
+    pub is_management_node: bool,
+    /// API base urls of the realm's management nodes, from their node
+    /// information documents; a device follows one to enroll. Public.
+    pub management_urls: Vec<String>,
     /// Realm discovery configuration. Realm-authenticated callers only.
     #[schema(value_type = Object)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +330,8 @@ pub struct RealmQuotaConfig {
     pub max_groups_per_user: Option<u32>,
     pub user_group_cap_overrides: Vec<RealmUserGroupCapOverride>,
     pub max_devices_per_user: Option<u32>,
+    pub device_requests_per_minute: Option<u32>,
+    pub device_concurrent_pulls: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -360,6 +372,8 @@ impl From<QuotaConfig> for RealmQuotaConfig {
                 })
                 .collect(),
             max_devices_per_user: quota.max_devices_per_user,
+            device_requests_per_minute: quota.device_requests_per_minute,
+            device_concurrent_pulls: quota.device_concurrent_pulls,
         }
     }
 }
@@ -405,6 +419,8 @@ impl RealmQuotaConfig {
             max_groups_per_user: self.max_groups_per_user,
             user_group_cap_overrides,
             max_devices_per_user: self.max_devices_per_user,
+            device_requests_per_minute: self.device_requests_per_minute,
+            device_concurrent_pulls: self.device_concurrent_pulls,
         })
     }
 }
@@ -807,9 +823,16 @@ pub struct RealmOidcProviderResponse {
 pub struct RealmNodeInfoResponse {
     pub node_id: String,
     pub kind: RealmNodeKindInfo,
+    /// Owner of a `user` node; null for infrastructure nodes.
+    pub owner: Option<String>,
     pub configured: bool,
     pub present: bool,
     pub connection_status: RealmNodeConnectionStatus,
+    /// When a `user` node last reached this node, in unix milliseconds. This
+    /// node's own observation; absent for other kinds and for a device it has
+    /// not seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
     /// Placement map entry (location/weight/status) when the node is mapped.
     pub placement: Option<RealmNodePlacementResponse>,
     /// Latest published node info document (capabilities/labels/urls/utilization) if received.
@@ -863,7 +886,6 @@ pub struct RealmNodeUtilizationResponse {
 pub enum RealmNodeKindInfo {
     Management,
     Server,
-    Local,
     User,
 }
 
@@ -872,6 +894,11 @@ pub enum RealmNodeKindInfo {
 pub enum RealmNodeConnectionStatus {
     Connected,
     Configured,
+    /// A device that reached this node recently. Not a connection: it is what
+    /// this node itself saw, and only this node saw it.
+    Seen,
+    /// Presence does not describe this node: a device publishes none.
+    Unknown,
 }
 
 impl From<&RealmNodeKind> for RealmNodeKindInfo {
@@ -879,8 +906,7 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
         match value {
             RealmNodeKind::Management => Self::Management,
             RealmNodeKind::Server => Self::Server,
-            RealmNodeKind::Local => Self::Local,
-            RealmNodeKind::User => Self::User,
+            RealmNodeKind::User { .. } => Self::User,
         }
     }
 }
@@ -897,7 +923,12 @@ token of another realm or one this node cannot validate, the response is the pub
 
 **Behavior**
 - The public part is the realm id, description, metadata replication policy, the OIDC providers a
-  client needs to obtain a token, the public interface urls, and `public_overview`.
+  client needs to obtain a token, the public interface urls, `public_overview`, and where the
+  realm's management nodes are: `is_management_node` says whether this node is one, and
+  `management_urls` lists the api base urls the management nodes published, this node's own first.
+  Only a management node mints enrollments and issues the realm's credentials, so a device or a
+  client that reached any other node follows one of these urls instead. The list comes from the
+  node information documents that reached this node, so it may lag or omit a fresh node.
 - That overview contains only three nullable aggregates: `live_datasets` is the realm's
   lifecycle-live metadata registry count, never caller-filtered or replica-multiplied; `groups` is
   the realm's stored group count; and `nodes_configured` is the membership count in this node's
@@ -916,7 +947,15 @@ token of another realm or one this node cannot validate, the response is the pub
   node counts as present.
 - `present` true and `connection_status` `connected` therefore mean the peer was confirmed live by a
   fresh lookup just now; `configured` means no fresh confirmation, which is not evidence that the
-  peer is down. Stale presence is candidate data and is never reported as a connection."#,
+  peer is down. Stale presence is candidate data and is never reported as a connection.
+- A `user` node is a device and publishes no presence at all, so `present` is always false and
+  `connection_status` is never `connected`. That is the absence of a signal, never a report that
+  the device is down.
+- A device is instead reported from what this node itself saw: `last_seen_ms` is when the device
+  last reached this node over an authorized request, and `connection_status` `seen` means that was
+  within the last three minutes, otherwise `unknown`. Both are this node's own observation, are
+  never realm state, and start empty after a restart; a device that talks to a different realm node
+  is `unknown` here and `seen` there. A node answering about itself reports itself seen now."#,
     responses(
         (
             status = 200,
@@ -934,6 +973,8 @@ token of another realm or one this node cannot validate, the response is the pub
                             "groups": 12,
                             "nodes_configured": 3
                         },
+                        "is_management_node": false,
+                        "management_urls": ["https://mgmt.example.test/api/v1"],
                         "oidc_providers": [
                             {
                                 "id": "example",
@@ -960,12 +1001,15 @@ token of another realm or one this node cannot validate, the response is the pub
                             "groups": 12,
                             "nodes_configured": 3
                         },
+                        "is_management_node": true,
+                        "management_urls": ["https://node.example.test/api/v1"],
                         "oidc_providers": [],
                         "discovery": {"Dynamic": {"methods": [{"DhtSigned": {"ttl_secs": 3600, "refresh_after_secs": 1800}}]}},
                         "nodes": [
                             {
                                 "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                                 "kind": "server",
+                                "owner": null,
                                 "configured": true,
                                 "present": true,
                                 "connection_status": "connected",
@@ -985,10 +1029,12 @@ token of another realm or one this node cannot validate, the response is the pub
                             },
                             {
                                 "node_id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
-                                "kind": "local",
+                                "kind": "user",
+                                "owner": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                                 "configured": true,
                                 "present": false,
-                                "connection_status": "configured",
+                                "connection_status": "seen",
+                                "last_seen_ms": 1775744591123_i64,
                                 "placement": null,
                                 "info": null
                             }
@@ -1000,7 +1046,9 @@ token of another realm or one this node cannot validate, the response is the pub
                             "group_overrides": [],
                             "max_groups_per_user": 10,
                             "user_group_cap_overrides": [],
-                            "max_devices_per_user": null
+                            "max_devices_per_user": 5,
+                            "device_requests_per_minute": 600,
+                            "device_concurrent_pulls": 8
                         },
                         "interfaces": {
                             "rest": {"status": "available", "bind": "0.0.0.0:3000", "url": "https://node.example.test/api/v1"},
@@ -1018,6 +1066,13 @@ pub async fn get_realm_info(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<RealmInfoResponse>)> {
+    Ok((StatusCode::OK, Json(run_realm_info(&state, auth).await?)))
+}
+
+pub(crate) async fn run_realm_info(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> ServerResult<RealmInfoResponse> {
     let config = drive(
         GetRealmConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1031,10 +1086,13 @@ pub async fn get_realm_info(
     })?;
     let realm_authenticated = auth.is_some_and(|auth| auth.realm_id == state.get_realm_id());
 
-    let mut interfaces = interface_services_status(&state).await;
+    let mut interfaces = interface_services_status(state).await;
     if !realm_authenticated {
         interfaces.rest.bind = None;
         interfaces.s3.bind = None;
+        if let Some(mcp) = interfaces.mcp.as_mut() {
+            mcp.bind = None;
+        }
     }
 
     let metadata_replication = RealmMetadataReplicationResponse {
@@ -1060,12 +1118,32 @@ pub async fn get_realm_info(
         nodes_configured: u64::try_from(config.nodes.len()).ok(),
     });
 
+    let node_info_docs = load_node_info_documents_best_effort(state, &config).await;
+    let mut management_urls = management_urls(
+        state,
+        &config,
+        &node_info_docs,
+        interfaces.rest.url.as_deref(),
+    );
+    // A device holds no peer node-info document, so the list a realm node
+    // installed on it is what the portal is offered there.
+    if management_urls.is_empty() {
+        management_urls = installed_management_urls(&state.get_ctx(), config.realm_id).await;
+    }
+
     let (discovery, nodes, quota) = if realm_authenticated {
-        let present_nodes = load_realm_presence_best_effort(&state).await;
-        let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
+        let present_nodes = load_realm_presence_best_effort(state).await;
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
-        let nodes = map_realm_nodes(&state, &config, present_nodes, node_info_docs);
+        let contacts = state.peer_contacts();
+        let nodes = map_realm_nodes(
+            state,
+            &config,
+            present_nodes,
+            node_info_docs,
+            &contacts,
+            unix_timestamp_millis(),
+        );
         (
             Some(discovery),
             nodes,
@@ -1075,32 +1153,79 @@ pub async fn get_realm_info(
         (None, Vec::new(), None)
     };
 
-    Ok((
-        StatusCode::OK,
-        Json(RealmInfoResponse {
-            realm_id: config.realm_id.to_string(),
-            description: config.description,
-            metadata_replication,
-            oidc_providers: config
-                .oidc_providers
-                .into_iter()
-                .map(|provider| RealmOidcProviderResponse {
-                    id: provider.id,
-                    issuer: provider.issuer,
-                    audience: provider.audience,
-                    discovery_url: provider.discovery_url,
-                })
-                .collect(),
-            public_overview,
-            discovery,
-            nodes,
-            quota,
-            interfaces,
-        }),
-    ))
+    Ok(RealmInfoResponse {
+        realm_id: config.realm_id.to_string(),
+        description: config.description,
+        metadata_replication,
+        oidc_providers: config
+            .oidc_providers
+            .into_iter()
+            .map(|provider| RealmOidcProviderResponse {
+                id: provider.id,
+                issuer: provider.issuer,
+                audience: provider.audience,
+                discovery_url: provider.discovery_url,
+            })
+            .collect(),
+        public_overview,
+        is_management_node: state.is_management_node(),
+        management_urls,
+        discovery,
+        nodes,
+        quota,
+        interfaces,
+    })
 }
 
-async fn load_node_info_documents_best_effort(
+/// Every management node of the realm with the api url it published, in
+/// realm-config order. The caller decides where its own node belongs.
+pub(crate) fn management_node_urls(
+    config: &RealmConfigDocument,
+    node_info_docs: &BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
+) -> Vec<(aruna_core::NodeId, Option<String>)> {
+    config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
+        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .map(|node_id| {
+            let url = node_info_docs
+                .get(&node_id)
+                .and_then(|doc| doc.urls.api.clone());
+            (node_id, url)
+        })
+        .collect()
+}
+
+/// The management nodes' published api urls, this node first. A management
+/// node whose own document has not landed yet names its published interface.
+fn management_urls(
+    state: &ServerState,
+    config: &RealmConfigDocument,
+    node_info_docs: &BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
+    own_url: Option<&str>,
+) -> Vec<String> {
+    let current = state.get_node_id();
+    let mut urls: Vec<String> = Vec::new();
+    for (node_id, published) in management_node_urls(config, node_info_docs) {
+        let is_current = node_id == current;
+        let url = published.or_else(|| is_current.then(|| own_url.map(str::to_string)).flatten());
+        let Some(url) = url else {
+            continue;
+        };
+        if urls.contains(&url) {
+            continue;
+        }
+        if is_current {
+            urls.insert(0, url);
+        } else {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+pub(crate) async fn load_node_info_documents_best_effort(
     state: &ServerState,
     config: &RealmConfigDocument,
 ) -> BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument> {
@@ -1205,8 +1330,8 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     summary = "Read the realm's placement strategies, bindings and overrides",
     description = r#"Returns the placement policy as stored in this node's copy of the realm configuration.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path, and only
-a management node serves it; every other node answers 403 whatever the caller holds.
+**Authentication**: realm bearer token with WRITE on the realm's configuration admin path. A
+management node serves it, and every other node relays the call to one.
 
 **Behavior**
 - The response carries the defined strategies with their replica count, distinctness requirement,
@@ -1258,9 +1383,10 @@ a management node serves it; every other node answers 403 whatever the caller ho
             })
         ),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
-        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
+        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1293,8 +1419,8 @@ pub async fn get_realm_placement(
     summary = "Apply one change to the realm's placement policy",
     description = r#"Applies exactly one change to the realm's placement policy and returns the whole policy.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path, and only
-a management node serves it; every other node answers 403.
+**Authentication**: realm bearer token with WRITE on the realm's configuration admin path. A
+management node serves it, and every other node relays the call to one.
 
 **Behavior**
 - The body carries exactly one change, selected by its `mutation` field: define or replace a
@@ -1386,11 +1512,12 @@ response."#,
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "The strategy is still referenced by a binding or override, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
         (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = crate::error::ErrorResponse)
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1518,8 +1645,9 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
     summary = "Replace the realm-wide quota policy",
     description = r#"Replaces the realm-wide quota policy wholesale and echoes back the stored result.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path, and only
-a management node serves it; an anonymous caller is rejected and every other node answers 403.
+**Authentication**: realm bearer token with WRITE on the realm's configuration admin path; an
+anonymous caller is rejected. A management node serves it, and every other node relays the call to
+one.
 
 **Behavior**
 - This replaces the stored policy rather than patching it: overrides absent from the body are
@@ -1529,6 +1657,16 @@ a management node serves it; an anonymous caller is rejected and every other nod
   `warn_threshold_percent` only decides when a group is reported as warning.
 - Per-group overrides replace both values for one group, and per-user overrides cap how many groups
   a user may hold.
+- `max_devices_per_user` caps how many devices one user may enroll; null leaves device enrollment
+  uncapped. Enrolled devices and unclaimed device enrollment secrets both occupy a slot.
+- `device_requests_per_minute` and `device_concurrent_pulls` bound what one enrolled device may ask
+  of each realm node: how many requests it may send per minute and how many it may keep in flight,
+  which is what bounds long blob pulls. Both are per device and per node, and null leaves that
+  dimension uncapped.
+- Device limits are enforced where a device's requests actually arrive, at the node's inbound
+  network admission, not at REST: an over-budget request is dropped there, so the device sees a
+  transport failure and reports the retryable 503 class to its owner rather than a 429. The 429
+  with `Retry-After` stays the answer of the per-address and per-principal REST limiters.
 - Quota is evaluated against a group's realm-wide logical bytes, which are aggregated from counters
   that replicate between nodes, so enforcement follows a policy change as those counters and the
   realm configuration propagate.
@@ -1536,8 +1674,10 @@ a management node serves it; an anonymous caller is rejected and every other nod
 **Limits**
 - `grace_factor_percent` must be at least 100.
 - `warn_threshold_percent` must be between 1 and 100.
-- `max_devices_per_user` must be null, since device ownership is not enforced yet and any other
-  value is refused."#,
+- `max_devices_per_user` must be null or greater than zero; zero is refused rather than read as a
+  ban on device enrollment.
+- `device_requests_per_minute` and `device_concurrent_pulls` must be null or greater than zero;
+  zero would silence every enrolled device and is refused."#,
     request_body(
         content = RealmQuotaConfig,
         description = "The complete quota policy to store; it replaces the current one, including all override lists",
@@ -1552,7 +1692,9 @@ a management node serves it; an anonymous caller is rejected and every other nod
             "user_group_cap_overrides": [
                 {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
             ],
-            "max_devices_per_user": null
+            "max_devices_per_user": 5,
+            "device_requests_per_minute": 600,
+            "device_concurrent_pulls": 8
         })
     ),
     responses(
@@ -1571,14 +1713,17 @@ a management node serves it; an anonymous caller is rejected and every other nod
                 "user_group_cap_overrides": [
                     {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
                 ],
-                "max_devices_per_user": null
+                "max_devices_per_user": 5,
+                "device_requests_per_minute": 600,
+                "device_concurrent_pulls": 8
             })
         ),
-        (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a value for max_devices_per_user", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, retry later", body = crate::error::ErrorResponse)
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
+        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1640,8 +1785,14 @@ fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
 pub struct UsageResponse {
     pub buckets: u64,
     pub objects: u64,
-    pub stored_blobs: u64,
-    pub stored_bytes: u64,
+    /// Physical blob copies this node holds. Copies are content-addressed and
+    /// shared between the groups referencing them, so they are attributed to the
+    /// node, never to a group: the group usage endpoint omits this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_blobs: Option<u64>,
+    /// Bytes those copies occupy. Omitted wherever `stored_blobs` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
     pub logical_bytes: u64,
     pub referenced_bytes: u64,
     pub realm: UsageTotals,
@@ -1714,8 +1865,10 @@ impl GroupQuotaStatus {
 pub struct UsageTotals {
     pub buckets: u64,
     pub objects: u64,
-    pub stored_blobs: u64,
-    pub stored_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_blobs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
     pub logical_bytes: u64,
     pub referenced_bytes: u64,
 }
@@ -1725,10 +1878,20 @@ impl From<UsageCounters> for UsageTotals {
         Self {
             buckets: counters.buckets,
             objects: counters.objects,
-            stored_blobs: counters.stored_blobs,
-            stored_bytes: counters.stored_bytes,
+            stored_blobs: Some(counters.stored_blobs),
+            stored_bytes: Some(counters.stored_bytes),
             logical_bytes: counters.logical_bytes,
             referenced_bytes: counters.referenced_bytes,
+        }
+    }
+}
+
+impl UsageTotals {
+    fn without_stored(counters: UsageCounters) -> Self {
+        Self {
+            stored_blobs: None,
+            stored_bytes: None,
+            ..Self::from(counters)
         }
     }
 }
@@ -1738,8 +1901,8 @@ impl UsageResponse {
         Self {
             buckets: local.buckets,
             objects: local.objects,
-            stored_blobs: local.stored_blobs,
-            stored_bytes: local.stored_bytes,
+            stored_blobs: Some(local.stored_blobs),
+            stored_bytes: Some(local.stored_bytes),
             logical_bytes: local.logical_bytes,
             referenced_bytes: local.referenced_bytes,
             realm: realm.into(),
@@ -1748,6 +1911,18 @@ impl UsageResponse {
             profile_count: None,
             process_run_count: None,
             quota: None,
+        }
+    }
+
+    /// Group scope. Physical copies are content-addressed and shared between
+    /// groups, so the counters carry no group dimension and the `stored_*`
+    /// fields are omitted instead of reported as an unattributed zero.
+    pub fn for_group(local: UsageCounters, realm: UsageCounters) -> Self {
+        Self {
+            stored_blobs: None,
+            stored_bytes: None,
+            realm: UsageTotals::without_stored(realm),
+            ..Self::new(local, realm)
         }
     }
 }
@@ -1783,6 +1958,9 @@ views.
   node's replicated usage snapshot, so it is eventually consistent: a node whose snapshot has not
   arrived or has not refreshed yet is simply not part of the sum, which can make the total lag
   reality after a burst of writes.
+- `stored_blobs` and `stored_bytes` count physical, content-addressed blob copies. A copy is shared
+  by every group referencing it, so it is attributed to this node and its backend, never to a group;
+  the group usage endpoint therefore omits both fields.
 - `metadata_documents` counts the realm's live metadata documents, excluding lifecycle-deleted ones,
   and is deliberately unfiltered by what the caller may read.
 - It is omitted, never zeroed, when this node has no metadata subsystem or the count cannot be
@@ -1842,6 +2020,8 @@ fn map_realm_nodes(
     config: &RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
     node_info_docs: BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
+    contacts: &PeerContacts,
+    now_ms: u64,
 ) -> Vec<RealmNodeInfoResponse> {
     let current_node = state.get_node_id();
     config
@@ -1850,8 +2030,12 @@ fn map_realm_nodes(
         .map(|node| {
             let parsed = node.node_id.parse::<aruna_core::NodeId>().ok();
             let is_current = node.node_id == current_node.to_string();
-            let present =
-                is_current || parsed.is_some_and(|node_id| present_nodes.contains(&node_id));
+            let kind = RealmNodeKindInfo::from(&node.kind);
+            // A device publishes no realm presence, so presence carries no
+            // statement about it, not even on the device's own node.
+            let is_device = matches!(kind, RealmNodeKindInfo::User);
+            let present = !is_device
+                && (is_current || parsed.is_some_and(|node_id| present_nodes.contains(&node_id)));
             let placement = parsed
                 .and_then(|node_id| config.placement_entry(node_id))
                 .map(|entry| RealmNodePlacementResponse {
@@ -1863,16 +2047,28 @@ fn map_realm_nodes(
             let info = parsed
                 .and_then(|node_id| node_info_docs.get(&node_id))
                 .map(map_node_info_document);
+            // A device answering for itself is in contact by definition.
+            let last_seen_ms = match (is_device, is_current) {
+                (true, true) => Some(now_ms),
+                (true, false) => parsed.and_then(|node_id| contacts.last_seen(&node_id)),
+                (false, _) => None,
+            };
+            let seen_recently = is_device
+                && (is_current
+                    || parsed.is_some_and(|node_id| contacts.seen_recently(&node_id, now_ms)));
             RealmNodeInfoResponse {
                 node_id: node.node_id.clone(),
-                kind: RealmNodeKindInfo::from(&node.kind),
+                kind,
+                owner: node.kind.owner().map(|owner| owner.to_string()),
                 configured: true,
                 present,
-                connection_status: if present {
-                    RealmNodeConnectionStatus::Connected
-                } else {
-                    RealmNodeConnectionStatus::Configured
+                connection_status: match (is_device, seen_recently, present) {
+                    (true, true, _) => RealmNodeConnectionStatus::Seen,
+                    (true, false, _) => RealmNodeConnectionStatus::Unknown,
+                    (false, _, true) => RealmNodeConnectionStatus::Connected,
+                    (false, _, false) => RealmNodeConnectionStatus::Configured,
                 },
+                last_seen_ms,
                 placement,
                 info,
             }
@@ -1945,6 +2141,11 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
                 url: None,
             },
         },
+        mcp: interface_runtime.mcp.map(|mcp| InterfaceStatus {
+            status: ServiceStatus::Available,
+            bind: Some(mcp.bind_address.to_string()),
+            url: Some(mcp.url),
+        }),
     }
 }
 
@@ -2077,14 +2278,21 @@ pub async fn get_info(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> (StatusCode, Json<InfoResponse>) {
-    let access = info_access(&state, auth.as_ref()).await;
+    (StatusCode::OK, Json(run_node_info(&state, auth).await))
+}
+
+pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>) -> InfoResponse {
+    let access = info_access(state, auth.as_ref()).await;
     let realm = access != InfoAccess::Public;
     let admin = access == InfoAccess::Admin;
 
-    let mut interfaces = interface_services_status(&state).await;
+    let mut interfaces = interface_services_status(state).await;
     if !realm {
         interfaces.rest.bind = None;
         interfaces.s3.bind = None;
+        if let Some(mcp) = interfaces.mcp.as_mut() {
+            mcp.bind = None;
+        }
     }
 
     let mut response = InfoResponse {
@@ -2108,7 +2316,7 @@ pub async fn get_info(
     };
 
     if !realm {
-        return (StatusCode::OK, Json(response));
+        return response;
     }
 
     let ctx = state.get_ctx();
@@ -2165,7 +2373,7 @@ pub async fn get_info(
                     io: info.timeouts.control_plane_io_timeout.as_secs(),
                     transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
                 }),
-                backends: backend_statuses(&state, info.backends).await,
+                backends: backend_statuses(state, info.backends).await,
             },
             None => BlobServiceStatus {
                 status: ServiceStatus::NotConfigured,
@@ -2185,7 +2393,7 @@ pub async fn get_info(
         response.warnings = warnings;
     }
 
-    (StatusCode::OK, Json(response))
+    response
 }
 
 /// Maps a live peer connection to its wire form. `last_error` leaks internal
@@ -2293,12 +2501,13 @@ fn transport_addr_to_string(addr: &iroh::TransportAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, RealmPlacementBinding,
+        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, PeerContacts,
+        RealmNodeConnectionStatus, RealmNodeKindInfo, RealmPlacementBinding,
         RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
         RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
-        get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
-        map_mutate_realm_placement_error, map_set_realm_quota_error, mutate_realm_placement,
-        presence_nodes, set_realm_quota,
+        UsageResponse, get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
+        map_mutate_realm_placement_error, map_realm_nodes, map_set_realm_quota_error,
+        mutate_realm_placement, presence_nodes, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -2311,7 +2520,7 @@ mod tests {
     use aruna_core::keyspaces::GROUP_KEYSPACE;
     use aruna_core::structs::{
         Actor, AuthContext, DocumentClass, Group, NodeCapabilities, PlacementScope, QuotaConfig,
-        RealmId,
+        RealmId, UsageCounters,
     };
     use aruna_operations::allocate_handle::{HandleAllocationError, allocate_placement_binding};
     use aruna_operations::claim_initial_realm_admin::{
@@ -2328,7 +2537,7 @@ mod tests {
     use axum::extract::{FromRequest, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use tower::ServiceExt;
@@ -2355,7 +2564,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -2372,6 +2581,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -2458,7 +2668,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.node.peer_id, Some(state.get_node_id().to_string()));
-        assert_eq!(response.node.capabilities, Some(NodeCapabilityKind::Local));
+        assert_eq!(response.node.capabilities, Some(NodeCapabilityKind::User));
         let network = response.services.network.expect("realm token sees network");
         assert_eq!(network.status, ServiceStatus::Unavailable);
         assert!(
@@ -2478,6 +2688,7 @@ mod tests {
                     bind: Some("0.0.0.0:1337".to_string()),
                     url: Some("http://127.0.0.1:1337".to_string()),
                 },
+                mcp: None,
             }
         );
         assert!(
@@ -2498,6 +2709,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let (_, Json(response)) = get_info(State(state.clone()), Extension(Some(member))).await;
@@ -2641,6 +2853,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), state.get_realm_id()),
             realm_id: state.get_realm_id(),
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -2710,7 +2923,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -2921,6 +3134,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -3014,6 +3228,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), local_state.get_realm_id()),
             realm_id: local_state.get_realm_id(),
             path_restrictions: None,
+            session: None,
         };
         assert!(matches!(
             get_realm_placement(State(local_state), Extension(Some(local_auth))).await,
@@ -3032,6 +3247,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         assert!(matches!(
             get_realm_placement(State(state), Extension(Some(stranger))).await,
@@ -3444,6 +3660,7 @@ mod tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let body = RealmQuotaConfig::from(QuotaConfig::default());
 
@@ -3461,9 +3678,13 @@ mod tests {
             user_id: admin,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.default_group_quota_bytes = Some(4096);
+        body.max_devices_per_user = Some(3);
+        body.device_requests_per_minute = Some(600);
+        body.device_concurrent_pulls = Some(8);
 
         let (status, Json(stored)) = set_realm_quota(
             State(state.clone()),
@@ -3474,7 +3695,9 @@ mod tests {
         .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(stored.default_group_quota_bytes, Some(4096));
-        assert_eq!(stored.max_devices_per_user, None);
+        assert_eq!(stored.max_devices_per_user, Some(3));
+        assert_eq!(stored.device_requests_per_minute, Some(600));
+        assert_eq!(stored.device_concurrent_pulls, Some(8));
 
         let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
             .await
@@ -3482,7 +3705,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let quota = info.quota.expect("realm token sees quota");
         assert_eq!(quota.default_group_quota_bytes, Some(4096));
-        assert_eq!(quota.max_devices_per_user, None);
+        assert_eq!(quota.max_devices_per_user, Some(3));
     }
 
     /// Anonymous callers keep what they need to authenticate; realm topology,
@@ -3514,6 +3737,12 @@ mod tests {
             assert_eq!(info.realm_id, realm_id.to_string());
             assert_eq!(info.description, "Realm");
             assert!(info.nodes.is_empty(), "realm topology is not public");
+            assert!(info.is_management_node, "the node kind is public");
+            assert_eq!(
+                info.management_urls,
+                vec!["http://127.0.0.1:3000/api/v1".to_string()],
+                "a management node names its own published url"
+            );
             assert!(info.quota.is_none(), "quota policy is not public");
             assert!(info.discovery.is_none(), "discovery is not public");
             assert_eq!(
@@ -3600,6 +3829,65 @@ mod tests {
         assert!(body.get("quota").is_none());
         assert_eq!(body["nodes"], serde_json::json!([]));
         assert!(!body.to_string().contains("Protected group title"));
+    }
+
+    #[tokio::test]
+    async fn management_urls_follow_documents() {
+        // The published document names the url a device follows; without one
+        // a management node falls back to its own interface, and a server
+        // node lists the others but never itself.
+        use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+        use aruna_core::structs::{
+            NodeInfoDocument, NodeUrls, NodeUtilization, node_info_storage_key,
+        };
+
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        state
+            .register_rest_interface("0.0.0.0:3000".parse().unwrap())
+            .await;
+        let node_id = state.get_node_id();
+        let document = NodeInfoDocument {
+            node_id,
+            executors: Vec::new(),
+            labels: Default::default(),
+            urls: NodeUrls {
+                api: Some("https://mgmt.example/api/v1".to_string()),
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 0,
+                documents_held: None,
+                load_permille: None,
+                heartbeat_at_ms: 1_700_000_000_000,
+            },
+            updated_at_ms: 1_700_000_000_500,
+            epoch: aruna_core::structs::AdvertisementEpoch {
+                membership_generation: 1,
+                publisher_generation: 1,
+                observed_at_ms: 1_700_000_000_500,
+            },
+            compute_draining: false,
+            leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
+        };
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_INFO_KEYSPACE.to_string(),
+                key: node_info_storage_key(node_id).into(),
+                value: document.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let (_status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        assert!(info.is_management_node);
+        assert_eq!(
+            info.management_urls,
+            vec!["https://mgmt.example/api/v1".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -3724,6 +4012,7 @@ mod tests {
             user_id: admin,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.warn_threshold_percent = 0;
@@ -3752,15 +4041,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_realm_quota_rejects_unsupported_device_cap() {
+    async fn rejects_zero_cap() {
+        // A zero device quota is refused by the route, not silently stored.
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = AuthContext {
             user_id: admin,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
-        body.max_devices_per_user = Some(2);
+        body.max_devices_per_user = Some(0);
 
         let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
             .await
@@ -3770,6 +4061,41 @@ mod tests {
             error,
             ServerError::BadRequestReason(reason) if reason.contains("max_devices_per_user")
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_limits() {
+        // Zero would silence an enrolled device; only null is uncapped.
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        for body in [
+            RealmQuotaConfig {
+                device_requests_per_minute: Some(0),
+                ..RealmQuotaConfig::from(QuotaConfig::default())
+            },
+            RealmQuotaConfig {
+                device_concurrent_pulls: Some(0),
+                ..RealmQuotaConfig::from(QuotaConfig::default())
+            },
+        ] {
+            let error = set_realm_quota(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Json(body),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                ServerError::BadRequestReason(reason) if reason.starts_with("device_")
+            ));
+        }
     }
 
     #[test]
@@ -3784,5 +4110,154 @@ mod tests {
 
         let stale = presence_nodes(RealmPresence::new(nodes, true), local);
         assert_eq!(stale, HashSet::from([local]));
+    }
+
+    #[tokio::test]
+    async fn device_never_connected() {
+        // Devices publish no presence, so a presence answer naming one, and
+        // this node answering about itself, may still not connect it.
+        let (state, realm_id, owner, _tempdir) = setup_management_state().await;
+        let mut config = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        let device = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
+        for node_id in [device, state.get_node_id()] {
+            config.nodes.push(aruna_core::structs::RealmNode {
+                node_id: node_id.to_string(),
+                kind: aruna_core::structs::RealmNodeKind::User { owner },
+            });
+        }
+
+        let present = HashSet::from([device, state.get_node_id()]);
+        let nodes = map_realm_nodes(
+            &state,
+            &config,
+            present,
+            BTreeMap::new(),
+            &PeerContacts::default(),
+            10_000,
+        );
+
+        let devices: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.kind == RealmNodeKindInfo::User)
+            .collect();
+        assert_eq!(devices.len(), 2);
+        for node in devices {
+            assert!(!node.present, "a device is never presence-confirmed");
+            assert_ne!(node.connection_status, RealmNodeConnectionStatus::Connected);
+        }
+        let infra = nodes
+            .iter()
+            .find(|node| node.kind != RealmNodeKindInfo::User)
+            .unwrap();
+        assert!(infra.present);
+        assert_eq!(
+            infra.connection_status,
+            RealmNodeConnectionStatus::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_device_seen() {
+        // A device is reported from this node's own contact record, and the
+        // device's own node is serving the request, so it saw itself now.
+        let (state, realm_id, owner, _tempdir) = setup_management_state().await;
+        let mut config = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        let recent = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
+        let stale = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
+        for node_id in [recent, stale, state.get_node_id()] {
+            config.nodes.push(aruna_core::structs::RealmNode {
+                node_id: node_id.to_string(),
+                kind: aruna_core::structs::RealmNodeKind::User { owner },
+            });
+        }
+        let now_ms = 1_000_000;
+        let window = aruna_operations::metadata::PEER_CONTACT_WINDOW.as_millis() as u64;
+        let contacts = PeerContacts::default();
+        contacts.note(recent, now_ms - window);
+        contacts.note(stale, now_ms - window - 1);
+
+        let nodes = map_realm_nodes(
+            &state,
+            &config,
+            HashSet::new(),
+            BTreeMap::new(),
+            &contacts,
+            now_ms,
+        );
+        let device = |node_id: aruna_core::NodeId| {
+            nodes
+                .iter()
+                .find(|node| {
+                    node.node_id == node_id.to_string() && node.kind == RealmNodeKindInfo::User
+                })
+                .unwrap()
+        };
+
+        assert_eq!(
+            device(recent).connection_status,
+            RealmNodeConnectionStatus::Seen
+        );
+        assert_eq!(device(recent).last_seen_ms, Some(now_ms - window));
+        assert_eq!(
+            device(stale).connection_status,
+            RealmNodeConnectionStatus::Unknown
+        );
+        assert_eq!(device(stale).last_seen_ms, Some(now_ms - window - 1));
+        let current = device(state.get_node_id());
+        assert_eq!(current.connection_status, RealmNodeConnectionStatus::Seen);
+        assert_eq!(current.last_seen_ms, Some(now_ms));
+        let infra = nodes
+            .iter()
+            .find(|node| node.kind != RealmNodeKindInfo::User)
+            .unwrap();
+        assert_eq!(infra.last_seen_ms, None, "only devices report contact");
+    }
+
+    fn usage_counters() -> UsageCounters {
+        UsageCounters {
+            buckets: 1,
+            objects: 2,
+            stored_blobs: 2,
+            stored_bytes: 20,
+            logical_bytes: 20,
+            referenced_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn usage_reports_stored() {
+        let body = serde_json::to_value(UsageResponse::new(usage_counters(), usage_counters()))
+            .expect("serialized");
+        assert_eq!(body["stored_blobs"], 2);
+        assert_eq!(body["stored_bytes"], 20);
+        assert_eq!(body["realm"]["stored_blobs"], 2);
+    }
+
+    #[test]
+    fn group_omits_stored() {
+        // Physical copies carry no group dimension, so the group scope must omit
+        // them instead of reporting the counter row's structural zero.
+        let response = UsageResponse::for_group(usage_counters(), usage_counters());
+        assert_eq!(response.stored_blobs, None);
+        assert_eq!(response.realm.stored_bytes, None);
+
+        let body = serde_json::to_value(&response).expect("serialized");
+        let fields = body.as_object().expect("object");
+        assert_eq!(fields["objects"], 2);
+        assert!(!fields.contains_key("stored_blobs"));
+        assert!(!fields.contains_key("stored_bytes"));
+        let realm = body["realm"].as_object().expect("object");
+        assert!(!realm.contains_key("stored_blobs"));
+        assert!(!realm.contains_key("stored_bytes"));
     }
 }

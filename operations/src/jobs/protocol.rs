@@ -695,6 +695,7 @@ mod tests {
             user_id: user(local),
             realm_id: local,
             path_restrictions: None,
+            session: None,
         };
         assert!(auth_realm_matches(&auth, local));
         auth.realm_id = foreign;

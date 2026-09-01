@@ -721,6 +721,7 @@ mod tests {
                 user_id: user_id(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 path_restrictions: None,
+                session: None,
             },
         })
     }

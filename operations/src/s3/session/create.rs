@@ -1,6 +1,6 @@
 use super::{
     MAX_GROUP_SESSIONS, S3SessionCredentials, S3SessionError, build_session, decode_index,
-    encode_index, expiry_key, owner_key,
+    encode_index, expiry_key, owner_key, session_age,
 };
 use aruna_core::credential_seal::CredentialSealKey;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -32,7 +32,7 @@ enum CreateSessionState {
     StartTransaction,
     ReadIndex,
     ReadSessions { index: BTreeSet<String> },
-    DeleteStale { index: BTreeSet<String> },
+    DeleteSessions { index: BTreeSet<String> },
     WriteSession,
     CommitTransaction,
     Finish,
@@ -169,14 +169,18 @@ impl CreateS3SessionOperation {
         if values.len() != index.len() + 1 {
             return self.fail(S3SessionError::IndexInconsistent);
         }
-        let Some(pending) = self.pending.as_ref() else {
+        let Some(pending_key) = self
+            .pending
+            .as_ref()
+            .map(|pending| pending.access_key_id.clone())
+        else {
             return self.fail(S3SessionError::Failed);
         };
-        let mut active = BTreeSet::new();
-        let mut stale = Vec::new();
+        let mut active = Vec::new();
+        let mut removed = Vec::new();
         for (key, value) in values {
             let key_bytes = key.as_ref();
-            if key_bytes == pending.access_key_id.as_bytes() {
+            if key_bytes == pending_key.as_bytes() {
                 if value.is_some() {
                     return self.fail(S3SessionError::IndexInconsistent);
                 }
@@ -197,23 +201,28 @@ impl CreateS3SessionOperation {
                 return self.fail(S3SessionError::IndexInconsistent);
             }
             if session.is_expired(self.config.now) {
-                stale.push(session);
+                removed.push(session);
             } else {
-                active.insert(session.access_key);
+                active.push(session);
             }
         }
-        if active.len() >= MAX_GROUP_SESSIONS {
-            return self.fail(S3SessionError::LimitReached);
-        }
-        active.insert(pending.access_key_id.clone());
-        if stale.is_empty() {
-            return self.write_session(active);
+        // The new session must fit the bound, so the oldest ones above it are evicted.
+        active.sort_by_key(session_age);
+        let evicted = active.len().saturating_sub(MAX_GROUP_SESSIONS - 1);
+        removed.extend(active.drain(..evicted));
+        let mut index: BTreeSet<String> = active
+            .into_iter()
+            .map(|session| session.access_key)
+            .collect();
+        index.insert(pending_key);
+        if removed.is_empty() {
+            return self.write_session(index);
         }
         let Some(txn_id) = self.txn_id else {
             return self.fail(S3SessionError::Failed);
         };
-        let mut deletes = Vec::with_capacity(stale.len() * 2);
-        for session in stale {
+        let mut deletes = Vec::with_capacity(removed.len() * 2);
+        for session in removed {
             let expiry_key = match expiry_key(session.expiry, &session.access_key) {
                 Ok(key) => key,
                 Err(error) => return self.fail(error),
@@ -224,14 +233,14 @@ impl CreateS3SessionOperation {
             ));
             deletes.push((S3_SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key));
         }
-        self.state = CreateSessionState::DeleteStale { index: active };
+        self.state = CreateSessionState::DeleteSessions { index };
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,
             txn_id: Some(txn_id),
         })]
     }
 
-    fn stale_deleted(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
+    fn sessions_deleted(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected(event, "StorageEvent::BatchDeleteResult");
         };
@@ -330,7 +339,7 @@ impl Operation for CreateS3SessionOperation {
             CreateSessionState::StartTransaction => self.transaction_started(event),
             CreateSessionState::ReadIndex => self.index_read(event),
             CreateSessionState::ReadSessions { index } => self.sessions_read(event, index),
-            CreateSessionState::DeleteStale { index } => self.stale_deleted(event, index),
+            CreateSessionState::DeleteSessions { index } => self.sessions_deleted(event, index),
             CreateSessionState::WriteSession => self.session_written(event),
             CreateSessionState::CommitTransaction => self.transaction_committed(event),
             CreateSessionState::Init | CreateSessionState::Finish | CreateSessionState::Error => {

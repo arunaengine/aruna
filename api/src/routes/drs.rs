@@ -1294,7 +1294,7 @@ mod tests {
             ctx,
             test_realm_id(),
             test_node_id(),
-            NodeCapabilities::local_node(test_realm_id()).expect("capabilities"),
+            NodeCapabilities::user_node(test_realm_id()).expect("capabilities"),
             false,
             None,
             aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -1442,11 +1442,13 @@ mod tests {
                 user_id: owner,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             AuthContext {
                 user_id: denied,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             VersionedObjectArn::new(realm_id, node_id, bucket, key, version)
                 .expect("versioned ARN"),
@@ -1560,6 +1562,7 @@ mod tests {
             user_id: UserId::new(Ulid::from_bytes([5u8; 16]), state.get_realm_id()),
             realm_id: state.get_realm_id(),
             path_restrictions: None,
+            session: None,
         };
         let other_node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let other_realm = RealmId::from_bytes(

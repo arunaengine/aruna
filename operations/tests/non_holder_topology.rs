@@ -111,6 +111,7 @@ async fn owner_read_routes() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
 
@@ -164,6 +165,7 @@ async fn record_routes_owner() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
     let probe = realm.node(1);
@@ -213,6 +215,7 @@ async fn origin_scoped_dedup() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
     let retried = submit_execution_job(
@@ -224,6 +227,7 @@ async fn origin_scoped_dedup() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
     assert!(first.created);
@@ -239,6 +243,7 @@ async fn origin_scoped_dedup() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
     assert!(elsewhere.created, "another origin owns its own job");
@@ -280,6 +285,7 @@ async fn cap_stays_local() -> TestResult<()> {
             user_id: realm.user_id,
             realm_id: realm.realm_id,
             path_restrictions: None,
+            session: None,
         },
         source: ImportRoCrateSource::Upload {
             upload_id: Ulid::from_bytes([seed; 16]),
@@ -348,6 +354,7 @@ async fn owner_claims() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
     let passive = realm.node(1);
@@ -405,6 +412,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
     assert_eq!(derived_owner(&realm, submitted.job_id)?, owner_id);
@@ -501,6 +509,7 @@ async fn owner_down_unavailable() -> TestResult<()> {
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
+        None,
     )
     .await?;
     let probe = realm.node(1);
@@ -989,6 +998,7 @@ async fn document_export_routes() -> TestResult<()> {
         user_id: realm.user_id,
         realm_id: realm.realm_id,
         path_restrictions: None,
+        session: None,
     };
     let internal = export_routed(
         &realm,

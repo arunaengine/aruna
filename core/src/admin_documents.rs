@@ -7,10 +7,14 @@ use crate::NodeId;
 use crate::structs::{
     Actor, BandPool, BindingScope, CandidatePlacementMap, CompletionProof, HandleRange,
     MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmComputeConfig,
-    RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding, TransitionPlan,
+    PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
+    RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding,
+    TransitionPlan,
 };
 use crate::types::{GroupId, RoleId, UserId};
+
+/// Domain separator for the origin signature over an administrative event.
+pub const ADMIN_DOCUMENT_EVENT_DOMAIN: &str = "aruna-admin-document-event-v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminDocumentClock {
@@ -278,6 +282,12 @@ pub enum AdminDocumentOperation {
     RealmConfigComputeSet {
         compute: RealmComputeConfig,
     },
+    /// Drops a node from realm membership. The node keeps its keys but stops
+    /// being an admitted peer wherever the configuration replicates, so an
+    /// evicted device loses its connections at the next membership refresh.
+    RealmConfigNodeRemoved {
+        node_id: NodeId,
+    },
 }
 
 #[cfg(test)]
@@ -398,6 +408,7 @@ mod tests {
                 node_id: node(1),
                 kind: RealmNodeKind::Management,
             },
+            AdminDocumentOperation::RealmConfigNodeRemoved { node_id: node(1) },
             AdminDocumentOperation::RealmConfigOidcProviderUpserted {
                 provider: oidc_provider("default"),
             },
@@ -556,6 +567,56 @@ mod tests {
     }
 
     #[test]
+    fn signature_binds_envelope() {
+        // The origin's signature covers the placement, actor and origin, so a
+        // relay cannot move or rewrite the envelope it republishes.
+        use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
+        use crate::structs::{Actor, PlacementRef};
+
+        let realm_id = RealmId::from_bytes([9; 32]);
+        let secret = iroh::SecretKey::from_bytes(&[11; 32]);
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([3; 16]),
+            shard: 5,
+        };
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_bytes([4; 16]),
+            target: AdminDocumentTarget::Group {
+                group_id: group_id(1),
+            },
+            origin_node_id: secret.public(),
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor: Actor {
+                node_id: secret.public(),
+                user_id: user_id(2),
+                realm_id,
+            },
+            op: AdminDocumentOperation::GroupCreated {
+                realm_id,
+                display_name: "Engineering".to_string(),
+                owner: user_id(2),
+            },
+        };
+        let bytes = event.signing_bytes(&placement).expect("event signs");
+        assert_eq!(bytes, event.signing_bytes(&placement).expect("stable"));
+        let signature = secret.sign(&bytes);
+        assert!(event.origin_signed(&placement, &signature));
+
+        let mut elsewhere = placement;
+        elsewhere.shard += 1;
+        assert!(!event.origin_signed(&elsewhere, &signature));
+
+        let mut tampered = event.clone();
+        tampered.actor.user_id = user_id(3);
+        assert!(!tampered.origin_signed(&placement, &signature));
+
+        let mut foreign = event;
+        foreign.origin_node_id = iroh::SecretKey::from_bytes(&[12; 32]).public();
+        assert!(!foreign.origin_signed(&placement, &signature));
+    }
+
+    #[test]
     fn realm_config_node_ensured_operation_roundtrips() {
         let operation = AdminDocumentOperation::RealmConfigNodeEnsured {
             node_id: node(3),
@@ -632,5 +693,18 @@ impl AdminDocumentEvent {
             origin_node_id: self.origin_node_id,
             origin_seq: self.origin_seq,
         }
+    }
+
+    /// Deterministic bytes the origin signs. Binds the whole envelope plus the
+    /// placement it rides, so a relay can forward but never re-target, re-actor,
+    /// or re-shard another origin's event.
+    pub fn signing_bytes(&self, placement: &PlacementRef) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(&(ADMIN_DOCUMENT_EVENT_DOMAIN, self, placement))
+    }
+
+    /// Whether `signature` is the origin node's signature over this envelope.
+    pub fn origin_signed(&self, placement: &PlacementRef, signature: &iroh::Signature) -> bool {
+        self.signing_bytes(placement)
+            .is_ok_and(|bytes| self.origin_node_id.verify(&bytes, signature).is_ok())
     }
 }

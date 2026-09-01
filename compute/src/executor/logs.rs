@@ -1,20 +1,5 @@
 use std::collections::VecDeque;
 
-use aruna_core::compute::LogStream;
-
-/// Optional full-stream copy target invoked for every captured chunk, in
-/// addition to the bounded tail. Backends call this before dropping bytes.
-pub trait LogSink: Send + Sync {
-    fn write(&self, stream: LogStream, chunk: &[u8]);
-}
-
-/// A sink that discards everything (bounded tail only).
-pub struct NullSink;
-
-impl LogSink for NullSink {
-    fn write(&self, _stream: LogStream, _chunk: &[u8]) {}
-}
-
 /// Fixed-capacity ring retaining the last `cap` bytes seen while counting the
 /// total, so a chatty stream stays bounded.
 #[derive(Debug)]

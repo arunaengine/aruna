@@ -5,7 +5,7 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
+use aruna_core::effects::{BlobEffect, Effect, LocalFileEffect, StagingSourceEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
@@ -67,6 +67,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
         BlobEffect::ServeRead { .. } => (EffectClass::Transfer, "serve_read"),
+        BlobEffect::ServeSourceRead { .. } => (EffectClass::Transfer, "serve_source_read"),
         BlobEffect::ReceiveRead { .. } => (EffectClass::Transfer, "receive_read"),
         BlobEffect::OpenConnection { .. } => (EffectClass::Control, "open_connection"),
         BlobEffect::SendMessage { .. } => (EffectClass::Control, "send_message"),
@@ -174,6 +175,7 @@ impl Handle for BlobHandle {
             Effect::StagingSource(staging_source_effect) => {
                 self.send_staging_source_effect(staging_source_effect).await
             }
+            Effect::LocalFile(file_effect) => self.send_file_effect(file_effect).await,
             _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
         }
     }
@@ -309,6 +311,33 @@ impl BlobHandle {
 
     pub fn clear_reservation(&self, id: Ulid) {
         self.handler.clear_active(id);
+    }
+
+    /// Executes one write into a folder the owner bound on this machine. The
+    /// adapter enforces the jail and the guard; the policy is the operation's.
+    pub async fn send_file_effect(&self, effect: LocalFileEffect) -> Event {
+        Event::LocalFile(match effect {
+            LocalFileEffect::Write {
+                root,
+                relative,
+                guard,
+                blob,
+            } => crate::fs_write::write_guarded(&root, &relative, &guard, blob).await,
+            LocalFileEffect::WriteConflicted {
+                root,
+                relative,
+                at_ms,
+                blob,
+            } => crate::fs_write::write_conflicted(&root, &relative, at_ms, blob).await,
+            LocalFileEffect::MoveAside {
+                root,
+                relative,
+                guard,
+            } => crate::fs_write::move_aside(&root, &relative, &guard).await,
+            LocalFileEffect::Hash { root, relative } => {
+                crate::fs_write::hash_local(&root, &relative).await
+            }
+        })
     }
 
     pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
@@ -619,6 +648,22 @@ impl BlobHandler {
                 location,
                 expected_blake3,
             } => Box::pin(self.serve_read(stream_id, location, expected_blake3)).await,
+            BlobEffect::ServeSourceRead {
+                stream_id,
+                access,
+                size,
+                expected_blake3,
+                fingerprint,
+            } => {
+                Box::pin(self.serve_source_read(
+                    stream_id,
+                    access,
+                    size,
+                    expected_blake3,
+                    fingerprint,
+                ))
+                .await
+            }
             BlobEffect::ReceiveRead {
                 stream_id,
                 size,

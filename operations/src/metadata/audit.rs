@@ -713,8 +713,7 @@ pub async fn list_audit(
                 .find(|node| node.node_id == local_node.to_string())
             {
                 Some(node) => {
-                    let current_local_authorized =
-                        !matches!(&node.kind, aruna_core::structs::RealmNodeKind::User);
+                    let current_local_authorized = node.kind.is_sync_eligible();
                     user_origin = !current_local_authorized;
                     include_local = request.local_authorized && current_local_authorized;
                     if request.local_authorized != current_local_authorized {
@@ -1779,6 +1778,7 @@ mod tests {
                 user_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             format!("/{realm_id}/g/{group_id}/admin"),
         )

@@ -335,6 +335,7 @@ mod tests {
                 user_id: UserId::nil(realm_id()),
                 realm_id: realm_id(),
                 path_restrictions: None,
+                session: None,
             },
             mutation_id: Ulid::from_bytes([8u8; 16]),
             expected_head: CurrentVersionPointer::new_with_generation(

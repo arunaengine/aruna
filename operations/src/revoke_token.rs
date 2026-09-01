@@ -297,7 +297,7 @@ impl RevokeTokenOperation {
         if record.node_id != self.config.actor.node_id || record.target != self.document_ref() {
             return None;
         }
-        let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event else {
+        let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event else {
             return None;
         };
         if event.origin_node_id != self.config.actor.node_id
@@ -549,9 +549,7 @@ impl RevokeTokenOperation {
                 self.config.actor.node_id,
                 document_target,
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(admin_event),
-                },
+                DocumentSyncOutboxEvent::admin(admin_event),
                 placement,
                 false,
             );
@@ -1097,7 +1095,7 @@ mod tests {
         .filter(|record: &DocumentSyncOutboxRecord| {
             matches!(
                 &record.event,
-                DocumentSyncOutboxEvent::AdminOperation { event }
+                DocumentSyncOutboxEvent::AdminOperation { event, .. }
                     if matches!(
                         &event.op,
                         AdminDocumentOperation::RealmConfigTokenRevoked { .. }

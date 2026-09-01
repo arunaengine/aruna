@@ -14,7 +14,9 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend};
+use aruna_core::structs::{
+    BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend, ResolvedSourceAccess,
+};
 use aruna_core::util::unix_timestamp_millis;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -115,14 +117,26 @@ impl BlobHandler {
                     return BlobEvent::Error(BlobError::OutboardCreationFailed(error.to_string()));
                 }
             };
+        self.stream_encoding(stream_id, reader, &mut outboard, location.blob_size)
+            .await
+    }
+    /// Streams one bao encoding to the peer and tears the connection down,
+    /// whatever the encoder answered.
+    async fn stream_encoding<R: iroh_io::AsyncSliceReader>(
+        &self,
+        stream_id: Ulid,
+        reader: R,
+        outboard: &mut PreOrderOutboard<BytesMut>,
+        size: u64,
+    ) -> BlobEvent {
         let stream = match self.connection_handle(stream_id).await {
             Ok(stream) => stream,
             Err(event) => return event,
         };
         let mut stream = stream.lock().await;
-        let ranges = round_up_to_chunks(&ByteRanges::from(0..location.blob_size));
+        let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
         let mut sender = SendStreamWrapper::new(&mut stream.0, self.transfer_idle_timeout());
-        let result = encode_ranges_validated(reader, &mut outboard, &ranges, &mut sender).await;
+        let result = encode_ranges_validated(reader, outboard, &ranges, &mut sender).await;
         _ = stream.0.finish();
         _ = stream.1.stop(0u32.into());
         drop(stream);
@@ -132,6 +146,35 @@ impl BlobHandler {
             Ok(()) => BlobEvent::ReadServed { stream_id },
             Err(error) => BlobEvent::Error(BlobError::ReplicationFailed(error.to_string())),
         }
+    }
+
+    /// Serves one version this node never materialized: the bytes come from the
+    /// owner's own file. The file is refused unless it still carries the
+    /// observed fingerprint and hashes to the requester's identity.
+    pub async fn serve_source_read(
+        &self,
+        stream_id: Ulid,
+        access: ResolvedSourceAccess,
+        size: u64,
+        expected_blake3: [u8; 32],
+        fingerprint: String,
+    ) -> BlobEvent {
+        let (reader, mut outboard, path, current) =
+            match verified_source(&access, size, expected_blake3, &fingerprint).await {
+                Ok(verified) => verified,
+                Err(event) => return event,
+            };
+        let served = self
+            .stream_encoding(stream_id, reader, &mut outboard, size)
+            .await;
+        // The encoder validates every chunk against the outboard, so a file
+        // rewritten mid-stream already fails; this only names the cause.
+        if crate::fs_source::current_fingerprint(&path).await != Some(current) {
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "the offered file changed while it was served".to_string(),
+            ));
+        }
+        served
     }
 
     pub async fn receive_read(
@@ -480,5 +523,186 @@ impl BlobHandler {
             _ = self.close_connection(stream_id).await;
         }
         event
+    }
+}
+
+/// Resolves one observation to a reader whose bytes provably carry the named
+/// identity. Every refusal here happens before a single byte is offered.
+async fn verified_source(
+    access: &ResolvedSourceAccess,
+    size: u64,
+    expected_blake3: [u8; 32],
+    fingerprint: &str,
+) -> Result<
+    (
+        crate::bao_tree::LocalFileReader,
+        PreOrderOutboard<BytesMut>,
+        std::path::PathBuf,
+        String,
+    ),
+    BlobEvent,
+> {
+    // Only a local directory is ever streamed this way: another connector kind
+    // carrying an offered root must never reach the filesystem here.
+    if !crate::fs_source::is_local_access(access) {
+        return Err(BlobEvent::Error(BlobError::ReadError(
+            "only a local directory is served from its source".to_string(),
+        )));
+    }
+    let (path, current) = crate::fs_source::stable_source(access)
+        .await
+        .map_err(|error| BlobEvent::Error(BlobError::ReadError(error.to_string())))?;
+    if fingerprint != current {
+        return Err(BlobEvent::Error(BlobError::IntegrityCheckFailed(
+            "the offered file changed since it was observed".to_string(),
+        )));
+    }
+    let mut reader = crate::bao_tree::LocalFileReader::open(&path, size)
+        .await
+        .map_err(|error| BlobEvent::Error(BlobError::ReadError(error.to_string())))?;
+    let outboard = match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
+        Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,
+        Ok(_) => {
+            return Err(BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "the offered file does not carry the expected hash".to_string(),
+            )));
+        }
+        Err(error) => {
+            return Err(BlobEvent::Error(BlobError::OutboardCreationFailed(
+                error.to_string(),
+            )));
+        }
+    };
+    Ok((reader, outboard, path, current))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verified_source;
+    use aruna_core::errors::BlobError;
+    use aruna_core::events::BlobEvent;
+    use aruna_core::structs::{
+        FileStat, OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind,
+        weak_fingerprint,
+    };
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    fn access(root: &Path, path: &str, kind: SourceConnectorKind) -> ResolvedSourceAccess {
+        ResolvedSourceAccess::OpenDal {
+            kind,
+            config: HashMap::from([(
+                OFFERED_DIRECTORY_ROOT.to_string(),
+                root.to_string_lossy().to_string(),
+            )]),
+            path: path.to_string(),
+            version: None,
+        }
+    }
+
+    async fn fingerprint_of(path: &Path) -> String {
+        let metadata = tokio::fs::metadata(path).await.unwrap();
+        weak_fingerprint(&FileStat::from_metadata(&metadata))
+    }
+
+    #[tokio::test]
+    async fn serves_verified_source() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("note.txt");
+        tokio::fs::write(&file, b"hello").await.unwrap();
+        let hash = *blake3::hash(b"hello").as_bytes();
+        let fingerprint = fingerprint_of(&file).await;
+        assert!(
+            verified_source(
+                &access(root.path(), "note.txt", SourceConnectorKind::LocalDirectory),
+                5,
+                hash,
+                &fingerprint,
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    // Only a local directory is streamed from its source; another connector
+    // kind carrying an offered root must never reach the filesystem.
+    #[tokio::test]
+    async fn refuses_foreign_kind() {
+        let root = tempfile::tempdir().unwrap();
+        tokio::fs::write(root.path().join("note.txt"), b"hello")
+            .await
+            .unwrap();
+        let refused = verified_source(
+            &access(root.path(), "note.txt", SourceConnectorKind::S3),
+            5,
+            *blake3::hash(b"hello").as_bytes(),
+            "5-0",
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(BlobEvent::Error(BlobError::ReadError(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_changed_file() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("note.txt");
+        tokio::fs::write(&file, b"hello").await.unwrap();
+        let refused = verified_source(
+            &access(root.path(), "note.txt", SourceConnectorKind::LocalDirectory),
+            5,
+            *blake3::hash(b"hello").as_bytes(),
+            "5-deadbeef",
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(BlobEvent::Error(BlobError::IntegrityCheckFailed(_)))
+        ));
+    }
+
+    // The requester names an identity; a file that does not carry it is never
+    // streamed under it.
+    #[tokio::test]
+    async fn refuses_wrong_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("note.txt");
+        tokio::fs::write(&file, b"hello").await.unwrap();
+        let fingerprint = fingerprint_of(&file).await;
+        let refused = verified_source(
+            &access(root.path(), "note.txt", SourceConnectorKind::LocalDirectory),
+            5,
+            [9u8; 32],
+            &fingerprint,
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(BlobEvent::Error(BlobError::IntegrityCheckFailed(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_escaping_link() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(outside.path().join("secret"), b"hello")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("link"))
+            .unwrap();
+        let refused = verified_source(
+            &access(root.path(), "link", SourceConnectorKind::LocalDirectory),
+            5,
+            *blake3::hash(b"hello").as_bytes(),
+            "5-0",
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(BlobEvent::Error(BlobError::ReadError(_)))
+        ));
     }
 }

@@ -638,7 +638,7 @@ mod tests {
             }),
             realm_id,
             local_node,
-            NodeCapabilities::local_node(realm_id).unwrap(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
             JobsRuntime::new(),

@@ -417,6 +417,14 @@ impl IntoS3Error for GetObjectError {
                 )
             }
             GetObjectError::ReferenceAdvanceExhausted => reference_exhausted_error(),
+            // A device is never a legal destination for governed data, so this
+            // is a refusal (403), not a fault: retrying cannot change it.
+            GetObjectError::GovernedUnavailable => {
+                s3_error!(
+                    AccessDenied,
+                    "Governed content is not served on a user node."
+                )
+            }
             GetObjectError::DeleteMarker => delete_marker_error(),
             GetObjectError::NoSuchKey => no_such_key_error(),
             GetObjectError::InvalidRange => {
@@ -619,6 +627,15 @@ mod tests {
                 Some(http::StatusCode::SERVICE_UNAVAILABLE)
             );
         }
+    }
+
+    // Governed content on a device is refused, not faulted: an honest 403 tells
+    // the client the read will never succeed here.
+    #[test]
+    fn refuses_governed_read() {
+        let refused = GetObjectError::GovernedUnavailable.into_s3_error();
+        assert_eq!(*refused.code(), S3ErrorCode::AccessDenied);
+        assert_eq!(refused.status_code(), Some(http::StatusCode::FORBIDDEN));
     }
 
     // The three reference failures are distinct to a client: gone (404), retry

@@ -109,9 +109,16 @@ pub async fn expand_realm_placement(
         .collect();
     let mut started = Vec::new();
     for strategy_id in strategy_ids {
-        if config.placement_transitions.iter().any(|transition| {
+        if let Some(transition) = config.placement_transitions.iter().find(|transition| {
             transition.plan.strategy_id == strategy_id && !transition.is_terminal()
         }) {
+            // The joiner stays out of the holder sets until the successor
+            // expansion in `process_transitions` runs for it.
+            tracing::debug!(
+                %strategy_id,
+                transition_id = %transition.plan.transition_id,
+                "Expansion deferred behind an in-flight transition"
+            );
             continue;
         }
         let buckets = expansion_buckets(&config, strategy_id, epoch).map_err(invalid)?;

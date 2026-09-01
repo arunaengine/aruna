@@ -8,15 +8,22 @@ use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
     ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
-    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, Permission,
-    WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
+    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
+    Permission, WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path,
+    blob_group_permission_path,
+};
+use aruna_core::types::NodeId;
+use aruna_operations::device::compute::{
+    LocalExecutionConfig, LocalExecutionError, submit_local_execution,
 };
 use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
-    cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
+    cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_owned_job,
+    read_report_routed,
 };
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use axum::body::Body;
@@ -30,18 +37,18 @@ use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
-};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
+use crate::routes::device::require_owner;
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
 
@@ -65,23 +72,40 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_job_artifact, head_job_artifact))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct ExecutionInputRequest {
+    /// Source bucket holding the object, for example `project-data`.
     pub bucket: String,
+    /// Source object key inside `bucket`, for example `inputs/reads.fastq.gz`.
+    /// A relative key without a leading slash and without `..` segments.
     pub key: String,
+    /// Exact object version to stage. Required by `exact_reference` mode and
+    /// refused by `floating_reference` mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    /// Realm node holding this object. Only a `local` run accepts it: the named
+    /// version is copied onto the device before the run and `version_id` is
+    /// then required. A realm run refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
+    /// Destination key inside the workspace bucket, for example `reads.fastq.gz`.
+    /// Must not be empty and must be unique across the declared inputs.
     pub dest_key: String,
-    /// Absolute container path; defaults to `/inputs/<dest_key>`.
+    /// Absolute container path; defaults to `/inputs/<dest_key>`. It must be
+    /// absolute, must not be `/`, must carry no `.` or `..` component, and must
+    /// be unique across the declared inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_path: Option<String>,
+    /// Composition mode; defaults to `snapshot`.
     #[serde(default)]
     pub mode: InputModeRequest,
 }
 
 /// Per-input composition mode. `exact_reference` requires `version_id`,
 /// `floating_reference` rejects it.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum InputModeRequest {
     #[default]
@@ -90,7 +114,11 @@ pub enum InputModeRequest {
     ExactReference,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+/// How a claimed destination key is resolved. `reject` refuses the submission,
+/// `replace` lets the later declaration win, and `keep_existing` keeps the first.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CollisionPolicyRequest {
     #[default]
@@ -99,15 +127,20 @@ pub enum CollisionPolicyRequest {
     KeepExisting,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct ExecutionOutputRequest {
-    /// Absolute container path captured after the task exits.
+    /// Absolute container path captured after the task exits, for example
+    /// `/work/result.json`. Must be unique across the declared outputs.
     pub container_path: String,
-    /// Destination key inside the workspace bucket.
+    /// Destination key inside the workspace bucket, for example
+    /// `results/result.json`. Must not be empty and must be unique.
     pub dest_key: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+/// Where a run's staged inputs and captured outputs live. `temporary` discards
+/// the workspace after the run, `kept` retains it in a new bucket, and
+/// `existing` reuses the named bucket.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceModeRequest {
     Temporary,
@@ -115,46 +148,107 @@ pub enum WorkspaceModeRequest {
     Existing,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct WorkspaceRequest {
+    /// `temporary` discards the workspace after the run, `kept` retains it in a
+    /// new bucket, and `existing` reuses the named bucket.
     pub mode: WorkspaceModeRequest,
+    /// Required by `existing` mode and refused by the other two. The bucket must
+    /// exist, belong to the same group, and be writable by the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// Where a submission runs. `local` is served by a user device only, and runs
+/// the job on that machine for its owner.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    rmcp::schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionTarget {
+    #[default]
+    Realm,
+    Local,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct SubmitExecutionRequest {
+    /// Owning group's bare 26-character ULID, for example
+    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. The caller needs write permission on it.
     pub group_id: String,
+    /// OCI image the task runs, for example `docker.io/library/python:3.13-slim`.
+    /// Must not be blank.
     pub image: String,
+    /// Replaces the image ENTRYPOINT. Omit to keep the image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
+    /// Argument vector appended after the entrypoint, for example
+    /// `["python", "/work/script.py"]`. Defaults to empty.
     #[serde(default)]
     pub command: Vec<String>,
+    /// Environment variables for the task. Defaults to empty.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Scheduling tags. `aruna-engine.org/label/<key>` demands a matching target
+    /// label, at most 16 of them. The workspace tags of that namespace are
+    /// reserved and refused. Defaults to empty.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    /// Absolute working directory inside the container, for example `/work`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Whole CPU cores reserved. Defaults to 1; `0` is refused and the group's
+    /// compute quota may cap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_cores: Option<u32>,
+    /// RAM reserved in bytes, for example `1073741824` for 1 GiB. Defaults to
+    /// 1 GiB; `0` and anything above 9223372036854775807 are refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_bytes: Option<u64>,
+    /// Wall-clock limit in milliseconds, for example `600000` for ten minutes.
+    /// Defaults to 86400000, one day; the group's compute quota may cap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_walltime_ms: Option<u64>,
+    /// Optional executor selector. Leave unset unless the realm documents one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_constraint: Option<String>,
+    /// Objects staged into the container before the run, at most 512.
     #[serde(default)]
     pub inputs: Vec<ExecutionInputRequest>,
+    /// Container paths captured into the workspace bucket after the run, at
+    /// most 1024.
     #[serde(default)]
     pub outputs: Vec<ExecutionOutputRequest>,
     #[serde(default)]
     /// Workspace prefixes to inventory at completion. Only objects this
     /// execution itself wrote under a prefix are reported: a version another
-    /// writer produced is never attributed to this job.
+    /// writer produced is never attributed to this job. This route declares no
+    /// file outputs, so a non-empty list is refused; leave it empty.
     pub output_prefixes: Vec<String>,
+    /// How a destination key already claimed by another declared input or by an
+    /// object in the workspace bucket is resolved. Defaults to `reject`.
     #[serde(default)]
     pub collision_policy: CollisionPolicyRequest,
+    /// Caller-chosen key that makes a resubmission return the same job instead
+    /// of starting a second one. A different request under a used key is a 409.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Where staged inputs and captured outputs live. Absent means a kept
+    /// workspace in a new bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRequest>,
+    /// `realm` (the default) admits the job into the realm; `local` runs it on
+    /// this machine and is served by a user device only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ExecutionTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -163,8 +257,10 @@ pub struct SubmitJobResponse {
     pub job_id: String,
     pub created: bool,
     /// The replicated identity of the request itself, hex encoded. Two aliases
-    /// of one request always share it.
-    pub submission_id: String,
+    /// of one request always share it. Absent for a local run, which is never
+    /// replicated and belongs to no submission family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<String>,
     /// The alias the responder currently reduces as canonical. It may change
     /// once a partitioned lower claim is learned; `job_id` never does.
     pub canonical_job_id: String,
@@ -234,8 +330,6 @@ pub struct JobFamilyResponse {
     pub outputs: Vec<JobOutputResponse>,
     pub revision: u64,
     pub projection_digest: String,
-    /// Always true: the family is replicated, so this is one node's view.
-    pub eventually_consistent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub responder_node_id: Option<String>,
     /// The family holds more records than one projection may reduce.
@@ -370,11 +464,11 @@ fn rfc3339(ms: u64) -> String {
         .unwrap_or_default()
 }
 
-fn job_status_response(record: &JobRecord) -> JobStatusResponse {
+pub(crate) fn job_status_response(record: &JobRecord) -> JobStatusResponse {
     job_view_response(&JobStatusView::from(record))
 }
 
-fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
+pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
     JobStatusResponse {
         job_id: job.job_id.to_string(),
         kind: job.kind.name().to_string(),
@@ -447,7 +541,6 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
         outputs,
         revision: report.revision,
         projection_digest: hex32(&report.digest),
-        eventually_consistent: true,
         responder_node_id: report.responder.map(|node| node.to_string()),
         partial: report.partial,
         locally_exhausted: report.locally_exhausted,
@@ -467,7 +560,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
     }
 }
 
-fn bind_output_routes(
+pub(crate) fn bind_output_routes(
     result: &mut Option<serde_json::Value>,
     outputs: &[JobOutputResponse],
 ) -> Result<(), JobRouteError> {
@@ -480,7 +573,7 @@ fn bind_output_routes(
     Ok(())
 }
 
-fn parse_state(value: &str) -> ServerResult<JobState> {
+pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
     match value {
         "queued" => Ok(JobState::Queued),
         "claimed" => Ok(JobState::Claimed),
@@ -496,7 +589,7 @@ fn parse_state(value: &str) -> ServerResult<JobState> {
     }
 }
 
-fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
+pub(crate) fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
     match cursor {
         Some(cursor) => {
             let bytes = URL_SAFE_NO_PAD
@@ -511,7 +604,7 @@ fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
     }
 }
 
-fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
+pub(crate) fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
     cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
 }
 
@@ -580,7 +673,7 @@ pub(crate) fn map_submit_error(
             format!("idempotency key already bound to job {existing_job_id}"),
         ),
         SubmitJobError::ActiveJobLimit { limit } => {
-            ServerError::Conflict(format!("active RO-Crate job limit of {limit} reached"))
+            ServerError::Conflict(format!("active job limit of {limit} reached"))
         }
         SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
         SubmitJobError::TooManyOutputs { limit } => {
@@ -623,6 +716,7 @@ async fn validate_existing_workspace(
     auth: &AuthContext,
     group_id: Ulid,
     bucket: &str,
+    extras: PolicyRequestExtras,
 ) -> ServerResult<()> {
     let info = match drive(
         GetBucketInfoOperation::new(bucket.to_string()),
@@ -638,11 +732,12 @@ async fn validate_existing_workspace(
     if info.group_id != group_id {
         return Err(ServerError::BadRequest);
     }
-    ensure_permission(
+    crate::auth::ensure_permission_with(
         state,
         auth,
         blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
         Permission::WRITE,
+        extras,
     )
     .await
 }
@@ -658,10 +753,26 @@ fn container_path(path: &str) -> ServerResult<String> {
 
 /// Native inputs land in the container at the given path, defaulting to
 /// `/inputs/<dest_key>` so `load_inputs` always stages them.
-fn native_input(input: ExecutionInputRequest) -> ServerResult<InputSelection> {
+fn native_input(
+    input: ExecutionInputRequest,
+    target: ExecutionTarget,
+) -> ServerResult<InputSelection> {
     if input.dest_key.is_empty() {
         return Err(ServerError::BadRequest);
     }
+    // A realm submission resolves its inputs through the planner, which seals
+    // the holder itself; naming one there would claim an unverified fact.
+    let source_node_id = match (&input.source_node_id, target) {
+        (Some(node_id), ExecutionTarget::Local) => {
+            Some(NodeId::from_str(node_id).map_err(|_| ServerError::BadRequest)?)
+        }
+        (Some(_), ExecutionTarget::Realm) => {
+            return Err(ServerError::BadRequestMessage(
+                "source_node_id is only accepted by a local run".to_string(),
+            ));
+        }
+        (None, _) => None,
+    };
     let path = match &input.container_path {
         Some(path) => container_path(path)?,
         None => container_path(&format!("/inputs/{}", input.dest_key))?,
@@ -672,7 +783,7 @@ fn native_input(input: ExecutionInputRequest) -> ServerResult<InputSelection> {
             key: input.key,
             version_id: input.version_id,
         },
-        source_node_id: None,
+        source_node_id,
         dest_key: input.dest_key,
         mode: match input.mode {
             InputModeRequest::Snapshot => InputMode::Snapshot,
@@ -728,7 +839,8 @@ its own jobs.
 
 **Behavior**
 - The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs
-  this node owns.
+  this node owns. On a user device that includes every local run the owner started there; there is
+  no separate listing for them.
 - Jobs recorded on other nodes are never merged in, so a caller that submitted against another
   node pages that node's listing instead (submission answers with the `origin_node_url` it was
   accepted at).
@@ -846,6 +958,26 @@ on that bucket and that it belongs to the same group.
 - The group's standing quota is decided against a replicated demand view. A replay of an
   idempotency key this node already claimed is settled before any quota is read and is never
   quota-refused.
+- On a user device a `realm` request is always forwarded: the inputs are referenced rather than
+  resolved here, the outputs land on the admitting realm holder, and the device itself never
+  executes, admits or stores any part of the job. A device forwards the caller's own bearer token,
+  so a submission it cannot back with one is a 403 rather than a forwarded request.
+
+- `target` `local` is served by a user device only; any other node answers 400. The job runs on this machine for the user the device is enrolled for, and is refused for anyone
+  else with a 403. Nothing about it is forwarded, replicated or offered to the realm, and the
+  response carries no `submission_id`: a local run belongs to no submission family.
+- Inputs must be readable on the device. An input naming `source_node_id` and `version_id` is a
+  realm object: staging fetches that exact version into the run's own workspace bucket, as an
+  ordinary local object and never as a reference, so an unreachable holder fails the run rather
+  than the submission. Any other input this device does not hold is a 400 naming it.
+- Outputs stay in the node-local workspace bucket until the owner publishes them, and the run is
+  listed by this device's own `GET /jobs/`.
+- Mounted inputs and `workspace.mode` `none` are refused, because a device stages files and exposes
+  no S3 endpoint a container could reach, and so is `workspace.mode` `existing`, because a local
+  run's outputs stay in its own workspace bucket.
+- A paused compute plane, a device without a compute backend, and a device that already holds as
+  many unfinished jobs as `ARUNA_COMPUTE_MAX_CONCURRENT` all answer 409; the ceiling is counted in
+  the admitting transaction, so two submissions cannot both pass it.
 
 **Limits** (all refused with 400)
 - An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
@@ -862,7 +994,12 @@ on that bucket and that it belongs to the same group.
 - A 503 is retryable and the caller may submit again with the same idempotency key: no family
   holder could admit the request, the demand view could not be read or kept moving under three
   reads, three admission transactions in a row lost to a concurrent submission of the same group,
-  or the id clock is unhealthy."#,
+  or the id clock is unhealthy.
+- A device submission whose inputs sit on no holder of its family answers that same 503, and it is
+  the one case retrying does not clear. The family is picked by hashing the request, the holder
+  resolves the referenced inputs against its own objects only, and a holder that cannot read one
+  refuses without naming it, so an unstaged input is indistinguishable here from an unreachable
+  realm. Submit from a node that holds the inputs, or replicate them first."#,
     request_body(
         content = SubmitExecutionRequest,
         description = "Container image, command and the inputs and outputs to stage around it",
@@ -873,6 +1010,10 @@ on that bucket and that it belongs to the same group.
             "env": {
                 "FASTQC_THREADS": "2"
             },
+            "tags": {
+                "aruna-engine.org/label/accelerator": "gpu"
+            },
+            "workdir": "/work",
             "cpu_cores": 2,
             "ram_bytes": 4294967296_i64,
             "max_walltime_ms": 3600000,
@@ -925,10 +1066,10 @@ on that bucket and that it belongs to the same group.
                 "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
             })
         ),
-        (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, or a workspace request that names no usable bucket", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is bound to a different plan, the group's compute quota refuses the admission, the composition conflicts on a staged key, or the active RO-Crate job limit is reached", body = ErrorResponse),
+        (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, a workspace request that names no usable bucket, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is bound to a different plan, the group's compute quota refuses the admission, the composition conflicts on a staged key, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, or the caller lacks WRITE on the group or on the named existing workspace bucket", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group or on the named existing workspace bucket, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
         (status = 503, description = "No family holder could admit the request, an unreadable or unsettled demand view, three lost admission transactions, or an unhealthy id clock; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -939,7 +1080,29 @@ pub async fn submit_job(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SubmitExecutionRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let (status, response) = submit_execution(
+        state.as_ref(),
+        auth,
+        bearer,
+        request,
+        PolicyRequestExtras::rest(),
+    )
+    .await?;
+    Ok((status, Json(response)))
+}
+
+pub(crate) async fn submit_execution(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    bearer: Option<ValidatedArunaBearerTokenCarrier>,
+    request: SubmitExecutionRequest,
+    extras: PolicyRequestExtras,
+) -> ServerResult<(StatusCode, SubmitJobResponse)> {
+    let target = request.target.unwrap_or_default();
+    let auth = match target {
+        ExecutionTarget::Realm => require_unrestricted_realm_auth(state, auth)?,
+        ExecutionTarget::Local => local_auth(state, auth).await?,
+    };
     let group_id = Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
     let (workspace_mode, workspace_bucket) = workspace_request(request.workspace)?;
     if request.image.trim().is_empty() {
@@ -954,15 +1117,16 @@ pub async fn submit_job(
         return Err(ServerError::BadRequest);
     }
     let output_prefixes = validate_output_prefixes(request.output_prefixes)?;
-    ensure_permission(
-        &state,
+    crate::auth::ensure_permission_with(
+        state,
         &auth,
         blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
         Permission::WRITE,
+        extras.clone(),
     )
     .await?;
     if let Some(bucket) = workspace_bucket.as_deref() {
-        validate_existing_workspace(&state, &auth, group_id, bucket).await?;
+        validate_existing_workspace(state, &auth, group_id, bucket, extras).await?;
     }
 
     if request.inputs.len() > MAX_PLAN_INPUTS || request.outputs.len() > MAX_EXECUTION_OUTPUTS {
@@ -971,7 +1135,7 @@ pub async fn submit_job(
     // Destination-key overlaps are the composition's collision policy to resolve.
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
-        let input = native_input(input)?;
+        let input = native_input(input, target)?;
         if inputs
             .iter()
             .any(|existing| existing.container_path == input.container_path)
@@ -995,11 +1159,11 @@ pub async fn submit_job(
         group_id,
         name: None,
         description: None,
-        tags: BTreeMap::new(),
+        tags: request.tags,
         image: request.image,
         entrypoint: request.entrypoint,
         command: request.command,
-        workdir: None,
+        workdir: request.workdir,
         env: request.env,
         resources: ComputeResources {
             cpu_cores: request.cpu_cores,
@@ -1015,39 +1179,128 @@ pub async fn submit_job(
         output_prefixes,
         collision_policy: collision_policy(request.collision_policy),
     };
-    let result = submit_external_job(
-        &state.get_ctx(),
-        spec,
-        auth.user_id,
-        request.idempotency_key,
-        workspace_mode,
-        workspace_bucket,
-        state.rocrate_limits().artifact_retention_ms,
-        forwarded_job_auth(bearer)?,
-    )
-    .await
-    .map_err(map_submit_error)?;
+    let accepted = match target {
+        ExecutionTarget::Local => {
+            local_submit(state, &auth, spec, request.idempotency_key, workspace_mode).await?
+        }
+        ExecutionTarget::Realm => {
+            let result = submit_external_job(
+                &state.get_ctx(),
+                spec,
+                auth.user_id,
+                request.idempotency_key,
+                workspace_mode,
+                workspace_bucket,
+                state.rocrate_limits().artifact_retention_ms,
+                forwarded_job_auth(bearer)?,
+            )
+            .await
+            .map_err(map_submit_error)?;
+            AcceptedJob {
+                job_id: result.job_id,
+                created: result.created,
+                submission_id: Some(hex32(&result.submission_id.0)),
+                state: result.state.name().to_string(),
+            }
+        }
+    };
 
-    let status = if result.created {
+    let status = if accepted.created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
-    let urls = job_urls(&state, result.job_id).await?;
+    let urls = job_urls(state, accepted.job_id).await?;
     // The accepting holder's canonical binding is the alias it answered with;
     // a later merge may move it, which the status surface then reports.
     Ok((
         status,
-        Json(SubmitJobResponse {
-            job_id: result.job_id.to_string(),
-            created: result.created,
-            submission_id: hex32(&result.submission_id.0),
-            canonical_job_id: result.job_id.to_string(),
-            state: result.state.name().to_string(),
+        SubmitJobResponse {
+            job_id: accepted.job_id.to_string(),
+            created: accepted.created,
+            submission_id: accepted.submission_id,
+            canonical_job_id: accepted.job_id.to_string(),
+            state: accepted.state,
             origin_node_url: urls.owner_node_url,
             status_url: urls.status_url,
-        }),
+        },
     ))
+}
+
+/// What both submission paths answer with. A local run has no submission
+/// family, so it names none.
+struct AcceptedJob {
+    job_id: JobId,
+    created: bool,
+    submission_id: Option<String>,
+    state: String,
+}
+
+/// The owner of this device, for a run that must stay on this machine. A node
+/// that serves no device plane refuses the target itself, not the caller.
+async fn local_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
+    if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
+        return Err(ServerError::BadRequestMessage(
+            "target `local` is served by a user device only".to_string(),
+        ));
+    }
+    require_owner(state, auth).await
+}
+
+async fn local_submit(
+    state: &ServerState,
+    auth: &AuthContext,
+    spec: ExecutionSpec,
+    idempotency_key: Option<String>,
+    workspace_mode: WorkspaceMode,
+) -> ServerResult<AcceptedJob> {
+    let context = state.get_ctx();
+    let result = submit_local_execution(
+        &context,
+        LocalExecutionConfig {
+            spec,
+            owner: auth.user_id,
+            node_id: state.get_node_id(),
+            idempotency_key,
+            workspace_mode,
+            retention_ms: state.rocrate_limits().artifact_retention_ms,
+        },
+    )
+    .await
+    .map_err(map_local_error)?;
+    // A replay answers with the state the device already reduced for that job.
+    let state = read_owned_job(&context, auth.user_id, result.job_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(JobState::Queued, |record| record.state);
+    Ok(AcceptedJob {
+        job_id: result.job_id,
+        created: result.created,
+        submission_id: None,
+        state: state.name().to_string(),
+    })
+}
+
+pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
+    match error {
+        LocalExecutionError::NotADevice => ServerError::BadRequestMessage(
+            "target `local` is served by a user device only".to_string(),
+        ),
+        LocalExecutionError::NotOwner => ServerError::Forbidden,
+        LocalExecutionError::Paused | LocalExecutionError::NoExecutor => {
+            ServerError::Conflict(error.to_string())
+        }
+        LocalExecutionError::Unsupported(_)
+        | LocalExecutionError::InputNotLocal { .. }
+        | LocalExecutionError::InputRefused { .. } => {
+            ServerError::BadRequestMessage(error.to_string())
+        }
+        LocalExecutionError::Unavailable(_) => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
+        LocalExecutionError::Submit(error) => map_submit_error(error),
+    }
 }
 
 #[utoipa::path(
@@ -1155,7 +1408,6 @@ cannot be reached is a retryable 503."#,
                     ],
                     "revision": 7,
                     "projection_digest": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f",
-                    "eventually_consistent": true,
                     "responder_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
                     "partial": false,
                     "locally_exhausted": false,
@@ -2003,7 +2255,6 @@ mod tests {
         assert_eq!(response.logical_state, "indeterminate");
         assert!(response.locally_exhausted);
         assert!(response.partial);
-        assert!(response.eventually_consistent);
         assert_eq!(
             response.responder_node_id.as_deref(),
             Some(&*node_id().to_string())
@@ -2079,6 +2330,7 @@ mod tests {
             user_id,
             realm_id: realm(),
             path_restrictions: None,
+            session: None,
         })
     }
 
@@ -2090,6 +2342,7 @@ mod tests {
                 pattern: "/realm/g/group/data/**".to_string(),
                 permission: Permission::READ,
             }]),
+            session: None,
         })
     }
 
@@ -2108,7 +2361,7 @@ mod tests {
             ctx,
             realm(),
             node_id(),
-            NodeCapabilities::local_node(realm()).unwrap(),
+            NodeCapabilities::user_node(realm()).unwrap(),
             false,
             None,
             JobsRuntime::new(),
@@ -2743,6 +2996,167 @@ mod tests {
         assert!(matches!(cancel, Err(ServerError::Forbidden)));
     }
 
+    fn local_request() -> SubmitExecutionRequest {
+        SubmitExecutionRequest {
+            group_id: Ulid::from_bytes([5u8; 16]).to_string(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            env: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            workdir: None,
+            cpu_cores: None,
+            ram_bytes: None,
+            max_walltime_ms: None,
+            executor_constraint: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+            idempotency_key: None,
+            workspace: None,
+            target: Some(ExecutionTarget::Local),
+        }
+    }
+
+    async fn management_state() -> (TempDir, Arc<ServerState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let capabilities =
+            NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();
+        let state = ServerState::new(
+            ctx,
+            realm(),
+            node_id(),
+            capabilities,
+            false,
+            None,
+            JobsRuntime::new(),
+        )
+        .await;
+        (dir, Arc::new(state))
+    }
+
+    async fn enroll_device(state: &ServerState, owner: UserId) {
+        use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
+        let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id(), RealmNodeKind::User { owner });
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: UserId::nil(realm()),
+            realm_id: realm(),
+        };
+        let bytes = config.to_bytes(&actor).expect("config serializes");
+        let event = state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm().as_bytes().to_vec().into(),
+                value: bytes.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            aruna_core::events::Event::Storage(
+                aruna_core::events::StorageEvent::WriteResult { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_needs_device() {
+        // The realm never runs a job locally on behalf of a target it has not
+        // enrolled as somebody's machine.
+        let (_dir, state) = management_state().await;
+
+        let result = submit_job(
+            State(state),
+            Extension(auth_for(user(2))),
+            Extension(None),
+            Json(local_request()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn device_checks_group() {
+        // A device caches the group documents, so its group check is the realm's
+        // own: an owner holding no grant is refused here as on a realm node.
+        let (_dir, state) = build_state().await;
+        enroll_device(&state, user(2)).await;
+
+        for target in [None, Some(ExecutionTarget::Local)] {
+            let result = submit_job(
+                State(state.clone()),
+                Extension(auth_for(user(2))),
+                Extension(None),
+                Json(SubmitExecutionRequest {
+                    target,
+                    ..local_request()
+                }),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ServerError::Forbidden)),
+                "{target:?} must run the local group check"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_refuses_stranger() {
+        let (_dir, state) = build_state().await;
+        enroll_device(&state, user(2)).await;
+
+        let result = submit_job(
+            State(state),
+            Extension(auth_for(user(3))),
+            Extension(None),
+            Json(local_request()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[test]
+    fn local_names_holder() {
+        // Only a local run may name the holder: the planner seals it otherwise.
+        let input = ExecutionInputRequest {
+            bucket: "src".to_string(),
+            key: "data.csv".to_string(),
+            version_id: Some(Ulid::from_bytes([4u8; 16]).to_string()),
+            source_node_id: Some(node_id().to_string()),
+            dest_key: "data.csv".to_string(),
+            container_path: None,
+            mode: InputModeRequest::Snapshot,
+        };
+
+        assert!(matches!(
+            native_input(input.clone(), ExecutionTarget::Realm),
+            Err(ServerError::BadRequestMessage(_))
+        ));
+        assert_eq!(
+            native_input(input, ExecutionTarget::Local)
+                .unwrap()
+                .source_node_id,
+            Some(node_id())
+        );
+    }
+
     #[tokio::test]
     async fn rejects_huge_ram() {
         // ram_bytes above i64::MAX would wrap negative in the Docker backend.
@@ -2754,6 +3168,8 @@ mod tests {
                 entrypoint: None,
                 command: vec!["true".to_string()],
                 env: BTreeMap::new(),
+                tags: BTreeMap::new(),
+                workdir: None,
                 cpu_cores: None,
                 ram_bytes: Some(ram_bytes),
                 max_walltime_ms: None,
@@ -2764,6 +3180,7 @@ mod tests {
                 collision_policy: Default::default(),
                 idempotency_key: None,
                 workspace: None,
+                target: None,
             };
             let result = submit_job(
                 State(state.clone()),
@@ -2786,11 +3203,12 @@ mod tests {
             bucket: "src".to_string(),
             key: "data.csv".to_string(),
             version_id: None,
+            source_node_id: None,
             dest_key: "in/data.csv".to_string(),
             container_path: None,
             mode: InputModeRequest::Snapshot,
         };
-        let mapped = native_input(input.clone()).unwrap();
+        let mapped = native_input(input.clone(), ExecutionTarget::Realm).unwrap();
         assert_eq!(
             mapped.container_path.as_deref(),
             Some("/inputs/in/data.csv")
@@ -2801,7 +3219,10 @@ mod tests {
             ..input.clone()
         };
         assert_eq!(
-            native_input(explicit).unwrap().container_path.as_deref(),
+            native_input(explicit, ExecutionTarget::Realm)
+                .unwrap()
+                .container_path
+                .as_deref(),
             Some("/data/input.csv")
         );
 
@@ -2809,7 +3230,7 @@ mod tests {
             container_path: Some("/in/../etc".to_string()),
             ..input
         };
-        assert!(native_input(traversal).is_err());
+        assert!(native_input(traversal, ExecutionTarget::Realm).is_err());
     }
 
     #[test]

@@ -282,9 +282,7 @@ impl CreateRealmOperation {
             self.config.actor.node_id,
             realm_auth_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(realm_role_event),
-            },
+            DocumentSyncOutboxEvent::admin(realm_role_event),
             realm_auth_placement,
             true,
         );
@@ -299,9 +297,7 @@ impl CreateRealmOperation {
                 self.config.actor.node_id,
                 realm_config_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event),
-                },
+                DocumentSyncOutboxEvent::admin(event),
                 realm_config_placement,
                 true,
             );
@@ -843,7 +839,7 @@ mod test {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
                     &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation { event }
+                    DocumentSyncOutboxEvent::AdminOperation { event, .. }
                         if event.target == realm_target
                             && matches!(
                                 &event.op,
@@ -859,7 +855,7 @@ mod test {
                     return None;
                 }
 
-                let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event else {
+                let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event else {
                     return None;
                 };
 

@@ -140,6 +140,10 @@ pub enum IncomingVersionReplicationError {
     MissingReferenceSource,
     #[error("Reference replication manifest is missing its advance count")]
     MissingReferenceAdvanceCount,
+    /// An offered directory resolves against the registration of the device that
+    /// offers it, so a binding naming one is never valid on another node.
+    #[error("Reference replication manifest names a device-local source")]
+    LocalReferenceSource,
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
     #[error(transparent)]
@@ -572,6 +576,9 @@ impl IncomingVersionReplicationOperation {
             .source
             .clone()
             .ok_or(IncomingVersionReplicationError::MissingReferenceSource)?;
+        if source.descriptor.kind == aruna_core::structs::SourceConnectorKind::LocalDirectory {
+            return Err(IncomingVersionReplicationError::LocalReferenceSource);
+        }
         let metadata = self
             .manifest
             .reference_metadata
@@ -1696,15 +1703,11 @@ impl IncomingVersionReplicationOperation {
         };
 
         self.state = IncomingVersionReplicationState::RegisterBlobInDht;
-        let effect = match dht_registration_effect(
-            blake3_hash,
-            self.local_realm_id,
-            self.local_node_id,
-            &self.rocrate_limits,
-        ) {
-            Ok(effect) => effect,
-            Err(_) => return self.send_apply_complete(),
-        };
+        let effect =
+            match dht_registration_effect(blake3_hash, self.local_realm_id, &self.rocrate_limits) {
+                Ok(effect) => effect,
+                Err(_) => return self.send_apply_complete(),
+            };
         smallvec![effect]
     }
 
@@ -2836,6 +2839,7 @@ mod tests {
                 user_id: test_user_id(),
                 realm_id: test_realm_id(),
                 path_restrictions: None,
+                session: None,
             },
             blob,
             source: None,
@@ -2847,6 +2851,7 @@ mod tests {
                 user_id: test_user_id(),
                 realm_id: test_realm_id(),
                 path_restrictions: None,
+                session: None,
             }),
             reference_metadata: None,
             metadata: HashMap::new(),

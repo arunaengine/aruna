@@ -21,8 +21,6 @@ pub mod docker;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
 
-use logs::LogSink;
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackendCaps {
     pub file_staging: bool,
@@ -186,12 +184,11 @@ pub trait ExecutorBackend: Send + Sync {
 
     async fn cancel(&self, context: &FenceContext) -> Result<CancelEvidence, BackendError>;
 
-    /// Bounded tail per stream plus an optional full-stream copy into `sink`.
+    /// Bounded tail per stream.
     async fn fetch_logs(
         &self,
         context: &FenceContext,
         limits: &LogLimits,
-        sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError>;
 
     /// Stream one declared output file out of the terminal attempt.

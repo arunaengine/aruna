@@ -27,8 +27,10 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
+uuid = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
+rmcp = { workspace = true }
 
 # REST
 axum = { workspace = true }
@@ -63,4 +65,8 @@ s3s = { workspace = true }
 aruna-net = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-tasks = { workspace = true }
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 tempfile = { workspace = true }

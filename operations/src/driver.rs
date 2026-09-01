@@ -348,6 +348,15 @@ async fn dispatch_effect_until(
                 })
             }
         }
+        Effect::LocalFile(local_file_effect) => {
+            if let Some(blob_handle) = &context.blob_handle {
+                Box::pin(blob_handle.send_file_effect(local_file_effect)).await
+            } else {
+                Event::LocalFile(aruna_core::events::LocalFileEvent::Error {
+                    message: "this node has no local file adapter".to_string(),
+                })
+            }
+        }
         Effect::Storage(storage_effect) => {
             let realm_config_write = match &storage_effect {
                 StorageEffect::Write {
@@ -1269,6 +1278,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
+        Effect::LocalFile(_) => "local_file",
         Effect::Storage(_) => "storage",
         Effect::Net(_) => "net",
         Effect::Metadata(_) => "metadata",
@@ -1283,6 +1293,7 @@ fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::Blob(_) => "blob",
         Event::StagingSource(_) => "staging_source",
+        Event::LocalFile(_) => "local_file",
         Event::Storage(_) => "storage",
         Event::Net(_) => "net",
         Event::Metadata(_) => "metadata",

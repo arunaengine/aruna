@@ -25,9 +25,9 @@ use aruna_core::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
     validate_user_attribute_value,
 };
+use aruna_core::util::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
-use chrono::Utc;
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -400,9 +400,7 @@ impl UpdateUserOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -665,10 +663,6 @@ impl Operation for UpdateUserOperation {
     }
 }
 
-fn current_timestamp_ms() -> u64 {
-    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
-}
-
 fn local_user_document_sync_change(
     previous_change: Option<&DocumentSyncChange>,
     actor: &Actor,
@@ -805,6 +799,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -981,9 +976,7 @@ mod tests {
                 );
                 assert!(outbox_records.iter().any(|record| matches!(
                     &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation {
-                        event
-                    } if matches!(
+                    DocumentSyncOutboxEvent::AdminOperation { event, .. } if matches!(
                         &event.op,
                         aruna_core::admin_documents::AdminDocumentOperation::UserNameSet { .. }
                     )

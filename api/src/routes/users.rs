@@ -1,27 +1,33 @@
-use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
-    Role, User,
+    Role, SessionKind, User,
 };
+use aruna_core::util::unix_timestamp_secs as now_timestamp;
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
-use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::delete_onboarding_secret::{
+    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::ensure_canonical_user_token_subject::{
     EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
 };
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
+use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_operations::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
 use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
 use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
 use aruna_operations::read_realm_authorization::{
     ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
@@ -30,14 +36,19 @@ use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocume
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
+use aruna_operations::remove_device_node::{
+    DeviceEvictionScope, RemoveDeviceNodeConfig, RemoveDeviceNodeError, RemoveDeviceNodeOperation,
+};
 use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_operations::session::{CreateSessionConfig, CreateSessionError, CreateSessionOperation};
 use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::error;
 use ulid::Ulid;
@@ -60,6 +71,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(search_users))
         .routes(routes!(resolve_users))
         .routes(routes!(get_user, update_user))
+        .routes(routes!(list_user_devices))
+        .routes(routes!(revoke_user_device))
+        .routes(routes!(evict_device))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -169,6 +183,26 @@ pub struct GetUserInfoResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserDevicesResponse {
+    pub devices: Vec<UserDeviceResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserDeviceResponse {
+    /// Identifier this device is addressed by: its node id once enrolled, its
+    /// enrollment id while the secret is still outstanding.
+    pub id: String,
+    /// Node id, set once the device has joined the realm configuration.
+    pub node_id: Option<String>,
+    /// Enrollment id, set while an enrollment secret is still outstanding.
+    pub enrollment_id: Option<String>,
+    /// `enrolled`, `claimed`, `pending` or `expired`.
+    pub status: String,
+    /// Expiry of an outstanding enrollment secret, in Unix seconds.
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateUserRequest {
     pub name: Option<String>,
     #[serde(default)]
@@ -242,10 +276,6 @@ impl From<User> for RegisterUserResponse {
     }
 }
 
-fn now_timestamp() -> u64 {
-    chrono::Utc::now().timestamp().max(0) as u64
-}
-
 fn map_consume_onboarding_error(error: ConsumeOnboardingSecretError) -> ServerError {
     match error {
         ConsumeOnboardingSecretError::NotFound
@@ -268,24 +298,32 @@ fn map_inspect_onboarding_error(error: InspectOnboardingSecretError) -> ServerEr
 
 const USER_TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
-async fn issue_user_token(
+async fn issue_user_session(
     state: &Arc<ServerState>,
     user_id: UserId,
-    expiry: Option<u64>,
+    expiry: u64,
+    kind: SessionKind,
 ) -> ServerResult<String> {
-    drive(
-        CreateTokenOperation::new(CreateTokenConfig {
+    let created = drive(
+        CreateSessionOperation::new(CreateSessionConfig {
             time: now_timestamp(),
             expiry,
             user_id,
             realm_id: state.get_realm_id(),
             node_capabilities: state.node_capabilities().clone(),
-        })
-        .map_err(|err| ServerError::InternalError(err.to_string()))?,
+            kind,
+            label: None,
+        }),
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))
+    .map_err(|err| match err {
+        CreateSessionError::LimitReached => {
+            ServerError::Conflict("active session limit reached".to_string())
+        }
+        error => ServerError::InternalError(error.to_string()),
+    })?;
+    Ok(created.token.expose().to_string())
 }
 
 async fn ensure_canonical_user_token_subject(
@@ -417,6 +455,7 @@ async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
         user_id,
         realm_id: state.get_realm_id(),
         path_restrictions: None,
+        session: None,
     };
     if let Err(error) = state.claim_initial_realm_admin(&auth_context).await {
         error!(error = %error, "Failed to claim initial realm admin after user registration");
@@ -630,6 +669,9 @@ on behalf of somebody else.
 
 **Behavior**
 - The issued token is a realm bearer credential valid for 24 hours.
+- The issued token preserves a bound Aruna session's kind; OIDC and legacy unbound callers receive
+  a `portal` session.
+- Issuance prunes expired and revoked session history and refuses when 256 active sessions remain.
 - It is returned only in this response and is not retrievable afterwards, so a lost token has to
   be reissued here.
 
@@ -646,7 +688,8 @@ an alias rather than the canonical user of that OIDC subject."#,
         ),
         (status = 400, description = "Not produced by this operation; a request that cannot be authenticated is answered with 401 or 403 instead", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented, the OIDC token failed validation, or this node knows no user for the presented identity", body = ErrorResponse),
-        (status = 403, description = "The presented access token carries path restrictions, or its subject is an alias of the canonical user of that OIDC subject", body = ErrorResponse)
+        (status = 403, description = "The presented access token carries path restrictions, or its subject is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 409, description = "Active session limit reached", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -655,13 +698,17 @@ async fn get_token(
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
-    let user_id = match auth {
+    let (user_id, kind) = match auth {
         Some(aruna_ctx) => {
             if aruna_ctx.path_restrictions.is_some() {
                 return Err(ServerError::Forbidden);
             }
             ensure_canonical_user_token_subject(&state, aruna_ctx.user_id).await?;
-            aruna_ctx.user_id
+            let kind = aruna_ctx
+                .session
+                .as_ref()
+                .map_or(SessionKind::Portal, |session| session.kind);
+            (aruna_ctx.user_id, kind)
         }
         None => {
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
@@ -675,12 +722,14 @@ async fn get_token(
             )
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
-            user.user_id
+            (user.user_id, SessionKind::Portal)
         }
     };
 
-    let expiry = Some(now_timestamp() + USER_TOKEN_EXPIRY_SECONDS);
-    let token = issue_user_token(&state, user_id, expiry).await?;
+    let expiry = now_timestamp()
+        .checked_add(USER_TOKEN_EXPIRY_SECONDS)
+        .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
+    let token = issue_user_session(&state, user_id, expiry, kind).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
 }
@@ -1419,11 +1468,307 @@ async fn update_user(
     Ok((StatusCode::OK, Json(user.into())))
 }
 
+/// What an outstanding enrollment reads as. An unclaimed secret past its expiry
+/// is dead whether or not a later request has pruned it, so it must never be
+/// reported as an enrollment still in flight.
+fn enrollment_status(claimed: bool, expires_at: u64, now: u64) -> &'static str {
+    match (claimed, expires_at <= now) {
+        (true, _) => "claimed",
+        (false, true) => "expired",
+        (false, false) => "pending",
+    }
+}
+
+/// The caller's devices, enrolled and still enrolling. A device's owner lives
+/// in its membership kind, so the realm configuration is the authority here and
+/// an outstanding enrollment secret only shows what has not landed yet.
+async fn owned_devices(
+    state: &Arc<ServerState>,
+    owner: aruna_core::UserId,
+) -> ServerResult<Vec<UserDeviceResponse>> {
+    let config = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        GetRealmConfigError::DocumentNotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    let mut devices = config
+        .nodes
+        .iter()
+        .filter(|node| node.kind.owner() == Some(owner))
+        .map(|node| UserDeviceResponse {
+            id: node.node_id.clone(),
+            node_id: Some(node.node_id.clone()),
+            enrollment_id: None,
+            status: "enrolled".to_string(),
+            expires_at: None,
+        })
+        .collect::<Vec<_>>();
+
+    let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let now = aruna_core::util::unix_timestamp_secs();
+    for entry in secrets {
+        if entry.record.mode.owner() != Some(owner) {
+            continue;
+        }
+        let claimed = entry.state.claimed_node_id().map(str::to_string);
+        if claimed
+            .as_ref()
+            .is_some_and(|node_id| devices.iter().any(|device| &device.id == node_id))
+        {
+            continue;
+        }
+        devices.push(UserDeviceResponse {
+            id: entry.record.enrollment_id.to_string(),
+            node_id: claimed.clone(),
+            enrollment_id: Some(entry.record.enrollment_id.to_string()),
+            status: enrollment_status(claimed.is_some(), entry.record.expires_at, now).to_string(),
+            expires_at: Some(entry.record.expires_at),
+        });
+    }
+
+    Ok(devices)
+}
+
+#[utoipa::path(
+    get,
+    path = "/users/me/devices",
+    tag = "users",
+    summary = "List the calling user's devices",
+    description = r#"Lists the devices this user has enrolled, plus the device enrollments still in flight.
+
+**Authentication**: realm bearer token. Self-scoped: it always lists the caller's own devices and
+takes no user id, so it grants no view of anybody else's.
+
+**Behavior**
+- An enrolled device is a realm member of kind `User` whose owner is the caller; it reads
+  `enrolled` and is addressed by its node id.
+- An enrollment whose secret is still outstanding reads `pending`, or `claimed` once a device has
+  redeemed the secret but the realm configuration has not caught up; it is addressed by its
+  enrollment id and carries the secret's expiry.
+- An unclaimed enrollment whose `expires_at` has passed reads `expired`. It stays listed until a
+  later mint or admin listing prunes it, but it is never reported as still in flight.
+- An enrollment is dropped from the list as soon as the device it claimed appears as a member, so
+  one device is listed once.
+- The realm configuration is the authority on ownership, and the outstanding secrets are this
+  node's local state, so a device enrolled elsewhere appears once that configuration replicates
+  here.
+
+**Errors**: 404 means this node holds no configuration document for its realm yet."#,
+    responses(
+        (
+            status = 200,
+            description = "The caller's enrolled devices and in-flight device enrollments",
+            body = UserDevicesResponse,
+            example = json!({
+                "devices": [
+                    {
+                        "id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "enrollment_id": null,
+                        "status": "enrolled",
+                        "expires_at": null
+                    },
+                    {
+                        "id": "01JABCDEF0123456789ABCDEFG",
+                        "node_id": null,
+                        "enrollment_id": "01JABCDEF0123456789ABCDEFG",
+                        "status": "pending",
+                        "expires_at": 1775748191
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
+        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_user_devices(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<UserDevicesResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let devices = owned_devices(&state, auth.user_id).await?;
+    Ok((StatusCode::OK, Json(UserDevicesResponse { devices })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/users/me/devices/{id}",
+    tag = "users",
+    summary = "Revoke one of the calling user's devices",
+    description = r#"Revokes a device enrollment of the calling user, making its secret unredeemable from here on.
+
+**Authentication**: realm bearer token. Self-scoped: only a device owned by the caller can be
+revoked, and a device owned by anybody else answers 404 rather than admitting it exists.
+
+**Behavior**
+- `id` is what `GET /users/me/devices` reported: an enrollment id while the enrollment is still in
+  flight, or a node id once the device has joined.
+- Revoking an in-flight enrollment deletes the enrollment record on the management node holding it,
+  so the secret can no longer be redeemed. It does not reach back into a completed enrollment.
+- Evicting a device that already joined drops it from the realm configuration and retires the
+  secret it redeemed. The eviction replicates like any other configuration change, and each node
+  closes the device's open connections when it applies the new membership.
+- The eviction is a realm configuration change, so it is served by a management node; a call to any
+  other node is relayed to one, because its peers would refuse the event.
+
+**Errors**: an id that is neither an enrollment id nor a node id of a device owned by the caller
+answers 404, which is also what a caller sees after an earlier revoke."#,
+    params(("id" = String, Path, description = "Enrollment id or node id of the device, as reported by GET /users/me/devices")),
+    responses(
+        (status = 204, description = "Device enrollment revoked, or the device evicted from the realm; no response body"),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
+        (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn revoke_user_device(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(device_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_realm_auth(&state, auth)?;
+    let device = owned_devices(&state, auth.user_id)
+        .await?
+        .into_iter()
+        .find(|device| device.id == device_id)
+        .ok_or(ServerError::NotFound)?;
+    if let Some(enrollment_id) = device.enrollment_id {
+        let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::NotFound)?;
+        delete_enrollment(&state, enrollment_id).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    let node_id = aruna_core::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    evict_node(&state, &auth, node_id, DeviceEvictionScope::Owner).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/devices/{node_id}",
+    tag = "users",
+    summary = "Evict any enrolled device as a realm admin",
+    description = r#"Evicts one enrolled user device from the realm on behalf of the realm's administration.
+
+**Authentication**: realm bearer token with WRITE on the realm's onboarding administration path. A
+management node serves it, and every other node relays the call to one. This is the same
+authorization the onboarding administration routes carry, so the realm request policies constrain
+it too.
+
+**Behavior**
+- `node_id` is the device's node id, which `GET /users/me/devices` reports to its owner and the
+  realm configuration lists as a node of kind `User`.
+- The device is dropped from the realm configuration and the enrollment secret it redeemed is
+  retired, so the eviction cannot be undone by replaying that secret.
+- The eviction replicates like any other configuration change, and each node closes the device's
+  open connections when it applies the new membership.
+- Only an enrolled device is reachable here: a management or server node is not a device and
+  answers 404, so this route can never remove realm infrastructure.
+- The owner's own `DELETE /users/me/devices/{id}` is unchanged and stays self-scoped; this route
+  neither replaces nor requires it.
+
+**Errors**: a node id that names no enrolled device answers 404, which is also what a caller sees
+after an earlier eviction."#,
+    params(("node_id" = String, Path, description = "Node id of the enrolled device to evict")),
+    responses(
+        (status = 204, description = "Device evicted from the realm; no response body"),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The caller is not a realm onboarding admin", body = ErrorResponse),
+        (status = 404, description = "No enrolled device carries this node id", body = ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn evict_device(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(node_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = authorize_onboarding_admin(&state, auth).await?;
+    let node_id = aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
+    evict_node(&state, &auth, node_id, DeviceEvictionScope::RealmAdmin).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Retires the redeemed secret and drops the device from the membership. The
+/// secret goes first: it would otherwise resurface as an in-flight enrollment
+/// once the device is no longer listed as a member.
+async fn evict_node(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    node_id: aruna_core::NodeId,
+    scope: DeviceEvictionScope,
+) -> ServerResult<()> {
+    if let Some(enrollment_id) = claimed_enrollment(state, &node_id.to_string()).await? {
+        delete_enrollment(state, enrollment_id).await?;
+    }
+    drive(
+        RemoveDeviceNodeOperation::new(RemoveDeviceNodeConfig {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id: auth.realm_id,
+            },
+            node_id,
+            scope,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        RemoveDeviceNodeError::DeviceNotFound { .. }
+        | RemoveDeviceNodeError::RealmConfigNotFound => ServerError::NotFound,
+        RemoveDeviceNodeError::NotManagementNode => ServerError::Forbidden,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    Ok(())
+}
+
+/// Enrollment whose secret this node claimed, so an eviction can retire it.
+async fn claimed_enrollment(state: &Arc<ServerState>, node_id: &str) -> ServerResult<Option<Ulid>> {
+    let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    Ok(secrets
+        .into_iter()
+        .find(|entry| entry.state.claimed_node_id() == Some(node_id))
+        .map(|entry| entry.record.enrollment_id))
+}
+
+async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> ServerResult<()> {
+    drive(
+        DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput { enrollment_id }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        DeleteOnboardingSecretError::NotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
-    use crate::auth::OidcValidator;
+    use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
+    use crate::auth::{OidcValidator, handle_token};
     use crate::error::ErrorResponse;
+    use crate::routes::sessions::{CreateSessionRequest, CreateSessionResponse};
     use crate::server::Server;
     use crate::server::ServerConfig;
     use crate::server_state::ServerState;
@@ -1438,7 +1783,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission,
-        RealmConfigDocument, RealmId, TokenClaims, User, oidc_subject_key,
+        RealmConfigDocument, RealmId, SessionKind, TokenClaims, User, oidc_subject_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::announce_realm_presence::{
@@ -1555,6 +1900,16 @@ mod tests {
         )
     }
 
+    // An unclaimed enrollment past its expiry is dead: reporting it as pending
+    // would show an enrollment in flight that can never complete.
+    #[test]
+    fn reports_expired_enrollment() {
+        assert_eq!(enrollment_status(false, 100, 99), "pending");
+        assert_eq!(enrollment_status(false, 100, 100), "expired");
+        assert_eq!(enrollment_status(false, 100, 101), "expired");
+        assert_eq!(enrollment_status(true, 100, 101), "claimed");
+    }
+
     fn sign_oidc_token(
         issuer: &str,
         kid: &str,
@@ -1605,6 +1960,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -1829,7 +2186,7 @@ mod tests {
             seed_url: node.base_url.clone(),
             enrollment_id: Ulid::generate(),
             secret: [7u8; 32],
-            mode: OnboardingMode::Local,
+            mode: OnboardingMode::Server,
             realm_id: node.realm_id,
             purpose: OnboardingPurpose::InitialAdministrator,
         };
@@ -1838,7 +2195,7 @@ mod tests {
                 record: OnboardingSecretRecord {
                     enrollment_id: onboarding_secret.enrollment_id,
                     secret_hash: onboarding_secret.secret_hash(),
-                    mode: OnboardingMode::Local,
+                    mode: OnboardingMode::Server,
                     purpose: OnboardingPurpose::InitialAdministrator,
                     expires_at: u64::MAX,
                     claimed_node_id: None,
@@ -2024,6 +2381,7 @@ mod tests {
             user_id: node.realm_admin_id,
             realm_id: node.realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         let rename = |name: &str| super::UpdateUserRequest {
@@ -2120,6 +2478,7 @@ mod tests {
             user_id: node.realm_admin_id,
             realm_id: node.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let query = || {
             axum::extract::Query(super::ListUsersQuery {
@@ -2271,6 +2630,8 @@ mod tests {
                 realm_id: foreign_realm_id,
                 node_capabilities: NodeCapabilities::management_node(foreign_realm_signing_key)
                     .unwrap(),
+
+                session: None,
             })
             .unwrap(),
             node.context.as_ref(),
@@ -2325,6 +2686,53 @@ mod tests {
         assert_eq!(token_response.status(), StatusCode::OK);
         let body: GetTokenResponse = token_response.json().await.unwrap();
         assert!(!body.token.is_empty());
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_kind() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+        let (_registered, portal_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-123",
+            "Alice",
+            None,
+        )
+        .await;
+        let created = reqwest::Client::new()
+            .post(format!("{}/api/v1/users/sessions", node.base_url))
+            .bearer_auth(&portal_token)
+            .json(&CreateSessionRequest {
+                kind: "assistant".to_string(),
+                label: None,
+                expires_in_seconds: Some(600),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let assistant: CreateSessionResponse = created.json().await.unwrap();
+
+        let refreshed = reqwest::Client::new()
+            .get(format!("{}/api/v1/users/token", node.base_url))
+            .bearer_auth(&assistant.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let refreshed: GetTokenResponse = refreshed.json().await.unwrap();
+        let claims = handle_token(&node.state, &refreshed.token).await.unwrap();
+        assert_eq!(claims.session_kind, Some(SessionKind::Assistant));
 
         node.server_task.abort();
         node.net.shutdown().await;
@@ -2466,7 +2874,7 @@ mod resolve_tests {
                 driver_ctx,
                 realm_id,
                 iroh::SecretKey::generate().public(),
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -2481,6 +2889,7 @@ mod resolve_tests {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -2552,5 +2961,373 @@ mod resolve_tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::BadRequest)));
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::{UserDeviceResponse, evict_device, list_user_devices, revoke_user_device};
+    use crate::error::ServerError;
+    use crate::server_state::ServerState;
+    use aruna_core::UserId;
+    use aruna_core::keys::generate_signing_key;
+    use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId, RealmNodeKind};
+    use aruna_operations::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use aruna_operations::create_onboarding_secret::{
+        CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+    };
+    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::ensure_realm_config::{
+        EnsureRealmConfigConfig, EnsureRealmConfigOperation,
+    };
+    use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::{Extension, Json};
+    use std::sync::Arc;
+    use tempfile::{TempDir, tempdir};
+    use ulid::Ulid;
+
+    struct Fixture {
+        state: Arc<ServerState>,
+        owner: UserId,
+        other: UserId,
+        admin: UserId,
+        _dir: TempDir,
+    }
+
+    fn node(seed: u8) -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// One device and one outstanding enrollment per owner, plus a management
+    /// node, so every filter the routes apply has something to reject. The realm
+    /// and its members are produced by the operations enrollment uses.
+    async fn setup_devices() -> Fixture {
+        let dir = tempdir().unwrap();
+        let storage_handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+        });
+        let realm_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let owner = UserId::local(Ulid::generate(), realm_id);
+        let other = UserId::local(Ulid::generate(), realm_id);
+        let admin = UserId::local(Ulid::generate(), realm_id);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "devices".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+        for (device, device_owner) in [(node(2), owner), (node(3), other)] {
+            drive(
+                EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+                    actor: actor.clone(),
+                    target_node_id: device,
+                    target_node_kind: RealmNodeKind::User {
+                        owner: device_owner,
+                    },
+                    default_metadata_replication_factor: 3,
+                    realm_description: String::new(),
+                    create_if_missing: false,
+                    reject_kind_mismatch: true,
+                }),
+                driver_ctx.as_ref(),
+            )
+            .await
+            .unwrap();
+        }
+
+        for secret_owner in [owner, other] {
+            drive(
+                CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+                    record: OnboardingSecretRecord {
+                        enrollment_id: Ulid::generate(),
+                        secret_hash: Ulid::generate().to_string(),
+                        mode: OnboardingMode::User {
+                            owner: secret_owner,
+                        },
+                        purpose: OnboardingPurpose::NodeEnrollment,
+                        expires_at: u64::MAX,
+                        claimed_node_id: None,
+                    },
+                }),
+                driver_ctx.as_ref(),
+            )
+            .await
+            .unwrap();
+        }
+
+        drive(
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                actor: Actor {
+                    node_id: node(1),
+                    user_id: admin,
+                    realm_id,
+                },
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node(1),
+                NodeCapabilities::management_node(realm_signing_key).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+        Fixture {
+            state,
+            owner,
+            other,
+            admin,
+            _dir: dir,
+        }
+    }
+
+    fn auth(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: user_id.realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    async fn devices(state: &Arc<ServerState>, owner: UserId) -> Vec<UserDeviceResponse> {
+        let (_, Json(listed)) =
+            list_user_devices(State(state.clone()), Extension(Some(auth(owner))))
+                .await
+                .unwrap();
+        listed.devices
+    }
+
+    #[tokio::test]
+    async fn lists_owned_devices() {
+        let fixture = setup_devices().await;
+        let listed = devices(&fixture.state, fixture.owner).await;
+
+        assert_eq!(listed.len(), 2);
+        let enrolled = listed
+            .iter()
+            .find(|device| device.status == "enrolled")
+            .expect("the enrolled device");
+        assert_eq!(
+            enrolled.node_id.as_deref(),
+            Some(node(2).to_string()).as_deref()
+        );
+        assert!(enrolled.enrollment_id.is_none());
+        let pending = listed
+            .iter()
+            .find(|device| device.status == "pending")
+            .expect("the outstanding enrollment");
+        assert_eq!(pending.enrollment_id.as_deref(), Some(pending.id.as_str()));
+        assert!(pending.expires_at.is_some());
+
+        let foreign = devices(&fixture.state, fixture.other).await;
+        assert!(
+            foreign
+                .iter()
+                .all(|device| device.id != node(2).to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn revokes_pending_device() {
+        let fixture = setup_devices().await;
+        let pending = devices(&fixture.state, fixture.owner)
+            .await
+            .into_iter()
+            .find(|device| device.status == "pending")
+            .expect("the outstanding enrollment");
+
+        let status = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(pending.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let listed = devices(&fixture.state, fixture.owner).await;
+        assert!(listed.iter().all(|device| device.status == "enrolled"));
+
+        let repeated = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(pending.id),
+        )
+        .await;
+        assert!(matches!(repeated, Err(ServerError::NotFound)));
+
+        // Another owner's outstanding enrollment stays untouched.
+        assert!(
+            devices(&fixture.state, fixture.other)
+                .await
+                .iter()
+                .any(|device| device.status == "pending")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_stranger_device() {
+        let fixture = setup_devices().await;
+
+        let foreign = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(node(3).to_string()),
+        )
+        .await;
+        assert!(matches!(foreign, Err(ServerError::NotFound)));
+
+        let anonymous = list_user_devices(State(fixture.state), Extension(None)).await;
+        assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn evicts_enrolled_device() {
+        // Eviction drops the membership itself, so the device stops being a
+        // realm peer instead of merely losing an unredeemed secret.
+        let fixture = setup_devices().await;
+
+        let status = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(node(2).to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let listed = devices(&fixture.state, fixture.owner).await;
+        assert!(listed.iter().all(|device| device.id != node(2).to_string()));
+
+        let repeated = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.owner))),
+            Path(node(2).to_string()),
+        )
+        .await;
+        assert!(matches!(repeated, Err(ServerError::NotFound)));
+
+        // Another owner's device keeps its membership.
+        assert!(
+            devices(&fixture.state, fixture.other)
+                .await
+                .iter()
+                .any(|device| device.id == node(3).to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_evicts_device() {
+        // A realm admin reaches a device it does not own, and the owner path is
+        // left as it was for every other device.
+        let fixture = setup_devices().await;
+
+        let status = evict_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.admin))),
+            Path(node(2).to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            devices(&fixture.state, fixture.owner)
+                .await
+                .iter()
+                .all(|device| device.id != node(2).to_string())
+        );
+
+        let status = revoke_user_device(
+            State(fixture.state.clone()),
+            Extension(Some(auth(fixture.other))),
+            Path(node(3).to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn refuses_non_admin() {
+        // Owning a device is not administering the realm: the admin route
+        // refuses a plain member and an anonymous caller, and the device stays.
+        let fixture = setup_devices().await;
+
+        assert!(matches!(
+            evict_device(
+                State(fixture.state.clone()),
+                Extension(Some(auth(fixture.owner))),
+                Path(node(2).to_string()),
+            )
+            .await,
+            Err(ServerError::Forbidden)
+        ));
+        assert!(matches!(
+            evict_device(
+                State(fixture.state.clone()),
+                Extension(None),
+                Path(node(2).to_string()),
+            )
+            .await,
+            Err(ServerError::Unauthorized)
+        ));
+        assert!(
+            devices(&fixture.state, fixture.owner)
+                .await
+                .iter()
+                .any(|device| device.id == node(2).to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_spares_management() {
+        // The route reaches enrolled devices only, so the realm's own management
+        // node is not removable through it.
+        let fixture = setup_devices().await;
+
+        assert!(matches!(
+            evict_device(
+                State(fixture.state.clone()),
+                Extension(Some(auth(fixture.admin))),
+                Path(node(1).to_string()),
+            )
+            .await,
+            Err(ServerError::NotFound)
+        ));
     }
 }

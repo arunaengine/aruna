@@ -815,7 +815,7 @@ mod tests {
                 }),
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 JobsRuntime::new(),
@@ -826,6 +826,7 @@ mod tests {
             user_id: UserId::new(Ulid::from_bytes([3u8; 16]), realm_id),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         (storage_dir, state, auth)
     }
@@ -836,6 +837,7 @@ mod tests {
             user_id: UserId::new(Ulid::from_bytes([9u8; 16]), realm_id),
             realm_id,
             path_restrictions,
+            session: None,
         }
     }
 

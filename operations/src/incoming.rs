@@ -18,6 +18,7 @@ use crate::metadata::projector::{
     project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::mutate_realm_placement::node_kind;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::permission_rules::GroupPermissionRules;
@@ -88,29 +89,56 @@ impl OperationsInboundHandler {
         }
     }
 
-    /// Blob replication is trusted only from realm nodes eligible to hold and
-    /// sync data; unknown or user-kind peers are rejected. Fails closed when
-    /// the realm config cannot be read.
-    async fn peer_sync_eligible(&self, realm_id: RealmId, peer: NodeId) -> bool {
-        match drive(
+    /// What the bao plane admits this peer as.
+    ///
+    /// Replication is trusted only from realm nodes eligible to hold and sync
+    /// data. An owner-bound device is admitted for bao reads alone, and only by
+    /// a sync-eligible node: it never reaches the manifest or summary branches,
+    /// so it can never become a replication source, and device-to-device
+    /// transfer is not a path. Fails closed when the config is unreadable.
+    async fn bao_peer_admitted(
+        &self,
+        realm_id: RealmId,
+        local: NodeId,
+        peer: NodeId,
+    ) -> Option<BaoAdmission> {
+        let config = match drive(
             GetRealmConfigOperation::new(realm_id),
             self.context.as_ref(),
         )
         .await
         {
-            Ok(config) => match config.sync_eligible_node_ids() {
-                Ok(ids) => ids.contains(&peer),
-                Err(error) => {
-                    warn!(peer = %peer, error = %error, "Failed to resolve sync-eligible peers");
-                    false
-                }
-            },
+            Ok(config) => config,
             Err(error) => {
                 warn!(peer = %peer, error = %error, "Failed to read realm config for replication gate");
-                false
+                return None;
             }
+        };
+        let eligible = match config.sync_eligible_node_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!(peer = %peer, error = %error, "Failed to resolve replication peers");
+                return None;
+            }
+        };
+        if eligible.contains(&peer) {
+            return Some(BaoAdmission::Infra);
         }
+        // Only a realm node answers a device, so a device never reaches another
+        // device's plane.
+        let device = node_kind(&config, peer)
+            .and_then(|kind| kind.owner())
+            .is_some();
+        (device && eligible.contains(&local)).then_some(BaoAdmission::DeviceRead)
     }
+}
+
+/// What the bao plane admitted a peer as. A device reaches the read branch and
+/// nothing else, so replication stays infrastructure-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaoAdmission {
+    Infra,
+    DeviceRead,
 }
 
 async fn emit_replication_watch(
@@ -332,7 +360,7 @@ async fn bao_policy(
                 let request = policy_request_with(
                     &path,
                     &Permission::READ,
-                    Some(&request.auth_context.user_id),
+                    Some(&request.auth_context),
                     PolicyRequestExtras::operation("s3.GetObject"),
                 );
                 let evaluator = evaluators
@@ -597,13 +625,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                             };
                             // #332: only an authenticated sync-eligible realm peer
                             // may open the blob replication plane at all.
-                            let eligible = timeout(
+                            let admission = timeout(
                                 INBOUND_BAO_TIMEOUT,
-                                self.peer_sync_eligible(*net_handle.realm_id(), node_id),
+                                self.bao_peer_admitted(*net_handle.realm_id(), net_handle.node_id(), node_id),
                             )
                             .await
-                            .unwrap_or(false);
-                            if !eligible {
+                            .ok()
+                            .flatten();
+                            if admission.is_none() {
                                 warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
                                 close_bao_stream(stream);
                                 return;
@@ -624,17 +653,18 @@ impl InboundEventHandler for OperationsInboundHandler {
                                     return;
                                 }
                             };
-                            let eligible = timeout(
+                            let admission = timeout(
                                 INBOUND_BAO_TIMEOUT,
-                                self.peer_sync_eligible(*net_handle.realm_id(), node_id),
+                                self.bao_peer_admitted(*net_handle.realm_id(), net_handle.node_id(), node_id),
                             )
                             .await
-                            .unwrap_or(false);
-                            if !eligible {
+                            .ok()
+                            .flatten();
+                            let Some(admission) = admission else {
                                 warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
                                 close_failed_bao(&blob_handle, stream_id).await;
                                 return;
-                            }
+                            };
                             let first_event = blob_handle
                                 .send_blob_effect(BlobEffect::ReadMessage { stream_id });
                             let first_event = match timeout(INBOUND_BAO_TIMEOUT, first_event).await {
@@ -654,6 +684,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             manifest,
                                             ..
                                         }) => {
+                                            // A manifest carries its own asserted
+                                            // identity, so only infrastructure may
+                                            // ever publish one.
+                                            if admission != BaoAdmission::Infra {
+                                                warn!(peer = %node_id, stream_id = %stream_id, "Refusing a replication manifest from a device");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
                                             debug!(
                                                 peer = %node_id,
                                                 stream_id = %stream_id,
@@ -783,6 +821,13 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         Ok(VersionReplicationMessage::LocationSummaryRequest(
                                             request,
                                         )) => {
+                                            // The summary describes what this node
+                                            // holds; a device is never told.
+                                            if admission != BaoAdmission::Infra {
+                                                warn!(peer = %node_id, stream_id = %stream_id, "Refusing a location summary to a device");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
                                             let identity_allowed = request.realm_id
                                                 == *net_handle.realm_id()
                                                 && auth_matches(
@@ -1175,7 +1220,12 @@ mod tests {
         let mut config =
             aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
-        config.ensure_node(user, aruna_core::structs::RealmNodeKind::User);
+        config.ensure_node(
+            user,
+            aruna_core::structs::RealmNodeKind::User {
+                owner: aruna_core::UserId::nil(realm_id),
+            },
+        );
         let actor = aruna_core::structs::Actor {
             node_id: server,
             user_id: aruna_core::UserId::nil(realm_id),
@@ -1205,10 +1255,28 @@ mod tests {
             Shutdown::new(),
         );
 
-        assert!(handler.peer_sync_eligible(realm_id, server).await);
-        assert!(!handler.peer_sync_eligible(realm_id, user).await);
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        assert!(!handler.peer_sync_eligible(realm_id, unknown).await);
+        let foreign = aruna_core::structs::RealmId::from_bytes([4u8; 32]);
+        // A realm node reaches the whole plane; a device reaches reads only, and
+        // only through a realm node, so it is never a replication source and
+        // never answered by another device.
+        assert_eq!(
+            handler.bao_peer_admitted(realm_id, server, server).await,
+            Some(BaoAdmission::Infra)
+        );
+        assert_eq!(
+            handler.bao_peer_admitted(realm_id, server, user).await,
+            Some(BaoAdmission::DeviceRead)
+        );
+        assert_eq!(handler.bao_peer_admitted(realm_id, user, user).await, None);
+        assert_eq!(
+            handler.bao_peer_admitted(realm_id, server, unknown).await,
+            None
+        );
+        assert_eq!(
+            handler.bao_peer_admitted(foreign, server, server).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -1236,6 +1304,7 @@ mod tests {
                 pattern: "/source/**".to_string(),
                 permission: Permission::READ,
             }]),
+            session: None,
         };
         let mut manifest = VersionReplicationManifest {
             bucket: "bucket".to_string(),
@@ -1301,6 +1370,7 @@ mod tests {
             user_id: UserId::nil(foreign_realm),
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         assert_eq!(
             manifest_policy(&context, realm_id, node_id, &manifest)

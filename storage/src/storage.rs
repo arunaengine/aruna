@@ -3095,6 +3095,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Storage(storage_effect) => storage_effect_kind(storage_effect),
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
+        Effect::LocalFile(_) => "local_file",
         Effect::Net(_) => "net",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",

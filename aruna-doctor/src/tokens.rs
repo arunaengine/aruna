@@ -194,6 +194,8 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
             user_id: user.user_id,
             realm_id: config.realm_id,
             node_capabilities: config.node_capabilities,
+
+            session: None,
         })?,
         &driver_ctx,
     )
@@ -222,14 +224,14 @@ pub async fn recover_initial_admin() -> Result<String, CliError> {
         seed_url: format!("http://{}", config.http_socket_addr),
         enrollment_id: Ulid::generate(),
         secret: secret_bytes,
-        mode: OnboardingMode::Local,
+        mode: OnboardingMode::Server,
         realm_id: config.realm_id,
         purpose: OnboardingPurpose::InitialAdministrator,
     };
     let record = OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
-        mode: OnboardingMode::Local,
+        mode: OnboardingMode::Server,
         purpose: OnboardingPurpose::InitialAdministrator,
         expires_at: u64::MAX,
         claimed_node_id: None,
@@ -968,6 +970,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

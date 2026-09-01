@@ -61,7 +61,7 @@ pub async fn authorize(
     enforce_policies(
         context,
         realm_id,
-        &policy_request_with(path, permission, Some(&auth.user_id), extras),
+        &policy_request_with(path, permission, Some(auth), extras),
     )
     .await?;
     Ok(())

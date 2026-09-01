@@ -337,6 +337,7 @@ pub async fn ensure_sync_mirror(
                 user_id: relationship.created_by,
                 realm_id: relationship.source.realm_id,
                 path_restrictions: None,
+                session: None,
             })),
             source_group_id,
             relationship.clone(),
@@ -377,6 +378,7 @@ pub async fn delete_sync_mirror(
                 user_id: relationship.created_by,
                 realm_id: relationship.source.realm_id,
                 path_restrictions: None,
+                session: None,
             })),
             relationship.clone(),
             PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
@@ -522,6 +524,7 @@ async fn authorize_repair(
         user_id: relationship.created_by,
         realm_id: relationship.created_by.realm_id,
         path_restrictions: None,
+        session: None,
     };
     match authorize(
         context,

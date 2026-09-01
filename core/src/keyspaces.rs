@@ -65,6 +65,10 @@ pub const TASK_TIMER_KEYSPACE: &str = "task_timers";
 pub const USER_KEYSPACE: &str = "users";
 pub const USER_SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
 pub const USER_SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
+pub const USER_SESSION_KEYSPACE: &str = "user_sessions";
+pub const USER_SESSION_OWNER_KEYSPACE: &str = "user_session_owner";
+pub const ASSISTANT_PROVIDER_KEYSPACE: &str = "assistant_providers";
+pub const ASSISTANT_PROVIDER_OWNER_KEYSPACE: &str = "assistant_provider_owner";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
@@ -124,6 +128,51 @@ pub const GROUP_STORAGE_BACKEND_SECRET_KEYSPACE: &str = "group_storage_backend_s
 /// one group's backends instead of every tenant's. Written in the same batch or
 /// transaction as the id-keyed record it mirrors.
 pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_index";
+
+/// Device-local registrations of the directories this node offers as read-only
+/// buckets, keyed by bucket name. Never replicated: the root path is the one
+/// fact about the owner's machine that must not leave it.
+pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
+
+/// Authoring intents the owner queued on the device while the realm was
+/// unreachable, keyed by local draft id. Never replicated: an entry becomes
+/// realm state only when the drain forwards it as an ordinary create.
+pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
+
+/// The realm-config clock the realm documents this device holds were copied at,
+/// keyed by realm id. It is what keeps a later copy from rolling the device
+/// back, and it is never replicated.
+pub const DEVICE_REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
+
+/// The api urls of the realm's management nodes, as a realm node served them,
+/// keyed by realm id. A device holds no peer node-info document, so this is the
+/// only address it has for a management-only route.
+pub const DEVICE_MANAGEMENT_URL_KEYSPACE: &str = "device_management_urls";
+
+/// The one row a device keeps about its exchange with the realm: when the realm
+/// last answered, when the last pass finished, and whether one is in flight.
+pub const DEVICE_SYNC_STATE_KEYSPACE: &str = "device_sync_state";
+
+/// The metadata documents this device keeps a local craqle replica of, keyed
+/// by document id. Never replicated: it records what the owner selected and
+/// how far this device has synced each replica.
+pub const DEVICE_REPLICA_KEYSPACE: &str = "device_replica";
+
+/// Device-local bindings of a directory to a realm bucket prefix, keyed by
+/// folder id. Never replicated: the root path must not leave the machine.
+pub const SYNCED_FOLDER_KEYSPACE: &str = "synced_folders";
+
+/// The merge base of every synced path, keyed by `folder id || relative path`.
+/// It is the only evidence a file is still the one the last sync wrote.
+pub const SYNC_BASE_KEYSPACE: &str = "sync_bases";
+
+/// Local versions waiting to be pulled by their realm node, keyed by ULID so a
+/// forward scan drains in observation order.
+pub const SYNC_UPLOAD_OUTBOX_KEYSPACE: &str = "sync_upload_outbox";
+
+/// Append-only record of the explicit owner actions that replaced or removed
+/// local bytes, keyed by `folder id || action id`.
+pub const SYNC_ACTION_LOG_KEYSPACE: &str = "sync_action_log";
 
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";

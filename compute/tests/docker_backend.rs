@@ -7,10 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_compute::DockerConfig;
 use aruna_compute::executor::docker::DockerBackend;
-use aruna_compute::executor::logs::LogSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, FenceContext, LogLimits,
-    LogStream, LogTails, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec,
+    LogTails, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -42,7 +41,6 @@ trait DockerTestExt {
         &self,
         attempt: &AttemptRef,
         limits: &LogLimits,
-        sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError>;
     async fn fetch_output(
         &self,
@@ -124,9 +122,8 @@ impl DockerTestExt for DockerBackend {
         &self,
         attempt: &AttemptRef,
         limits: &LogLimits,
-        sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
-        aruna_compute::ExecutorBackend::fetch_logs(self, &fence(attempt), limits, sink).await
+        aruna_compute::ExecutorBackend::fetch_logs(self, &fence(attempt), limits).await
     }
 
     async fn fetch_output(
@@ -550,19 +547,6 @@ async fn reconcile_adopts() {
     let _ = recovered.cleanup(&attempt).await;
 }
 
-#[derive(Default)]
-struct CountingSink {
-    stdout: std::sync::atomic::AtomicU64,
-}
-
-impl LogSink for CountingSink {
-    fn write(&self, stream: LogStream, chunk: &[u8]) {
-        if stream == LogStream::Stdout {
-            self.stdout.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        }
-    }
-}
-
 #[tokio::test]
 async fn log_bounds() {
     // A chatty container's captured tail is bounded; totals show truncation.
@@ -582,9 +566,8 @@ async fn log_bounds() {
     backend.submit(&spec, &cancel).await.unwrap();
     backend.wait(&attempt, &cancel).await.unwrap();
 
-    let sink = CountingSink::default();
     let tails = backend
-        .fetch_logs(&attempt, &spec.log_limits, &sink)
+        .fetch_logs(&attempt, &spec.log_limits)
         .await
         .unwrap();
 
@@ -602,9 +585,6 @@ async fn log_bounds() {
         "true total must exceed the cap, got {}",
         tails.stdout_total
     );
-    // The sink saw the full stream, not just the bounded tail.
-    assert!(sink.stdout.load(Ordering::Relaxed) > 4096);
-
     let _ = backend.cleanup(&attempt).await;
 }
 

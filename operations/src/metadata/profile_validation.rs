@@ -8,14 +8,15 @@ use aruna_core::keyspaces::METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
     MetadataProfileValidationSeverity, MetadataProfileValidationState,
-    MetadataProfileValidationStatus, MetadataValidationViolation, is_rocrate_specification,
+    MetadataProfileValidationStatus, MetadataRawRevision, MetadataValidationViolation,
+    is_rocrate_specification,
 };
 use aruna_core::storage_entries::{
     metadata_profile_validation_status_key, metadata_profile_validation_status_write_entry,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::TxnId;
-use chrono::Utc;
+use aruna_core::util::unix_timestamp_millis as now_ms;
 use craqle::{CrateViolation, ShaclValidationResult};
 use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxttl::NQuadsParser;
@@ -165,6 +166,39 @@ async fn assess_submission(
     let metadata = evaluator_handle(context, Some(profile.revision))?;
     let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
     Ok(profiled_status(document_id, &profile, assessment.findings))
+}
+
+/// Profile verdict for a merged render. A merge is never rejected, so an
+/// evaluator that cannot answer reports stale rather than failing the job.
+pub(crate) async fn assess_render(
+    context: &DriverContext,
+    document_id: Ulid,
+    jsonld: &str,
+) -> MetadataProfileValidationStatus {
+    match assess_submission(context, document_id, jsonld).await {
+        Ok(status) => status,
+        Err(MetadataError::ProfileValidation(findings)) => {
+            let mut status = stale_status(document_id, "profile_unavailable");
+            status.findings = findings;
+            status
+        }
+        Err(error) => stale_status(document_id, &error.to_string()),
+    }
+}
+
+/// Findings that make a document invalid, and so keep the render undisplayed.
+pub(crate) fn violation_count(status: &MetadataProfileValidationStatus) -> u32 {
+    if status.state != MetadataProfileValidationState::Invalid {
+        return 0;
+    }
+    u32::try_from(
+        status
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == MetadataProfileValidationSeverity::Violation)
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 /// The verdict a create or replace would enforce for an unsaved draft.
@@ -398,6 +432,7 @@ fn profiled_status(
         findings,
         completeness,
         stale_reason: None,
+        dataset_digest: None,
     }
 }
 
@@ -414,6 +449,7 @@ pub fn not_profiled_status(document_id: Ulid) -> MetadataProfileValidationStatus
         findings: Vec::new(),
         completeness: MetadataProfileValidationCompleteness::Complete,
         stale_reason: None,
+        dataset_digest: None,
     }
 }
 
@@ -430,6 +466,7 @@ pub fn stale_status(document_id: Ulid, reason: &str) -> MetadataProfileValidatio
         findings: Vec::new(),
         completeness: MetadataProfileValidationCompleteness::Incomplete,
         stale_reason: Some(reason.to_string()),
+        dataset_digest: None,
     }
 }
 
@@ -471,7 +508,7 @@ pub async fn current_validation_status(
             "validation_status_missing",
         ));
     };
-    if status.dataset_revision != record.last_event_id {
+    if !validation_is_current(context, record, &status).await? {
         status.state = MetadataProfileValidationState::Stale;
         status.completeness = MetadataProfileValidationCompleteness::Incomplete;
         status.stale_reason = Some("dataset_revision_changed".to_string());
@@ -502,6 +539,23 @@ pub async fn current_validation_status(
     Ok(status)
 }
 
+/// A merged document's status is bound to the render it validated, because a
+/// merge can leave the displayed revision behind the newest event. A status
+/// written before the first merge still carries only its event id.
+async fn validation_is_current(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+    status: &MetadataProfileValidationStatus,
+) -> Result<bool, MetadataError> {
+    let Some(digest) = status.dataset_digest else {
+        return Ok(status.dataset_revision == record.last_event_id);
+    };
+    let current = crate::metadata::raw::load_raw_digest(context, record.document_id)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    Ok(current == Some(digest))
+}
+
 pub async fn revalidate_current(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
@@ -510,13 +564,18 @@ pub async fn revalidate_current(
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?
         .ok_or(MetadataError::GraphNotFound)?;
-    if raw.winning_event_id != record.last_event_id {
+    let Some(digest) = raw.dataset_digest else {
         return Err(MetadataError::Backend(
-            "metadata raw revision changed during profile revalidation".to_string(),
+            "metadata raw revision has no dataset digest to fence on".to_string(),
         ));
-    }
-    let mut status = assess_submission(context, record.document_id, &raw.jsonld).await?;
+    };
+    let merged = merged_jsonld(&raw).map(str::to_owned);
+    let mut status = match merged.as_deref() {
+        Some(jsonld) => assess_render(context, record.document_id, jsonld).await,
+        None => assess_submission(context, record.document_id, &raw.jsonld).await?,
+    };
     status.dataset_revision = raw.winning_event_id;
+    status.dataset_digest = Some(digest);
     let mut owner = context
         .storage_handle
         .start_transaction(false)
@@ -535,7 +594,12 @@ pub async fn revalidate_current(
             .await,
     )
     .map_err(map_registry_error)?;
-    if fenced.as_ref().map(|record| record.last_event_id) != Some(raw.winning_event_id) {
+    let fenced_raw = load_raw_revision(context, record.document_id, Some(txn_id))
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let fenced_digest = fenced_raw.as_ref().and_then(|raw| raw.dataset_digest);
+    let fenced_merged = fenced_raw.as_ref().and_then(merged_jsonld);
+    if fenced.is_none() || fenced_digest != Some(digest) || fenced_merged != merged.as_deref() {
         let _ = context
             .storage_handle
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -580,6 +644,10 @@ pub async fn revalidate_current(
             "unexpected profile revalidation commit: {other:?}"
         ))),
     }
+}
+
+fn merged_jsonld(raw: &MetadataRawRevision) -> Option<&str> {
+    raw.merged.as_ref().map(|merged| merged.jsonld.as_str())
 }
 
 async fn resolve_registered_profile(
@@ -893,10 +961,6 @@ fn unavailable_error(code: &str, message: &str, revision: Option<Ulid>) -> Metad
     }])
 }
 
-fn now_ms() -> u64 {
-    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +977,23 @@ mod tests {
             severity: EncodedTerm(format!("<{SH}{severity}>")),
             messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn selects_merged_candidate() {
+        let mut raw = MetadataRawRevision {
+            jsonld: "displayed".to_string(),
+            winning_event_id: Ulid::nil(),
+            context_digest: [0u8; 32],
+            dataset_digest: Some([1u8; 32]),
+            merged: None,
+        };
+        assert!(merged_jsonld(&raw).is_none());
+        raw.merged = Some(aruna_core::metadata::MetadataMergedRevision {
+            jsonld: "candidate".to_string(),
+            findings: 1,
+        });
+        assert_eq!(merged_jsonld(&raw), Some("candidate"));
     }
 
     #[test]
@@ -1010,6 +1091,113 @@ mod tests {
         assert_eq!(
             profile_id_from_iri(&MetadataRegistryRecord::graph_iri_for(id)),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_status_digest() {
+        // A merge can leave the displayed revision behind the newest event, so
+        // freshness follows the render's digest, not the event id.
+        use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
+        use aruna_core::structs::{PlacementRef, RealmId};
+        use aruna_storage::FjallStorage;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let group_id = Ulid::from_parts(1, 1);
+        let document_id = Ulid::from_parts(1, 2);
+        let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: "datasets/digest".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "datasets/digest",
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: vec![node_id],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            establishing_event_id: Ulid::from_parts(1, 3),
+            last_event_id: Ulid::from_parts(2, 3),
+        };
+        let event = MetadataCreateEventRecord {
+            event_id: record.last_event_id,
+            record: record.clone(),
+            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 4), realm_id),
+            node_id,
+            payload: MetadataCreateEventPayload::UpsertDataEntity {
+                jsonld: "{}".to_string(),
+            },
+            occurred_at_ms: 1,
+        };
+        let render = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [{ "@id": "./", "@type": "Dataset", "name": "merged" }]
+        })
+        .to_string();
+
+        // A status written before the first merge still keys on its event id.
+        let mut status = not_profiled_status(document_id);
+        status.dataset_revision = record.last_event_id;
+        assert!(
+            validation_is_current(&context, &record, &status)
+                .await
+                .unwrap()
+        );
+        status.dataset_digest = Some([9u8; 32]);
+        assert!(
+            !validation_is_current(&context, &record, &status)
+                .await
+                .unwrap()
+        );
+
+        let plan = crate::metadata::raw::prepare_merged_event(
+            &context,
+            &event,
+            render,
+            0,
+            &mut crate::metadata::raw::RawStateCache::default(),
+        )
+        .await
+        .expect("merged raw state");
+        let (key_space, key, value) = plan.state_write.clone();
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space,
+                    key,
+                    value,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        status.dataset_digest = plan
+            .revision
+            .as_ref()
+            .and_then(|revision| revision.dataset_digest);
+        assert!(status.dataset_digest.is_some());
+        assert!(
+            validation_is_current(&context, &record, &status)
+                .await
+                .unwrap()
         );
     }
 

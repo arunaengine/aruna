@@ -119,6 +119,7 @@ pub async fn create_replicated_watch_subscription(
             user_id: owner,
             realm_id: owner.realm_id,
             path_restrictions: None,
+            session: None,
         },
         &subscription.path_prefix,
         subscription.event_mask,

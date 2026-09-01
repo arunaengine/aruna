@@ -1647,14 +1647,42 @@ pub fn job_owner_index_prefix(created_by: UserId) -> Key {
     ByteView::from(created_by.to_storage_key())
 }
 
-pub fn job_active_key(created_by: UserId, job_id: JobId) -> Key {
-    let mut bytes = created_by.to_storage_key();
+/// The slot a running job occupies in its submitter's active index. Slots are
+/// scoped per kind, so an execution ceiling and an RO-Crate limit never count
+/// each other's work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveJobKind {
+    RoCrate,
+    Execution,
+}
+
+impl ActiveJobKind {
+    /// The slot this payload holds while it runs, if it holds one.
+    pub fn of(payload: &JobPayload) -> Option<Self> {
+        if payload.is_rocrate() {
+            return Some(Self::RoCrate);
+        }
+        matches!(payload, JobPayload::Execution(_)).then_some(Self::Execution)
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            Self::RoCrate => 0,
+            Self::Execution => 1,
+        }
+    }
+}
+
+pub fn job_active_key(created_by: UserId, kind: ActiveJobKind, job_id: JobId) -> Key {
+    let mut bytes = job_active_prefix(created_by, kind).to_vec();
     bytes.extend_from_slice(&job_id.to_bytes());
     ByteView::from(bytes)
 }
 
-pub fn job_active_prefix(created_by: UserId) -> Key {
-    ByteView::from(created_by.to_storage_key())
+pub fn job_active_prefix(created_by: UserId, kind: ActiveJobKind) -> Key {
+    let mut bytes = created_by.to_storage_key();
+    bytes.push(kind.tag());
+    ByteView::from(bytes)
 }
 
 pub fn job_entry_key(job_id: JobId, entry_key: &[u8]) -> Key {
@@ -1835,6 +1863,7 @@ impl JobRetryPolicy {
 pub struct EffectiveResources {
     pub cpu_cores: u32,
     pub ram_bytes: u64,
+    /// Zero is the absence of a disk request, not a zero-byte ceiling.
     pub disk_bytes: u64,
     pub max_walltime_ms: u64,
     pub preemptible: bool,
@@ -3544,6 +3573,7 @@ mod tests {
                     user_id: owner,
                     realm_id: RealmId([1u8; 32]),
                     path_restrictions: None,
+                    session: None,
                 },
                 source: ImportRoCrateSource::Upload {
                     upload_id: Ulid::from_bytes([3u8; 16]),

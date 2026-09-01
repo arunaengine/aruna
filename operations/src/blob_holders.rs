@@ -48,7 +48,6 @@ pub enum RefreshBlobHoldersError {
 #[derive(Debug, PartialEq)]
 pub struct RefreshBlobHoldersOperation {
     realm_id: RealmId,
-    node_id: NodeId,
     limits: RoCrateLimits,
     state: RefreshState,
     pending: VecDeque<DhtKeyId>,
@@ -59,10 +58,9 @@ pub struct RefreshBlobHoldersOperation {
 }
 
 impl RefreshBlobHoldersOperation {
-    pub fn new(realm_id: RealmId, node_id: NodeId, limits: RoCrateLimits) -> Self {
+    pub fn new(realm_id: RealmId, limits: RoCrateLimits) -> Self {
         Self {
             realm_id,
-            node_id,
             limits,
             state: RefreshState::Init,
             pending: VecDeque::new(),
@@ -88,12 +86,7 @@ impl RefreshBlobHoldersOperation {
         if let Some(key) = self.pending.pop_front() {
             self.state = RefreshState::Publish;
             self.refreshed = self.refreshed.saturating_add(1);
-            return match dht_registration_effect(
-                key.as_bytes(),
-                self.realm_id,
-                self.node_id,
-                &self.limits,
-            ) {
+            return match dht_registration_effect(key.as_bytes(), self.realm_id, &self.limits) {
                 Ok(effect) => smallvec![effect],
                 Err(error) => self.fail(error.into()),
             };
@@ -354,7 +347,7 @@ mod tests {
             holder_refresh_ms: 30_000,
             ..RoCrateLimits::default()
         };
-        let effect = dht_registration_effect(&[2; 32], realm_id, node(3), &limits).unwrap();
+        let effect = dht_registration_effect(&[2; 32], realm_id, &limits).unwrap();
 
         assert!(matches!(
             effect,
@@ -369,13 +362,12 @@ mod tests {
     #[test]
     fn refreshes_blob_pages() {
         let realm_id = RealmId::from_bytes([1; 32]);
-        let node_id = node(2);
         let limits = RoCrateLimits {
             holder_ttl_ms: 90_000,
             holder_refresh_ms: 30_000,
             ..RoCrateLimits::default()
         };
-        let mut operation = RefreshBlobHoldersOperation::new(realm_id, node_id, limits);
+        let mut operation = RefreshBlobHoldersOperation::new(realm_id, limits);
 
         let schedule = operation.start();
         assert_eq!(
@@ -485,8 +477,7 @@ mod tests {
     #[test]
     fn terminal_rejects_event() {
         let realm_id = RealmId::from_bytes([1; 32]);
-        let mut refresh =
-            RefreshBlobHoldersOperation::new(realm_id, node(2), RoCrateLimits::default());
+        let mut refresh = RefreshBlobHoldersOperation::new(realm_id, RoCrateLimits::default());
 
         let effects = refresh.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
             key: DhtKeyId::from_bytes([1; 32]),

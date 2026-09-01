@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod connection_pool;
+pub mod device_limits;
 pub mod dht;
 #[path = "irokle.rs"]
 pub mod document_sync;
@@ -11,7 +12,7 @@ pub mod error;
 pub mod streams;
 mod telemetry;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::mem;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -610,6 +611,7 @@ impl NetHandle {
             endpoint.clone(),
             storage.clone(),
             connection_pool.clone(),
+            inbound_admission.peer_kinds(),
             shutdown.child_token(),
         )?;
         let dht = Arc::new(dht_handle);
@@ -633,7 +635,7 @@ impl NetHandle {
         // joiner admits its seed's pushes before the first realm config applies.
         let mut document_sync_peers = realm_peer_nodes.clone();
         document_sync_peers.extend(peer_hints.iter().copied());
-        let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
+        let mut document_sync = DocumentSyncService::open_with_persist_policy(
             endpoint.clone(),
             storage.clone(),
             document_sync_path,
@@ -642,7 +644,10 @@ impl NetHandle {
             config.document_sync_runtime.unwrap_or_default(),
             config.fjall_persist_policy,
             config.realm_id,
-        )?);
+        )?;
+        // Dial-side half of the ALPN x kind matrix: sync never targets a device.
+        document_sync.set_peer_kinds(inbound_admission.peer_kinds());
+        let document_sync = Arc::new(document_sync);
 
         let streams = Arc::new(StreamsService::new(
             connection_pool.clone(),
@@ -701,6 +706,7 @@ impl NetHandle {
         let inbound_handler_for_streams = inbound_handler.clone();
         let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
         let inbound_tasks_for_streams = inbound_tasks.clone();
+        let admission_for_streams = inbound_admission.clone();
         let stream_task = tokio::spawn(async move {
             while let Some((alpn, stream, peer_id)) = stream_rx.recv().await {
                 if let Err(err) = dht_for_streams.add_peer(peer_id) {
@@ -720,8 +726,24 @@ impl NetHandle {
                         );
                         continue;
                     };
+                    // A user device is bounded by the realm's published limits
+                    // rather than by responsibilities it does not carry; the
+                    // slot it takes is held for the whole handler.
+                    let device_permit = match admission_for_streams.admit_stream(peer_id) {
+                        Ok(permit) => permit,
+                        Err(refusal) => {
+                            warn!(
+                                node_id = %peer_id,
+                                alpn = %alpn,
+                                refusal = ?refusal,
+                                "Dropping inbound stream: device is over its realm limit"
+                            );
+                            continue;
+                        }
+                    };
                     inbound_tasks_for_streams.spawn(async move {
                         let _permit = permit;
+                        let _device_permit = device_permit;
                         handler.handle_incoming_stream(alpn, stream, peer_id).await;
                     });
                 } else {
@@ -1007,6 +1029,12 @@ impl NetHandle {
             .ensure_document_sync_topics(topics, peers)
     }
 
+    /// Ensures topics this node is the only holder of. No peer is added to
+    /// their membership, so a device's own topics stay entirely local.
+    pub fn ensure_local_topics(&self, topics: &[::irokle::TopicId]) -> Result<()> {
+        self.inner.document_sync.ensure_local_topics(topics)
+    }
+
     /// Whether a document sync topic's genesis is known locally.
     pub fn document_sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
         self.inner.document_sync.topic_exists(topic)
@@ -1150,6 +1178,33 @@ impl NetHandle {
                 document.realm_id, self.inner.realm_id
             )));
         }
+        // Node kind decides which protocols each side of a connection may
+        // speak; the accept loop and the DHT read the same table. Kinds are
+        // published first: a peer admitted before its kind is known would pass
+        // the ALPN matrix as an unconfigured node.
+        let mut peer_kinds = BTreeMap::new();
+        let mut local_kind = None;
+        for node in &document.nodes {
+            let Ok(node_id) = NodeId::from_str(&node.node_id) else {
+                continue;
+            };
+            if node_id == self.inner.node_id {
+                local_kind = Some(node.kind.clone());
+            } else {
+                peer_kinds.insert(node_id, node.kind.clone());
+            }
+        }
+        self.inner
+            .inbound_admission
+            .set_kinds(local_kind, peer_kinds);
+        // Device limits are keyed by the kinds just published, so they follow the
+        // same refresh rather than a second source of truth.
+        self.inner
+            .inbound_admission
+            .set_device_limits(device_limits::DeviceLimits {
+                requests_per_minute: document.quota.device_requests_per_minute,
+                concurrent: document.quota.device_concurrent_pulls,
+            });
         // Connection admission covers every registered realm node, User kind
         // included: user nodes forward metadata and job-control requests.
         let admitted = unique_peer_nodes(
@@ -1347,6 +1402,13 @@ impl NetHandle {
         if matches!(alpn, Alpn::Dht) {
             return Err(NetError::Stream(format!(
                 "{alpn} is an internal network protocol"
+            )));
+        }
+        // Outbound half of the accept matrix: a device must not even dial a
+        // protocol its own node kind is refused on.
+        if !self.inner.inbound_admission.local_dials(alpn) {
+            return Err(NetError::Stream(format!(
+                "{alpn} is not permitted for this node kind"
             )));
         }
 
@@ -2583,6 +2645,7 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
+        Effect::LocalFile(_) => "local_file",
         Effect::Storage(_) => "storage",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
@@ -3385,13 +3448,28 @@ mod tests {
         document.ensure_node(peer_a, aruna_core::structs::RealmNodeKind::Server);
         // A User-kind node must never enter the sync fan-out set.
         let user_node = make_secret(13).public();
-        document.ensure_node(user_node, aruna_core::structs::RealmNodeKind::User);
+        document.ensure_node(
+            user_node,
+            aruna_core::structs::RealmNodeKind::User {
+                owner: aruna_core::types::UserId::nil(*handle.realm_id()),
+            },
+        );
         let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());
 
         let peers = handle.refresh_realm_peers_from_document(&document).await?;
         assert_eq!(peers, expected);
         assert_eq!(handle.realm_peers().await, expected);
         assert_eq!(*handle.inner.dht_signed_authorized_nodes.read(), expected);
+        // The same refresh that admits a node publishes its kind, so an
+        // admitted peer is never briefly ungated.
+        assert!(
+            handle
+                .inner
+                .inbound_admission
+                .peer_kinds()
+                .read()
+                .contains_key(&user_node)
+        );
 
         let mut replacement =
             RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());

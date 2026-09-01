@@ -9,8 +9,9 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataCreateEventPayload,
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
-    MetadataGraphLifecycleRecord, MetadataMaterializationState, MetadataRawRevision,
-    apply_raw_upsert, resolve_raw_revision,
+    MetadataGraphLifecycleRecord, MetadataMaterializationState, MetadataMergedRevision,
+    MetadataRawRevision, apply_raw_upsert, raw_context_digest, raw_upsert_entity,
+    resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
     metadata_document_lifecycle_key, metadata_event_log_key, metadata_event_log_prefix,
@@ -81,6 +82,9 @@ struct RawRevisionState {
     base: Option<RawBaseIdentity>,
     last_event_id: Ulid,
     revision: Option<MetadataRawRevision>,
+    /// Set once a batch has merged into the graph. From then on the rendered
+    /// graph owns this document's revision and no text event rebuilds it.
+    merged: bool,
 }
 
 #[derive(Debug, Default)]
@@ -178,6 +182,13 @@ pub async fn load_raw_revision(
     if raw_deleted(context, document_id, txn_id).await? {
         return Ok(None);
     }
+    // Once a batch has merged, the rendered graph is the document's revision;
+    // the authored-text replay only serves a document until then.
+    if let Some(state) = read_raw_state(context, document_id, txn_id).await?
+        && state.merged
+    {
+        return Ok(state.revision);
+    }
     let events = load_raw_events(
         context,
         document_id,
@@ -188,6 +199,17 @@ pub async fn load_raw_revision(
     )
     .await?;
     resolve_raw_revision(&events).map_err(Into::into)
+}
+
+/// Digest of the displayed revision, read without replaying the event log.
+pub(crate) async fn load_raw_digest(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<Option<[u8; 32]>, MetadataRawReadError> {
+    Ok(read_raw_state(context, document_id, None)
+        .await?
+        .and_then(|state| state.revision)
+        .and_then(|revision| revision.dataset_digest))
 }
 
 async fn raw_deleted(
@@ -251,6 +273,9 @@ pub(crate) async fn prepare_raw_event(
         cache.loaded = true;
     }
     let (state, rebuild) = match cache.state.as_ref() {
+        // A merged document's revision comes from the graph, so a replayed text
+        // event must neither rebuild it nor overwrite it.
+        Some(state) if state.merged => (state.clone(), false),
         Some(state) if event.event_id > state.last_event_id => {
             let events = load_raw_events(
                 context,
@@ -296,6 +321,80 @@ pub(crate) async fn prepare_raw_event(
         rebuild,
         state_write,
         state,
+    })
+}
+
+/// Raw state after `event`'s batch merged and the graph re-rendered.
+///
+/// Out-of-order arrival needs no replay: the OR-Set already converged, so the
+/// render describes every batch this node has merged.
+pub(crate) async fn prepare_merged_event(
+    context: &DriverContext,
+    event: &MetadataCreateEventRecord,
+    render: String,
+    findings: u32,
+    cache: &mut RawStateCache,
+) -> Result<RawEventPlan, MetadataRawReadError> {
+    if !cache.loaded {
+        cache.state = read_raw_state(context, event.record.document_id, None).await?;
+        cache.loaded = true;
+    }
+    let previous = cache.state.clone().unwrap_or(RawRevisionState {
+        base: None,
+        last_event_id: event.event_id,
+        revision: None,
+        merged: true,
+    });
+    let state = merged_raw_state(previous, event, render, findings)?;
+    let state_write = (
+        METADATA_RAW_REVISION_KEYSPACE.to_string(),
+        raw_revision_key(event.record.document_id),
+        ByteView::from(postcard::to_allocvec(&state).map_err(ConversionError::from)?),
+    );
+    Ok(RawEventPlan {
+        revision: state.revision.clone(),
+        rebuild: false,
+        state_write,
+        state,
+    })
+}
+
+/// Only a valid render is displayed: an invalid one is flagged beside the last
+/// valid revision so the editor can open it and the export stays sound.
+fn merged_raw_state(
+    mut state: RawRevisionState,
+    event: &MetadataCreateEventRecord,
+    render: String,
+    findings: u32,
+) -> Result<RawRevisionState, MetadataError> {
+    state.merged = true;
+    state.last_event_id = state.last_event_id.max(event.event_id);
+    match state.revision.as_mut() {
+        Some(revision) if findings > 0 => {
+            revision.merged = Some(MetadataMergedRevision {
+                jsonld: render,
+                findings,
+            });
+        }
+        _ => state.revision = Some(rendered_revision(render, state.last_event_id)?),
+    }
+    Ok(state)
+}
+
+fn rendered_revision(
+    jsonld: String,
+    winning_event_id: Ulid,
+) -> Result<MetadataRawRevision, MetadataError> {
+    let context_digest = raw_context_digest(&jsonld)?;
+    let dataset_digest = craqle::canonicalize_jsonld(&jsonld)
+        .ok()
+        .map(|canonical| canonical.digest);
+    Ok(MetadataRawRevision {
+        jsonld,
+        winning_event_id,
+        context_digest,
+        dataset_digest,
+        merged: None,
     })
 }
 
@@ -394,10 +493,8 @@ fn advance_raw_state(
             if event.event_id <= base.event_id {
                 continue;
             }
-            let (jsonld, link_root) = match &event.payload {
-                MetadataCreateEventPayload::UpsertDataEntity { jsonld } => (jsonld, true),
-                MetadataCreateEventPayload::UpsertContextualEntity { jsonld } => (jsonld, false),
-                _ => continue,
+            let Some((jsonld, link_root)) = raw_upsert_entity(&event.payload) else {
+                continue;
             };
             apply_raw_upsert(&mut document, jsonld, link_root)?;
             revision.winning_event_id = event.event_id;
@@ -429,6 +526,7 @@ fn resolve_raw_state(
         base,
         last_event_id,
         revision,
+        merged: false,
     }))
 }
 
@@ -456,7 +554,8 @@ fn event_matches_state(event: &MetadataCreateEventRecord, state: &RawRevisionSta
                     .is_some_and(|revision| revision.winning_event_id == event.event_id)
         }
         MetadataCreateEventPayload::UpsertDataEntity { .. }
-        | MetadataCreateEventPayload::UpsertContextualEntity { .. } => true,
+        | MetadataCreateEventPayload::UpsertContextualEntity { .. }
+        | MetadataCreateEventPayload::ApplyBatch { .. } => true,
     }
 }
 
@@ -745,6 +844,38 @@ mod tests {
         assert_eq!(state.last_event_id, update.event_id);
         assert!(state.base.is_none());
         assert!(state.revision.is_none());
+    }
+
+    #[test]
+    fn invalid_render_flagged() {
+        // Only a valid crate is displayed; an invalid merge is flagged beside it.
+        let mut base = test_event(Ulid::from_parts(1, 10), 1);
+        base.payload = crate_payload("displayed");
+        let state = resolve_raw_state(&[base]).unwrap().unwrap();
+        let event = test_event(Ulid::from_parts(2, 10), 2);
+        let render = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [{ "@id": "./", "@type": "Dataset", "name": "merged" }]
+        })
+        .to_string();
+
+        let flagged = merged_raw_state(state, &event, render.clone(), 2).unwrap();
+
+        assert!(flagged.merged);
+        let revision = flagged.revision.clone().unwrap();
+        assert!(revision.jsonld.contains("\"name\":\"displayed\""));
+        assert_eq!(revision.winning_event_id, Ulid::from_parts(1, 10));
+        let merged = revision.merged.unwrap();
+        assert_eq!(merged.findings, 2);
+        assert_eq!(merged.jsonld, render);
+
+        let later = test_event(Ulid::from_parts(3, 10), 3);
+        let repaired = merged_raw_state(flagged, &later, render.clone(), 0).unwrap();
+
+        let revision = repaired.revision.unwrap();
+        assert_eq!(revision.jsonld, render);
+        assert_eq!(revision.winning_event_id, later.event_id);
+        assert!(revision.merged.is_none());
     }
 
     #[test]

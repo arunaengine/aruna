@@ -1,25 +1,35 @@
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
+use aruna_core::admin_document_reducer::AdminDocumentReducerState;
+use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget};
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+    ADMIN_DOCUMENT_STATE_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataError, MetadataProfileValidationStatus, MetadataQueryResults,
+    MetadataBatch, MetadataBatchSource, MetadataCreateEventRecord, MetadataEffect, MetadataError,
+    MetadataEvent, MetadataMaterializationState, MetadataMergedRevision,
+    MetadataProfileValidationStatus, MetadataQueryResults, MetadataRawRevision, raw_context_digest,
 };
-use aruna_core::storage_entries::metadata_create_acceptance_key;
+use aruna_core::storage_entries::{
+    admin_document_reducer_state_key, metadata_create_acceptance_key,
+};
 use aruna_core::structs::{
-    Actor, AuthContext, JobId, MetadataRegistryRecord, MintPersistentIdSpec, Permission,
-    PersistentIdFailure, PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId,
-    RealmNodeKind,
+    Actor, AuthContext, BucketInfo, Group, GroupAuthorizationDocument, JobId,
+    MetadataRegistryRecord, MintPersistentIdSpec, Permission, PersistentIdFailure,
+    PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
 };
-use aruna_core::types::UserId;
+use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
 use futures_util::StreamExt;
@@ -29,6 +39,7 @@ use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 use ulid::Ulid;
 
+use crate::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentResult, accepted_create_matches, create_metadata_document,
@@ -37,11 +48,18 @@ use crate::create_metadata_document::{
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
 };
+use crate::device::edit::{DeviceEditError, accepts_edits, apply_local_edit};
+use crate::device::replica::{ReplicaRecord, read_replica};
+use crate::document_sync_outbox::{
+    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
+};
 use crate::driver::{DriverContext, drive};
+use crate::get_group::{GetGroupConfig, GetGroupOperation};
 use crate::get_metadata_document::load_metadata_record_by_document;
+use crate::list_groups::ListGroupOperation;
 use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
-    MetadataApiError, ensure_record_readable, export_metadata_rocrate,
+    MetadataApiError, MetadataRoCrateExportView, ensure_record_readable, export_metadata_rocrate,
     get_visible_metadata_document, load_record_by_document,
 };
 use crate::metadata::handle::{
@@ -49,9 +67,12 @@ use crate::metadata::handle::{
 };
 use crate::metadata::profile_validation::{current_validation_status, revalidate_current};
 use crate::metadata::protocol::{
-    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
-    PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
+    DeviceGroupDocuments, GraphState, MAX_DEVICE_GROUPS, MetadataAuthToken, MetadataReadError,
+    MetadataTransportMessage, MetadataWriteAuthError, PersistentIdOutcome, PersistentIdRequest,
+    PersistentIdResolution, RealmDocuments,
 };
+use crate::metadata::raw::{MetadataRawView, load_raw_view};
+use crate::node_info::read_node_info_documents;
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
@@ -60,6 +81,8 @@ use crate::request_policy::PolicyRequestExtras;
 use crate::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
+use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
+use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document,
@@ -100,11 +123,14 @@ pub enum MetadataWriteError {
 }
 
 const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
+const ADMIN_RELAY_PEER_LIMIT: usize = 3;
+const ADMIN_RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 const METADATA_READ_FANOUT_LIMIT: usize = 8;
 const METADATA_READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
+const DEVICE_GROUP_SCAN_PAGE: usize = 10_000;
 
 /// Route for a write against `placement`, from the local node's point of view.
 ///
@@ -130,8 +156,9 @@ pub fn write_route(
     MetadataWriteRoute::Forward(resolve_shard_holders(config, placement))
 }
 
-/// User-kind nodes hold no metadata or authorization buckets, so their HTTP
-/// write handlers must defer permission checks to the selected holder.
+/// Whether the local node is a device. Devices cache the realm's documents, so
+/// their local checks are real, but they hold no metadata bucket: an effectful
+/// write goes to an ingress, which stays the authority for what it applies.
 pub async fn is_user_origin(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -148,7 +175,7 @@ pub async fn is_user_origin(
         .into_iter()
         .find(|node| node.node_id == local_node_id.to_string())
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    Ok(node.kind == RealmNodeKind::User)
+    Ok(!node.kind.is_sync_eligible())
 }
 
 pub async fn forward_token_revoke(
@@ -170,12 +197,7 @@ pub async fn forward_token_revoke(
         config
             .nodes
             .iter()
-            .filter(|node| {
-                matches!(
-                    &node.kind,
-                    RealmNodeKind::Management | RealmNodeKind::Server
-                )
-            })
+            .filter(|node| node.kind.is_sync_eligible())
             .filter_map(|node| NodeId::from_str(&node.node_id).ok())
             .filter(|peer| Some(*peer) != local_node_id),
         &subject,
@@ -327,6 +349,117 @@ where
     }
 }
 
+/// The replica this device keeps of one document, when it can answer on its
+/// own. A node that holds buckets is never a device and always reads its own
+/// registry instead.
+async fn device_replica(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+    local_node: Option<NodeId>,
+    document_id: Ulid,
+) -> Option<ReplicaRecord> {
+    if local_node.is_none_or(|node| is_sync_eligible(config, node)) {
+        return None;
+    }
+    read_replica(context, document_id)
+        .await
+        .filter(ReplicaRecord::serves_reads)
+}
+
+/// Exports one document from this device's replica. The displayed render is
+/// what the device holds, and the graph views come from the local craqle graph
+/// the replica installed.
+async fn device_export(
+    context: &Arc<DriverContext>,
+    replica: ReplicaRecord,
+    request: &ExportMetadataRoCrateRequest,
+) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    let record = replica
+        .record
+        .map(|record| *record)
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    ensure_record_readable(
+        context.as_ref(),
+        record.realm_id,
+        request.auth.as_ref(),
+        &record,
+        None,
+    )
+    .await?;
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    match request.view {
+        MetadataRoCrateExportView::Full => Ok(ExportMetadataRoCrateResult::Full {
+            jsonld: replica.displayed_jsonld,
+            record,
+        }),
+        MetadataRoCrateExportView::Raw => {
+            let merged = if replica.findings > 0 {
+                Some(
+                    handle
+                        .export_rocrate_jsonld(record.graph_iri.clone())
+                        .await
+                        .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+                )
+            } else {
+                None
+            };
+            Ok(ExportMetadataRoCrateResult::Raw {
+                raw: MetadataRawView {
+                    revision: device_raw_revision(
+                        &replica.displayed_jsonld,
+                        replica.dataset_digest,
+                        replica.findings,
+                        record.last_event_id,
+                        merged,
+                    ),
+                    projection_state: MetadataMaterializationState::Materialized,
+                    projected_event_id: Some(record.last_event_id),
+                },
+                dataset_digest: replica.dataset_digest,
+                record,
+            })
+        }
+        MetadataRoCrateExportView::Summary => Ok(ExportMetadataRoCrateResult::Summary {
+            jsonld: handle
+                .export_rocrate_summary_jsonld(record.graph_iri.clone())
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+            record,
+        }),
+        MetadataRoCrateExportView::Page => Ok(ExportMetadataRoCrateResult::Page {
+            page: handle
+                .export_rocrate_page(
+                    record.graph_iri.clone(),
+                    request.limit.unwrap_or(100).clamp(1, 1_000),
+                    request.offset,
+                    request.after.clone(),
+                )
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+            record,
+        }),
+    }
+}
+
+fn device_raw_revision(
+    displayed_jsonld: &str,
+    dataset_digest: Option<[u8; 32]>,
+    findings: u32,
+    winning_event_id: Ulid,
+    merged_jsonld: Option<String>,
+) -> MetadataRawRevision {
+    MetadataRawRevision {
+        context_digest: raw_context_digest(displayed_jsonld).unwrap_or_default(),
+        jsonld: displayed_jsonld.to_string(),
+        winning_event_id,
+        dataset_digest,
+        merged: merged_jsonld.map(|jsonld| MetadataMergedRevision { jsonld, findings }),
+    }
+}
+
 pub async fn get_metadata_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -339,6 +472,24 @@ pub async fn get_metadata_routed(
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    // A device answers from its own replica, so a selected document stays
+    // readable while the realm is out of reach.
+    if let Some(replica) = device_replica(context, &config, local_node, request.document_id).await {
+        let record = replica
+            .record
+            .map(|record| *record)
+            .ok_or(MetadataApiError::ServiceUnavailable)?;
+        ensure_record_readable(
+            context.as_ref(),
+            realm_id,
+            request.auth.as_ref(),
+            &record,
+            None,
+        )
+        .await?;
+        return Ok(record);
+    }
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
@@ -347,7 +498,6 @@ pub async fn get_metadata_routed(
     let holders =
         read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
     let holder_count = holders.len();
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
     let config = Arc::new(config);
     let metadata = context.metadata_handle.clone();
@@ -596,6 +746,12 @@ pub async fn export_rocrate_routed(
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    if let Some(replica) = device_replica(context, &config, local_node, request.document_id).await {
+        let export = device_export(context, replica, &request).await?;
+        ensure_export_limit(&export, metadata_bytes)?;
+        return Ok(export);
+    }
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
@@ -604,7 +760,6 @@ pub async fn export_rocrate_routed(
     let holders =
         read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
     let holder_count = holders.len();
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
     let metadata = context.metadata_handle.clone();
     let request_template = request.clone();
@@ -792,6 +947,15 @@ pub async fn update_metadata_document_routed(
         .ok_or_else(|| {
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
+    // On a device a selected document is edited locally and queued; a holder
+    // sees the change set when the intake drain forwards it.
+    if let Some(replica) = device_replica(context, &config, Some(actor.node_id), document_id).await
+        && accepts_edits(&replica)
+    {
+        return apply_local_edit(context, actor.user_id, actor.node_id, &replica, mutation)
+            .await
+            .map_err(device_edit_error);
+    }
     let placement = resolve_metadata_id(
         &config,
         actor.realm_id,
@@ -879,6 +1043,93 @@ pub async fn update_metadata_document_routed(
                 .into(),
         ),
         other => Err(unexpected_response(other)),
+    }
+}
+
+/// Forwards one edit a device made on its replica to a holder.
+///
+/// The batch is idempotent by its dot, but an ambiguous delivery still stops
+/// the attempt: replaying it would append a second event for a merge that
+/// changes nothing.
+pub async fn apply_batch_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+    batch: Box<MetadataBatch>,
+    authored: MetadataBatchSource,
+    auth_token: MetadataAuthToken,
+) -> Result<MetadataRegistryRecord, MetadataWriteError> {
+    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
+        MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
+    })?;
+    let config_digest = config
+        .digest()
+        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    let placement = resolve_metadata_id(&config, realm_id, None, document_id)
+        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    let metadata = context.metadata_handle.as_ref().ok_or_else(|| {
+        MetadataWriteError::Undeliverable("no metadata handle to forward with".to_string())
+    })?;
+    let message = MetadataTransportMessage::ForwardApplyBatch {
+        auth_token,
+        config_digest,
+        document_id,
+        batch,
+        authored,
+    };
+    let mut detail = String::from("the document's bucket has no reachable holder");
+    for holder in distinct_holders(&resolve_shard_holders(&config, &placement)) {
+        match metadata
+            .request_forwarded_write(holder, message.clone())
+            .await
+        {
+            Ok(MetadataTransportMessage::ForwardedApplyBatch { result: Ok(record) }) => {
+                return Ok(*record);
+            }
+            Ok(MetadataTransportMessage::ForwardedApplyBatch {
+                result: Err(SyncRefusal::Unavailable),
+            }) => detail = format!("{holder}: holder could not apply the device edit"),
+            Ok(MetadataTransportMessage::ForwardedApplyBatch {
+                result: Err(refusal),
+            }) => return Err(batch_refusal(refusal)),
+            Ok(other) => return Err(unexpected_response(other)),
+            Err(error) => {
+                warn!(holder = %holder, error = %error, "Failed to forward a device edit to holder");
+                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
+                    return Err(MetadataWriteError::Undeliverable(format!(
+                        "forward to holder `{holder}` may have applied the device edit before failing; refusing to replay it: {error}"
+                    )));
+                }
+                detail = format!("{holder}: {error}");
+            }
+        }
+    }
+    Err(MetadataWriteError::Undeliverable(detail))
+}
+
+/// An offline edit's verdict, as the metadata routes report it.
+fn device_edit_error(error: DeviceEditError) -> MetadataWriteError {
+    match error {
+        DeviceEditError::Invalid(message) => {
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
+        }
+        DeviceEditError::NoReplica => MetadataWriteError::NotFound,
+        other => MetadataWriteError::Undeliverable(other.to_string()),
+    }
+}
+
+/// A holder's verdict on a device edit, as the drain classifies it.
+fn batch_refusal(refusal: SyncRefusal) -> MetadataWriteError {
+    match refusal {
+        SyncRefusal::Unauthorized => MetadataWriteError::Unauthorized,
+        SyncRefusal::Forbidden => MetadataWriteError::Forbidden,
+        SyncRefusal::NotFound => MetadataWriteError::NotFound,
+        SyncRefusal::Invalid(message) => {
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
+        }
+        SyncRefusal::Unavailable => {
+            MetadataWriteError::Undeliverable("no holder could apply the device edit".to_string())
+        }
     }
 }
 
@@ -1965,6 +2216,866 @@ pub(crate) async fn apply_forwarded_pid(
     }
 }
 
+/// Why a forwarded group create did not produce a group. `Conflict` is the
+/// caller's problem (quota or a racing create) and must not be retried on
+/// another ingress; everything else maps to the usual transport response.
+#[derive(Debug, Error)]
+pub enum ForwardGroupError {
+    #[error(transparent)]
+    Api(#[from] MetadataApiError),
+    #[error("{0}")]
+    Conflict(String),
+}
+
+/// Sends a User node's group create to a sync-eligible ingress. The device
+/// never originates a realm administrative event: the ingress authorizes the
+/// caller's own token and originates the event with the caller as actor.
+pub async fn forward_group_create(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    auth_token: MetadataAuthToken,
+    display_name: String,
+) -> Result<(Group, GroupAuthorizationDocument), ForwardGroupError> {
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return Err(MetadataApiError::ServiceUnavailable.into());
+    };
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return Err(MetadataApiError::ServiceUnavailable.into());
+    };
+    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut subject = display_name.clone().into_bytes();
+    subject.extend_from_slice(&Ulid::generate().to_bytes());
+    let peers = rank_revoke_peers(
+        config
+            .nodes
+            .iter()
+            .filter(|node| node.kind.is_sync_eligible())
+            .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+            .filter(|peer| Some(*peer) != local_node_id),
+        &subject,
+    );
+    if peers.is_empty() {
+        return Err(MetadataApiError::ServiceUnavailable.into());
+    }
+    let message = MetadataTransportMessage::ForwardGroupCreate {
+        auth_token: Some(auth_token),
+        display_name,
+    };
+    // Retrying a create on another ingress could mint a second group, so only a
+    // request that never left this node moves on. A timeout cannot tell a hung
+    // dial from a slow-but-applied create, so it stops here as well.
+    for peer in peers {
+        match timeout(
+            ADMIN_RELAY_ATTEMPT_TIMEOUT,
+            metadata.request_forwarded_write(peer, message.clone()),
+        )
+        .await
+        {
+            Ok(Ok(MetadataTransportMessage::ForwardedGroupCreated {
+                group,
+                authorization,
+            })) => return Ok((*group, *authorization)),
+            Ok(Ok(MetadataTransportMessage::ForwardedGroupCreateConflict { reason })) => {
+                return Err(ForwardGroupError::Conflict(reason));
+            }
+            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Unauthorized,
+            })) => return Err(MetadataApiError::Unauthorized.into()),
+            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Forbidden,
+            })) => return Err(MetadataApiError::Forbidden.into()),
+            Ok(Ok(MetadataTransportMessage::Reject(error))) => {
+                warn!(%peer, %error, "Ingress rejected a forwarded group create");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
+            Ok(Ok(_)) => {
+                warn!(%peer, "Ingress answered a forwarded group create unexpectedly");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
+            Ok(Err(error)) if retry_disposition(error.delivery()) == RetryDisposition::TryNext => {
+                warn!(%peer, %error, "Failed to reach an ingress for a forwarded group create");
+                continue;
+            }
+            Ok(Err(error)) => {
+                warn!(%peer, %error, "Forwarded group create may have been applied");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
+            Err(_) => {
+                warn!(%peer, "Forwarded group create timed out on a reached ingress");
+                return Err(MetadataApiError::ServiceUnavailable.into());
+            }
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable.into())
+}
+
+/// Serves the realm-wide documents to one of the realm's devices.
+///
+/// A device runs no document sync, so this routed read is how it sees the realm
+/// configuration it is judged by. It is served by realm infrastructure only,
+/// for the owner the realm config binds the asking device to, and it hands out
+/// copies of documents this node already holds.
+pub(crate) async fn serve_realm_documents(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::FetchRealmDocuments { auth_token } = message else {
+        return reject("unexpected metadata control message");
+    };
+    MetadataTransportMessage::FetchedRealmDocuments {
+        result: read_realm_documents(context, peer, auth_token).await,
+    }
+}
+
+async fn read_realm_documents(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+) -> Result<RealmDocuments, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    // Only realm infrastructure answers: a device holds no realm state to serve.
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    // The documents are this realm's own; nothing about another realm is served.
+    if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    let realm_config = read_document(context, DocumentSyncTarget::RealmConfig { realm_id })
+        .await?
+        .ok_or(SyncRefusal::NotFound)?;
+    let realm_authorization =
+        read_document(context, DocumentSyncTarget::RealmAuthorization { realm_id }).await?;
+    // The token's own subject: for a device that is its owner by the check above.
+    let owner = read_document(
+        context,
+        DocumentSyncTarget::User {
+            user_id: auth.user_id,
+        },
+    )
+    .await?;
+    let node_ids = config
+        .sync_eligible_node_ids()
+        .map_err(|_| SyncRefusal::Unavailable)?;
+    let node_infos = read_node_info_documents(context, &node_ids)
+        .await
+        .map_err(|error| {
+            warn!(%error, "Failed to read the node info documents for a device");
+            SyncRefusal::Unavailable
+        })?
+        .into_values()
+        .collect();
+    Ok(RealmDocuments {
+        realm_config,
+        realm_authorization,
+        owner,
+        groups: device_group_documents(context, auth.user_id).await,
+        node_infos,
+        management_urls: management_urls(context, &config).await,
+        clock: applied_clock(context, realm_id).await,
+    })
+}
+
+/// The api urls the realm's management nodes published, in node-id order so
+/// repeated answers pin the same peer. A device relays its management-only
+/// routes to these.
+async fn management_urls(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+) -> Vec<String> {
+    let node_ids: Vec<NodeId> = config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .collect();
+    let documents = match read_node_info_documents(context, &node_ids).await {
+        Ok(documents) => documents,
+        Err(error) => {
+            warn!(%error, "Failed to read the management urls for a device");
+            return Vec::new();
+        }
+    };
+    let mut urls: Vec<String> = Vec::new();
+    for url in documents
+        .values()
+        .filter_map(|document| document.urls.api.clone())
+    {
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// The caller's own groups, as the documents this node stores. A read that
+/// fails yields an empty list: one unreadable group must not cost the device
+/// the realm configuration it is judged by.
+async fn device_group_documents(
+    context: &Arc<DriverContext>,
+    user_id: UserId,
+) -> Vec<DeviceGroupDocuments> {
+    let mut documents = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let groups = match drive(
+            ListGroupOperation::with_pagination(DEVICE_GROUP_SCAN_PAGE, offset),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(groups) => groups,
+            Err(error) => {
+                warn!(error = %error, "Failed to list groups for a device");
+                return Vec::new();
+            }
+        };
+        let page_len = groups.len();
+        for Group { group_id, .. } in groups {
+            let read = drive(
+                GetGroupOperation::new(GetGroupConfig { group_id }),
+                context.as_ref(),
+            )
+            .await;
+            let Ok((group, authorization)) = read else {
+                warn!(%group_id, "Failed to read a group for a device");
+                continue;
+            };
+            if !holds_any_role(&authorization, user_id) {
+                continue;
+            }
+            documents.push(DeviceGroupDocuments {
+                group,
+                authorization,
+            });
+            if documents.len() >= MAX_DEVICE_GROUPS {
+                return documents;
+            }
+        }
+        if page_len < DEVICE_GROUP_SCAN_PAGE {
+            return documents;
+        }
+        offset = offset.saturating_add(page_len);
+    }
+}
+
+/// Whether the owner holds a role in this group. A device caches its owner's
+/// groups only; a realm-scale group list is not theirs to hold.
+fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -> bool {
+    authorization
+        .roles
+        .values()
+        .any(|role| role.assigned_users.contains(&user_id))
+}
+
+/// What this node has applied to the realm configuration, as the reducer keeps
+/// it. A device compares it with its own copy's and never accepts less.
+async fn applied_clock(context: &Arc<DriverContext>, realm_id: RealmId) -> AdminDocumentClock {
+    let key = admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(bytes), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    else {
+        return AdminDocumentClock::default();
+    };
+    postcard::from_bytes::<AdminDocumentReducerState>(&bytes)
+        .map(|state| state.clock)
+        .unwrap_or_default()
+}
+
+/// One stored document, or `None` when this node holds it not (yet).
+async fn read_document(
+    context: &Arc<DriverContext>,
+    target: DocumentSyncTarget,
+) -> Result<Option<Vec<u8>>, SyncRefusal> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|bytes| bytes.as_ref().to_vec()))
+        }
+        other => {
+            warn!(event = ?other, "Failed to read a realm document for a device");
+            Err(SyncRefusal::Unavailable)
+        }
+    }
+}
+
+/// Serves one document's graph state to a device that keeps a replica of it.
+///
+/// Only a holder answers, and only for the owner the realm config binds the
+/// asking device to. The device joins the snapshot into its own replica, so
+/// what travels is state, never authority.
+pub(crate) async fn serve_graph_state(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::FetchGraphState {
+        auth_token,
+        document_id,
+    } = message
+    else {
+        return reject("unexpected metadata control message");
+    };
+    MetadataTransportMessage::FetchedGraphState {
+        result: read_graph_state(context, peer, auth_token, document_id)
+            .await
+            .map(Box::new),
+    }
+}
+
+async fn read_graph_state(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+    document_id: Ulid,
+) -> Result<GraphState, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    let record = load_record_by_document(context.as_ref(), document_id)
+        .await
+        .map_err(sync_refusal)?;
+    ensure_record_readable(context.as_ref(), realm_id, Some(&auth), &record, None)
+        .await
+        .map_err(sync_refusal)?;
+    let graph_iri = record.graph_iri.clone();
+    let snapshot = match metadata
+        .send_metadata_effect(MetadataEffect::GraphSnapshot { graph_iri })
+        .await
+    {
+        Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => *snapshot,
+        other => {
+            warn!(%document_id, event = ?other, "Could not snapshot a graph for a device");
+            return Err(SyncRefusal::Unavailable);
+        }
+    };
+    let raw = load_raw_view(context.as_ref(), document_id, None)
+        .await
+        .map_err(|_| SyncRefusal::Unavailable)?
+        .ok_or(SyncRefusal::NotFound)?;
+    Ok(GraphState {
+        record,
+        snapshot,
+        displayed_jsonld: raw.revision.jsonld,
+        dataset_digest: raw.revision.dataset_digest,
+        findings: raw.revision.merged.map_or(0, |merged| merged.findings),
+    })
+}
+
+fn sync_refusal(error: MetadataApiError) -> SyncRefusal {
+    match error {
+        MetadataApiError::Unauthorized => SyncRefusal::Unauthorized,
+        MetadataApiError::Forbidden => SyncRefusal::Forbidden,
+        MetadataApiError::NotFound => SyncRefusal::NotFound,
+        _ => SyncRefusal::Unavailable,
+    }
+}
+
+/// Applies an edit a device already made on its replica.
+///
+/// The batch is appended unchanged as an ordinary update event, so every holder
+/// materializes the same OR-Set change set the owner saw locally and the two
+/// sides converge whatever else happened while the device was away.
+pub(crate) async fn apply_device_batch(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    MetadataTransportMessage::ForwardedApplyBatch {
+        result: run_device_batch(context, peer, message).await.map(Box::new),
+    }
+}
+
+async fn run_device_batch(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataRegistryRecord, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = authorize_forwarded_caller(context, peer, realm_id, &message)
+        .await
+        .map_err(|error| match error {
+            ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
+            ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
+            ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    let MetadataTransportMessage::ForwardApplyBatch {
+        config_digest,
+        document_id,
+        batch,
+        authored,
+        ..
+    } = message
+    else {
+        return Err(SyncRefusal::Invalid(
+            "unexpected metadata control message".to_string(),
+        ));
+    };
+    if config.digest().ok() != Some(config_digest) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let record = held_record(context, &config, net_handle.node_id(), document_id)
+        .await
+        .map_err(|error| match error {
+            HeldRecordError::NotFound => SyncRefusal::NotFound,
+            HeldRecordError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    // The batch names the graph it was planned against; another graph's change
+    // set must never be applied here.
+    if batch.graph_iri != record.graph_iri {
+        return Err(SyncRefusal::Invalid(
+            "the batch was planned against another document".to_string(),
+        ));
+    }
+    authorize_write(context, auth.clone(), record.permission_path.clone())
+        .await
+        .map_err(|error| match error {
+            ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
+            ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
+            ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    let operation = UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        actor: Actor {
+            node_id: net_handle.node_id(),
+            user_id: auth.user_id,
+            realm_id,
+        },
+        group_id: record.group_id,
+        document_id,
+        public: record.public,
+        mutation: UpdateMetadataDocumentMutation::ApplyBatch { batch, authored },
+    });
+    update_metadata_document(operation, context.as_ref())
+        .await
+        .map_err(|error| match error {
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)) => {
+                SyncRefusal::Invalid(message)
+            }
+            other => {
+                warn!(%document_id, error = %other, "A device edit did not apply");
+                SyncRefusal::Unavailable
+            }
+        })
+}
+
+pub(crate) async fn apply_bucket_create(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::ForwardCreateBucket {
+        auth_token,
+        bucket,
+        group_id,
+    } = message
+    else {
+        return reject("unexpected bucket create message");
+    };
+    let result = create_remote_bucket(context, peer, auth_token, &bucket, group_id).await;
+    if let Err(refusal) = &result {
+        warn!(
+            %peer,
+            %bucket,
+            kind = super::sync_pull::refusal_kind(refusal),
+            "Refused a forwarded bucket creation"
+        );
+    }
+    MetadataTransportMessage::ForwardedBucketCreated { result }
+}
+
+async fn create_remote_bucket(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+    bucket: &str,
+    group_id: GroupId,
+) -> Result<(), SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = super::sync_pull::authorize_peer(context, peer, auth_token).await?;
+    if auth.realm_id != realm_id {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    super::sync_pull::authorize_pull(
+        context,
+        &auth,
+        aruna_core::structs::blob_bucket_permission_path(
+            realm_id,
+            group_id,
+            net_handle.node_id(),
+            bucket,
+        ),
+        Permission::WRITE,
+        "s3.CreateBucket",
+    )
+    .await?;
+
+    let created = drive(
+        CreateBucketOperation::new(
+            bucket.to_string(),
+            BucketInfo {
+                group_id,
+                created_at: SystemTime::now(),
+                created_by: auth.user_id,
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+            },
+        ),
+        context.as_ref(),
+    )
+    .await
+    .and_then(|result| result.transpose());
+    match created {
+        Ok(Some(_)) => Ok(()),
+        Err(CreateBucketError::BucketAlreadyExists) => {
+            match drive(
+                GetBucketInfoOperation::new(bucket.to_string()),
+                context.as_ref(),
+            )
+            .await
+            .and_then(|result| result.transpose())
+            {
+                Ok(Some(info)) if info.group_id == group_id => Ok(()),
+                Ok(Some(_)) => Err(SyncRefusal::Invalid(format!(
+                    "bucket \"{bucket}\" belongs to another group"
+                ))),
+                Ok(None) | Err(_) => Err(SyncRefusal::Unavailable),
+            }
+        }
+        Ok(None) | Err(_) => Err(SyncRefusal::Unavailable),
+    }
+}
+
+/// Originates a group create requested by a device. Authority is the caller's
+/// forwarded token, checked exactly as the local HTTP handler would; a User
+/// peer may only ever act for the owner its realm config binds it to.
+pub(crate) async fn apply_group_create(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let realm_id = *net_handle.realm_id();
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    }
+    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
+        Ok(auth) => auth,
+        Err(error) => return forward_auth_error(error),
+    };
+    if auth.path_restrictions.is_some() {
+        return MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Forbidden,
+        };
+    }
+    let MetadataTransportMessage::ForwardGroupCreate { display_name, .. } = message else {
+        return reject("unexpected group create message");
+    };
+    let realm_admin = authorize_write(context, auth.clone(), format!("/{realm_id}/admin/groups"))
+        .await
+        .is_ok();
+    let owner_cap = if realm_admin {
+        None
+    } else {
+        config.quota.max_groups_for(&auth.user_id)
+    };
+    match drive(
+        CreateGroupOperation::new(CreateGroupConfig {
+            actor: Actor {
+                node_id: net_handle.node_id(),
+                user_id: auth.user_id,
+                realm_id,
+            },
+            display_name,
+            owner_cap,
+        }),
+        context.as_ref(),
+    )
+    .await
+    {
+        Ok((group, authorization)) => MetadataTransportMessage::ForwardedGroupCreated {
+            group: Box::new(group),
+            authorization: Box::new(authorization),
+        },
+        Err(CreateGroupError::OwnedGroupLimitReached { limit }) => {
+            MetadataTransportMessage::ForwardedGroupCreateConflict {
+                reason: format!("owned group limit reached ({limit})"),
+            }
+        }
+        Err(
+            CreateGroupError::StorageError(StorageError::TransactionConflict)
+            | CreateGroupError::PlacementFenced,
+        ) => MetadataTransportMessage::ForwardedGroupCreateConflict {
+            reason: "concurrent group creation conflict; retry".to_string(),
+        },
+        Err(error) => reject(format!("group create failed: {error}")),
+    }
+}
+
+/// Hands an origin-signed administrative envelope to a holder of its shard.
+/// The origin holds none of that shard, so it cannot publish onto the topic
+/// itself; the holder republishes the exact envelope, and receivers still
+/// authorize the origin, never the relay.
+pub async fn relay_admin_event(
+    context: &Arc<DriverContext>,
+    holders: &[NodeId],
+    target: DocumentSyncTarget,
+    event: Box<AdminDocumentEvent>,
+    placement: PlacementRef,
+    origin_signature: iroh::Signature,
+) -> Result<(), MetadataApiError> {
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return Err(MetadataApiError::ServiceUnavailable);
+    };
+    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let message = MetadataTransportMessage::ForwardAdminEvent {
+        target,
+        event,
+        placement,
+        origin_signature,
+    };
+    for peer in holders
+        .iter()
+        .copied()
+        .filter(|peer| Some(*peer) != local_node_id)
+        .take(ADMIN_RELAY_PEER_LIMIT)
+    {
+        match timeout(
+            ADMIN_RELAY_ATTEMPT_TIMEOUT,
+            metadata.request_forwarded_write(peer, message.clone()),
+        )
+        .await
+        {
+            Ok(Ok(MetadataTransportMessage::ForwardedAdminEventQueued)) => return Ok(()),
+            Ok(Ok(MetadataTransportMessage::Reject(error))) => {
+                // A rejection is a verdict on the envelope, not on this peer.
+                warn!(%peer, %error, "Holder rejected a relayed admin event");
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable)
+}
+
+/// Whether this node may take custody of a relayed administrative envelope.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RelayAdmission {
+    Accept,
+    /// The sending peer has no business relaying realm administration.
+    Forbidden,
+    /// The envelope itself is invalid; no other holder would accept it either.
+    Reject(String),
+    /// This node cannot publish the record, but another holder can.
+    Unavailable,
+}
+
+/// Admission decision for a relayed envelope. Authority is the origin
+/// signature, never the relaying peer and never a caller token; this node only
+/// proves the envelope is sound and that it can publish it at all.
+pub(crate) fn admit_relayed_admin(
+    config: &RealmConfigDocument,
+    local_node_id: NodeId,
+    peer: NodeId,
+    event: &AdminDocumentEvent,
+    placement: &PlacementRef,
+    origin_signature: &iroh::Signature,
+) -> RelayAdmission {
+    if !is_sync_eligible(config, peer) {
+        return RelayAdmission::Forbidden;
+    }
+    if !is_sync_eligible(config, event.origin_node_id) {
+        return RelayAdmission::Reject("relayed admin event origin may not publish".to_string());
+    }
+    if event.actor.realm_id != config.realm_id || event.origin_node_id != event.actor.node_id {
+        return RelayAdmission::Reject("relayed admin event identity does not match".to_string());
+    }
+    if !event.origin_signed(placement, origin_signature) {
+        return RelayAdmission::Reject(
+            "relayed admin event is not signed by its origin".to_string(),
+        );
+    }
+    if !holds_placement(config, placement, local_node_id) {
+        return RelayAdmission::Unavailable;
+    }
+    RelayAdmission::Accept
+}
+
+/// Accepts a relayed administrative envelope and takes custody of publishing it.
+pub(crate) async fn apply_admin_relay(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::ForwardAdminEvent {
+        target,
+        event,
+        placement,
+        origin_signature,
+    } = message
+    else {
+        return reject("unexpected admin relay message");
+    };
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let Some(config) = load_realm_config(context, *net_handle.realm_id()).await else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    match admit_relayed_admin(
+        &config,
+        net_handle.node_id(),
+        peer,
+        &event,
+        &placement,
+        &origin_signature,
+    ) {
+        RelayAdmission::Accept => {}
+        RelayAdmission::Forbidden => {
+            return MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Forbidden,
+            };
+        }
+        RelayAdmission::Reject(reason) => return reject(reason),
+        RelayAdmission::Unavailable => {
+            return MetadataTransportMessage::ForwardedWriteUnavailable;
+        }
+    }
+    // The relay never mints a genesis for another origin's document.
+    let record = new_outbox_record(
+        net_handle.node_id(),
+        target,
+        Vec::new(),
+        DocumentSyncOutboxEvent::relayed_admin(*event, origin_signature),
+        placement,
+        false,
+    );
+    let effect = match write_outbox_effect(&record) {
+        Ok(effect) => effect,
+        Err(error) => return reject(format!("relayed admin event does not encode: {error}")),
+    };
+    match context.storage_handle.send_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => {
+            warn!(event = ?other, "Failed to persist a relayed admin event");
+            return MetadataTransportMessage::ForwardedWriteUnavailable;
+        }
+    }
+    if let Some(task_handle) = context.task_handle.as_ref()
+        && let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
+            .send_effect(schedule_outbox_drain_effect())
+            .await
+    {
+        warn!(%message, "Failed to schedule the drain for a relayed admin event");
+    }
+    MetadataTransportMessage::ForwardedAdminEventQueued
+}
+
+pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    configured_kind(config, node_id).is_some_and(RealmNodeKind::is_sync_eligible)
+}
+
+/// A User peer is owner-bound: it may forward only for the owner its realm
+/// config names, whatever token it managed to present. Other kinds are not
+/// owner-bound, so any authenticated caller may travel through them (D12).
+pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
+    match configured_kind(config, peer).and_then(RealmNodeKind::owner) {
+        Some(owner) => owner == user_id,
+        None => true,
+    }
+}
+
+fn configured_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<&RealmNodeKind> {
+    let node_id = node_id.to_string();
+    config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| &node.kind)
+}
+
 async fn authorize_forwarded_pid(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -2024,12 +3135,7 @@ pub(crate) async fn apply_token_revoke(
         .nodes
         .iter()
         .find(|node| node.node_id == net_handle.node_id().to_string());
-    if !local_node.is_some_and(|node| {
-        matches!(
-            &node.kind,
-            RealmNodeKind::Management | RealmNodeKind::Server
-        )
-    }) {
+    if !local_node.is_some_and(|node| node.kind.is_sync_eligible()) {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     }
     let Some(metadata) = context.metadata_handle.as_ref() else {
@@ -2364,6 +3470,8 @@ pub(crate) async fn authorize_forwarded_caller(
         MetadataTransportMessage::ForwardCreatePlacementPolicy { auth_token, .. } => {
             auth_token.clone()
         }
+        MetadataTransportMessage::ForwardGroupCreate { auth_token, .. } => auth_token.clone(),
+        MetadataTransportMessage::ForwardApplyBatch { auth_token, .. } => Some(auth_token.clone()),
         _ => None,
     };
     let auth = metadata_handle
@@ -2376,6 +3484,16 @@ pub(crate) async fn authorize_forwarded_caller(
             }
         })?;
     if auth.realm_id != realm_id {
+        return Err(ForwardAuthError::Forbidden);
+    }
+    // A User peer is owner-bound: whatever token it presents, the write it
+    // forwards must be its owner's own (D12).
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return Err(ForwardAuthError::Unavailable(
+            "forwarded metadata write needs the realm configuration".to_string(),
+        ));
+    };
+    if !peer_acts_for(&config, peer, auth.user_id) {
         return Err(ForwardAuthError::Forbidden);
     }
     Ok(auth)
@@ -2621,6 +3739,7 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::replica::ReplicaOrigin;
     use aruna_core::metadata::{
         MetadataProfileValidationCompleteness, MetadataProfileValidationState,
     };
@@ -2645,7 +3764,112 @@ mod tests {
             findings: Vec::new(),
             completeness: MetadataProfileValidationCompleteness::Complete,
             stale_reason: None,
+            dataset_digest: None,
         }
+    }
+
+    #[test]
+    fn raw_includes_candidate() {
+        let document_id = Ulid::generate();
+        let mut replica = ReplicaRecord::new(
+            document_id,
+            Ulid::generate(),
+            "notes".to_string(),
+            ReplicaOrigin::Realm,
+        );
+        replica.displayed_jsonld = "displayed".to_string();
+        replica.dataset_digest = Some([3u8; 32]);
+        replica.findings = 2;
+        let revision = device_raw_revision(
+            &replica.displayed_jsonld,
+            replica.dataset_digest,
+            replica.findings,
+            Ulid::from_bytes([4u8; 16]),
+            Some("candidate".to_string()),
+        );
+
+        assert_eq!(revision.jsonld, "displayed");
+        assert_eq!(revision.dataset_digest, Some([3u8; 32]));
+        assert!(matches!(
+            revision.merged,
+            Some(MetadataMergedRevision { jsonld, findings: 2 }) if jsonld == "candidate"
+        ));
+    }
+
+    #[tokio::test]
+    async fn finds_later_membership() {
+        // The only matching group sits just beyond the legacy default page.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let member = UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);
+        let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: member,
+            realm_id,
+        };
+        let mut writes = Vec::with_capacity((DEVICE_GROUP_SCAN_PAGE + 1) * 2);
+        for seed in 1..=DEVICE_GROUP_SCAN_PAGE + 1 {
+            let group_id = Ulid::from(seed as u128);
+            let group = Group {
+                display_name: seed.to_string(),
+                group_id,
+                realm_id,
+                roles: Default::default(),
+                owner: other,
+            };
+            let authorization = GroupAuthorizationDocument::new_default_group_doc(
+                if seed > DEVICE_GROUP_SCAN_PAGE {
+                    member
+                } else {
+                    other
+                },
+                realm_id,
+                group_id,
+            );
+            for (target, bytes) in [
+                (
+                    DocumentSyncTarget::Group { group_id },
+                    group.to_bytes(&actor).unwrap(),
+                ),
+                (
+                    DocumentSyncTarget::GroupAuthorization { group_id },
+                    authorization.to_bytes(&actor).unwrap(),
+                ),
+            ] {
+                writes.push((
+                    target.storage_keyspace().to_string(),
+                    target.storage_key(),
+                    aruna_core::types::Value::from(bytes),
+                ));
+            }
+        }
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+
+        let documents = device_group_documents(&context, member).await;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].group.group_id,
+            Ulid::from((DEVICE_GROUP_SCAN_PAGE + 1) as u128)
+        );
     }
 
     #[test]
@@ -2685,6 +3909,130 @@ mod tests {
         )
     }
 
+    fn relay_fixture() -> (RealmConfigDocument, PlacementRef, NodeId) {
+        let (mut config, placement) = config_and_placement();
+        let device = node(9);
+        let owner = UserId::nil(config.realm_id);
+        config.ensure_node(device, RealmNodeKind::User { owner });
+        let holder = resolve_shard_holders(&config, &placement)
+            .into_iter()
+            .next()
+            .expect("fixture has holders");
+        (config, placement, holder)
+    }
+
+    fn signed_event(
+        config: &RealmConfigDocument,
+        placement: &PlacementRef,
+        origin_seed: u8,
+    ) -> (AdminDocumentEvent, iroh::Signature) {
+        let secret = iroh::SecretKey::from_bytes(&[origin_seed; 32]);
+        let user_id = UserId::nil(config.realm_id);
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_bytes([5u8; 16]),
+            target: aruna_core::admin_documents::AdminDocumentTarget::Group {
+                group_id: Ulid::from_bytes([6u8; 16]),
+            },
+            origin_node_id: secret.public(),
+            origin_seq: 1,
+            observed: Default::default(),
+            actor: Actor {
+                node_id: secret.public(),
+                user_id,
+                realm_id: config.realm_id,
+            },
+            op: aruna_core::admin_documents::AdminDocumentOperation::GroupCreated {
+                realm_id: config.realm_id,
+                display_name: "Engineering".to_string(),
+                owner: user_id,
+            },
+        };
+        let signature = secret.sign(&event.signing_bytes(placement).expect("event signs"));
+        (event, signature)
+    }
+
+    #[test]
+    fn holder_accepts_relay() {
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+
+        assert_eq!(
+            admit_relayed_admin(&config, holder, node(2), &event, &placement, &signature),
+            RelayAdmission::Accept
+        );
+    }
+
+    #[test]
+    fn relay_rejects_forged() {
+        // A relay that rewrites the actor invalidates the origin signature.
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+        let mut forged = event;
+        forged.actor.user_id = UserId::local(Ulid::from_bytes([8u8; 16]), config.realm_id);
+
+        assert!(matches!(
+            admit_relayed_admin(&config, holder, node(2), &forged, &placement, &signature),
+            RelayAdmission::Reject(reason)
+                if reason == "relayed admin event is not signed by its origin"
+        ));
+    }
+
+    #[test]
+    fn rejects_device_origin() {
+        // A relayed admin event originated by a device may never be published.
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 9);
+
+        assert!(matches!(
+            admit_relayed_admin(&config, holder, node(2), &event, &placement, &signature),
+            RelayAdmission::Reject(reason)
+                if reason == "relayed admin event origin may not publish"
+        ));
+    }
+
+    #[test]
+    fn rejects_device_peer() {
+        // A device is not a relay: it may not hand an admin event to a holder.
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+
+        assert_eq!(
+            admit_relayed_admin(&config, holder, node(9), &event, &placement, &signature),
+            RelayAdmission::Forbidden
+        );
+    }
+
+    #[test]
+    fn nonholder_defers_relay() {
+        // Another holder can still take it, so this is unavailable, not a reject.
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 1);
+        let non_holder = (1..=4u8)
+            .map(node)
+            .find(|candidate| {
+                *candidate != holder
+                    && !resolve_shard_holders(&config, &placement).contains(candidate)
+            })
+            .expect("fixture has a non-holder");
+
+        assert_eq!(
+            admit_relayed_admin(&config, non_holder, node(2), &event, &placement, &signature),
+            RelayAdmission::Unavailable
+        );
+    }
+
+    #[test]
+    fn peer_binds_owner() {
+        // A device may forward only for the owner its realm config names.
+        let (config, _, _) = relay_fixture();
+        let owner = UserId::nil(config.realm_id);
+        let other = UserId::local(Ulid::from_bytes([8u8; 16]), config.realm_id);
+
+        assert!(peer_acts_for(&config, node(9), owner));
+        assert!(!peer_acts_for(&config, node(9), other));
+        assert!(peer_acts_for(&config, node(1), other));
+    }
+
     #[test]
     fn holder_writes_stay_local() {
         let (config, placement) = config_and_placement();
@@ -2722,7 +4070,8 @@ mod tests {
         // `metadata_forwarding::user_node_forwards_create`, which needs a real
         // node and a real token and so cannot live here.
         let (mut config, placement) = config_and_placement();
-        config.ensure_node(node(9), RealmNodeKind::User);
+        let owner = UserId::nil(config.realm_id);
+        config.ensure_node(node(9), RealmNodeKind::User { owner });
 
         assert!(matches!(
             write_route(Some(&config), &placement, node(9)),

@@ -108,6 +108,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
                 user_id: parent.created_by,
                 realm_id: parent.created_by.realm_id,
                 path_restrictions: None,
+                session: None,
             },
             path: MetadataRegistryRecord::permission_path_for(
                 &parent.created_by.realm_id,
@@ -166,6 +167,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
             user_id: parent.created_by,
             realm_id: parent.created_by.realm_id,
             path_restrictions: None,
+            session: None,
         })),
     )
     .await

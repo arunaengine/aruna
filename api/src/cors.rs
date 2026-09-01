@@ -19,13 +19,31 @@ pub(crate) const S3_PREFLIGHT_VARY: &[HeaderName] = &[
     header::ACCESS_CONTROL_REQUEST_HEADERS,
 ];
 
+/// Origins of the first-party Aruna Desktop shell, which serves the portal
+/// build from its own fixed origin. Which of the two a request carries depends
+/// on the platform webview.
+pub const DESKTOP_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
+
 /// Allowed cross-origin request origins, shared by the REST and S3 interfaces.
-/// An empty configuration denies all cross-origin access (no CORS headers are
-/// emitted); a literal `*` entry allows every origin.
-#[derive(Clone, Debug, Default)]
+/// An empty configuration denies all cross-origin access to S3 (no CORS headers
+/// are emitted); a literal `*` entry allows every origin.
+///
+/// The REST API additionally admits [`DESKTOP_ORIGINS`], including when nothing
+/// is configured, so the desktop app reaches realms it did not deploy itself.
+/// That is safe because REST authenticates by bearer token and never by cookie,
+/// which makes the origin allowlist defense in depth rather than the
+/// authorization boundary; operators can still opt out with `DESKTOP_CORS=off`.
+#[derive(Clone, Debug)]
 pub struct CorsConfig {
     allowed_origins: Vec<String>,
     allow_any: bool,
+    allow_desktop: bool,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl CorsConfig {
@@ -46,9 +64,18 @@ impl CorsConfig {
         Self {
             allowed_origins,
             allow_any,
+            allow_desktop: true,
         }
     }
 
+    /// Operator escape hatch for the desktop admission (`DESKTOP_CORS=off`).
+    pub fn with_desktop(mut self, allow_desktop: bool) -> Self {
+        self.allow_desktop = allow_desktop;
+        self
+    }
+
+    /// Whether any origin is configured. The desktop admission is REST-only and
+    /// deliberately does not enable the S3 interface.
     pub fn is_enabled(&self) -> bool {
         self.allow_any || !self.allowed_origins.is_empty()
     }
@@ -67,18 +94,45 @@ impl CorsConfig {
             .unwrap_or(false)
     }
 
-    pub fn rest_layer(&self) -> Option<CorsLayer> {
-        if !self.is_enabled() {
-            return None;
+    fn rest_origins(&self) -> Vec<HeaderValue> {
+        let desktop: &[&str] = if self.allow_desktop {
+            &DESKTOP_ORIGINS
+        } else {
+            &[]
+        };
+        self.allowed_origins
+            .iter()
+            .map(String::as_str)
+            .chain(desktop.iter().copied())
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect()
+    }
+
+    pub(crate) fn mcp_origins(&self) -> Vec<String> {
+        if self.allow_any {
+            return Vec::new();
         }
+        let desktop: &[&str] = if self.allow_desktop {
+            &DESKTOP_ORIGINS
+        } else {
+            &[]
+        };
+        self.allowed_origins
+            .iter()
+            .cloned()
+            .chain(desktop.iter().map(|origin| (*origin).to_string()))
+            .collect()
+    }
+
+    pub fn rest_layer(&self) -> Option<CorsLayer> {
         let allow_origin = if self.allow_any {
             AllowOrigin::any()
         } else {
-            AllowOrigin::list(
-                self.allowed_origins
-                    .iter()
-                    .filter_map(|origin| origin.parse().ok()),
-            )
+            let origins = self.rest_origins();
+            if origins.is_empty() {
+                return None;
+            }
+            AllowOrigin::list(origins)
         };
         Some(
             CorsLayer::new()
@@ -92,7 +146,14 @@ impl CorsConfig {
                     Method::HEAD,
                     Method::OPTIONS,
                 ])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    HeaderName::from_static("mcp-method"),
+                    HeaderName::from_static("mcp-name"),
+                    HeaderName::from_static("mcp-protocol-version"),
+                    HeaderName::from_static("mcp-session-id"),
+                ])
                 // The portal is always cross-origin now, so its retry backoff
                 // and download filenames depend on these being readable.
                 .expose_headers([header::CONTENT_DISPOSITION, header::RETRY_AFTER])
@@ -225,12 +286,107 @@ mod tests {
         );
     }
 
+    async fn rest_allow_origin(config: &CorsConfig, origin: &'static str) -> Option<String> {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/", get(|| async {}))
+            .layer(config.rest_layer()?);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn empty_admits_desktop() {
+        // Realms that configured no portal origin must still serve the app.
+        let config = CorsConfig::default();
+        for origin in DESKTOP_ORIGINS {
+            assert_eq!(
+                rest_allow_origin(&config, origin).await.as_deref(),
+                Some(origin)
+            );
+        }
+        assert!(
+            rest_allow_origin(&config, "http://evil.test")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_admits_desktop() {
+        let config = CorsConfig::new(vec!["http://portal.test".to_string()]);
+        assert_eq!(
+            rest_allow_origin(&config, "http://portal.test")
+                .await
+                .as_deref(),
+            Some("http://portal.test")
+        );
+        assert_eq!(
+            rest_allow_origin(&config, "tauri://localhost")
+                .await
+                .as_deref(),
+            Some("tauri://localhost")
+        );
+        assert!(
+            rest_allow_origin(&config, "http://evil.test")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_hatch_off() {
+        let config = CorsConfig::new(vec!["http://portal.test".to_string()]).with_desktop(false);
+        assert!(
+            rest_allow_origin(&config, "tauri://localhost")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            rest_allow_origin(&config, "http://portal.test")
+                .await
+                .as_deref(),
+            Some("http://portal.test")
+        );
+        assert!(
+            CorsConfig::default()
+                .with_desktop(false)
+                .rest_layer()
+                .is_none()
+        );
+    }
+
     #[test]
-    fn empty_config_denies_everything() {
+    fn s3_denies_desktop() {
+        // The desktop admission covers the bearer-only REST API, not S3.
+        let config = CorsConfig::new(vec!["http://portal.test".to_string()]);
+        let origin = HeaderValue::from_static("tauri://localhost");
+        assert!(!config.allows(&origin));
+        assert!(config.s3_preflight_headers(&origin, None).is_none());
+        let mut headers = HeaderMap::new();
+        config.apply_s3_response_headers(Some(&origin), &mut headers);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn empty_denies_foreign() {
         let config = CorsConfig::default();
         assert!(!config.is_enabled());
         assert!(!config.allows(&HeaderValue::from_static("http://portal.test")));
-        assert!(config.rest_layer().is_none());
         assert!(
             config
                 .s3_preflight_headers(&HeaderValue::from_static("http://portal.test"), None)

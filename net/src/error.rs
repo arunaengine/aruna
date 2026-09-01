@@ -31,6 +31,11 @@ pub enum NetError {
     #[error("Document sync topic {0} not ready")]
     TopicNotReady(String),
 
+    /// The local node may not originate or relay this event under its own
+    /// publisher capability. Permanent: receivers would reject the envelope.
+    #[error("Publisher unauthorized: {0}")]
+    PublisherUnauthorized(String),
+
     /// A replicated document names evidence that has not arrived yet. Retryable:
     /// the event stays unapplied and its topic cursor does not advance.
     #[error("Deferred until its dependency replicates: {0}")]

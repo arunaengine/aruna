@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
-    CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogStream, LogTails,
+    CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogTails,
     MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, OutputMatcher,
     ReconcileEvidence, ResumePoint, StagingMode, TaskInput, TaskOutput, TaskSpec,
     TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
@@ -33,7 +33,7 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
 use super::config::DockerConfig;
-use super::logs::{BoundedTail, LogSink};
+use super::logs::BoundedTail;
 use super::staging::StageLayout;
 use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
 
@@ -578,6 +578,18 @@ impl<'a> ArchivePlan<'a> {
         }
         for path in &outputs {
             add_parents(path, 0o777, &mut directories);
+        }
+        // The non-root run identity writes caches and scratch relative to its
+        // working directory, so that one ships writable like output parents.
+        if let Some(workdir) = &spec.workdir {
+            let path = container_path(workdir)?;
+            if !files.contains(&path) {
+                add_parents(&path, 0o755, &mut directories);
+                directories
+                    .entry(path)
+                    .and_modify(|mode| *mode = (*mode).max(0o777))
+                    .or_insert(0o777);
+            }
         }
 
         Ok(Self {
@@ -1367,7 +1379,6 @@ impl ExecutorBackend for DockerBackend {
         &self,
         context: &FenceContext,
         limits: &LogLimits,
-        sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
         validate_control(self.daemon_lock.read(context)?, context)?;
         let attempt = &context.attempt;
@@ -1388,11 +1399,9 @@ impl ExecutorBackend for DockerBackend {
             use bollard::container::LogOutput;
             match item.map_err(|e| classify(&e))? {
                 LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                    sink.write(LogStream::Stdout, &message);
                     stdout.push(&message);
                 }
                 LogOutput::StdErr { message } => {
-                    sink.write(LogStream::Stderr, &message);
                     stderr.push(&message);
                 }
                 LogOutput::StdIn { .. } => {}
@@ -2353,6 +2362,28 @@ mod tests {
         assert_eq!(found[Path::new("data/input.txt")].1 & 0o777, 0o444);
         assert_eq!(found[Path::new("data/input.txt")].2, b"hello");
         assert!(found[Path::new("data/input.txt")].0.is_file());
+    }
+
+    #[test]
+    fn workdir_is_writable() {
+        // Tools write caches relative to the workdir, so it plans as 0o777
+        // even when the spec declares no output below it.
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.inputs.push(TaskInput::from_bytes(
+            "/work/script.py",
+            b"print()".to_vec(),
+        ));
+        spec.workdir = Some("/work".to_string());
+        let plan = ArchivePlan::new(&spec).unwrap();
+        assert_eq!(plan.directories[Path::new("work")], 0o777);
+
+        let mut nested = TaskSpec::new(AttemptRef::new("j2", 0), "alpine");
+        nested.workdir = Some("/scratch/run".to_string());
+        nested.output_paths.push("/results/out.txt".to_string());
+        let plan = ArchivePlan::new(&nested).unwrap();
+        assert_eq!(plan.directories[Path::new("scratch")], 0o755);
+        assert_eq!(plan.directories[Path::new("scratch/run")], 0o777);
+        assert_eq!(plan.directories[Path::new("results")], 0o777);
     }
 
     #[tokio::test]

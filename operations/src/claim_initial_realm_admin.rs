@@ -240,9 +240,7 @@ impl ClaimInitialRealmAdminOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
                 aruna_core::structs::PlacementRef::NIL,
@@ -739,13 +737,13 @@ mod tests {
         };
         assert!(outbox_records.iter().any(|record| matches!(
             &record.event,
-            DocumentSyncOutboxEvent::AdminOperation { event }
+            DocumentSyncOutboxEvent::AdminOperation { event, .. }
                 if matches!(&event.op, AdminDocumentOperation::RealmRoleCreated { role: event_role }
                     if event_role == &AdminDocumentRoleDefinition::from(&role))
         )));
         assert!(outbox_records.iter().any(|record| matches!(
             &record.event,
-            DocumentSyncOutboxEvent::AdminOperation { event }
+            DocumentSyncOutboxEvent::AdminOperation { event, .. }
                 if matches!(&event.op, AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
                     if *role_id == role.role_id && *user_id == actor.user_id)
         )));

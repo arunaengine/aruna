@@ -24,6 +24,7 @@ use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use aruna_blob::blob::BlobHandler;
 use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
@@ -36,9 +37,9 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, GroupAuthorizationDocument, MetadataRegistryRecord, NodePlacementEntry,
-    PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-    TokenClaims, TransitionLimits,
+    Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument, MetadataRegistryRecord,
+    NodePlacementEntry, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RealmNodeKind, TokenClaims, TransitionLimits,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
@@ -161,7 +162,7 @@ impl Topology {
             let kind = if index < management {
                 RealmNodeKind::Management
             } else {
-                RealmNodeKind::User
+                RealmNodeKind::User { owner: user_id }
             };
             nodes.push(spawn_node(realm_id, kind).await?);
         }
@@ -232,6 +233,7 @@ impl Topology {
             user_id: self.user_id,
             realm_id: self.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -253,6 +255,7 @@ impl Topology {
             user_id,
             realm_id: self.realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -320,6 +323,8 @@ impl Topology {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -961,7 +966,7 @@ impl Topology {
     }
 }
 
-async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNode> {
+pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNode> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open_test(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
     let net = NetHandle::new(
@@ -977,6 +982,22 @@ async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNo
     )
     .await?;
     let task_handle = TaskHandle::new();
+    let blob_root = temp_dir.path().join("blobstore");
+    std::fs::create_dir_all(&blob_root)?;
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            root: blob_root.to_string_lossy().to_string(),
+            service_config: std::collections::HashMap::new(),
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100_000),
+            multipart_bucket: Some("uploaded-parts".to_string()),
+            timeouts: Default::default(),
+        },
+        storage.clone(),
+        net.clone(),
+    )
+    .await?;
     let metadata_handle = MetadataHandle::new(
         temp_dir.path().join("metadata"),
         net.node_id(),
@@ -989,7 +1010,7 @@ async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNo
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
-        blob_handle: None,
+        blob_handle: Some(blob_handle),
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
@@ -1233,6 +1254,7 @@ async fn seed_config_topic(
                     event: Box::new(event),
                     placement,
                     allow_genesis: true,
+                    origin_signature: None,
                 }],
                 peers: Vec::new(),
             },
@@ -1302,7 +1324,7 @@ async fn reconcile_nodes(
 /// Flushes every node's document-sync outbox and pulls the realm-config topic,
 /// so an admin event converges on the next poll instead of waiting out the
 /// drain timer and a gossip round.
-async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
+pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
     // Concurrent for the same reason the reconcile pass is: both loops make
     // seconds-long network calls per node, and they share one poll's budget.
     join_all(nodes.iter().map(|node| {
@@ -1334,7 +1356,12 @@ async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
     .await;
 }
 
-async fn write(node: &TestNode, key_space: &str, key: Vec<u8>, value: Vec<u8>) -> TestResult<()> {
+pub async fn write(
+    node: &TestNode,
+    key_space: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> TestResult<()> {
     match node
         .context
         .storage_handle
@@ -1351,7 +1378,7 @@ async fn write(node: &TestNode, key_space: &str, key: Vec<u8>, value: Vec<u8>) -
     }
 }
 
-async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
+pub async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
     match node
         .context
         .storage_handle
@@ -1369,7 +1396,27 @@ async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Option<V
     }
 }
 
-async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
+/// The realm authorization row, which shares AUTH_KEYSPACE with the group rows
+/// but keys by realm id.
+pub async fn read_realm_auth(node: &TestNode, realm_id: RealmId) -> TestResult<Option<Vec<u8>>> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: AUTH_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|bytes| bytes.to_vec()))
+        }
+        other => Err(format!("unexpected realm auth read event: {other:?}").into()),
+    }
+}
+
+pub async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
     match node
         .context
         .storage_handle
@@ -1387,7 +1434,10 @@ async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option
     }
 }
 
-async fn read_realm_config(node: &TestNode, realm_id: RealmId) -> TestResult<RealmConfigDocument> {
+pub async fn read_realm_config(
+    node: &TestNode,
+    realm_id: RealmId,
+) -> TestResult<RealmConfigDocument> {
     match node
         .context
         .storage_handle

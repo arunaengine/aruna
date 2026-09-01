@@ -554,6 +554,12 @@ fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
                 },
             })
         }
+        MetadataCreateEventPayload::ApplyBatch { batch, .. } => {
+            Effect::Metadata(MetadataEffect::MergeBatch {
+                graph_iri: event.record.graph_iri.clone(),
+                batch: batch.clone(),
+            })
+        }
     }
 }
 

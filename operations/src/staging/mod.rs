@@ -2,6 +2,7 @@ pub mod check_source;
 pub mod descriptor;
 pub mod head_source;
 pub mod list_source;
+pub mod offered_directory;
 pub mod read_source;
 pub mod reference;
 pub mod snapshot;
@@ -10,6 +11,7 @@ pub use check_source::*;
 pub use descriptor::*;
 pub use head_source::*;
 pub use list_source::*;
+pub use offered_directory::*;
 pub use read_source::*;
 pub use reference::*;
 pub use snapshot::*;
@@ -19,6 +21,7 @@ use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 pub(crate) fn describe_event(event: &Event) -> String {
     match event {
         Event::Blob(_) => "Event::Blob".to_string(),
+        Event::LocalFile(_) => "Event::LocalFile".to_string(),
         Event::StagingSource(staging_event) => match staging_event {
             StagingSourceEvent::CheckResult => {
                 "Event::StagingSource(StagingSourceEvent::CheckResult)".to_string()
@@ -78,6 +81,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             }
             SubOperationEvent::NotificationsEmitted => {
                 "Event::SubOperation(SubOperationEvent::NotificationsEmitted)".to_string()
+            }
+            SubOperationEvent::TokenRevoked { .. } => {
+                "Event::SubOperation(SubOperationEvent::TokenRevoked)".to_string()
             }
         },
         Event::Task(_) => "Event::Task".to_string(),

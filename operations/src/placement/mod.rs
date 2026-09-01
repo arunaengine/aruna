@@ -964,7 +964,8 @@ mod tests {
     #[test]
     fn user_origin_holds_nothing() {
         let (mut config, _) = config_and_placement();
-        config.ensure_node(node(5), RealmNodeKind::User);
+        let owner = aruna_core::UserId::nil(config.realm_id);
+        config.ensure_node(node(5), RealmNodeKind::User { owner });
         let strategy = strategy_of(&config);
         assert!(held_buckets(&config, strategy, node(5)).is_empty());
         assert_eq!(

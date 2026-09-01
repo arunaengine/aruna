@@ -31,6 +31,9 @@ use aruna_core::structs::NodeCapabilities;
 use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::device::wipe as device_wipe;
+use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_holder;
@@ -93,13 +96,12 @@ async fn publish_core(
     allow_genesis: bool,
     documents: Vec<DocumentSyncTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(debug_assertions)]
-    {
-        if documents.is_empty() {
-            return Ok(());
-        }
-        core_barrier().await;
+    // A device announces nothing: it holds no sync topic and is refused one.
+    if documents.is_empty() {
+        return Ok(());
     }
+    #[cfg(debug_assertions)]
+    core_barrier().await;
     publish_core_documents(
         core_ctx.as_ref(),
         node_id,
@@ -180,6 +182,18 @@ async fn recover_child(
     run_recovery(context, config, status, cancelled).await;
 }
 
+/// A device is started by its desktop app with the environment already set, so
+/// a missing `.env` is a valid profile. A malformed one is still an error.
+fn dotenv_optional(
+    loaded: Result<std::path::PathBuf, dotenvy::Error>,
+) -> Result<(), dotenvy::Error> {
+    match loaded {
+        Ok(_) => Ok(()),
+        Err(error) if error.not_found() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn main() {
     // Both ring and aws-lc-rs are in the graph; rustls needs one picked before any TLS init.
     rustls::crypto::ring::default_provider()
@@ -193,7 +207,7 @@ fn main() {
 
 #[tokio::main]
 async fn async_main() {
-    dotenvy::dotenv().expect("Failed to load .env file");
+    dotenv_optional(dotenvy::dotenv()).expect("Failed to load .env file");
     init_tracing();
 
     let result = run().await;
@@ -343,6 +357,9 @@ struct CoreAnnouncement {
     allow_genesis: bool,
 }
 
+/// How long a device waits for the realm documents before it serves anyway.
+const STARTUP_DOCUMENT_FETCH: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn prepare_startup(
     config: &Config,
     driver_ctx: &Arc<DriverContext>,
@@ -360,6 +377,15 @@ async fn prepare_startup(
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
     prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    // A device runs no document sync, so it fetches the realm documents it is
+    // judged by before it serves anything. The attempt is short on purpose: an
+    // unreachable realm must not keep the owner's own machine down, and the
+    // stored copy answers until the beat retries.
+    if matches!(config.node_capabilities, NodeCapabilities::User { .. })
+        && !fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH).await
+    {
+        warn!("Serving this device from its stored realm documents for now");
+    }
     Ok(announcement)
 }
 
@@ -451,7 +477,7 @@ async fn join_realm(
         .or_else(|| config.peer_nodes.first().copied());
     if matches!(phase, OnboardingPhase::Bootstrapped) {
         fetch_core_onboarding_documents(
-            driver_ctx.as_ref(),
+            driver_ctx,
             &config.node_state,
             &config.realm_id,
             bootstrap_peer,
@@ -460,9 +486,10 @@ async fn join_realm(
         .await?;
     }
     wait_for_onboarding_placement(
-        driver_ctx.as_ref(),
+        driver_ctx,
         config.realm_id,
         config.node_id,
+        config.device_owner(),
         bootstrap_peer,
         config.onboarding_sync_timeout(),
     )
@@ -480,19 +507,30 @@ async fn join_realm(
     }
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
-    let documents = prepare_core_documents(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        false,
-        true,
-    )
-    .await?;
+    let documents = match is_device(config) {
+        true => Vec::new(),
+        false => {
+            prepare_core_documents(
+                driver_ctx.as_ref(),
+                config.node_id,
+                config.realm_id,
+                false,
+                true,
+            )
+            .await?
+        }
+    };
     mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
     Ok(CoreAnnouncement {
         documents,
         allow_genesis: false,
     })
+}
+
+/// A device reads the realm's documents over metadata and publishes none of
+/// its own over sync, so it never joins or announces a sync topic.
+fn is_device(config: &Config) -> bool {
+    matches!(config.node_capabilities, NodeCapabilities::User { .. })
 }
 
 async fn provision_realm(
@@ -525,14 +563,19 @@ async fn provision_realm(
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let allow_genesis = config.is_initial_node();
-    let documents = prepare_core_documents(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        allow_genesis,
-        false,
-    )
-    .await?;
+    let documents = match is_device(config) {
+        true => Vec::new(),
+        false => {
+            prepare_core_documents(
+                driver_ctx.as_ref(),
+                config.node_id,
+                config.realm_id,
+                allow_genesis,
+                false,
+            )
+            .await?
+        }
+    };
     Ok(CoreAnnouncement {
         documents,
         allow_genesis,
@@ -541,11 +584,55 @@ async fn provision_realm(
 
 struct ServerBindings {
     rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
-    s3_handle: tokio::task::JoinHandle<()>,
+    s3_handle: Option<tokio::task::JoinHandle<()>>,
     portal_handle: Option<tokio::task::JoinHandle<()>>,
     realm_id: aruna_core::structs::RealmId,
     node_id: iroh::PublicKey,
     is_initial_boot: bool,
+    /// Present on a user node only: the owner's local wipe latch.
+    device_wipe: Option<Arc<DeviceWipe>>,
+}
+
+/// Everything a wipe erases: the store root, every derived root, and every
+/// filesystem backend. A backend this process cannot erase is named instead, so
+/// the wipe reports an incomplete erasure rather than claiming a complete one.
+fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    let (mut roots, unsupported) = backend_wipe(&config.blob_backends);
+    roots.extend([
+        std::path::PathBuf::from(&config.storage_path),
+        std::path::PathBuf::from(&config.metadata_storage_path),
+        config.document_sync_storage_path.clone(),
+        std::path::PathBuf::from(&config.blob_root),
+    ]);
+    (aruna::config::outermost_roots(&roots), unsupported)
+}
+
+/// The filesystem roots a wipe has to visit, and the backends it cannot erase.
+fn backend_wipe(
+    backends: &aruna_core::structs::NodeBackendsConfig,
+) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    let mut roots = Vec::new();
+    let mut unsupported = Vec::new();
+    for entry in &backends.backends {
+        match entry.config.backend_type {
+            aruna_core::structs::Backend::FileSystem => {
+                roots.push(std::path::PathBuf::from(&entry.config.root));
+            }
+            _ => unsupported.push(entry.name.clone()),
+        }
+    }
+    unsupported.sort();
+    unsupported.dedup();
+    (roots, unsupported)
+}
+
+/// Pends forever when this node serves no device plane, so the failure select
+/// never fires for it.
+async fn device_wipe_armed(wipe: Option<&Arc<DeviceWipe>>) {
+    match wipe {
+        Some(wipe) => wipe.wait().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn bind_servers(
@@ -559,39 +646,55 @@ async fn bind_servers(
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let s3_timeouts = config.s3_timeouts();
-    let state = Arc::new(
-        ServerState::new(
-            driver_ctx.clone(),
-            config.realm_id,
-            config.node_id,
-            config.node_capabilities,
-            is_initial_node,
-            Some(Arc::new(OidcValidator::new()?)),
-            jobs_runtime,
-        )
-        .await
-        .with_metrics(metrics.clone())
-        .with_rocrate_limits(config.rocrate_limits.clone())
-        .with_s3_mounts(s3_mounts_available)
-        .with_trusted_proxies(config.trusted_proxies.clone())
-        .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
-            config.rate_limits.ip_per_minute,
-            config.rate_limits.ip_burst,
-            config.rate_limits.principal_per_minute,
-            config.rate_limits.principal_burst,
-        ))
-        .with_shutdown_token(shutdown.token()),
-    );
+    let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
+        true => {
+            let (roots, unsupported) = wipe_plan(&config);
+            // A wipe erases what these roots hold, so an unsafe one fails the
+            // start rather than the erasure, and what it erases is the
+            // normalized path, never the one that hid it.
+            let roots = aruna::config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
+            Some(Arc::new(DeviceWipe::new(roots, unsupported)))
+        }
+        false => None,
+    };
+    let mut state = ServerState::new(
+        driver_ctx.clone(),
+        config.realm_id,
+        config.node_id,
+        config.node_capabilities,
+        is_initial_node,
+        Some(Arc::new(OidcValidator::new()?)),
+        jobs_runtime,
+    )
+    .await
+    .with_metrics(metrics.clone())
+    .with_rocrate_limits(config.rocrate_limits.clone())
+    .with_assistant_proxy(config.assistant_proxy)
+    .with_s3_mounts(s3_mounts_available)
+    .with_trusted_proxies(config.trusted_proxies.clone())
+    .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+        config.rate_limits.ip_per_minute,
+        config.rate_limits.ip_burst,
+        config.rate_limits.principal_per_minute,
+        config.rate_limits.principal_burst,
+    ))
+    .with_shutdown_token(shutdown.token());
+    if let Some(wipe) = device_wipe.clone() {
+        state = state.with_device_wipe(wipe);
+    }
+    let state = Arc::new(state);
     portal::initialize(config.portal.clone(), state.clone()).await;
 
-    let cors = CorsConfig::new(config.cors_allowed_origins.clone());
+    let cors =
+        CorsConfig::new(config.cors_allowed_origins.clone()).with_desktop(config.desktop_cors);
     let server_config = ServerConfig {
         http_addr: config.http_socket_addr,
         max_http_body_size: config.max_http_body_size,
         cors: cors.clone(),
     };
     let server = Server::new(state.clone(), server_config)
-        .with_api_public_url(config.api_public_url.clone());
+        .with_api_public_url(config.api_public_url.clone())
+        .with_mcp_enabled(config.mcp_enabled);
 
     let portal_handle = bind_portal(
         &config.portal,
@@ -602,44 +705,54 @@ async fn bind_servers(
     )
     .await?;
 
-    let s3_server = S3Server::new(
-        &config.s3_address,
-        &config.s3_host,
-        driver_ctx,
-        config.realm_id,
-        config.node_id,
-        aruna_core::credential_seal::CredentialSealKey::derive(&config.node_state.net_secret_key),
-        config.rocrate_limits.clone(),
-        cors,
-        metrics,
-    )
-    .await
-    .unwrap()
-    .with_concurrency_limits(
-        config.rate_limits.s3_max_connections as usize,
-        config.rate_limits.s3_max_requests as usize,
-    )
-    .with_timeouts(s3_timeouts)
-    .with_trusted_proxies(config.trusted_proxies.clone())
-    .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
-        config.rate_limits.ip_per_minute,
-        config.rate_limits.ip_burst,
-        config.rate_limits.principal_per_minute,
-        config.rate_limits.principal_burst,
-    ))
-    .unwrap();
+    // A device serves S3 only where S3_HOST and S3_ADDRESS are configured; the
+    // desktop shell sets both to loopback by default, and the pair stays whole.
+    let s3_handle = match (config.s3_address.as_deref(), config.s3_host.as_deref()) {
+        (Some(s3_address), Some(s3_host)) => {
+            let s3_server = S3Server::new(
+                s3_address,
+                s3_host,
+                driver_ctx,
+                config.realm_id,
+                config.node_id,
+                aruna_core::credential_seal::CredentialSealKey::derive(
+                    &config.node_state.net_secret_key,
+                ),
+                config.rocrate_limits.clone(),
+                cors,
+                metrics,
+            )
+            .await
+            .unwrap()
+            .with_concurrency_limits(
+                config.rate_limits.s3_max_connections as usize,
+                config.rate_limits.s3_max_requests as usize,
+            )
+            .with_timeouts(s3_timeouts)
+            .with_trusted_proxies(config.trusted_proxies.clone())
+            .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+                config.rate_limits.ip_per_minute,
+                config.rate_limits.ip_burst,
+                config.rate_limits.principal_per_minute,
+                config.rate_limits.principal_burst,
+            ))
+            .unwrap();
 
-    let s3_listener = TcpListener::bind(&config.s3_address).await.unwrap();
-    let s3_bound_addr = s3_listener.local_addr().unwrap();
-    state
-        .register_s3_interface(
-            s3_bound_addr,
-            config.s3_public_url.as_deref().unwrap_or(&config.s3_host),
-        )
-        .await;
-    let (_s3_addr, s3_handle) = s3_server
-        .run_with_listener(s3_listener, shutdown.token())
-        .unwrap();
+            let s3_listener = TcpListener::bind(s3_address).await.unwrap();
+            let s3_bound_addr = s3_listener.local_addr().unwrap();
+            state
+                .register_s3_interface(
+                    s3_bound_addr,
+                    config.s3_public_url.as_deref().unwrap_or(s3_host),
+                )
+                .await;
+            let (_s3_addr, s3_handle) = s3_server
+                .run_with_listener(s3_listener, shutdown.token())
+                .unwrap();
+            Some(s3_handle)
+        }
+        _ => None,
+    };
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
     let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
@@ -651,6 +764,7 @@ async fn bind_servers(
         realm_id: config.realm_id,
         node_id: config.node_id,
         is_initial_boot,
+        device_wipe,
     })
 }
 
@@ -695,6 +809,16 @@ async fn portal_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String
         Some(handle) => match handle.await {
             Ok(()) => "Portal server stopped unexpectedly".to_string(),
             Err(error) => format!("Portal server panicked: {error}"),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn s3_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+    match handle {
+        Some(handle) => match handle.await {
+            Ok(()) => "S3 server stopped unexpectedly".to_string(),
+            Err(error) => format!("S3 server panicked: {error}"),
         },
         None => std::future::pending().await,
     }
@@ -816,6 +940,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         realm_id,
         node_id,
         is_initial_boot,
+        device_wipe,
     } = bind_servers(
         config,
         driver_ctx.clone(),
@@ -843,18 +968,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     let mut rest_handle = Some(rest_handle);
-    let mut s3_handle = Some(s3_handle);
+    let mut s3_handle = s3_handle;
 
     // A server that returns before shutdown was requested has failed: the node
     // is no longer serving, so it must not exit as success.
     let mut failure: Option<String> = None;
     tokio::select! {
-        result = s3_handle.as_mut().expect("s3 server handle is present") => {
+        message = s3_exit(s3_handle.as_mut()) => {
             s3_handle = None;
-            failure = Some(match result {
-                Ok(()) => "S3 server stopped unexpectedly".to_string(),
-                Err(error) => format!("S3 server panicked: {error}"),
-            });
+            failure = Some(message);
         }
         result = rest_handle.as_mut().expect("rest server handle is present") => {
             rest_handle = None;
@@ -868,6 +990,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             portal_handle = None;
             failure = Some(message);
         }
+        _ = device_wipe_armed(device_wipe.as_ref()) => {}
         _ = &mut signal => {}
     }
 
@@ -904,6 +1027,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .run()
     .await;
 
+    // The stores keep their files open until the shutdown sequence finished, so
+    // the owner's wipe erases the roots here and exits with its own status.
+    if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
+        let failed = device_wipe::purge(wipe.roots());
+        // Only a complete erasure may claim the wiped status; paths left behind
+        // and storage this process cannot erase at all both exit with their own
+        // code so a supervisor does not read the device as erased.
+        let code = if failed.is_empty() && wipe.unsupported().is_empty() {
+            info!("Wiped this device on its owner's request");
+            device_wipe::WIPED_EXIT_CODE
+        } else {
+            error!(
+                paths = failed.len(),
+                backends = wipe.unsupported().join(","),
+                "The device wipe did not erase everything this node stores"
+            );
+            device_wipe::WIPE_INCOMPLETE_EXIT_CODE
+        };
+        shutdown_tracing();
+        std::process::exit(code);
+    }
+
     match failure {
         Some(failure) => Err(failure.into()),
         None => Ok(()),
@@ -914,8 +1059,10 @@ async fn build_compute_registry(
     config: &Config,
 ) -> Result<(Option<Arc<aruna_compute::ExecutorRegistry>>, bool), String> {
     let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
-    let result = match selected.as_str() {
-        "none" => return Ok((None, false)),
+    let result = match selected.trim() {
+        // A supervisor that turns compute off writes a disabling value rather
+        // than unsetting the key, which an inherited environment would refill.
+        "none" | "off" | "" => return Ok((None, false)),
         "docker" => build_docker(config).await,
         "apptainer" => build_apptainer(config).await,
         "kubernetes" => build_kubernetes(config).await,
@@ -945,6 +1092,7 @@ fn read_mount_driver() -> Option<String> {
         .filter(|driver| !driver.is_empty())
 }
 
+#[derive(Debug)]
 enum ComputeBuildError {
     Config(String),
     Unavailable(String),
@@ -962,6 +1110,39 @@ impl From<&'static str> for ComputeBuildError {
     }
 }
 
+/// The container-facing S3 endpoint the Docker registry carries, or `None` in
+/// the local-only profile a user device runs: it exposes no S3 listener, so the
+/// checks that keep a shared deployment reachable would only refuse it.
+#[cfg(any(feature = "docker", test))]
+fn docker_workspace(
+    local_only: bool,
+    endpoint: Option<&str>,
+    s3_address: Option<&str>,
+) -> Result<Option<String>, ComputeBuildError> {
+    if local_only {
+        return Ok(None);
+    }
+    let endpoint = endpoint.ok_or_else(|| {
+        "Docker executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
+    })?;
+    if container_local_endpoint(endpoint) {
+        return Err(
+            "Docker executor requires a container-reachable S3_PUBLIC_URL"
+                .to_string()
+                .into(),
+        );
+    }
+    if !s3_address
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| !address.ip().is_loopback())
+    {
+        return Err("Docker executor requires a non-loopback S3_ADDRESS"
+            .to_string()
+            .into());
+    }
+    Ok(Some(endpoint.to_string()))
+}
+
 #[cfg(feature = "docker")]
 async fn build_docker(
     config: &Config,
@@ -971,40 +1152,33 @@ async fn build_docker(
             .ok()
             .as_deref(),
     )?;
-    let endpoint = compute_s3_endpoint(config).ok_or_else(|| {
-        "Docker executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
-    })?;
-    if container_local_endpoint(&endpoint) {
-        return Err(
-            "Docker executor requires a container-reachable S3_PUBLIC_URL"
-                .to_string()
-                .into(),
-        );
-    }
-    if !config
-        .s3_address
-        .parse::<std::net::SocketAddr>()
-        .is_ok_and(|address| !address.ip().is_loopback())
-    {
-        return Err("Docker executor requires a non-loopback S3_ADDRESS"
-            .to_string()
-            .into());
-    }
-    let docker_config = aruna_compute::DockerConfig {
+    let workspace = docker_workspace(
+        env_true("ARUNA_COMPUTE_LOCAL_ONLY"),
+        compute_s3_endpoint(config).as_deref(),
+        config.s3_address.as_deref(),
+    )?;
+    let mut docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
         envelope: compute_envelope()?,
+        keep_failed: env_true("ARUNA_COMPUTE_KEEP_FAILED"),
         ..aruna_compute::DockerConfig::default()
     };
+    if let Some(state_root) = env_path("ARUNA_COMPUTE_STATE_ROOT") {
+        docker_config.state_root = state_root;
+    }
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
         .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
-    info!("Docker executor backend enabled");
+    info!(
+        local_only = workspace.is_none(),
+        "Docker executor backend enabled"
+    );
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string()))
+        .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
 }
 
 #[cfg(not(feature = "docker"))]
@@ -1279,7 +1453,17 @@ fn compute_s3_endpoint(config: &Config) -> Option<String> {
         .or_else(|| config.s3_public_url.clone())
 }
 
+/// A configured filesystem path; an empty value is treated as unset.
 #[cfg(feature = "docker")]
+fn env_path(name: &str) -> Option<std::path::PathBuf> {
+    dotenvy::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(any(feature = "docker", test))]
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()
@@ -1364,6 +1548,49 @@ mod tests {
         }
     }
 
+    fn backend(
+        name: &str,
+        backend_type: aruna_core::structs::Backend,
+        root: &str,
+    ) -> aruna_core::structs::NodeBackendEntry {
+        aruna_core::structs::NodeBackendEntry {
+            name: name.to_string(),
+            config: aruna_core::structs::BackendConfig {
+                backend_type,
+                root: root.to_string(),
+                service_config: std::collections::HashMap::new(),
+                bucket_prefix: None,
+                max_bucket_size: None,
+                multipart_bucket: None,
+                timeouts: aruna_core::structs::BlobTimeoutConfig::default(),
+            },
+            class: None,
+            allow_tenants: true,
+            quota_bytes: None,
+            cleanup: aruna_core::structs::CleanupStrategy::node_default(),
+        }
+    }
+
+    // A relocated filesystem backend must be erased, and one this process
+    // cannot erase must be named instead of quietly reported as wiped.
+    #[test]
+    fn wipe_covers_backends() {
+        let backends = aruna_core::structs::NodeBackendsConfig {
+            backends: vec![
+                backend("hot", aruna_core::structs::Backend::FileSystem, "/srv/hot"),
+                backend("cold", aruna_core::structs::Backend::S3, ""),
+            ],
+            default_name: "hot".to_string(),
+            rules: Vec::new(),
+            serve_group_backends: true,
+            extra_deny: Vec::new(),
+        };
+
+        let (roots, unsupported) = backend_wipe(&backends);
+        assert_eq!(roots, vec![std::path::PathBuf::from("/srv/hot")]);
+        assert_eq!(unsupported, vec!["cold".to_string()]);
+    }
+
     #[test]
     fn accepts_disk_limit() {
         assert_eq!(
@@ -1377,6 +1604,32 @@ mod tests {
         assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[test]
+    fn skips_s3_checks() {
+        // A device has no S3 listener and hands its containers no endpoint.
+        assert_eq!(docker_workspace(true, None, None).unwrap(), None);
+        assert_eq!(
+            docker_workspace(true, Some("http://127.0.0.1:9000"), Some("127.0.0.1:9000")).unwrap(),
+            None
+        );
+        assert_eq!(
+            docker_workspace(false, Some("https://s3.example.test"), Some("0.0.0.0:9000")).unwrap(),
+            Some("https://s3.example.test".to_string())
+        );
+        assert!(docker_workspace(false, None, Some("0.0.0.0:9000")).is_err());
+        assert!(
+            docker_workspace(false, Some("http://localhost:9000"), Some("0.0.0.0:9000")).is_err()
+        );
+        assert!(
+            docker_workspace(
+                false,
+                Some("https://s3.example.test"),
+                Some("127.0.0.1:9000")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1402,6 +1655,29 @@ mod tests {
 
         let mut panicked = tokio::spawn(async { panic!("portal panicked") });
         assert!(portal_exit(Some(&mut panicked)).await.contains("panicked"));
+    }
+
+    #[test]
+    fn dotenv_allows_missing() {
+        // No .env is a device profile; a malformed one must still fail startup.
+        assert!(dotenv_optional(Ok(std::path::PathBuf::from(".env"))).is_ok());
+        assert!(
+            dotenv_optional(Err(dotenvy::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound
+            ))))
+            .is_ok()
+        );
+        assert!(dotenv_optional(Err(dotenvy::Error::LineParse("KEY".into(), 1))).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_exit_pends() {
+        // Without an S3 listener the failure select must never fire for it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), s3_exit(None))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]

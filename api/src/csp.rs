@@ -19,6 +19,7 @@ const FONT_STYLE_ORIGIN: &str = "https://fonts.googleapis.com";
 const FONT_FILE_ORIGIN: &str = "https://fonts.gstatic.com";
 const PYPI_ORIGIN: &str = "https://pypi.org";
 const NPM_ORIGIN: &str = "https://registry.npmjs.org";
+const LOCAL_MODEL_ORIGINS: &str = "http://localhost:* http://127.0.0.1:* http://[::1]:*";
 
 /// Anti-clickjacking policy every response carries when it has no stricter one.
 const BASELINE_CSP: &str = "frame-ancestors 'none'";
@@ -270,7 +271,7 @@ pub(crate) async fn baseline_security_headers(request: Request, next: Next) -> R
 /// generated theme stylesheet.
 fn content_security_policy(origins: &ResolvedOrigins) -> String {
     let connect_src = directive(
-        &format!("connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN}"),
+        &format!("connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN} {LOCAL_MODEL_ORIGINS}"),
         &origins.connect,
     );
     let img_src = directive("img-src 'self' data: blob:", &origins.img);
@@ -350,8 +351,8 @@ fn is_loopback_host(host: Option<Host<&str>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        NPM_ORIGIN, PYPI_ORIGIN, PortalCspConfig, ResolvedOrigins, content_security_policy,
-        normalize_origin,
+        LOCAL_MODEL_ORIGINS, NPM_ORIGIN, PYPI_ORIGIN, PortalCspConfig, ResolvedOrigins,
+        content_security_policy, normalize_origin,
     };
 
     fn origins(connect: &[&str], img: &[&str]) -> ResolvedOrigins {
@@ -426,6 +427,7 @@ mod tests {
         assert!(policy.contains("connect-src 'self'"));
         assert!(policy.contains(NPM_ORIGIN));
         assert!(policy.contains(PYPI_ORIGIN));
+        assert!(policy.contains(LOCAL_MODEL_ORIGINS));
         assert!(policy.contains("frame-ancestors 'none'"));
         assert!(policy.contains("object-src 'none'"));
         assert!(policy.contains("base-uri 'self'"));
@@ -442,8 +444,18 @@ mod tests {
         ));
 
         assert!(policy.ends_with(&format!(
-            "connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN} http://127.0.0.1:9000 https://issuer.test"
+            "connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN} {LOCAL_MODEL_ORIGINS} http://127.0.0.1:9000 https://issuer.test"
         )));
+    }
+
+    #[test]
+    fn loopback_origins() {
+        let policy = content_security_policy(&ResolvedOrigins::default());
+
+        assert!(policy.contains("http://localhost:*"));
+        assert!(policy.contains("http://127.0.0.1:*"));
+        assert!(policy.contains("http://[::1]:*"));
+        assert!(!policy.contains("http://192.168.0.1:*"));
     }
 
     #[test]

@@ -77,8 +77,18 @@ mod tests {
         UserId::new(Ulid::from_bytes(ulid_bytes), RealmId::from_bytes([1u8; 32]))
     }
 
+    fn realm() -> RealmId {
+        RealmId::from_bytes([1u8; 32])
+    }
+
+    fn device() -> RealmNodeKind {
+        RealmNodeKind::User {
+            owner: UserId::nil(realm()),
+        }
+    }
+
     fn config_with(nodes: &[(NodeId, RealmNodeKind)]) -> RealmConfigDocument {
-        let mut config = RealmConfigDocument::new(RealmId::from_bytes([1u8; 32]), Vec::new(), 3);
+        let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         for (node_id, kind) in nodes {
             config.ensure_node(*node_id, kind.clone());
         }
@@ -146,10 +156,7 @@ mod tests {
     fn user_nodes_are_never_holders() {
         let server = node(1);
         let user_node = node(2);
-        let config = config_with(&[
-            (server, RealmNodeKind::Server),
-            (user_node, RealmNodeKind::User),
-        ]);
+        let config = config_with(&[(server, RealmNodeKind::Server), (user_node, device())]);
 
         for seed in 0..32u8 {
             let holder = resolve_inbox_holder(&user(seed), &config).unwrap();
@@ -188,10 +195,7 @@ mod tests {
 
     #[test]
     fn empty_eligible_set_yields_none() {
-        let only_users = config_with(&[
-            (node(1), RealmNodeKind::User),
-            (node(2), RealmNodeKind::User),
-        ]);
+        let only_users = config_with(&[(node(1), device()), (node(2), device())]);
         assert_eq!(resolve_inbox_holder(&user(1), &only_users).unwrap(), None);
 
         let empty = config_with(&[]);

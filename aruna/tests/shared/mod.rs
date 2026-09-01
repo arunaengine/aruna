@@ -324,6 +324,8 @@ pub(crate) async fn create_bearer_token(
             user_id,
             realm_id,
             node_capabilities,
+
+            session: None,
         })?,
         context,
     )
@@ -342,6 +344,8 @@ pub(crate) fn sign_scoped_bearer_token(
         iat: now,
         exp: now + 600,
         jti: Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
         restrictions: Some(path_restrictions),
         issuer_pubkey: None,
         delegation_signature: None,
@@ -585,7 +589,7 @@ pub(crate) async fn create_onboarding_secret_via_http(
         .bearer_auth(token)
         .json(&CreateOnboardingSecretRequest {
             seed_url: seed.base_url.clone(),
-            mode,
+            mode: mode.into(),
             expires_in_seconds: Some(600),
         })
         .send()
@@ -769,7 +773,7 @@ async fn spawn_joiner_node_with_mode(
     announce_realm_presence(seed.context.as_ref(), &seed.realm_id, seed.net.node_id()).await?;
 
     fetch_core_onboarding_documents(
-        joiner_context.as_ref(),
+        &joiner_context,
         &config.node_state,
         &config.realm_id,
         config.peer_endpoints.first().map(|endpoint| endpoint.id),
@@ -778,9 +782,10 @@ async fn spawn_joiner_node_with_mode(
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
     wait_for_onboarding_placement(
-        joiner_context.as_ref(),
+        &joiner_context,
         config.realm_id,
         config.node_id,
+        config.device_owner(),
         config.peer_endpoints.first().map(|endpoint| endpoint.id),
         config.onboarding_sync_timeout(),
     )

@@ -24,8 +24,8 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, AuthContext, BlobHeadKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
-    RealmConfigDocument, RealmId, RealmNodeKind, VersionKey, W3idDataIdentifier,
-    blob_bucket_permission_path, blob_object_permission_path,
+    RealmConfigDocument, RealmId, VersionKey, W3idDataIdentifier, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -618,7 +618,6 @@ pub struct MetadataReferenceEntry {
 #[derive(Debug, Clone)]
 pub struct MetadataReferencesExecution {
     pub references: Vec<MetadataReferenceEntry>,
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -905,17 +904,14 @@ pub async fn list_visible_metadata_documents(
     )
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let policy_user = request.auth.as_ref().map(|auth| auth.user_id);
+    let policy_auth = request.auth.as_ref();
     let record_visible = |record: &MetadataRegistryRecord| {
         permissions.record_visible(record)
             && evaluators
                 .get(&(record.realm_id, record.group_id))
                 .is_some_and(|evaluator| {
                     evaluator
-                        .evaluate(&metadata_read_request(
-                            &record.permission_path,
-                            policy_user.as_ref(),
-                        ))
+                        .evaluate(&metadata_read_request(&record.permission_path, policy_auth))
                         .is_ok()
                 })
     };
@@ -1023,10 +1019,10 @@ pub async fn lookup_metadata_path(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let trusted_origin = config.nodes.iter().any(|node| {
-        node.node_id == local_node.to_string()
-            && matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server)
-    });
+    let trusted_origin = config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == local_node.to_string() && node.kind.is_sync_eligible());
     if !trusted_origin {
         let config_digest = config
             .digest()
@@ -1312,7 +1308,7 @@ fn select_forward_peers(
     for node in config
         .nodes
         .iter()
-        .filter(|node| matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server))
+        .filter(|node| node.kind.is_sync_eligible())
     {
         let Ok(peer) = node.node_id.parse::<NodeId>() else {
             continue;
@@ -1631,7 +1627,7 @@ pub(crate) async fn local_path_candidates(
     )
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let policy_user = auth.map(|auth| auth.user_id);
+    let policy_auth = auth;
     let mut candidates = records
         .into_iter()
         .map(|record| {
@@ -1647,10 +1643,7 @@ pub(crate) async fn local_path_candidates(
                     .get(&(record.realm_id, record.group_id))
                     .is_some_and(|evaluator| {
                         evaluator
-                            .evaluate(&metadata_read_request(
-                                &record.permission_path,
-                                policy_user.as_ref(),
-                            ))
+                            .evaluate(&metadata_read_request(&record.permission_path, policy_auth))
                             .is_ok()
                     });
             let record = visible.then_some(record);
@@ -2259,7 +2252,6 @@ pub async fn references_metadata(
         let entry = resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?;
         return Ok(MetadataReferencesExecution {
             references: entry.into_iter().collect(),
-            next_cursor: None,
         });
     }
 
@@ -2325,10 +2317,7 @@ pub async fn references_metadata(
         references.push(entry);
     }
 
-    Ok(MetadataReferencesExecution {
-        references,
-        next_cursor: None,
-    })
+    Ok(MetadataReferencesExecution { references })
 }
 
 struct ResolvedPreflightTargets {
@@ -3042,6 +3031,7 @@ pub async fn references_preflight(
                 score: 0.0,
                 title: reference.title,
                 snippet: None,
+                subject_types: Vec::new(),
             })
             .collect();
         node_results.push(NodeSearchResult {
@@ -3844,12 +3834,12 @@ async fn ensure_record_materialized_for_graph_read(
 /// shared by the single-record and bulk visibility seams.
 pub(crate) fn metadata_read_request(
     permission_path: &str,
-    user: Option<&aruna_core::UserId>,
+    auth: Option<&AuthContext>,
 ) -> aruna_core::request_policy::PolicyRequest {
     crate::request_policy::policy_request_with(
         permission_path,
         &Permission::READ,
-        user,
+        auth,
         crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
     )
 }
@@ -3867,7 +3857,7 @@ pub(crate) async fn ensure_record_readable(
         let request = crate::request_policy::policy_request_with(
             &record.permission_path,
             &Permission::READ,
-            auth.map(|auth| &auth.user_id),
+            auth,
             crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
         );
         let result = match txn_id {
@@ -3921,7 +3911,7 @@ pub(crate) async fn can_read_record(
             &crate::request_policy::policy_request_with(
                 &record.permission_path,
                 &Permission::READ,
-                auth.map(|auth| &auth.user_id),
+                auth,
                 crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
             ),
         )
@@ -3966,9 +3956,8 @@ async fn ensure_permission(
     if auth.realm_id != realm_id {
         return Err(MetadataApiError::Forbidden);
     }
-    let auth_user = auth.user_id;
     let config = CheckPermissionsConfig {
-        auth_context: auth,
+        auth_context: auth.clone(),
         path: path.clone(),
         required_permission: required_permission.clone(),
     };
@@ -3993,7 +3982,7 @@ async fn ensure_permission(
     let request = crate::request_policy::policy_request_with(
         &path,
         &required_permission,
-        Some(&auth_user),
+        Some(&auth),
         crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
     );
     match txn_id {
@@ -5668,7 +5657,8 @@ mod tests {
         metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_write_entry,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
+        Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument,
+        RealmNodeKind, Role,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{Key, RoleId};
@@ -6896,6 +6886,7 @@ mod tests {
             user_id,
             realm_id: TEST_REALM_ID,
             path_restrictions: None,
+            session: None,
         }
     }
 
@@ -7210,6 +7201,7 @@ mod tests {
             user_id: foreign_user,
             realm_id: foreign_realm,
             path_restrictions: None,
+            session: None,
         };
 
         let listed = list_visible_metadata_documents(
@@ -7601,9 +7593,15 @@ mod tests {
         let server = iroh::SecretKey::from_bytes(&[24u8; 32]).public();
         let user = iroh::SecretKey::from_bytes(&[25u8; 32]).public();
         let unknown = iroh::SecretKey::from_bytes(&[26u8; 32]).public();
-        let mut config = RealmConfigDocument::new(RealmId([4u8; 32]), Vec::new(), 2);
-        config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
-        config.ensure_node(user, aruna_core::structs::RealmNodeKind::User);
+        let realm_id = RealmId([4u8; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.ensure_node(server, RealmNodeKind::Server);
+        config.ensure_node(
+            user,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
 
         let nodes = authorized_realm_nodes(&config, HashSet::from([server, user, unknown]))
             .expect("valid node ids");
@@ -7910,6 +7908,7 @@ mod tests {
                 score: 0.0,
                 title: format!("Document {index}"),
                 snippet: None,
+                subject_types: Vec::new(),
             })
             .collect::<Vec<_>>();
         let mut watermark = None;

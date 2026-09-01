@@ -6,11 +6,13 @@ const ROUTES_DIR: &str = "src/routes";
 const METHODS: &[&str] = &[
     "any", "delete", "get", "head", "options", "patch", "post", "put", "trace",
 ];
-/// The one REST authorization boundary. `ensure_permission` also matches
-/// `ensure_permission_with` and the `metadata` module wrapper around it.
+/// REST authorization boundaries. `ensure_permission` also matches
+/// `ensure_permission_with` and the `metadata` module wrapper around it;
+/// `require_owner` is the user-node device plane's owner gate.
 const BOUNDARY: &[&str] = &[
     "ensure_permission",
     "permission_granted",
+    "require_owner",
     "request_authorization::authorize",
 ];
 
@@ -280,13 +282,18 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "sessions.rs",
-        "create_s3_session",
-        "realm bearer, explicit group membership and WRITE on the group node-local data path checked via authorize_credential_issuance",
+        "create_session",
+        "self-scoped: creates a bearer only for the unrestricted caller",
     ),
     (
         "sessions.rs",
-        "refresh_s3_session",
-        "realm bearer, explicit group membership and WRITE on the group node-local data path checked via authorize_credential_issuance",
+        "delete_session",
+        "self-scoped: the operation hides records owned by another user",
+    ),
+    (
+        "sessions.rs",
+        "list_sessions",
+        "self-scoped: the owner index is keyed by the caller",
     ),
     (
         "staging.rs",
@@ -340,6 +347,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "users.rs",
+        "list_user_devices",
+        "self-scoped: realm-config nodes and enrollments filtered to the owner \
+         carried by the caller's credential",
+    ),
+    (
+        "users.rs",
         "patch_user_info",
         "self-scoped: updates only the caller's own user record",
     ),
@@ -347,6 +360,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "users.rs",
         "register_user",
         "public OIDC registration, the admin variant needs an onboarding secret",
+    ),
+    (
+        "users.rs",
+        "revoke_user_device",
+        "self-scoped: RemoveDeviceNodeOperation re-checks that the node is a \
+         User device owned by the caller",
     ),
 ];
 

@@ -986,6 +986,9 @@ impl AdminDocumentReducerState {
         if event.target != self.target {
             return Err(AdminDocumentReducerError::TargetMismatch);
         }
+        // Dropped by event id alone: a second event reusing an applied id never
+        // overwrites the first, so an equivocating origin gains nothing here.
+        // Keeping the evidence is admission's job, not the reducer's.
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminDocumentApplyStatus::Duplicate);
         }
@@ -1124,7 +1127,13 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
             ) => {
-                self.apply_realm_config_node(event, node_id, kind);
+                self.apply_realm_config_node(event, node_id, Some(realm_node_kind_value(kind)));
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigNodeRemoved { node_id },
+            ) => {
+                self.apply_realm_config_node(event, node_id, None);
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
@@ -1718,6 +1727,20 @@ impl AdminDocumentReducerState {
                     .and_then(realm_node_kind_from_value)?;
                 Some((node_id, kind))
             })
+            .collect()
+    }
+
+    /// Nodes whose membership path reduced to no value. The overlays need them
+    /// because a stored configuration still carries the earlier membership.
+    pub fn removed_config_nodes(&self) -> BTreeSet<NodeId> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeSet::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter(|(_, version)| version.value.is_none())
+            .filter_map(|(path, _)| realm_config_node_id_from_path(path))
             .collect()
     }
 
@@ -2480,12 +2503,12 @@ impl AdminDocumentReducerState {
         &mut self,
         event: &AdminDocumentEvent,
         node_id: &NodeId,
-        kind: &RealmNodeKind,
+        value: Option<String>,
     ) {
         let path = realm_config_node_path(node_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
-        match self.reduce_value(event, &path, current, Some(realm_node_kind_value(kind))) {
+        match self.reduce_value(event, &path, current, value) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -2841,7 +2864,8 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
             vec![realm_role_user_assignment_path(role_id, user_id)]
         }
-        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, .. } => {
+        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, .. }
+        | AdminDocumentOperation::RealmConfigNodeRemoved { node_id } => {
             vec![realm_config_node_path(node_id)]
         }
         AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
@@ -3168,7 +3192,6 @@ fn quota_value(quota: &QuotaConfig) -> String {
 
 fn supported_quota(quota: &QuotaConfig) -> QuotaConfig {
     let mut quota = quota.clone();
-    quota.max_devices_per_user = None;
     quota.group_overrides.sort_by_key(|over| over.group_id);
     quota
         .user_group_cap_overrides
@@ -3240,13 +3263,7 @@ fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
 }
 
 fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
-    match kind {
-        RealmNodeKind::Management => "management",
-        RealmNodeKind::Server => "server",
-        RealmNodeKind::Local => "local",
-        RealmNodeKind::User => "user",
-    }
-    .to_string()
+    serde_json::to_string(kind).expect("realm node kind serializes")
 }
 
 pub fn group_role_id_from_path(path: &str) -> Option<RoleId> {
@@ -3456,13 +3473,7 @@ fn parse_band_pool(value: &str) -> Option<BandPool> {
 }
 
 fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
-    match value {
-        "management" => Some(RealmNodeKind::Management),
-        "server" => Some(RealmNodeKind::Server),
-        "local" => Some(RealmNodeKind::Local),
-        "user" => Some(RealmNodeKind::User),
-        _ => None,
-    }
+    serde_json::from_str(value).ok()
 }
 
 #[cfg(test)]
@@ -3482,9 +3493,10 @@ mod tests {
         realm_config_placement_node_id_from_path, realm_config_placement_node_path,
         realm_config_placement_strategy_id_from_path, realm_config_placement_strategy_path,
         realm_config_strategy_binding_path, realm_config_strategy_binding_scope_key_from_path,
-        realm_discovery_value, realm_role_id_from_path, realm_role_path,
-        realm_role_user_assignment_from_path, realm_role_user_assignment_path,
-        role_definition_value, user_attribute_path, user_subject_id_path,
+        realm_discovery_value, realm_node_kind_from_value, realm_node_kind_value,
+        realm_role_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
+        realm_role_user_assignment_path, role_definition_value, user_attribute_path,
+        user_subject_id_path,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
@@ -5008,18 +5020,48 @@ mod tests {
             .get(&format!("realm_config.nodes.{config_node}"))
             .expect("conflict is recorded");
         assert_eq!(conflict.values.len(), 2);
-        assert!(
-            conflict
-                .values
-                .iter()
-                .any(|value| value.value.as_deref() == Some("management"))
+        for kind in [RealmNodeKind::Management, RealmNodeKind::Server] {
+            let encoded = realm_node_kind_value(&kind);
+            assert!(
+                conflict
+                    .values
+                    .iter()
+                    .any(|value| value.value.as_deref() == Some(encoded.as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn removes_config_node() {
+        // Ensured then removed: the node leaves the materialization and is
+        // reported as removed, which is what the overlays subtract.
+        let mut state = realm_config_state();
+        let config_node = node(11);
+        let origin = node(1);
+        let ensured = ensure_realm_config_node(
+            1,
+            1,
+            config_node,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id()),
+            },
         );
-        assert!(
-            conflict
-                .values
-                .iter()
-                .any(|value| value.value.as_deref() == Some("server"))
+        let removed = realm_config_event(
+            2,
+            origin,
+            2,
+            AdminDocumentClock::default().with_observed(origin, 1),
+            AdminDocumentOperation::RealmConfigNodeRemoved {
+                node_id: config_node,
+            },
         );
+
+        state.apply(&ensured).unwrap();
+        state.apply(&removed).unwrap();
+
+        assert!(state.materialized_realm_config_nodes().is_empty());
+        assert_eq!(state.removed_config_nodes(), BTreeSet::from([config_node]));
+        assert!(state.conflicts.is_empty());
     }
 
     #[test]
@@ -5057,7 +5099,9 @@ mod tests {
                 .with_observed(second_origin, 1),
             AdminDocumentOperation::RealmConfigNodeEnsured {
                 node_id: config_node,
-                kind: RealmNodeKind::Local,
+                kind: RealmNodeKind::User {
+                    owner: UserId::nil(realm_id()),
+                },
             },
         );
 
@@ -5067,9 +5111,33 @@ mod tests {
 
         assert_eq!(
             state.materialized_realm_config_nodes(),
-            BTreeMap::from([(config_node, RealmNodeKind::Local)])
+            BTreeMap::from([(
+                config_node,
+                RealmNodeKind::User {
+                    owner: UserId::nil(realm_id()),
+                }
+            )])
         );
         assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn node_kinds_roundtrip() {
+        // The materialized attribute value is the only carrier of the owner a
+        // User node is bound to, so decode must return it unchanged.
+        let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id());
+        for kind in [
+            RealmNodeKind::Management,
+            RealmNodeKind::Server,
+            RealmNodeKind::User { owner },
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id()),
+            },
+        ] {
+            let encoded = realm_node_kind_value(&kind);
+            assert_eq!(realm_node_kind_from_value(&encoded), Some(kind));
+        }
+        assert_eq!(realm_node_kind_from_value("not-a-kind"), None);
     }
 
     #[test]
@@ -5269,17 +5337,18 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_quota_materialization_drops_unsupported_max_devices_per_user() {
+    fn keeps_device_cap() {
+        // The device cap and the per-device limits materialize like any other
+        // quota field.
         let mut state = realm_config_state();
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(1_000),
             max_devices_per_user: Some(6),
+            device_requests_per_minute: Some(120),
+            device_concurrent_pulls: Some(4),
             ..QuotaConfig::default()
         };
-        let expected = QuotaConfig {
-            max_devices_per_user: None,
-            ..quota.clone()
-        };
+        let expected = quota.clone();
 
         state
             .apply(&realm_config_event(
@@ -5348,7 +5417,8 @@ mod tests {
                     max_groups: Some(3),
                 },
             ],
-            max_devices_per_user: None,
+            max_devices_per_user: Some(6),
+            ..QuotaConfig::default()
         };
         let reordered = QuotaConfig {
             group_overrides: expected.group_overrides.iter().cloned().rev().collect(),

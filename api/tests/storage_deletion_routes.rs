@@ -76,7 +76,7 @@ async fn setup() -> Fixture {
             }),
             realm_id,
             node_id,
-            NodeCapabilities::local_node(realm_id).unwrap(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
             JobsRuntime::new(),
@@ -229,6 +229,7 @@ async fn setup() -> Fixture {
             user_id: owner,
             realm_id,
             path_restrictions: None,
+            session: None,
         },
     }
 }

@@ -2054,6 +2054,7 @@ mod tests {
                 user_id: owner,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             source: ImportRoCrateSource::Upload { upload_id },
             target: ImportRoCrateTarget {

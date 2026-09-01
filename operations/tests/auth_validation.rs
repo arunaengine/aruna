@@ -254,6 +254,8 @@ fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
         iat: now,
         exp: now + 600,
         jti: Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
         restrictions: None,
         issuer_pubkey: None,
         delegation_signature: None,

@@ -1025,7 +1025,7 @@ mod tests {
                 }),
                 realm_id,
                 node_id(),
-                NodeCapabilities::local_node(realm_id).expect("capabilities"),
+                NodeCapabilities::user_node(realm_id).expect("capabilities"),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -1146,6 +1146,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         }
     }
 

@@ -1,20 +1,24 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
-    MetadataProfileValidationFinding, MetadataProfileValidationStatus, MetadataQueryResults,
-    MetadataSearchHit,
+    MetadataBatch, MetadataBatchSource, MetadataProfileValidationFinding,
+    MetadataProfileValidationStatus, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::structs::{
-    MetadataRegistryRecord, PathClaimRecord, PersistentIdFailure, PersistentIdMapping,
-    PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId,
-    SyncRelationship,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeInfoDocument, PathClaimRecord,
+    PersistentIdFailure, PersistentIdMapping, PlacementPolicy, PlacementPolicyDocument,
+    PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor, SyncPageLimit, SyncPullAck,
+    SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
+use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -346,6 +350,157 @@ pub enum MetadataTransportMessage {
     ReferencePreflightResults {
         result: Result<Box<MetadataReferencePreflightNodeExecution>, MetadataReadError>,
     },
+    /// An administrative event whose origin holds none of the target's shard,
+    /// handed to a holder that relays the exact origin-signed envelope. It
+    /// deliberately carries no caller token: the envelope's origin signature is
+    /// the authority, and every receiver re-authorizes against the origin.
+    /// Appended after the preflight variants so all prior postcard discriminants
+    /// remain stable.
+    ForwardAdminEvent {
+        target: DocumentSyncTarget,
+        event: Box<AdminDocumentEvent>,
+        placement: PlacementRef,
+        origin_signature: iroh::Signature,
+    },
+    ForwardedAdminEventQueued,
+    /// A User node cannot originate a realm administrative event, so its local
+    /// group create travels to a sync-eligible ingress under the caller's own
+    /// token. That ingress authorizes the caller and originates the event.
+    ForwardGroupCreate {
+        auth_token: Option<MetadataAuthToken>,
+        display_name: String,
+    },
+    ForwardedGroupCreated {
+        group: Box<Group>,
+        authorization: Box<GroupAuthorizationDocument>,
+    },
+    ForwardedGroupCreateConflict {
+        reason: String,
+    },
+    /// One device version a synced folder asks its realm node to pull and
+    /// commit as the owner. The realm node reads the exact version from the
+    /// device and writes its own copy, so the device never pushes. Appended
+    /// after the earlier variants so their indices stay stable.
+    ForwardSyncPull {
+        auth_token: MetadataAuthToken,
+        source: Box<VersionedObjectArn>,
+        blake3: Option<[u8; 32]>,
+        size: u64,
+        target_bucket: String,
+        target_key: String,
+        /// A local delete asks for a delete marker instead of a version.
+        deleted: bool,
+    },
+    ForwardedSyncPull {
+        result: Result<SyncPullAck, SyncRefusal>,
+    },
+    /// Bounded listing of the current heads under one bucket prefix, served as
+    /// a routed read with the requesting owner's authority.
+    ForwardListVersions {
+        auth_token: MetadataAuthToken,
+        bucket: String,
+        prefix: String,
+        cursor: Option<SyncListCursor>,
+        limit: SyncPageLimit,
+    },
+    ForwardedVersions {
+        result: Result<SyncVersionPage, SyncRefusal>,
+    },
+    /// The realm-wide documents a device asks a realm node for. A device takes
+    /// no part in document sync, so this routed read is how the configuration
+    /// it is judged by - revocations included - reaches it.
+    FetchRealmDocuments {
+        auth_token: MetadataAuthToken,
+    },
+    FetchedRealmDocuments {
+        result: Result<RealmDocuments, SyncRefusal>,
+    },
+    /// The state a device seeds or refreshes one metadata replica from. A
+    /// device holds no bucket, so this routed read is how the OR-Set graph, the
+    /// registry record and the displayed render reach it.
+    FetchGraphState {
+        auth_token: MetadataAuthToken,
+        document_id: Ulid,
+    },
+    FetchedGraphState {
+        result: Result<Box<GraphState>, SyncRefusal>,
+    },
+    /// An edit a device already applied to its replica. The holder appends it
+    /// as an `ApplyBatch` event unchanged, so both sides converge on the same
+    /// OR-Set state whatever else happened meanwhile.
+    ForwardApplyBatch {
+        auth_token: MetadataAuthToken,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        batch: Box<MetadataBatch>,
+        authored: MetadataBatchSource,
+    },
+    ForwardedApplyBatch {
+        result: Result<Box<MetadataRegistryRecord>, SyncRefusal>,
+    },
+    ForwardCreateBucket {
+        auth_token: MetadataAuthToken,
+        bucket: String,
+        group_id: GroupId,
+    },
+    ForwardedBucketCreated {
+        result: Result<(), SyncRefusal>,
+    },
+}
+
+/// One document as a holder serves it to a device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphState {
+    pub record: MetadataRegistryRecord,
+    /// The graph's live quads with their dots, joined into the device's replica.
+    pub snapshot: GraphReplicaSnapshot,
+    /// The last valid render, which is what the device displays and exports.
+    pub displayed_jsonld: String,
+    pub dataset_digest: Option<[u8; 32]>,
+    /// Profile findings against the merged state while it is invalid. Zero
+    /// means the displayed render is the merged one.
+    pub findings: u32,
+}
+
+/// The most groups a serving node hands one device. A device caches its
+/// owner's groups; it never mirrors a realm-scale group list, and the bound is
+/// what keeps this answer small.
+pub const MAX_DEVICE_GROUPS: usize = 256;
+
+/// One group as a realm node stores it. The device writes both documents into
+/// the keyspaces every local read already uses, so the group answers there
+/// exactly as it does on a realm node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceGroupDocuments {
+    pub group: Group,
+    pub authorization: GroupAuthorizationDocument,
+}
+
+/// The realm-wide documents as the serving node stores them. The copies a
+/// device installs from them are never published again: they are a read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmDocuments {
+    pub realm_config: Vec<u8>,
+    /// Absent while the realm has no authorization document yet.
+    pub realm_authorization: Option<Vec<u8>>,
+    /// The device owner's own user document, so the owner's profile answers on
+    /// the device as it does on a realm node. Absent while the serving node
+    /// holds none.
+    pub owner: Option<Vec<u8>>,
+    /// The owner's own groups as the serving node stores them, in group-id
+    /// order and capped at [`MAX_DEVICE_GROUPS`]. The device caches them, so
+    /// its local checks are the realm's rules; it still publishes nothing.
+    pub groups: Vec<DeviceGroupDocuments>,
+    /// Stored advertisements for the configuration's sync-eligible nodes, in
+    /// node-id order. Devices are excluded.
+    pub node_infos: Vec<NodeInfoDocument>,
+    /// The api urls the realm's management nodes published, in node-id order. A
+    /// device holds no peer node-info document, so a management-only route has
+    /// no target there without this list.
+    pub management_urls: Vec<String>,
+    /// What the serving node had applied when it made this copy. A device
+    /// refuses a copy that has seen less than the one it already holds.
+    pub clock: AdminDocumentClock,
 }
 
 /// One page of immutable records plus the cursor of the next one.
@@ -1160,6 +1315,7 @@ mod tests {
                 pattern: format!("/{realm_id}/g/**"),
                 permission: Permission::READ,
             }]),
+            session: None,
         };
         let token = MetadataAuthToken::internal(auth);
         let bytes = postcard::to_allocvec(&token).unwrap();

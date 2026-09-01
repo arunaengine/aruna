@@ -17,9 +17,9 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::util::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
-use chrono::Utc;
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -263,9 +263,7 @@ impl RegisterOrGetOidcUserOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(event.clone()),
-                },
+                DocumentSyncOutboxEvent::admin(event.clone()),
                 placement,
                 true,
             )
@@ -553,10 +551,6 @@ fn apply_admin_reducer_operation(
     Ok(event)
 }
 
-fn current_timestamp_ms() -> u64 {
-    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
-}
-
 fn initial_user_document_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentSyncChange {
     let updated_at_ms = current_timestamp_ms();
     DocumentSyncChange {
@@ -704,7 +698,7 @@ mod tests {
                     assert_eq!(record.target, document_target);
                     assert_eq!(record.node_id, actor.node_id);
                     assert!(record.peers.is_empty());
-                    let DocumentSyncOutboxEvent::AdminOperation { event } = record.event else {
+                    let DocumentSyncOutboxEvent::AdminOperation { event, .. } = record.event else {
                         panic!("unexpected outbox event");
                     };
                     assert_eq!(record.outbox_id, event.event_id);

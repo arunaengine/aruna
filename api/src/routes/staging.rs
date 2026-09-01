@@ -4,7 +4,9 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::connectors::ApiSourceConnectorKind;
-use crate::routes::jobs::map_submit_error;
+use crate::routes::jobs::{
+    decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
+};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
@@ -203,7 +205,6 @@ pub struct StageBatchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct SubmitStagingJobResponse {
     pub job_id: String,
-    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -532,8 +533,8 @@ WRITE on each target key or target prefix. Nothing is authorized later while the
   referenced yet.
 - Unlike the blocking endpoint there is no cap on the number of items, and no request-side prefix
   expansion happens: prefixes are stored and walked by the job.
-- There is no idempotency key, so every call creates a new job, `created` is always true, and
-  resubmitting the same body stages the same objects a second time.
+- There is no idempotency key, so resubmitting the same body creates another job and stages the same
+  objects a second time.
 - Progress and completion are observed by reading the job by its id.
 
 **Limits**
@@ -566,11 +567,10 @@ unavailable job placement binding or an unhealthy structured id clock is a 503 c
     responses(
         (
             status = 202,
-            description = "The job is durably queued on this node; `created` is always true because staging jobs are never deduplicated",
+            description = "The job is durably queued on this node",
             body = SubmitStagingJobResponse,
             example = json!({
-                "job_id": "01JJOB0123456789ABCDEFGHJ",
-                "created": true
+                "job_id": "01JJOB0123456789ABCDEFGHJ"
             })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path or prefix is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
@@ -690,7 +690,6 @@ pub async fn submit_staging(
         StatusCode::ACCEPTED,
         Json(SubmitStagingJobResponse {
             job_id: result.job_id.to_string(),
-            created: result.created,
         }),
     ))
 }
@@ -1167,25 +1166,6 @@ fn format_job_time(timestamp_ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
         .map(|timestamp| timestamp.to_rfc3339())
         .unwrap_or_default()
-}
-
-fn decode_job_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
-    match cursor {
-        Some(cursor) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
-            if bytes.len() != 24 {
-                return Err(ServerError::BadRequest);
-            }
-            Ok(Some(bytes))
-        }
-        None => Ok(None),
-    }
-}
-
-fn encode_job_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
-    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
 }
 
 fn decode_reference_cursor(
@@ -1913,6 +1893,7 @@ mod tests {
                 kind: SourceEntryKind::File,
                 size: Some(4),
                 modified: None,
+                stat: None,
             }],
             "folder/",
             "imported",
@@ -2296,7 +2277,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -2333,6 +2314,7 @@ mod tests {
                     pattern: bucket_path,
                     permission: Permission::READ,
                 }]),
+                session: None,
             },
             auth_with_source_read: AuthContext {
                 user_id: user_with_source_read,
@@ -2347,6 +2329,7 @@ mod tests {
                         permission: Permission::READ,
                     },
                 ]),
+                session: None,
             },
             auth_without_source_read: AuthContext {
                 user_id: user_without_source_read,
@@ -2355,6 +2338,7 @@ mod tests {
                     pattern: target_path,
                     permission: Permission::WRITE,
                 }]),
+                session: None,
             },
         }
     }

@@ -14,6 +14,7 @@ use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
+use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::notifications::watch::interest::{
@@ -31,10 +32,25 @@ use crypto_box::{
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 const ONBOARDING_PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Ceiling for the doubling retry delay, so a peer that is not ready yet is
+/// asked patiently instead of ten times a second for the whole budget.
+const ONBOARDING_PLACEMENT_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// Longest a device waits on one answer, so a hung peer costs one attempt
+/// rather than the whole onboarding budget.
+const DEVICE_FETCH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Delay before retry `attempt`, doubling from the base interval up to the cap.
+fn backoff(attempt: u32) -> Duration {
+    ONBOARDING_PLACEMENT_RETRY_INTERVAL
+        .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+        .min(ONBOARDING_PLACEMENT_RETRY_MAX)
+}
 
 pub async fn realm_bootstrap_exists(
     driver_ctx: &DriverContext,
@@ -174,14 +190,24 @@ pub async fn prepare_core_documents(
     }
 }
 
+/// Fetches the documents a joining node needs before it serves its realm.
+/// Infrastructure syncs the ticket's topics from the bootstrap peer; a device is
+/// refused that protocol, so it reads the realm documents over metadata instead.
 pub async fn fetch_core_onboarding_documents(
-    driver_ctx: &DriverContext,
+    driver_ctx: &Arc<DriverContext>,
     node_state: &PersistedNodeState,
     realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<NodeId>,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
+    // Realm infrastructure refuses a device the sync protocol, so a device asks
+    // the bootstrap peer for the realm documents as a routed read instead. Its
+    // own user document is not fetched here: a device holds no shard topic, and
+    // the document reaches it later over the same route.
+    if let Some(owner) = node_state.identity.owner() {
+        return fetch_device_documents(driver_ctx, owner, bootstrap_peer, timeout).await;
+    }
     let onboarding_sync_ticket = node_state
         .onboarding_sync_ticket
         .as_deref()
@@ -202,7 +228,7 @@ pub async fn fetch_core_onboarding_documents(
             continue;
         }
         let topic = document.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
-        sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await?;
+        sync_with_retry(net_handle, topic, bootstrap_peer, &document, timeout).await?;
     }
 
     if !user_documents.is_empty() {
@@ -222,17 +248,56 @@ pub async fn fetch_core_onboarding_documents(
             else {
                 continue;
             };
-            sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await?;
+            // Best effort: the bootstrap peer serves a shard topic only to its
+            // members, and the joiner is admitted once its placement expansion
+            // runs, which waits behind any transition already in flight.
+            if let Err(error) =
+                sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await
+            {
+                warn!(error = %error, document = ?document, "Leaving an onboarding user document to placement sync");
+            }
         }
     }
 
     Ok(())
 }
 
+/// Asks the bootstrap peer for the realm documents until it serves them. The
+/// realm-config update that admits the device may land after the enrollment
+/// answer, and until it does the peer refuses the read as unauthorized.
+async fn fetch_device_documents(
+    driver_ctx: &Arc<DriverContext>,
+    owner: UserId,
+    bootstrap_peer: NodeId,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let budget = timeout.min(DEVICE_FETCH_BUDGET);
+    let mut attempt = 0;
+    loop {
+        if fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out after {timeout:?} fetching the realm documents for this device from bootstrap peer {bootstrap_peer}"
+            )
+            .into());
+        }
+        warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
+        tokio::time::sleep(backoff(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+/// Waits until the realm configuration names this node as ready, re-reading it
+/// from the bootstrap peer between checks: over document sync, or as a routed
+/// read when `device_owner` says this node is a device.
 pub async fn wait_for_onboarding_placement(
-    driver_ctx: &DriverContext,
+    driver_ctx: &Arc<DriverContext>,
     realm_id: aruna_core::structs::RealmId,
     node_id: NodeId,
+    device_owner: Option<UserId>,
     bootstrap_peer: Option<NodeId>,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -240,30 +305,69 @@ pub async fn wait_for_onboarding_placement(
     let target = DocumentSyncTarget::RealmConfig { realm_id };
 
     tokio::time::timeout(timeout, async {
+        let mut attempt = 0;
         loop {
             let config = drive(GetRealmConfigOperation::new(realm_id), driver_ctx).await?;
             if node_is_ready(&config, node_id) {
+                info!(
+                    realm_id = %realm_id,
+                    node_id = %node_id,
+                    kind = kind_label(&config, node_id),
+                    "Onboarding complete: the node joined its realm"
+                );
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
 
-            sync_topic_from_peer(
-                driver_ctx
-                    .net_handle
-                    .as_ref()
-                    .ok_or("net handle unavailable")?,
-                target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
-                bootstrap_peer,
-                &target,
-                timeout,
-            )
-            .await?;
-            tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
+            match device_owner {
+                // A device has no membership in the realm-config topic, so it
+                // re-reads the documents the same way it first fetched them.
+                Some(owner) => {
+                    let budget = timeout.min(DEVICE_FETCH_BUDGET);
+                    if !fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
+                        warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
+                    }
+                }
+                None => {
+                    if let Err(error) = sync_topic_from_peer(
+                        driver_ctx
+                            .net_handle
+                            .as_ref()
+                            .ok_or("net handle unavailable")?,
+                        target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
+                        bootstrap_peer,
+                        &target,
+                        timeout,
+                    )
+                    .await
+                    {
+                        warn!(error = %error, "Retrying onboarding placement sync");
+                    }
+                }
+            }
+            tokio::time::sleep(backoff(attempt)).await;
+            attempt = attempt.saturating_add(1);
         }
     })
     .await
     .map_err(|_| {
         format!("timed out after {timeout:?} waiting for onboarding placement for node {node_id}")
     })?
+}
+
+/// Node-kind label for the completion log; the owner of a device stays out of it.
+fn kind_label(config: &aruna_core::structs::RealmConfigDocument, node_id: NodeId) -> &'static str {
+    let node_id = node_id.to_string();
+    match config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| &node.kind)
+    {
+        Some(aruna_core::structs::RealmNodeKind::Management) => "management",
+        Some(aruna_core::structs::RealmNodeKind::Server) => "server",
+        Some(aruna_core::structs::RealmNodeKind::User { .. }) => "user",
+        None => "unknown",
+    }
 }
 
 fn node_is_ready(config: &aruna_core::structs::RealmConfigDocument, node_id: NodeId) -> bool {
@@ -341,6 +445,30 @@ async fn sync_topic_from_peer(
     }
 }
 
+/// The bootstrap peer may refuse a fresh joiner until the config update that
+/// admits it reaches the peer, so failures retry within the same time budget.
+async fn sync_with_retry(
+    net_handle: &aruna_net::NetHandle,
+    topic: ::irokle::TopicId,
+    bootstrap_peer: NodeId,
+    document: &DocumentSyncTarget,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempt = 0;
+    loop {
+        match sync_topic_from_peer(net_handle, topic, bootstrap_peer, document, timeout).await {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                warn!(error = %error, document = ?document, "Retrying onboarding document sync");
+                tokio::time::sleep(backoff(attempt)).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Persisted onboarding secret, encrypted at rest under the node key.
 #[derive(Serialize, Deserialize)]
 struct SealedOnboardingSecret {
@@ -379,14 +507,14 @@ pub async fn ensure_initial_local_onboarding_secret(
         seed_url,
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
-        mode: OnboardingMode::Local,
+        mode: OnboardingMode::Server,
         realm_id,
         purpose: OnboardingPurpose::InitialAdministrator,
     };
     let record = aruna_core::onboarding::OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
-        mode: OnboardingMode::Local,
+        mode: OnboardingMode::Server,
         purpose: OnboardingPurpose::InitialAdministrator,
         expires_at: u64::MAX,
         claimed_node_id: None,
@@ -420,9 +548,10 @@ pub async fn ensure_initial_local_onboarding_secret(
 #[cfg(test)]
 mod tests {
     use super::{
-        node_is_ready, prepare_core_documents, publish_core_documents, sync_topic_from_peer,
-        unique_user_topic, watch_target_needed,
+        backoff, node_is_ready, prepare_core_documents, publish_core_documents,
+        sync_topic_from_peer, sync_with_retry, unique_user_topic, watch_target_needed,
     };
+    use crate::config::PersistedNodeIdentity;
     use aruna_core::NodeId;
     use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
     use aruna_core::effects::StorageEffect;
@@ -471,6 +600,40 @@ mod tests {
         );
         assert!(unique_user_topic(&mut synced_topics, realm_id, &second_shard, &second).is_some());
         assert_eq!(synced_topics.len(), 2);
+    }
+
+    // The retries must survive a full sync budget without flooding the log, and
+    // must keep asking at a usable pace once they reach the ceiling.
+    #[test]
+    fn backoff_grows_capped() {
+        assert_eq!(backoff(0), Duration::from_millis(100));
+        assert_eq!(backoff(1), Duration::from_millis(200));
+        assert_eq!(backoff(4), Duration::from_millis(1_600));
+        assert_eq!(backoff(6), Duration::from_secs(5));
+        assert_eq!(backoff(u32::MAX), Duration::from_secs(5));
+    }
+
+    // Only a device takes the metadata route, and it is the persisted owner that
+    // selects it: infrastructure keeps fetching its documents over sync.
+    #[test]
+    fn device_identity_routes() {
+        let owner = aruna_core::UserId::nil(RealmId::from_bytes([2u8; 32]));
+        assert_eq!(PersistedNodeIdentity::User { owner }.owner(), Some(owner));
+        assert_eq!(
+            PersistedNodeIdentity::Server {
+                issuer_private_key_pem: String::new(),
+                delegation_signature: String::new(),
+            }
+            .owner(),
+            None
+        );
+        assert_eq!(
+            PersistedNodeIdentity::Management {
+                realm_private_key_pem: String::new(),
+            }
+            .owner(),
+            None
+        );
     }
 
     #[test]
@@ -843,6 +1006,69 @@ mod tests {
         assert_eq!(batch.records.len(), 1);
         assert!(!batch.records[0].1.allow_genesis);
         OutboxDrainer::new(joiner_context.clone()).run_once().await;
+        assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
+        bootstrap_net.shutdown().await;
+        joiner_net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retries_until_seeded() {
+        // Onboarding must survive the window before the peer serves the topic.
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        let (_bootstrap_dir, bootstrap_context, bootstrap_net) = net_context(realm_id, 12).await;
+        let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 13).await;
+        let bootstrap_context = Arc::new(bootstrap_context);
+        let joiner_context = Arc::new(joiner_context);
+        initialize_net_incoming(bootstrap_context.clone());
+        initialize_net_incoming(joiner_context.clone());
+        let bootstrap_id = bootstrap_net.node_id();
+        let joiner_id = joiner_net.node_id();
+        write_config_nodes(
+            &bootstrap_context,
+            realm_id,
+            bootstrap_id,
+            &[bootstrap_id, joiner_id],
+        )
+        .await;
+        write_config_nodes(
+            &joiner_context,
+            realm_id,
+            joiner_id,
+            &[bootstrap_id, joiner_id],
+        )
+        .await;
+        bootstrap_net.reload_realm_peers().await.unwrap();
+        joiner_net.reload_realm_peers().await.unwrap();
+        bootstrap_net
+            .add_peer_addr(joiner_net.endpoint_addr())
+            .await;
+        joiner_net
+            .add_peer_addr(bootstrap_net.endpoint_addr())
+            .await;
+
+        let target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: bootstrap_id,
+        };
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let (sync, seeded) = tokio::join!(
+            sync_with_retry(
+                &joiner_net,
+                topic,
+                bootstrap_id,
+                &target,
+                Duration::from_secs(60),
+            ),
+            seed_topic(
+                &bootstrap_context,
+                &bootstrap_net,
+                realm_id,
+                bootstrap_id,
+                joiner_id,
+            ),
+        );
+        assert_eq!(seeded, topic);
+        sync.unwrap();
         assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
         bootstrap_net.shutdown().await;
         joiner_net.shutdown().await;

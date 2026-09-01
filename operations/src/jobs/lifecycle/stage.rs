@@ -63,6 +63,7 @@ pub async fn stage_remote_input(
                 user_id: record.created_by,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             realm_id,
             target: BaoReadTarget::ExactVersion(VersionedObjectArn {

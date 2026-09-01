@@ -266,8 +266,7 @@ async fn register_dht(
         holder_ttl_ms: ttl_ms,
         ..RoCrateLimits::default()
     };
-    let Ok(effect) = dht_registration_effect(&blake3, realm_id, net_handle.node_id(), &limits)
-    else {
+    let Ok(effect) = dht_registration_effect(&blake3, realm_id, &limits) else {
         return false;
     };
     match net_handle.send_effect(effect).await {

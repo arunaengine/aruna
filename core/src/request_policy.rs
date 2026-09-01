@@ -5,7 +5,6 @@
 use cel_interpreter::{Context, Program, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use ulid::Ulid;
 
 /// Maximum number of policies one scope may carry.
@@ -23,6 +22,7 @@ pub const KNOWN_POLICY_VARIABLES: &[&str] = &[
     "params",
     "headers",
     "body",
+    "request",
 ];
 
 /// Built-in CEL functions and macros always available to a policy expression.
@@ -101,6 +101,15 @@ pub struct PolicyRequest {
     pub headers: BTreeMap<String, String>,
     /// Already-parsed request body; `None` becomes the CEL `null`.
     pub body: Option<serde_json::Value>,
+    /// Session identity, absent for anonymous and unbound legacy requests.
+    pub session: Option<PolicySession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySession {
+    pub sid: String,
+    pub kind: String,
+    pub label: String,
 }
 
 impl PolicyRequest {
@@ -115,6 +124,7 @@ impl PolicyRequest {
             params: BTreeMap::new(),
             headers: BTreeMap::new(),
             body: None,
+            session: None,
         }
     }
 }
@@ -132,36 +142,6 @@ pub enum PolicyDecision {
 impl PolicyDecision {
     pub fn is_denied(&self) -> bool {
         matches!(self, PolicyDecision::Denied { .. })
-    }
-}
-
-/// A registered set of pure CEL helper functions. Providers capture pre-loaded
-/// immutable data only, so registration stays free of I/O. This is the seam a
-/// future SHACL provider slots into without touching the engine.
-pub trait PolicyFunctionProvider: Send + Sync {
-    fn names(&self) -> Vec<&'static str>;
-    fn register(&self, context: &mut Context);
-}
-
-#[derive(Clone, Default)]
-pub struct PolicyFunctions {
-    providers: Vec<Arc<dyn PolicyFunctionProvider>>,
-}
-
-impl PolicyFunctions {
-    pub fn new(providers: Vec<Arc<dyn PolicyFunctionProvider>>) -> Self {
-        Self { providers }
-    }
-
-    /// Names contributed by the registered providers, for reference-checking.
-    pub fn function_names(&self) -> BTreeSet<&'static str> {
-        self.providers.iter().flat_map(|p| p.names()).collect()
-    }
-
-    fn register(&self, context: &mut Context) {
-        for provider in &self.providers {
-            provider.register(context);
-        }
     }
 }
 
@@ -323,18 +303,29 @@ impl CompiledPolicySet {
         self.policies.len()
     }
 
-    fn build_context(
-        &self,
-        request: &PolicyRequest,
-        functions: &PolicyFunctions,
-    ) -> Context<'static> {
+    fn build_context(&self, request: &PolicyRequest) -> Context<'static> {
         let mut context = Context::default();
-        functions.register(&mut context);
         context.add_variable_from_value("path", request.path.clone());
         context.add_variable_from_value("permission", request.permission.clone());
         context.add_variable_from_value("user", request.user.clone());
         context.add_variable_from_value("anonymous", request.user.is_empty());
         context.add_variable_from_value("operation", request.operation.clone());
+        let session = request.session.clone().unwrap_or(PolicySession {
+            sid: String::new(),
+            kind: String::new(),
+            label: String::new(),
+        });
+        let request_value = serde_json::json!({
+            "session": {
+                "sid": session.sid,
+                "kind": session.kind,
+                "label": session.label,
+            }
+        });
+        context.add_variable_from_value(
+            "request",
+            cel_interpreter::to_value(&request_value).unwrap_or(Value::Null),
+        );
         if self.needs_params {
             let _ = context.add_variable("params", &request.params);
             let _ = context.add_variable("headers", &request.headers);
@@ -351,8 +342,8 @@ impl CompiledPolicySet {
     }
 
     /// Evaluates the set against a request; the first deny wins.
-    pub fn evaluate(&self, request: &PolicyRequest, functions: &PolicyFunctions) -> PolicyDecision {
-        let context = self.build_context(request, functions);
+    pub fn evaluate(&self, request: &PolicyRequest) -> PolicyDecision {
+        let context = self.build_context(request);
         for policy in &self.policies {
             if !policy.enabled {
                 continue;
@@ -372,12 +363,8 @@ impl CompiledPolicySet {
 
     /// Evaluates the set and records why each policy passed, denied, or was
     /// skipped, stopping at the first deny.
-    pub fn evaluate_traced(
-        &self,
-        request: &PolicyRequest,
-        functions: &PolicyFunctions,
-    ) -> TracedDecision {
-        let context = self.build_context(request, functions);
+    pub fn evaluate_traced(&self, request: &PolicyRequest) -> TracedDecision {
+        let context = self.build_context(request);
         let mut trace = Vec::with_capacity(self.policies.len());
         let mut decision = PolicyDecision::Allowed;
         for policy in &self.policies {
@@ -533,16 +520,10 @@ pub struct PolicyAnalysis {
 
 /// Compiles a candidate guard and expression and reports referenced variables
 /// and functions, flagging any that are unknown. Pure; performs no I/O.
-pub fn analyze_policy_source(
-    when: Option<&str>,
-    expression: &str,
-    functions: &PolicyFunctions,
-) -> PolicyAnalysis {
+pub fn analyze_policy_source(when: Option<&str>, expression: &str) -> PolicyAnalysis {
     let mut errors = Vec::new();
     let mut variables = BTreeSet::new();
     let mut unknown_functions = BTreeSet::new();
-    let registered = functions.function_names();
-
     for (label, source) in [("guard", when), ("expression", Some(expression))] {
         let Some(source) = source else { continue };
         if source.len() > MAX_POLICY_EXPRESSION_BYTES {
@@ -558,8 +539,7 @@ pub fn analyze_policy_source(
                     variables.insert(variable.to_string());
                 }
                 for function in references.functions() {
-                    if !KNOWN_POLICY_FUNCTIONS.contains(&function) && !registered.contains(function)
-                    {
+                    if !KNOWN_POLICY_FUNCTIONS.contains(&function) {
                         unknown_functions.insert(function.to_string());
                     }
                 }
@@ -587,7 +567,7 @@ pub fn analyze_policy_source(
 /// uses a cached [`CompiledPolicySet`].
 pub fn evaluate_policies(policies: &[RequestPolicy], request: &PolicyRequest) -> PolicyDecision {
     match CompiledPolicySet::compile(policies) {
-        Ok(set) => set.evaluate(request, &PolicyFunctions::default()),
+        Ok(set) => set.evaluate(request),
         Err(error) => PolicyDecision::Denied {
             policy_id: error.policy_id,
             name: error.name,
@@ -651,6 +631,19 @@ mod tests {
     }
 
     #[test]
+    fn denies_assistant_session() {
+        let policies = [policy("request.session.kind == 'assistant'")];
+        let mut request = request("/realm/data", "read", "u");
+        request.session = Some(PolicySession {
+            sid: Ulid::from_bytes([8; 16]).to_string(),
+            kind: "assistant".to_string(),
+            label: String::new(),
+        });
+
+        assert!(evaluate_policies(&policies, &request).is_denied());
+    }
+
+    #[test]
     fn require_needs_true() {
         // A require policy inverts: false denies, true allows.
         let mut require = policy("permission == 'read'");
@@ -694,7 +687,7 @@ mod tests {
         let mut guarded = policy("false");
         guarded.when = Some("missing_var".to_string());
         let set = CompiledPolicySet::compile(&[guarded]).unwrap();
-        let traced = set.evaluate_traced(&request("/p", "read", "u"), &PolicyFunctions::default());
+        let traced = set.evaluate_traced(&request("/p", "read", "u"));
         assert!(traced.decision.is_denied());
         assert_eq!(traced.trace[0].result, PolicyResult::Error);
     }
@@ -784,7 +777,7 @@ mod tests {
         disabled.enabled = false;
         let deny = policy("permission == 'write'");
         let set = CompiledPolicySet::compile(&[disabled, deny]).unwrap();
-        let traced = set.evaluate_traced(&request("/p", "write", "u"), &PolicyFunctions::default());
+        let traced = set.evaluate_traced(&request("/p", "write", "u"));
         assert!(traced.decision.is_denied());
         assert_eq!(traced.trace.len(), 2);
         assert_eq!(traced.trace[0].result, PolicyResult::SkippedDisabled);
@@ -796,7 +789,6 @@ mod tests {
         let analysis = analyze_policy_source(
             Some("permission == 'write'"),
             "mystery(body.kind) && unknown_var",
-            &PolicyFunctions::default(),
         );
         assert!(analysis.valid);
         assert!(
@@ -810,7 +802,7 @@ mod tests {
 
     #[test]
     fn reports_compile_error() {
-        let analysis = analyze_policy_source(None, "path.startsWith(", &PolicyFunctions::default());
+        let analysis = analyze_policy_source(None, "path.startsWith(");
         assert!(!analysis.valid);
         assert!(!analysis.errors.is_empty());
     }

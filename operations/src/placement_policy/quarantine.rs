@@ -315,6 +315,7 @@ mod tests {
                 user_id: UserId::new(Ulid::from_bytes([2u8; 16]), REALM),
                 realm_id: REALM,
                 path_restrictions: None,
+                session: None,
             },
             realm_id: REALM,
             release,

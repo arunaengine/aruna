@@ -70,6 +70,13 @@ use crate::blob::reclaim::{
 };
 use crate::blob_holders::RefreshBlobHoldersOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::device::drain::{
+    DrainOutcome, INTAKE_CONTINUE_AFTER, INTAKE_DEFER_RETRY_AFTER, restore_intake_timer,
+};
+use crate::device::sync::{
+    RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
+    UPLOAD_DEFER_RETRY_AFTER, restore_sync_timers,
+};
 use crate::document_sync_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
     restore_document_sync_outbox_timers,
@@ -78,6 +85,7 @@ use crate::driver::{DriverContext, drive};
 use crate::group_backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::lifecycle::outbox::{OUTBOX_RETRY_AFTER, drain_family_outbox};
+use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, settle_terminals};
 use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
@@ -157,6 +165,14 @@ const OUTBOX_CONTINUATION_STREAK: u32 = 8;
 const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
 const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+
+/// How long a device keeps its copy of the realm documents before asking for
+/// them again. A revocation reaches it within this window at the latest.
+const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
+
+/// How long one attempt may spend on the realm as a whole. The folder cadence
+/// is what it shares that time with, so it is bounded once, not per node.
+const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_SWEEP_TICKS: usize = 12;
 /// How long a record may wait for its shard topic's genesis before the drain
@@ -202,6 +218,9 @@ struct OperationsTaskHandler {
     rotation: std::sync::Mutex<OutboxRotation>,
     drain_guard: tokio::sync::Mutex<()>,
     outbox_limits: OutboxLimits,
+    // When a device may next fetch the realm documents, and how many attempts
+    // have failed. Loss on restart is fine: a restart fetches them anyway.
+    realm_documents: std::sync::Mutex<(u32, u64)>,
 }
 
 /// Outcome counts accumulated across the invocations of one rotation.
@@ -382,11 +401,15 @@ fn document_publish_from_outbox(
             change,
             allow_genesis,
         },
-        DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
+        DocumentSyncOutboxEvent::AdminOperation {
+            event,
+            origin_signature,
+        } => DocumentSyncPublish::AdminOperation {
             target,
             event,
             placement,
             allow_genesis,
+            origin_signature,
         },
     }
 }
@@ -489,7 +512,7 @@ enum DrainPage {
 /// within one origin node.
 fn admin_origin(record: &DocumentSyncOutboxRecord) -> Option<aruna_core::NodeId> {
     match &record.event {
-        DocumentSyncOutboxEvent::AdminOperation { event } => Some(event.origin_node_id),
+        DocumentSyncOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
         _ => None,
     }
 }
@@ -524,9 +547,12 @@ enum DeferOutcome {
 /// defer/publish boundary would let the newer op publish first, invert its origin
 /// sequence on receivers, and drop the older op forever as StaleOriginSequence —
 /// so a topic never straddles that boundary within a run, across pages included.
+/// `publishes_shared` is whether this node may publish into the shared realm
+/// topics at all; a device may not, so its records there are undeliverable.
 fn partition_drain_records(
     records: Vec<DrainRecord>,
     defer: &mut DrainDeferState,
+    publishes_shared: bool,
     mut topic_available: impl FnMut(irokle::TopicId) -> bool,
     mut classify_defer: impl FnMut(&DocumentSyncOutboxRecord) -> DeferOutcome,
 ) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
@@ -540,7 +566,10 @@ fn partition_drain_records(
             continue;
         }
         if !record.target.uses_shard_topic() {
-            to_publish.push((record_key, record, topic));
+            match publishes_shared {
+                true => to_publish.push((record_key, record, topic)),
+                false => undeliverable.push((record_key, record, topic)),
+            }
             continue;
         }
         if defer.undeliverable_topics.contains(&topic) {
@@ -627,6 +656,7 @@ impl OperationsTaskHandler {
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
+            realm_documents: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -661,11 +691,21 @@ impl OperationsTaskHandler {
             .await;
             return;
         };
-        let operation = RefreshBlobHoldersOperation::new(
-            *net_handle.realm_id(),
-            net_handle.node_id(),
-            self.rocrate_limits.clone(),
-        );
+        // A User-kind device registers no holdership: the realm refuses its DHT
+        // puts. An unreadable config is bootstrap, which registers.
+        if matches!(
+            crate::metadata::forward::is_user_origin(
+                &self.context,
+                *net_handle.realm_id(),
+                net_handle.node_id()
+            )
+            .await,
+            Ok(true)
+        ) {
+            return;
+        }
+        let operation =
+            RefreshBlobHoldersOperation::new(*net_handle.realm_id(), self.rocrate_limits.clone());
         if let Err(error) = drive(operation, self.context.as_ref()).await {
             warn!(task_id = ?TaskKey::RefreshBlobHolders, error = %error, "Failed to refresh blob holders");
             self.reschedule_timer(
@@ -676,25 +716,43 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Surfaces records this node can never publish, loudly, and leaves them in
-    /// the outbox.
+    /// Handles records this node cannot publish itself.
     ///
     /// This node holds none of the record's bucket, so it may neither mint that
-    /// bucket's topic genesis nor join the topic: it can never publish the record
-    /// from here. The record is never relayed to a holder — a peer-relayed
-    /// upsert/delete would publish under the holder's signature with no proof it
-    /// was permission-checked — and never deleted, since the caller already holds
-    /// a 200 and there is no replay source. It stays in the outbox, error-logged
-    /// on every drain, until a config change makes this node a holder or an
-    /// operator intervenes. In practice the only record that lands here is the
-    /// rare rebalance race: a node that held the bucket when it accepted the
-    /// write and lost holdership before draining.
-    fn report_undeliverable_records(&self, undeliverable: &[DrainRecord]) {
-        UNDELIVERABLE_RECORD_COUNT.fetch_add(
-            undeliverable.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        for (_, record, topic) in undeliverable {
+    /// bucket's topic genesis nor join the topic. An administrative record is
+    /// relayed: its envelope is signed by this node as origin, so a holder can
+    /// republish the exact bytes while every receiver still authorizes the
+    /// origin, and the local copy is deleted once a holder takes custody. An
+    /// upsert or delete carries no origin signature, so relaying it would
+    /// publish under the holder's identity with no proof it was
+    /// permission-checked: those stay in the outbox, error-logged on every
+    /// drain, until a config change makes this node a holder or an operator
+    /// intervenes. Returns the keys whose custody moved to a holder.
+    async fn relay_undeliverable_records(
+        &self,
+        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        undeliverable: &[DrainRecord],
+    ) -> Vec<Vec<u8>> {
+        let mut relayed = Vec::new();
+        let device = self.is_device(config);
+        for (record_key, record, topic) in undeliverable {
+            if let Some(config) = config
+                && self.relay_admin_record(config, record).await
+            {
+                relayed.push(record_key.clone());
+                continue;
+            }
+            // A device can never become a holder, so an unrelayable row of its
+            // own would only be error-logged on every drain: drop it instead.
+            if device && !matches!(record.event, DocumentSyncOutboxEvent::AdminOperation { .. }) {
+                warn!(
+                    event = "pipeline.drain.dropped",
+                    target = ?record.target,
+                    "Dropping a document sync outbox record no device can publish"
+                );
+                relayed.push(record_key.clone());
+                continue;
+            }
             error!(
                 event = "pipeline.drain.undeliverable",
                 target = ?record.target,
@@ -704,6 +762,90 @@ impl OperationsTaskHandler {
                 age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
                 "Cannot publish a document sync outbox record from this node and it is not relayable; leaving it in the outbox"
             );
+        }
+        // A relayed record left this node, so it never counts as undeliverable.
+        UNDELIVERABLE_RECORD_COUNT.fetch_add(
+            undeliverable.len().saturating_sub(relayed.len()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        relayed
+    }
+
+    /// Whether this node is a device: configured with a kind that holds no
+    /// sync topic. Unknown kinds count as infrastructure.
+    fn is_device(&self, config: Option<&aruna_core::structs::RealmConfigDocument>) -> bool {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            return false;
+        };
+        config
+            .and_then(|config| {
+                crate::mutate_realm_placement::node_kind(config, net_handle.node_id())
+            })
+            .is_some_and(|kind| !kind.is_sync_eligible())
+    }
+
+    /// Signs one locally originated administrative envelope and hands it to a
+    /// holder. Returns whether a holder took custody.
+    async fn relay_admin_record(
+        &self,
+        config: &aruna_core::structs::RealmConfigDocument,
+        record: &DocumentSyncOutboxRecord,
+    ) -> bool {
+        let DocumentSyncOutboxEvent::AdminOperation {
+            event,
+            origin_signature,
+        } = &record.event
+        else {
+            return false;
+        };
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            return false;
+        };
+        let origin_signature = match origin_signature {
+            Some(signature) => *signature,
+            None if event.origin_node_id == net_handle.node_id() => {
+                match event.signing_bytes(&record.placement) {
+                    Ok(bytes) => net_handle.sign(&bytes),
+                    Err(error) => {
+                        warn!(%error, "Cannot sign an admin event for relay");
+                        return false;
+                    }
+                }
+            }
+            None => return false,
+        };
+        let holders = crate::placement::resolve_shard_holders(config, &record.placement);
+        if holders.is_empty() {
+            return false;
+        }
+        match crate::metadata::forward::relay_admin_event(
+            &self.context,
+            &holders,
+            record.target.clone(),
+            event.clone(),
+            record.placement,
+            origin_signature,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(
+                    event = "pipeline.drain.relayed",
+                    target = ?record.target,
+                    origin = %event.origin_node_id,
+                    "Relayed an admin outbox record to a holder"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    event = "pipeline.drain.relay_failed",
+                    target = ?record.target,
+                    %error,
+                    "No holder accepted a relayed admin outbox record"
+                );
+                false
+            }
         }
     }
 
@@ -839,6 +981,51 @@ impl OperationsTaskHandler {
         if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await
         {
             warn!(task_id = ?task_id, message = %message, "Failed to schedule shard placement sync after local realm config change");
+        }
+    }
+
+    /// Fetches the realm documents on a device, at most once per backoff
+    /// window. A device is judged by state it does not hold, so this is the one
+    /// beat that keeps a revocation or an eviction reaching it.
+    async fn fetch_realm_documents(&self) {
+        let now = unix_timestamp_millis();
+        {
+            let due = self
+                .realm_documents
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if due.1 > now {
+                return;
+            }
+        }
+        let fetched = crate::device::realm_documents::fetch_realm_documents(
+            &self.context,
+            REALM_DOCUMENTS_BUDGET,
+        )
+        .await;
+        if fetched {
+            crate::device::status::note_contact(&self.context).await;
+        }
+        let mut state = self
+            .realm_documents
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let attempts = match fetched {
+            true => 0,
+            false => state.0.saturating_add(1),
+        };
+        let after = match fetched {
+            true => REALM_DOCUMENTS_AFTER.as_millis() as u64,
+            false => queue_retry_after_ms(attempts),
+        };
+        *state = (attempts, now.saturating_add(after));
+    }
+
+    /// Refreshes the metadata replicas this device keeps, on the same beat the
+    /// folders run on. A node that keeps none does nothing.
+    async fn refresh_device_replicas(&self) {
+        if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
+            crate::device::status::note_sync(&self.context).await;
         }
     }
 
@@ -1175,6 +1362,7 @@ impl OperationsTaskHandler {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut invocation.defer,
+            !self.is_device(config),
             |topic| {
                 net_handle
                     .document_sync_topic_exists(topic)
@@ -1199,8 +1387,15 @@ impl OperationsTaskHandler {
                     Some((record_ms, record.target.clone(), *topic, record.placement));
             }
         }
-        invocation.undeliverable += undeliverable.len();
-        self.report_undeliverable_records(&undeliverable);
+        let relayed = self
+            .relay_undeliverable_records(config, &undeliverable)
+            .await;
+        invocation.undeliverable += undeliverable.len().saturating_sub(relayed.len());
+        if !relayed.is_empty()
+            && let Err(error) = delete_outbox_records(&self.context.storage_handle, relayed).await
+        {
+            warn!(%error, "Failed to delete relayed admin outbox records");
+        }
 
         let (groups, subbatches) = Self::build_drain_batches(to_publish);
         invocation.groups += groups;
@@ -2199,6 +2394,23 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// Retries the terminal publications receipted executions still owe. The
+    /// reservation row keeps the obligation durable, so the retry re-arms until
+    /// every one of them is published and its capacity released.
+    async fn settle_job_terminals(&self) {
+        let pending = match settle_terminals(self.context.as_ref()).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::SettleJobTerminals, error = %error, "Failed to settle terminal job publications");
+                true
+            }
+        };
+        if pending {
+            self.reschedule_timer(TaskKey::SettleJobTerminals, SETTLE_RETRY_AFTER)
+                .await;
+        }
+    }
+
     /// Runs every witness round whose persisted deadline has elapsed.
     async fn drain_job_witness_queue(&self) {
         let now_ms = unix_timestamp_millis();
@@ -2409,6 +2621,8 @@ async fn durable_rearm_loop(
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_intake_timer(&context.storage_handle, &task_handle).await;
+        restore_sync_timers(&context, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2535,6 +2749,11 @@ impl TaskQueues {
         spawn_queue_rearm(&context, &task_handle, shutdown);
         restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_intake_timer(&context.storage_handle, &task_handle).await;
+        // Before the first refresh: a queued edit is the one local change no
+        // holder would hand back.
+        crate::device::edit::replay_queued_edits(&context).await;
+        restore_sync_timers(&context, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
@@ -2618,6 +2837,15 @@ impl InboundTaskHandler for OperationsTaskHandler {
         delete_persisted_timer(&self.context.storage_handle, &key).await;
         match key {
             TaskKey::RealmPresence { realm_id, node_id } => {
+                // A User-kind device is DHT read-only and never publishes
+                // presence. An unreadable config is bootstrap, which announces.
+                if matches!(
+                    crate::metadata::forward::is_user_origin(&self.context, realm_id, node_id)
+                        .await,
+                    Ok(true)
+                ) {
+                    return;
+                }
                 let op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
                     realm_id,
                     node_id,
@@ -2715,6 +2943,44 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainJobWitnessQueue => {
                 self.drain_job_witness_queue().await;
+            }
+            TaskKey::SettleJobTerminals => {
+                self.settle_job_terminals().await;
+            }
+            TaskKey::ReconcileSyncedFolders => {
+                let after = match crate::device::sync::reconcile_folders(&self.context).await {
+                    DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
+                    DrainOutcome::More => RECONCILE_CONTINUE_AFTER,
+                    DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
+                };
+                self.reschedule_timer(TaskKey::ReconcileSyncedFolders, after)
+                    .await;
+                // After the folders, never before them: an unreachable realm
+                // must not hold up the owner's own files.
+                self.fetch_realm_documents().await;
+                self.refresh_device_replicas().await;
+            }
+            TaskKey::DrainSyncUploadOutbox => {
+                let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
+                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_RETRY_AFTER),
+                    DrainOutcome::More => Some(UPLOAD_CONTINUE_AFTER),
+                    DrainOutcome::Idle => None,
+                };
+                if let Some(after) = after {
+                    self.reschedule_timer(TaskKey::DrainSyncUploadOutbox, after)
+                        .await;
+                }
+            }
+            TaskKey::DrainDeviceIntake => {
+                let after = match crate::device::drain::drain_intake(&self.context).await {
+                    DrainOutcome::Deferred => Some(INTAKE_DEFER_RETRY_AFTER),
+                    DrainOutcome::More => Some(INTAKE_CONTINUE_AFTER),
+                    DrainOutcome::Idle => None,
+                };
+                if let Some(after) = after {
+                    self.reschedule_timer(TaskKey::DrainDeviceIntake, after)
+                        .await;
+                }
             }
         }
     }
@@ -3301,6 +3567,7 @@ mod tests {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut defer,
+            true,
             |_| {
                 calls += 1;
                 calls > 1
@@ -3339,23 +3606,21 @@ mod tests {
             node(1),
             target,
             Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(AdminDocumentEvent {
-                    event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
-                    target: AdminDocumentTarget::User { user_id },
-                    origin_node_id: origin,
-                    origin_seq,
-                    observed: AdminDocumentClock::default(),
-                    actor: aruna_core::structs::Actor {
-                        node_id: node(1),
-                        user_id,
-                        realm_id,
-                    },
-                    op: AdminDocumentOperation::UserNameSet {
-                        name: format!("user-{origin_seq}"),
-                    },
-                }),
-            },
+            DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+                event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
+                target: AdminDocumentTarget::User { user_id },
+                origin_node_id: origin,
+                origin_seq,
+                observed: AdminDocumentClock::default(),
+                actor: aruna_core::structs::Actor {
+                    node_id: node(1),
+                    user_id,
+                    realm_id,
+                },
+                op: AdminDocumentOperation::UserNameSet {
+                    name: format!("user-{origin_seq}"),
+                },
+            }),
             placement,
             false,
         )
@@ -3397,6 +3662,7 @@ mod tests {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut defer,
+            true,
             |topic| topic != blocked_topic,
             |_| DeferOutcome::Retry,
         );
@@ -3418,6 +3684,7 @@ mod tests {
         let (_, deferred, _) = partition_drain_records(
             vec![(b"first".to_vec(), shard_topic_record(1), topic)],
             &mut defer,
+            true,
             |_| false,
             |_| DeferOutcome::Retry,
         );
@@ -3429,6 +3696,7 @@ mod tests {
                 (b"second".to_vec(), shard_topic_record(2), topic),
             ],
             &mut defer,
+            true,
             |_| true,
             |_| DeferOutcome::Retry,
         );
@@ -3447,6 +3715,7 @@ mod tests {
         let (_, deferred, _) = partition_drain_records(
             vec![(b"first".to_vec(), admin_record(origin, 1), blocked_topic)],
             &mut defer,
+            true,
             |_| false,
             |_| DeferOutcome::Retry,
         );
@@ -3455,6 +3724,7 @@ mod tests {
         let (published, deferred, undeliverable) = partition_drain_records(
             vec![(b"second".to_vec(), admin_record(origin, 2), healthy_topic)],
             &mut defer,
+            true,
             |_| true,
             |_| DeferOutcome::Retry,
         );
@@ -3577,7 +3847,8 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        let origin = node(4);
+        // The local node is the origin: it can only publish envelopes it signs.
+        let origin = net.node_id();
         let blocked_target = DocumentSyncTarget::Group {
             group_id: Ulid::from_parts(11, 1),
         };
@@ -3971,7 +4242,7 @@ mod tests {
 
         let mut defer = DrainDeferState::default();
         let (to_publish, deferred, undeliverable) =
-            partition_drain_records(records, &mut defer, |_| true, |_| DeferOutcome::Retry);
+            partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
 
         assert!(deferred.is_empty());
         assert!(undeliverable.is_empty());
@@ -3995,6 +4266,7 @@ mod tests {
         let (to_publish, deferred, undeliverable) = partition_drain_records(
             records,
             &mut defer,
+            true,
             |_| false,
             |_| {
                 classified += 1;
@@ -5728,5 +6000,81 @@ mod tests {
             .await
             .expect("outbox read");
         assert!(remaining.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_skips_holders() {
+        // A device publishes no holder record, so the refresh does not even arm
+        // its own timer.
+        let realm_id = RealmId::from_bytes([57u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(
+            net.node_id(),
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        );
+        let actor = Actor {
+            node_id: net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: config.to_bytes(&actor).expect("config bytes").into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write: {other:?}"),
+        }
+
+        OperationsTaskHandler::new(context, JobsRuntime::new())
+            .refresh_blob_holders()
+            .await;
+
+        let timer = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                key: ByteView::from(
+                    postcard::to_allocvec(&TaskKey::RefreshBlobHolders).expect("timer key"),
+                ),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            timer,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+
+        net.shutdown().await;
     }
 }

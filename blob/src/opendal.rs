@@ -78,6 +78,9 @@ pub(crate) async fn check_staging_source(
     guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<(), StagingSourceError> {
+    if crate::fs_source::is_local_access(access) {
+        return crate::fs_source::check_local(access).await;
+    }
     let (operator, ..) = build_source_operator(guard, access).await?;
     let ResolvedSourceAccess::OpenDal { kind, .. } = access;
     check_operator(&operator, *kind).await
@@ -103,6 +106,9 @@ pub(crate) async fn head_staging_source(
     guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {
+    if crate::fs_source::is_local_access(access) {
+        return crate::fs_source::head_local(access).await;
+    }
     let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = match version {
         Some(version) => operator.stat_with(path).version(version).await,
@@ -130,6 +136,9 @@ pub(crate) async fn read_staging_source(
     ),
     StagingSourceError,
 > {
+    if crate::fs_source::is_local_access(access) {
+        return crate::fs_source::read_local(access, range).await;
+    }
     let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = head_staging_source(guard, access).await?;
     let capability = operator.info().full_capability();
@@ -181,6 +190,9 @@ pub(crate) async fn list_staging_source(
     recursive: bool,
     files_only: bool,
 ) -> Result<(Vec<aruna_core::structs::SourceEntry>, bool), StagingSourceError> {
+    if crate::fs_source::is_local_access(access) {
+        return crate::fs_source::list_local(access, offset, limit, recursive, files_only).await;
+    }
     let ResolvedSourceAccess::OpenDal {
         kind, config, path, ..
     } = access;
@@ -241,6 +253,7 @@ async fn list_operator(
             size: (kind == aruna_core::structs::SourceEntryKind::File)
                 .then(|| entry.metadata().content_length()),
             modified: entry.metadata().last_modified().map(Into::into),
+            stat: None,
         });
     }
 
@@ -275,7 +288,11 @@ async fn build_source_operator<'access>(
                 }
                 // opendal's ftp service exposes no way to constrain the passive
                 // data address, so the data socket cannot be screened.
-                SourceConnectorKind::Ftp | SourceConnectorKind::ArunaNative => {
+                // Native and local-directory sources never reach an operator:
+                // both are answered before one is built.
+                SourceConnectorKind::Ftp
+                | SourceConnectorKind::ArunaNative
+                | SourceConnectorKind::LocalDirectory => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
             };

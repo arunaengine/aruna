@@ -16,10 +16,10 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
-    MetadataQueryResults, MetadataRequestDurability, MetadataRoCratePage, MetadataSearchHit,
-    MetadataUpsertEntityRequest, MetadataValidationViolation,
+    MetadataBatch, MetadataBatchSource, MetadataCreateCrateRequest, MetadataDot, MetadataEffect,
+    MetadataError, MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy,
+    MetadataQuadOp, MetadataQueryResults, MetadataRequestDurability, MetadataRoCratePage,
+    MetadataSearchHit, MetadataUpsertEntityRequest, MetadataValidationViolation,
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
@@ -28,6 +28,7 @@ use aruna_core::structs::{
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
@@ -53,6 +54,7 @@ use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
+use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
 use super::profile_shacl::{
     ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
@@ -67,7 +69,7 @@ use super::query_cache::{
 };
 use super::repository::{iter_registry_effect, parse_registry_iter};
 use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
-use super::search_enrichment::{hit_snippet, hit_title};
+use super::search_enrichment::{hit_snippet, hit_title, hit_types};
 use super::summary_cache::summary_cache;
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
@@ -75,7 +77,7 @@ use crate::auth::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::permission_rules::GroupPermissionRules;
-use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
+use crate::realm_peer::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
@@ -297,6 +299,7 @@ struct MetadataInner {
     deferred_persist_running: AtomicBool,
     profile_validation_disabled: bool,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
+    peer_contacts: PeerContacts,
 }
 
 #[derive(Clone)]
@@ -906,6 +909,7 @@ impl MetadataHandle {
                 deferred_persist_running: AtomicBool::new(false),
                 profile_validation_disabled: metadata_options.profile_validation_disabled,
                 profile_shacl,
+                peer_contacts: PeerContacts::default(),
             }),
             storage_priority: StoragePriority::Foreground,
         })
@@ -1898,6 +1902,42 @@ impl MetadataHandle {
                 })
                 .await
             }
+            pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
+                Box::pin(async { super::sync_pull::serve_sync_pull(context, peer, pull).await })
+                    .await
+            }
+            listing @ MetadataTransportMessage::ForwardListVersions { .. } => {
+                Box::pin(async {
+                    super::sync_pull::serve_list_versions(context, peer, listing).await
+                })
+                .await
+            }
+            create @ MetadataTransportMessage::ForwardCreateBucket { .. } => {
+                Box::pin(async { super::forward::apply_bucket_create(context, peer, create).await })
+                    .await
+            }
+            fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
+                Box::pin(async {
+                    super::forward::serve_realm_documents(context, peer, fetch).await
+                })
+                .await
+            }
+            fetch @ MetadataTransportMessage::FetchGraphState { .. } => {
+                Box::pin(async { super::forward::serve_graph_state(context, peer, fetch).await })
+                    .await
+            }
+            forward @ MetadataTransportMessage::ForwardApplyBatch { .. } => {
+                Box::pin(async { super::forward::apply_device_batch(context, peer, forward).await })
+                    .await
+            }
+            forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
+                Box::pin(async { super::forward::apply_admin_relay(context, peer, forward).await })
+                    .await
+            }
+            forward @ MetadataTransportMessage::ForwardGroupCreate { .. } => {
+                Box::pin(async { super::forward::apply_group_create(context, peer, forward).await })
+                    .await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
@@ -1929,6 +1969,15 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedProfileValidation { .. }
             | MetadataTransportMessage::ForwardedProfileValidationStatus { .. }
             | MetadataTransportMessage::ReferencePreflightResults { .. }
+            | MetadataTransportMessage::ForwardedAdminEventQueued
+            | MetadataTransportMessage::ForwardedGroupCreated { .. }
+            | MetadataTransportMessage::ForwardedGroupCreateConflict { .. }
+            | MetadataTransportMessage::ForwardedSyncPull { .. }
+            | MetadataTransportMessage::ForwardedVersions { .. }
+            | MetadataTransportMessage::ForwardedBucketCreated { .. }
+            | MetadataTransportMessage::FetchedRealmDocuments { .. }
+            | MetadataTransportMessage::FetchedGraphState { .. }
+            | MetadataTransportMessage::ForwardedApplyBatch { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -2227,11 +2276,12 @@ impl MetadataHandle {
                 &self.inner.storage_handle,
                 peer,
                 realm_id,
-                true,
+                PeerTrust::Vouched(None),
             )
             .await
             .map_err(|_| MetadataReadError::Unavailable)?;
         }
+        self.note_peer_contact(peer);
         Ok(auth)
     }
 
@@ -2244,11 +2294,13 @@ impl MetadataHandle {
             return Err(MetadataWritePeerError::Unauthorized);
         };
         let MetadataAuthToken::Bearer(token) = auth_token else {
-            return self
+            let auth = self
                 .authorize_remote_peer(peer, Some(auth_token))
                 .await
                 .map_err(MetadataWritePeerError::Unavailable)?
-                .ok_or(MetadataWritePeerError::Unauthorized);
+                .ok_or(MetadataWritePeerError::Unauthorized)?;
+            self.note_peer_contact(peer);
+            return Ok(auth);
         };
         let auth = validate_aruna_bearer_token(&self.inner.auth_validation, token.as_str())
             .await
@@ -2268,12 +2320,24 @@ impl MetadataHandle {
                 &self.inner.storage_handle,
                 peer,
                 auth.realm_id,
-                false,
+                PeerTrust::Member,
             )
             .await
             .map_err(MetadataWritePeerError::Unavailable)?;
         }
+        self.note_peer_contact(peer);
         Ok(auth)
+    }
+
+    /// This node's own liveness observation, taken where the peer identity is
+    /// authorized. Never realm state: it is neither replicated nor published.
+    fn note_peer_contact(&self, peer: NodeId) {
+        self.inner.peer_contacts.note(peer, unix_timestamp_millis());
+    }
+
+    /// When this node last saw each authorized peer.
+    pub fn peer_contacts(&self) -> PeerContacts {
+        self.inner.peer_contacts.clone()
     }
 
     pub(crate) async fn claims_for_revocation(
@@ -2874,9 +2938,14 @@ where
     if auth.realm_id != local_realm_id {
         return Err(MetadataReadError::Forbidden);
     }
-    ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, auth.realm_id, false)
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?;
+    ensure_remote_metadata_peer_is_configured_for_realm(
+        storage_handle,
+        peer,
+        auth.realm_id,
+        PeerTrust::Member,
+    )
+    .await
+    .map_err(|_| MetadataReadError::Unavailable)?;
     Ok(auth)
 }
 
@@ -2931,13 +3000,14 @@ where
             )
         })?,
     };
-    ensure_remote_metadata_peer_is_configured_for_realm(
-        storage_handle,
-        peer,
-        peer_realm_id,
-        internal_auth,
-    )
-    .await?;
+    // Internal auth is node-vouched, so the gate is told which user the peer
+    // vouches for: an owner-bound device passes only for its own owner.
+    let trust = match internal_auth {
+        true => PeerTrust::Vouched(auth_context.as_ref().map(|auth| auth.user_id)),
+        false => PeerTrust::Member,
+    };
+    ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, peer_realm_id, trust)
+        .await?;
     Ok(auth_context)
 }
 
@@ -2945,7 +3015,7 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
     storage_handle: &StorageHandle,
     peer: NodeId,
     realm_id: RealmId,
-    require_internal_trust: bool,
+    trust: PeerTrust,
 ) -> Result<(), MetadataError> {
     match storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -2960,7 +3030,7 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
         }) => {
             let document = RealmConfigDocument::from_bytes(&bytes)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            ensure_realm_peer(&document, peer, realm_id, require_internal_trust)
+            ensure_peer_trust(&document, peer, realm_id, trust)
                 .map_err(|error| {
                     MetadataError::InvalidInput(match error {
                         RealmPeerError::RealmMismatch { configured, .. } => format!(
@@ -3120,6 +3190,8 @@ fn metadata_effect_mutates_graph(effect: &MetadataEffect) -> bool {
             | MetadataEffect::SetGraphPolicy { .. }
             | MetadataEffect::AddGraphPeer { .. }
             | MetadataEffect::DeleteGraph { .. }
+            | MetadataEffect::InstallSnapshot { .. }
+            | MetadataEffect::MergeBatch { .. }
     )
 }
 
@@ -3138,6 +3210,8 @@ fn effect_rejects_deleted_graph(effect: &MetadataEffect) -> bool {
             | MetadataEffect::ExportRoCrate { .. }
             | MetadataEffect::ExportRoCrateSummary { .. }
             | MetadataEffect::ExportRoCratePage { .. }
+            | MetadataEffect::PlanBatch { .. }
+            | MetadataEffect::MergeBatch { .. }
     )
 }
 
@@ -3349,11 +3423,12 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     let effect_name = metadata_effect_kind(&effect);
     let auth = AllowAllAuthorizer;
     let graph_iri = effect_graph_iri(&effect);
-    let reads_existing_graph = matches!(
+    let needs_existing_graph = matches!(
         effect,
         MetadataEffect::ExportRoCrate { .. }
             | MetadataEffect::ExportRoCrateSummary { .. }
             | MetadataEffect::ExportRoCratePage { .. }
+            | MetadataEffect::PlanBatch { .. }
     );
     let persist_document_sync_after_success = metadata_effect_persists_document_sync(&effect);
     let deferred_persist_after_success = metadata_effect_defers_persist(&effect);
@@ -3821,6 +3896,120 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             );
             result
         }
+        // Device replicas
+        MetadataEffect::GraphSnapshot { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.graph_snapshot",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                quad_count = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.graph_snapshot(&GraphId::new(&graph_iri)))
+                .map(|snapshot| {
+                    call_span.record("quad_count", snapshot.quads.len() as u64);
+                    MetadataEvent::GraphSnapshotResult {
+                        graph_iri: graph_iri.clone(),
+                        snapshot: Box::new(snapshot),
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "graph_snapshot",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::InstallSnapshot {
+            graph_iri,
+            snapshot,
+        } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.install_snapshot",
+                graph_iri = %graph_iri,
+                quad_count = snapshot.quads.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                applied = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.install_graph_snapshot(&snapshot))
+                .map(|merged| {
+                    call_span.record("applied", merged.applied);
+                    MetadataEvent::SnapshotInstalled {
+                        graph_iri: graph_iri.clone(),
+                        applied: merged.applied,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "install_snapshot",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        // OR-Set metadata graphs
+        MetadataEffect::PlanBatch {
+            graph_iri,
+            actor,
+            source,
+        } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.plan_batch",
+                graph_iri = %graph_iri,
+                jsonld_len = source.jsonld().len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                batch_ops = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| plan_batch(&node, &auth, &graph_iri, actor, &source))
+                .map(|batch| {
+                    call_span.record("batch_ops", batch.ops.len() as u64);
+                    MetadataEvent::BatchPlanned {
+                        graph_iri: graph_iri.clone(),
+                        batch,
+                    }
+                });
+            record_metadata_result(&call_span, "plan_batch", Some(&graph_iri), started, &result);
+            result
+        }
+        MetadataEffect::MergeBatch { graph_iri, batch } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.merge_batch",
+                graph_iri = %graph_iri,
+                batch_ops = batch.ops.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                applied = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| to_craqle_batch(&batch).and_then(|batch| node.merge_batch(&batch)))
+                .map(|merged| {
+                    call_span.record("applied", merged.applied);
+                    MetadataEvent::BatchMerged {
+                        graph_iri: graph_iri.clone(),
+                        applied: merged.applied,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "merge_batch",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
     });
 
     let persist_error = if persist_document_sync_after_success && result.is_ok() {
@@ -3836,10 +4025,10 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         (_, Some(error)) => MetadataEvent::Error { graph_iri, error },
         (Ok(event), None) => event,
         (Err(error), None) => {
-            // Craqle has no public typed missing-graph error on the export
-            // path, so probe graph existence to distinguish a pending
-            // materialization from a genuine backend failure.
-            let error = if reads_existing_graph
+            // Craqle has no public typed missing-graph error, so probe graph
+            // existence to distinguish a materialization that has not caught up
+            // (retryable, 503) from a genuine backend failure.
+            let error = if needs_existing_graph
                 && graph_iri
                     .as_deref()
                     .is_some_and(|iri| matches!(node.contains_graph(&GraphId::new(iri)), Ok(false)))
@@ -3929,7 +4118,14 @@ fn metadata_effect_persists_document_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::ExportRoCrateSummary { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ListGraphs
-        | MetadataEffect::ContainsGraph { .. } => false,
+        | MetadataEffect::ContainsGraph { .. }
+        | MetadataEffect::GraphSnapshot { .. }
+        // A device runs no document sync, so an installed snapshot has no
+        // journal entry to flush.
+        | MetadataEffect::InstallSnapshot { .. }
+        // A merged batch publishes nothing back to irokle.
+        | MetadataEffect::PlanBatch { .. }
+        | MetadataEffect::MergeBatch { .. } => false,
     }
 }
 
@@ -4593,6 +4789,10 @@ fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
         MetadataEffect::DeleteGraph { .. } => "delete_graph",
         MetadataEffect::ListGraphs => "list_graphs",
         MetadataEffect::ContainsGraph { .. } => "contains_graph",
+        MetadataEffect::PlanBatch { .. } => "plan_batch",
+        MetadataEffect::MergeBatch { .. } => "merge_batch",
+        MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
+        MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
     }
 }
 
@@ -4614,6 +4814,10 @@ fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
         MetadataEvent::GraphDeleted { .. } => "graph_deleted",
         MetadataEvent::GraphListResult { .. } => "graph_list_result",
         MetadataEvent::ContainsGraphResult { .. } => "contains_graph_result",
+        MetadataEvent::BatchPlanned { .. } => "batch_planned",
+        MetadataEvent::BatchMerged { .. } => "batch_merged",
+        MetadataEvent::GraphSnapshotResult { .. } => "graph_snapshot_result",
+        MetadataEvent::SnapshotInstalled { .. } => "snapshot_installed",
         MetadataEvent::Error { .. } => "error",
     }
 }
@@ -4745,6 +4949,25 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         }
         MetadataTransportMessage::ReferencePreflight { .. } => "reference_preflight",
         MetadataTransportMessage::ReferencePreflightResults { .. } => "reference_preflight_results",
+        MetadataTransportMessage::ForwardAdminEvent { .. } => "forward_admin_event",
+        MetadataTransportMessage::ForwardedAdminEventQueued => "forwarded_admin_event_queued",
+        MetadataTransportMessage::ForwardGroupCreate { .. } => "forward_group_create",
+        MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
+        MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
+        MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
+        MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
+        MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
+        MetadataTransportMessage::ForwardCreateBucket { .. } => "forward_create_bucket",
+        MetadataTransportMessage::ForwardedBucketCreated { .. } => "forwarded_bucket_created",
+        MetadataTransportMessage::FetchRealmDocuments { .. } => "fetch_realm_documents",
+        MetadataTransportMessage::FetchedRealmDocuments { .. } => "fetched_realm_documents",
+        MetadataTransportMessage::FetchGraphState { .. } => "fetch_graph_state",
+        MetadataTransportMessage::FetchedGraphState { .. } => "fetched_graph_state",
+        MetadataTransportMessage::ForwardApplyBatch { .. } => "forward_apply_batch",
+        MetadataTransportMessage::ForwardedApplyBatch { .. } => "forwarded_apply_batch",
+        MetadataTransportMessage::ForwardedGroupCreateConflict { .. } => {
+            "forwarded_group_create_conflict"
+        }
     }
 }
 
@@ -4763,7 +4986,11 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::ExportRoCrate { graph_iri }
         | MetadataEffect::ExportRoCrateSummary { graph_iri }
         | MetadataEffect::DeleteGraph { graph_iri }
-        | MetadataEffect::ContainsGraph { graph_iri } => Some(graph_iri.clone()),
+        | MetadataEffect::ContainsGraph { graph_iri }
+        | MetadataEffect::GraphSnapshot { graph_iri }
+        | MetadataEffect::InstallSnapshot { graph_iri, .. }
+        | MetadataEffect::PlanBatch { graph_iri, .. }
+        | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
         MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
         MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris
             .as_ref()
@@ -4870,6 +5097,94 @@ fn metadata_batch_from_craqle(batch: Batch) -> MetadataBatch {
     }
 }
 
+fn to_craqle_batch(batch: &MetadataBatch) -> Result<Batch, CraqleError> {
+    let timestamp =
+        chrono::DateTime::from_timestamp_millis(batch.timestamp_millis).ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::InvalidBatch(
+                "batch timestamp is out of range".to_string(),
+            ))
+        })?;
+    Ok(Batch {
+        graph: GraphId::new(&batch.graph_iri),
+        actor: ActorId::from_bytes(batch.actor),
+        counter: batch.counter,
+        base_clock: batch.base_clock.clone(),
+        ops: batch
+            .ops
+            .iter()
+            .map(|op| match op {
+                MetadataQuadOp::Add {
+                    subject,
+                    predicate,
+                    object,
+                    dot,
+                } => craqle::QuadOp::Add {
+                    subject: craqle::EncodedTerm(subject.clone()),
+                    predicate: craqle::EncodedTerm(predicate.clone()),
+                    object: craqle::EncodedTerm(object.clone()),
+                    dot: craqle::Dot {
+                        actor: ActorId::from_bytes(dot.actor),
+                        counter: dot.counter,
+                    },
+                },
+                MetadataQuadOp::Remove {
+                    subject,
+                    predicate,
+                    object,
+                    witnessed,
+                } => craqle::QuadOp::Remove {
+                    subject: craqle::EncodedTerm(subject.clone()),
+                    predicate: craqle::EncodedTerm(predicate.clone()),
+                    object: craqle::EncodedTerm(object.clone()),
+                    witnessed: witnessed.clone(),
+                },
+            })
+            .collect(),
+        timestamp,
+    })
+}
+
+/// Plans `source` against the local graph and publishes it as a batch under
+/// `actor`, witnessing the graph's clock at plan time.
+fn plan_batch(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    graph_iri: &str,
+    actor: [u8; 32],
+    source: &MetadataBatchSource,
+) -> Result<MetadataBatch, CraqleError> {
+    let graph = GraphId::new(graph_iri);
+    // Planning against a graph this node has not materialized yet would omit
+    // the removals the change set needs, so the caller must retry instead.
+    if !node.contains_graph(&graph)? {
+        return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
+            "metadata graph `{graph_iri}` is not materialized yet"
+        ))));
+    }
+    let changes = match source {
+        MetadataBatchSource::ReplaceRoCrate { jsonld } => {
+            node.plan_rocrate_document_checked(auth, &graph, jsonld)?
+        }
+        MetadataBatchSource::UpsertDataEntity { jsonld } => {
+            node.plan_patch_data(auth, &craqle_patch_request(&graph, jsonld)?)?
+        }
+        MetadataBatchSource::UpsertContextualEntity { jsonld } => {
+            node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)?
+        }
+    };
+    let base_clock = node.vector_clock(&graph)?;
+    let batch = Batch::from_changes(
+        graph,
+        ActorId::from_bytes(actor),
+        1,
+        base_clock,
+        changes,
+        chrono::Utc::now(),
+    )
+    .map_err(|error| CraqleError::RoCrate(RoCrateError::InvalidBatch(error.to_string())))?;
+    Ok(metadata_batch_from_craqle(batch))
+}
+
 fn metadata_rocrate_page_from_craqle(page: craqle::RoCratePage) -> MetadataRoCratePage {
     MetadataRoCratePage {
         jsonld: page.jsonld,
@@ -4897,6 +5212,7 @@ fn metadata_search_hit_from_craqle(
         score: hit.score,
         title,
         snippet,
+        subject_types: hit_types(properties),
     }
 }
 
@@ -6119,6 +6435,7 @@ async fn search_candidate_graphs(
                 document_id: record.document_id.to_string(),
                 group_id: record.group_id.to_string(),
                 title: hit_title(&properties, &record.document_path, &subject_iri),
+                subject_types: hit_types(&properties),
                 document_path: record.document_path,
                 graph_iri: record.graph_iri,
                 subject_iri,
@@ -6659,7 +6976,7 @@ async fn resolve_graph_visibility_scope(
     )
     .await
     .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let policy_user = auth_context.as_ref().map(|auth| auth.user_id);
+    let policy_auth = auth_context.as_ref();
     let records = Arc::new(
         records
             .iter()
@@ -6670,7 +6987,7 @@ async fn resolve_graph_visibility_scope(
                         evaluator
                             .evaluate(&crate::metadata::api::metadata_read_request(
                                 &record.permission_path,
-                                policy_user.as_ref(),
+                                policy_auth,
                             ))
                             .is_ok()
                     })
@@ -7322,6 +7639,149 @@ mod tests {
         (metadata_dir, metadata_handle)
     }
 
+    async fn plan_entity(
+        handle: &MetadataHandle,
+        graph_iri: &str,
+        actor: u8,
+        name: &str,
+    ) -> MetadataBatch {
+        let event = handle
+            .send_metadata_effect(MetadataEffect::PlanBatch {
+                graph_iri: graph_iri.to_string(),
+                actor: [actor; 32],
+                source: MetadataBatchSource::UpsertContextualEntity {
+                    jsonld: format!(r##"{{"@id":"#{name}","@type":"Person","name":"{name}"}}"##),
+                },
+            })
+            .await;
+        let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) = event else {
+            panic!("expected a planned batch, got {event:?}");
+        };
+        batch
+    }
+
+    async fn merge_into(handle: &MetadataHandle, graph_iri: &str, batch: &MetadataBatch) -> bool {
+        let event = handle
+            .send_metadata_effect(MetadataEffect::MergeBatch {
+                graph_iri: graph_iri.to_string(),
+                batch: batch.clone(),
+            })
+            .await;
+        let Event::Metadata(MetadataEvent::BatchMerged { applied, .. }) = event else {
+            panic!("expected a merged batch, got {event:?}");
+        };
+        applied
+    }
+
+    async fn graph_state(
+        handle: &MetadataHandle,
+        graph_iri: &str,
+    ) -> Vec<(String, String, String)> {
+        let event = handle
+            .send_metadata_effect(MetadataEffect::GraphSnapshot {
+                graph_iri: graph_iri.to_string(),
+            })
+            .await;
+        let Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) = event else {
+            panic!("expected a graph snapshot, got {event:?}");
+        };
+        let mut quads = snapshot
+            .quads
+            .into_iter()
+            .map(|quad| (quad.subject.0, quad.predicate.0, quad.object.0))
+            .collect::<Vec<_>>();
+        quads.sort();
+        quads
+    }
+
+    #[tokio::test]
+    async fn plan_needs_graph() {
+        // A graph this node has not materialized yet is a lagging replica, so
+        // planning defers instead of rejecting the change set for good.
+        let (_storage_dir, storage) = auth_storage();
+        let (_metadata_dir, handle) = memory_handle(storage);
+
+        let event = handle
+            .send_metadata_effect(MetadataEffect::PlanBatch {
+                graph_iri: "urn:test:orset:absent".to_string(),
+                actor: [7u8; 32],
+                source: MetadataBatchSource::UpsertDataEntity {
+                    jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#
+                        .to_string(),
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Metadata(MetadataEvent::Error {
+                error: MetadataError::GraphNotFound,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn merges_converge() {
+        // Two holders plan against the same base and merge in opposite orders.
+        let graph_iri = "urn:test:orset:converge";
+        let (_left_storage_dir, left_storage) = auth_storage();
+        let (_left_dir, left) = memory_handle(left_storage);
+        let (_right_storage_dir, right_storage) = auth_storage();
+        let (_right_dir, right) = memory_handle(right_storage);
+        let request = MetadataCreateCrateRequest {
+            graph_iri: graph_iri.to_string(),
+            name: "Converge".to_string(),
+            description: "OR-Set convergence".to_string(),
+            date_published: "2026-08-26".to_string(),
+            license: None,
+            policy: MetadataGraphPolicy {
+                public: true,
+                permission_paths: Vec::new(),
+            },
+            durability: MetadataRequestDurability::Durable,
+            deterministic_actor: Some([1u8; 32]),
+        };
+        for handle in [&left, &right] {
+            assert!(matches!(
+                handle
+                    .send_metadata_effect(MetadataEffect::CreateCrate {
+                        request: request.clone(),
+                    })
+                    .await,
+                Event::Metadata(MetadataEvent::CreateCrateResult { .. })
+            ));
+        }
+
+        let first = plan_entity(&left, graph_iri, 2, "ada").await;
+        let second = plan_entity(&right, graph_iri, 3, "grace").await;
+        assert!(merge_into(&left, graph_iri, &first).await);
+        assert!(merge_into(&left, graph_iri, &second).await);
+        assert!(merge_into(&right, graph_iri, &second).await);
+        assert!(merge_into(&right, graph_iri, &first).await);
+        assert!(
+            !merge_into(&left, graph_iri, &first).await,
+            "a batch dot the clock already covers is a no-op"
+        );
+
+        let left_render = left
+            .export_rocrate_jsonld(graph_iri.to_string())
+            .await
+            .expect("left render");
+        let right_render = right
+            .export_rocrate_jsonld(graph_iri.to_string())
+            .await
+            .expect("right render");
+        assert_eq!(left_render, right_render);
+        // The export renders only entities the crate references, so both
+        // concurrent adds are checked against the authoritative graph state.
+        let left_state = graph_state(&left, graph_iri).await;
+        assert_eq!(left_state, graph_state(&right, graph_iri).await);
+        for subject in ["<#ada>", "<#grace>"] {
+            assert!(left_state.iter().any(|(held, ..)| held == subject));
+        }
+    }
+
     #[tokio::test]
     async fn versions_roundtrip() {
         let (_storage_dir, storage) = auth_storage();
@@ -7686,6 +8146,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: Some(restrictions),
+            session: None,
         };
         let (_dir, storage) = auth_storage();
         persist_realm_config(&storage, realm_id, &[peer]).await;
@@ -8098,6 +8559,8 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::generate().to_string(),
+            sid: None,
+            session_kind: None,
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

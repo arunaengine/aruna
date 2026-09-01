@@ -7,10 +7,10 @@ use crate::structs::{
     Actor, BandPool, BindingDirectory, BindingError, BindingScope, CandidateMapNode,
     CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
     DocumentClass, FrozenStrategySelector, HandleRange, HandleRangeDirectory, JobId,
-    KIND_LABEL_KEY, METADATA_HANDLE, NodePlacementEntry, PlacementActivation, PlacementBinding,
-    PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, PlacementTransition,
-    SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start, coordinator_spans,
-    shard_for_subject,
+    KIND_LABEL_KEY, METADATA_HANDLE, NODE_LABEL_KEY, NodePlacementEntry, PlacementActivation,
+    PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
+    PlacementTransition, SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start,
+    coordinator_spans, shard_for_subject,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -221,6 +221,12 @@ pub struct QuotaConfig {
     pub max_groups_per_user: Option<u32>,
     pub user_group_cap_overrides: Vec<UserGroupCapOverride>,
     pub max_devices_per_user: Option<u32>,
+    /// Inbound requests one user device may send a realm node per minute.
+    /// `None` leaves devices uncapped.
+    pub device_requests_per_minute: Option<u32>,
+    /// Inbound requests one user device may keep in flight at a realm node at
+    /// once, which is what bounds long blob pulls. `None` leaves them uncapped.
+    pub device_concurrent_pulls: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -246,6 +252,8 @@ impl Default for QuotaConfig {
             max_groups_per_user: Some(3),
             user_group_cap_overrides: Vec::new(),
             max_devices_per_user: None,
+            device_requests_per_minute: None,
+            device_concurrent_pulls: None,
         }
     }
 }
@@ -335,15 +343,29 @@ pub struct RealmNode {
 pub enum RealmNodeKind {
     Management,
     Server,
-    Local,
-    /// Owner-bound user device (laptop). Never a sync/holder target.
-    User,
+    /// Owner-bound user device (laptop). Never a sync/holder target. The owner
+    /// is fixed at enrollment and is a security input: every User-node decision
+    /// reads it from here, never from a label or a self-authored descriptor.
+    User {
+        owner: UserId,
+    },
 }
 
 impl RealmNodeKind {
-    /// User nodes must never become document holders or sync targets.
+    /// Whether nodes of this kind carry shared realm responsibilities: holder
+    /// and placement membership, sync publication and relay, administrative
+    /// event origination, routing and distributed-query targeting. A User node
+    /// has none of them, whoever owns it.
     pub fn is_sync_eligible(&self) -> bool {
-        !matches!(self, RealmNodeKind::User)
+        !matches!(self, RealmNodeKind::User { .. })
+    }
+
+    /// Owner of a User-kind device; `None` for infrastructure nodes.
+    pub fn owner(&self) -> Option<UserId> {
+        match self {
+            RealmNodeKind::User { owner } => Some(*owner),
+            RealmNodeKind::Management | RealmNodeKind::Server => None,
+        }
     }
 
     /// Value of the derived, read-only kind label placement views carry.
@@ -351,8 +373,7 @@ impl RealmNodeKind {
         match self {
             RealmNodeKind::Management => "management",
             RealmNodeKind::Server => "server",
-            RealmNodeKind::Local => "local",
-            RealmNodeKind::User => "user",
+            RealmNodeKind::User { .. } => "user",
         }
     }
 }
@@ -781,6 +802,8 @@ impl RealmConfigDocument {
                 KIND_LABEL_KEY.to_string(),
                 realm_node.kind.label().to_string(),
             );
+            // The config's own id string, so a submission can pin this node.
+            labels.insert(NODE_LABEL_KEY.to_string(), realm_node.node_id.clone());
             crate::structs::stamp_location(
                 &mut labels,
                 entry
@@ -1098,10 +1121,11 @@ mod test {
     use crate::request_policy::{PolicyKind, RequestPolicy};
     use crate::structs::{
         Actor, CandidatePlacementMap, DynamicDiscoveryMethod, KIND_LABEL_KEY,
-        MetadataGroupReplicationOverride, MetadataPathReplicationOverride, OidcProviderConfig,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
+        MetadataGroupReplicationOverride, MetadataPathReplicationOverride, NODE_LABEL_KEY,
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
     };
+    use crate::types::UserId;
     use ulid::Ulid;
 
     use super::JobFamilyError;
@@ -1196,7 +1220,7 @@ mod test {
     fn config_bytes_canonical() {
         // Pins the canonical wire form. Postcard is positional, so the field
         // occupies a fixed slot that a shorter encoding cannot satisfy.
-        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e550001030000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000";
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000";
         let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
         config.job_family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
@@ -1499,6 +1523,11 @@ mod test {
         assert_eq!(
             frozen.nodes[0].labels.get(KIND_LABEL_KEY),
             Some(&"server".to_string())
+        );
+        // Every candidate carries its own id as an immutable label.
+        assert_eq!(
+            frozen.nodes[0].labels.get(NODE_LABEL_KEY),
+            Some(&frozen.nodes[0].node_id.to_string())
         );
         assert_eq!(config.candidate_nodes().len(), 2);
 
@@ -1806,12 +1835,15 @@ mod test {
 
         let server = node_id(1);
         let user_device = node_id(2);
-        let mut document = RealmConfigDocument::new(RealmId::from_bytes([9u8; 32]), Vec::new(), 3);
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let owner = UserId::nil(realm_id);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.ensure_node(server, RealmNodeKind::Server);
-        document.ensure_node(user_device, RealmNodeKind::User);
+        document.ensure_node(user_device, RealmNodeKind::User { owner });
 
         assert_eq!(document.node_ids().unwrap(), vec![server, user_device]);
         assert_eq!(document.sync_eligible_node_ids().unwrap(), vec![server]);
+        assert_eq!(document.nodes[1].kind.owner(), Some(owner));
     }
 
     #[test]

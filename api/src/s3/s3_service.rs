@@ -67,7 +67,7 @@ use aruna_operations::s3::delete_objects::{
 };
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{
-    GetObjectInput as GOI, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
+    GetObjectInput as GOI, GetObjectResult, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::get_object_attributes::{
     GetObjectAttributesInput as GOAI, GetObjectAttributesOperation,
@@ -297,6 +297,7 @@ impl ArunaS3Service {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
                 path_restrictions: None,
+                session: None,
             },
             &bucket_path,
             &Permission::READ,
@@ -544,6 +545,7 @@ impl ArunaS3Service {
                     user_id: user_access.user_identity,
                     realm_id: user_access.user_identity.realm_id,
                     path_restrictions: user_access.path_restrictions.clone(),
+                    session: None,
                 },
                 &blob_bucket_permission_path(
                     self.realm_id,
@@ -565,6 +567,7 @@ impl ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         });
         request_sync_mirror_create(
             &self.state,
@@ -678,6 +681,22 @@ impl ArunaS3Service {
         emit_resource_watch_event(self.state.as_ref(), event).await;
     }
 
+    pub(crate) async fn complete_put(
+        &self,
+        auth: AuthContext,
+        group_id: ulid::Ulid,
+        bucket: String,
+        key: String,
+        version_id: ulid::Ulid,
+        size_bytes: u64,
+    ) {
+        let actor = auth.user_id;
+        self.queue_live_version_replication(auth, bucket.clone(), key.clone(), version_id, false)
+            .await;
+        self.emit_data_uploaded_watch(actor, group_id, bucket, key, size_bytes)
+            .await;
+    }
+
     /// Deviates from AWS S3 by returning the true full-object MD5 hex as the
     /// multipart ETag, without the AWS `-<partCount>` suffix. AWS derives its
     /// multipart ETag from the concatenated part digests, so its value is opaque
@@ -715,20 +734,15 @@ impl ArunaS3Service {
             Some(result.part_count),
         ));
 
-        let watch_actor = replication_auth.user_id;
-        let watch_bucket = replication_bucket.clone();
-        let watch_key = replication_key.clone();
-        let watch_size = result.location.blob_size;
-        self.queue_live_version_replication(
+        self.complete_put(
             replication_auth,
+            group_id,
             replication_bucket,
             replication_key,
             result.version_id,
-            false,
+            result.location.blob_size,
         )
         .await;
-        self.emit_data_uploaded_watch(watch_actor, group_id, watch_bucket, watch_key, watch_size)
-            .await;
 
         Ok(S3Response::new(output))
     }
@@ -759,20 +773,15 @@ impl ArunaS3Service {
             checksum_request.checksum_type.clone(),
             None,
         ));
-        let watch_actor = replication_auth.user_id;
-        let watch_bucket = replication_bucket.clone();
-        let watch_key = replication_key.clone();
-        let watch_size = result.location.blob_size;
-        self.queue_live_version_replication(
+        self.complete_put(
             replication_auth,
+            group_id,
             replication_bucket,
             replication_key,
             result.version_id,
-            false,
+            result.location.blob_size,
         )
         .await;
-        self.emit_data_uploaded_watch(watch_actor, group_id, watch_bucket, watch_key, watch_size)
-            .await;
 
         Ok(S3Response::new(output))
     }
@@ -1584,6 +1593,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
@@ -1709,6 +1719,7 @@ impl S3 for ArunaS3Service {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
                 path_restrictions: user_access.path_restrictions.clone(),
+                session: None,
             }
         } else {
             AuthContext::anonymous(self.realm_id)
@@ -1767,6 +1778,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let conditions = copy_source_conditions(
             req.input.copy_source_if_match.as_ref(),
@@ -2062,6 +2074,7 @@ impl S3 for ArunaS3Service {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
                 path_restrictions: user_access.path_restrictions.clone(),
+                session: None,
             }
         } else {
             AuthContext::anonymous(self.realm_id)
@@ -2171,6 +2184,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let completed_parts = req
             .input
@@ -2292,7 +2306,7 @@ impl S3 for ArunaS3Service {
 
         let range_request = requested_range.map(object_range_request);
 
-        let operation = GetObjectOperation::new(GOI {
+        let input = GOI {
             bucket,
             key,
             version_id,
@@ -2303,10 +2317,11 @@ impl S3 for ArunaS3Service {
                 .unwrap_or(user_access.group_id),
             user_identity: user_access.user_identity,
             node_id: self.node_id,
-        })
-        .with_restrictions(user_access.path_restrictions.clone());
+        };
 
-        let result = drive(operation, &self.state)
+        // A device holds version records without their bytes, so a local miss
+        // continues against the realm's holders instead of failing here.
+        let result = get_object_routed(&self.state, input, user_access.path_restrictions.clone())
             .await
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
@@ -3017,6 +3032,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
@@ -3101,6 +3117,7 @@ impl S3 for ArunaS3Service {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
         };
         let bucket = req.input.bucket;
 
@@ -3151,7 +3168,7 @@ impl S3 for ArunaS3Service {
             let policy_request = aruna_operations::request_policy::policy_request_with(
                 &object_path,
                 &Permission::WRITE,
-                Some(&replication_auth.user_id),
+                Some(&replication_auth),
                 extras.clone(),
             );
             if !allowed || policy_evaluator.evaluate(&policy_request).is_err() {
@@ -3689,6 +3706,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
 
         write_storage_value(
@@ -3907,6 +3925,7 @@ mod tests {
             user_id,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let checksum_request = UploadChecksumRequest {
             expected: Vec::new(),
@@ -3982,6 +4001,7 @@ mod tests {
             user_id: anonymous,
             realm_id,
             path_restrictions: None,
+            session: None,
         };
         let checksum_request = UploadChecksumRequest {
             expected: Vec::new(),

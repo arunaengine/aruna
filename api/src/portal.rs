@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 const API_PATH: &str = "/api/v1";
@@ -41,6 +42,7 @@ pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
     Router::new()
         .route("/portal-config.json", get(portal_config))
         .fallback(serve_portal)
+        .layer(CompressionLayer::new())
         .layer(from_fn_with_state(security, portal_security_headers))
         .layer(from_fn(crate::csp::baseline_security_headers))
         .with_state(PortalState {
@@ -242,7 +244,7 @@ mod tests {
                 driver_ctx,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -392,6 +394,36 @@ mod tests {
         );
         let body = to_bytes(asset.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"console.log('portal');");
+    }
+
+    #[tokio::test]
+    async fn portal_compresses_static_assets() {
+        let tempdir = tempdir().unwrap();
+        let portal_dir = tempdir.path().join("portal");
+        let (router, _state_dir, _discovery_origin) = setup_serving_node(&portal_dir).await;
+        std::fs::write(
+            portal_dir.join("assets/app.js"),
+            "console.log('portal');".repeat(256),
+        )
+        .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/assets/app.js")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
     }
 
     #[tokio::test]

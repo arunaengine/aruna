@@ -6,10 +6,10 @@ use crate::driver::{DriverContext, drive};
 use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyFunctions, PolicyRequest,
+    CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
     RequestPolicy, policy_set_hash,
 };
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{AuthContext, RealmId};
 use aruna_core::types::{GroupId, TxnId};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
@@ -320,7 +320,7 @@ fn decide(
     request: &PolicyRequest,
     scope: &str,
 ) -> Result<(), PolicyEnforcementError> {
-    match set.evaluate(request, &PolicyFunctions::default()) {
+    match set.evaluate(request) {
         PolicyDecision::Allowed => Ok(()),
         PolicyDecision::Denied {
             policy_id,
@@ -415,16 +415,23 @@ pub fn policy_request(
 pub fn policy_request_with(
     path: &str,
     permission: &aruna_core::structs::Permission,
-    user: Option<&aruna_core::UserId>,
+    auth: Option<&AuthContext>,
     extras: PolicyRequestExtras,
 ) -> PolicyRequest {
-    let mut request = policy_request(path, permission, user);
+    let mut request = policy_request(path, permission, auth.map(|auth| &auth.user_id));
     if !extras.operation.is_empty() {
         request.operation = extras.operation;
     }
     request.params = extras.params;
     request.headers = extras.headers;
     request.body = extras.body;
+    request.session = auth.and_then(|auth| {
+        auth.session.as_ref().map(|session| PolicySession {
+            sid: session.sid.clone(),
+            kind: session.kind.to_string(),
+            label: String::new(),
+        })
+    });
     request
 }
 

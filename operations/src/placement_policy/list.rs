@@ -228,6 +228,7 @@ mod tests {
                 user_id: UserId::nil(realm_id()),
                 realm_id: realm_id(),
                 path_restrictions: None,
+                session: None,
             },
             start_after: None,
             limit: 16,

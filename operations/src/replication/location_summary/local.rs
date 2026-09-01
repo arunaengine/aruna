@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFunctions};
+use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, GroupAuthorizationDocument, GroupStorageBackend, ManagedCopyKey,
@@ -420,7 +420,7 @@ impl LocationSummaryOperation {
         let request = policy_request_with(
             path,
             &Permission::READ,
-            Some(&self.request.auth_context.user_id),
+            Some(&self.request.auth_context),
             PolicyRequestExtras::operation("s3.GetObject"),
         );
         let realm_set = match CompiledPolicySet::compile(&realm.request_policies) {
@@ -432,14 +432,8 @@ impl LocationSummaryOperation {
             Err(_) => return self.deny(),
         };
         self.policy_current = self.policy_allowed
-            && matches!(
-                realm_set.evaluate(&request, &PolicyFunctions::default()),
-                PolicyDecision::Allowed
-            )
-            && matches!(
-                group_set.evaluate(&request, &PolicyFunctions::default()),
-                PolicyDecision::Allowed
-            );
+            && matches!(realm_set.evaluate(&request), PolicyDecision::Allowed)
+            && matches!(group_set.evaluate(&request), PolicyDecision::Allowed);
         self.state = SummaryState::CheckPermission;
         let Some(txn_id) = self.txn_id else {
             return self.deny();

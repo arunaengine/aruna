@@ -548,7 +548,7 @@ mod tests {
                 context,
                 realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id).unwrap(),
+                NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -562,6 +562,7 @@ mod tests {
                 user_id: admin_id,
                 realm_id,
                 path_restrictions: None,
+                session: None,
             },
             realm_id,
         }
@@ -726,6 +727,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([77; 16]), fx.realm_id),
             realm_id: fx.realm_id,
             path_restrictions: None,
+            session: None,
         };
         let listed = list_quarantine(
             State(fx.state.clone()),
@@ -751,6 +753,7 @@ mod tests {
             user_id: fx.admin.user_id,
             realm_id: fx.realm_id,
             path_restrictions: Some(Vec::new()),
+            session: None,
         };
         let listed = list_quarantine(
             State(fx.state.clone()),
