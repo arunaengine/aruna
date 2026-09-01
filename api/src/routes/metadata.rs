@@ -732,24 +732,20 @@ impl MetadataDocumentListItem {
     summary = "Create a metadata document",
     description = r#"Creates a metadata document from scaffold fields or a submitted RO-Crate.
 
-**Authentication**: realm bearer token whose realm matches the serving node; on a server or
-management node the caller needs WRITE on the group's metadata path and on the new document's
-permission path.
+**Authentication**: realm bearer token with WRITE on the group's metadata path and on the new
+document's permission path. A user-kind node holds no metadata bucket, so it forwards the create to
+a holder that re-runs both checks under the caller's own token.
 
 **Behavior**
-- A user-kind node holds no metadata bucket, so it forwards the create to a holder that re-runs
-  the same checks under the caller's own bearer token.
-- A 201 means the create was durably accepted into the event/projection pipeline: the graph may
-  not be materialized, queryable, searchable or present on every replica yet, so a follow-up read
-  can still answer 404 or 503 for a moment.
+- Acceptance is durable but asynchronous: the graph may not be materialized, queryable, searchable
+  or present on every replica yet, so a follow-up read can answer 404 or 503 for a moment.
 - A write that can neither be applied locally nor delivered to a holder is refused rather than
   accepted.
 
-**Limits**
-- The document path is normalized before use and must not be empty."#,
+**Limits**: the document path is normalized before use and must not be empty."#,
     request_body(
         content = CreateMetadataRequest,
-        description = "Create metadata either from scaffold fields or from a full RO-Crate JSON-LD object. Scaffold creation emits RO-Crate 1.3. The RO-Crate form accepts 1.2 and 1.3 contexts and specification IRIs and preserves the submitted version. Both forms reject unknown fields; the RO-Crate form must be a JSON object and is validated before acceptance.",
+        description = "Scaffold fields or a full RO-Crate JSON-LD object. Scaffold creation emits RO-Crate 1.3; the RO-Crate form accepts 1.2 and 1.3 contexts and specification IRIs and preserves the submitted version. Both forms reject unknown fields.",
         examples(
             (
                 "ScaffoldCreate" = (
@@ -799,7 +795,7 @@ permission path.
     responses(
         (
             status = 201,
-            description = "Metadata create accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
+            description = "Accepted into the durable event/projection pipeline; not necessarily fully materialized, queryable, searchable or replicated yet",
             body = CreateMetadataResponse,
             examples(
                 (
@@ -821,9 +817,9 @@ permission path.
         ),
         (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or WRITE is denied on the group's metadata path or the new document's path", body = ErrorResponse),
-        (status = 409, description = "Concurrent create conflict; retry, because the create was not accepted", body = ErrorResponse),
-        (status = 503, description = "Placement binding unavailable or conflicted, realm configuration unreadable, local clock unhealthy, or no holder accepted the forwarded write. The response carries Retry-After and the caller may retry", body = ErrorResponse)
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path or the new document's path", body = ErrorResponse),
+        (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried", body = ErrorResponse),
+        (status = 503, description = "Placement binding unavailable or conflicted, realm configuration unreadable, local clock unhealthy, or no holder accepted the forwarded write; the create was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -960,10 +956,9 @@ identity may read, an anonymous caller only public documents.
 - Answered from this node's eventually consistent registry view, so a just-accepted create can be
   missing for a moment, and a document whose graph is not materialized yet is listed without its
   RO-Crate summary.
-- Pagination is offset-based over the filtered, visibility-checked sequence in the requested
-  order; a page is stable only as far as concurrent metadata churn allows.
-- `limit` echoes the page size actually applied after clamping and `offset` the skip that was
-  applied; `total_returned` counts this page.
+- Pagination is offset-based over the filtered, visibility-checked sequence, so a page is stable
+  only as far as concurrent metadata churn allows.
+- `limit` and `offset` echo the values actually applied after clamping.
 - `total_estimate` is only present for browse-sized pages (an effective limit of 24 or more),
   where it counts the documents visible to the caller across all pages of the same filter."#,
     params(
@@ -1046,10 +1041,8 @@ group their identity may read, an anonymous caller only public documents.
 - Answered from this node's eventually consistent registry view, so a just-accepted create can be
   missing for a moment, and a document whose graph is not materialized yet is listed without its
   RO-Crate summary.
-- Pagination is offset-based over the filtered, visibility-checked sequence in the requested
-  order.
-- `limit` echoes the page size actually applied after clamping and `offset` the skip that was
-  applied; `total_returned` counts this page.
+- Pagination is offset-based over the filtered, visibility-checked sequence, and `limit` and
+  `offset` echo the values actually applied after clamping.
 - `total_estimate` is only present for browse-sized pages (an effective limit of 24 or more)."#,
     params(
         ("group_id" = String, Path, description = "Group ULID whose metadata documents are listed"),
@@ -1118,14 +1111,9 @@ pub async fn list_metadata_documents(
 anonymous caller resolves the winner among public documents only.
 
 **Behavior**
-- Returns the deterministic visible winner and the authorized conflicts reported consistently by
-  every current replica for the path.
-- The lookup is answered by the replicas that hold the path's registry shards, with a bounded
-  fan-out and an overall deadline of a few seconds.
-- A path whose only claims are invisible answers 404 rather than disclosing that it is taken.
-
-**Errors**: an unavailable or divergent current-replica view fails closed with 503 instead of
-answering from a partial view."#,
+- The winner and its conflicts are the ones reported consistently by every current replica of the
+  path's registry shards, under a bounded fan-out and a deadline of a few seconds.
+- A path whose only claims are invisible answers 404 rather than disclosing that it is taken."#,
     params(
         ("group_id" = String, Path, description = "Group ULID that owns the path"),
         ("path" = String, Query, description = "Exact metadata path, normalized before lookup (surrounding slashes trimmed); an empty path is rejected with 400. Prefix matching is not applied")
@@ -1133,7 +1121,7 @@ answering from a partial view."#,
     responses(
         (
             status = 200,
-            description = "The winning document for the path plus the document ids of visible losing claims for the same path, which stay reachable by id",
+            description = "The winning document plus the ids of visible losing claims, which stay reachable by id",
             body = MetadataPathResponse,
             examples(
                 (
@@ -1159,8 +1147,8 @@ answering from a partial view."#,
         (status = 400, description = "Group id that is not a ULID, an empty path, or an unusable bearer forwarding carrier", body = ErrorResponse),
         (status = 401, description = "A replica rejected the forwarded credential as unauthenticated", body = ErrorResponse),
         (status = 403, description = "A replica denied READ for this caller on the path's documents", body = ErrorResponse),
-        (status = 404, description = "No claim for the path is visible to the caller, which is also the answer when the path exists but the caller may not read any of its claims", body = ErrorResponse),
-        (status = 503, description = "Current-replica path view unavailable, divergent, or past the lookup deadline. The response carries Retry-After and the caller may retry", body = ErrorResponse)
+        (status = 404, description = "No claim for the path is visible to the caller, which is also the answer when the path is taken by claims the caller may not read", body = ErrorResponse),
+        (status = 503, description = "The current-replica path view is unavailable, divergent, or past the lookup deadline, so the lookup fails closed instead of answering from a partial view; retryable", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -1200,23 +1188,21 @@ pub async fn get_metadata_path(
     summary = "Get backend Profile validation capabilities",
     description = r#"Reports how this node compiles and evaluates registered Profile shapes.
 
-**Authentication**: none; the route declares no security requirement and answers every caller
-with the same capability report.
+**Authentication**: none; public route, every caller gets the same capability report.
 
 **Behavior**
-- Shapes registered as a Profile are compiled and executed by craqle's native SHACL Core Subset
-  v1 engine, server side and authoritative.
+- Registered Profile shapes are compiled and executed server side by craqle's native SHACL Core
+  Subset v1 engine.
 - Supported targets are `sh:targetClass`, `sh:targetNode`, `sh:targetSubjectsOf`,
   `sh:targetObjectsOf` and implicit class targets; a node shape that names no target at all is
   bound to the crate root, so a Profile can constrain the root entity without knowing its minted
   IRI.
 - Supported paths are predicate, `sh:inversePath`, sequence, `sh:alternativePath`,
   `sh:zeroOrOnePath`, `sh:zeroOrMorePath` and `sh:oneOrMorePath`.
-- The supported constraint set is listed in `supported_constraints`.
 - `sh:class` is exact `rdf:type` membership: no RDFS or OWL inference is applied, so a subclass
   instance does not satisfy a superclass constraint.
-- Shapes may reference crate-local ids relative to the crate root, for example
-  `sh:hasValue <#person-1>`.
+- Shapes may address the crate root relatively; any other crate-local id fails closed with the
+  `crate_local_reference` rule.
 
 **Limits**
 - SHACL-SPARQL, SHACL-JS, SHACL-AF, custom components and targets, recursive shapes, RDF-star
@@ -1272,14 +1258,14 @@ pub async fn profile_validation_capabilities()
     summary = "Preview the Profile verdict for a draft",
     description = r#"Runs the Profile and structural verdict for a draft crate without storing it.
 
-**Authentication**: authenticated realm caller; no document permission is checked because only
-the realm-public registered Profile is read.
+**Authentication**: realm bearer token; no document permission is checked because only the
+registered Profile is read.
 
 **Behavior**
 - Applies the exact verdict `POST /metadata` and `PUT /metadata/{document_id}/rocrate` would
-  enforce against the draft, and stores nothing.
-- `structural_violations` carries the RO-Crate structural failures and `findings` the Profile
-  constraint findings; `accepted` is true only when both would let the write through.
+  enforce, and stores nothing.
+- `accepted` is true only when the structural RO-Crate rules and the Profile constraints would
+  both let the write through.
 - The draft is evaluated under its own crate root, so focus nodes and paths are reported in
   crate-local form with the root as `./`."#,
     request_body(content = ProfileValidationPreviewRequest,
@@ -1331,8 +1317,8 @@ the realm-public registered Profile is read.
                 "structural_violations": []
             })),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
-        (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
-        (status = 503, description = "The Profile or the evaluator is temporarily unavailable; the response carries Retry-After", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 503, description = "The Profile or the evaluator is temporarily unavailable; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1392,9 +1378,9 @@ apply.
             })),
         (status = 400, description = "Document id is not a structured metadata id", body = ErrorResponse),
         (status = 401, description = "A holder rejected the forwarded credential", body = ErrorResponse),
-        (status = 403, description = "READ is denied", body = ErrorResponse),
+        (status = 403, description = "Caller lacks READ on the document", body = ErrorResponse),
         (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
-        (status = 503, description = "No holder can supply the exact status", body = ErrorResponse)
+        (status = 503, description = "No holder can supply the revision-bound status; retryable", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -1424,11 +1410,11 @@ pub async fn get_profile_validation_status(
     summary = "Revalidate a document against its current Profile",
     description = r#"Rebuilds the durable validation status from the current Profile revision.
 
-**Authentication**: authenticated realm caller allowed to READ the document.
+**Authentication**: realm bearer token with READ on the document.
 
 **Behavior**
-- Reconstructs validation from the last accepted raw Dataset revision and the registered
-  Profile's current exact revision.
+- Revalidates the last accepted raw Dataset revision against the registered Profile's current
+  exact revision.
 - Fences the Dataset revision and durably replaces the stored status."#,
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
@@ -1447,10 +1433,10 @@ pub async fn get_profile_validation_status(
                 "stale_reason": null
             })),
         (status = 400, description = "Document id or Profile tag is invalid", body = ErrorResponse),
-        (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
-        (status = 403, description = "READ is denied", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Caller lacks READ on the document", body = ErrorResponse),
         (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
-        (status = 503, description = "The Profile, validator, Dataset revision, or a holder is temporarily unavailable", body = ErrorResponse)
+        (status = 503, description = "The Profile, evaluator, Dataset revision or a holder is temporarily unavailable; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1485,20 +1471,18 @@ pub async fn revalidate_profile(
     description = r#"Returns the registry summary of one metadata document.
 
 **Authentication**: optional bearer token; a document that is not public is only returned to a
-caller whose identity may read it.
+caller whose identity may read it, and existence is hidden, so an anonymous caller is never told
+401 or 403 for a private document.
 
 **Behavior**
 - The read is routed to the document's current holders and answered by the first holder that
   returns a matching record.
-- A record whose create was only just accepted may still answer 404 until it lands on a holder.
-
-**Errors**: existence is hidden, so an unknown document and a document the caller may not read
-both answer 404 and an anonymous caller is never told 401 or 403 for a private document."#,
+- A record whose create was only just accepted may still answer 404 until it lands on a holder."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     responses(
         (
             status = 200,
-            description = "Registry summary of the document, where replicas is the number of holders that currently carry it",
+            description = "Registry summary; `replicas` counts the holders that currently carry the document",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -1522,7 +1506,7 @@ both answer 404 and an anonymous caller is never told 401 or 403 for a private d
         (status = 401, description = "A holder rejected the forwarded credential as unauthenticated", body = ErrorResponse),
         (status = 403, description = "A holder denied READ for this caller on the document", body = ErrorResponse),
         (status = 404, description = "The document does not exist or is not readable by the caller; the two cases are deliberately indistinguishable", body = ErrorResponse),
-        (status = 503, description = "Placement view unreadable, no holder answered, or holders disagreed about the document. The response carries Retry-After and the caller may retry", body = ErrorResponse)
+        (status = 503, description = "Placement view unreadable, no holder answered, or holders disagreed about the document; retryable", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -1552,26 +1536,23 @@ pub async fn get_metadata_document(
     summary = "Delete a metadata document",
     description = r#"Deletes a metadata document and tombstones its RO-Crate graph.
 
-**Authentication**: realm bearer token with WRITE on the document's permission path.
+**Authentication**: realm bearer token with WRITE on the document's permission path. A node that
+does not hold the document forwards the delete to a holder that re-runs that check under the
+caller's own token.
 
 **Behavior**
-- When this node holds the document the permission is checked here; otherwise the delete is
-  forwarded to a holder that re-runs the same check under the caller's own bearer token.
 - The delete itself is applied by the document's persistent-id authority.
-- A 204 means the delete was durably accepted into the event/projection pipeline: the graph
-  tombstone, the removal from listings, search and query results, and the pruning of remote
-  replicas follow asynchronously, so the document can still answer reads for a short window.
-
-**Errors**: a 503 carries `Retry-After` and means the delete was not accepted, so the caller may
-retry."#,
+- Acceptance is durable but asynchronous: the graph tombstone, the removal from listings, search
+  and query results, and the pruning of remote replicas follow, so the document can still answer
+  reads for a short window."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     responses(
-        (status = 204, description = "Delete durably accepted, with no response body. Tombstoning, listing and query visibility, and replica pruning may still be catching up"),
+        (status = 204, description = "Delete durably accepted; tombstoning, listing and query visibility, and replica pruning may still be catching up"),
         (status = 400, description = "Document id that is not a structured metadata id, or an unusable bearer forwarding carrier", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),
-        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, or no holder accepted the forwarded delete", body = ErrorResponse)
+        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, or no holder accepted the forwarded delete; the delete was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1619,28 +1600,20 @@ unreadable one because both answer 404.
   succeeds.
 - RO-Crate 1.2 and 1.3 documents retain their stored context and specification version in every
   export view.
-- The projected views (`full`, `summary`, `page`) require the document's graph to be materialized
-  and answer 503 while a recently accepted write is still being projected.
-- The `raw` view returns the displayed revision together with the last event merged into it,
-  projection state (`pending`, `materialized` or `failed`) and digests, so it is the view that can
-  be read during that window.
-- Metadata graphs merge as OR-Sets, and only a valid crate is displayed. When the merged graph
-  fails profile validation the displayed revision stays at the last valid render and the `raw`
-  view also carries `merged` with the invalid render and its finding count, which is what an
-  editor opens so the owner can fix it.
-- The projected views (`full`, `summary`, `page`) render the merged graph, so they show the merged
-  state even while `merged` is present.
-- The pagination fields of the returned crate are only populated for the `page` view.
-- In the `summary` and `page` views the crate's root identifier is rewritten to a view-specific
-  identifier carrying the requested view and cursor, so a partial crate is not mistaken for the
-  full one.
+- The projected views (`full`, `summary`, `page`) need the document's graph to be materialized. The
+  `raw` view returns the displayed revision with the last event merged into it, the projection
+  state (`pending`, `materialized` or `failed`) and digests, so it stays readable while a recently
+  accepted write is still being projected.
+- Metadata graphs merge as OR-Sets and only a valid crate is displayed: when the merged graph fails
+  Profile validation the displayed revision stays at the last valid render and the `raw` view also
+  carries `merged` with the invalid render and its finding count, which is what an editor opens.
+  The projected views render the merged graph either way.
+- The pagination fields are only populated for the `page` view, and in the `summary` and `page`
+  views the crate's root identifier is rewritten to carry the requested view and cursor, so a
+  partial crate is not mistaken for the full one.
 
-**Limits**
-- An export larger than this node's configured metadata byte limit is refused with 503 rather
-  than truncated.
-
-**Errors**: a 503 carries `Retry-After`; while a recently accepted write is still being projected
-the caller may retry with `view=raw`."#,
+**Limits**: an export larger than this node's configured metadata byte limit is refused rather than
+truncated."#,
     params(
         ("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list"),
         ("view" = Option<MetadataRoCrateView>, Query, description = "Export view, default full: full for the whole projected crate, summary for the root entity, page for a window over root-linked data entities, raw for the last accepted revision"),
@@ -1756,7 +1729,7 @@ the caller may retry with `view=raw`."#,
         (status = 401, description = "A holder rejected the forwarded credential as unauthenticated", body = ErrorResponse),
         (status = 403, description = "A holder denied READ for this caller on the document", body = ErrorResponse),
         (status = 404, description = "The document does not exist or is not readable by the caller; the two cases are deliberately indistinguishable", body = ErrorResponse),
-        (status = 503, description = "The graph is not materialized yet for a projected view, the export exceeds this node's metadata byte limit, or no holder answered", body = ErrorResponse)
+        (status = 503, description = "The graph is not materialized yet for a projected view, which `view=raw` can read meanwhile, the export exceeds this node's metadata byte limit, or no holder answered", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -1797,20 +1770,17 @@ pub async fn export_metadata_rocrate(
     summary = "Submit an RO-Crate export job",
     description = r#"Submits an asynchronous job that assembles the document's RO-Crate.
 
-**Authentication**: realm bearer token that is not path-restricted (a delegated token whose scope
-is confined to a path is rejected with 403 even when it would pass the per-document check); the
-caller needs READ on the document, which is resolved from this node's registry view.
+**Authentication**: realm bearer token with READ on the document, resolved from this node's
+registry view. A path-restricted delegated token is refused even when it would pass that check.
 
 **Behavior**
-- A 202 only means the job was durably accepted and is owned by this node; the crate is assembled
-  asynchronously, so the artifact does not exist yet.
+- The job is durably accepted and owned by this node; the crate is assembled asynchronously, so
+  the artifact does not exist yet.
 - The artifact preserves whether the source document is RO-Crate 1.2 or 1.3.
-- Poll `status_url` for progress and fetch `artifact_url` once the job reports success. The URLs
-  are absolute and point at the owning node, the only node that can serve the job's status,
-  report and artifact.
+- `status_url`, `report_url` and `artifact_url` are absolute and point at the owning node, the only
+  node that can serve them.
 - Submissions are idempotent per caller when `idempotency_key` is set: replaying the same key
-  returns the same job with `created` set to false, while reusing it for a different document is
-  a conflict."#,
+  returns the same job with `created` false, while reusing it for a different document conflicts."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = SubmitRoCrateExportRequest,
@@ -1822,7 +1792,7 @@ caller needs READ on the document, which is resolved from this node's registry v
     responses(
         (
             status = 202,
-            description = "Export job durably accepted and queued on this node; created is false when an existing job was returned for the same key",
+            description = "Export job durably accepted and queued on this node; `created` is false when an existing job was replayed",
             body = SubmitRoCrateExportResponse,
             examples(
                 (
@@ -1832,9 +1802,9 @@ caller needs READ on the document, which is resolved from this node's registry v
                             "job_id": "01JJOB0123456789ABCDEFGHJK",
                             "created": true,
                             "owner_node_url": "https://node.example.test/api/v1",
-                            "status_url": "https://node.example.test/api/v1/jobs/01JJOB0123456789ABCDEFGHJK",
-                            "report_url": "https://node.example.test/api/v1/jobs/01JJOB0123456789ABCDEFGHJK/report",
-                            "artifact_url": "https://node.example.test/api/v1/jobs/01JJOB0123456789ABCDEFGHJK/artifacts/rocrate"
+                            "status_url": "https://node.example.test/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHJK",
+                            "report_url": "https://node.example.test/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHJK/report",
+                            "artifact_url": "https://node.example.test/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHJK/artifacts/rocrate"
                         })
                     )
                 )
@@ -1842,9 +1812,9 @@ caller needs READ on the document, which is resolved from this node's registry v
         ),
         (status = 400, description = "Malformed body, unknown fields, or a document id that is not a structured metadata id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Metadata READ denied, the token belongs to another realm, or the token is path-restricted and therefore not accepted here", body = ErrorResponse),
+        (status = 403, description = "READ denied on the document, the token belongs to another realm, or the token is path-restricted", body = ErrorResponse),
         (status = 404, description = "This node's registry view has no such metadata document", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is already bound to a job with a different plan, or the caller's active RO-Crate job limit is reached; retry with a fresh key or after an active job finishes", body = ErrorResponse)
+        (status = 409, description = "The idempotency key is already bound to a job with a different plan, or the caller's active RO-Crate job limit is reached", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1898,24 +1868,20 @@ pub async fn submit_rocrate_export(
     summary = "Replace a document's RO-Crate",
     description = r#"Replaces a document's stored RO-Crate with the submitted crate.
 
-**Authentication**: realm bearer token with WRITE on the document's permission path.
+**Authentication**: realm bearer token with WRITE on the document's permission path. A node that
+does not hold the document forwards the write to a holder that re-runs that check under the
+caller's own token.
 
 **Behavior**
-- When this node holds the document the permission is checked here and the write is applied
-  locally; otherwise it is forwarded to a holder that re-runs the same check under the caller's
-  own bearer token.
 - The submitted crate replaces the stored one wholesale, so any entity omitted from it is
   dropped.
 - Omitting `public` leaves the current visibility unchanged.
-- A 200 means the replacement was durably accepted into the event/projection pipeline, not that
-  it is already materialized, queryable, searchable or present on every replica.
-
-**Errors**: a 503 carries `Retry-After` and means the write was not accepted, so the caller may
-retry."#,
+- Acceptance is durable but asynchronous: the revision may not be materialized, queryable,
+  searchable or present on every replica yet."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = ReplaceMetadataRoCrateRequest,
-        description = "Replace the full RO-Crate document with a 1.2 or 1.3 context and specification IRI; the submitted version is preserved. Use the entity endpoints for small incremental changes. rocrate must be a JSON object and is validated before acceptance; public is optional and keeps the current visibility when omitted.",
+        description = "The full replacement RO-Crate with a 1.2 or 1.3 context and specification IRI; the submitted version is preserved. Use the entity routes for small incremental changes. Omitting public keeps the current visibility.",
         examples(
             (
                 "ReplaceRoCrate" = (
@@ -1949,7 +1915,7 @@ retry."#,
     responses(
         (
             status = 200,
-            description = "Metadata update accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
+            description = "Accepted into the durable event/projection pipeline; not necessarily fully materialized, queryable, searchable or replicated yet",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -1971,9 +1937,9 @@ retry."#,
         ),
         (status = 400, description = "Malformed body, a document id that is not a structured metadata id, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),
-        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write", body = ErrorResponse)
+        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write; the write was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2020,25 +1986,21 @@ pub async fn replace_metadata_rocrate(
     summary = "Upsert an RO-Crate data entity",
     description = r#"Adds or replaces one root-linked data entity in a document's RO-Crate.
 
-**Authentication**: realm bearer token with WRITE on the document's permission path.
+**Authentication**: realm bearer token with WRITE on the document's permission path. A node that
+does not hold the document forwards the write to a holder that re-runs that check under the
+caller's own token.
 
 **Behavior**
-- When this node holds the document the permission is checked here and the write is applied
-  locally; otherwise it is forwarded to a holder that re-runs the same check under the caller's
-  own bearer token.
 - The entity is matched by its `@id`: an existing data entity with that id is replaced, otherwise
   it is added and linked from the crate's root dataset.
 - The rest of the crate, including its RO-Crate 1.2 or 1.3 version, is left untouched, and the
   document's visibility is unchanged.
-- A 200 means the upsert was durably accepted into the event/projection pipeline, not that it is
-  already materialized, queryable, searchable or present on every replica.
-
-**Errors**: a 503 carries `Retry-After` and means the write was not accepted, so the caller may
-retry."#,
+- Acceptance is durable but asynchronous: the revision may not be materialized, queryable,
+  searchable or present on every replica yet."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = inline(JsonLdObject),
-        description = "Upsert one root-linked RO-Crate data entity as a JSON-LD object. The body must be a single JSON object carrying its own @id and must not be a crate: a body containing @graph is rejected.",
+        description = "One root-linked RO-Crate data entity as a single JSON-LD object carrying its own @id; a body containing @graph is rejected.",
         examples(
             (
                 "DataEntity" = (
@@ -2060,7 +2022,7 @@ retry."#,
     responses(
         (
             status = 200,
-            description = "Data entity upsert accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
+            description = "Accepted into the durable event/projection pipeline; not necessarily fully materialized, queryable, searchable or replicated yet",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -2082,9 +2044,9 @@ retry."#,
         ),
         (status = 400, description = "Malformed body, a body that is not a single JSON-LD object or that contains @graph, a document id that is not a structured metadata id, or RO-Crate violations listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),
-        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write", body = ErrorResponse)
+        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write; the write was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2131,26 +2093,22 @@ pub async fn add_metadata_data_entity(
     summary = "Upsert an RO-Crate contextual entity",
     description = r#"Adds or replaces one contextual entity in a document's RO-Crate.
 
-**Authentication**: realm bearer token with WRITE on the document's permission path.
+**Authentication**: realm bearer token with WRITE on the document's permission path. A node that
+does not hold the document forwards the write to a holder that re-runs that check under the
+caller's own token.
 
 **Behavior**
-- When this node holds the document the permission is checked here and the write is applied
-  locally; otherwise it is forwarded to a holder that re-runs the same check under the caller's
-  own bearer token.
 - The entity is matched by its `@id`: an existing contextual entity with that id is replaced,
   otherwise it is added.
 - Contextual entities describe people, organizations, licenses and the like and are not linked
   from the root dataset as parts.
 - The surrounding crate retains its RO-Crate 1.2 or 1.3 version.
-- A 200 means the upsert was durably accepted into the event/projection pipeline, not that it is
-  already materialized, queryable, searchable or present on every replica.
-
-**Errors**: a 503 carries `Retry-After` and means the write was not accepted, so the caller may
-retry."#,
+- Acceptance is durable but asynchronous: the revision may not be materialized, queryable,
+  searchable or present on every replica yet."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = inline(JsonLdObject),
-        description = "Upsert one RO-Crate contextual entity as a JSON-LD object. The body must be a single JSON object carrying its own @id and must not be a crate: a body containing @graph is rejected.",
+        description = "One RO-Crate contextual entity as a single JSON-LD object carrying its own @id; a body containing @graph is rejected.",
         examples(
             (
                 "ContextualEntity" = (
@@ -2168,7 +2126,7 @@ retry."#,
     responses(
         (
             status = 200,
-            description = "Contextual entity upsert accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
+            description = "Accepted into the durable event/projection pipeline; not necessarily fully materialized, queryable, searchable or replicated yet",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -2190,9 +2148,9 @@ retry."#,
         ),
         (status = 400, description = "Malformed body, a body that is not a single JSON-LD object or that contains @graph, a document id that is not a structured metadata id, or RO-Crate violations listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),
-        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write", body = ErrorResponse)
+        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write; the write was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2246,8 +2204,8 @@ both answer 404.
 **Behavior**
 - In distributed mode the document's replicas are tried one after another until one returns a
   complete result, so a successful answer is never a merge of partial replies.
-- `nodes_failed` only counts replicas that were tried and failed before a success, and
-  `nodes_queried` counts the replica attempts made.
+- `nodes_queried` counts the replica attempts made and `nodes_failed` only those that failed
+  before a success.
 - The queried graph reflects the last materialized revision, so a write that was only just
   accepted may not be visible yet.
 - `kind` is `Solutions` with one object per row (variable name to lexical value, unbound
@@ -2255,7 +2213,7 @@ both answer 404.
 - `complete` is false when a selected partition is missing, and `failed_partitions` names the node
   ids that failed, plus `partition-discovery` when the realm view itself was unavailable.
 
-**Limits** (all refused with 400)
+**Limits**
 - Only `SELECT` and `ASK` are accepted.
 - The query text is limited to 64 KiB.
 - A `LIMIT` above 10000 rows is rejected.
@@ -2263,7 +2221,7 @@ both answer 404.
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` tries the document's registry replicas until one returns a complete result. Failed replica attempts do not make a successful result partial; `allow_partial` only permits local fallback when holder discovery is unavailable.",
+        description = "A SPARQL `SELECT` or `ASK` query over one metadata document. `mode=local` queries only the current node, while `mode=distributed` tries the document's registry replicas until one returns a complete result. `allow_partial` only permits local fallback when holder discovery is unavailable.",
         examples(
             (
                 "DocumentAsk" = (
@@ -2287,7 +2245,7 @@ both answer 404.
     responses(
         (
             status = 200,
-            description = "SPARQL query result for the document, with the replica attempt counters and completeness flags",
+            description = "SPARQL query result for the document, with replica attempt counters and completeness flags",
             body = MetadataQueryResponse,
             examples(
                 (
@@ -2327,7 +2285,7 @@ both answer 404.
         (status = 401, description = "A replica rejected the forwarded credential as unauthenticated", body = ErrorResponse),
         (status = 403, description = "A replica denied READ for this caller on the document", body = ErrorResponse),
         (status = 404, description = "The document does not exist or is not readable by the caller; the two cases are deliberately indistinguishable", body = ErrorResponse),
-        (status = 503, description = "The graph is not materialized yet, holder discovery failed while allow_partial was false, or every document replica failed. The response carries Retry-After and the caller may retry", body = ErrorResponse)
+        (status = 503, description = "The graph is not materialized yet, holder discovery failed while allow_partial was false, or every document replica failed; retryable", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -2383,7 +2341,7 @@ caller may read, so an anonymous request sees the public documents alone.
 - `kind` is `Solutions` with one object per row (variable name to lexical value, unbound
   variables omitted) for a `SELECT`, or `Boolean` for an `ASK`.
 
-**Limits** (all refused with 400)
+**Limits**
 - Only `SELECT` and `ASK` are accepted.
 - The query text is limited to 64 KiB.
 - A `LIMIT` above 10000 rows is rejected.
@@ -2392,7 +2350,7 @@ caller may read, so an anonymous request sees the public documents alone.
   pattern, without `OFFSET`, can be merged across partitions."#,
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries and merges partition sets. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any partition is unavailable.",
+        description = "A SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries, merges partition sets, and is best-effort by default; set `allow_partial=false` to fail when a partition is unavailable.",
         examples(
             (
                 "SelectDatasets" = (
@@ -2416,7 +2374,7 @@ caller may read, so an anonymous request sees the public documents alone.
     responses(
         (
             status = 200,
-            description = "SPARQL query result over the visible graph union, with the partition counters and completeness flags",
+            description = "SPARQL query result over the visible graph union, with partition counters and completeness flags",
             body = MetadataQueryResponse,
             examples(
                 (
@@ -2455,7 +2413,7 @@ caller may read, so an anonymous request sees the public documents alone.
             )
         ),
         (status = 400, description = "Malformed body, a query that is not SELECT or ASK, a query over the size or row limits, a SERVICE clause, or a distributed query that is not union-safe", body = ErrorResponse),
-        (status = 501, description = "Unsupported query mode. Not reachable through this route today: both local and distributed are supported", body = ErrorResponse)
+        (status = 501, description = "Unsupported query mode; not reachable today because both local and distributed are supported", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -2517,8 +2475,8 @@ so an anonymous request returns fewer documents.
   matched exactly, never as a prefix.
 
 **Limits**
-- Either `q` or `conforms_to` must be given; a request with neither is rejected with 400.
-- A cursor is bound to the original query, so replaying it with a changed query returns 400.
+- Either `q` or `conforms_to` must be given.
+- A cursor is bound to the original query.
 - Hits are ordered by descending score and the page size is silently clamped to at most 100."#,
     params(
         ("q" = Option<String>, Query, description = "Free-text search query, matched against indexed literals. Optional when conforms_to is set"),
@@ -2531,7 +2489,7 @@ so an anonymous request returns fewer documents.
     responses(
         (
             status = 200,
-            description = "Metadata search hits the caller may read, ordered by descending score, with the paging and partition flags",
+            description = "Search hits ordered by descending score, with the paging and partition flags",
             body = MetadataSearchResponse,
             examples(
                 (
@@ -2596,7 +2554,7 @@ so an anonymous request returns fewer documents.
             )
         ),
         (status = 400, description = "Neither q nor conforms_to given, a conforms_to or group_id that is not a valid IRI or ULID, or a cursor that is unreadable, unsigned by a realm node, or bound to a different query", body = ErrorResponse),
-        (status = 501, description = "Unsupported query mode. Not reachable through this route today: both local and distributed are supported", body = ErrorResponse)
+        (status = 501, description = "Unsupported query mode; not reachable today because both local and distributed are supported", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -2646,9 +2604,8 @@ pub async fn search_metadata(
     summary = "List documents referencing an IRI",
     description = r#"Lists the visible metadata documents that reference an IRI.
 
-**Authentication**: realm bearer token; there is no anonymous access to this route, and each
-candidate document is additionally filtered by the caller's READ permission, so an unreadable
-referencing document is simply omitted.
+**Authentication**: realm bearer token; there is no anonymous access. Each candidate document is
+filtered by the caller's READ permission, so an unreadable referencing document is omitted.
 
 **Behavior**
 - The scan is answered from the local node's reference index only, without realm fan-out, so
@@ -2710,7 +2667,7 @@ referencing document is simply omitted.
         ),
         (status = 400, description = "Missing iri, or an iri or predicate that is not a valid absolute IRI", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm", body = ErrorResponse)
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2768,21 +2725,17 @@ fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
     summary = "Preflight destructive content operations against metadata backlinks",
     description = r#"Reports the metadata backlinks a destructive content operation would break.
 
-**Authentication**: realm bearer token for the serving realm. A `bucket_prefix` target additionally
-requires WRITE on the bucket, on the prefix when one is given, and on every key the prefix resolves
-to; a `content_w3ids` target names content identities directly and checks no storage permission.
+**Authentication**: realm bearer token. A `bucket_prefix` target additionally requires WRITE on the
+bucket, on the prefix when one is given, and on every key the prefix resolves to; a `content_w3ids`
+target names content identities directly and checks no storage permission.
 
 **Behavior**
-- Maps a bounded exact content-W3ID set or an authorized bucket/prefix inventory to canonical
-  content identities, then queries canonical and known legacy location IRIs.
-- Local mode reports realm coverage incomplete.
-- Distributed mode fans out to realm nodes and reports per-node index freshness, failed
-  partitions, and stable cursor pagination.
+- The target set is mapped to canonical content identities, which are then queried as canonical
+  and known legacy location IRIs.
+- Local mode reports realm coverage as incomplete; distributed mode fans out to realm nodes and
+  reports per-node index freshness, failed partitions and stable cursor pagination.
 - Restricted referencing documents are represented only by `hidden_references_exist`; their count
-  and identity are never returned.
-
-**Errors**: with `allow_partial=false`, any failed, stale, or otherwise incomplete partition
-returns 503 rather than silently downgrading the request."#,
+  and identity are never returned."#,
     request_body(content = MetadataReferencePreflightBody,
         example = json!({
             "target": {
@@ -2848,9 +2801,9 @@ returns 503 rather than silently downgrading the request."#,
             })),
         (status = 400, description = "Malformed or oversized target set, unsupported content identity, or invalid cursor", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Wrong realm or insufficient WRITE permission for the bucket/prefix", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is missing on the bucket, prefix or a resolved key", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
-        (status = 503, description = "Strict lookup could not produce complete current coverage", body = ErrorResponse)
+        (status = 503, description = "With allow_partial=false a failed, stale or otherwise incomplete partition fails the request instead of silently downgrading it; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

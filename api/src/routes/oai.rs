@@ -108,8 +108,8 @@ fn protocol(code: &'static str, message: impl Into<String>) -> OaiFault {
     summary = "Answer an OAI-PMH request from query arguments",
     description = r#"Public OAI-PMH 2.0 provider for this realm's metadata registry, driven by query arguments.
 
-**Authentication**: none; authentication is neither required nor accepted, only documents an
-anonymous caller may read are enumerated, and every candidate is re-checked before it is rendered.
+**Authentication**: none; a token is neither required nor accepted. Only documents an anonymous
+caller may read are enumerated, and every candidate is re-checked before it is rendered.
 
 **Behavior**
 - Supported verbs are `Identify`, `ListMetadataFormats`, `ListSets`, `ListIdentifiers`,
@@ -117,18 +117,17 @@ anonymous caller may read are enumerated, and every candidate is re-checked befo
 - `oai_dc` is the only disseminated format and the repository has no set hierarchy.
 - Lists are paged at 100 records and continue through `resumptionToken`, which must then be the
   only argument; the last response of a token sequence carries an empty `resumptionToken` element.
-
-**Errors**: protocol failures (`badVerb`, `badArgument`, `cannotDisseminateFormat`,
-`idDoesNotExist`, `noRecordsMatch`, `noSetHierarchy`, `badResumptionToken`) are returned as an
-error element inside a 200 `text/xml` envelope, not as HTTP error codes."#,
+- Protocol failures (`badVerb`, `badArgument`, `cannotDisseminateFormat`, `idDoesNotExist`,
+  `noRecordsMatch`, `noSetHierarchy`, `badResumptionToken`) are error elements inside the 200
+  envelope, not HTTP error codes."#,
     params(
-        ("verb" = Option<String>, Query, description = "OAI-PMH verb: Identify, ListMetadataFormats, ListSets, ListIdentifiers, ListRecords or GetRecord. A missing or unknown verb answers badVerb."),
-        ("metadataPrefix" = Option<String>, Query, description = "Requested metadata format, required by ListIdentifiers, ListRecords and GetRecord unless a resumptionToken is used. Only oai_dc is supported; anything else answers cannotDisseminateFormat."),
-        ("identifier" = Option<String>, Query, description = "Record identifier, the document graph IRI https://w3id.org/aruna/{document_id}. Required by GetRecord, optional for ListMetadataFormats."),
-        ("from" = Option<String>, Query, description = "Inclusive lower datestamp bound as YYYY-MM-DD or YYYY-MM-DDThh:mm:ssZ. Both bounds must use the same granularity."),
-        ("until" = Option<String>, Query, description = "Inclusive upper datestamp bound as YYYY-MM-DD or YYYY-MM-DDThh:mm:ssZ. When omitted the window closes at the current instant so later writes cannot join a running sequence."),
-        ("set" = Option<String>, Query, description = "Set spec. This repository publishes no sets and answers noSetHierarchy."),
-        ("resumptionToken" = Option<String>, Query, description = "Opaque continuation token from a previous incomplete list. It must be the only argument, and an unknown or expired token answers badResumptionToken.")
+        ("verb" = Option<String>, Query, description = "OAI-PMH verb; a missing or unknown verb answers badVerb"),
+        ("metadataPrefix" = Option<String>, Query, description = "Requested metadata format, required by ListIdentifiers, ListRecords and GetRecord unless a resumptionToken is used. Only oai_dc is supported; anything else answers cannotDisseminateFormat"),
+        ("identifier" = Option<String>, Query, description = "Record identifier, the document graph IRI https://w3id.org/aruna/{document_id}. Required by GetRecord, optional for ListMetadataFormats"),
+        ("from" = Option<String>, Query, description = "Inclusive lower datestamp bound as YYYY-MM-DD or YYYY-MM-DDThh:mm:ssZ; both bounds must use the same granularity"),
+        ("until" = Option<String>, Query, description = "Inclusive upper datestamp bound in the same forms. When omitted the window closes at the current instant, so later writes cannot join a running sequence"),
+        ("set" = Option<String>, Query, description = "Set spec; this repository publishes no sets and answers noSetHierarchy"),
+        ("resumptionToken" = Option<String>, Query, description = "Continuation token from a previous incomplete list. It must be the only argument, and an unknown or expired token answers badResumptionToken")
     ),
     responses(
         (
@@ -138,8 +137,8 @@ error element inside a 200 `text/xml` envelope, not as HTTP error codes."#,
             content_type = "text/xml",
             example = json!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><OAI-PMH xmlns=\"http://www.openarchives.org/OAI/2.0/\"><responseDate>2026-04-09T14:23:11Z</responseDate><request verb=\"Identify\">https://node.example.test/api/v1/oai</request><Identify><repositoryName>Aruna</repositoryName></Identify></OAI-PMH>")
         ),
-        (status = 500, description = "Internal fault; the body is a short plain-text marker rather than an OAI-PMH envelope"),
-        (status = 503, description = "The anonymous visibility index is unavailable; retry the same request later. The body is a short plain-text marker rather than an OAI-PMH envelope.")
+        (status = 500, description = "Internal fault; the body is a plain-text marker, not an OAI-PMH envelope"),
+        (status = 503, description = "The anonymous visibility index is unavailable; retryable. The body is a plain-text marker, not an OAI-PMH envelope")
     ),
     security(())
 )]
@@ -161,16 +160,14 @@ async fn handle_oai(
     summary = "Answer an OAI-PMH request from a url-encoded form",
     description = r#"The POST form of the same public OAI-PMH provider, taking arguments as a url-encoded body.
 
-**Authentication**: none; authentication is neither required nor accepted and only anonymously
-readable documents are enumerated.
+**Authentication**: none; a token is neither required nor accepted, and only anonymously readable
+documents are enumerated.
 
 **Behavior**
-- Arguments arrive as an `application/x-www-form-urlencoded` body instead of a query string, and
-  are validated by the identical verb matrix.
-
-**Errors**: protocol failures are returned inside a 200 `text/xml` envelope. A body sent with any
-other content type answers a `badArgument` envelope, and a repeated argument answers `badArgument`
-rather than being silently collapsed."#,
+- Arguments arrive as an `application/x-www-form-urlencoded` body instead of a query string and are
+  validated by the identical verb matrix, so protocol failures again ride inside the 200 envelope.
+- Any other content type answers a `badArgument` envelope, as does a repeated argument, which is
+  never silently collapsed."#,
     request_body(
         content = String,
         content_type = "application/x-www-form-urlencoded",
@@ -184,8 +181,8 @@ rather than being silently collapsed."#,
             content_type = "text/xml",
             example = json!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><OAI-PMH xmlns=\"http://www.openarchives.org/OAI/2.0/\"><responseDate>2026-04-09T14:23:11Z</responseDate><request verb=\"ListIdentifiers\" metadataPrefix=\"oai_dc\">https://node.example.test/api/v1/oai</request><ListIdentifiers><header><identifier>https://w3id.org/aruna/01JMETADATA0123456789ABCDE</identifier><datestamp>2026-04-09T14:23:11Z</datestamp></header></ListIdentifiers></OAI-PMH>")
         ),
-        (status = 500, description = "Internal fault; the body is a short plain-text marker rather than an OAI-PMH envelope"),
-        (status = 503, description = "The anonymous visibility index is unavailable; retry the same request later. The body is a short plain-text marker rather than an OAI-PMH envelope.")
+        (status = 500, description = "Internal fault; the body is a plain-text marker, not an OAI-PMH envelope"),
+        (status = 503, description = "The anonymous visibility index is unavailable; retryable. The body is a plain-text marker, not an OAI-PMH envelope")
     ),
     security(())
 )]

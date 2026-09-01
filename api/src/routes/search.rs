@@ -327,24 +327,21 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
     summary = "Search buckets across the realm",
     description = r#"Searches bucket names across the realm's serving nodes and merges the authorized matches.
 
-**Authentication**: bearer token issued by this realm; a token from another realm is refused with
-403. Every node applies its own authorization and deny policies to its own buckets, so a bucket the
-caller may not read never appears.
+**Authentication**: realm bearer token. Every node applies its own authorization and deny policies
+to its own buckets, so a bucket the caller may not read never appears.
 
 **Behavior**
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
-- Answers are merged and cut to the page size; there is no continuation token, so a broader result
-  set is reached by narrowing the query rather than by paging.
-- A node that fails, is omitted by the node cap or times out does not fail the request: the answer
-  is partial and says so through `nodes_queried`, `nodes_failed` and `failed_nodes`, which names
-  the nodes that did not answer and carries the entry `partition-discovery` when node discovery
-  itself failed.
-- A partial answer means matching buckets may be missing rather than absent, and the caller may
-  repeat the request.
+- There is no continuation token: answers are merged and cut to the page size, so a broader result
+  set is reached by narrowing the query.
+- A node that fails, times out or is dropped by the node cap does not fail the request. The answer
+  is partial and reports it through `nodes_queried`, `nodes_failed` and `failed_nodes`, which names
+  the nodes that did not answer and carries `partition-discovery` when node discovery itself
+  failed.
+- A partial answer is still 200 and means matching buckets may be missing rather than absent.
 
 **Limits**
-- The query is trimmed and must keep at least 2 characters, otherwise the request is rejected with
-  400.
+- The query is trimmed and must keep at least 2 characters.
 - At most 32 nodes are queried per request."#,
     params(
         ("q" = String, Query, description = "Case-insensitive bucket-name substring; trimmed, minimum 2 characters, no wildcards"),
@@ -353,7 +350,7 @@ caller may not read never appears.
     responses(
         (
             status = 200,
-            description = "Authorized federated bucket matches, possibly partial when nodes_failed is non-zero",
+            description = "Merged authorized bucket matches, partial when `nodes_failed` is non-zero",
             body = BucketsSection,
             example = json!({
                 "hits": [
@@ -417,15 +414,14 @@ pub async fn bucket_search(
     summary = "Search current object heads",
     description = r#"Searches current live object heads by key, on this node or across the realm.
 
-**Authentication**: bearer token issued by this realm. Every current live head is checked against
-group READ, token path restrictions and request policies before it can be returned.
+**Authentication**: realm bearer token. Every live head is checked against group READ, token path
+restrictions and request policies before it can be returned.
 
 **Behavior**
-- Keys are matched case-sensitively by substring or prefix, optionally inside one exact bucket.
 - Delete markers and historical versions are excluded, and no total is exposed.
 - `local` searches this node, `distributed_best_effort` returns reachable node pages with explicit
-  failed coverage, and `distributed_strict` returns 503 rather than a partial page.
-- The opaque cursor is bound to the query, bucket, match type and mode; it composes per-node keyset
+  failed coverage, and `distributed_strict` answers 503 rather than a partial page.
+- The cursor is bound to the query, bucket, match type and mode; it composes per-node keyset
   positions and an as-of watermark so newly created versions do not enter a cursor chain.
 - `coverage` names the live-head source, observation times, failed partitions, completeness and
   truncation."#,
@@ -485,10 +481,10 @@ group READ, token path restrictions and request policies before it can be return
                 }
             })
         ),
-        (status = 400, description = "Malformed query or cursor", body = ErrorResponse),
+        (status = 400, description = "Query shorter than 2 characters, or a cursor that does not match this query, bucket, match type and mode", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
-        (status = 503, description = "Strict distributed coverage could not be completed, or the local live-head scan was unavailable", body = ErrorResponse)
+        (status = 503, description = "Strict distributed coverage could not be completed, or the live-head scan was unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -632,30 +628,25 @@ fn format_system_time(time: std::time::SystemTime) -> String {
     summary = "Search documents, buckets, groups and users",
     description = r#"Searches documents, buckets, groups and users concurrently and returns one sectioned answer.
 
-**Authentication**: bearer token issued by this realm; a token from another realm is refused with
-403. Each section is authorized on its own terms: every node filters its own document and bucket
-results, group hits are filtered per hit against READ on the group's data so a caller who may not
-read a group never learns it exists, and the user directory is an admin-scoped read.
+**Authentication**: realm bearer token. Each section is authorized on its own terms: every node
+filters its own document and bucket hits, a group hit is filtered against READ on the group's data
+so a caller never learns of a group it may not read, and the user directory is an admin-scoped read.
 
 **Behavior**
-- Documents and buckets fan out over the realm's serving nodes, at most 32 nodes under one shared
+- Documents and buckets fan out over at most 32 of the realm's serving nodes under one shared
   deadline of about 12 seconds; groups are matched locally.
-- A caller without the admin-scoped directory read simply gets no `users` section instead of an
-  error, and a section that was not requested is omitted from the response.
-- Answers can be partial: for documents and buckets, `nodes_queried` and `nodes_failed` count the
-  fan-out and a non-zero `nodes_failed` (a node that failed, timed out or was dropped by the node
-  cap) means hits may be missing rather than absent.
-- Documents also set `truncated` when paging stopped at the server-side depth cap, and groups set
-  `truncated` when the per-hit visibility scan hit its round cap with matches still pending.
-- A partial answer is still 200 and the caller may repeat the request.
+- A caller without the admin-scoped directory read gets no `users` section instead of an error, and
+  a section that was not requested is omitted.
+- An answer can be partial and is still 200: for documents and buckets a non-zero `nodes_failed`
+  means hits may be missing rather than absent.
+- Documents set `truncated` when paging stopped at the server-side depth cap, groups when the
+  per-hit visibility scan hit its round cap with matches still pending.
 - Paging is per section and only for a single-type request: pass the section's `next_cursor` back
-  as `cursor`, and a missing `next_cursor` means that section is exhausted.
+  as `cursor`, and a missing `next_cursor` means that section is exhausted. The buckets section has
+  no continuation token.
 - A document cursor is a signed token bound to the exact query and filters, a group cursor is the
   last returned group id as a ULID, and a user cursor is the last returned user id in its
-  `ulid@realm` form.
-
-**Errors**: a malformed or unsupported cursor is rejected with 400, as is a cursor sent with more
-than one type or with `types=buckets`, which has no continuation token."#,
+  `ulid@realm` form."#,
     params(
         ("q" = String, Query, description = "Search query; trimmed, minimum 2 characters, matched as a substring for buckets, groups and users and as a full-text query for documents"),
         ("types" = Option<String>, Query, description = "Comma-separated subset of documents,buckets,groups,users. Defaults to all four; empty entries are ignored and an unknown type returns 400"),
@@ -668,7 +659,7 @@ than one type or with `types=buckets`, which has no continuation token."#,
     responses(
         (
             status = 200,
-            description = "Sectioned search results; a section is omitted when it was not requested and is authoritative only when its failure counters are zero",
+            description = "Sectioned search results; a section is authoritative only when its failure counters are zero",
             body = SearchResponse,
             example = json!({
                 "documents": {
@@ -724,7 +715,7 @@ than one type or with `types=buckets`, which has no continuation token."#,
                 }
             })
         ),
-        (status = 400, description = "Query shorter than 2 characters, unknown type, malformed group id, or a cursor that is multi-type, unsupported or does not match the original query", body = ErrorResponse),
+        (status = 400, description = "Query shorter than 2 characters, unknown type, malformed group id, or a cursor that is unsupported, sent with more than one type, or does not match the original query", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
