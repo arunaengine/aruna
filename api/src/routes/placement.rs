@@ -591,21 +591,17 @@ async fn bucket_info(
     summary = "Publish an immutable placement policy",
     description = r#"Publishes an immutable placement policy definition and returns the document holders serve.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path; the check runs
-inside the operation, so a caller without it is refused before anything is written.
+**Authentication**: realm bearer token with WRITE on the realm-configuration path
+`/{realm_id}/admin/config`, checked inside the operation before anything else is read.
 
 **Behavior**
-- The definition is immutable: publishing the same id with the same selectors returns the stored
-  document unchanged.
-- Omitting `policy_id` mints one.
+- A definition is immutable: omitting `policy_id` mints one, and republishing an id with the same
+  selectors returns the stored document unchanged.
 - The document is committed on a holder of the bucket its id resolves to; when this node holds none,
   the publication is forwarded to a current holder under the caller's own token, and that holder
   re-runs the same admin check, so a relay never becomes the author.
 - The response carries the publisher, the authorizing user and the definition digest that every
-  later reference must name.
-
-**Errors**: the same id with different selectors is refused with 409 and never replaces the stored
-rule. A 503 means no holder could be reached or this node cannot sign, and nothing was published."#,
+  later reference must name."#,
     request_body(content = CreatePolicyRequest, example = json!({
         "name": "eu-residency",
         "allowed": [
@@ -625,10 +621,10 @@ rule. A 503 means no holder could be reached or this node cannot sign, and nothi
             "created_at_ms": 1755500000000u64
         })),
         (status = 400, description = "The definition is invalid, or an id, node id or digest could not be parsed", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
-        (status = 409, description = "The policy id already carries a different definition", body = ErrorResponse),
-        (status = 503, description = "No holder could commit the publication right now; nothing was written", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
+        (status = 409, description = "The policy id already carries a different definition, which is never replaced", body = ErrorResponse),
+        (status = 503, description = "No holder could commit the publication; nothing was written", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -678,18 +674,15 @@ pub async fn create_placement_policy(
     summary = "Read one placement policy by reference",
     description = r#"Returns one authenticated placement policy document named by its id and definition digest.
 
-**Authentication**: realm bearer token.
+**Authentication**: realm bearer token; this is the one placement route that needs no
+realm-configuration permission.
 
 **Behavior**
-- Both the id and the `digest` of the definition are needed, because an id alone could be answered
+- Both the id and the `digest` of the definition are required, because an id alone could be answered
   with other bytes.
 - The document is read from this node when it holds a replica and otherwise fetched from the holders
   the policy id resolves to, and it is only returned after its original publication verified against
-  this node's replicated realm view, so a relay cannot present itself as the author.
-
-**Errors**: a digest that does not match what the holders serve is reported as 404 rather than
-returning a substituted rule. A 503 means no holder answered or the publication could not be
-verified here; it never means the rule denies anything."#,
+  this node's replicated realm view, so a relay cannot present itself as the author."#,
     params(
         ("policy_id" = String, Path, description = "ULID of the policy"),
         ("digest" = String, Query, description = "Lowercase hex of the 32-byte definition digest")
@@ -707,10 +700,10 @@ verified here; it never means the rule denies anything."#,
             "created_at_ms": 1755500000000u64
         })),
         (status = 400, description = "The id or digest could not be parsed", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm", body = ErrorResponse),
-        (status = 404, description = "No holder has a policy with that id and digest", body = ErrorResponse),
-        (status = 503, description = "No holder answered, or the publication could not be verified", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm", body = ErrorResponse),
+        (status = 404, description = "No holder has a policy with that id and digest; a mismatched digest is a 404 rather than a substituted rule", body = ErrorResponse),
+        (status = 503, description = "No holder answered, or the publication could not be verified here; never a denial", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -746,15 +739,17 @@ pub async fn get_placement_policy(
     summary = "List the placement policies this responder holds",
     description = r#"Returns one bounded page of the placement policy documents this node holds.
 
-**Authentication**: realm bearer token with READ on the realm configuration path, checked inside the
-operation.
+**Authentication**: realm bearer token with READ on the realm-configuration path, checked inside the
+operation, so the listing is no existence oracle.
 
 **Behavior**
 - Policy documents replicate only to the holders their id resolves to, so a page names what this
   node stores rather than a realm-wide catalog.
 - `complete` means this node's own bounded iterator was exhausted in the pass.
-- Policies are ordered by ascending policy id; `next_cursor` continues after the last one
-  returned."#,
+- Policies are ordered by ascending policy id; `next_cursor` continues after the last one returned.
+
+**Limits**
+- `limit` defaults to 50 and is capped at 200."#,
     params(PolicyListQuery),
     responses(
         (status = 200, description = "One bounded page of policies this node holds", body = PolicyListResponse, example = json!({
@@ -775,8 +770,8 @@ operation.
             "complete": false
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -821,9 +816,9 @@ pub struct PolicyRefQuery {
     path = "/data/buckets/{bucket}/placement",
     tag = "data/placement",
     summary = "Read a bucket's default placement policies",
-    description = r#"Returns the placement policy refs a bucket applies by default, with their generation.
+    description = r#"Returns the placement policy references a bucket applies by default, with their generation.
 
-**Authentication**: realm bearer token with READ on the realm configuration path, because the
+**Authentication**: realm bearer token with READ on the realm-configuration path, because the
 default names policy ids.
 
 **Behavior**
@@ -834,7 +829,7 @@ default names policy ids.
 - A bucket that has never been given a default returns an empty list at its current generation."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     responses(
-        (status = 200, description = "The default ref set and the generation it was written at", body = BucketPlacementResponse, example = json!({
+        (status = 200, description = "The default reference set and the generation it was written at", body = BucketPlacementResponse, example = json!({
             "bucket": "datasets",
             "policies": [
                 {
@@ -844,8 +839,8 @@ default names policy ids.
             ],
             "generation": 3
         })),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -881,25 +876,21 @@ pub async fn get_bucket_placement(
     path = "/data/buckets/{bucket}/placement",
     tag = "data/placement",
     summary = "Replace a bucket's default placement policies",
-    description = r#"Replaces the placement policy refs a bucket applies by default to newly minted versions.
+    description = r#"Replaces the placement policy references a bucket applies by default to newly minted versions.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path, checked inside
+**Authentication**: realm bearer token with WRITE on the realm-configuration path, checked inside
 the operation.
 
 **Behavior**
 - The submitted list replaces the whole default set; an empty list clears it.
-- Every ref is resolved and authenticated through the ordinary policy read before it can become a
-  default, so a ref no holder can supply leaves the stored default untouched.
+- Every reference is resolved and authenticated through the ordinary policy read before it can
+  become a default, so one no holder can supply leaves the stored default untouched.
 - A real change advances `placement_policy_generation` exactly once inside the same transaction;
   submitting the set that is already stored commits nothing and returns the current generation, so a
-  replay cannot supersede a bulk run that sealed the same refs.
+  replay cannot supersede a bulk run that sealed the same references.
 - Sending `expected_generation` makes the change a compare-and-set.
-- The default governs versions minted after it: stored versions keep their own refs until a
-  successor is minted for them.
-
-**Errors**: a compare-and-set that another writer moved first, and an exhausted counter, are 409. A
-ref no holder can authenticate is 503 and nothing was changed. A placement rule refusal is a 400
-reported with a fixed reason that never names a policy, a ref or a node."#,
+- The default governs versions minted after it: stored versions keep their own references until a
+  successor is minted for them."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     request_body(content = BucketPlacementRequest, example = json!({
         "policies": [
@@ -911,7 +902,7 @@ reported with a fixed reason that never names a policy, a ref or a node."#,
         "expected_generation": 3
     })),
     responses(
-        (status = 200, description = "The default set as stored, with the generation it now carries", body = BucketPlacementResponse, example = json!({
+        (status = 200, description = "The default reference set as stored, with the generation it now carries", body = BucketPlacementResponse, example = json!({
             "bucket": "datasets",
             "policies": [
                 {
@@ -921,9 +912,9 @@ reported with a fixed reason that never names a policy, a ref or a node."#,
             ],
             "generation": 4
         })),
-        (status = 400, description = "A ref could not be parsed, the set is not a valid ref set, or a placement rule refuses it", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
+        (status = 400, description = "A reference could not be parsed, the set is not a valid reference set, or a placement rule refuses it under a fixed reason that names no policy, reference or node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The stored generation is not the expected one, or the counter is exhausted", body = ErrorResponse),
         (status = 503, description = "A referenced policy could not be authenticated; nothing was changed", body = ErrorResponse)
@@ -966,32 +957,25 @@ pub async fn put_bucket_placement(
     path = "/data/buckets/{bucket}/placement/objects",
     tag = "data/placement",
     summary = "Attach an exact policy set to one object",
-    description = r#"Mints a successor version of one object that carries exactly the submitted placement refs.
+    description = r#"Mints a successor version of one object that carries exactly the submitted placement references.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path, checked inside
+**Authentication**: realm bearer token with WRITE on the realm-configuration path, checked inside
 the operation.
 
 **Behavior**
-- This is an exact replacement, not a union: the successor carries exactly the submitted refs, so an
-  explicit mutation may tighten or relax.
-- Nothing stored is rewritten; a new version is minted that carries the new refs and the
-  predecessor's bytes, and the predecessor keeps its own refs.
+- This is an exact replacement, not a union: the successor carries exactly the submitted references,
+  so an explicit mutation may tighten or relax.
+- Nothing stored is rewritten; a new version is minted that carries the new references and the
+  predecessor's bytes, and the predecessor keeps its own.
 - The mutation advances the head only while it still is exactly `expected_version_id` at
-  `expected_generation` and the bucket is still the same record, so a concurrent write is reported
-  as 409 and the caller replans from the new head.
+  `expected_generation` and the bucket is still the same record; a concurrent write is a 409 and the
+  caller replans from the new head.
 - Repeating the same `mutation_id` with the same parameters returns the version the first attempt
   assigned, which is what makes a lost response safe; the same id with other parameters is a 409.
-- A materialized object needs a verified local copy of its bytes on a destination the new refs
-  admit: without one the response is `blocked` with a reason and nothing was written, and the
-  ordinary movement path has to stage and register compliant bytes first.
-- A reference-only head mints a successor and registers no copy.
-
-**Errors**
-- A 400 covers an unparsable id, version id or ref, and a placement rule that refuses the
-  destination, which is reported with a fixed reason that never names a policy, a ref or a node.
-- A 503 means a referenced policy could not be authenticated, this node advertises no placement
-  subject or is not admitting governed data, or its subject moved during the mutation; nothing was
-  written and the caller may retry."#,
+- A materialized object needs a verified local copy of its bytes on a destination the new references
+  admit: without one the outcome is `blocked` with a reason and nothing was written, and compliant
+  bytes have to be staged and registered first.
+- A reference-only head mints a successor and registers no copy."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     request_body(content = ObjectPlacementRequest, example = json!({
         "key": "raw/sample.fastq",
@@ -1017,12 +1001,12 @@ the operation.
                 }
             ]
         })),
-        (status = 400, description = "An id, version id or ref could not be parsed, or a placement rule refuses the destination", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
+        (status = 400, description = "An id, version id or reference could not be parsed, or a placement rule refuses the destination under a fixed reason that names no policy, reference or node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No such bucket, or the expected head version no longer exists", body = ErrorResponse),
         (status = 409, description = "The head moved, the bucket changed, the mutation id was reused with other parameters, or the assigned version id is taken", body = ErrorResponse),
-        (status = 503, description = "A referenced policy, this node's placement subject or its admission state made the mutation impossible; nothing was written", body = ErrorResponse)
+        (status = 503, description = "A referenced policy could not be authenticated, this node advertises no placement subject or is not admitting governed data, or its subject moved during the mutation; nothing was written and the call may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1107,28 +1091,31 @@ fn mutation_response(outcome: SuccessorOutcome) -> ObjectPlacementResponse {
     path = "/data/buckets/{bucket}/placement/runs",
     tag = "data/placement",
     summary = "Apply the bucket default to local heads",
-    description = r#"Runs one resumable pass that applies the bucket's default refs to this responder's current heads.
+    description = r#"Runs one resumable pass applying the bucket's default references to this responder's current heads.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path, checked inside
+**Authentication**: realm bearer token with WRITE on the realm-configuration path, checked inside
 the operation.
 
 **Behavior**
 - The first call under an `operation_id` seals the run against the bucket's exact identity,
-  generation and default ref set; repeating that id resumes the sealed run, and every later pass is
-  bound to what was sealed.
-- The application is additive: each object's successor carries the union of the refs its head
+  generation and default reference set; repeating that id resumes the sealed run, and every later
+  pass is bound to what was sealed.
+- The application is additive: each object's successor carries the union of the references its head
   already had and the sealed target, so applying a default never removes a constraint. Exact
-  replacement is a separate surface.
+  replacement is the per-object route.
 - One pass walks a bounded page of this responder's own heads and returns a `cursor` to continue
-  with; heads that already carry the target and delete markers are counted as covered.
-- An object whose bytes cannot be reused, whose destination the refs deny, or whose policy cannot be
-  authenticated is retained as a durable blocked gap and retried by a later pass rather than being
-  reported as done.
-- A head that moved is replanned instead of advanced.
-- When the bucket default changes the run is marked superseded and stops, so one run never mixes two
+  with; heads that already carry the target and delete markers count as covered, and a head that
+  moved is replanned.
+- An object whose bytes cannot be reused, whose destination the references deny, or whose policy
+  cannot be authenticated becomes a durable blocked gap that a later pass retries.
+- Status `active` is resumable, including after a pass stopped because this node's own placement
+  subject moved; `superseded` means the bucket default itself moved, so one run never mixes two
   policies.
 - `complete` means this node's bounded iterator was exhausted, never that another partition
-  converged."#,
+  converged.
+
+**Limits**
+- The default page is 64 heads."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     request_body(content = BulkRunRequest, example = json!({
         "operation_id": "01K2ZK4Q0X3D5M6P7R8S9T0V6E",
@@ -1159,8 +1146,8 @@ the operation.
             "complete": false
         })),
         (status = 400, description = "The operation id or cursor could not be parsed", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The run was sealed against a different bucket record", body = ErrorResponse),
         (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started", body = ErrorResponse)
@@ -1225,22 +1212,21 @@ const SCAN_DEFAULT_LIMIT: usize = 128;
     path = "/data/buckets/{bucket}/placement/coverage",
     tag = "data/placement",
     summary = "Report responder-local coverage of the bucket default",
-    description = r#"Reports how far this responder's own stored objects carry the bucket's default placement refs.
+    description = r#"Reports how far this responder's own stored objects carry the bucket's default placement references.
 
-**Authentication**: realm bearer token with READ on the realm configuration path, checked inside the
+**Authentication**: realm bearer token with READ on the realm-configuration path, checked inside the
 operation.
 
 **Behavior**
-- The report names the exact default ref set and generation it compared against and reports only
-  what this responder stores: `complete` means its own bounded iterator was exhausted, not that
-  another partition or a concurrent write was observed, and the `limits` list states that
-  explicitly.
-- Attachment gaps and local copy state are separate answers: an object can carry every ref and still
-  have no serveable copy here, so zero gaps never implies that every registered copy is compliant.
+- The report names the exact default reference set and generation it compared against, and covers
+  only what this responder stores: `complete` means its own bounded iterator was exhausted, and the
+  `limits` list states what the report deliberately does not claim.
+- Attachment gaps and local copy state are separate answers: an object can carry every reference and
+  still have no serveable copy here, so zero gaps never implies that every registered copy complies.
 - Scope `current` walks current heads; scope `historical` reports versions that are no longer the
   head and lack the default, which is diagnostic only, because minting successors never rewrites
-  their immutable refs.
-- Reference-only heads are included and labelled rather than omitted."#,
+  their immutable references.
+- Reference-only heads are labelled rather than omitted."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used by the S3 surface"),
         CoverageQuery
@@ -1277,8 +1263,8 @@ operation.
             ]
         })),
         (status = 400, description = "The scope, cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1379,16 +1365,16 @@ fn coverage_response(
     summary = "Inspect local policy enforcement, violations and cache coverage",
     description = r#"Reports this node's own placement subject, its policy violations and its policy cache figures.
 
-**Authentication**: realm bearer token with READ on the realm configuration path, checked inside the
+**Authentication**: realm bearer token with READ on the realm-configuration path, checked inside the
 operation.
 
 **Behavior**
 - Everything reported is an observation of this node's own rows: the placement subject it
-  advertises, whether serving is currently blocked or draining, and a bounded page of its registered
-  copies.
+  advertises, whether serving is currently blocked or the node is policy-draining, and a bounded
+  page of its registered copies.
 - A copy that is quarantined or was last seen on a departed node is listed as a violation with the
-  refs it was registered under; a serveable registration is counted but never listed, and it is not
-  by itself a compliance claim.
+  references it was registered under; a serveable registration is counted but never listed, and
+  being counted is no compliance claim.
 - Cache figures are diagnostics only and never policy truth: an evicted entry only costs a refetch,
   and a negative entry is an availability hint that expires.
 - `complete` refers to this node's bounded copy iterator, and `cache_truncated` says the cache scan
@@ -1426,8 +1412,8 @@ operation.
             "complete": true
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1523,20 +1509,18 @@ pub struct QuarantineResolveResponse {
     summary = "Resolve the quarantined copies that block governed admission",
     description = r#"Revalidates or releases the quarantined copies that keep this node from admitting governed data.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path, checked inside
+**Authentication**: realm bearer token with WRITE on the realm-configuration path, checked inside
 the operation.
 
 **Behavior**
-- A subject transition, a rejoin or a failed revalidation leaves non-compliant copies quarantined,
-  and while any of them remains this node serves no governed data and admits no new governed work,
-  including new execution targets. This route is how an operator ends that state.
-- List the quarantined copies with `GET /admin/placement-diagnostics` first: each violation names
-  the exact bucket, key and version to act on.
-- `action` of `revalidate` re-evaluates every local registration against the subject this node
-  advertises now, restoring the ones that comply again.
-- `action` of `release` additionally drops every local registration of the one named version first,
-  which makes that version locally unavailable rather than serveable and never deletes data on
-  another node.
+- While any copy stays quarantined this node serves no governed data and admits no new governed
+  work, including new execution targets; this route is how an operator ends that state.
+- List the quarantined copies with `GET /data/placement/diagnostics` first: each violation names the
+  exact bucket, key and version to act on.
+- `revalidate` re-evaluates every local registration against the subject this node advertises now,
+  restoring the ones that comply again.
+- `release` additionally drops every local registration of the one named version first, which makes
+  that version locally unavailable rather than serveable and never deletes data on another node.
 - The block ends only when the walk finds nothing quarantined, which the response reports as
   `cleared`; a still-quarantined copy leaves the node draining, which is the safe state, not an
   error.
@@ -1563,8 +1547,8 @@ the operation.
             "cleared": true
         })),
         (status = 400, description = "Unknown `action`, a release without an exact version, or a version that could not be parsed", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

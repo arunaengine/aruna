@@ -100,27 +100,21 @@ async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketIn
     summary = "Queue a replication copy onto another node",
     description = r#"Durably queues replication of a bucket, object or version onto another node.
 
-**Authentication**: bearer token issued by this realm; a token from another realm is refused with
-403. The caller needs WRITE on the object when `path` is given and WRITE on the whole bucket when
-it is not.
+**Authentication**: realm bearer token with WRITE on the object when `path` is given, and WRITE on
+the whole bucket when it is not.
 
 **Behavior**
-- The 202 means the replication job was written durably on this node and nothing more: no bytes
-  have been copied, the target node has not been contacted, and the copy may still fail or be
-  retried in the background.
-- A caller that needs the outcome polls the locations endpoint until the target reports the copy as
-  present; the response echoes the accepted scope rather than any progress.
-- Scope follows the fields: no `path` replicates the whole bucket, a `path` replicates that object,
-  and a `path` with `version_id` replicates exactly that version.
+- The 202 means the job is durable on this node and nothing more: no bytes are copied yet, and the
+  copy may still fail or be retried in the background.
+- Progress is observed through `GET /data/blobs/locations`; the response only echoes the accepted
+  scope.
+- No `path` replicates the whole bucket, a `path` replicates that object, and a `path` with
+  `version_id` replicates exactly that version.
 - Delete markers are included in the queued work.
-- Submitting the same scope again queues the work again, so the request is not idempotent.
-
-**Limits**
-- A `version_id` sent without a `path` is rejected with 400.
-- A bucket that does not exist on this node is reported as 404."#,
+- Submitting the same scope again queues the work again, so the request is not idempotent."#,
     request_body(
         content = ReplicateBlobRequest,
-        description = "Bucket to replicate from, the optional object path and version that narrow the scope, and the hex id of the destination node",
+        description = "Replication scope and the hex id of the destination node",
         example = json!({
             "bucket": "lab-raw",
             "path": "runs/2026-04-09/reads.fastq.gz",
@@ -131,7 +125,7 @@ it is not.
     responses(
         (
             status = 202,
-            description = "Replication work was durably queued; the copy is not complete and its progress is observed through the locations endpoint",
+            description = "Replication work was durably queued; no bytes have been copied yet",
             body = ReplicateBlobResponse,
             example = json!({
                 "bucket": "lab-raw",
@@ -142,7 +136,8 @@ it is not.
         ),
         (status = 400, description = "Malformed destination node id or version id, or a version_id sent without a path", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the bucket or object", body = ErrorResponse)
+        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the bucket or object", body = ErrorResponse),
+        (status = 404, description = "Bucket unknown to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -373,40 +368,29 @@ fn copy_response(
     summary = "List the nodes holding one object version",
     description = r#"Lists every node that holds or is expected to hold one object version.
 
-**Authentication**: bearer token issued by this realm and READ on the object; a token from another
-realm is refused with 403.
+**Authentication**: realm bearer token with READ on the object.
 
 **Behavior**
-- The local node resolves the version, then asks every node that might hold a copy: the
-  destinations a sync relationship maps this key to, the bucket's configured replication targets,
-  the destinations with queued replication work, and the nodes the durable holder index names for
-  these bytes.
-- One entry is returned per destination path, so a node reachable under two bucket-and-key pairs
-  appears twice and only the whole node, bucket and key triple identifies an entry.
-- Per-copy `state` is `present` when the node reports the bytes, `pending` when the copy is
-  expected but not there yet, `not-stored` when the version carries no bytes anywhere such as a
-  delete marker, `denied` when the node refused to answer under the caller's identity, and
-  `unreachable` when it gave no answer at all.
-- An unreachable holder does not fail the request: the answer is still 200 with `complete` false
-  and `unreachable` listed in `limits`, and repeating the request may reach that node and complete
-  the picture.
-- `complete` is true only when every candidate was enumerated and answered; otherwise `limits`
-  names each reason, and a copy may be missing from the list rather than genuinely absent.
-- Copies are ordered local first, then by node, bucket and key.
+- This node asks every destination that might hold a copy: the destinations a sync relationship
+  maps this key to, the bucket's configured replication targets, the destinations with queued
+  replication work, and the nodes the durable holder index names for these bytes.
+- One entry is returned per destination, so a node reached under two bucket-and-key pairs appears
+  twice; copies are ordered local first, then by node, bucket and key.
+- A destination that does not answer never fails the request: the reply stays 200 with `complete`
+  false and the reason in `limits`, and a copy may then be missing rather than genuinely absent.
 
 **Limits**
-- At most 64 destinations are asked, at most 8 at a time, each with a 5 second answer window inside
-  a 30 second budget for the whole request, so a stalled peer costs the deadline once rather than
-  once per node."#,
+- At most 64 destinations are asked, 8 at a time, each with a 5 second answer window inside a 30
+  second budget for the whole request."#,
     params(
         ("bucket" = String, Query, description = "Bucket holding the object, as known to this node"),
         ("path" = String, Query, description = "Object key within the bucket, without a leading slash"),
-        ("version_id" = Option<String>, Query, description = "Version to inspect, given as a ULID; defaults to the current version and a malformed value returns 400")
+        ("version_id" = Option<String>, Query, description = "Version to inspect as a ULID; defaults to the current version")
     ),
     responses(
         (
             status = 200,
-            description = "Copies of one version; authoritative only when complete is true, otherwise limits explains what the search could not cover and the caller may retry",
+            description = "Copies of one version; a false complete means limits names what the search could not cover",
             body = BlobLocationsResponse,
             example = json!({
                 "bucket": "lab-raw",

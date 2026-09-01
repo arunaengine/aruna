@@ -233,8 +233,6 @@ enum ResolveOutcome {
 **Authentication**: none; the route is deliberately public and a bearer token changes nothing.
 
 **Behavior**
-- Answered from this node alone, with no lookup and no network call, so it is always current for
-  the node that received the request.
 - `id` and `name` are derived from the realm this node serves, and `type` reports the GA4GH
   `org.ga4gh`/`drs` service type with this node's software version.
 - `organization.url` is the externally visible base URL of the node, taken from the forwarded scheme
@@ -302,7 +300,7 @@ pub async fn get_service_info(
   `passport_auth_issuers` is always empty.
 - `bearer_auth_issuers` lists the OIDC issuers this node currently trusts, and is empty when no
   OIDC validator is configured or it cannot be reached.
-- A browser CORS preflight on this path is answered by the CORS layer, when one is configured, and
+- A browser CORS preflight on this path is answered by the CORS layer, where one is configured, and
   never reaches this operation."#,
     params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator; echoed back verbatim and not validated here")),
     responses(
@@ -343,10 +341,10 @@ pub async fn get_authorizations(
     summary = "Resolve a DRS object by identifier",
     description = r#"Resolves one DRS identifier to the object's metadata and access method.
 
-**Authentication**: optional, and it changes the result: an anonymous caller only resolves objects
-readable by the public role. A request without a bearer token, or with one this node cannot
-validate, is treated as anonymous rather than rejected, and READ is then evaluated for the Everyone
-principal.
+**Authentication**: optional, and it changes the result. A request without a bearer token, or with
+one this node cannot validate, is treated as anonymous rather than rejected, and READ is then
+evaluated for the Everyone principal, so an anonymous caller resolves only publicly readable
+objects.
 
 **Behavior**
 - An identifier naming another realm answers 404 without any lookup.
@@ -354,12 +352,11 @@ principal.
   establishes absence: within one bounded probe budget the answer is its own 404, 403 or the
   object's metadata.
 - Only the owning node serves the bytes, so a routed answer advertises no access method.
-- A content-hash identifier is resolved against every object on this node carrying that content and
-  the first one the caller may read is returned, so the same digest can resolve differently for
+- A content-hash identifier resolves against every object on this node carrying that content and
+  returns the first one the caller may read, so the same digest can resolve differently for
   different callers.
 - The response carries the requested identifier in `id`, the canonical W3ID in `aliases` when the
-  request used a different form, and the stored checksums including the blake3 content digest in a
-  stable order.
+  request used a different form, and the stored checksums in a stable order.
 - For an object held here it carries a single `https` access method whose `access_url.url` is a
   direct download URL on this node; no redirect is issued and no signed or time-limited URL is
   minted, so the caller must send its own bearer token to that URL.
@@ -370,13 +367,7 @@ principal.
   `https://w3id.org/aruna/data/{blake3-hex}`, `https://w3id.org/aruna/data/{versioned-s3-arn}`,
   `arn:aruna:{realm_id}:{node_id}:ch/{blake3-hex}` with 64 lowercase hex characters, or
   `arn:aruna:{realm_id}:{node_id}:s3/{bucket}/{key}@{version-ulid}` whose key is percent-encoded
-  except for the separating slashes.
-- Identifiers contain slashes, so the whole remainder of the path is taken as the identifier.
-
-**Errors**: a caller that presented a token but lacks READ gets 403, while an anonymous caller in
-the same position gets the same 404 as for a missing object, so existence is never revealed to an
-unauthenticated caller. A probed owner that answers nothing inside the budget is a retryable 503
-rather than a 404."#,
+  except for the separating slashes."#,
     params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator; the whole remainder of the path is taken as the identifier")),
     responses(
         (status = 200, description = "The resolved DRS object, as visible to this caller", body = DrsObjectResponse, example = json!({
@@ -412,7 +403,7 @@ rather than a 404."#,
         })),
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
         (status = 403, description = "The caller presented a token but may not read the object, or the token belongs to another realm", body = DrsErrorPayload),
-        (status = 404, description = "No such object on this node, or an anonymous caller may not read it", body = DrsErrorPayload),
+        (status = 404, description = "No such object on this node, or an anonymous caller may not read it, which is deliberately indistinguishable", body = DrsErrorPayload),
         (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, so absence was never established; the caller may retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
@@ -449,31 +440,24 @@ pub async fn get_object(
     summary = "Resolve several DRS objects in one request",
     description = r#"Resolves a list of DRS identifiers in one request, one entry per identifier.
 
-**Authentication**: optional, and it changes the result: an anonymous caller only resolves objects
-readable by the public role, exactly as in the single-object lookup.
+**Authentication**: optional, and it changes the result exactly as in the single-object lookup: an
+anonymous caller resolves only publicly readable objects.
 
 **Behavior**
-- Each identifier is resolved and authorized exactly as the single-object lookup does, so a batch
-  is a convenience and not a transaction.
-- Identifiers owned by other nodes are probed concurrently against one budget for the whole
-  request, so a batch costs no more wall time than a single lookup.
-- The request itself succeeds with 200 whenever the body parses and stays inside the cap:
-  per-identifier failures are reported inside the matching entry as `{status_code, msg}` instead of
-  failing the batch.
-- Entries are returned in the order the identifiers were given, one entry per identifier, including
-  duplicates.
+- Each identifier is resolved and authorized exactly as the single-object lookup does, so a batch is
+  a convenience and not a transaction.
+- Identifiers owned by other nodes are probed concurrently against one budget for the whole request,
+  so a batch costs no more wall time than a single lookup.
+- The request itself succeeds with 200 whenever the body parses and stays inside the cap; entries
+  come back in request order, one per identifier, including duplicates.
 
 **Limits**
-- At most 100 identifiers may be named, and a longer list is rejected with 400 before anything is
-  resolved.
+- At most 100 identifiers may be named, and a longer list is rejected before anything is resolved.
 
-**Errors**
-- An identifier whose owner did not answer inside the budget appears as a per-item 503, never as an
-  absence.
-- An unreadable object appears as 403 for a token-bearing caller and as 404 for an anonymous one,
-  and an object that could not be serialized appears as 500.
-- A body that is not valid JSON for a list of identifiers is rejected by the body extractor and
-  returned as plain text rather than the declared payload."#,
+**Errors**: a per-identifier failure is reported inside its own entry as `{status_code, msg}`.
+- An owner that did not answer inside the budget is 503, never an absence.
+- An unreadable object is 403 for a token-bearing caller and 404 for an anonymous one.
+- An object that could not be serialized is 500."#,
     request_body(
         content = DrsBulkObjectsRequestBody,
         description = "The DRS identifiers to resolve, in any of the forms the single-object lookup accepts",
@@ -526,7 +510,7 @@ readable by the public role, exactly as in the single-object lookup.
                 }
             ]
         })),
-        (status = 400, description = "More than 100 identifiers were named, or the request body is not valid JSON for a list of identifiers", body = DrsErrorPayload)
+        (status = 400, description = "More than 100 identifiers were named; a body that is not valid JSON for a list of identifiers is rejected by the extractor as plain text instead of this payload", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -617,9 +601,8 @@ fn download_error(error: GetObjectError) -> Response {
     summary = "Download the bytes of a DRS object",
     description = r#"Streams the bytes of a DRS object from the node that owns it.
 
-**Authentication**: optional, and it changes the result: an anonymous caller only downloads objects
-readable by the public role. The identifier is resolved and authorized exactly as the object lookup
-does.
+**Authentication**: optional, and it changes the result exactly as in the object lookup: an
+anonymous caller downloads only publicly readable objects.
 
 **Behavior**
 - This is the URL advertised as the object's `https` access method; it streams the bytes itself and
@@ -627,25 +610,21 @@ does.
   token.
 - Only the owning node serves bytes: an identifier that resolves at another node of the realm is
   answered 501, because this node holds the metadata but not the object.
-- On success the response is 200 with the raw bytes and a `Content-Length` taken from the stored
-  object; no content type is asserted and range requests are not supported.
+- The 200 carries the raw bytes and a `Content-Length` taken from the stored object; no content type
+  is asserted and range requests are not supported.
 - Each transfer takes one node-wide download slot and one per-caller slot, keyed by user for an
-  authenticated caller and by client address for an anonymous one; when a slot cannot be taken the
-  download is refused rather than queued and the caller may retry later.
+  authenticated caller and by client address for an anonymous one; a slot that cannot be taken
+  refuses the download rather than queueing it.
 
 **Limits**
-- `object_id` takes the same three forms the object lookup accepts, given as a single query
-  parameter.
-- A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut
-  mid-body: the 200 has already been sent, so a client must treat a body shorter than
-  `Content-Length` as a failed download and retry.
-
-**Errors**: every denial an anonymous caller could observe is reported as 404 so that existence
-stays hidden, while an authenticated caller without READ gets 403."#,
+- A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut mid-body:
+  the 200 has already been sent, so a client must treat a body shorter than `Content-Length` as a
+  failed download and retry."#,
     params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator, URL-encoded because these identifiers contain `:` and `/`")),
     responses(
         (status = 200, description = "Object bytes, streamed inline with a `Content-Length` header and no content type"),
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
+        (status = 403, description = "An authenticated caller lacks READ; an anonymous caller gets 404 instead, so existence stays hidden", body = DrsErrorPayload),
         (status = 404, description = "No such object on this node, an anonymous caller may not read it, or the recorded reference observation is no longer served by its source", body = DrsErrorPayload),
         (status = 409, description = "Reference binding reached its automatic advance limit; retrying does not help until the reference is rebound by an explicit write", body = DrsErrorPayload),
         (status = 501, description = "The identifier resolves to an object owned by another node, which alone serves its bytes; read the object first and download from the endpoint it names", body = DrsErrorPayload),
