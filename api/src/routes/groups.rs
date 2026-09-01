@@ -41,6 +41,7 @@ use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation}
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
 };
+use aruna_operations::update_group::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -64,7 +65,7 @@ pub struct GroupsApiDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(GroupsApiDoc::openapi())
         .routes(routes!(create_group, list_groups))
-        .routes(routes!(get_group))
+        .routes(routes!(get_group, update_group))
         .routes(routes!(get_group_usage))
         .routes(routes!(list_data_paths))
         .routes(routes!(list_group_members, add_group_member))
@@ -85,6 +86,11 @@ pub struct CreateGroupResponse {
     pub group_id: String,
     pub realm_id: String,
     pub roles: Vec<RoleResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateGroupRequest {
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -369,7 +375,11 @@ realm's per-user group quota, from which WRITE on the realm group-admin path exe
 - A user node forwards the create to a management or server peer under the caller's own token, which
   is where the quota and the permission are checked.
 - The write commits here and reaches the rest of the realm through document sync, so another node
-  may not list the group immediately."#,
+  may not list the group immediately.
+
+**Limits**
+- The name is trimmed and must be 1 to 256 characters.
+- Names need not be unique."#,
     request_body(
         content = CreateGroupRequest,
         description = "Display name for the new group. It is stored as given and need not be unique.",
@@ -410,7 +420,7 @@ realm's per-user group quota, from which WRITE on the realm group-admin path exe
                 ]
             })
         ),
-        (status = 400, description = "Malformed request body", body = ErrorResponse),
+        (status = 400, description = "Malformed request body, or a name that is empty or longer than 256 characters", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter is retryable unchanged", body = ErrorResponse),
@@ -514,6 +524,7 @@ pub async fn create_group(
         CreateGroupError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent group creation conflict; retry".to_string())
         }
+        CreateGroupError::InvalidDisplayName => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     })?;
     create_span.record("group_id", field::display(result.0.group_id));
@@ -731,6 +742,116 @@ pub(crate) async fn run_get_group(
         realm_id: group.realm_id.to_string(),
         roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
     })
+}
+
+#[utoipa::path(
+    patch,
+    path = "/access/groups/{id}",
+    tag = "access/groups",
+    summary = "Rename a group",
+    description = r#"Changes a group's display name and returns its refreshed directory entry.
+
+**Authentication**: realm bearer token without path restrictions, carrying WRITE on the group's
+administrative path or on the realm group-administration path.
+
+**Behavior**
+- Only the label changes: the group id and every permission path, bucket, dataset and usage counter
+  stay as they are.
+- The rename commits here and reaches the rest of the realm through document sync, so another node
+  may still answer with the previous name for a moment.
+- Two concurrent renames converge on the later one; a receiver that cannot order them keeps the name
+  it already stored.
+
+**Limits**
+- The name is trimmed and must be 1 to 256 characters.
+- Names need not be unique."#,
+    request_body(
+        content = UpdateGroupRequest,
+        description = "The new display name. It is stored as given, trimmed, and need not be unique.",
+        example = json!({
+            "display_name": "Proteomics Lab"
+        })
+    ),
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
+    responses(
+        (
+            status = 200,
+            description = "The group after the rename, in the same shape as reading it",
+            body = GroupInfoResponse,
+            example = json!({
+                "display_name": "Proteomics Lab",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "roles": [
+                    {
+                        "role_id": "01JROLEADMIN0123456789ABCD",
+                        "name": "admin",
+                        "permissions": {
+                            "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/**": "Write"
+                        },
+                        "assigned_users": [
+                            "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                        ],
+                        "public": false
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "The path segment is not a valid ULID, or the name is empty or longer than 256 characters", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller administers neither the group nor the realm's groups", body = ErrorResponse),
+        (status = 404, description = "No such group on this node", body = ErrorResponse),
+        (status = 409, description = "This node is a device, a concurrent write conflicted, or the group's bucket cut over; the latter two are retryable unchanged", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_group(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    Json(request): Json<UpdateGroupRequest>,
+) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
+    let auth = require_unrestricted(auth)?;
+    let realm_id = state.get_realm_id();
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+    let group_id = parse_group_id(&group_id)?;
+    refuse_group_edit(&state).await?;
+
+    drive(
+        UpdateGroupOperation::new(UpdateGroupConfig {
+            actor: actor_for(&state, &auth),
+            auth_context: auth.clone(),
+            group_id,
+            display_name: request.display_name,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_update_group_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(run_get_group(&state, Some(auth), &group_id.to_string()).await?),
+    ))
+}
+
+fn map_update_group_error(error: UpdateGroupError) -> ServerError {
+    match error {
+        UpdateGroupError::Unauthorized => ServerError::Forbidden,
+        UpdateGroupError::GroupNotFound => ServerError::NotFound,
+        UpdateGroupError::InvalidDisplayName | UpdateGroupError::ConversionError(_) => {
+            ServerError::BadRequest
+        }
+        UpdateGroupError::PlacementFenced => {
+            ServerError::Conflict("the group moved to a new holder set; retry".to_string())
+        }
+        UpdateGroupError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent group update conflict; retry".to_string())
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
@@ -1839,9 +1960,10 @@ fn encode_object_token(token: ListObjectsV2ContinuationToken) -> ServerResult<St
 #[cfg(test)]
 mod tests {
     use super::{
-        AddGroupMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, ListGroupsQuery,
-        add_group_member, create_group, get_group, get_group_usage, list_data_paths,
-        list_group_members, list_groups,
+        AddGroupMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, GroupInfoResponse,
+        ListGroupsQuery, UpdateGroupRequest, add_group_member, create_group, get_group,
+        get_group_usage, list_data_paths, list_group_members, list_groups, run_get_group,
+        update_group,
     };
     use crate::auth::ValidatedArunaBearerTokenCarrier;
     use crate::error::{ServerError, ServerResult};
@@ -2155,6 +2277,128 @@ mod tests {
         assert!(
             matches!(error, ServerError::Conflict(reason) if reason.contains("through the realm"))
         );
+    }
+
+    async fn rename(
+        state: &Arc<ServerState>,
+        auth: Option<AuthContext>,
+        group_id: Ulid,
+        name: &str,
+    ) -> ServerResult<GroupInfoResponse> {
+        update_group(
+            State(state.clone()),
+            Extension(auth),
+            Path(group_id.to_string()),
+            Json(UpdateGroupRequest {
+                display_name: name.to_string(),
+            }),
+        )
+        .await
+        .map(|(status, Json(body))| {
+            assert_eq!(status, StatusCode::OK);
+            body
+        })
+    }
+
+    #[tokio::test]
+    async fn renames_group() {
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let group_id = seed_group(&state, admin).await;
+
+        let renamed = rename(&state, Some(member_auth(admin)), group_id, "  Platform  ")
+            .await
+            .unwrap();
+        assert_eq!(renamed.display_name, "Platform");
+        assert_eq!(renamed.group_id, group_id.to_string());
+
+        let stored = run_get_group(&state, Some(member_auth(admin)), &group_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(stored.display_name, "Platform");
+        assert_eq!(stored.roles.len(), renamed.roles.len());
+    }
+
+    #[tokio::test]
+    async fn renames_foreign_group() {
+        // A realm admin renames a group they are not a member of.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+
+        let renamed = rename(&state, Some(member_auth(admin)), group_id, "Platform")
+            .await
+            .unwrap();
+        assert_eq!(renamed.display_name, "Platform");
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_stranger() {
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let group_id = seed_group(&state, admin).await;
+        let stranger = UserId::local(Ulid::generate(), state.get_realm_id());
+
+        let error = rename(&state, Some(member_auth(stranger)), group_id, "Platform")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::Forbidden));
+        assert!(matches!(
+            rename(&state, None, group_id, "Platform")
+                .await
+                .unwrap_err(),
+            ServerError::Unauthorized
+        ));
+        assert!(matches!(
+            rename(&state, Some(foreign_auth()), group_id, "Platform")
+                .await
+                .unwrap_err(),
+            ServerError::Forbidden
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_name() {
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let group_id = seed_group(&state, admin).await;
+
+        for name in ["   ".to_string(), "n".repeat(257)] {
+            assert!(matches!(
+                rename(&state, Some(member_auth(admin)), group_id, &name)
+                    .await
+                    .unwrap_err(),
+                ServerError::BadRequest
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn device_refuses_rename() {
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let group_id = seed_group(&state, admin).await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        let error = rename(&state, Some(member_auth(admin)), group_id, "Platform")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ServerError::Conflict(reason) if reason.contains("through the realm"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_long_name() {
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let error = new_group(&state, admin, &"n".repeat(257))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::BadRequest));
     }
 
     #[tokio::test]
