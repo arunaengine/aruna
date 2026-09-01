@@ -8,15 +8,16 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN apt-get update \
     && apt-get install -y --no-install-recommends clang cmake mold \
     && rm -rf /var/lib/apt/lists/*
-# .dockerignore strips local files under docker/, so the default build ships an empty portal.
+# .dockerignore strips docker/ from the context, so the default build ships an empty portal.
 # To embed portal assets, pass --build-arg PORTAL_EMBED_DIR=<staged dir outside docker/>.
 ARG PORTAL_EMBED_DIR=docker/portal
 COPY . .
 RUN cargo build --release --locked -p aruna
 RUN cargo build --release --locked -p aruna-doctor
 RUN cargo install --locked --version 0.101.0 --root target iroh-doctor
-# The runtime image has no shell, so the portal is staged here.
-RUN mkdir -p /portal && cp -r ${PORTAL_EMBED_DIR}/. /portal/ && rm -f /portal/.gitkeep
+# The runtime image has no shell, so the portal is staged here; the embed dir
+# is created on demand because the repository no longer tracks it.
+RUN mkdir -p /portal ${PORTAL_EMBED_DIR} && cp -r ${PORTAL_EMBED_DIR}/. /portal/
 
 FROM gcr.io/distroless/cc-debian13@sha256:ed7c407fd64eb0af9dddb9456b94cee188a40a7f53cf38c9836e1e9ae14fca02
 WORKDIR /run

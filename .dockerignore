@@ -3,7 +3,4 @@ target
 .env
 **/.env
 .compose-data
-docker/*
-!docker/portal
-docker/portal/*
-!docker/portal/.gitkeep
+docker/
