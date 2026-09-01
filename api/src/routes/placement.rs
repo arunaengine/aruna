@@ -542,6 +542,33 @@ fn map_successor_error(error: SuccessorError) -> ServerError {
     }
 }
 
+/// Bucket defaults name policy ids: a realm-configuration reader may see them,
+/// and so may an administrator of the group that owns the bucket, who is also
+/// the one allowed to change them.
+async fn ensure_placement_read(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: aruna_core::types::GroupId,
+) -> ServerResult<()> {
+    let realm_reader = crate::auth::permission_granted(
+        state,
+        auth,
+        aruna_core::structs::policy_admin_path(auth.realm_id),
+        aruna_core::structs::Permission::READ,
+    )
+    .await?;
+    if realm_reader {
+        return Ok(());
+    }
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        aruna_core::structs::group_admin_path(auth.realm_id, group_id),
+        aruna_core::structs::Permission::READ,
+    )
+    .await
+}
+
 /// A group-owned rule governs only its owner's buckets. The reason is readable
 /// because the caller supplied the reference or already reads the default.
 fn foreign_policy() -> ServerError {
@@ -910,8 +937,9 @@ pub struct PolicyRefQuery {
     summary = "Read a bucket's default placement policies",
     description = r#"Returns the placement policy references a bucket applies by default, with their generation.
 
-**Authentication**: realm bearer token with READ on the realm-configuration path, because the
-default names policy ids.
+**Authentication**: realm bearer token with READ on the realm-configuration path, or READ on
+`/{realm_id}/g/{group}/admin` for the group that owns the bucket, because the default names policy
+ids.
 
 **Behavior**
 - This is a node-local read of the replicated bucket record: a default written on another node can
@@ -932,7 +960,7 @@ default names policy ids.
             "generation": 3
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or neither realm-configuration read nor admin read on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -943,15 +971,8 @@ pub async fn get_bucket_placement(
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    // Bucket defaults name policy ids; only realm-config readers may see them.
-    crate::auth::ensure_permission(
-        &state,
-        &auth,
-        aruna_core::structs::policy_admin_path(auth.realm_id),
-        aruna_core::structs::Permission::READ,
-    )
-    .await?;
     let info = bucket_info(&state, &bucket).await?;
+    ensure_placement_read(&state, &auth, info.group_id).await?;
     let policies = named_refs(&state, auth.realm_id, info.placement_policies).await?;
     Ok(Json(BucketPlacementResponse {
         bucket,
