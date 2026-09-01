@@ -235,7 +235,6 @@ self-scoped: only the submitter of a request may audit it, and any other id answ
 surface never confirms that somebody else's job exists.
 
 **Behavior**
-- The page is ordered by stable record key, never by arrival.
 - `scope=family` pages the request family the alias resolves to; `scope=submission` also pages the
   idempotency conflicts of the same submission, each record marked with `conflicting_family`.
 - Every alternative execution and every output any partition produced is listed, not only the
@@ -253,11 +252,7 @@ surface never confirms that somebody else's job exists.
 **Limits** (all refused with 400)
 - `limit` is 1 to 64 records per page and defaults to 64.
 - `cursor` must be a `next_cursor` of this log, base64url without padding.
-- `scope` is `family` or `submission`.
-
-**Errors**: an unknown id, an unparseable id and a job submitted by somebody else are the same 404,
-as is a responder that never held the family, so page the node that accepted the submission. A 503
-means the log could not be reduced here and the caller may page again."#,
+- `scope` is `family` or `submission`."#,
     params(
         ("job_id" = String, Path, description = "Job id from submission, or any accepted alias of the same request: a 26-character ULID"),
         ("scope" = Option<String>, Query, description = "`family` (the default) pages this request family only; `submission` also pages other families of the same submission"),
@@ -317,7 +312,7 @@ means the log could not be reduced here and the caller may page again."#,
         (status = 400, description = "Unknown `scope`, a cursor that is not a record key of this log, or a `limit` outside 1..=64", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
-        (status = 404, description = "Unknown, unparseable or foreign job id, or a responder that never held the family", body = ErrorResponse),
+        (status = 404, description = "Unknown, unparseable or foreign job id, or a responder that never held the family; page the node that accepted the submission", body = ErrorResponse),
         (status = 503, description = "The log could not be reduced here; retryable, the caller may page again", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

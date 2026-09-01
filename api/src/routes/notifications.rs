@@ -460,21 +460,19 @@ async fn canonicalize_watch_path(
     description = r#"Lists the calling user's notification inbox, newest first.
 
 **Authentication**: realm bearer token; the inbox is self-scoped to the calling user, so no further
-permission is checked, and a token carrying path restrictions is rejected with 403 because a
-user-scoped surface cannot honor a delegated token's confinement.
+permission is checked, and a path-restricted token is refused because a user-scoped surface cannot
+honor a delegated token's confinement.
 
 **Behavior**
-- The inbox always belongs to the calling user and there is no way to read another user's inbox.
 - The request is served by the node that holds the caller's inbox, either locally or proxied to
   that holder over the realm network, so results are as consistent as that single holder.
-- Notifications are returned newest first by creation time.
 - Resource-watch notifications are re-authorized while the page is assembled and dropped when the
   caller may no longer read the resource; suppressed rows do not consume the page.
 - A response without `next_cursor` is the last page.
 
 **Limits**
 - `limit` defaults to 50 and is capped at 200; a limit of 0 is raised to 1.
-- `cursor` must be an unpadded base64url encoding of exactly 24 bytes; anything else is a 400."#,
+- `cursor` must be an unpadded base64url encoding of exactly 24 bytes."#,
     params(
         ("limit" = Option<usize>, Query, description = "Max notifications to return, default 50, capped at 200; a limit of 0 is raised to 1"),
         ("cursor" = Option<String>, Query, description = "Opaque pagination cursor: pass the `next_cursor` of the previous page, an unpadded base64url encoding of 24 bytes; omit it to start at the newest notification")
@@ -563,15 +561,15 @@ pub async fn list_notifications(
     description = r#"Returns the unread badge value for the calling user's inbox.
 
 **Authentication**: realm bearer token; the count is self-scoped to the calling user and a
-path-restricted token is rejected with 403.
+path-restricted token is refused.
 
 **Behavior**
 - The count is produced by the node holding the caller's inbox, locally or proxied to that holder.
 - Resource-watch notifications the caller may no longer read are excluded.
 
 **Limits**
-- It is a badge value, not an exact total: counting stops at 100 and stops after scanning 2000 inbox
-  rows, and `capped` is true in either case, meaning `at least count unread`."#,
+- It is a badge value, not an exact total: counting stops at 100 unread or after 2000 scanned inbox
+  rows, and `capped` is true in either case, meaning at least `count` unread."#,
     responses(
         (
             status = 200,
@@ -918,11 +916,11 @@ fn state_event(state: NotificationStreamStateResponse) -> Event {
     description = r#"Streams a small state frame the client uses as a trigger to refetch the inbox.
 
 **Authentication**: realm bearer token; the stream is self-scoped to the calling user and a
-path-restricted token is rejected with 403.
+path-restricted token is refused.
 
 **Behavior**
 - The response is a `text/event-stream` that stays open until the client disconnects or the node
-  shuts down; it is not a JSON document and carries no notification payloads.
+  shuts down; it carries no notification payloads.
 - Every application frame is `event: state` followed by one `data:` line holding JSON
   `{"epoch": <string>, "revision": <u64>, "unread": {"count": <u32>, "capped": <bool>}}` and a
   blank line; frames carry no `id:` field, so `Last-Event-ID` is not honored.
@@ -933,9 +931,9 @@ path-restricted token is rejected with 403.
 - The epoch changes when the retained counter is reset, which tells a client its cached revision is
   meaningless.
 - When this node holds the caller's inbox the stream reacts to local delivery wakes within about
-  200ms of coalescing; otherwise it polls the holder every 5s and emits only on change.
-- A local stream re-resolves the holder after 60s of silence and degrades to polling if the inbox
-  moved to another node, so a client never has to reconnect for that.
+  200ms of coalescing; otherwise it polls the holder every 5s and emits only on change. A local
+  stream re-resolves the holder after 60s of silence and degrades to polling if the inbox moved, so
+  a client never has to reconnect for that.
 - Transient fetch failures are skipped rather than ending the stream.
 - A client resumes by simply reconnecting: the first frame of the new stream is the full current
   state, and any state missed while disconnected is recovered by refetching the inbox, never
@@ -1000,7 +998,7 @@ pub async fn stream_notifications(
     description = r#"Marks the calling user's notifications as read, by id, by age, or both.
 
 **Authentication**: realm bearer token; only the calling user's own inbox is affected and a
-path-restricted token is rejected with 403.
+path-restricted token is refused.
 
 **Behavior**
 - The update is applied on the node holding the caller's inbox, locally or proxied to that holder.
@@ -1011,8 +1009,7 @@ path-restricted token is rejected with 403.
 - A body with no ids and no `up_to_ms` marks nothing and returns 0.
 
 **Limits**
-- At most 512 ids, and duplicates are collapsed; more ids, or an id that is not a ULID, is refused
-  with 400."#,
+- At most 512 ids, and duplicates are collapsed."#,
     request_body(
         content = MarkReadApiRequest,
         description = "Notifications to mark read, by id, by age, or both; at most 512 ids, duplicates are collapsed",
@@ -1074,7 +1071,7 @@ pub async fn mark_read(
     description = r#"Lists every watch subscription owned by the calling user.
 
 **Authentication**: realm bearer token; watches are per-user, so this returns only the calling
-user's own subscriptions and a path-restricted token is rejected with 403.
+user's own subscriptions and a path-restricted token is refused.
 
 **Behavior**
 - The list is read from the node holding the caller's inbox, locally or proxied to that holder.
@@ -1129,16 +1126,14 @@ pub async fn list_watches(
     summary = "Create a notification watch for the caller",
     description = r#"Creates an authorized watch subscription over a canonical resource prefix.
 
-**Authentication**: realm bearer token; a path-restricted token is rejected with 403. Data events
-require READ on that exact node's blob bucket permission path and metadata events READ on the
-group's metadata permission path, evaluated against the caller's current grants at creation time.
+**Authentication**: realm bearer token; a path-restricted token is refused. Data events require READ
+on that exact node's blob bucket permission path and metadata events READ on the group's metadata
+permission path, evaluated against the caller's current grants at creation time.
 
 **Behavior**
-- The watch is created for the calling user only.
 - Data events use `s3/{group_id}/{node_id}/{bucket}/{key-prefix}`; for a bucket on this node the
   supplied group is canonicalized to the bucket-owning group and the response exposes that
-  canonical prefix.
-- Metadata events use `meta/{group_id}/{normalized_document_path-prefix}`.
+  canonical prefix. Metadata events use `meta/{group_id}/{normalized_document_path-prefix}`.
 - The subscription is stored on the node holding the caller's inbox, locally or proxied to that
   holder; 201 means it is durably recorded there, while replication to the other holders and
   publication of the watch interest are scheduled afterwards, so the first matching events may
@@ -1147,13 +1142,10 @@ group's metadata permission path, evaluated against the caller's current grants 
   without deleting the watch.
 
 **Limits**
-- The slash after the bucket or metadata group is required and no leading slash is allowed.
+- The prefix must be non-empty and at most 1024 bytes, must carry no leading slash, must keep the
+  slash after the bucket or metadata group, and at least one event name must be given.
 - Metadata and data event kinds cannot be combined, because their canonical namespaces differ.
-- The prefix must be non-empty and at most 1024 bytes, and at least one event name must be given.
-- A user may hold at most 50 watches, beyond which creation answers 409.
-
-**Errors**: a caller that cannot read the prefix always gets 403, never a 404 that would separate
-an unreadable resource from a missing one."#,
+- A user may hold at most 50 watches."#,
     request_body(
         content = CreateWatchRequest,
         description = "Canonical resource prefix plus the event names to subscribe to; valid names are `metadata_created`, `data_uploaded`, `sync_completed` and `sync_failed`",
@@ -1176,7 +1168,7 @@ an unreadable resource from a missing one."#,
         ),
         (status = 400, description = "Invalid or non-canonical path prefix, prefix longer than 1024 bytes, empty event list, or invalid event name", body = ErrorResponse),
         (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, carries path restrictions, or the caller may not read the watched prefix", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, carries path restrictions, or the caller may not read the watched prefix; an unreadable and a missing resource are deliberately indistinguishable", body = ErrorResponse),
         (status = 409, description = "The caller already holds the maximum of 50 watches", body = ErrorResponse),
         (status = 502, description = "The inbox holder was reached but did not answer; the caller may retry", body = ErrorResponse),
         (status = 503, description = "No inbox holder is currently available, or this node has no realm network handle to reach it; the caller may retry", body = ErrorResponse)
@@ -1239,9 +1231,9 @@ pub async fn create_watch(
     summary = "Delete one of the caller's notification watches",
     description = r#"Deletes one watch subscription owned by the calling user.
 
-**Authentication**: realm bearer token; watches are per-user and the id is resolved inside the
-caller's own set, so another user's watch can never be deleted and no further permission is checked.
-A path-restricted token is rejected with 403.
+**Authentication**: realm bearer token; the id is resolved inside the caller's own set, so another
+user's watch can never be deleted and no further permission is checked. A path-restricted token is
+refused.
 
 **Behavior**
 - The delete is applied on the node holding the caller's inbox, locally or proxied to that holder.
@@ -1886,8 +1878,8 @@ mod tests {
     // The recheck tick is the missed-wake backstop: with no wake fired, the local
     // arm still periodically re-resolves the holder and refetches, emitting when the
     // count changed. Driving a live holder re-rank (degrade to the remote arm) in a
-    // single in-process node is impractical — that path needs a real second node
-    // holding the inbox — so it is covered by the multi-node and remote-arm tests;
+    // single in-process node is impractical (that path needs a real second node
+    // holding the inbox), so it is covered by the multi-node and remote-arm tests;
     // here we lock in the same-node backstop refetch.
     #[tokio::test]
     async fn stream_local_arm_recheck_refetches_on_change_without_wake() {
