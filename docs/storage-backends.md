@@ -146,8 +146,8 @@ node labelled `tier=cold` actually registers a `cold` backend.
 Rules resolve most-specific first: exact key, key prefix (longest first),
 bucket, group, node, then the default backend. Operator rules live in the
 `[[routing]]` entries of the backends file. Tenants add rules per bucket
-(`PUT /buckets/{bucket}/storage-routing`) and one group default
-(`PUT /groups/{group_id}/storage-routing`). The response carries advisory
+(`PUT /data/buckets/{bucket}/storage/routing`) and one group default
+(`PUT /data/groups/{group_id}/storage/routing`). The response carries advisory
 warnings, for example when no node currently advertises the requested class.
 
 Ties are rejected when rules are written, never broken at write time. Two
@@ -162,7 +162,7 @@ Replication targets do not inherit the writer's routing: every node resolves
 its own rules for the copy it materializes. Tenant data therefore does not
 stay exclusively on the endpoint the tenant wrote to, and the copies of one
 version can sit on different classes and even on different kinds of storage.
-`GET /blobs/locations` asks every node that might hold a copy and reports where
+`GET /data/blobs/locations` asks every node that might hold a copy and reports where
 each one keeps it. Each copy carries the destination bucket and key it is
 stored under, so a node reached under several mapped paths has one entry per
 path and its node id repeats. `complete` is false whenever any part of the

@@ -20,7 +20,7 @@ For per-backend behaviour of the executors themselves see
 | `execution_id` | One physical execution attempt | Immutable; duplicates get their own |
 | `VersionId` | One exact object version an execution wrote | Immutable |
 
-`GET /jobs/{job_id}` answers for any accepted alias of the request. The `family`
+`GET /compute/jobs/{job_id}` answers for any accepted alias of the request. The `family`
 block carries all of the above plus the projection `revision` and digest, so a
 client can detect that its view moved without diffing whole responses.
 
@@ -95,15 +95,15 @@ Reading the job's outputs without a version id therefore answers "whatever is
 current", not "what this job produced". Use the VersionId when you mean the
 result of the job.
 
-`endpoint_url` is nullable in both `GET /jobs/{job_id}` and
-`GET /jobs/{job_id}/audit`. An output whose owning node has no advertisement
+`endpoint_url` is nullable in both `GET /compute/jobs/{job_id}` and
+`GET /compute/jobs/{job_id}/audit`. An output whose owning node has no advertisement
 here is returned without an address rather than failing the whole read; the
 VersionId and the owning execution are still exact. Retry, or ask a node that
 holds that advertisement, for the address.
 
 ## Audit
 
-`GET /jobs/{job_id}/audit` pages the immutable records of the request by stable
+`GET /compute/jobs/{job_id}/audit` pages the immutable records of the request by stable
 record key: every claim, witness budget, launch intent, receipt, execution state
 update, output set and cancellation observation. `scope=submission` additionally
 pages the idempotency conflicts of the same submission, each marked with
@@ -141,16 +141,16 @@ and `PUT` needs WRITE. Only a genuinely absent realm-configuration document is
 `404`. A read that failed in storage or could not decode is `500`, so absence is
 never inferred from a failed read.
 
-- `GET /admin/compute/config` reads the configuration this node holds. It is a
+- `GET /compute/config` reads the configuration this node holds. It is a
   node-local read of a replicated document, so a change written elsewhere can be
   missing here until it arrives.
-- `PUT /admin/compute/config` replaces that configuration wholesale. Links and
+- `PUT /compute/config` replaces that configuration wholesale. Links and
   group quotas absent from the body are dropped, so send the complete intended
   configuration. `400` covers a malformed group id, a duplicate directed link or
   group entry, an empty or oversized location, a zero bandwidth and a zero
   witness delay; `409` means another update won the race and the same body may
   be retried.
-- `GET /admin/compute/snapshots` reports the observed demand and reservation
+- `GET /compute/snapshots` reports the observed demand and reservation
   snapshots, each stamped with its publisher's membership and publisher
   generations and its observation time. `?group_id=` adds that group's merged
   demand next to the standing quota it is judged against; a value that is not a
@@ -221,7 +221,7 @@ is never quota-refused.
 
 ## Departure, drain and rejoin
 
-`POST /admin/compute/drain` drains this node's compute plane: no planner selects
+`POST /compute/drain` drains this node's compute plane: no planner selects
 it for new executions and it declines launch offers, while everything holding a
 receipt keeps running. The operator drain is stored separately from the
 departure state a placement change causes, so returning to the placement map
@@ -238,7 +238,7 @@ whatever the flag says.
 `changed` in the response reports that the durable flag moved, not that the
 advertisement was already republished; the advertisement follows, and a node
 that has not advertised yet logs a warning and republishes when it does.
-`GET /admin/compute/snapshots` reports the current value as `operator_draining`.
+`GET /compute/snapshots` reports the current value as `operator_draining`.
 `503` on the drain route means the advertisement could not be republished and is
 retryable.
 
@@ -247,7 +247,7 @@ snapshots, and records every execution it still holds capacity for as
 **unresolved**. Unresolved is not finished: a departing node may not declare a
 remotely observed execution terminal. Removal is never blocked because governed
 bytes or unresolved executions exist, and the report stays readable at
-`GET /admin/compute/snapshots`.
+`GET /compute/snapshots`.
 
 A rejoining node uses a new membership epoch and quarantines every local copy
 until it has been revalidated.
@@ -266,9 +266,9 @@ staging snapshot or inbound replication still succeeds on a blocked or draining
 node. What is refused is exactly a write whose refs would have to be evaluated
 against a subject this node cannot currently stand behind.
 
-1. List them with `GET /admin/placement-diagnostics`; each violation names the
+1. List them with `GET /data/placement/diagnostics`; each violation names the
    exact bucket, key and version.
-2. Resolve them with `POST /admin/placement-quarantine`:
+2. Resolve them with `POST /data/placement/quarantine`:
    - `{"action": "revalidate"}` re-evaluates every local registration against
      the subject the node advertises now and restores the compliant ones;
    - `{"action": "release", "bucket": …, "key": …, "version_id": …}` first drops
@@ -389,7 +389,7 @@ infrastructure error as `SYSTEM_ERROR`, so the two classes stay distinguishable
 through the facade.
 
 A task read in the `BASIC` or `FULL` view carries read-only tags derived from the
-same job and family the native `GET /jobs/{id}` reports. They are stamped on
+same job and family the native `GET /compute/jobs/{id}` reports. They are stamped on
 every read and never stored, so a creation naming one of them is refused with
 `400` and the error code `reserved_tag`. `MINIMAL` is unchanged and still carries
 only `id` and `state`.

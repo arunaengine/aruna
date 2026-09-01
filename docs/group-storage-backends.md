@@ -7,7 +7,8 @@ responsibility.
 
 ## Registering a backend
 
-`POST /groups/{group_id}/storage-backends` with ADMIN on the group:
+`POST /data/groups/{group_id}/storage/backends` with WRITE on the group's admin
+path:
 
 ```json
 {
@@ -60,7 +61,7 @@ Reclaim is a request, not a guarantee. If your bucket is versioned or
 object-locked, the delete only writes a marker and frees nothing, which is your
 bucket's configuration and visible to you.
 
-`GET /groups/{group_id}/storage-backends/{backend_id}/reclaim-status` reports
+`GET /data/groups/{group_id}/storage/backends/{backend_id}/reclaim/status` reports
 how many copies are queued, how many physical deletes are still owed, and how
 old the oldest queued entry is. `queued_cleanups` is normally non-zero: the
 drain runs on its own timer, so every sweep leaves work behind for a few
@@ -73,12 +74,12 @@ A group backend receives data only when a routing rule names it, by backend
 id:
 
 ```
-PUT /buckets/{bucket}/storage-routing
+PUT /data/buckets/{bucket}/storage/routing
 { "rules": [ { "key_prefix": "archive/", "exact": false,
                "target": { "backend_id": "01J..." } } ] }
 ```
 
-or as the group default via `PUT /groups/{group_id}/storage-routing`. Rules
+or as the group default via `PUT /data/groups/{group_id}/storage/routing`. Rules
 apply to new writes only; existing objects stay where they were written.
 
 Aruna uses the container you configured and never creates another one.
@@ -92,8 +93,8 @@ release.
 
 ## Changing credentials
 
-`PUT /groups/{group_id}/storage-backends/{backend_id}` replaces the stored
-credentials and the display name. The backend type and the keys that name the
+`PUT /data/groups/{group_id}/storage/backends/{backend_id}` replaces the whole
+stored record, so an omitted `cleanup` resets the policy to `retain`. The backend type and the keys that name the
 store, `endpoint`, `bucket` (or `container`, `filesystem`), `account_name` and
 `root`, are fixed after create and a request that changes one is refused with
 400: stored objects record only the path below `root` and neither the kind nor
@@ -105,7 +106,7 @@ without enabling writes again.
 
 ## Disabling a backend
 
-`DELETE /groups/{group_id}/storage-backends/{backend_id}` disables the backend.
+`DELETE /data/groups/{group_id}/storage/backends/{backend_id}` disables the backend.
 It does not delete anything: the record and its credentials stay, so objects
 already stored there keep being readable and cleanups that were already queued
 still reach the store. What stops is writing. Routing no longer chooses the
@@ -115,7 +116,7 @@ both `UploadPart` and `CompleteMultipartUpload` re-read the record inside their
 own transaction and refuse; the part or the composed object is deleted again.
 Repeating the request is harmless and answers `204` again.
 
-`POST /groups/{group_id}/storage-backends/{backend_id}/enable` turns writes back
+`POST /data/groups/{group_id}/storage/backends/{backend_id}/enable` turns writes back
 on. `disabled` on the backend record tells you which state it is in.
 
 Credentials can be changed while a backend is disabled, so a leaked key can be
@@ -131,7 +132,7 @@ to let go of both.
 An open multipart upload holds the backend for as long as it exists, and nothing
 expires abandoned uploads: an upload nobody completes or aborts blocks removal
 indefinitely. `ListMultipartUploads` and `AbortMultipartUpload` are how you clear
-one. The reclaim-status response does not count open uploads, because that would
+one. The reclaim/status response does not count open uploads, because that would
 mean scanning every upload on the node per request.
 
 A write that is streaming has no record of any kind yet, so the node also holds
@@ -156,7 +157,7 @@ replica resolves its own rules, so copies generally land on Aruna-managed
 storage even when the origin write went to your own endpoint. This is by
 design: it is what keeps the data available when your endpoint is not.
 
-`GET /blobs/locations?bucket={bucket}&path={key}&version_id={ulid}` reports one
+`GET /data/blobs/locations?bucket={bucket}&path={key}&version_id={ulid}` reports one
 version's copies. It needs READ on the object; `version_id` defaults to the
 current version.
 

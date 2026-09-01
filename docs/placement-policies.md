@@ -83,7 +83,7 @@ A compute backend may advertise a different site than the node it runs on; see
 
 ## Publishing and reading a policy
 
-`POST /admin/placement-policies` publishes a definition. Omitting `policy_id`
+`POST /data/placement/policies` publishes a definition. Omitting `policy_id`
 mints one; supplying one makes a retried publication idempotent. Publishing the
 same id with the same selectors returns the stored document unchanged. The same
 id with different selectors is `409` and never replaces what is stored.
@@ -93,11 +93,11 @@ this node holds none, the publication is forwarded to a current holder under the
 caller's own token and that holder re-runs the same admin check, so a relay
 never becomes the author.
 
-`GET /admin/placement-policies/{policy_id}?digest=…` reads one policy back. The
+`GET /data/placement/policies/{policy_id}?digest=…` reads one policy back. The
 digest is required. A digest that does not match what the holders serve is `404`
 rather than a substituted rule.
 
-`GET /admin/placement-policies?limit&cursor` lists policies in ascending policy
+`GET /data/placement/policies?limit&cursor` lists policies in ascending policy
 id, `limit` defaulting to 50 and capped at 200. It needs realm-config `READ`, and
 a caller without it is refused before anything is read, so the listing is no
 existence oracle. A document replicates only to the holders its id resolves to,
@@ -159,18 +159,18 @@ A negative entry records that holders could not supply a document. It is an
 availability hint with a 10 second expiry, never a denial, so a rule that becomes
 reachable again is used as soon as the hint expires.
 
-`GET /admin/placement-diagnostics` reports cache counts and bytes. They are
+`GET /data/placement/diagnostics` reports cache counts and bytes. They are
 diagnostics only and never policy truth.
 
 ## Bucket defaults
 
-`GET /buckets/{bucket}/placement` returns the bucket's default reference set and
+`GET /data/buckets/{bucket}/placement` returns the bucket's default reference set and
 the generation it was written at. This is a node-local read of the replicated
 bucket record, so a default written on another node can be missing here until it
 arrives. A bucket that never had a default returns an empty list at its current
 generation.
 
-`PUT /buckets/{bucket}/placement` replaces the whole set; an empty list clears
+`PUT /data/buckets/{bucket}/placement` replaces the whole set; an empty list clears
 it. Every reference is resolved and authenticated through the ordinary policy
 read before it can become a default, so a reference no holder can supply is
 `503` and the stored default is untouched. A real change advances the
@@ -185,7 +185,7 @@ references until a successor is minted for them.
 
 ## Attaching a policy set to one object
 
-`POST /buckets/{bucket}/placement/objects` is an exact replacement, not a union:
+`POST /data/buckets/{bucket}/placement/objects` is an exact replacement, not a union:
 the successor carries exactly the submitted references, so an explicit mutation
 may tighten or relax. Nothing stored is rewritten. A new version is minted that
 carries the new references and the predecessor's bytes, and the predecessor keeps
@@ -214,7 +214,7 @@ A reference-only head mints a successor and registers no copy.
 
 ## Applying the default in bulk
 
-`POST /buckets/{bucket}/placement/runs` applies a bucket default to this
+`POST /data/buckets/{bucket}/placement/runs` applies a bucket default to this
 responder's current heads. The first call under an `operation_id` seals the run
 against the bucket's exact identity, generation and default reference set;
 repeating that id resumes the sealed run, and every later pass is bound to what
@@ -244,7 +244,7 @@ partition converged.
 
 ## Coverage and diagnostics
 
-`GET /buckets/{bucket}/placement/coverage` reports, for a bounded page, how far
+`GET /data/buckets/{bucket}/placement/coverage` reports, for a bounded page, how far
 this responder's own objects carry the bucket default. It names the exact
 default reference set and generation it compared against. Attachment gaps and
 local copy state are separate answers: an object can carry every reference and
@@ -258,7 +258,7 @@ The `limits` list states what the report deliberately does not claim:
 `responder_local` and `concurrent_writes` always, `bounded_page` when a cursor
 was returned, and `historical_excluded` in the current-heads scope.
 
-`GET /admin/placement-diagnostics` reports this node's own enforcement state:
+`GET /data/placement/diagnostics` reports this node's own enforcement state:
 the placement subject it advertises, whether serving is blocked or the node is
 policy-draining, and a bounded page of its registered copies. A copy that is
 quarantined or was last seen on a departed node is listed as a violation with the

@@ -9,17 +9,17 @@ the API after creation.
 Every bearer minted by the user session API has a ULID session id and one of these kinds:
 `portal`, `assistant`, or `api`.
 
-- `POST /api/v1/users/sessions` creates a session from an unrestricted bearer. Its lifetime is the
+- `POST /api/v1/access/sessions` creates a session from an unrestricted bearer. Its lifetime is the
   shortest of the requested lifetime, the parent bearer's remaining lifetime, and 24 hours. The
   token is returned only once.
-- `GET /api/v1/users/sessions` lists records held by the issuing node. `current` identifies the
+- `GET /api/v1/access/sessions` lists records held by the issuing node. `current` identifies the
   session used for that request.
-- `DELETE /api/v1/users/sessions/{session_id}` is idempotent and revokes only a session owned by the
+- `DELETE /api/v1/access/sessions/{session_id}` is idempotent and revokes only a session owned by the
   caller.
 
 Revocation writes the token hash to the realm's existing replicated revocation set. The local
 session record retains `revoked: true` for listing, while the replicated set is the authority that
-stops the token on every realm node. `GET /api/v1/users/token` keeps its `{ "token": ... }` response
+stops the token on every realm node. `GET /api/v1/access/token` keeps its `{ "token": ... }` response
 and records the issued bearer as a `portal` session.
 
 ## Portal provider boundary
@@ -75,7 +75,7 @@ accepted:
 | --- | --- |
 | `anthropic` | `POST /v1/messages`, `GET /v1/models` |
 | `openai`, `openrouter`, `openai_compatible` | `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models` |
-| `chatgpt` | `POST /responses` |
+| `chatgpt` | `POST /responses`, `GET /models` |
 
 Inbound bodies are limited to 4 MiB. `authorization`, `x-api-key`, `cookie`, `host`,
 `content-length`, and hop-by-hop headers are removed. Stored custom headers are added, followed by
@@ -91,7 +91,7 @@ timeout, so long model streams can remain open.
 
 Start login with `POST /api/v1/system/assistant/providers/chatgpt/login`. The response contains the
 provider id, user code, verification URL, polling interval, and expiry. The provider remains
-`pending_login`. The portal calls `POST /api/v1/system/assistant/providers/{id}/login/poll` once per
+`pending`. The portal calls `POST /api/v1/system/assistant/providers/{id}/login/poll` once per
 interval; each call performs at most one upstream poll and returns `pending`, `ready`, `expired`, or
 `denied`.
 

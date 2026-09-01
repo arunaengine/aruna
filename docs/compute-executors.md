@@ -80,7 +80,7 @@ nothing. A declared path without wildcards must still exist when the task ends.
 ## Local runs on a user device
 
 A user device runs compute for the owner of that device alone, and only when the
-owner asks for it: `POST /jobs/` with `target: "local"`, or a TES task tagged
+owner asks for it: `POST /compute/jobs` with `target: "local"`, or a TES task tagged
 `aruna-engine.org/target=local`. The realm never dispatches to a device, because
 a device advertises no executor at all, whatever compute the owner enabled on the
 machine.
@@ -110,7 +110,7 @@ A local run stages its inputs as files into the node-local workspace bucket
 staging, all of which need an S3 endpoint a container could reach, and
 `workspace.mode` `existing`.
 
-Where an output lands depends on the surface. `POST /jobs/` declares workspace
+Where an output lands depends on the surface. `POST /compute/jobs` declares workspace
 outputs, which stay in `ws-<jobid>` until the owner publishes them. A TES task
 declares each output with an `s3://bucket/key` url, and a local task writes it to
 the device-local bucket that url names, which must belong to the execution group
@@ -123,7 +123,7 @@ cannot reach fails the run, not the submission. A run is refused while this
 node's compute plane is drained, and while the owner's unfinished runs already
 reach `ARUNA_COMPUTE_MAX_CONCURRENT`.
 
-Local runs are listed by the ordinary `GET /jobs/` of the device's own API, and
+Local runs are listed by the ordinary `GET /compute/jobs` of the device's own API, and
 `GET /device/compute` reports the plane the owner configured. Nothing about a
 local run is forwarded, replicated or offered to the realm.
 
