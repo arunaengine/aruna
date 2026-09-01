@@ -215,24 +215,22 @@ pub(crate) async fn ensure_group_admin(
     path = "/data/buckets/{bucket}/storage/routing",
     tag = "data/storage",
     summary = "Read a bucket's write routing rules",
-    description = r#"Returns the write routing rules stored for a bucket on this node, in the order they were submitted.
+    description = r#"Returns the write routing rules stored for a bucket on this node, in submission order.
 
 **Authentication**: realm bearer token with WRITE on the owning group's admin path. Routing decides
 where a group's bytes physically land, so the write rights that suffice for objects are not enough.
 
 **Behavior**
-- The bucket's owning group is resolved first, so a bucket unknown to this node is not found and the
-  admin check always runs against the group that owns it.
-- This is a node-local read of the replicated bucket record: rules written on another node can be
-  missing until they arrive here, and a bucket that never had rules returns an empty list.
-- `warnings` is advisory only and is recomputed per request from the storage classes this node
-  offers to tenants plus the backends the group itself registered, so the same stored rules can
-  warn here and not on another node."#,
-    params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface, without a leading slash")),
+- Node-local read of the replicated bucket record: rules written on another node can be missing
+  until they arrive here.
+- `warnings` is advisory and is recomputed per request from the storage classes this node offers to
+  tenants plus the backends the group registered, so the same rules can warn here and not on
+  another node."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
         (
             status = 200,
-            description = "The stored rules in submission order, plus advisory warnings for targets this node cannot serve",
+            description = "The stored rules in submission order, with advisory warnings for targets this node cannot serve",
             body = BucketRoutingResponse,
             example = json!({
                 "bucket": "research-raw",
@@ -253,9 +251,9 @@ where a group's bytes physically land, so the write rights that suffice for obje
                 ]
             })
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse),
-        (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -299,24 +297,24 @@ pub async fn get_bucket_routing(
 **Authentication**: realm bearer token with WRITE on the owning group's admin path.
 
 **Behavior**
-- The submitted list replaces the bucket's whole rule set; sending an empty list clears it.
-- At write time the most specific rule wins, in this order: an exact-key rule, then the longest
-  matching `key_prefix` rule (an empty prefix is the bucket default), then the group default, then
-  the operator's own node rules, then the node's default backend.
-- This only steers data written after the change; objects already stored are never moved.
-- Rules are stored even when this node cannot serve their target, because the bucket record
-  replicates to nodes that may offer it, and the unserved targets come back in `warnings`.
+- The submitted list replaces the whole rule set; an empty list clears it.
+- Resolution is most specific first: exact key, then the longest matching `key_prefix` (an empty
+  prefix is the bucket default), then the group default, the operator's node rules, and the node's
+  default backend.
+- Rules steer writes made after the change; stored objects are never moved.
+- A target this node cannot serve is stored anyway, because the bucket record replicates to nodes
+  that may offer it, and comes back in `warnings`.
 
-**Limits** (all refused with 400)
+**Limits**
 - Each rule target sets exactly one of `backend_id` or `class`.
-- A `backend_id` must be the ULID of a backend the group itself registered, so tenant rules can
-  never name an operator's node backend.
-- A `class` must be a valid storage-class name.
+- A `backend_id` must name a backend the group itself registered, so a tenant rule can never name
+  an operator's node backend.
+- A `class` must be a valid storage class name.
 - Two rules may not share the same `key_prefix` and `exact` combination."#,
-    params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface, without a leading slash")),
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(
         content = BucketRoutingRequest,
-        description = "The complete rule set for this bucket. `key_prefix` defaults to the empty string (the bucket default) and `exact` defaults to false (prefix match).",
+        description = "The complete rule set for this bucket. An empty `key_prefix` is the bucket default, and `exact` false matches by prefix.",
         example = json!({
             "rules": [
                 {
@@ -357,9 +355,9 @@ pub async fn get_bucket_routing(
             })
         ),
         (status = 400, description = "A rule target is invalid, names a backend the group does not own, or duplicates another rule's prefix and match mode", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse),
-        (status = 404, description = "No bucket of that name is known to this node, or it no longer belongs to the authorized group", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -402,20 +400,18 @@ pub async fn put_bucket_routing(
     path = "/data/groups/{group_id}/storage/routing",
     tag = "data/storage",
     summary = "Read a group's default write target",
-    description = r#"Returns the default write target this node holds for a group, or none when the group never set one.
+    description = r#"Returns the default write target this node holds for a group, if the group has set one.
 
 **Authentication**: realm bearer token with WRITE on that group's admin path.
 
 **Behavior**
-- The group default applies to every bucket of the group and is consulted only after the bucket's
-  own rules: an exact-key rule and then the longest matching key prefix on the bucket take
-  precedence over it, and it in turn takes precedence over the operator's node rules and the node's
-  default backend.
-- This is a node-local read of the replicated group routing record; a group that has never set a
-  default returns `default_target` omitted.
-- `warnings` is advisory only and is recomputed per request against the classes this node offers to
-  tenants and the backends the group registered, so it can differ between nodes for the same stored
-  default."#,
+- The default applies to every bucket of the group, ranks below that bucket's own rules and above
+  the operator's node rules and the node's default backend.
+- Node-local read of the replicated group routing record; `default_target` is omitted when no
+  default is stored.
+- `warnings` is advisory and is recomputed per request from the storage classes this node offers to
+  tenants plus the backends the group registered, so it can differ between nodes for the same
+  stored default."#,
     params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
@@ -429,8 +425,8 @@ pub async fn put_bucket_routing(
             })
         ),
         (status = 400, description = "The path segment is not a valid group ULID", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -469,21 +465,18 @@ pub async fn get_group_routing(
 **Authentication**: realm bearer token with WRITE on that group's admin path.
 
 **Behavior**
-- The submitted value replaces the group's default outright, and omitting `default_target` or
-  sending it as null clears it, which returns the group to the operator's node rules and the node
-  default.
-- The default is scoped to the whole group and is weaker than any matching rule on an individual
-  bucket.
-- It only steers data written after the change; objects already stored are never moved.
-- The record is stored even when this node cannot serve the target, because it replicates to nodes
-  that may, and the unserved target comes back in `warnings`.
-- Each write records the caller and the time as the last decider.
+- The submitted value replaces the stored default outright; omitting `default_target` or sending it
+  as null clears it and returns the group to the operator's node rules and the node default.
+- The default is weaker than any matching rule on an individual bucket.
+- It steers writes made after the change; stored objects are never moved.
+- A target this node cannot serve is stored anyway, because the record replicates to nodes that may
+  offer it, and comes back in `warnings`.
 
-**Limits** (all refused with 400)
+**Limits**
 - The target sets exactly one of `backend_id` or `class`.
-- A `backend_id` must be the ULID of a backend the group itself registered, so a tenant can never
-  bind an operator's node backend.
-- A `class` must be a valid storage-class name."#,
+- A `backend_id` must name a backend the group itself registered, so a tenant can never bind an
+  operator's node backend.
+- A `class` must be a valid storage class name."#,
     params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     request_body(
         content = GroupRoutingRequest,
@@ -506,8 +499,8 @@ pub async fn get_group_routing(
             })
         ),
         (status = 400, description = "The path segment is not a valid group ULID, or the target is invalid or names a backend the group does not own", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

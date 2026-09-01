@@ -176,20 +176,19 @@ pub struct SubmitPurgeResponse {
     summary = "Preview what a permanent deletion would destroy",
     description = r#"Reports the bounded inventory and consequences of permanently deleting one storage scope.
 
-**Authentication**: bearer token issued for this realm and READ on the selected scope; the reported
-`permissions.purge` says separately whether the same caller could actually run the purge.
+**Authentication**: realm bearer token with READ on the selected scope; `permissions.purge` reports
+separately whether the same caller may run the purge.
 
 **Behavior**
 - Nothing is deleted or reserved here.
-- The inventory is one bounded page of this node's own rows: `counts.complete` false means every
-  number counts that page rather than the scope, and `truncation` carries the markers a following
-  request resumes from.
-- Sync relationships that a bucket delete would act on are listed with the ones that block it.
+- The inventory is one bounded page of this node's own rows: `counts.complete` false means the
+  numbers count that page rather than the scope, and `truncation` carries the resume markers.
+- Sync relationships a bucket delete would act on are listed, together with the ones that block it.
 - `reference_coverage` never implies that the scope is unreferenced: it reports how much of the
   backlink question this node could answer at all."#,
     request_body(
         content = DeletionPreflightRequest,
-        description = "The scope to inspect plus optional page bound and resume markers",
+        description = "The scope to inspect plus an optional page bound and resume markers",
         example = json!({
             "scope": {
                 "kind": "prefix",
@@ -385,17 +384,15 @@ pub async fn deletion_preflight(
     summary = "Submit a permanent purge of one storage scope",
     description = r#"Queues a permanent purge of one storage scope as a job.
 
-**Authentication**: bearer token issued for this realm and WRITE on the selected scope.
+**Authentication**: realm bearer token with WRITE on the selected scope.
 
 **Behavior**
 - The purge runs as a job: a 201 means it was durably queued, never that anything was deleted yet,
   so poll the returned `status_url`.
-- Deletion is permanent and no version survives it, which is why the preflight surface exists to
-  report the consequences first.
-- An `idempotency_key` makes a retried submission return the retained job with a 200 instead of
-  queuing a second purge.
-
-**Errors**: an `idempotency_key` that names a different scope than the retained job is a 409."#,
+- Deletion is permanent and no version survives it, which is what the preflight route reports on
+  beforehand.
+- An `idempotency_key` makes a retried submission return the retained job instead of queuing a
+  second purge."#,
     request_body(
         content = SubmitPurgeRequest,
         description = "The scope to purge plus an optional idempotency key",
@@ -411,29 +408,29 @@ pub async fn deletion_preflight(
     responses(
         (
             status = 201,
-            description = "Purge job created",
+            description = "Purge job durably queued; nothing is deleted yet",
             body = SubmitPurgeResponse,
             example = json!({
                 "job_id": "01JABCDEF0123456789ABCDEFG",
                 "created": true,
-                "status_url": "/api/v1/jobs/01JABCDEF0123456789ABCDEFG"
+                "status_url": "/api/v1/compute/jobs/01JABCDEF0123456789ABCDEFG"
             })
         ),
         (
             status = 200,
-            description = "Idempotent replay returned the retained job",
+            description = "The idempotency key matched a retained job, which is returned unchanged",
             body = SubmitPurgeResponse,
             example = json!({
                 "job_id": "01JABCDEF0123456789ABCDEFG",
                 "created": false,
-                "status_url": "/api/v1/jobs/01JABCDEF0123456789ABCDEFG"
+                "status_url": "/api/v1/compute/jobs/01JABCDEF0123456789ABCDEFG"
             })
         ),
         (status = 400, description = "Invalid scope or idempotency key", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot purge the selected scope", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
-        (status = 409, description = "Idempotency key conflicts with a different purge", body = ErrorResponse)
+        (status = 409, description = "The idempotency key is retained for a purge of a different scope", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
