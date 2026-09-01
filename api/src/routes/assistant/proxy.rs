@@ -224,8 +224,8 @@ async fn proxy_request(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers/{id}/proxy/{path}",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/proxy/{path}",
+    tag = "system/assistant",
     summary = "Proxy a provider request",
     description = r#"Forwards one chat request to the provider and streams its answer back unchanged.
 
@@ -272,8 +272,8 @@ pub async fn proxy_post(
 
 #[utoipa::path(
     get,
-    path = "/users/assistant/providers/{id}/proxy/{path}",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/proxy/{path}",
+    tag = "system/assistant",
     summary = "Proxy a provider models request",
     description = r#"Forwards the provider's own model listing and streams its answer back unchanged.
 

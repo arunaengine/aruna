@@ -38,7 +38,7 @@ use utoipa_axum::routes;
 pub(super) const PROXY_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(OpenApi)]
-#[openapi(tags((name = "assistant", description = "Assistant provider operations")))]
+#[openapi(tags((name = "system/assistant", description = "Assistant provider operations")))]
 pub struct AssistantApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -51,7 +51,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(poll_login));
     super::routes_at(
         router,
-        "/users/assistant/providers/{id}/proxy/{*path}",
+        "/system/assistant/providers/{id}/proxy/{*path}",
         routes!(proxy_post, proxy_get),
     )
     .layer(DefaultBodyLimit::max(PROXY_BODY_LIMIT))
@@ -361,8 +361,8 @@ fn provider_base_url(
 
 #[utoipa::path(
     get,
-    path = "/users/assistant/providers",
-    tag = "assistant",
+    path = "/system/assistant/providers",
+    tag = "system/assistant",
     summary = "List assistant providers",
     description = r#"Lists the assistant providers the calling user registered on this node.
 
@@ -414,8 +414,8 @@ pub async fn list_providers(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers",
-    tag = "assistant",
+    path = "/system/assistant/providers",
+    tag = "system/assistant",
     summary = "Create an assistant provider",
     description = r#"Registers an assistant provider for the calling user and seals its credentials.
 
@@ -518,8 +518,8 @@ pub async fn create_provider(
 
 #[utoipa::path(
     patch,
-    path = "/users/assistant/providers/{id}",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}",
+    tag = "system/assistant",
     summary = "Update an assistant provider",
     description = r#"Updates one assistant provider, changing only the fields the request carries.
 
@@ -612,8 +612,8 @@ pub async fn patch_provider(
 
 #[utoipa::path(
     delete,
-    path = "/users/assistant/providers/{id}",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}",
+    tag = "system/assistant",
     summary = "Delete an assistant provider",
     description = r#"Deletes one assistant provider together with the credentials sealed for it.
 
@@ -651,8 +651,8 @@ pub async fn delete_provider(
 
 #[utoipa::path(
     get,
-    path = "/users/assistant/providers/{id}/models",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/models",
+    tag = "system/assistant",
     summary = "List provider models",
     description = r#"Asks the provider itself which models it serves and returns the text ones.
 
@@ -708,8 +708,8 @@ pub async fn get_models(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers/{id}/test",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/test",
+    tag = "system/assistant",
     summary = "Test an assistant provider",
     description = r#"Checks whether the stored credentials still reach the provider.
 

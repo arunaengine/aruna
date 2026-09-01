@@ -64,7 +64,7 @@ const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "notifications", description = "User notification inbox")),
+    tags((name = "system/notifications", description = "User notification inbox")),
     components(schemas(
         NotificationStreamStateResponse,
         UnreadCountApiResponse
@@ -454,8 +454,8 @@ async fn canonicalize_watch_path(
 
 #[utoipa::path(
     get,
-    path = "/notifications",
-    tag = "notifications",
+    path = "/system/notifications",
+    tag = "system/notifications",
     summary = "List the caller's notification inbox",
     description = r#"Lists the calling user's notification inbox, newest first.
 
@@ -557,8 +557,8 @@ pub async fn list_notifications(
 
 #[utoipa::path(
     get,
-    path = "/notifications/unread",
-    tag = "notifications",
+    path = "/system/notifications/unread",
+    tag = "system/notifications",
     summary = "Count the caller's unread notifications",
     description = r#"Returns the unread badge value for the calling user's inbox.
 
@@ -912,8 +912,8 @@ fn state_event(state: NotificationStreamStateResponse) -> Event {
 
 #[utoipa::path(
     get,
-    path = "/notifications/stream",
-    tag = "notifications",
+    path = "/system/notifications/stream",
+    tag = "system/notifications",
     summary = "Stream the caller's notification state",
     description = r#"Streams a small state frame the client uses as a trigger to refetch the inbox.
 
@@ -994,8 +994,8 @@ pub async fn stream_notifications(
 
 #[utoipa::path(
     post,
-    path = "/notifications/read",
-    tag = "notifications",
+    path = "/system/notifications/read",
+    tag = "system/notifications",
     summary = "Mark the caller's notifications as read",
     description = r#"Marks the calling user's notifications as read, by id, by age, or both.
 
@@ -1068,8 +1068,8 @@ pub async fn mark_read(
 
 #[utoipa::path(
     get,
-    path = "/notifications/watches",
-    tag = "notifications",
+    path = "/system/notifications/watches",
+    tag = "system/notifications",
     summary = "List the caller's notification watches",
     description = r#"Lists every watch subscription owned by the calling user.
 
@@ -1124,8 +1124,8 @@ pub async fn list_watches(
 
 #[utoipa::path(
     post,
-    path = "/notifications/watches",
-    tag = "notifications",
+    path = "/system/notifications/watches",
+    tag = "system/notifications",
     summary = "Create a notification watch for the caller",
     description = r#"Creates an authorized watch subscription over a canonical resource prefix.
 
@@ -1234,8 +1234,8 @@ pub async fn create_watch(
 
 #[utoipa::path(
     delete,
-    path = "/notifications/watches/{id}",
-    tag = "notifications",
+    path = "/system/notifications/watches/{id}",
+    tag = "system/notifications",
     summary = "Delete one of the caller's notification watches",
     description = r#"Deletes one watch subscription owned by the calling user.
 

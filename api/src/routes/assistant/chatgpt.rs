@@ -179,8 +179,8 @@ async fn exchange_tokens(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers/chatgpt/login",
-    tag = "assistant",
+    path = "/system/assistant/providers/chatgpt/login",
+    tag = "system/assistant",
     summary = "Start ChatGPT device login",
     description = r#"Starts a ChatGPT device login and registers the provider in a pending state.
 
@@ -304,8 +304,8 @@ pub async fn start_login(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers/{id}/login/poll",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/login/poll",
+    tag = "system/assistant",
     summary = "Poll ChatGPT device login",
     description = r#"Reports how far a ChatGPT device login has come, and completes it once it has.
 

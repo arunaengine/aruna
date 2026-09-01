@@ -48,7 +48,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "info", description = "Node information endpoints"))
+    tags(
+        (name = "system/info", description = "Node information and usage"),
+        (name = "system/realm", description = "Realm configuration, placement and quota")
+    )
 )]
 pub struct InfoApiDoc;
 
@@ -913,8 +916,8 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
 
 #[utoipa::path(
     get,
-    path = "/info/realm",
-    tag = "info",
+    path = "/system/realm",
+    tag = "system/realm",
     summary = "Read the realm's public settings and node topology",
     description = r#"Answers every caller, but answers a realm member with more.
 
@@ -1325,8 +1328,8 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
 
 #[utoipa::path(
     get,
-    path = "/info/realm/placement",
-    tag = "info",
+    path = "/system/realm/placement",
+    tag = "system/realm",
     summary = "Read the realm's placement strategies, bindings and overrides",
     description = r#"Returns the placement policy as stored in this node's copy of the realm configuration.
 
@@ -1414,8 +1417,8 @@ pub async fn get_realm_placement(
 
 #[utoipa::path(
     patch,
-    path = "/info/realm/placement",
-    tag = "info",
+    path = "/system/realm/placement",
+    tag = "system/realm",
     summary = "Apply one change to the realm's placement policy",
     description = r#"Applies exactly one change to the realm's placement policy and returns the whole policy.
 
@@ -1640,8 +1643,8 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
 
 #[utoipa::path(
     put,
-    path = "/info/realm/quota",
-    tag = "info",
+    path = "/system/realm/quota",
+    tag = "system/realm",
     summary = "Replace the realm-wide quota policy",
     description = r#"Replaces the realm-wide quota policy wholesale and echoes back the stored result.
 
@@ -1944,8 +1947,8 @@ pub async fn load_realm_usage(
 
 #[utoipa::path(
     get,
-    path = "/info/usage",
-    tag = "info",
+    path = "/system/usage",
+    tag = "system/info",
     summary = "Report this node's and the realm's storage usage",
     description = r#"Reports this node's own storage counters together with the realm-wide totals.
 
@@ -2180,8 +2183,8 @@ async fn backend_statuses(
 
 #[utoipa::path(
     get,
-    path = "/info",
-    tag = "info",
+    path = "/system/info",
+    tag = "system/info",
     summary = "Report this node's health, version and service status",
     description = r#"The health check of a single node, answered locally and never routed to a peer.
 
@@ -2802,7 +2805,7 @@ mod tests {
     fn openapi_includes_info_path() {
         let openapi = ApiDoc::openapi();
 
-        assert!(openapi.paths.paths.contains_key("/info"));
+        assert!(openapi.paths.paths.contains_key("/system/info"));
     }
 
     async fn seed_usage_state(state: &Arc<ServerState>) {
@@ -3041,7 +3044,7 @@ mod tests {
     fn openapi_includes_realm_quota_path() {
         let openapi = ApiDoc::openapi();
 
-        assert!(openapi.paths.paths.contains_key("/info/realm/quota"));
+        assert!(openapi.paths.paths.contains_key("/system/realm/quota"));
     }
 
     #[test]
@@ -3578,7 +3581,7 @@ mod tests {
         let response = crate::routes::rest_router(state)
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/info/realm/placement")
+                    .uri("/system/realm/placement")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3590,7 +3593,7 @@ mod tests {
     #[test]
     fn openapi_registers_realm_placement_get_patch_and_schemas() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let path = &openapi["paths"]["/info/realm/placement"];
+        let path = &openapi["paths"]["/system/realm/placement"];
         assert!(path.get("get").is_some());
         assert!(path.get("patch").is_some());
         assert!(
