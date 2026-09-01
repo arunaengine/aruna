@@ -892,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_export_carries_no_token() {
+    fn tokenless_profile_export() {
         // The validation channel asserts no user at all; a token field here
         // would be a peer-asserted identity the responder cannot verify.
         let value = serde_json::to_value(MetadataTransportMessage::ForwardExportProfile {

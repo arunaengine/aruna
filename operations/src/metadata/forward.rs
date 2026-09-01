@@ -878,7 +878,7 @@ pub(crate) async fn export_profile_routed(
         .await
         .ok_or(MetadataReadError::Unavailable)?;
     if !is_sync_eligible(&config, local_node) {
-        return export_profile_as_owner(context, &config, realm_id, local_node, profile_id).await;
+        return export_as_owner(context, &config, realm_id, local_node, profile_id).await;
     }
     let config_digest = config
         .digest()
@@ -958,7 +958,7 @@ fn collect_profile_export(
 /// A device never joins the validation channel: it reads its own replica first
 /// and otherwise asks a holder as its owner, so it learns nothing its owner
 /// may not read.
-async fn export_profile_as_owner(
+async fn export_as_owner(
     context: &Arc<DriverContext>,
     config: &RealmConfigDocument,
     realm_id: RealmId,

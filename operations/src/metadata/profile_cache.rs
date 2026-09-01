@@ -74,7 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_is_part_of_key() {
+    fn revision_keys_cache() {
         // A republished Profile must never be answered from the older entry.
         let cache = ProfileCache::new();
         let profile_id = Ulid::from_bytes([1u8; 16]);
