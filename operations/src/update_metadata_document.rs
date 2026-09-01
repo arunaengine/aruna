@@ -576,7 +576,13 @@ pub async fn update_metadata_document(
 ) -> Result<MetadataRegistryRecord, UpdateMetadataDocumentError> {
     operation.profile_validation_status = Some(match &operation.config.mutation {
         UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
-            validate_submission(context, operation.config.document_id, jsonld).await?
+            validate_submission(
+                context,
+                operation.config.document_id,
+                operation.config.group_id,
+                jsonld,
+            )
+            .await?
         }
         UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
         | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. }

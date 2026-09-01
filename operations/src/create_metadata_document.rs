@@ -753,7 +753,13 @@ pub async fn create_metadata_document(
     }
     template.profile_validation_status = Some(match &template.config.payload {
         CreateMetadataDocumentPayload::RoCrate { jsonld } => {
-            validate_submission(context.as_ref(), template.config.document_id, jsonld).await?
+            validate_submission(
+                context.as_ref(),
+                template.config.document_id,
+                template.config.group_id,
+                jsonld,
+            )
+            .await?
         }
         CreateMetadataDocumentPayload::Scaffold { .. } => {
             not_profiled_status(template.config.document_id)
