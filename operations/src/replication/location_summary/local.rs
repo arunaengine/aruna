@@ -1,12 +1,13 @@
 use super::LocationSummaryError;
 use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::blob::managed_copy::{
-    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+    CopyRequest, read_effect, registration_for, serve_reads, split_serve_reads,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm_peer::ensure_realm_peer;
 use crate::replication::protocol::{
-    LocationCopyStorage, LocationSummary, LocationSummaryRequest, VersionReplicationMessage,
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
+    VersionReplicationMessage,
 };
 use crate::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::NodeId;
@@ -40,6 +41,7 @@ enum SummaryState {
     ReadHead,
     ReadVersion,
     ReadLocation,
+    ReadCopyOrigin,
     CheckManagedCopy,
     ReadBackend,
     CommitTransaction,
@@ -148,6 +150,7 @@ impl LocationSummaryOperation {
             SummaryState::ReadHead => "read_head",
             SummaryState::ReadVersion => "read_version",
             SummaryState::ReadLocation => "read_location",
+            SummaryState::ReadCopyOrigin => "read_copy_origin",
             SummaryState::CheckManagedCopy => "check_managed_copy",
             SummaryState::ReadBackend => "read_backend",
             SummaryState::CommitTransaction => "commit_transaction",
@@ -562,11 +565,6 @@ impl LocationSummaryOperation {
         };
         self.summary.blob_size = Some(location.blob_size);
         self.summary.hashes = location.hashes.clone().into_iter().collect();
-        // A governed copy is only advertised as held when this node could
-        // actually serve it; the summary discloses no rule either way.
-        if self.version_refs.is_empty() {
-            return self.describe(location);
-        }
         let Some(version_id) = self.version_id else {
             return self.answer();
         };
@@ -578,15 +576,49 @@ impl LocationSummaryOperation {
             ),
             location.backend.clone(),
         );
-        let effect = match serve_reads(&key, self.txn_id) {
+        // An ungoverned copy is advertised from its location record alone, as
+        // before; its registration is read only to learn where it came from.
+        let (effect, state) = match self.version_refs.is_empty() {
+            true => (read_effect(&key, self.txn_id), SummaryState::ReadCopyOrigin),
+            false => (serve_reads(&key, self.txn_id), SummaryState::CheckManagedCopy),
+        };
+        let effect = match effect {
             Ok(effect) => effect,
             Err(error) => return self.fail(error.into()),
         };
         self.pending_copy = Some((key, location));
-        self.state = SummaryState::CheckManagedCopy;
+        self.state = state;
         smallvec![effect]
     }
 
+    /// The registration matching exactly this copy, whatever its state.
+    fn copy_request<'a>(&'a self, key: &'a ManagedCopyKey) -> CopyRequest<'a> {
+        CopyRequest {
+            key,
+            node_id: self.local_node,
+            blake3: self.blake3,
+            refs: &self.version_refs,
+            subject_generation: None,
+        }
+    }
+
+    fn handle_copy_origin(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        let Some((key, location)) = self.pending_copy.take() else {
+            return self.answer();
+        };
+        if let Ok(record) = registration_for(value.as_deref(), &self.copy_request(&key)) {
+            self.summary.origin = record.origin;
+        }
+        // No rule governs this version, so no rule can refuse the copy either.
+        self.summary.compliance = CopyCompliance::Allowed;
+        self.describe(location)
+    }
+
+    /// A governed copy the node is not serving is listed with its verdict rather
+    /// than hidden: the caller already holds READ, and no rule is disclosed.
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
@@ -594,23 +626,20 @@ impl LocationSummaryOperation {
         let Some((key, location)) = self.pending_copy.take() else {
             return self.answer();
         };
-        let serveable = split_serve_reads(values).is_ok_and(|(copy, subject)| {
-            validate_registration(
-                copy.as_deref(),
-                &CopyRequest {
-                    key: &key,
-                    node_id: self.local_node,
-                    blake3: self.blake3,
-                    refs: &self.version_refs,
-                    subject_generation: Some(subject.subject.generation),
-                },
-            )
-            .is_ok()
-        });
-        match serveable {
-            true => self.describe(location),
-            false => self.answer(),
-        }
+        let Ok((copy, subject)) = split_serve_reads(values) else {
+            return self.answer();
+        };
+        let Ok(record) = registration_for(copy.as_deref(), &self.copy_request(&key)) else {
+            return self.answer();
+        };
+        self.summary.origin = record.origin;
+        self.summary.compliance = match record.state.is_serveable()
+            && record.subject_generation == subject.subject.generation
+        {
+            true => CopyCompliance::Allowed,
+            false => CopyCompliance::Quarantined,
+        };
+        self.describe(location)
     }
 
     fn describe(&mut self, location: BackendLocation) -> Effects {
@@ -674,6 +703,7 @@ impl Operation for LocationSummaryOperation {
             SummaryState::ReadHead => self.handle_head(event),
             SummaryState::ReadVersion => self.handle_version(event),
             SummaryState::ReadLocation => self.handle_location(event),
+            SummaryState::ReadCopyOrigin => self.handle_copy_origin(event),
             SummaryState::CheckManagedCopy => self.handle_managed_copy(event),
             SummaryState::ReadBackend => self.handle_backend(event),
             SummaryState::CommitTransaction => self.handle_commit(event),
@@ -735,7 +765,8 @@ impl Operation for LocationSummaryOperation {
 mod tests {
     use super::{LocationSummaryError, LocationSummaryOperation};
     use crate::replication::location_summary::fixtures::{node_id, realm_id, request};
-    use crate::replication::protocol::LocationCopyStorage;
+    use crate::replication::protocol::{CopyCompliance, LocationCopyStorage};
+    use aruna_core::structs::{CopyOrigin, VersionKey};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -863,6 +894,7 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
         )));
+        operation.step(read_result(None));
         verify(&mut operation);
 
         let local = operation.finalize().unwrap();
@@ -878,6 +910,148 @@ mod tests {
         );
     }
 
+    fn hashed_location() -> BackendLocation {
+        let mut location = location(BackendRef::node_default(), None);
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            [7u8; 32].to_vec(),
+        );
+        location
+    }
+
+    fn policy_ref() -> aruna_core::structs::PlacementPolicyRef {
+        aruna_core::structs::PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([4u8; 16]),
+            digest: [5u8; 32],
+        }
+    }
+
+    fn copy_record(
+        version_id: Ulid,
+        state: aruna_core::structs::ManagedCopyState,
+        origin: CopyOrigin,
+        governed: bool,
+    ) -> aruna_core::structs::ManagedCopyRecord {
+        let refs = match governed {
+            true => vec![policy_ref()],
+            false => Vec::new(),
+        };
+        aruna_core::structs::ManagedCopyRecord::new(
+            VersionKey::new("raw", "run1.tar", version_id),
+            node_id(5),
+            hashed_location(),
+            refs,
+            7,
+            state,
+        )
+        .expect("record builds")
+        .sealed_under(match governed {
+            true => 1,
+            false => 0,
+        })
+        .from_origin(origin)
+    }
+
+    /// Copy row plus subject row, the pair a governed answer reads at once.
+    fn serve_batch(record: &aruna_core::structs::ManagedCopyRecord) -> Event {
+        let subject = aruna_core::structs::NodeSubjectRecord::seed(
+            aruna_core::structs::PlacementSubject {
+                node_id: node_id(5),
+                generation: 1,
+                location: "eu-west".to_string(),
+                labels: Default::default(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+        )
+        .expect("subject is valid");
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"copy".to_vec().into(), Some(record.to_bytes().unwrap().into())),
+                (
+                    b"subject".to_vec().into(),
+                    Some(subject.to_bytes().unwrap().into()),
+                ),
+            ],
+        })
+    }
+
+    #[test]
+    fn reports_copy_origin() {
+        // An ungoverned copy is advertised as before and now names its cause.
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let relationship_id = Ulid::from_bytes([6u8; 16]);
+        let mut operation = authorized(Some(version_id));
+        operation.step(read_result(Some(materialized().to_bytes().unwrap())));
+        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
+        operation.step(read_result(Some(
+            copy_record(
+                version_id,
+                aruna_core::structs::ManagedCopyState::Registered,
+                CopyOrigin::Sync { relationship_id },
+                false,
+            )
+            .to_bytes()
+            .unwrap(),
+        )));
+        verify(&mut operation);
+
+        let summary = operation.finalize().unwrap().summary;
+        assert!(summary.held);
+        assert_eq!(summary.origin, CopyOrigin::Sync { relationship_id });
+        assert_eq!(summary.compliance, CopyCompliance::Allowed);
+    }
+
+    fn governed_version() -> BlobVersion {
+        materialized()
+            .with_policies(vec![policy_ref()])
+            .expect("refs seal")
+    }
+
+    #[test]
+    fn lists_quarantined_copy() {
+        // A copy this node holds but refuses to serve is reported rather than
+        // hidden, and it names no rule.
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let mut operation = authorized(Some(version_id));
+        operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
+        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
+        operation.step(serve_batch(&copy_record(
+            version_id,
+            aruna_core::structs::ManagedCopyState::Quarantined(
+                aruna_core::structs::ManagedCopyQuarantine::PolicyViolation,
+            ),
+            CopyOrigin::Replicate,
+            true,
+        )));
+        verify(&mut operation);
+
+        let summary = operation.finalize().unwrap().summary;
+        assert!(summary.held);
+        assert_eq!(summary.origin, CopyOrigin::Replicate);
+        assert_eq!(summary.compliance, CopyCompliance::Quarantined);
+    }
+
+    #[test]
+    fn allows_served_copy() {
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let mut operation = authorized(Some(version_id));
+        operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
+        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
+        operation.step(serve_batch(&copy_record(
+            version_id,
+            aruna_core::structs::ManagedCopyState::Registered,
+            CopyOrigin::Write,
+            true,
+        )));
+        verify(&mut operation);
+
+        let summary = operation.finalize().unwrap().summary;
+        assert!(summary.held);
+        assert_eq!(summary.origin, CopyOrigin::Write);
+        assert_eq!(summary.compliance, CopyCompliance::Allowed);
+    }
+
     #[test]
     fn names_group_backend() {
         // Tenant-owned storage is the durability signal, so id and name ship.
@@ -889,6 +1063,7 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
         )));
+        operation.step(read_result(None));
         operation.step(read_result(None));
         verify(&mut operation);
 
