@@ -56,6 +56,7 @@ use ulid::Ulid;
 
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
+use super::profile_cache::ProfileCache;
 use super::profile_shacl::{
     ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
 };
@@ -64,7 +65,6 @@ use super::protocol::{
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
     write_message,
 };
-use super::profile_cache::ProfileCache;
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
 };

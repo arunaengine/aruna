@@ -134,7 +134,8 @@ pub enum ProfileScope {
 
 impl ProfileScope {
     fn may_use(self, record: &MetadataRegistryRecord) -> bool {
-        record.public || matches!(self, ProfileScope::Group(group_id) if group_id == record.group_id)
+        record.public
+            || matches!(self, ProfileScope::Group(group_id) if group_id == record.group_id)
     }
 }
 

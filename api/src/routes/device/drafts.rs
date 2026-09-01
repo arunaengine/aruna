@@ -415,7 +415,11 @@ async fn preview_draft(
     Json(request): Json<ProfileValidationPreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
     require_owner(&state, auth).await?;
-    let group_id = request.group_id.as_deref().map(parse_group_id).transpose()?;
+    let group_id = request
+        .group_id
+        .as_deref()
+        .map(parse_group_id)
+        .transpose()?;
     let jsonld = rocrate_jsonld(&request.rocrate)?;
     let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await

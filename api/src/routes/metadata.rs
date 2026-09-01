@@ -1327,7 +1327,11 @@ pub async fn preview_profile_validation(
     Json(request): Json<ProfileValidationPreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
     require_realm_auth(&state, auth)?;
-    let group_id = request.group_id.as_deref().map(parse_group_id).transpose()?;
+    let group_id = request
+        .group_id
+        .as_deref()
+        .map(parse_group_id)
+        .transpose()?;
     let jsonld = serialize_jsonld_object(&request.rocrate)?;
     let preview = run_preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
