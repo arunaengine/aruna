@@ -694,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn names_broken_bucket_rule() {
+    fn names_broken_rule() {
         // One sentence per rule; the portal mirrors the same table.
         assert_eq!(
             bucket_name_reason("b1"),
@@ -735,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_valid_bucket_names() {
+    fn accepts_valid_names() {
         for name in ["abc", "my-bucket", "my.bucket-1", &"a".repeat(63)] {
             assert_eq!(bucket_name_reason(name), None, "rejected {name}");
         }

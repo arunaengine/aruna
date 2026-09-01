@@ -52,7 +52,7 @@ impl BlobDeleteAuditRecord {
 
 /// Group prefix followed by a time-ordered id, so one group's trail scans in
 /// deletion order.
-pub fn blob_delete_audit_key(group_id: GroupId, audit_id: Ulid) -> Vec<u8> {
+pub fn delete_audit_key(group_id: GroupId, audit_id: Ulid) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes.extend_from_slice(&audit_id.to_bytes());

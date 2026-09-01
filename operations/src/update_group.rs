@@ -153,7 +153,7 @@ impl UpdateGroupOperation {
 
     /// Realm admins may rename a group they are not a member of, so a refused
     /// group-admin check falls back to the realm group administration path.
-    fn emit_realm_admin_auth(&mut self) -> Effects {
+    fn emit_realm_auth(&mut self) -> Effects {
         self.state = UpdateGroupState::AuthRealmAdmin;
         self.check_permission(format!("/{}/admin/groups", self.config.actor.realm_id))
     }
@@ -325,7 +325,7 @@ impl UpdateGroupOperation {
                     read: false
                 })]
             }
-            Ok(false) if allow_fallback => self.emit_realm_admin_auth(),
+            Ok(false) if allow_fallback => self.emit_realm_auth(),
             Ok(false) => self.fail(UpdateGroupError::Unauthorized),
             Err(error) => {
                 warn!(error = %error, "Group rename authorization check failed");
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn renames_group_and_queues_event() {
+    fn renames_and_queues() {
         let mut operation = UpdateGroupOperation::new(config("  Platform  "));
         assert!(matches!(
             operation.start().first(),
@@ -691,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_realm_admin() {
+    fn realm_admin_fallback() {
         // A realm admin who is not a group member renames through the realm path.
         let mut operation = UpdateGroupOperation::new(config("Platform"));
         operation.start();

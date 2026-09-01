@@ -829,7 +829,7 @@ pub async fn update_group(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_update_group_error)?;
+    .map_err(map_rename_error)?;
 
     Ok((
         StatusCode::OK,
@@ -837,7 +837,7 @@ pub async fn update_group(
     ))
 }
 
-fn map_update_group_error(error: UpdateGroupError) -> ServerError {
+fn map_rename_error(error: UpdateGroupError) -> ServerError {
     match error {
         UpdateGroupError::Unauthorized => ServerError::Forbidden,
         UpdateGroupError::GroupNotFound => ServerError::NotFound,
@@ -2393,7 +2393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_rejects_long_name() {
+    async fn create_caps_name() {
         let (state, admin, _tempdir) = setup_admin_state().await;
         let error = new_group(&state, admin, &"n".repeat(257))
             .await

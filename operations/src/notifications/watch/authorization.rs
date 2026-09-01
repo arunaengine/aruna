@@ -1052,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_group_wide_prefix() {
+    fn accepts_group_prefix() {
         // An empty document prefix watches every dataset of the group.
         let realm_id = RealmId([1u8; 32]);
         let group_id = Ulid::from_bytes([2u8; 16]);

@@ -6,7 +6,7 @@ use aruna_core::keyspaces::BLOB_DELETE_AUDIT_KEYSPACE;
 use aruna_core::structs::{
     BlobDeleteAuditKind, BlobDeleteAuditRecord, BlobPurgeScopeKind, JobError, JobProgress,
     JobResultPayload, MultipartUpload, Permission, StoragePurgeCheckpoint, StoragePurgeResult,
-    StoragePurgeScope, StoragePurgeSpec, blob_delete_audit_key, blob_object_permission_path,
+    StoragePurgeScope, StoragePurgeSpec, blob_object_permission_path, delete_audit_key,
 };
 use aruna_core::util::unix_timestamp_millis;
 
@@ -207,7 +207,7 @@ async fn write_purge_audit(ctx: &JobContext, spec: &StoragePurgeSpec) -> Result<
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: BLOB_DELETE_AUDIT_KEYSPACE.to_string(),
-            key: blob_delete_audit_key(spec.group_id, ctx.job_id.as_ulid()).into(),
+            key: delete_audit_key(spec.group_id, ctx.job_id.as_ulid()).into(),
             value: value.into(),
             txn_id: None,
         })

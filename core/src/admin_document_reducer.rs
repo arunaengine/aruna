@@ -4608,7 +4608,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_replaces_created_name() {
+    fn rename_replaces_name() {
         let mut state = group_state();
         state
             .apply(&create_group(1, 1, "Engineering", realm_id()))
@@ -4623,7 +4623,7 @@ mod tests {
     }
 
     #[test]
-    fn older_rename_is_stale() {
+    fn older_rename_stale() {
         // The second rename observes the first, so replaying the first loses.
         let mut state = group_state();
         state

@@ -20,7 +20,7 @@ use aruna_core::structs::{
     AuthContext, BackendLocation, BlobDeleteAuditKind, BlobDeleteAuditRecord, BlobHeadKey,
     BlobLocationKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
     MultipartObjectMetadataKey, PathRestriction, RealmId, ReclaimCandidate, ReclaimCandidateKey,
-    UsageDelta, VersionKey, blob_delete_audit_key,
+    UsageDelta, VersionKey, delete_audit_key,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -769,7 +769,7 @@ impl DeleteObjectOperation {
         self.state = DeleteObjectState::WriteDeleteAudit;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: BLOB_DELETE_AUDIT_KEYSPACE.to_string(),
-            key: blob_delete_audit_key(self.input.group_id, Ulid::generate()).into(),
+            key: delete_audit_key(self.input.group_id, Ulid::generate()).into(),
             value: value.into(),
             txn_id: Some(txn_id),
         })]

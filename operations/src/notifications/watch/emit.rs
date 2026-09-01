@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_wide_prefix_delivers() {
+    async fn group_prefix_delivers() {
         // A `meta/{group}/` watch fires for a dataset created anywhere in it.
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, _net) = ctx_with_net(realm, [86u8; 32]).await;
