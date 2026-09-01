@@ -64,6 +64,7 @@ use super::protocol::{
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
     write_message,
 };
+use super::profile_cache::ProfileCache;
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
 };
@@ -292,6 +293,7 @@ struct MetadataInner {
     document_sync_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
     query_cache: MetadataQueryCache,
+    profile_cache: ProfileCache,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
@@ -900,6 +902,7 @@ impl MetadataHandle {
                 document_sync_persist_policy: metadata_options.document_sync_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
                 query_cache: MetadataQueryCache::new(),
+                profile_cache: ProfileCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
@@ -1004,6 +1007,16 @@ impl MetadataHandle {
 
     pub(super) fn query_cache(&self) -> &MetadataQueryCache {
         &self.inner.query_cache
+    }
+
+    pub(super) fn profile_cache(&self) -> &ProfileCache {
+        &self.inner.profile_cache
+    }
+
+    /// Profile revisions this node fetched for validation since start. A
+    /// second validation of the same revision must not raise it.
+    pub fn profile_loads(&self) -> u64 {
+        self.inner.profile_cache.loads()
     }
 
     pub(crate) fn visibility_generation(&self) -> u64 {

@@ -5,6 +5,7 @@ pub mod forward;
 mod handle;
 mod iri_index;
 pub mod materialization_queue;
+mod profile_cache;
 pub(crate) mod profile_shacl;
 pub mod profile_validation;
 pub mod projector;
