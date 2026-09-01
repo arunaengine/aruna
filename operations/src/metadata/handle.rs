@@ -1834,6 +1834,39 @@ impl MetadataHandle {
                 })
                 .await
             }
+            forward @ MetadataTransportMessage::ForwardExportProfile { .. } => {
+                Box::pin(async {
+                    match super::forward::apply_forwarded_profile(
+                        context,
+                        peer,
+                        forward,
+                        metadata_bytes,
+                    )
+                    .await
+                    {
+                        Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
+                            Ok(bytes) => {
+                                let length = bytes.len() as u64;
+                                if length > metadata_body_limit(metadata_bytes) {
+                                    MetadataTransportMessage::ForwardedExport {
+                                        result: Err(MetadataReadError::Unavailable),
+                                    }
+                                } else {
+                                    response_body = Some(bytes);
+                                    MetadataTransportMessage::ForwardedExport { result: Ok(length) }
+                                }
+                            }
+                            Err(_) => MetadataTransportMessage::ForwardedExport {
+                                result: Err(MetadataReadError::Unavailable),
+                            },
+                        },
+                        Err(error) => {
+                            MetadataTransportMessage::ForwardedExport { result: Err(error) }
+                        }
+                    }
+                })
+                .await
+            }
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
@@ -4903,6 +4936,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedWriteUnavailable => "forwarded_write_unavailable",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
+        MetadataTransportMessage::ForwardExportProfile { .. } => "forward_export_profile",
         MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
         MetadataTransportMessage::QueryDocument { .. } => "query_document",
         MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
@@ -7100,6 +7134,8 @@ async fn send_export_request(
 {
     let metadata_bytes = match &message {
         MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => *metadata_bytes,
+        // The channel carries one Profile document; the holder caps the body.
+        MetadataTransportMessage::ForwardExportProfile { .. } => u64::MAX,
         _ => {
             return Err(MetadataRequestError::definitely_not_sent(
                 MetadataError::InvalidInput("expected a metadata export request".to_string()),
