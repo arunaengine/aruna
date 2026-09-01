@@ -13,7 +13,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, PlacementPolicyError, PlacementPolicyRef,
+    AuthContext, BucketInfo, Permission, PlacementPolicyError, PlacementPolicyRef, group_admin_path,
     policy_admin_path,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -23,6 +23,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement_policy::foreign_owner;
 use crate::placement_policy::read::ReadPolicyError;
 use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 
@@ -50,6 +51,7 @@ pub struct BucketPlacementDefault {
 enum PutPlacementState {
     Init,
     Authorize,
+    AuthorizeGroup,
     Resolve,
     StartTransaction,
     ReadBucket,
@@ -69,8 +71,11 @@ pub enum PutBucketPlacementError {
     Policy(#[from] PlacementPolicyError),
     #[error("The specified bucket does not exist.")]
     NoSuchBucket,
-    #[error("caller may not administer the realm configuration")]
+    #[error("caller may not administer placement for this bucket")]
     Unauthorized,
+    /// A group-owned rule governs only its owner's buckets.
+    #[error("placement policy {policy_id} belongs to another group")]
+    ForeignPolicy { policy_id: Ulid },
     /// The ref was not authenticated, so it never became a default.
     #[error("placement policy {policy_id} could not be resolved")]
     PolicyUnavailable {
@@ -122,6 +127,7 @@ impl PutBucketPlacementOperation {
         match self.state {
             PutPlacementState::Init => "Init",
             PutPlacementState::Authorize => "Authorize",
+            PutPlacementState::AuthorizeGroup => "AuthorizeGroup",
             PutPlacementState::Resolve => "Resolve",
             PutPlacementState::StartTransaction => "StartTransaction",
             PutPlacementState::ReadBucket => "ReadBucket",
@@ -152,7 +158,14 @@ impl PutBucketPlacementOperation {
         match step {
             ResolveStep::Pending(effects) => effects,
             ResolveStep::Done => {
+                let foreign = self
+                    .resolver
+                    .as_ref()
+                    .and_then(|resolver| foreign_owner(resolver.resolutions(), self.input.group_id));
                 self.resolver = None;
+                if let Some(policy_id) = foreign {
+                    return self.fail(PutBucketPlacementError::ForeignPolicy { policy_id });
+                }
                 self.state = PutPlacementState::StartTransaction;
                 smallvec![Effect::Storage(StorageEffect::StartTransaction {
                     read: false
@@ -166,6 +179,20 @@ impl PutBucketPlacementOperation {
                 })
             }
         }
+    }
+
+    fn authorize(&self, path: String) -> Effects {
+        let auth_config = CheckPermissionsConfig {
+            auth_context: self.input.auth_context.clone(),
+            path,
+            required_permission: Permission::WRITE,
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(auth_config),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
     }
 
     fn fail(&mut self, error: PutBucketPlacementError) -> Effects {
@@ -257,23 +284,34 @@ impl Operation for PutBucketPlacementOperation {
 
     fn start(&mut self) -> Effects {
         self.state = PutPlacementState::Authorize;
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.input.auth_context.clone(),
-            path: policy_admin_path(self.input.auth_context.realm_id),
-            required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+        self.authorize(policy_admin_path(self.input.auth_context.realm_id))
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             PutPlacementState::Init => self.start(),
             PutPlacementState::Authorize => {
+                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
+                else {
+                    return self.invalid_event();
+                };
+                match allowed {
+                    Ok(true) => self.resolve_refs(),
+                    // A group administrator governs that group's own buckets.
+                    Ok(false) => {
+                        self.state = PutPlacementState::AuthorizeGroup;
+                        self.authorize(group_admin_path(
+                            self.input.auth_context.realm_id,
+                            self.input.group_id,
+                        ))
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Bucket placement authorization check failed");
+                        self.fail(PutBucketPlacementError::Unauthorized)
+                    }
+                }
+            }
+            PutPlacementState::AuthorizeGroup => {
                 let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
                 else {
                     return self.invalid_event();
@@ -559,17 +597,83 @@ mod tests {
 
     #[test]
     fn denies_non_admin() {
-        // Setting a default is a realm-configuration change, so it is refused
-        // before the bucket is even read.
+        // Neither realm-configuration write nor admin write on the bucket's
+        // group: nothing is opened for the caller.
         let policies = vec![policy(1)];
         let mut operation = operation(&policies, None);
         operation.start();
+        operation.step(authorized(false));
         let effects = operation.step(authorized(false));
 
         assert!(effects.is_empty(), "nothing is opened for a denied caller");
         assert_eq!(
             operation.finalize(),
             Err(PutBucketPlacementError::Unauthorized)
+        );
+    }
+
+    fn owned_policy(seed: u8, owner: Ulid) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some("eu-west".to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(owner)
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    #[test]
+    fn accepts_group_admin() {
+        // A group administrator governs that group's own bucket, and its own
+        // rule is a legal reference there.
+        let policies = vec![owned_policy(1, group_id())];
+        let mut operation = operation(&policies, None);
+        operation.start();
+        operation.step(authorized(false));
+        operation.step(authorized(true));
+        operation.step(cached(&policies[0]));
+        operation.step(crate::placement_policy::fixtures::group_authority(
+            realm_id(),
+            group_id(),
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([4u8; 16]),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // A rule another group owns never governs this bucket, and the refusal
+        // lands before any transaction is opened.
+        let foreign = Ulid::from_bytes([8u8; 16]);
+        let policies = vec![owned_policy(1, foreign)];
+        let mut operation = operation(&policies, None);
+        operation.start();
+        operation.step(authorized(true));
+        operation.step(cached(&policies[0]));
+        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+            realm_id(),
+            foreign,
+        ));
+
+        assert!(effects.is_empty(), "a foreign rule opens no transaction");
+        assert_eq!(
+            operation.finalize(),
+            Err(PutBucketPlacementError::ForeignPolicy {
+                policy_id: Ulid::from_bytes([1u8; 16])
+            })
         );
     }
 

@@ -73,7 +73,7 @@ use aruna_core::structs::{
     watch_interest_key_node_id, watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
-use aruna_core::types::{RoleId, TxnId, UserId, Value};
+use aruna_core::types::{GroupId, RoleId, TxnId, UserId, Value};
 use aruna_core::util::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
@@ -4490,8 +4490,8 @@ impl DocumentSyncService {
 
     /// A publication counts only against this realm's current replicated view:
     /// the original publisher must be a permitted node and its named authorizing
-    /// user must still hold realm-configuration write. A relay or current holder
-    /// never supplies that authority for someone else.
+    /// user must still hold write on the path the rule's ownership names. A
+    /// relay or current holder never supplies that authority for someone else.
     async fn apply_policy_document(
         &self,
         document: &PlacementPolicyDocument,
@@ -4507,11 +4507,24 @@ impl DocumentSyncService {
                 DocumentSyncDependency::RealmAuthorization(self.realm_id),
             ));
         };
-        if let Err(reason) = verify_policy_authority(document, &config, &auth) {
+        // A group-owned rule is decided against its owner's roles; without them
+        // nothing is accepted, so the document waits instead of being trusted.
+        let group_auth = match document.policy.owner_group_id {
+            Some(group_id) => match read_group_authorization(&self.storage, group_id).await? {
+                Some(group_auth) => Some(group_auth),
+                None => {
+                    return Ok(MetadataPlacementOutcome::Deferred(
+                        DocumentSyncDependency::GroupAuthorization(group_id),
+                    ));
+                }
+            },
+            None => None,
+        };
+        if let Err(reason) = verify_policy_authority(document, &config, &auth, group_auth.as_ref()) {
             warn!(
                 policy_id = %document.policy_id(),
                 %reason,
-                "Rejecting placement policy without realm-admin publication authority"
+                "Rejecting placement policy without publication authority"
             );
             return Ok(MetadataPlacementOutcome::Rejected);
         }
@@ -8107,6 +8120,9 @@ enum DocumentSyncDependency {
         realm_id: RealmId,
         strategy_id: Ulid,
     },
+    /// Roles of the group that owns a placement policy; without them its
+    /// publication authority cannot be decided here.
+    GroupAuthorization(GroupId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8190,6 +8206,9 @@ fn satisfied_document_sync_dependencies(
         DocumentSyncTarget::RealmAuthorization { realm_id } => {
             dependencies.push(DocumentSyncDependency::RealmAuthorization(*realm_id));
         }
+        DocumentSyncTarget::GroupAuthorization { group_id } => {
+            dependencies.push(DocumentSyncDependency::GroupAuthorization(*group_id));
+        }
         _ => {}
     }
     dependencies
@@ -8216,7 +8235,26 @@ async fn document_sync_dependency_available(
             .is_some_and(|config| {
                 config.realm_id == realm_id && config.strategy(&strategy_id).is_some()
             })),
+        DocumentSyncDependency::GroupAuthorization(group_id) => {
+            Ok(read_group_authorization(storage, group_id).await?.is_some())
+        }
     }
+}
+
+async fn read_group_authorization(
+    storage: &StorageHandle,
+    group_id: GroupId,
+) -> Result<Option<GroupAuthorizationDocument>> {
+    let target = DocumentSyncTarget::GroupAuthorization { group_id };
+    storage_read_from(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+    )
+    .await?
+    .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
 fn register_deferred_topic(

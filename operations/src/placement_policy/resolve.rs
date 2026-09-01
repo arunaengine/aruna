@@ -12,8 +12,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_CACHE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    PlacementPolicyRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId, VerifiedPolicy,
-    verify_policy_authority,
+    GroupAuthorizationDocument, PlacementPolicyRef, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmId, VerifiedPolicy, verify_policy_authority,
 };
 use aruna_core::types::{Effects, Key};
 use byteview::ByteView;
@@ -99,7 +99,10 @@ impl ResolvePolicyOperation {
         effects
     }
 
+    /// A cached entry is re-authenticated against the realm view, plus the
+    /// owning group's roles when the rule names one.
     fn revalidate(&mut self, authentic: AuthenticPolicy) -> Effects {
+        let owner = authentic.document.policy.owner_group_id;
         self.cached = Some(authentic);
         self.state = ResolveState::Revalidate;
         let config = DocumentSyncTarget::RealmConfig {
@@ -108,18 +111,27 @@ impl ResolvePolicyOperation {
         let auth = DocumentSyncTarget::RealmAuthorization {
             realm_id: self.config.realm_id,
         };
+        let mut reads = vec![
+            (config.storage_keyspace().to_string(), config.storage_key()),
+            (auth.storage_keyspace().to_string(), auth.storage_key()),
+        ];
+        if let Some(group_id) = owner {
+            let group = DocumentSyncTarget::GroupAuthorization { group_id };
+            reads.push((group.storage_keyspace().to_string(), group.storage_key()));
+        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (config.storage_keyspace().to_string(), config.storage_key()),
-                (auth.storage_keyspace().to_string(), auth.storage_key()),
-            ],
+            reads,
             txn_id: None,
         })]
     }
 
     fn accept_cached(&mut self, values: Vec<(Key, Option<ByteView>)>) -> Effects {
-        let [(_, config_value), (_, auth_value)] = values.as_slice() else {
-            return self.unexpected_event("realm config and authorization", format!("{values:?}"));
+        let ([(_, config_value), (_, auth_value)], group_value) = match values.as_slice() {
+            [config, auth] => ([config, auth], None),
+            [config, auth, (_, group)] => ([config, auth], Some(group)),
+            other => {
+                return self.unexpected_event("realm config and authorization", format!("{other:?}"));
+            }
         };
         let Some(config_value) = config_value else {
             return self.fail(ReadPolicyError::RealmConfigMissing);
@@ -137,10 +149,20 @@ impl ResolvePolicyOperation {
             Ok(auth) => auth,
             Err(error) => return self.fail(error.into()),
         };
+        let group_auth = match group_value
+            .and_then(|value| value.as_ref())
+            .map(|value| GroupAuthorizationDocument::from_bytes(value))
+            .transpose()
+        {
+            Ok(group_auth) => group_auth,
+            Err(error) => return self.fail(error.into()),
+        };
         let Some(authentic) = self.cached.take() else {
             return self.unexpected_event("cached policy", String::new());
         };
-        if let Err(error) = verify_policy_authority(&authentic.document, &config, &auth) {
+        if let Err(error) =
+            verify_policy_authority(&authentic.document, &config, &auth, group_auth.as_ref())
+        {
             return self.fail(error.into());
         }
         self.result = Some(Ok((authentic.policy, PolicySource::Cached)));

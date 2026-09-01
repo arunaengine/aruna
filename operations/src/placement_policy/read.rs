@@ -12,8 +12,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicyFetchEvent, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PolicyAuthorityError,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, VerifiedPolicy,
+    GroupAuthorizationDocument, PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef,
+    PolicyAuthorityError, RealmAuthorizationDocument, RealmConfigDocument, RealmId, VerifiedPolicy,
     placement_policy_target, verify_policy_authority,
 };
 use aruna_core::types::{Effects, Value};
@@ -67,6 +67,16 @@ pub struct ReadPolicyOperation {
     output: Option<Result<(AuthenticPolicy, PolicySource), ReadPolicyError>>,
 }
 
+/// A candidate document waiting for the owning group's authorization state.
+/// `remaining` names the holders still to ask when this one is refused.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingAuthority {
+    document: PlacementPolicyDocument,
+    policy: VerifiedPolicy,
+    source: PolicySource,
+    remaining: Vec<aruna_core::NodeId>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ReadPolicyState {
     Init,
@@ -75,6 +85,11 @@ enum ReadPolicyState {
     /// definition is dropped and the remainder is asked again.
     Fetch {
         asked: Vec<aruna_core::NodeId>,
+    },
+    /// A group-owned candidate is authenticated only once its owner's roles
+    /// are in hand; without them the read fails closed.
+    ReadGroupAuth {
+        pending: Box<PendingAuthority>,
     },
     Finish,
     Error,
@@ -149,23 +164,98 @@ impl ReadPolicyOperation {
         Ok(verified)
     }
 
-    /// A document counts only when it is this realm's, hashes to the requested
-    /// ref, and carries an authentic realm-admin publication, whether it came
-    /// from a local row or from a holder.
-    fn accept_document(
+    /// A document counts only when it is this realm's and hashes to the
+    /// requested ref; its publication is authenticated separately, because a
+    /// group-owned rule needs its owner's roles.
+    fn check_document(
         &self,
         document: PlacementPolicyDocument,
-    ) -> Result<AuthenticPolicy, ReadPolicyError> {
+    ) -> Result<(PlacementPolicyDocument, VerifiedPolicy), ReadPolicyError> {
         if document.realm_id != self.config.realm_id {
             return Err(ReadPolicyError::RealmMismatch);
         }
         let policy = self.accept(document.policy.clone())?;
+        Ok((document, policy))
+    }
+
+    fn authenticate(
+        &self,
+        document: PlacementPolicyDocument,
+        policy: VerifiedPolicy,
+        group_auth: Option<&GroupAuthorizationDocument>,
+    ) -> Result<AuthenticPolicy, ReadPolicyError> {
         let realm = self
             .realm
             .as_ref()
             .ok_or_else(|| ReadPolicyError::Unavailable("realm view unavailable".to_string()))?;
-        verify_policy_authority(&document, &realm.config, &realm.auth)?;
+        verify_policy_authority(&document, &realm.config, &realm.auth, group_auth)?;
         Ok(AuthenticPolicy { document, policy })
+    }
+
+    /// Either finishes the candidate or reads the roles of the group that owns
+    /// it. `remaining` is what a refused candidate falls back to.
+    fn decide(
+        &mut self,
+        document: PlacementPolicyDocument,
+        source: PolicySource,
+        remaining: Vec<aruna_core::NodeId>,
+    ) -> Effects {
+        let (document, policy) = match self.check_document(document) {
+            Ok(checked) => checked,
+            Err(error) => return self.refuse(error, remaining),
+        };
+        let Some(group_id) = document.policy.owner_group_id else {
+            return match self.authenticate(document, policy, None) {
+                Ok(authentic) => self.finish(Ok((authentic, source))),
+                Err(error) => self.refuse(error, remaining),
+            };
+        };
+        let target = DocumentSyncTarget::GroupAuthorization { group_id };
+        self.state = ReadPolicyState::ReadGroupAuth {
+            pending: Box::new(PendingAuthority {
+                document,
+                policy,
+                source,
+                remaining,
+            }),
+        };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_group_auth(&mut self, pending: PendingAuthority, value: Option<Value>) -> Effects {
+        let group_auth = match value
+            .as_ref()
+            .map(|value| GroupAuthorizationDocument::from_bytes(value))
+            .transpose()
+        {
+            Ok(group_auth) => group_auth,
+            Err(error) => return self.refuse(error.into(), pending.remaining),
+        };
+        let PendingAuthority {
+            document,
+            policy,
+            source,
+            remaining,
+        } = pending;
+        match self.authenticate(document, policy, group_auth.as_ref()) {
+            Ok(authentic) => self.finish(Ok((authentic, source))),
+            Err(error) => self.refuse(error, remaining),
+        }
+    }
+
+    /// A refused candidate ends the read only when no holder is left to ask.
+    fn refuse(&mut self, error: ReadPolicyError, remaining: Vec<aruna_core::NodeId>) -> Effects {
+        if remaining.is_empty() {
+            return self.finish(Err(error));
+        }
+        match self.emit_fetch(remaining) {
+            Ok(effects) => effects,
+            Err(error) => self.finish(Err(error)),
+        }
     }
 
     /// Keeps the realm view every publication is verified against. Without it
@@ -238,22 +328,11 @@ impl ReadPolicyOperation {
         if !asked.contains(&publisher) {
             return self.finish(Err(ReadPolicyError::UnexpectedPublisher));
         }
-        match self.accept_document(document) {
-            Ok(authentic) => self.finish(Ok((authentic, PolicySource::Fetched))),
-            Err(error) => {
-                let remaining: Vec<_> = asked
-                    .into_iter()
-                    .filter(|holder| *holder != publisher)
-                    .collect();
-                if remaining.is_empty() {
-                    return self.finish(Err(error));
-                }
-                match self.emit_fetch(remaining) {
-                    Ok(effects) => effects,
-                    Err(error) => self.finish(Err(error)),
-                }
-            }
-        }
+        let remaining: Vec<_> = asked
+            .into_iter()
+            .filter(|holder| *holder != publisher)
+            .collect();
+        self.decide(document, PolicySource::Fetched, remaining)
     }
 
     fn finish(
@@ -317,13 +396,10 @@ impl Operation for ReadPolicyOperation {
                         return self.finish(Err(error));
                     }
                     match policy_value.clone() {
-                        Some(value) => {
-                            let result = PlacementPolicyDocument::from_bytes(&value)
-                                .map_err(ReadPolicyError::from)
-                                .and_then(|document| self.accept_document(document))
-                                .map(|authentic| (authentic, PolicySource::Local));
-                            self.finish(result)
-                        }
+                        Some(value) => match PlacementPolicyDocument::from_bytes(&value) {
+                            Ok(document) => self.decide(document, PolicySource::Local, Vec::new()),
+                            Err(error) => self.finish(Err(error.into())),
+                        },
                         None => match self.plan_fetch() {
                             Ok(effects) => effects,
                             Err(error) => self.finish(Err(error)),
@@ -347,6 +423,13 @@ impl Operation for ReadPolicyOperation {
                     }
                 },
                 other => self.unexpected_event("policy fetch result", format!("{other:?}")),
+            },
+            ReadPolicyState::ReadGroupAuth { pending } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.handle_group_auth(*pending, value)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
+                other => self.unexpected_event("group authorization read", format!("{other:?}")),
             },
             ReadPolicyState::Init | ReadPolicyState::Finish | ReadPolicyState::Error => {
                 smallvec![]

@@ -9,10 +9,11 @@ use crate::document::{
 use crate::errors::ConversionError;
 use crate::permission_path::compile_permission_matcher;
 use crate::structs::{
-    Permission, PlacementPolicy, PlacementPolicyError, PlacementPolicyRef, PlacementRef,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, VerifiedPolicy,
+    GroupAuthorizationDocument, Permission, PlacementPolicy, PlacementPolicyError,
+    PlacementPolicyRef, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    Role, VerifiedPolicy,
 };
-use crate::types::UserId;
+use crate::types::{GroupId, UserId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -37,6 +38,10 @@ pub enum PolicyAuthorityError {
     Unauthorized,
     #[error("realm view belongs to another realm")]
     RealmMismatch,
+    /// The owning group's authorization state is missing or names another
+    /// group, so group-admin authority cannot be decided here.
+    #[error("owning group's authorization state is unavailable")]
+    GroupUnavailable,
 }
 
 /// The tuple one policy publication signs. Reconstructed from the document, so a
@@ -152,20 +157,40 @@ impl PolicyPublication {
     }
 }
 
-/// Permission path a policy publication is authorized against. The creating
-/// operation and every verifier read this one path, so they cannot drift.
+/// Permission path a realm-wide policy publication is authorized against. The
+/// creating operation and every verifier read this one path, so they cannot
+/// drift.
 pub fn policy_admin_path(realm_id: RealmId) -> String {
     format!("/{realm_id}/admin/config")
 }
 
-/// Realm-admin authority behind one publication: the original publisher must be
-/// a permitted realm node and the authorizing user must hold realm-configuration
-/// write in the verifier's own replicated view. Neither a relay nor a current
-/// holder can supply that authority for someone else.
+/// Permission path a group-owned policy is authorized against: administering
+/// the owning group, never the realm configuration.
+pub fn group_admin_path(realm_id: RealmId, group_id: GroupId) -> String {
+    format!("/{realm_id}/g/{group_id}/admin")
+}
+
+/// The path one policy's publication has to be authorized against.
+pub fn policy_authority_path(realm_id: RealmId, owner_group_id: Option<GroupId>) -> String {
+    match owner_group_id {
+        Some(group_id) => group_admin_path(realm_id, group_id),
+        None => policy_admin_path(realm_id),
+    }
+}
+
+/// Publication authority behind one document: the original publisher must be a
+/// permitted realm node, and the authorizing user must still hold write on the
+/// path the rule's ownership names, in the verifier's own replicated view. A
+/// realm-wide rule needs realm-configuration write; a group-owned rule needs
+/// admin write on its owning group, decided over the realm and group roles
+/// together, exactly as the creating operation decided it. Neither a relay nor
+/// a current holder can supply that authority for someone else, and a group
+/// whose authorization state is missing fails closed.
 pub fn verify_policy_authority(
     document: &PlacementPolicyDocument,
     config: &RealmConfigDocument,
     auth: &RealmAuthorizationDocument,
+    group_auth: Option<&GroupAuthorizationDocument>,
 ) -> Result<(), PolicyAuthorityError> {
     if config.realm_id != document.realm_id || auth.realm_id != document.realm_id {
         return Err(PolicyAuthorityError::RealmMismatch);
@@ -184,17 +209,36 @@ pub fn verify_policy_authority(
     if created_by.is_nil() || created_by.realm_id != document.realm_id {
         return Err(PolicyAuthorityError::Unauthorized);
     }
-    if !holds_admin_write(created_by, &policy_admin_path(document.realm_id), auth) {
-        return Err(PolicyAuthorityError::Unauthorized);
-    }
-    Ok(())
+    let Some(group_id) = document.policy.owner_group_id else {
+        return holds_admin_write(
+            created_by,
+            &policy_admin_path(document.realm_id),
+            auth.roles.values(),
+        )
+        .then_some(())
+        .ok_or(PolicyAuthorityError::Unauthorized);
+    };
+    let Some(group_auth) = group_auth.filter(|group| group.group_id == group_id) else {
+        return Err(PolicyAuthorityError::GroupUnavailable);
+    };
+    holds_admin_write(
+        created_by,
+        &group_admin_path(document.realm_id, group_id),
+        auth.roles.values().chain(group_auth.roles.values()),
+    )
+    .then_some(())
+    .ok_or(PolicyAuthorityError::Unauthorized)
 }
 
-/// Whether the realm's current roles grant this user write on the path. An
-/// uncompilable pattern denies, so a malformed role never widens authority.
-fn holds_admin_write(user_id: UserId, path: &str, auth: &RealmAuthorizationDocument) -> bool {
+/// Whether the given roles grant this user write on the path. An uncompilable
+/// pattern denies, so a malformed role never widens authority.
+fn holds_admin_write<'a>(
+    user_id: UserId,
+    path: &str,
+    roles: impl Iterator<Item = &'a Role>,
+) -> bool {
     let mut allowed = false;
-    for role in auth.roles.values() {
+    for role in roles {
         if !role.assigned_users.contains(&user_id) {
             continue;
         }
@@ -350,6 +394,121 @@ mod tests {
         UserId::local(Ulid::from_bytes([2; 16]), realm())
     }
 
+    fn group() -> Ulid {
+        Ulid::from_bytes([3; 16])
+    }
+
+    /// The same rule bound to `group()`, so only that group's admins publish it.
+    fn owned_policy(seed: u8) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "eu-only".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some("eu-west".to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(group())
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn group_roles(user: UserId, pattern: &str) -> crate::structs::GroupAuthorizationDocument {
+        let role = Role {
+            role_id: Ulid::from_bytes([2; 16]),
+            name: "group_admin".to_string(),
+            permissions: HashMap::from([(pattern.to_string(), Permission::WRITE)]),
+            assigned_users: HashSet::from([user]),
+        };
+        crate::structs::GroupAuthorizationDocument {
+            group_id: group(),
+            roles: HashMap::from([(role.role_id, role)]),
+            policies: Vec::new(),
+        }
+    }
+
+    fn owned_document(seed: u8) -> PlacementPolicyDocument {
+        let policy = owned_policy(seed);
+        let publication = publication(seed, &policy, 10);
+        PlacementPolicyDocument::new(realm(), &policy, publication)
+    }
+
+    /// A realm role that grants nothing outside the realm admin namespace.
+    fn narrow_realm() -> RealmAuthorizationDocument {
+        RealmAuthorizationDocument {
+            realm_id: realm(),
+            roles: HashMap::new(),
+            operation_restrictions: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn owned_needs_group_admin() {
+        // A group-owned rule is decided against its owner's roles: a realm-config
+        // admin alone does not publish it, and its own admin does.
+        let document = owned_document(1);
+        let member = UserId::local(Ulid::from_bytes([9; 16]), realm());
+        assert_eq!(
+            verify_policy_authority(
+                &document,
+                &config(),
+                &narrow_realm(),
+                Some(&group_roles(admin(), &format!("/{}/g/{}/**", realm(), group()))),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_policy_authority(
+                &document,
+                &config(),
+                &narrow_realm(),
+                Some(&group_roles(member, &format!("/{}/g/{}/**", realm(), group()))),
+            ),
+            Err(PolicyAuthorityError::Unauthorized),
+            "the signing admin of another user's group holds no authority here"
+        );
+    }
+
+    #[test]
+    fn owned_fails_closed() {
+        // Without the owner's roles nothing is decided, and a document from a
+        // foreign group's state is never accepted either.
+        let document = owned_document(1);
+        assert_eq!(
+            verify_policy_authority(&document, &config(), &authorization(admin()), None),
+            Err(PolicyAuthorityError::GroupUnavailable)
+        );
+        let mut foreign = group_roles(admin(), &format!("/{}/g/{}/**", realm(), group()));
+        foreign.group_id = Ulid::from_bytes([7; 16]);
+        assert_eq!(
+            verify_policy_authority(&document, &config(), &authorization(admin()), Some(&foreign)),
+            Err(PolicyAuthorityError::GroupUnavailable)
+        );
+    }
+
+    #[test]
+    fn owner_changes_digest() {
+        // The owner is inside the canonical bytes, so binding a rule to a group
+        // mints a different reference and cannot be swapped in silently.
+        let realm_wide = policy(1, "eu-west");
+        let owned = owned_policy(1);
+        assert_ne!(realm_wide.policy_ref(), owned.policy_ref());
+        assert_eq!(realm_wide.policy().policy_id, owned.policy().policy_id);
+    }
+
+    /// Pinned so a canonical-bytes or digest-domain change is deliberate.
+    #[test]
+    fn digest_domain_pinned() {
+        assert_eq!(
+            hex::encode(policy(1, "eu-west").digest()),
+            "a41f027aea08b68d469068dea97ae7aaba74726a2c37ba5e826287b6eaf51365"
+        );
+        assert_eq!(hex::encode(owned_policy(1).digest()), "f60af76d1feed5c3ccc30cc6be00c31a9cead0dfeada81427cb2c5b4b2a773d5");
+    }
+
     fn policy(seed: u8, location: &str) -> VerifiedPolicy {
         let policy = PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
@@ -460,7 +619,7 @@ mod tests {
             Err(PolicyAuthorityError::Signature)
         );
         assert_eq!(
-            verify_policy_authority(&replayed, &config(), &authorization(admin())),
+            verify_policy_authority(&replayed, &config(), &authorization(admin()), None),
             Err(PolicyAuthorityError::RealmMismatch)
         );
     }
@@ -469,13 +628,13 @@ mod tests {
     fn requires_admin_author() {
         let document = document(1, "eu-west", 10);
         assert_eq!(
-            verify_policy_authority(&document, &config(), &authorization(admin())),
+            verify_policy_authority(&document, &config(), &authorization(admin()), None),
             Ok(())
         );
 
         let outsider = UserId::local(Ulid::from_bytes([5; 16]), realm());
         assert_eq!(
-            verify_policy_authority(&document, &config(), &authorization(outsider)),
+            verify_policy_authority(&document, &config(), &authorization(outsider), None),
             Err(PolicyAuthorityError::Unauthorized),
             "a validly signed policy authored by a non-admin must be refused"
         );
@@ -489,7 +648,7 @@ mod tests {
             let document =
                 PlacementPolicyDocument::new(realm(), &policy, publication(seed, &policy, 10));
             assert_eq!(
-                verify_policy_authority(&document, &config(), &authorization(admin())),
+                verify_policy_authority(&document, &config(), &authorization(admin()), None),
                 Err(PolicyAuthorityError::Publisher)
             );
         }
