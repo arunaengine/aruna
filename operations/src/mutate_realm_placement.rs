@@ -24,8 +24,9 @@ use aruna_core::structs::{
     CompletionProof, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord,
     NodePlacementEntry, Permission, PlacementBinding, PlacementOverride, PlacementRef,
     PlacementScope, PlacementStrategy, RealmConfigDocument, RealmNodeKind, StrategyBinding,
-    TransitionPlan, policy_admin_path,
+    TransitionPlan, normalize_node_placement_input, policy_admin_path, reserved_label,
 };
+use std::collections::BTreeMap;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -47,6 +48,14 @@ const STRATEGY_REFERENCE_SCAN_PAGE_SIZE: usize = 8_192;
 pub enum RealmPlacementMutation {
     UpsertNode(NodePlacementEntry),
     RemoveNode(NodeId),
+    /// Edits the placement attributes of a node the realm already knows. An
+    /// absent field keeps its stored value; a changed one advances that node's
+    /// storage subject, which revalidates its copies.
+    SetNodeAttributes {
+        node_id: NodeId,
+        location: Option<String>,
+        labels: Option<BTreeMap<String, String>>,
+    },
     UpsertStrategy(PlacementStrategy),
     RemoveStrategy(Ulid),
     SetDefaultStrategy(Ulid),
@@ -92,11 +101,31 @@ pub enum RealmPlacementMutation {
 }
 
 impl RealmPlacementMutation {
-    fn admin_operation(&self) -> AdminDocumentOperation {
-        match self {
+    /// The replicated operation this mutation reduces to. An attribute edit is
+    /// resolved against the current entry here, so peers replay the whole entry
+    /// rather than a partial change against their own copy.
+    fn admin_operation(
+        &self,
+        document: &RealmConfigDocument,
+    ) -> Result<AdminDocumentOperation, MutateRealmPlacementError> {
+        Ok(match self {
             Self::UpsertNode(entry) => AdminDocumentOperation::RealmConfigNodePlacementSet {
                 entry: entry.clone(),
             },
+            Self::SetNodeAttributes {
+                node_id,
+                location,
+                labels,
+            } => {
+                let mut entry = placement_entry(document, *node_id)?.clone();
+                if let Some(location) = location {
+                    entry.location = location.trim().to_string();
+                }
+                if let Some(labels) = labels {
+                    entry.labels = labels.clone();
+                }
+                AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
+            }
             Self::RemoveNode(node_id) => {
                 AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id: *node_id }
             }
@@ -203,7 +232,7 @@ impl RealmPlacementMutation {
                 bucket: *bucket,
                 reported_by: *reported_by,
             },
-        }
+        })
     }
 
     /// Local parity with the receiving side's admission: an authority-moving
@@ -280,6 +309,29 @@ impl RealmPlacementMutation {
 
     fn validate(&self, document: &RealmConfigDocument) -> Result<(), MutateRealmPlacementError> {
         match self {
+            Self::SetNodeAttributes {
+                node_id,
+                location,
+                labels,
+            } => {
+                let current = placement_entry(document, *node_id)?;
+                if current.draining {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "draining freezes placement attributes until the node un-drains or is removed"
+                            .to_string(),
+                    ));
+                }
+                if let Some(location) = location {
+                    normalize_node_placement_input(Some(location), None)
+                        .map_err(|error| MutateRealmPlacementError::InvalidInput(error.to_string()))?;
+                }
+                match labels.as_ref().and_then(reserved_label) {
+                    Some(label) => Err(MutateRealmPlacementError::InvalidInput(format!(
+                        "placement label {label} is derived and cannot be set"
+                    ))),
+                    None => Ok(()),
+                }
+            }
             Self::UpsertNode(entry) if entry.draining => {
                 let unchanged = if let Some(current) = document.placement_entry(entry.node_id) {
                     entry.effective_location() == current.effective_location()
@@ -565,6 +617,17 @@ fn bucket_plan<'a>(
     document.transition(transition_id)?.plan.bucket_plan(bucket)
 }
 
+/// The placement entry of a node the realm already places. A node without one
+/// holds no governed data, so editing its attributes is refused.
+fn placement_entry(
+    document: &RealmConfigDocument,
+    node_id: NodeId,
+) -> Result<&NodePlacementEntry, MutateRealmPlacementError> {
+    document
+        .placement_entry(node_id)
+        .ok_or_else(|| MutateRealmPlacementError::InvalidInput(format!("node {node_id} has no placement entry")))
+}
+
 fn require_strategy(
     document: &RealmConfigDocument,
     strategy_id: &Ulid,
@@ -825,7 +888,7 @@ impl MutateRealmPlacementOperation {
             mutation.authorize(&document, &self.actor)?;
             mutation.validate(&document)?;
             let admin_event =
-                reducer_state.apply_operation(&self.actor, mutation.admin_operation())?;
+                reducer_state.apply_operation(&self.actor, mutation.admin_operation(&document)?)?;
             overlay_realm_config_placement_reducer_materialization(
                 &mut document,
                 &reducer_state,
@@ -2007,6 +2070,134 @@ mod tests {
         }
     }
 
+    fn placed_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+        NodePlacementEntry {
+            node_id,
+            location: "eu-west".to_string(),
+            weight: 42,
+            full: false,
+            draining: false,
+            labels: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+        }
+    }
+
+    fn placed_document(entry: NodePlacementEntry) -> RealmConfigDocument {
+        let mut document = RealmConfigDocument::new(RealmId::from_bytes([26; 32]), Vec::new(), 3);
+        document.placement_map.push(entry);
+        document
+    }
+
+    fn set_attributes(
+        node_id: aruna_core::NodeId,
+        location: Option<&str>,
+        labels: Option<BTreeMap<String, String>>,
+    ) -> RealmPlacementMutation {
+        RealmPlacementMutation::SetNodeAttributes {
+            node_id,
+            location: location.map(str::to_string),
+            labels,
+        }
+    }
+
+    #[test]
+    fn merges_node_attributes() {
+        // An absent field keeps its stored value; a present one replaces it.
+        let document = placed_document(placed_entry(node(1)));
+        let mutation = set_attributes(node(1), Some(" us-east "), None);
+        mutation.validate(&document).unwrap();
+
+        let Ok(AdminDocumentOperation::RealmConfigNodePlacementSet { entry }) =
+            mutation.admin_operation(&document)
+        else {
+            panic!("attribute edit reduces to a placement entry write");
+        };
+        assert_eq!(entry.location, "us-east");
+        assert_eq!(entry.labels, placed_entry(node(1)).labels);
+        assert_eq!(entry.weight, placed_entry(node(1)).weight);
+    }
+
+    #[test]
+    fn advances_subject() {
+        // A changed attribute advances the node's storage subject generation,
+        // which is what makes it revalidate; the stored values leave it alone.
+        let current = placed_entry(node(1));
+        let document = placed_document(current.clone());
+        let record = aruna_core::structs::NodeSubjectRecord::seed(
+            aruna_core::structs::storage_subject(&current, 1),
+        )
+        .unwrap();
+
+        let entry_of = |mutation: RealmPlacementMutation| match mutation.admin_operation(&document) {
+            Ok(AdminDocumentOperation::RealmConfigNodePlacementSet { entry }) => entry,
+            other => panic!("unexpected reduction: {other:?}"),
+        };
+        let unchanged = entry_of(set_attributes(
+            node(1),
+            Some("eu-west"),
+            Some(current.labels.clone()),
+        ));
+        assert_eq!(
+            record
+                .advance(aruna_core::structs::storage_subject(&unchanged, 1))
+                .unwrap(),
+            None
+        );
+
+        let moved = entry_of(set_attributes(node(1), Some("us-east"), None));
+        let advanced = record
+            .advance(aruna_core::structs::storage_subject(&moved, 1))
+            .unwrap()
+            .expect("a moved node advertises a new subject");
+        assert_eq!(advanced.subject.generation, 2);
+        assert!(advanced.serving_blocked);
+    }
+
+    #[test]
+    fn rejects_unknown_node() {
+        let document = placed_document(placed_entry(node(1)));
+        assert!(matches!(
+            set_attributes(node(2), Some("us-east"), None).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("no placement entry")
+        ));
+    }
+
+    #[test]
+    fn rejects_derived_label() {
+        // Derived labels are stamped from the entry itself and never set here.
+        let document = placed_document(placed_entry(node(1)));
+        let labels = BTreeMap::from([(
+            "aruna-engine.org/location".to_string(),
+            "forged".to_string(),
+        )]);
+        assert!(matches!(
+            set_attributes(node(1), None, Some(labels)).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("derived")
+        ));
+    }
+
+    #[test]
+    fn rejects_long_location() {
+        let document = placed_document(placed_entry(node(1)));
+        assert!(matches!(
+            set_attributes(node(1), Some(&"x".repeat(65)), None).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_draining_edit() {
+        let mut entry = placed_entry(node(1));
+        entry.draining = true;
+        let document = placed_document(entry);
+        assert!(matches!(
+            set_attributes(node(1), Some("us-east"), None).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("draining freezes")
+        ));
+    }
+
     #[test]
     fn unmapped_drain_allowed() {
         let document = RealmConfigDocument::new(RealmId::from_bytes([25; 32]), Vec::new(), 3);
@@ -2109,9 +2300,10 @@ mod tests {
             }],
         };
         let mutation = RealmPlacementMutation::UpsertStrategy(strategy.clone());
+        let document = RealmConfigDocument::new(RealmId::from_bytes([7; 32]), Vec::new(), 3);
         assert!(matches!(
-            mutation.admin_operation(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: stored }
+            mutation.admin_operation(&document),
+            Ok(AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: stored })
                 if stored == strategy
         ));
     }

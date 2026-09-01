@@ -542,6 +542,21 @@ pub enum RealmPlacementMutationRequest {
         strategy_id: String,
         group_id: Option<String>,
     },
+    SetNodeAttributes {
+        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<RealmPlacementNodeLabel>>,
+    },
+}
+
+/// One node placement label. Absent from a request means unchanged; a present
+/// list replaces the whole set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPlacementNodeLabel {
+    pub key: String,
+    pub value: String,
 }
 
 enum RealmPlacementAction {
@@ -772,6 +787,20 @@ impl RealmPlacementMutationRequest {
             Self::RemoveOverride { subject } => {
                 RealmPlacementMutation::RemoveOverride(parse_subject(&subject)?)
             }
+            Self::SetNodeAttributes {
+                node_id,
+                location,
+                labels,
+            } => RealmPlacementMutation::SetNodeAttributes {
+                node_id: parse_node_id(&node_id)?,
+                location,
+                labels: labels.map(|labels| {
+                    labels
+                        .into_iter()
+                        .map(|label| (label.key, label.value))
+                        .collect()
+                }),
+            },
             Self::ProvisionMetadataBinding {
                 strategy_id,
                 group_id,
@@ -796,6 +825,12 @@ fn parse_ulid(value: &str, field: &str) -> ServerResult<Ulid> {
 fn parse_subject(value: &str) -> ServerResult<Vec<u8>> {
     hex::decode(value)
         .map_err(|_| ServerError::BadRequestReason("subject must be valid hex".to_string()))
+}
+
+fn parse_node_id(value: &str) -> ServerResult<aruna_core::NodeId> {
+    value
+        .parse::<aruna_core::NodeId>()
+        .map_err(|_| ServerError::BadRequestReason(format!("invalid node_id: {value}")))
 }
 
 fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_core::NodeId>> {
@@ -1424,7 +1459,13 @@ management node serves the call and every other node relays it to one.
 **Behavior**
 - The body carries exactly one change, selected by its `mutation` field: define or replace a
   strategy, remove one, set the default, set or remove a binding for a scope, set or remove a
-  per-subject override, or provision a metadata binding for a strategy.
+  per-subject override, edit a node's placement attributes, or provision a metadata binding for a
+  strategy.
+- `set_node_attributes` edits the location and labels of a node the realm already places. An
+  omitted field keeps its stored value and a present `labels` list replaces the whole set. A real
+  change advances that node's storage subject, which makes it revalidate its registered copies and
+  quarantine the ones its new attributes no longer admit, and it serves no governed data until that
+  walk finishes. Submitting the values already stored changes nothing.
 - Provisioning is idempotent: an existing binding for the same scope and strategy is returned
   unchanged instead of allocating a second one.
 - The whole strategy set after the change is returned, so a client never has to re-read to learn
@@ -1435,7 +1476,10 @@ management node serves the call and every other node relays it to one.
 
 **Limits**
 - The strategy named by `job_family_strategy_id` cannot be removed or have its shard count
-  reshaped; those mutations fail with `JobFamilyImmutable`."#,
+  reshaped; those mutations fail with `JobFamilyImmutable`.
+- `set_node_attributes` refuses an unknown node, a location longer than 64 bytes, a derived label
+  key (`aruna-engine.org/kind`, `.../location`, `.../node`, `.../storage-class/*`), and any edit
+  while that node is draining."#,
     request_body(
         content = RealmPlacementMutationRequest,
         description = "Exactly one placement change, discriminated by `mutation`. Ids are ULIDs, node ids are hex-encoded, an override `subject` is a hex-encoded key prefix",
@@ -1471,6 +1515,15 @@ management node serves the call and every other node relays it to one.
                     "strategy_id": "01JABCDEF0123456789ABCDEFG",
                     "group_id": null
                 })
+            )),
+            ("Edit node attributes" = (
+                summary = "Move a node to another location and replace its labels; the node revalidates its copies",
+                value = json!({
+                    "mutation": "set_node_attributes",
+                    "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                    "location": "eu-west",
+                    "labels": [{"key": "tier", "value": "hot"}]
+                })
             ))
         )
     ),
@@ -1504,7 +1557,7 @@ management node serves the call and every other node relays it to one.
                 }
             })
         ),
-        (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
+        (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, a node the realm does not place, a location or label the placement map refuses, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
