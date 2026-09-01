@@ -40,7 +40,7 @@ admitted. The node provider API documented below remains a separate contract.
 ## Assistant providers
 
 Provider routes require an unrestricted realm bearer and are self-scoped under
-`/api/v1/users/assistant/providers`.
+`/api/v1/system/assistant/providers`.
 
 | Kind | Default base URL |
 | --- | --- |
@@ -68,7 +68,7 @@ local services such as Ollama, LM Studio, and vLLM.
 ## Proxy contract
 
 The proxy is available at
-`/api/v1/users/assistant/providers/{id}/proxy/{path}`. Only these method and path combinations are
+`/api/v1/system/assistant/providers/{id}/proxy/{path}`. Only these method and path combinations are
 accepted:
 
 | Kind | Requests |
@@ -89,9 +89,9 @@ timeout, so long model streams can remain open.
 
 ## ChatGPT subscription login
 
-Start login with `POST /api/v1/users/assistant/providers/chatgpt/login`. The response contains the
+Start login with `POST /api/v1/system/assistant/providers/chatgpt/login`. The response contains the
 provider id, user code, verification URL, polling interval, and expiry. The provider remains
-`pending_login`. The portal calls `POST /api/v1/users/assistant/providers/{id}/login/poll` once per
+`pending_login`. The portal calls `POST /api/v1/system/assistant/providers/{id}/login/poll` once per
 interval; each call performs at most one upstream poll and returns `pending`, `ready`, `expired`, or
 `denied`.
 

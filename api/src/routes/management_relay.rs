@@ -40,20 +40,20 @@ const RELAY_TARGET_LIMIT: usize = 3;
 /// node-local routes such as compute drain, placement diagnostics and sync
 /// quarantine must keep answering on the node they were called on.
 const RELAYED_ROUTES: &[(&str, &str)] = &[
-    ("DELETE", "/admin/devices/{node_id}"),
-    ("DELETE", "/admin/onboarding/secrets/{id}"),
-    ("DELETE", "/users/me/devices/{id}"),
-    ("GET", "/admin/onboarding/secrets"),
-    ("GET", "/info/realm/placement"),
-    ("GET", "/onboarding/secrets/{id}/status"),
-    ("GET", "/users/token"),
-    ("PATCH", "/info/realm/placement"),
-    ("POST", "/admin/onboarding/secrets"),
-    ("POST", "/onboarding/bootstrap"),
-    ("POST", "/users/sessions"),
-    ("PUT", "/admin/compute/config"),
-    ("PUT", "/info/realm/quota"),
-    ("PUT", "/policies/realm"),
+    ("DELETE", "/access/devices/{node_id}"),
+    ("DELETE", "/access/onboarding/secrets/{id}"),
+    ("DELETE", "/access/users/me/devices/{id}"),
+    ("GET", "/access/onboarding/secrets"),
+    ("GET", "/access/onboarding/secrets/{id}/status"),
+    ("GET", "/access/token"),
+    ("GET", "/system/realm/placement"),
+    ("PATCH", "/system/realm/placement"),
+    ("POST", "/access/onboarding/bootstrap"),
+    ("POST", "/access/onboarding/secrets"),
+    ("POST", "/access/sessions"),
+    ("PUT", "/access/policies/realm"),
+    ("PUT", "/compute/config"),
+    ("PUT", "/system/realm/quota"),
 ];
 
 static RELAY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -178,11 +178,11 @@ fn may_try_response(route: &str, status: StatusCode) -> bool {
     matches!(
         (route, status),
         (
-            "/admin/onboarding/secrets/{id}"
-                | "/onboarding/secrets/{id}/status"
-                | "/users/me/devices/{id}",
+            "/access/onboarding/secrets/{id}"
+                | "/access/onboarding/secrets/{id}/status"
+                | "/access/users/me/devices/{id}",
             StatusCode::NOT_FOUND
-        ) | ("/onboarding/bootstrap", StatusCode::UNAUTHORIZED)
+        ) | ("/access/onboarding/bootstrap", StatusCode::UNAUTHORIZED)
     )
 }
 
@@ -316,40 +316,40 @@ mod tests {
     #[test]
     fn matches_allowlisted_routes() {
         assert_eq!(
-            relay_route(&Method::PUT, Some("/api/v1/info/realm/quota"), false, false),
-            Some("/info/realm/quota")
+            relay_route(
+                &Method::PUT,
+                Some("/api/v1/system/realm/quota"),
+                false,
+                false
+            ),
+            Some("/system/realm/quota")
         );
         assert_eq!(
             relay_route(
                 &Method::DELETE,
-                Some("/api/v1/admin/onboarding/secrets/{id}"),
+                Some("/api/v1/access/onboarding/secrets/{id}"),
                 false,
                 false
             ),
-            Some("/admin/onboarding/secrets/{id}")
+            Some("/access/onboarding/secrets/{id}")
         );
         assert_eq!(
-            relay_route(&Method::GET, Some("/api/v1/users/token"), false, false),
-            Some("/users/token")
+            relay_route(&Method::GET, Some("/api/v1/access/token"), false, false),
+            Some("/access/token")
         );
         assert_eq!(
-            relay_route(&Method::POST, Some("/api/v1/users/sessions"), false, false),
-            Some("/users/sessions")
+            relay_route(&Method::POST, Some("/api/v1/access/sessions"), false, false),
+            Some("/access/sessions")
         );
         // Node-local admin routes stay on the node they were called on.
         assert_eq!(
-            relay_route(
-                &Method::POST,
-                Some("/api/v1/admin/compute/drain"),
-                false,
-                false
-            ),
+            relay_route(&Method::POST, Some("/api/v1/compute/drain"), false, false),
             None
         );
         assert_eq!(
             relay_route(
                 &Method::GET,
-                Some("/api/v1/admin/placement-diagnostics"),
+                Some("/api/v1/data/placement/diagnostics"),
                 false,
                 false
             ),
@@ -357,7 +357,12 @@ mod tests {
         );
         // The method is part of the match: only PUT on the quota route relays.
         assert_eq!(
-            relay_route(&Method::GET, Some("/api/v1/info/realm/quota"), false, false),
+            relay_route(
+                &Method::GET,
+                Some("/api/v1/system/realm/quota"),
+                false,
+                false
+            ),
             None
         );
     }
@@ -365,7 +370,12 @@ mod tests {
     #[test]
     fn hop_header_stops_relay() {
         assert_eq!(
-            relay_route(&Method::PUT, Some("/api/v1/info/realm/quota"), false, true),
+            relay_route(
+                &Method::PUT,
+                Some("/api/v1/system/realm/quota"),
+                false,
+                true
+            ),
             None
         );
     }
@@ -373,7 +383,12 @@ mod tests {
     #[test]
     fn management_node_answers_itself() {
         assert_eq!(
-            relay_route(&Method::PUT, Some("/api/v1/info/realm/quota"), true, false),
+            relay_route(
+                &Method::PUT,
+                Some("/api/v1/system/realm/quota"),
+                true,
+                false
+            ),
             None
         );
     }
@@ -381,14 +396,14 @@ mod tests {
     #[test]
     fn builds_target_url() {
         // Node info documents publish `API_PUBLIC_URL` as a bare origin.
-        let uri: Uri = "/api/v1/admin/onboarding/secrets?limit=5".parse().unwrap();
+        let uri: Uri = "/api/v1/access/onboarding/secrets?limit=5".parse().unwrap();
         assert_eq!(
             relay_url("http://127.0.0.1:43001", &uri),
-            "http://127.0.0.1:43001/api/v1/admin/onboarding/secrets?limit=5"
+            "http://127.0.0.1:43001/api/v1/access/onboarding/secrets?limit=5"
         );
         assert_eq!(
             relay_url("https://mgmt.example.test/api/v1/", &uri),
-            "https://mgmt.example.test/api/v1/admin/onboarding/secrets?limit=5"
+            "https://mgmt.example.test/api/v1/access/onboarding/secrets?limit=5"
         );
     }
 
@@ -419,23 +434,23 @@ mod tests {
     #[test]
     fn enrollment_miss_advances() {
         assert!(may_try_response(
-            "/admin/onboarding/secrets/{id}",
+            "/access/onboarding/secrets/{id}",
             StatusCode::NOT_FOUND
         ));
         assert!(may_try_response(
-            "/onboarding/secrets/{id}/status",
+            "/access/onboarding/secrets/{id}/status",
             StatusCode::NOT_FOUND
         ));
         assert!(may_try_response(
-            "/users/me/devices/{id}",
+            "/access/users/me/devices/{id}",
             StatusCode::NOT_FOUND
         ));
         assert!(may_try_response(
-            "/onboarding/bootstrap",
+            "/access/onboarding/bootstrap",
             StatusCode::UNAUTHORIZED
         ));
         assert!(!may_try_response(
-            "/admin/onboarding/secrets",
+            "/access/onboarding/secrets",
             StatusCode::NOT_FOUND
         ));
     }
@@ -610,7 +625,7 @@ mod test_routes {
 
     fn relay_app(state: Arc<ServerState>) -> Router {
         Router::new()
-            .route("/users/token", get(|| async { StatusCode::IM_A_TEAPOT }))
+            .route("/access/token", get(|| async { StatusCode::IM_A_TEAPOT }))
             .layer(from_fn_with_state(state.clone(), relay_middleware))
             .with_state(state)
     }
@@ -635,7 +650,7 @@ mod test_routes {
     fn token_request() -> Request<Body> {
         Request::builder()
             .method("GET")
-            .uri("/users/token")
+            .uri("/access/token")
             .body(Body::empty())
             .unwrap()
     }
@@ -675,7 +690,7 @@ mod test_routes {
         let fixture = setup(vec!["http://127.0.0.1:1".to_string()]).await;
         let request = Request::builder()
             .method("GET")
-            .uri("/users/token")
+            .uri("/access/token")
             .header(RELAY_HOP_HEADER, "peer")
             .body(Body::empty())
             .unwrap();

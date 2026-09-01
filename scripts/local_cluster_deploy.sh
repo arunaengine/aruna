@@ -500,7 +500,7 @@ create_onboarding_secret() {
       --header "Authorization: Bearer $token" \
       --header "Content-Type: application/json" \
       --data "{\"seed_url\":\"$base_url\",\"mode\":\"$mode\",\"expires_in_seconds\":600}" \
-      "$base_url/api/v1/admin/onboarding/secrets"
+      "$base_url/api/v1/access/onboarding/secrets"
   )"
 
   json_string_field "$response" "onboarding_secret"

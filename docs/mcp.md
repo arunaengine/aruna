@@ -2,7 +2,7 @@
 
 Aruna exposes an authenticated MCP Streamable HTTP endpoint at `<node-base-url>/mcp`. It uses the MCP `2026-07-28` stateless protocol. The endpoint is outside `/api/v1` and shares the API listener, request tracing, bearer validation, and rate limits.
 
-Set `MCP=enabled` or `MCP=disabled`. The default is `enabled`. When enabled, `GET /api/v1/info/realm` advertises the endpoint as `interfaces.mcp.url`.
+Set `MCP=enabled` or `MCP=disabled`. The default is `enabled`. When enabled, `GET /api/v1/system/realm` advertises the endpoint as `interfaces.mcp.url`.
 
 ## Authentication
 

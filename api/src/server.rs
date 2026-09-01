@@ -243,7 +243,7 @@ mod tests {
         let request = || {
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/users/credentials")
+                .uri("/api/v1/access/credentials")
                 .body(Body::empty())
                 .unwrap()
         };

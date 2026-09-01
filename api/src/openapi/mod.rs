@@ -233,14 +233,14 @@ mod tests {
     /// token without presenting the operation as authentication-only.
     const OPTIONAL_AUTH: &[(&str, &str)] = &[
         ("/metadata", "get"),
-        ("/groups/{group_id}/metadata", "get"),
+        ("/metadata/groups/{group_id}", "get"),
         ("/metadata/{document_id}", "get"),
         ("/metadata/{document_id}/rocrate", "get"),
         ("/metadata/{document_id}/sparql/query", "post"),
         ("/metadata/sparql/query", "post"),
         ("/metadata/search", "get"),
-        ("/info", "get"),
-        ("/info/realm", "get"),
+        ("/system/info", "get"),
+        ("/system/realm", "get"),
         ("/ga4gh/drs/v1/objects", "post"),
         ("/ga4gh/drs/v1/objects/{object_id}", "get"),
         ("/ga4gh/drs/v1/download", "get"),
@@ -248,26 +248,26 @@ mod tests {
 
     /// Operations that reject an anonymous caller.
     const REQUIRED_AUTH: &[(&str, &str)] = &[
-        ("/users/register", "post"),
+        ("/access/users/register", "post"),
         ("/metadata", "post"),
         ("/metadata/{document_id}", "delete"),
         ("/metadata/references", "get"),
-        ("/audit", "get"),
-        ("/admin/compute/config", "get"),
-        ("/admin/compute/config", "put"),
-        ("/admin/compute/drain", "post"),
-        ("/admin/compute/snapshots", "get"),
-        ("/admin/placement-quarantine", "post"),
-        ("/admin/placement-policies", "post"),
-        ("/admin/placement-policies", "get"),
-        ("/admin/placement-policies/{policy_id}", "get"),
-        ("/admin/placement-diagnostics", "get"),
-        ("/buckets/{bucket}/placement", "get"),
-        ("/buckets/{bucket}/placement", "put"),
-        ("/buckets/{bucket}/placement/objects", "post"),
-        ("/buckets/{bucket}/placement/runs", "post"),
-        ("/buckets/{bucket}/placement/coverage", "get"),
-        ("/jobs/{job_id}/audit", "get"),
+        ("/metadata/audit", "get"),
+        ("/compute/config", "get"),
+        ("/compute/config", "put"),
+        ("/compute/drain", "post"),
+        ("/compute/snapshots", "get"),
+        ("/data/placement/quarantine", "post"),
+        ("/data/placement/policies", "post"),
+        ("/data/placement/policies", "get"),
+        ("/data/placement/policies/{policy_id}", "get"),
+        ("/data/placement/diagnostics", "get"),
+        ("/data/buckets/{bucket}/placement", "get"),
+        ("/data/buckets/{bucket}/placement", "put"),
+        ("/data/buckets/{bucket}/placement/objects", "post"),
+        ("/data/buckets/{bucket}/placement/runs", "post"),
+        ("/data/buckets/{bucket}/placement/coverage", "get"),
+        ("/compute/jobs/{job_id}/audit", "get"),
     ];
 
     fn operation_security(doc: &Value, path: &str, method: &str) -> Vec<Value> {
@@ -845,7 +845,7 @@ mod tests {
             }
         }
         assert!(
-            doc["paths"]["/users/register"]["post"]["responses"]["500"]["content"][
+            doc["paths"]["/access/users/register"]["post"]["responses"]["500"]["content"][
                 "application/json"
             ]
             .is_object()
@@ -1036,8 +1036,8 @@ mod tests {
                 }],
             })
             .unwrap();
-        let onboarding_media = &doc["paths"]["/onboarding/bootstrap"]["post"]["responses"]["200"]["content"]
-            ["application/json"];
+        let onboarding_media = &doc["paths"]["/access/onboarding/bootstrap"]["post"]["responses"]["200"]
+            ["content"]["application/json"];
         assert_eq!(
             normalize_addrs(&onboarding_media["example"]),
             normalize_addrs(&onboarding)
@@ -1049,7 +1049,7 @@ mod tests {
         ));
 
         let policy = serde_json::to_value(policy_response()).unwrap();
-        let policy_media = &doc["paths"]["/policies/dry-run"]["post"]["responses"]["200"]["content"]
+        let policy_media = &doc["paths"]["/access/policies/dryrun"]["post"]["responses"]["200"]["content"]
             ["application/json"];
         assert_eq!(
             align_policy_ids(policy.clone(), &policy_media["example"]),

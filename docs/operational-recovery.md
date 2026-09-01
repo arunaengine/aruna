@@ -295,7 +295,7 @@ start instead of silently removing a bound.
 
 | Variable | Default | What it bounds |
 | --- | --- | --- |
-| `ONBOARDING_BOOTSTRAP_TIMEOUT_SECS` | `120` | Client-side budget for `POST /api/v1/onboarding/bootstrap`. The seed answers a bootstrap with a realm-config upsert, placement expansion and topic reconciliation inline, so raise this on a large or busy realm. |
+| `ONBOARDING_BOOTSTRAP_TIMEOUT_SECS` | `120` | Client-side budget for `POST /api/v1/access/onboarding/bootstrap`. The seed answers a bootstrap with a realm-config upsert, placement expansion and topic reconciliation inline, so raise this on a large or busy realm. |
 | `ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS` | `60` | One onboarding document-sync round trip, and the placement wait that repeats it until the seed has granted this node its placement. |
 | `S3_INITIAL_REQUEST_TIMEOUT_SECS` | `10` | How long an accepted S3 connection may stay silent before its first request. |
 | `S3_CONNECTION_IDLE_TIMEOUT_SECS` | `20` | How long an S3 connection may make no body progress before it is cancelled. Setting it too low truncates slow `GET`s. |
