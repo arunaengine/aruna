@@ -303,7 +303,9 @@ impl ReplicationHarness {
                 let member_token = member_token.clone();
                 async move {
                     reqwest::Client::new()
-                        .get(format!("{base_url}/api/v1/access/groups/{group_id}/members"))
+                        .get(format!(
+                            "{base_url}/api/v1/access/groups/{group_id}/members"
+                        ))
                         .bearer_auth(member_token)
                         .send()
                         .await
@@ -1071,7 +1073,10 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             device_concurrent_pulls: None,
         };
         let quota_response = reqwest::Client::new()
-            .put(format!("{}/api/v1/system/realm/quota", harness.seed.base_url))
+            .put(format!(
+                "{}/api/v1/system/realm/quota",
+                harness.seed.base_url
+            ))
             .bearer_auth(&harness.seed_token)
             .json(&quota)
             .send()

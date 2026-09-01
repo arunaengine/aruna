@@ -14,7 +14,9 @@ use ulid::Ulid;
 
 async fn get_members(base_url: &str, token: &str, group_id: &str) -> TestResult<reqwest::Response> {
     Ok(reqwest::Client::new()
-        .get(format!("{base_url}/api/v1/access/groups/{group_id}/members"))
+        .get(format!(
+            "{base_url}/api/v1/access/groups/{group_id}/members"
+        ))
         .bearer_auth(token)
         .send()
         .await?)
@@ -144,7 +146,10 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 
     // A permission path outside the group is privilege escalation.
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
+        .post(format!(
+            "{}/api/v1/access/groups/{group_id}/roles",
+            seed.base_url
+        ))
         .bearer_auth(&admin_token)
         .json(&CreateGroupRoleRequest {
             name: "escalation".to_string(),
@@ -158,7 +163,10 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 
     for permission in ["write", "deny"] {
         let response = reqwest::Client::new()
-            .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
+            .post(format!(
+                "{}/api/v1/access/groups/{group_id}/roles",
+                seed.base_url
+            ))
             .bearer_auth(&admin_token)
             .json(&CreateGroupRoleRequest {
                 name: format!("public-{permission}"),
@@ -175,7 +183,10 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
     }
 
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
+        .post(format!(
+            "{}/api/v1/access/groups/{group_id}/roles",
+            seed.base_url
+        ))
         .bearer_auth(&admin_token)
         .json(&CreateGroupRoleRequest {
             name: "nil-assigned-user".to_string(),
@@ -192,7 +203,10 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 
     // A valid scoped role can be created and deleted.
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
+        .post(format!(
+            "{}/api/v1/access/groups/{group_id}/roles",
+            seed.base_url
+        ))
         .bearer_auth(&admin_token)
         .json(&CreateGroupRoleRequest {
             name: "data-reader".to_string(),

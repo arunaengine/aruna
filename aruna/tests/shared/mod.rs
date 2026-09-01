@@ -585,7 +585,10 @@ pub(crate) async fn create_onboarding_secret_via_http(
     .await?;
 
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/access/onboarding/secrets", seed.base_url))
+        .post(format!(
+            "{}/api/v1/access/onboarding/secrets",
+            seed.base_url
+        ))
         .bearer_auth(token)
         .json(&CreateOnboardingSecretRequest {
             seed_url: seed.base_url.clone(),
