@@ -259,25 +259,27 @@ async fn folder_detail(
     summary = "Bind a directory to a realm prefix",
     description = r#"Keeps a directory on this machine in sync with one prefix of one realm bucket.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. A device caches the realm's documents, but its copy is never the authority for a remote write: the realm node that serves the folder authorizes the owner's WRITE on the remote bucket every time it pulls, and refuses the pull otherwise.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for. The device's cached copy of the realm is never the write authority: the realm node serving the
+folder checks the owner's WRITE on the remote bucket on every pull and refuses the pull otherwise.
 
 **Behavior**
-- The device-local bucket is derived from the folder id, so the owner never names it and it cannot collide with a bucket they already use.
-- `create_bucket` creates a missing remote bucket through the node plane before the existing listing probe.
-- The directory is walked once and every file becomes one read-only object of that bucket; no byte is copied into this node's blob store.
-- `two_way` syncs both directions. `upload_only` never writes to disk and replaces the earlier offered-directory model.
-- Local data always wins locally: a file is replaced automatically only while its fingerprint and its blake3 still equal the recorded synced base. Everything else is preserved and reported, the incoming version lands beside it as a conflicted copy, and replacing or removing local bytes is an explicit action.
-- A remote deletion never deletes a local file. A local deletion becomes a realm delete marker while `propagate_deletes` is set.
+- The device-local bucket is derived from the folder id, so the owner never names it and it cannot
+  collide with a bucket they already use.
+- `create_bucket` creates a missing remote bucket through the node plane before the listing probe.
+- The directory is walked once and every file becomes one read-only object of that bucket; no byte
+  is copied into this node's blob store.
+- `two_way` syncs both directions; `upload_only` never writes to disk.
+- Local data always wins locally: a file is replaced automatically only while its fingerprint and
+  its blake3 still equal the recorded synced base. Anything else is preserved and reported, the
+  incoming version lands beside it as a conflicted copy, and replacing or removing local bytes is an
+  explicit action.
+- A remote deletion never deletes a local file. A local deletion becomes a realm delete marker while
+  `propagate_deletes` is set.
 
 **Limits**
 - A device binds at most 64 folders, and a folder holds at most 100000 files.
-- Roots must not nest.
-
-**Errors**
-- 400 when the root is unusable, the target is not a realm server, or the bucket is missing.
-- 403 when the remote bucket refuses the owner.
-- 409 when the root overlaps a bound folder or the bucket belongs to another group.
-- 502 when the remote realm node is unreachable."#,
+- Roots must not nest."#,
     request_body(
         content = BindFolderRequest,
         description = "Local directory and the realm prefix to bind it to",
@@ -377,12 +379,13 @@ async fn bind_synced_folder(
     summary = "List the folders this device syncs",
     description = r#"Lists every directory this device keeps in sync, with its counters.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
 - The list is node-local and answers while the realm is unreachable."#,
     responses(
-        (status = 200, description = "The folders this device binds", body = SyncedFolderList,
+        (status = 200, description = "Every bound folder with its counters", body = SyncedFolderList,
             example = json!({"folders": [{
                 "folder_id": "01JFOLDER0123456789ABCDEFG",
                 "root": "/home/ada/data",
@@ -439,10 +442,12 @@ async fn list_synced_folders(
     summary = "Read one folder and its counters",
     description = r#"Reads one bound folder together with how much of it still needs attention.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- The counters are derived from the stored entries, so they always describe what the entries route would list."#,
+- The counters are derived from the stored entries, so they always describe what the entries route
+  would list."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
         (status = 200, description = "The folder and its counters", body = SyncedFolderView,
@@ -497,14 +502,17 @@ async fn get_synced_folder(
     path = "/device/folders/{folder_id}",
     tag = "device",
     summary = "Stop syncing a folder",
-    description = r#"Unbinds one folder. Nothing on the owner's filesystem is touched.
+    description = r#"Unbinds one folder without touching anything on the owner's filesystem.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. The owner binding is the whole authority, as it is for binding: the realm objects the folder published are untouched, so nothing outside this device is decided here.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for. Nothing outside this device is decided here, so the owner binding is the whole authority.
 
 **Behavior**
 - The binding, its merge bases, its queued uploads and its audit log are removed from this device.
-- The device's own observation bucket is emptied with delete markers; the realm objects the folder published stay.
-- The files on disk, including any conflicted copies and anything in the folder's trash, are left exactly as they are."#,
+- The device's own observation bucket is emptied with delete markers; the realm objects the folder
+  published stay.
+- The files on disk, including any conflicted copies and anything in the folder's trash, are left
+  exactly as they are."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
         (status = 200, description = "The folder is unbound", body = UnboundFolder,
@@ -551,7 +559,8 @@ async fn unbind_synced_folder(
     summary = "Pause one folder",
     description = r#"Stops reconciling one folder until it is resumed.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
 - Queued uploads stay queued; nothing on disk changes."#,
@@ -611,7 +620,8 @@ async fn pause_folder(
     summary = "Resume one folder",
     description = r#"Reconciles the folder again from the next pass on.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for."#,
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
         (status = 200, description = "The folder is active again", body = SyncedFolderView,
@@ -668,11 +678,12 @@ async fn resume_folder(
     summary = "Reconcile one folder now",
     description = r#"Runs one reconciliation of the folder without waiting for the timer.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- The pass observes the directory, lists the realm heads and applies exactly what the sync is allowed to apply.
-- A paused folder is refused."#,
+- The pass observes the directory and the realm heads and applies only what the sync may apply on
+  its own; everything else waits for an explicit action."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
         (status = 200, description = "The folder was reconciled", body = SyncedFolderView,
@@ -743,11 +754,13 @@ async fn sync_folder(
     summary = "List one folder's entries",
     description = r#"Lists the reconciled paths of one folder, in key order.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
 - `state` filters to one state name, for example `conflict` or `pending_replace`.
-- Each entry names both sides it was last seen with. The local side's `fingerprint` and `blake3` are what an action echoes back as `expected`.
+- Each entry names both sides it was last seen with. The local side's `fingerprint` and `blake3` are
+  what an action echoes back as `expected`.
 - The page carries an opaque `next_cursor` while more entries follow."#,
     params(
         ("folder_id" = String, Path, description = "Folder ULID"),
@@ -807,23 +820,25 @@ async fn list_folder_entries(
     path = "/device/folders/{folder_id}/entries/{path}/actions",
     tag = "device",
     summary = "Decide one entry explicitly",
-    description = r#"Applies the owner's decision to one entry. This is the only way local bytes are replaced or removed.
+    description = r#"Applies the owner's decision to one entry, the only way local bytes are replaced or removed.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- `replace_local` writes the remote version over the local file, but only while the file still carries exactly the bytes `expected` names. Anything else keeps the file and answers 412.
+- `replace_local` writes the remote version over the local file, but only while the file still
+  carries exactly the bytes `expected` names.
 - `keep_local` publishes the local bytes as the next realm version and clears the pending state.
-- `remove_local` moves the file into the folder's `.aruna/trash/` directory. Nothing is ever unlinked.
+- `remove_local` moves the file into the folder's `.aruna/trash/` directory; nothing is ever
+  unlinked.
 - `resolve` accepts the current state without touching either side.
-- Every action leaves an audit row, committed with the state it changed. The reply is the entry as it now stands.
+- Every action leaves an audit row, committed with the state it changed.
 
 **Limits**
-- The entry path is one URL-encoded path segment relative to the folder root; separators are percent-encoded.
-- `expected` is required for `replace_local` and carries the entry's local `fingerprint` and `blake3`.
-
-**Errors**
-- 412 when the bytes changed since the owner saw them, or when `expected` is missing for a replacement. The file is preserved and the attempt is audited."#,
+- The entry path is one URL-encoded path segment relative to the folder root; separators are
+  percent-encoded.
+- `expected` is required for `replace_local` and carries the entry's local `fingerprint` and
+  `blake3`."#,
     params(
         ("folder_id" = String, Path, description = "Folder ULID"),
         ("path" = String, Path, description = "URL-encoded path relative to the folder root")
@@ -863,7 +878,7 @@ async fn list_folder_entries(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder or entry, or this node is not a user node", body = ErrorResponse),
-        (status = 412, description = "The bytes changed since the owner saw them; the file is preserved", body = ErrorResponse),
+        (status = 412, description = "The bytes changed since the owner saw them, or `expected` is missing for a replacement; the file is preserved and the attempt is audited", body = ErrorResponse),
         (status = 503, description = "The remote version or the device store is unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -937,12 +952,15 @@ fn action_kind(action: EntryAction) -> ActionKind {
     summary = "Decide every pending entry of a folder",
     description = r#"Replaces every entry of the folder that is waiting for a decision.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Only `replace_local` at scope `all_pending` is accepted, and it covers conflicts and pending replacements only. A remote deletion is a removal and stays a per-entry decision.
-- Each entry is guarded by the bytes of its last observation, so a file that changed since the listing is preserved and counted as stale instead of being overwritten.
-- One audit row records the scope, how many entries it applied to and whether any were stale. The reply is the folder with fresh counters.
+- Only `replace_local` at scope `all_pending` is accepted, and it covers conflicts and pending
+  replacements only. A remote deletion is a removal and stays a per-entry decision.
+- Each entry is guarded by the bytes of its last observation, so a file that changed since the
+  listing is preserved and counted as stale instead of being overwritten.
+- One audit row records the scope, how many entries it applied to and whether any were stale.
 
 **Limits**
 - `confirm` must equal the last path segment of the folder's root."#,
@@ -1032,10 +1050,12 @@ async fn act_on_folder(
     summary = "Read one folder's audit log",
     description = r#"Lists the explicit decisions taken on this folder, oldest first.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Every replacement, removal and resolution is recorded, including the ones that were refused because the bytes had changed."#,
+- Every replacement, removal and resolution is recorded, including the ones refused because the
+  bytes had changed."#,
     params(
         ("folder_id" = String, Path, description = "Folder ULID"),
         ActionQuery

@@ -132,17 +132,21 @@ impl From<SyncStatus> for DeviceSyncStatus {
     summary = "What this device still owes the realm",
     description = r#"Reports every selected document and synced folder with what is still unfinished.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. Any other caller is refused, and a node that is not a user node answers 404.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Everything is derived from state this device already holds, so the view answers while the realm is unreachable.
-- `realmReachable` says whether the realm answered within the last poll window; when it is false the rest describes what will be exchanged once it does.
-- A document's `state` is `local_only` while a create has not published, `pending` or `publishing` while an intent is queued, `failed` when the owner has to act, `invalid` when the merged document fails profile validation, and `synced` otherwise.
-- A create the realm has not accepted yet is listed under its local draft id, because no realm document id exists for it.
-- `pendingEdits` counts edits applied to the local replica that no holder has confirmed yet.
-- A dataset's counters come from the folder's own rows: uploads a realm node has not pulled, files with no acknowledged version, and entries waiting for the owner to resolve."#,
+- Everything is derived from state this device already holds, so the view answers while the realm is
+  unreachable; `realmReachable` false means the rest describes what is still to be exchanged.
+- A document's `state` is `local_only` before its create publishes, `pending` or `publishing` while
+  the intent is queued, `invalid` when the merged document fails Profile validation, `failed` when
+  the owner has to act, and `synced` otherwise.
+- A create the realm has not accepted yet is listed under its local draft id, because no realm
+  document id exists for it.
+- A dataset's counters are the folder's own rows: uploads no realm node has pulled, files with no
+  acknowledged version, and entries waiting for the owner to resolve."#,
     responses(
-        (status = 200, description = "What this device still owes the realm", body = DeviceSyncStatus,
+        (status = 200, description = "Every selected document and synced folder with its unfinished work", body = DeviceSyncStatus,
             example = json!({
                 "realmReachable": true,
                 "lastSyncMs": 1756000000000u64,
@@ -189,14 +193,17 @@ async fn get_sync_status(
     summary = "Exchange everything with the realm now",
     description = r#"Asks this device to publish what it has queued and refresh what it keeps offline.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Schedules the authoring drain, the upload outbox drain and a refresh of every selected replica; the work then runs on the device's own timers.
+- Schedules the authoring drain, the upload outbox drain and a refresh of every selected replica;
+  the work then runs on the device's own timers.
 - Idempotent while a run is in flight: the answer is the same and no second run starts.
-- The route returns as soon as the work is scheduled, never when it has finished. `GET /device/sync/status` reports the progress."#,
+- Returns as soon as the work is scheduled, never when it has finished; `GET /device/sync/status`
+  reports the progress."#,
     responses(
-        (status = 202, description = "The device is exchanging with its realm", body = DeviceSyncRun,
+        (status = 202, description = "The exchange is scheduled and runs on the device's timers", body = DeviceSyncRun,
             example = json!({"started": true})),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),

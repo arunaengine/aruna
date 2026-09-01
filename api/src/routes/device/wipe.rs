@@ -51,21 +51,27 @@ pub struct WipeDeviceResponse {
     summary = "Erase this device and stop the node",
     description = r#"Erases everything this device stores locally and stops the node.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. A node that is not a user node answers 404.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Realm-side eviction is a separate, earlier step. The desktop calls `DELETE /users/me/devices/{id}` on a management node first, so the realm drops the membership; this route only erases what the device holds.
-- The node accepts the wipe, answers, then runs its ordinary shutdown, erases the contents of its storage roots including the persisted identity, and exits with status 79 so a supervisor can tell an erased device from a crash or an ordinary stop.
-- Status 79 is claimed only when every root was emptied. A wipe that left paths behind logs them and exits with status 80: data may still be on disk, so the device must not be treated as erased.
-- Every configured node-local filesystem backend is erased, including one an operator relocated outside the store root. A backend this process cannot erase, such as object storage, is refused a complete status up front: the answer carries `incomplete_reason` and `exit_code` 80, and the bytes on that backend stay where they are.
+- Realm-side eviction is a separate, earlier step: the desktop calls `DELETE /users/me/devices/{id}`
+  on a management node so the realm drops the membership. This route only erases what the device
+  holds.
+- The node answers first, then runs its ordinary shutdown, erases the contents of its storage roots
+  including the persisted identity, and exits 79 so a supervisor can tell an erased device from a
+  crash or an ordinary stop.
+- Exit 79 is claimed only when every root was emptied. A wipe that leaves paths behind logs them and
+  exits 80: data may still be on disk, so the device must not be treated as erased.
+- Every configured node-local filesystem backend is erased, including one relocated outside the
+  store root. A backend this process cannot erase, such as object storage, is known before the wipe
+  runs: the answer carries `incomplete_reason` and `exit_code` 80.
 - The storage roots themselves are kept, so a mounted volume stays mounted.
-- Everything local is lost: queued drafts, blobs, credentials and the node identity. Re-enrolling mints a new node id.
+- Everything local is lost, including queued drafts, blobs and credentials. Re-enrolling mints a new
+  node id.
 
 **Limits**
-- `confirm_node_id` must equal this node's own id.
-
-**Errors**
-- 400 when the confirmation names a different node."#,
+- `confirm_node_id` must equal this node's own id."#,
     request_body(
         content = WipeDeviceRequest,
         description = "This node's own id, typed back as confirmation",

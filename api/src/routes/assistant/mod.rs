@@ -366,7 +366,8 @@ fn provider_base_url(
     summary = "List assistant providers",
     description = r#"Lists the assistant providers the calling user registered on this node.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - Providers are stored per user on the node that registered them, so the listing is node-local and
@@ -419,14 +420,15 @@ pub async fn list_providers(
     summary = "Create an assistant provider",
     description = r#"Registers an assistant provider for the calling user and seals its credentials.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. The provider is registered for the calling user alone.
 
 **Behavior**
 - `kind` picks the wire dialect: `anthropic`, `openai`, `openrouter` or `openai_compatible`.
   `chatgpt` is refused here because that kind is registered by the device login route.
 - `base_url` defaults to the kind's official origin and is required for `openai_compatible`; a
   trailing slash is trimmed off.
-- `api_key` and `headers` are stored sealed and are never returned by any endpoint.
+- `api_key` and `headers` are stored sealed and are never returned by any route.
 - `models` keeps only the ids the portal sends back; display names are dropped.
 - The record is written on the node serving the request and is not replicated to the realm.
 
@@ -523,7 +525,8 @@ pub async fn create_provider(
     summary = "Update an assistant provider",
     description = r#"Updates one assistant provider, changing only the fields the request carries.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - An omitted field keeps its stored value; `api_key` replaces the sealed key and `headers` replaces
@@ -532,7 +535,6 @@ pub async fn create_provider(
   public https origin.
 - The write is conditional on the record this request read, so a concurrent change is refused with
   409 instead of overwriting it.
-- The response is the same summary the listing returns, and no secret is echoed back.
 
 **Limits**
 - The request body is capped at 4 MiB.
@@ -617,11 +619,11 @@ pub async fn patch_provider(
     summary = "Delete an assistant provider",
     description = r#"Deletes one assistant provider together with the credentials sealed for it.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - The provider record, its sealed secret and its sealed headers are removed in one write.
-- A provider of another user is not visible here and reads as 404, as does an unknown id.
 - The deletion is node-local, like the registration it removes; nothing is revoked upstream, so a
   ChatGPT login stays valid at the issuer until it expires there."#,
     params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
@@ -656,7 +658,8 @@ pub async fn delete_provider(
     summary = "List provider models",
     description = r#"Asks the provider itself which models it serves and returns the text ones.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - The node reads the provider's own model listing with the sealed credentials; the result is
@@ -713,20 +716,17 @@ pub async fn get_models(
     summary = "Test an assistant provider",
     description = r#"Checks whether the stored credentials still reach the provider.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
-- The node performs the same model listing the models route performs, and a ChatGPT provider is
-  checked by refreshing its login instead.
-- The verdict is reported in the body: a reachable provider answers `ok` true, and any failure
-  answers `ok` false with a fixed message.
-- The upstream reason is deliberately not passed on, so a failing check says only that the provider
-  did not answer usably.
-- A failed check answers 200 as well; only a missing provider or a refused caller changes the
-  status."#,
+- The check is the same model listing the models route performs; a ChatGPT provider is checked by
+  refreshing its login instead.
+- A failed check answers 200 as well, with `ok` false and a fixed message. The upstream reason is
+  deliberately not passed on."#,
     params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
-        (status = 200, description = "The verdict of the check", body = ProviderTestResponse,
+        (status = 200, description = "The verdict of the check, whether or not the provider answered", body = ProviderTestResponse,
             example = json!({"ok": true, "message": "Provider is ready"})),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),

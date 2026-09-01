@@ -87,18 +87,18 @@ impl From<ComputeStatus> for DeviceComputeResponse {
     summary = "Report this device's compute plane",
     description = r#"Describes the executor this machine runs the owner's jobs on.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
 - `enabled` reflects the executor the desktop app configured, and `healthy` is probed on the spot,
   so a stopped container daemon reads as enabled but unhealthy.
 - `paused` is the device's compute drain: while it is set, a local submission is refused.
 - `message` names why a local run would be refused right now: the pause, a missing backend, or the
-  health probe's own reason. It is absent when a run would be accepted.
-- `limits` are the owner's configured ceilings; an absent dimension is unmeasured and bounds
-  nothing, while `max_concurrent` also refuses a submission beyond it.
-- `running` and `queued` count the owner's unfinished runs on this device from its durable job
-  records, so they survive a restart. Both come from one bounded scan and are counted, not paged.
+  health probe's own reason.
+- `max_concurrent` also refuses a submission beyond it; the other limits only describe the ceiling.
+- `running` and `queued` come from this device's durable job records in one bounded scan, so they
+  are exact and survive a restart.
 - The runs themselves are listed by this device's own `GET /jobs/`; there is no separate listing.
 - Nothing here is realm state: the plane is never advertised and the realm never dispatches to it."#,
     responses(

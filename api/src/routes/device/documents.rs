@@ -91,14 +91,16 @@ fn map_selection_error(error: SelectionError) -> ServerError {
     summary = "List the documents this device keeps offline",
     description = r#"Lists every metadata document this device holds a local replica of.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. Any other caller is refused, and a node that is not a user node answers 404.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- A document is here because it was created on this device, selected for offline use, or edited here.
-- Reads and edits of a listed document are answered by this device alone, so they keep working while the realm is unreachable.
-- The list is node-local and answers while the realm is unreachable."#,
+- A document is here because it was created on this device, selected for offline use, or edited
+  here.
+- Reads and edits of a listed document are answered by this device alone, so they keep working while
+  the realm is unreachable."#,
     responses(
-        (status = 200, description = "The documents this device keeps offline", body = DeviceDocumentList,
+        (status = 200, description = "Every replica this device holds, selected or not", body = DeviceDocumentList,
             example = json!({
                 "documents": [{
                     "documentId": "01JDOCUMENT0123456789ABCDE",
@@ -137,17 +139,17 @@ async fn list_documents(
     summary = "Keep a document offline, or stop keeping it",
     description = r#"Selects one metadata document for offline use on this device, or deselects it.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Selecting fetches the document's graph from a holder once, so a first selection needs the realm. Selecting again only refreshes what is already here.
-- A selected document is read and edited on this device alone; edits queue and publish as soon as the realm answers.
-- Deselecting drops the ledger entry. The local graph stays, so selecting the same document again joins onto it rather than fetching it from nothing.
-- Documents created or edited on this device select themselves.
-
-**Errors**
-- 409 when the document still has edits this device has not published, or when the device already keeps the maximum number of documents offline.
-- 503 when the realm has not served the document to this device yet."#,
+- Selecting fetches the document's graph from a holder once, so a first selection needs the realm.
+  Selecting again only refreshes what is already here.
+- A selected document is read and edited on this device alone; edits queue and publish as soon as
+  the realm answers.
+- Deselecting drops the ledger entry. The local graph stays, so selecting the same document again
+  joins onto it rather than fetching it from nothing.
+- Documents created or edited on this device select themselves."#,
     request_body(
         content = SelectDocumentRequest,
         description = "Whether the document is kept offline on this device",
