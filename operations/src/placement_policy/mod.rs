@@ -125,16 +125,24 @@ pub(crate) mod fixtures {
         }
         let (config_value, auth_value) = realm_view(&config, admin_user(realm_id));
         let key: Key = Vec::new().into();
-        let mut values = vec![(key.clone(), Some(config_value)), (key.clone(), Some(auth_value))];
+        let mut values = vec![
+            (key.clone(), Some(config_value)),
+            (key.clone(), Some(auth_value)),
+        ];
         if let Some(group_id) = group_id {
             let document = super::tests::group_authorization(realm_id, group_id);
             values.push((
                 key,
-                Some(document.to_bytes(&aruna_core::structs::Actor {
-                    node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
-                    user_id: admin_user(realm_id),
-                    realm_id,
-                }).expect("group authorization encodes").into()),
+                Some(
+                    document
+                        .to_bytes(&aruna_core::structs::Actor {
+                            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+                            user_id: admin_user(realm_id),
+                            realm_id,
+                        })
+                        .expect("group authorization encodes")
+                        .into(),
+                ),
             ));
         }
         Event::Storage(StorageEvent::BatchReadResult { values })

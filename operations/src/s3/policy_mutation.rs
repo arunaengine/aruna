@@ -304,9 +304,7 @@ impl Operation for PolicyMutationOperation {
         match error {
             PolicyMutationError::Unauthorized
             | PolicyMutationError::ForeignPolicy { .. }
-            | PolicyMutationError::PolicyUnavailable { .. } => {
-                true
-            }
+            | PolicyMutationError::PolicyUnavailable { .. } => true,
             PolicyMutationError::Successor(error) => {
                 MintPolicySuccessorOperation::expected_error(error)
             }

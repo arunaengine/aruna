@@ -22,12 +22,11 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, BucketIdentity,
-    CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
-    POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
-    PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
-    PolicyMutationParams, PolicyMutationRecord, PolicyRefMode, PolicyResolution, VersionKey,
-    evaluate_placement,
+    AuthContext, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
+    ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+    PlacementDecision, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
+    PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationParams,
+    PolicyMutationRecord, PolicyRefMode, PolicyResolution, VersionKey, evaluate_placement,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;

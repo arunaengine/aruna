@@ -373,12 +373,9 @@ async fn named_refs(
     realm_id: aruna_core::structs::RealmId,
     refs: Vec<PlacementPolicyRef>,
 ) -> ServerResult<Vec<PolicyRefBody>> {
-    let names = drive(
-        PolicyNamesOperation::new(realm_id, &refs),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let names = drive(PolicyNamesOperation::new(realm_id, &refs), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
     Ok(refs
         .into_iter()
         .map(|policy_ref| {
@@ -1253,9 +1250,7 @@ fn mutation_response(outcome: &SuccessorOutcome) -> ObjectPlacementResponse {
             materialized,
             ..
         } => ("replayed", Some(*version_id), Some(*materialized), None),
-        SuccessorOutcome::Blocked(reason) => {
-            ("blocked", None, None, Some(blocked_reason(*reason)))
-        }
+        SuccessorOutcome::Blocked(reason) => ("blocked", None, None, Some(blocked_reason(*reason))),
     };
     ObjectPlacementResponse {
         outcome: outcome.to_string(),

@@ -26,11 +26,11 @@ use aruna_core::structs::{
     PlacementScope, PlacementStrategy, RealmConfigDocument, RealmNodeKind, StrategyBinding,
     TransitionPlan, normalize_node_placement_input, policy_admin_path, reserved_label,
 };
-use std::collections::BTreeMap;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
+use std::collections::BTreeMap;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -322,8 +322,9 @@ impl RealmPlacementMutation {
                     ));
                 }
                 if let Some(location) = location {
-                    normalize_node_placement_input(Some(location), None)
-                        .map_err(|error| MutateRealmPlacementError::InvalidInput(error.to_string()))?;
+                    normalize_node_placement_input(Some(location), None).map_err(|error| {
+                        MutateRealmPlacementError::InvalidInput(error.to_string())
+                    })?;
                 }
                 match labels.as_ref().and_then(reserved_label) {
                     Some(label) => Err(MutateRealmPlacementError::InvalidInput(format!(
@@ -623,9 +624,9 @@ fn placement_entry(
     document: &RealmConfigDocument,
     node_id: NodeId,
 ) -> Result<&NodePlacementEntry, MutateRealmPlacementError> {
-    document
-        .placement_entry(node_id)
-        .ok_or_else(|| MutateRealmPlacementError::InvalidInput(format!("node {node_id} has no placement entry")))
+    document.placement_entry(node_id).ok_or_else(|| {
+        MutateRealmPlacementError::InvalidInput(format!("node {node_id} has no placement entry"))
+    })
 }
 
 fn require_strategy(
@@ -2127,7 +2128,8 @@ mod tests {
         )
         .unwrap();
 
-        let entry_of = |mutation: RealmPlacementMutation| match mutation.admin_operation(&document) {
+        let entry_of = |mutation: RealmPlacementMutation| match mutation.admin_operation(&document)
+        {
             Ok(AdminDocumentOperation::RealmConfigNodePlacementSet { entry }) => entry,
             other => panic!("unexpected reduction: {other:?}"),
         };

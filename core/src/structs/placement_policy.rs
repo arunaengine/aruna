@@ -206,7 +206,10 @@ impl PlacementPolicy {
         if self.policy_id.is_nil() {
             return Err(PlacementPolicyError::NilPolicyId);
         }
-        if self.owner_group_id.is_some_and(|group_id| group_id.is_nil()) {
+        if self
+            .owner_group_id
+            .is_some_and(|group_id| group_id.is_nil())
+        {
             return Err(PlacementPolicyError::NilOwnerGroup);
         }
         let name = self.name.trim();

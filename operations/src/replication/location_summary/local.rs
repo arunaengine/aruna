@@ -580,7 +580,10 @@ impl LocationSummaryOperation {
         // before; its registration is read only to learn where it came from.
         let (effect, state) = match self.version_refs.is_empty() {
             true => (read_effect(&key, self.txn_id), SummaryState::ReadCopyOrigin),
-            false => (serve_reads(&key, self.txn_id), SummaryState::CheckManagedCopy),
+            false => (
+                serve_reads(&key, self.txn_id),
+                SummaryState::CheckManagedCopy,
+            ),
         };
         let effect = match effect {
             Ok(effect) => effect,
@@ -766,7 +769,6 @@ mod tests {
     use super::{LocationSummaryError, LocationSummaryOperation};
     use crate::replication::location_summary::fixtures::{node_id, realm_id, request};
     use crate::replication::protocol::{CopyCompliance, LocationCopyStorage};
-    use aruna_core::structs::{CopyOrigin, VersionKey};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -775,6 +777,7 @@ mod tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo, GroupAuthorizationDocument,
         RealmConfigDocument, RealmNodeKind,
     };
+    use aruna_core::structs::{CopyOrigin, VersionKey};
     use aruna_core::types::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -954,20 +957,22 @@ mod tests {
 
     /// Copy row plus subject row, the pair a governed answer reads at once.
     fn serve_batch(record: &aruna_core::structs::ManagedCopyRecord) -> Event {
-        let subject = aruna_core::structs::NodeSubjectRecord::seed(
-            aruna_core::structs::PlacementSubject {
+        let subject =
+            aruna_core::structs::NodeSubjectRecord::seed(aruna_core::structs::PlacementSubject {
                 node_id: node_id(5),
                 generation: 1,
                 location: "eu-west".to_string(),
                 labels: Default::default(),
                 executor_kind: None,
                 local_to_controller: true,
-            },
-        )
-        .expect("subject is valid");
+            })
+            .expect("subject is valid");
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
-                (b"copy".to_vec().into(), Some(record.to_bytes().unwrap().into())),
+                (
+                    b"copy".to_vec().into(),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
                 (
                     b"subject".to_vec().into(),
                     Some(subject.to_bytes().unwrap().into()),

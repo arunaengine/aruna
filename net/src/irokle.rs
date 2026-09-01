@@ -4520,7 +4520,8 @@ impl DocumentSyncService {
             },
             None => None,
         };
-        if let Err(reason) = verify_policy_authority(document, &config, &auth, group_auth.as_ref()) {
+        if let Err(reason) = verify_policy_authority(document, &config, &auth, group_auth.as_ref())
+        {
             warn!(
                 policy_id = %document.policy_id(),
                 %reason,

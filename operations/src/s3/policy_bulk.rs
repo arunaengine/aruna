@@ -228,7 +228,9 @@ impl PolicyBulkOperation {
 
     fn start_seal(&mut self) -> Effects {
         self.state = BulkState::StartSeal;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: false })]
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn fail(&mut self, error: BulkError) -> Effects {

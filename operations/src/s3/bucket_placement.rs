@@ -13,8 +13,8 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, PlacementPolicyError, PlacementPolicyRef, group_admin_path,
-    policy_admin_path,
+    AuthContext, BucketInfo, Permission, PlacementPolicyError, PlacementPolicyRef,
+    group_admin_path, policy_admin_path,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
@@ -158,10 +158,9 @@ impl PutBucketPlacementOperation {
         match step {
             ResolveStep::Pending(effects) => effects,
             ResolveStep::Done => {
-                let foreign = self
-                    .resolver
-                    .as_ref()
-                    .and_then(|resolver| foreign_owner(resolver.resolutions(), self.input.group_id));
+                let foreign = self.resolver.as_ref().and_then(|resolver| {
+                    foreign_owner(resolver.resolutions(), self.input.group_id)
+                });
                 self.resolver = None;
                 if let Some(policy_id) = foreign {
                     return self.fail(PutBucketPlacementError::ForeignPolicy { policy_id });

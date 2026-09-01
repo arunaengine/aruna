@@ -363,10 +363,10 @@ mod tests {
         CopyRequest, ManagedCopyError, ManagedCopyPage, ManagedCopyRemoval, check_serveable,
         register_effect, scan_effect, split_serve_reads, transition_effect, validate_registration,
     };
-    use aruna_core::structs::CopyOrigin;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+    use aruna_core::structs::CopyOrigin;
     use aruna_core::structs::{
         BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
         ManagedCopyState, NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, VersionKey,

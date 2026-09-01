@@ -805,8 +805,6 @@ mod tests {
         BlobCopyCompliance, BlobCopyOrigin, BlobCopyState, BlobCopyStorage, BlobLocationsQuery,
         blob_locations, copy_response, pending_copy,
     };
-    use aruna_core::structs::CopyOrigin;
-    use aruna_operations::replication::protocol::CopyCompliance;
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -815,12 +813,14 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::CopyOrigin;
     use aruna_core::structs::{
         Actor, AuthContext, BucketInfo, GroupAuthorizationDocument, NodeCapabilities,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::location_summary::LocationSummaryError;
+    use aruna_operations::replication::protocol::CopyCompliance;
     use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
     use aruna_storage::FjallStorage;
     use axum::Extension;

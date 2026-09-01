@@ -12,8 +12,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_CACHE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    GroupAuthorizationDocument, PlacementPolicyRef, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmId, VerifiedPolicy, verify_policy_authority,
+    GroupAuthorizationDocument, PlacementPolicyRef, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, VerifiedPolicy, verify_policy_authority,
 };
 use aruna_core::types::{Effects, Key};
 use byteview::ByteView;
@@ -130,7 +130,8 @@ impl ResolvePolicyOperation {
             [config, auth] => ([config, auth], None),
             [config, auth, (_, group)] => ([config, auth], Some(group)),
             other => {
-                return self.unexpected_event("realm config and authorization", format!("{other:?}"));
+                return self
+                    .unexpected_event("realm config and authorization", format!("{other:?}"));
             }
         };
         let Some(config_value) = config_value else {

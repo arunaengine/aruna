@@ -748,14 +748,13 @@ mod tests {
         let (_dir, context, actor) = setup().await;
         let group_id = Ulid::from_bytes([7u8; 16]);
         seed_group_admin(&context, &actor, group_id).await;
-        let owned = policy("eu-west").owned_by(group_id).expect("owner is valid");
+        let owned = policy("eu-west")
+            .owned_by(group_id)
+            .expect("owner is valid");
 
-        let document = drive(
-            CreatePolicyOperation::new(config(&actor, owned)),
-            &context,
-        )
-        .await
-        .expect("policy is created");
+        let document = drive(CreatePolicyOperation::new(config(&actor, owned)), &context)
+            .await
+            .expect("policy is created");
 
         assert_eq!(document.policy.owner_group_id, Some(group_id));
         let realm_config = read_document(
@@ -777,9 +776,8 @@ mod tests {
             DocumentSyncTarget::GroupAuthorization { group_id },
         )
         .await;
-        let group_auth =
-            aruna_core::structs::GroupAuthorizationDocument::from_bytes(&group_auth)
-                .expect("group authorization decodes");
+        let group_auth = aruna_core::structs::GroupAuthorizationDocument::from_bytes(&group_auth)
+            .expect("group authorization decodes");
         assert_eq!(
             verify_policy_authority(
                 &document,

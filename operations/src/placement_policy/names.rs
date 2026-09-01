@@ -110,7 +110,9 @@ impl Operation for PolicyNamesOperation {
                     return self.finish(Err(PolicyNamesError::InvalidEvent));
                 };
                 let mut names = BTreeMap::new();
-                for (_, value) in values.into_iter().flat_map(|(key, value)| value.map(|v| (key, v)))
+                for (_, value) in values
+                    .into_iter()
+                    .flat_map(|(key, value)| value.map(|v| (key, v)))
                 {
                     let document = match PlacementPolicyDocument::from_bytes(value.as_ref()) {
                         Ok(document) => document,
@@ -152,7 +154,7 @@ mod tests {
     use super::{PolicyName, PolicyNamesOperation};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{PlacementPolicy, PlacementPolicyRef, PlacementSelector, RealmId};
+    use aruna_core::structs::{PlacementPolicy, PlacementSelector, RealmId};
     use ulid::Ulid;
 
     fn realm() -> RealmId {
@@ -185,10 +187,8 @@ mod tests {
         let owner = Ulid::from_bytes([5u8; 16]);
         let held = policy(1, Some(owner));
         let unknown = policy(2, None);
-        let mut operation = PolicyNamesOperation::new(
-            realm(),
-            &[held.policy_ref(), unknown.policy_ref()],
-        );
+        let mut operation =
+            PolicyNamesOperation::new(realm(), &[held.policy_ref(), unknown.policy_ref()]);
         operation.start();
 
         let document = crate::placement_policy::tests::signed_document(realm(), &held, 1);
@@ -227,8 +227,11 @@ mod tests {
         let mut operation = PolicyNamesOperation::new(realm(), &[held.policy_ref()]);
         operation.start();
 
-        let document =
-            crate::placement_policy::tests::signed_document(RealmId::from_bytes([9u8; 32]), &held, 1);
+        let document = crate::placement_policy::tests::signed_document(
+            RealmId::from_bytes([9u8; 32]),
+            &held,
+            1,
+        );
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![(
                 b"a".to_vec().into(),

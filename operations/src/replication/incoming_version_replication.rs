@@ -34,11 +34,10 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CopyOrigin, CurrentVersionPointer, GroupRoutingInputs,
-    MultipartObjectMetadataKey, NodeRouting,
-    PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey,
-    ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits,
-    RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
+    BucketInfo, CopyOrigin, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey,
+    NodeRouting, PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate,
+    ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend,
+    RoCrateLimits, RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
     blob_bucket_permission_path, blob_object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;

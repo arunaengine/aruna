@@ -5,10 +5,9 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, CopyOrigin, MAX_POLICY_REF_INPUT,
-    MultipartChecksumType,
-    MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, PlacementSubject, RealmId,
-    ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata, VersionSourceBinding,
-    VersionedObjectArn,
+    MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef,
+    PlacementSubject, RealmId, ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata,
+    VersionSourceBinding, VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};

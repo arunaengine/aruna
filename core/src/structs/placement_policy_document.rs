@@ -456,7 +456,10 @@ mod tests {
                 &document,
                 &config(),
                 &narrow_realm(),
-                Some(&group_roles(admin(), &format!("/{}/g/{}/**", realm(), group()))),
+                Some(&group_roles(
+                    admin(),
+                    &format!("/{}/g/{}/**", realm(), group())
+                )),
             ),
             Ok(())
         );
@@ -465,7 +468,10 @@ mod tests {
                 &document,
                 &config(),
                 &narrow_realm(),
-                Some(&group_roles(member, &format!("/{}/g/{}/**", realm(), group()))),
+                Some(&group_roles(
+                    member,
+                    &format!("/{}/g/{}/**", realm(), group())
+                )),
             ),
             Err(PolicyAuthorityError::Unauthorized),
             "the signing admin of another user's group holds no authority here"
@@ -484,7 +490,12 @@ mod tests {
         let mut foreign = group_roles(admin(), &format!("/{}/g/{}/**", realm(), group()));
         foreign.group_id = Ulid::from_bytes([7; 16]);
         assert_eq!(
-            verify_policy_authority(&document, &config(), &authorization(admin()), Some(&foreign)),
+            verify_policy_authority(
+                &document,
+                &config(),
+                &authorization(admin()),
+                Some(&foreign)
+            ),
             Err(PolicyAuthorityError::GroupUnavailable)
         );
     }
@@ -506,7 +517,10 @@ mod tests {
             hex::encode(policy(1, "eu-west").digest()),
             "a41f027aea08b68d469068dea97ae7aaba74726a2c37ba5e826287b6eaf51365"
         );
-        assert_eq!(hex::encode(owned_policy(1).digest()), "f60af76d1feed5c3ccc30cc6be00c31a9cead0dfeada81427cb2c5b4b2a773d5");
+        assert_eq!(
+            hex::encode(owned_policy(1).digest()),
+            "f60af76d1feed5c3ccc30cc6be00c31a9cead0dfeada81427cb2c5b4b2a773d5"
+        );
     }
 
     fn policy(seed: u8, location: &str) -> VerifiedPolicy {
