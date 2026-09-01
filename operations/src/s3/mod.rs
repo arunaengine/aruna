@@ -23,6 +23,7 @@ pub mod list_objects_v2;
 pub mod list_parts;
 pub mod list_user_access;
 pub mod listing;
+pub mod object_placement;
 pub mod policy_bulk;
 pub mod policy_coverage;
 pub mod policy_mutation;
