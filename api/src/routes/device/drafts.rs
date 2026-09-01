@@ -383,11 +383,13 @@ for.
 - The same evaluation a create enforces, so the owner sees the verdict before queueing.
 - Structural checks need nothing but the payload. A draft that names a registered Profile is checked
   against the copy this device already holds, so an unknown Profile reports as unevaluated rather
-  than failing."#,
+  than failing.
+- `group_id` names the group the draft would be saved in, and a Profile of that group is resolved
+  under the device owner's own authority. Without it only public Profiles resolve."#,
     request_body(
         content = ProfileValidationPreviewRequest,
         description = "The RO-Crate JSON-LD to evaluate",
-        example = json!({"rocrate": {"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": []}})
+        example = json!({"group_id": "01JGROUP00000000000000000", "rocrate": {"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": []}})
     ),
     responses(
         (status = 200, description = "The verdict a create would enforce for this draft", body = ProfileValidationPreviewResponse,
@@ -413,8 +415,9 @@ async fn preview_draft(
     Json(request): Json<ProfileValidationPreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
     require_owner(&state, auth).await?;
+    let group_id = request.group_id.as_deref().map(parse_group_id).transpose()?;
     let jsonld = rocrate_jsonld(&request.rocrate)?;
-    let preview = preview_submission(&state.get_ctx(), &jsonld)
+    let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     Ok((StatusCode::OK, Json(preview.into())))

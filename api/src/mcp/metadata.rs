@@ -71,6 +71,12 @@ pub struct ValidateInput {
     /// `conformsTo` IRI on the root, and File entities use `s3://bucket/key`
     /// contentUrl values.
     pub rocrate: JsonPayload,
+    /// The group the draft would be saved in, from list_groups. A Profile of
+    /// that group is checked even while it is not public; without it only
+    /// public Profiles resolve and a group Profile reports
+    /// `profile_not_registered`.
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -338,7 +344,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Run the structural and Profile checks a metadata write applies and return the verdict without storing anything. Call it before create_dataset and replace_dataset and repair every reported item until `accepted` is true. Structural violations carry a code and a JSON pointer, Profile findings carry the failing SHACL rule and its focus node. It creates and changes nothing.",
+        description = "Run the structural and Profile checks a metadata write applies and return the verdict without storing anything. Call it before create_dataset and replace_dataset and repair every reported item until `accepted` is true. Pass the group_id the dataset will be saved in, otherwise only public Profiles are resolved. Structural violations carry a code and a JSON pointer, Profile findings carry the failing SHACL rule and its focus node. It creates and changes nothing.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -358,8 +364,9 @@ impl McpServer {
             tool_extras("validate_dataset", &input)?,
         )
         .await?;
+        let group_id = input.group_id.as_deref().map(parse_group).transpose()?;
         let jsonld = rocrate_json(&input.rocrate.0)?;
-        let preview = preview_submission(&self.state.get_ctx(), &jsonld)
+        let preview = preview_submission(&self.state.get_ctx(), group_id, &jsonld)
             .await
             .map_err(crate::routes::metadata::map_metadata_error)
             .map_err(server_error)?;

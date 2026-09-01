@@ -152,6 +152,10 @@ pub struct ProfileValidationPreviewRequest {
     /// RO-Crate JSON-LD draft. Nothing is stored.
     #[schema(value_type = Object)]
     pub rocrate: Value,
+    /// Group the draft would be saved in. A Profile of that group resolves
+    /// even while it is not public; without it only public Profiles do.
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1258,9 +1262,13 @@ registered Profile is read.
 - `accepted` is true only when the structural RO-Crate rules and the Profile constraints would
   both let the write through.
 - The draft is evaluated under its own crate root, so focus nodes and paths are reported in
-  crate-local form with the root as `./`."#,
+  crate-local form with the root as `./`.
+- `group_id` names the group the draft would be saved in. A Profile of that group resolves even
+  while it is not public; without it only public Profiles resolve, so a group Profile reports
+  `profile_not_registered`."#,
     request_body(content = ProfileValidationPreviewRequest,
         example = json!({
+            "group_id": "01JGROUP00000000000000000",
             "rocrate": {
                 "@context": "https://w3id.org/ro/crate/1.3/context",
                 "@graph": [
@@ -1319,8 +1327,9 @@ pub async fn preview_profile_validation(
     Json(request): Json<ProfileValidationPreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
     require_realm_auth(&state, auth)?;
+    let group_id = request.group_id.as_deref().map(parse_group_id).transpose()?;
     let jsonld = serialize_jsonld_object(&request.rocrate)?;
-    let preview = run_preview_submission(&state.get_ctx(), &jsonld)
+    let preview = run_preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
         .map_err(map_metadata_error)?;
     Ok((StatusCode::OK, Json(preview.into())))
