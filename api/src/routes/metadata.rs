@@ -13,10 +13,8 @@ use aruna_core::metadata::{
     MetadataProfileValidationStatus, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, ExportRoCrateSpec, MetadataRegistryRecord, Permission, WatchEvent,
-    WatchEventDetail, WatchEventKind,
+    Actor, AuthContext, ExportRoCrateSpec, MetadataRegistryRecord, Permission,
 };
-use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -53,7 +51,7 @@ use aruna_operations::metadata::profile_validation::{
     MetadataProfilePreview, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
     preview_submission as run_preview_submission,
 };
-use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::notifications::watch::emit::emit_metadata_created;
 use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -917,20 +915,13 @@ pub async fn create_metadata_document(
 
     // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
     // emission only warns and never affects the already-successful create.
-    emit_resource_watch_event(
+    emit_metadata_created(
         ctx.as_ref(),
-        WatchEvent {
-            event_id: Ulid::generate(),
-            realm_id: state.get_realm_id(),
-            kind: WatchEventKind::MetadataCreated,
-            path: format!("meta/{}/{}", result.group_id, result.document_path),
-            actor: auth.user_id,
-            occurred_at_ms: unix_timestamp_millis(),
-            detail: WatchEventDetail::MetadataCreated {
-                group_id: result.group_id,
-                document_id: result.document_id,
-            },
-        },
+        state.get_realm_id(),
+        auth.user_id,
+        result.group_id,
+        result.document_id,
+        &result.document_path,
     )
     .await;
 

@@ -1,6 +1,10 @@
-use aruna_core::structs::{WatchEvent, watch_path_matches};
-use aruna_core::types::UserId;
+use aruna_core::structs::{
+    RealmId, WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
+};
+use aruna_core::types::{GroupId, UserId};
+use aruna_core::util::unix_timestamp_millis;
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
@@ -88,6 +92,34 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
             warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
         }
     }
+}
+
+/// Post-commit, best-effort `metadata_created` emission shared by every dataset
+/// creation path, so an import or a job notifies exactly like `POST /metadata`.
+pub async fn emit_metadata_created(
+    context: &DriverContext,
+    realm_id: RealmId,
+    actor: UserId,
+    group_id: GroupId,
+    document_id: Ulid,
+    document_path: &str,
+) {
+    emit_resource_watch_event(
+        context,
+        WatchEvent {
+            event_id: Ulid::generate(),
+            realm_id,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/{document_path}"),
+            actor,
+            occurred_at_ms: unix_timestamp_millis(),
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        },
+    )
+    .await;
 }
 
 async fn include_local_holder_from_subscriptions(
@@ -356,6 +388,39 @@ mod tests {
         assert!(metrics.render().await.contains(
             "aruna_notification_watch_delivery_suppressions_total{reason=\"permission_denied\"} 1"
         ));
+    }
+
+    #[tokio::test]
+    async fn group_wide_prefix_delivers() {
+        // A `meta/{group}/` watch fires for a dataset created anywhere in it.
+        let realm = RealmId([1u8; 32]);
+        let (_dir, ctx, _net) = ctx_with_net(realm, [86u8; 32]).await;
+        let owner = UserId::new(Ulid::generate(), realm);
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        install_authorization(&ctx, realm, group_id, owner).await;
+        create_watch_subscription(
+            &ctx.storage_handle,
+            owner,
+            format!("meta/{group_id}/"),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            1,
+        )
+        .await
+        .expect("subscription creates");
+
+        emit_metadata_created(
+            &ctx,
+            realm,
+            UserId::new(Ulid::generate(), realm),
+            group_id,
+            Ulid::generate(),
+            "datasets/project",
+        )
+        .await;
+
+        let rows = read_inbox_rows(&ctx).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recipient, owner);
     }
 
     #[tokio::test]

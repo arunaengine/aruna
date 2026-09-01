@@ -4,11 +4,7 @@ use super::{
     parse_ulid, request_auth, server_error, tool_extras,
 };
 use aruna_core::StructuredId;
-use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, WatchEvent, WatchEventDetail,
-    WatchEventKind,
-};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_forward_document, mint_local_document,
@@ -23,7 +19,7 @@ use aruna_operations::metadata::forward::{
     update_metadata_document_routed,
 };
 use aruna_operations::metadata::profile_validation::preview_submission;
-use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::notifications::watch::emit::emit_metadata_created;
 use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
@@ -470,20 +466,13 @@ impl McpServer {
         .map_err(crate::routes::metadata::map_metadata_write_error)
         .map_err(server_error)?;
         let record = created.record;
-        emit_resource_watch_event(
+        emit_metadata_created(
             ctx.as_ref(),
-            WatchEvent {
-                event_id: Ulid::generate(),
-                realm_id: self.state.get_realm_id(),
-                kind: WatchEventKind::MetadataCreated,
-                path: format!("meta/{}/{}", record.group_id, record.document_path),
-                actor: auth.user_id,
-                occurred_at_ms: unix_timestamp_millis(),
-                detail: WatchEventDetail::MetadataCreated {
-                    group_id: record.group_id,
-                    document_id: record.document_id,
-                },
-            },
+            self.state.get_realm_id(),
+            auth.user_id,
+            record.group_id,
+            record.document_id,
+            &record.document_path,
         )
         .await;
         let summary = crate::routes::metadata::MetadataDocumentSummary::from(&record);
