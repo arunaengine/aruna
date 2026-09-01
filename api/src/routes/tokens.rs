@@ -24,7 +24,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "tokens", description = "Bearer token revocation"))
+    tags((name = "access/tokens", description = "Bearer token revocation"))
 )]
 pub struct TokensApiDoc;
 
@@ -39,8 +39,8 @@ pub struct RevokeTokenRequest {
 
 #[utoipa::path(
     post,
-    path = "/users/tokens/revoke",
-    tag = "tokens",
+    path = "/access/tokens/revoke",
+    tag = "access/tokens",
     summary = "Revoke a bearer token of this realm",
     description = r#"Records a bearer token of this realm in the replicated revocation set.
 

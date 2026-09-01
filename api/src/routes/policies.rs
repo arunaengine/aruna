@@ -31,7 +31,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "policies", description = "Deny-only CEL request policies")),
+    tags((name = "access/policies", description = "Deny-only CEL request policies")),
     components(schemas(
         PolicyTraceDoc,
         PolicyKindDoc,
@@ -369,8 +369,8 @@ async fn require_group_read(
 
 #[utoipa::path(
     get,
-    path = "/policies/realm",
-    tag = "policies",
+    path = "/access/policies/realm",
+    tag = "access/policies",
     summary = "Read the realm's request policy set",
     description = r#"Returns the stored realm-scoped request policies in the order enforcement evaluates them.
 
@@ -419,8 +419,8 @@ pub async fn get_realm_policies(
 
 #[utoipa::path(
     put,
-    path = "/policies/realm",
-    tag = "policies",
+    path = "/access/policies/realm",
+    tag = "access/policies",
     summary = "Replace the realm's request policy set",
     description = r#"Replaces the realm's request policy set wholesale with the submitted list.
 
@@ -551,8 +551,8 @@ pub async fn set_realm_policies(
 
 #[utoipa::path(
     get,
-    path = "/policies/group/{group_id}",
-    tag = "policies",
+    path = "/access/policies/group/{group_id}",
+    tag = "access/policies",
     summary = "Read a group's request policy set",
     description = r#"Returns the group-scoped request policies in the order enforcement evaluates them.
 
@@ -602,8 +602,8 @@ pub async fn get_group_policies(
 
 #[utoipa::path(
     put,
-    path = "/policies/group/{group_id}",
-    tag = "policies",
+    path = "/access/policies/group/{group_id}",
+    tag = "access/policies",
     summary = "Replace a group's request policy set",
     description = r#"Replaces a group's request policy set wholesale with the submitted list.
 
@@ -726,8 +726,8 @@ pub async fn set_group_policies(
 
 #[utoipa::path(
     get,
-    path = "/policies/effective",
-    tag = "policies",
+    path = "/access/policies/effective",
+    tag = "access/policies",
     summary = "List the effective policies for a scope",
     description = r#"Returns the realm policies followed by the group policies, in the order enforcement walks them.
 
@@ -807,8 +807,8 @@ pub async fn effective_policies(
 
 #[utoipa::path(
     post,
-    path = "/policies/validate",
-    tag = "policies",
+    path = "/access/policies/validate",
+    tag = "access/policies",
     summary = "Compile-check a candidate policy expression",
     description = r#"Parses a candidate policy guard and expression and reports whether they compile.
 
@@ -878,8 +878,8 @@ pub async fn validate_policy(
 
 #[utoipa::path(
     post,
-    path = "/policies/dry-run",
-    tag = "policies",
+    path = "/access/policies/dryrun",
+    tag = "access/policies",
     summary = "Evaluate policies against a hypothetical request",
     description = r#"Evaluates policies against a hypothetical request and reports the decision they would reach.
 

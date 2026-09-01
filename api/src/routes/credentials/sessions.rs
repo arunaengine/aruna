@@ -64,8 +64,8 @@ pub struct S3SessionResponse {
 
 #[utoipa::path(
     post,
-    path = "/users/s3-sessions",
-    tag = "credentials",
+    path = "/access/s3/sessions",
+    tag = "access/credentials",
     summary = "Exchange a bearer token for an S3 session",
     description = r#"Issues a short-lived, node-local S3 session for an explicitly selected group.
 
@@ -153,8 +153,8 @@ pub async fn create_s3_session(
 
 #[utoipa::path(
     post,
-    path = "/users/s3-sessions/{access_key_id}/refresh",
-    tag = "credentials",
+    path = "/access/s3/sessions/{access_key_id}/refresh",
+    tag = "access/credentials",
     summary = "Rotate an active S3 session",
     description = r#"Rotates the secret and session token of an active S3 session inside its refresh window.
 

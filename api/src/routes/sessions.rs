@@ -20,7 +20,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 #[derive(OpenApi)]
-#[openapi(tags((name = "sessions", description = "User bearer sessions")))]
+#[openapi(tags((name = "access/sessions", description = "User bearer sessions")))]
 pub struct SessionsApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -114,8 +114,8 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
 
 #[utoipa::path(
     post,
-    path = "/users/sessions",
-    tag = "sessions",
+    path = "/access/sessions",
+    tag = "access/sessions",
     summary = "Create a user bearer session",
     description = r#"Creates a self-scoped bearer session and returns its token once.
 
@@ -207,8 +207,8 @@ pub async fn create_session(
 
 #[utoipa::path(
     get,
-    path = "/users/sessions",
-    tag = "sessions",
+    path = "/access/sessions",
+    tag = "access/sessions",
     summary = "List user bearer sessions",
     description = r#"Lists the caller's own bearer sessions as this node stored them.
 
@@ -256,8 +256,8 @@ pub async fn list_sessions(
 
 #[utoipa::path(
     delete,
-    path = "/users/sessions/{session_id}",
-    tag = "sessions",
+    path = "/access/sessions/{session_id}",
+    tag = "access/sessions",
     summary = "Revoke a user bearer session",
     description = r#"Revokes one of the caller's own bearer sessions on the node that issued it.
 

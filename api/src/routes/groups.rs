@@ -57,7 +57,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "groups", description = "Group management operations"))
+    tags((name = "access/groups", description = "Group management operations"))
 )]
 pub struct GroupsApiDoc;
 
@@ -355,8 +355,8 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
 
 #[utoipa::path(
     post,
-    path = "/groups",
-    tag = "groups",
+    path = "/access/groups",
+    tag = "access/groups",
     summary = "Create a group in this realm",
     description = r#"Creates a group in this realm and makes the caller its owner and sole administrator.
 
@@ -535,8 +535,8 @@ pub async fn create_group(
 
 #[utoipa::path(
     get,
-    path = "/groups",
-    tag = "groups",
+    path = "/access/groups",
+    tag = "access/groups",
     summary = "List the groups of this realm",
     description = r#"Lists this realm's groups, optionally with their roles and permission paths.
 
@@ -663,8 +663,8 @@ async fn build_api_groups(
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}",
-    tag = "groups",
+    path = "/access/groups/{id}",
+    tag = "access/groups",
     summary = "Read one group's directory entry",
     description = r#"Returns one group's directory entry together with its roles.
 
@@ -778,8 +778,8 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}/usage",
-    tag = "groups",
+    path = "/access/groups/{id}/usage",
+    tag = "access/groups",
     summary = "Read a group's storage usage",
     description = r#"Reports what this node stores for a group next to the realm-wide totals.
 
@@ -908,8 +908,8 @@ pub(crate) async fn run_group_usage(
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}/members",
-    tag = "groups",
+    path = "/access/groups/{id}/members",
+    tag = "access/groups",
     summary = "List the members of a group",
     description = r#"Returns every member of a group with the roles that assign them.
 
@@ -1038,8 +1038,8 @@ async fn resolve_member_names(
 
 #[utoipa::path(
     post,
-    path = "/groups/{id}/members",
-    tag = "groups",
+    path = "/access/groups/{id}/members",
+    tag = "access/groups",
     summary = "Add a user to a group",
     description = r#"Assigns a user one or more roles in a group.
 
@@ -1159,8 +1159,8 @@ pub async fn add_group_member(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{id}/members/{user_id}",
-    tag = "groups",
+    path = "/access/groups/{id}/members/{user_id}",
+    tag = "access/groups",
     summary = "Remove a group member or revoke one role",
     description = r#"Revokes a user's roles in a group, or only the one named by `role_id`.
 
@@ -1238,8 +1238,8 @@ pub async fn remove_group_member(
 
 #[utoipa::path(
     post,
-    path = "/groups/{id}/leave",
-    tag = "groups",
+    path = "/access/groups/{id}/leave",
+    tag = "access/groups",
     summary = "Leave a group",
     description = r#"Drops every role the calling user holds in the group.
 
@@ -1287,8 +1287,8 @@ pub async fn leave_group(
 
 #[utoipa::path(
     post,
-    path = "/groups/{id}/roles",
-    tag = "groups",
+    path = "/access/groups/{id}/roles",
+    tag = "access/groups",
     summary = "Create a role in a group",
     description = r#"Creates a role in a group from permission paths confined to that group.
 
@@ -1432,8 +1432,8 @@ pub async fn create_group_role(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{id}/roles/{role_id}",
-    tag = "groups",
+    path = "/access/groups/{id}/roles/{role_id}",
+    tag = "access/groups",
     summary = "Delete a role from a group",
     description = r#"Deletes a role from a group and revokes it from everyone holding it.
 
@@ -1542,8 +1542,8 @@ pub struct DataPathsQuery {
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}/data-paths",
-    tag = "groups",
+    path = "/access/groups/{id}/data/paths",
+    tag = "access/groups",
     summary = "Browse the data permission paths of a group",
     description = r#"Returns one page of the data permission paths that a group's role grants are written against.
 

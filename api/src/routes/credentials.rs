@@ -28,7 +28,7 @@ mod sessions;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "credentials", description = "User credential management"))
+    tags((name = "access/credentials", description = "User credential management"))
 )]
 pub struct CredentialsApiDoc;
 
@@ -202,8 +202,8 @@ fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRes
 
 #[utoipa::path(
     get,
-    path = "/users/credentials",
-    tag = "credentials",
+    path = "/access/credentials",
+    tag = "access/credentials",
     summary = "List the caller's S3 credentials",
     description = r#"Lists the S3 credentials of the calling identity held by the node serving the request.
 
@@ -279,8 +279,8 @@ pub async fn list_s3_credentials(
 
 #[utoipa::path(
     post,
-    path = "/users/credentials",
-    tag = "credentials",
+    path = "/access/credentials",
+    tag = "access/credentials",
     summary = "Create an S3 credential for a group",
     description = r#"Issues an S3 access key and a one-time secret bound to a group, for the calling identity.
 
@@ -405,8 +405,8 @@ pub async fn create_s3_credentials(
 
 #[utoipa::path(
     delete,
-    path = "/users/credentials/{access_key_id}",
-    tag = "credentials",
+    path = "/access/credentials/{access_key_id}",
+    tag = "access/credentials",
     summary = "Revoke an S3 credential",
     description = r#"Revokes an S3 credential held by the node serving the request.
 

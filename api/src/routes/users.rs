@@ -58,7 +58,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "users", description = "User operations"))
+    tags(
+        (name = "access/users", description = "User operations"),
+        (name = "access/devices", description = "User device administration")
+    )
 )]
 pub struct UsersApiDoc;
 
@@ -546,8 +549,8 @@ async fn register_admin(
 
 #[utoipa::path(
     post,
-    path = "/users/register",
-    tag = "users",
+    path = "/access/users/register",
+    tag = "access/users",
     summary = "Register the calling OIDC identity",
     description = r#"Registers the subject of the presented OIDC token as a user of this realm.
 
@@ -657,8 +660,8 @@ async fn register_user(
 
 #[utoipa::path(
     get,
-    path = "/users/token",
-    tag = "users",
+    path = "/access/token",
+    tag = "access/tokens",
     summary = "Issue an access token for the calling identity",
     description = r#"Mints a realm access token for the calling identity.
 
@@ -736,8 +739,8 @@ async fn get_token(
 
 #[utoipa::path(
     get,
-    path = "/users/info",
-    tag = "users",
+    path = "/access/users/me",
+    tag = "access/users",
     summary = "Get the calling user's profile, roles and preferences",
     description = r#"Describes the calling user: profile, realm roles, group memberships and UI preferences.
 
@@ -825,8 +828,8 @@ async fn get_user_info(
 
 #[utoipa::path(
     patch,
-    path = "/users/info",
-    tag = "users",
+    path = "/access/users/me",
+    tag = "access/users",
     summary = "Update the calling user's profile",
     description = r#"Updates the calling user's display name and attributes and returns the refreshed profile.
 
@@ -961,8 +964,8 @@ async fn patch_user_info(
 
 #[utoipa::path(
     get,
-    path = "/users",
-    tag = "users",
+    path = "/access/users",
+    tag = "access/users",
     summary = "List the users of this realm",
     description = r#"Pages this realm's user documents in user id order.
 
@@ -1062,8 +1065,8 @@ async fn list_users(
 
 #[utoipa::path(
     get,
-    path = "/users/search",
-    tag = "users",
+    path = "/access/users/search",
+    tag = "access/users",
     summary = "Search this realm's users by name or email",
     description = r#"Pages this realm's users whose display name or email attribute contains the query.
 
@@ -1167,8 +1170,8 @@ async fn search_users(
 
 #[utoipa::path(
     post,
-    path = "/users/resolve",
-    tag = "users",
+    path = "/access/users/resolve",
+    tag = "access/users",
     summary = "Resolve user ids to directory entries",
     description = r#"Resolves a batch of user ids to directory entries held by this node.
 
@@ -1268,8 +1271,8 @@ async fn resolve_users(
 
 #[utoipa::path(
     get,
-    path = "/users/{id}",
-    tag = "users",
+    path = "/access/users/{id}",
+    tag = "access/users",
     summary = "Get a user of this realm by id",
     description = r#"Returns one user document of this realm as held by the responding node.
 
@@ -1349,8 +1352,8 @@ async fn get_user(
 
 #[utoipa::path(
     patch,
-    path = "/users/{id}",
-    tag = "users",
+    path = "/access/users/{id}",
+    tag = "access/users",
     summary = "Update a user of this realm by id",
     description = r#"Updates one user's display name and attributes and returns the updated document.
 
@@ -1537,8 +1540,8 @@ async fn owned_devices(
 
 #[utoipa::path(
     get,
-    path = "/users/me/devices",
-    tag = "users",
+    path = "/access/users/me/devices",
+    tag = "access/users",
     summary = "List the calling user's devices",
     description = r#"Lists the devices this user has enrolled, plus the device enrollments still in flight.
 
@@ -1601,8 +1604,8 @@ async fn list_user_devices(
 
 #[utoipa::path(
     delete,
-    path = "/users/me/devices/{id}",
-    tag = "users",
+    path = "/access/users/me/devices/{id}",
+    tag = "access/users",
     summary = "Revoke one of the calling user's devices",
     description = r#"Revokes a device enrollment of the calling user, making its secret unredeemable from here on.
 
@@ -1658,8 +1661,8 @@ async fn revoke_user_device(
 
 #[utoipa::path(
     delete,
-    path = "/admin/devices/{node_id}",
-    tag = "users",
+    path = "/access/devices/{node_id}",
+    tag = "access/devices",
     summary = "Evict any enrolled device as a realm admin",
     description = r#"Evicts one enrolled user device from the realm on behalf of the realm's administration.
 

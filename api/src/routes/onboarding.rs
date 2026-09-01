@@ -59,7 +59,7 @@ const ENROLL_DEVICE_OPERATION: &str = "onboarding.enroll_device";
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "onboarding", description = "Node onboarding and bootstrap operations"))
+    tags((name = "access/onboarding", description = "Node onboarding and bootstrap operations"))
 )]
 pub struct OnboardingApiDoc;
 
@@ -261,8 +261,8 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
 
 #[utoipa::path(
     post,
-    path = "/admin/onboarding/secrets",
-    tag = "onboarding",
+    path = "/access/onboarding/secrets",
+    tag = "access/onboarding",
     summary = "Mint a node enrollment secret",
     description = r#"Mints a single-use enrollment secret that a joining node or device redeems to enter the realm.
 
@@ -464,8 +464,8 @@ fn enroll_url(secret: &str, seed_url: &str, realm_id: RealmId) -> ServerResult<S
 
 #[utoipa::path(
     get,
-    path = "/admin/onboarding/secrets",
-    tag = "onboarding",
+    path = "/access/onboarding/secrets",
+    tag = "access/onboarding",
     summary = "List outstanding node enrollment secrets",
     description = r#"Lists this management node's live and in-flight enrollment secrets as bookkeeping only.
 
@@ -535,8 +535,8 @@ pub async fn list_onboarding_secrets(
 
 #[utoipa::path(
     delete,
-    path = "/admin/onboarding/secrets/{id}",
-    tag = "onboarding",
+    path = "/access/onboarding/secrets/{id}",
+    tag = "access/onboarding",
     summary = "Revoke a pending node enrollment secret",
     description = r#"Deletes the enrollment record on this node, making the secret unredeemable from here on.
 
@@ -582,8 +582,8 @@ pub async fn revoke_onboarding_secret(
 
 #[utoipa::path(
     get,
-    path = "/onboarding/secrets/{id}/status",
-    tag = "onboarding",
+    path = "/access/onboarding/secrets/{id}/status",
+    tag = "access/onboarding",
     summary = "Poll an enrollment secret's claim state",
     description = r#"Reports whether an outstanding enrollment secret is still pending, already claimed or expired.
 
@@ -672,8 +672,8 @@ pub async fn get_secret_status(
 
 #[utoipa::path(
     post,
-    path = "/onboarding/bootstrap",
-    tag = "onboarding",
+    path = "/access/onboarding/bootstrap",
+    tag = "access/onboarding",
     summary = "Redeem an enrollment secret and join the realm",
     description = r#"Redeems an enrollment secret and returns the one-time material a joiner needs to enter the realm.
 
