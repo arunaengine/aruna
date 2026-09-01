@@ -3,7 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::{PendingCleanup, schedule_blob_cleanup_effect};
-use crate::blob::managed_copy::{ManagedCopyError, register_effect};
+use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
@@ -28,7 +28,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
+    BucketInfo, CopyOrigin, CurrentVersionPointer, MultipartChecksumType,
+    MultipartObjectMetadataKey,
     MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
     MultipartUploadPartKey, MultipartUploadStatus, PathRestriction, PlacementPolicyError,
     PlacementPolicyRef, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
@@ -1212,12 +1213,15 @@ impl CompleteMultipartUploadOperation {
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
         let effect = match register_effect(
-            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
-            self.input.node_id,
-            &location,
-            &self.sealed_policies,
-            self.sealed_subject(),
-            version_id.timestamp_ms(),
+            CopyRegistration {
+                version: VersionKey::new(&self.input.bucket, &self.input.key, version_id),
+                node_id: self.input.node_id,
+                location: &location,
+                policies: &self.sealed_policies,
+                origin: CopyOrigin::Write,
+                subject_generation: self.sealed_subject(),
+                registered_at_ms: version_id.timestamp_ms(),
+            },
             self.txn_id,
         ) {
             Ok(effect) => effect,

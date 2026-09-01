@@ -8,8 +8,8 @@
 
 use crate::blob::blob_keyspace_helper::HeadAliasContext;
 use crate::blob::managed_copy::{
-    COPY_PAGE_LIMIT, CopyRequest, ManagedCopyError, ManagedCopyPage, register_entry, scan_effect,
-    validate_registration, version_scope,
+    COPY_PAGE_LIMIT, CopyRegistration, CopyRequest, ManagedCopyError, ManagedCopyPage,
+    register_entry, scan_effect, validate_registration, version_scope,
 };
 use crate::placement_policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
@@ -22,7 +22,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketIdentity,
+    AuthContext, BlobVersion, BlobVersionState, BucketIdentity,
     CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
     POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
     PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
@@ -105,6 +105,16 @@ pub enum SuccessorOutcome {
     },
     /// Nothing was written; the caller may retry once the reason clears.
     Blocked(PolicyBlockedReason),
+}
+
+impl SuccessorOutcome {
+    /// Refs the successor carries; empty for a blocked outcome, which wrote none.
+    pub fn refs(&self) -> Vec<PlacementPolicyRef> {
+        match self {
+            Self::Minted { refs, .. } | Self::Replayed { refs, .. } => refs.clone(),
+            Self::Blocked(_) => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -468,7 +478,7 @@ impl SuccessorMint {
             reusable_copy(&key, &record, &version, &self.plan.subject, hash, &refs)
         });
         match reusable {
-            Some(location) => self.write_records(txn_id, Some(location)),
+            Some(record) => self.write_records(txn_id, Some(record)),
             None => self.blocked(PolicyBlockedReason::SourceUnavailable, txn_id),
         }
     }
@@ -504,8 +514,9 @@ impl SuccessorMint {
     fn write_records(
         &mut self,
         txn_id: Option<TxnId>,
-        location: Option<BackendLocation>,
+        source: Option<ManagedCopyRecord>,
     ) -> Result<Option<Effects>, SuccessorError> {
+        let location = source.as_ref().map(|record| record.location.clone());
         let Some(predecessor) = self.predecessor.as_ref() else {
             return Err(SuccessorError::VersionMissing);
         };
@@ -559,14 +570,20 @@ impl SuccessorMint {
                     .into(),
                 Vec::new().into(),
             ));
-            writes.push(register_entry(
-                self.plan.version_key(version_id),
-                self.plan.subject.node_id,
+            // The successor is the same bytes under a new version, so it keeps
+            // the provenance the copy it reuses already recorded.
+            writes.push(register_entry(CopyRegistration {
+                version: self.plan.version_key(version_id),
+                node_id: self.plan.subject.node_id,
                 location,
-                &self.sealed_refs,
-                self.plan.subject.generation,
-                version_id.timestamp_ms(),
-            )?);
+                policies: &self.sealed_refs,
+                origin: source
+                    .as_ref()
+                    .map(|record| record.origin)
+                    .unwrap_or_default(),
+                subject_generation: self.plan.subject.generation,
+                registered_at_ms: version_id.timestamp_ms(),
+            })?);
         }
         // The successor replicates like any other write, so peers converge on
         // the governed version instead of only this node holding it.
@@ -615,7 +632,7 @@ fn reusable_copy(
     subject: &PlacementSubject,
     blob_hash: [u8; 32],
     refs: &[PlacementPolicyRef],
-) -> Option<BackendLocation> {
+) -> Option<ManagedCopyRecord> {
     if key.version != *version {
         return None;
     }
@@ -627,9 +644,8 @@ fn reusable_copy(
         subject_generation: Some(subject.generation),
     };
     let bytes = record.to_bytes().ok()?;
-    let validated = validate_registration(Some(bytes.as_slice()), &request).ok()?;
     // The hash binds the content, so a zero-length object is reusable too.
-    Some(validated.location)
+    validate_registration(Some(bytes.as_slice()), &request).ok()
 }
 
 /// The successor carries the predecessor's content and metadata under a new

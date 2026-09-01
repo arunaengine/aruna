@@ -4,8 +4,8 @@ use crate::blob::blob_keyspace_helper::{
 };
 use crate::blob::cleanup::PendingCleanup;
 use crate::blob::managed_copy::{
-    CopyRequest, ManagedCopyError, register_effect, serve_reads, split_serve_reads,
-    validate_registration,
+    CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
+    split_serve_reads, validate_registration,
 };
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::{
@@ -30,7 +30,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, ManagedCopyKey, PathRestriction, PlacementPolicyError,
+    BucketInfo, CopyOrigin, CurrentVersionPointer, ManagedCopyKey, PathRestriction, PlacementPolicyError,
     PlacementPolicyRef, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta,
     VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
 };
@@ -211,6 +211,8 @@ pub struct PutObjectOperation {
     /// before the replay may hand back its location.
     replay_policies: Vec<PlacementPolicyRef>,
     replay_location: Option<BackendLocation>,
+    /// Recorded on the registration so a reader learns why the copy is here.
+    origin: CopyOrigin,
 }
 
 impl PutObjectOperation {
@@ -246,7 +248,15 @@ impl PutObjectOperation {
             gated_bucket: None,
             replay_policies: Vec::new(),
             replay_location: None,
+            origin: CopyOrigin::Write,
         }
+    }
+
+    /// Why this write places a copy here. A plain client write records itself;
+    /// compute input staging names itself instead.
+    pub fn with_origin(mut self, origin: CopyOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// The destination this write is evaluated against. Omitting it leaves the
@@ -926,16 +936,19 @@ impl PutObjectOperation {
             return self.emit_error(PutObjectError::MissingOutput);
         };
         let effect = match register_effect(
-            VersionKey::new(
-                self.config.request.bucket.clone(),
-                self.config.request.key.clone(),
-                version_id,
-            ),
-            self.config.node_id,
-            &location,
-            &self.sealed_policies,
-            self.sealed_subject(),
-            version_id.timestamp_ms(),
+            CopyRegistration {
+                version: VersionKey::new(
+                    self.config.request.bucket.clone(),
+                    self.config.request.key.clone(),
+                    version_id,
+                ),
+                node_id: self.config.node_id,
+                location: &location,
+                policies: &self.sealed_policies,
+                origin: self.origin,
+                subject_generation: self.sealed_subject(),
+                registered_at_ms: version_id.timestamp_ms(),
+            },
             self.txn_id,
         ) {
             Ok(effect) => effect,
