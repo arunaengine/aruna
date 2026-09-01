@@ -24,7 +24,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "audit", description = "Audit trail reads"))
+    tags((name = "metadata/audit", description = "Audit trail reads"))
 )]
 pub struct AuditApiDoc;
 
@@ -88,8 +88,8 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
 
 #[utoipa::path(
     get,
-    path = "/audit",
-    tag = "audit",
+    path = "/metadata/audit",
+    tag = "metadata/audit",
     summary = "List a group's metadata audit trail",
     description = r#"Returns a group's metadata audit trail as a realm-wide merged page, oldest first.
 

@@ -48,9 +48,7 @@ const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "rocrate-import", description = "RO-Crate upload and import"))
-)]
+#[openapi()]
 pub struct RoCrateImportApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -121,7 +119,7 @@ pub struct SubmitImportResponse {
 #[utoipa::path(
     post,
     path = "/metadata/rocrate/uploads",
-    tag = "rocrate-import",
+    tag = "metadata/rocrate",
     summary = "Upload an RO-Crate archive for a later import",
     description = r#"Stores an RO-Crate archive privately on this node so a later import can claim it.
 
@@ -247,7 +245,7 @@ pub async fn upload_rocrate(
 #[utoipa::path(
     post,
     path = "/metadata/rocrate/imports",
-    tag = "rocrate-import",
+    tag = "metadata/rocrate",
     summary = "Submit an RO-Crate import job",
     description = r#"Accepts an RO-Crate import plan and durably records it as a job on this node.
 

@@ -37,7 +37,10 @@ use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "pid", description = "w3id persistent identifier landing and lifecycle"))
+    tags(
+        (name = "pid", description = "w3id persistent identifier landing and lifecycle"),
+        (name = "metadata/pids", description = "Persistent identifiers for metadata documents")
+    )
 )]
 pub struct PidApiDoc;
 
@@ -298,7 +301,7 @@ async fn require_status_visibility(
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}/pids",
-    tag = "pid",
+    tag = "metadata/pids",
     summary = "List a document's typed persistent identifiers",
     description = r#"Returns the one stored automatic w3id record for a document as a typed list.
 

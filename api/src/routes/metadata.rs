@@ -88,7 +88,13 @@ use std::time::Duration;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "metadata", description = "Metadata RO-Crate and SPARQL operations")),
+    tags(
+        (name = "metadata/documents", description = "Metadata document lifecycle"),
+        (name = "metadata/query", description = "Metadata search and SPARQL"),
+        (name = "metadata/references", description = "Metadata reference resolution"),
+        (name = "metadata/rocrate", description = "RO-Crate document operations"),
+        (name = "metadata/validation", description = "Metadata profile validation")
+    ),
     components(schemas(MetadataRoCrateView))
 )]
 pub struct MetadataApiDoc;
@@ -722,7 +728,7 @@ impl MetadataDocumentListItem {
 #[utoipa::path(
     post,
     path = "/metadata",
-    tag = "metadata",
+    tag = "metadata/documents",
     summary = "Create a metadata document",
     description = r#"Creates a metadata document from scaffold fields or a submitted RO-Crate.
 
@@ -943,7 +949,7 @@ pub async fn create_metadata_document(
 #[utoipa::path(
     get,
     path = "/metadata",
-    tag = "metadata",
+    tag = "metadata/documents",
     summary = "List visible metadata documents across groups",
     description = r#"Lists metadata documents from every group the caller may see.
 
@@ -1028,8 +1034,8 @@ pub async fn list_all_metadata_documents(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/metadata",
-    tag = "metadata",
+    path = "/metadata/groups/{group_id}",
+    tag = "metadata/documents",
     summary = "List a group's visible metadata documents",
     description = r#"Lists the metadata documents of one group that the caller may see.
 
@@ -1103,8 +1109,8 @@ pub async fn list_metadata_documents(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/metadata/path",
-    tag = "metadata",
+    path = "/metadata/groups/{group_id}/path",
+    tag = "metadata/documents",
     summary = "Resolve a metadata path to its winning document",
     description = r#"Resolves one normalized metadata path to its visible winning document.
 
@@ -1189,8 +1195,8 @@ pub async fn get_metadata_path(
 
 #[utoipa::path(
     get,
-    path = "/metadata/profile-validation/capabilities",
-    tag = "metadata",
+    path = "/metadata/profile/validation/capabilities",
+    tag = "metadata/validation",
     summary = "Get backend Profile validation capabilities",
     description = r#"Reports how this node compiles and evaluates registered Profile shapes.
 
@@ -1261,8 +1267,8 @@ pub async fn profile_validation_capabilities()
 
 #[utoipa::path(
     post,
-    path = "/metadata/profile-validation/preview",
-    tag = "metadata",
+    path = "/metadata/profile/validation/preview",
+    tag = "metadata/validation",
     summary = "Preview the Profile verdict for a draft",
     description = r#"Runs the Profile and structural verdict for a draft crate without storing it.
 
@@ -1345,8 +1351,8 @@ pub async fn preview_profile_validation(
 
 #[utoipa::path(
     get,
-    path = "/metadata/{document_id}/profile-validation",
-    tag = "metadata",
+    path = "/metadata/{document_id}/profile/validation",
+    tag = "metadata/validation",
     summary = "Get revision-bound Profile validation status",
     description = r#"Returns the durable validation status bound to the accepted revision.
 
@@ -1413,8 +1419,8 @@ pub async fn get_profile_validation_status(
 
 #[utoipa::path(
     post,
-    path = "/metadata/{document_id}/profile-validation/revalidate",
-    tag = "metadata",
+    path = "/metadata/{document_id}/profile/validation/revalidate",
+    tag = "metadata/validation",
     summary = "Revalidate a document against its current Profile",
     description = r#"Rebuilds the durable validation status from the current Profile revision.
 
@@ -1474,7 +1480,7 @@ pub async fn revalidate_profile(
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}",
-    tag = "metadata",
+    tag = "metadata/documents",
     summary = "Get a metadata document summary",
     description = r#"Returns the registry summary of one metadata document.
 
@@ -1542,7 +1548,7 @@ pub async fn get_metadata_document(
 #[utoipa::path(
     delete,
     path = "/metadata/{document_id}",
-    tag = "metadata",
+    tag = "metadata/documents",
     summary = "Delete a metadata document",
     description = r#"Deletes a metadata document and tombstones its RO-Crate graph.
 
@@ -1600,7 +1606,7 @@ pub async fn delete_metadata_document(
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}/rocrate",
-    tag = "metadata",
+    tag = "metadata/rocrate",
     summary = "Export a metadata document as RO-Crate",
     description = r#"Exports a metadata document as an RO-Crate in the requested view.
 
@@ -1787,7 +1793,7 @@ pub async fn export_metadata_rocrate(
 #[utoipa::path(
     post,
     path = "/metadata/{document_id}/rocrate/exports",
-    tag = "metadata",
+    tag = "metadata/rocrate",
     summary = "Submit an RO-Crate export job",
     description = r#"Submits an asynchronous job that assembles the document's RO-Crate.
 
@@ -1888,7 +1894,7 @@ pub async fn submit_rocrate_export(
 #[utoipa::path(
     put,
     path = "/metadata/{document_id}/rocrate",
-    tag = "metadata",
+    tag = "metadata/rocrate",
     summary = "Replace a document's RO-Crate",
     description = r#"Replaces a document's stored RO-Crate with the submitted crate.
 
@@ -2009,8 +2015,8 @@ pub async fn replace_metadata_rocrate(
 
 #[utoipa::path(
     post,
-    path = "/metadata/{document_id}/rocrate/data-entities",
-    tag = "metadata",
+    path = "/metadata/{document_id}/rocrate/entities/data",
+    tag = "metadata/rocrate",
     summary = "Upsert an RO-Crate data entity",
     description = r#"Adds or replaces one root-linked data entity in a document's RO-Crate.
 
@@ -2120,8 +2126,8 @@ pub async fn add_metadata_data_entity(
 
 #[utoipa::path(
     post,
-    path = "/metadata/{document_id}/rocrate/contextual-entities",
-    tag = "metadata",
+    path = "/metadata/{document_id}/rocrate/entities/contextual",
+    tag = "metadata/rocrate",
     summary = "Upsert an RO-Crate contextual entity",
     description = r#"Adds or replaces one contextual entity in a document's RO-Crate.
 
@@ -2229,7 +2235,7 @@ pub async fn add_metadata_contextual_entity(
 #[utoipa::path(
     post,
     path = "/metadata/{document_id}/sparql/query",
-    tag = "metadata",
+    tag = "metadata/query",
     summary = "Run a SPARQL query against one metadata document",
     description = r#"Runs a SPARQL query against the graph of one metadata document.
 
@@ -2358,7 +2364,7 @@ pub async fn query_metadata_document(
 #[utoipa::path(
     post,
     path = "/metadata/sparql/query",
-    tag = "metadata",
+    tag = "metadata/query",
     summary = "Run a SPARQL query across visible metadata",
     description = r#"Runs a SPARQL query over the metadata graph union the caller may read.
 
@@ -2485,7 +2491,7 @@ pub async fn query_all_metadata(
 #[utoipa::path(
     get,
     path = "/metadata/search",
-    tag = "metadata",
+    tag = "metadata/query",
     summary = "Search visible metadata documents",
     description = r#"Searches the metadata documents the caller may read, by text or Profile.
 
@@ -2636,7 +2642,7 @@ pub async fn search_metadata(
 #[utoipa::path(
     get,
     path = "/metadata/references",
-    tag = "metadata",
+    tag = "metadata/references",
     summary = "List documents referencing an IRI",
     description = r#"Lists the visible metadata documents that reference an IRI.
 
@@ -2758,7 +2764,7 @@ fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
 #[utoipa::path(
     post,
     path = "/metadata/references/preflight",
-    tag = "metadata",
+    tag = "metadata/references",
     summary = "Preflight destructive content operations against metadata backlinks",
     description = r#"Reports the metadata backlinks a destructive content operation would break.
 
@@ -4886,9 +4892,9 @@ mod tests {
 
         for (path, method) in [
             ("/metadata/{document_id}/rocrate", "put"),
-            ("/metadata/{document_id}/rocrate/data-entities", "post"),
+            ("/metadata/{document_id}/rocrate/entities/data", "post"),
             (
-                "/metadata/{document_id}/rocrate/contextual-entities",
+                "/metadata/{document_id}/rocrate/entities/contextual",
                 "post",
             ),
         ] {
@@ -4941,14 +4947,14 @@ mod tests {
                 .contains("best-effort")
         );
 
-        let data_entity_examples = openapi["paths"]["/metadata/{document_id}/rocrate/data-entities"]
+        let data_entity_examples = openapi["paths"]["/metadata/{document_id}/rocrate/entities/data"]
             ["post"]["requestBody"]["content"]["application/json"]["examples"]
             .as_object()
             .unwrap();
         assert!(data_entity_examples.contains_key("DataEntity"));
 
         let contextual_examples = openapi["paths"]
-            ["/metadata/{document_id}/rocrate/contextual-entities"]["post"]["requestBody"]
+            ["/metadata/{document_id}/rocrate/entities/contextual"]["post"]["requestBody"]
             ["content"]["application/json"]["examples"]
             .as_object()
             .unwrap();
