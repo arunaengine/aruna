@@ -1326,7 +1326,7 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     path = "/system/realm/placement",
     tag = "system/realm",
     summary = "Read the realm's placement strategies, bindings and overrides",
-    description = r#"Returns the placement policy as stored in this node's copy of the realm configuration.
+    description = r#"Returns the placement strategies as stored in this node's copy of the realm configuration.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
 management node serves the call and every other node relays it to one.
@@ -1336,8 +1336,10 @@ management node serves the call and every other node relays it to one.
   and shard count; the default strategy; the immutable job-family strategy id; the bindings that
   map a scope (the realm, a group, a document class or a metadata path prefix) to a strategy; and
   the per-subject overrides that pin or exclude individual nodes.
-- This is policy, not a placement result: it says how replicas are chosen, not where any particular
-  document currently sits.
+- Strategies place metadata records and job families. They never decide where S3 object bytes may
+  live; that is what the placement policy documents under `/data/placement/policies` do.
+- This is a rule set, not a placement result: it says how replicas are chosen, not where any
+  particular document currently sits.
 
 **Limits**
 - The strategy named by `job_family_strategy_id` cannot be removed or have its shard count
@@ -1345,7 +1347,7 @@ management node serves the call and every other node relays it to one.
     responses(
         (
             status = 200,
-            description = "The realm's placement policy as this management node has it",
+            description = "The realm's placement strategies as this management node has them",
             body = RealmPlacementConfigResponse,
             example = json!({
                 "strategies": [
@@ -1413,8 +1415,8 @@ pub async fn get_realm_placement(
     patch,
     path = "/system/realm/placement",
     tag = "system/realm",
-    summary = "Apply one change to the realm's placement policy",
-    description = r#"Applies exactly one change to the realm's placement policy and returns the whole policy.
+    summary = "Apply one change to the realm's placement strategies",
+    description = r#"Applies exactly one change to the realm's placement strategies and returns all of them.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
 management node serves the call and every other node relays it to one.
@@ -1425,7 +1427,7 @@ management node serves the call and every other node relays it to one.
   per-subject override, or provision a metadata binding for a strategy.
 - Provisioning is idempotent: an existing binding for the same scope and strategy is returned
   unchanged instead of allocating a second one.
-- The whole placement policy after the change is returned, so a client never has to re-read to learn
+- The whole strategy set after the change is returned, so a client never has to re-read to learn
   the new state.
 - The change is written to the replicated realm configuration: it is durable here when the response
   is sent and reaches the other realm nodes asynchronously. It moves no data by itself; existing
@@ -1475,7 +1477,7 @@ management node serves the call and every other node relays it to one.
     responses(
         (
             status = 200,
-            description = "The complete placement policy after the change was applied",
+            description = "The complete strategy set after the change was applied",
             body = RealmPlacementConfigResponse,
             example = json!({
                 "strategies": [
