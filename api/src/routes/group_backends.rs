@@ -31,7 +31,7 @@ use utoipa_axum::routes;
 #[derive(OpenApi)]
 #[openapi(
     tags((
-        name = "storage-backends",
+        name = "data/storage",
         description = "Tenant-registered write backends on a group's own object storage"
     ))
 )]
@@ -182,8 +182,8 @@ async fn admin_of_group(
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/storage-backends",
-    tag = "storage-backends",
+    path = "/data/groups/{group_id}/storage/backends",
+    tag = "data/storage",
     summary = "Register a storage backend for a group",
     description = r#"Registers a write backend on the group's own object storage after proving its credentials.
 
@@ -312,8 +312,8 @@ pub async fn create_group_backend(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/storage-backends",
-    tag = "storage-backends",
+    path = "/data/groups/{group_id}/storage/backends",
+    tag = "data/storage",
     summary = "List a group's storage backends",
     description = r#"Lists every storage backend the group has registered on this node.
 
@@ -383,8 +383,8 @@ pub async fn list_group_backends(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/storage-backends/{backend_id}",
-    tag = "storage-backends",
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}",
+    tag = "data/storage",
     summary = "Read one registered storage backend",
     description = r#"Returns one storage backend registration as stored on this node.
 
@@ -460,8 +460,8 @@ pub async fn get_group_backend(
 
 #[utoipa::path(
     put,
-    path = "/groups/{group_id}/storage-backends/{backend_id}",
-    tag = "storage-backends",
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}",
+    tag = "data/storage",
     summary = "Replace a storage backend registration",
     description = r#"Replaces a backend record whole, credentials included, after proving the new credentials.
 
@@ -588,8 +588,8 @@ pub async fn replace_group_backend(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{group_id}/storage-backends/{backend_id}",
-    tag = "storage-backends",
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}",
+    tag = "data/storage",
     summary = "Disable a group's storage backend",
     description = r#"Marks a group's storage backend disabled for new writes.
 
@@ -651,8 +651,8 @@ pub async fn delete_group_backend(
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/storage-backends/{backend_id}/enable",
-    tag = "storage-backends",
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}/enable",
+    tag = "data/storage",
     summary = "Re-enable a disabled storage backend",
     description = r#"Clears a backend's `disabled` flag so write routing may choose it again.
 
@@ -726,8 +726,8 @@ pub async fn enable_group_backend(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/storage-backends/{backend_id}/reclaim-status",
-    tag = "storage-backends",
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}/reclaim/status",
+    tag = "data/storage",
     summary = "Read a backend's pending reclaim work",
     description = r#"Counts the reclaim and cleanup work this node still owes one storage backend.
 

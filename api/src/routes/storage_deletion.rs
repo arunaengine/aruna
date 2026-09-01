@@ -35,7 +35,7 @@ const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
 const MAX_PREFLIGHT_LIMIT: usize = 1_000;
 
 #[derive(OpenApi)]
-#[openapi(tags((name = "storage deletion", description = "Permanent storage deletion safety")))]
+#[openapi()]
 pub struct StorageDeletionApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -171,8 +171,8 @@ pub struct SubmitPurgeResponse {
 
 #[utoipa::path(
     post,
-    path = "/storage/deletion-preflight",
-    tag = "storage deletion",
+    path = "/data/storage/deletion/preflight",
+    tag = "data/storage",
     summary = "Preview what a permanent deletion would destroy",
     description = r#"Reports the bounded inventory and consequences of permanently deleting one storage scope.
 
@@ -380,8 +380,8 @@ pub async fn deletion_preflight(
 
 #[utoipa::path(
     post,
-    path = "/storage/purge-jobs",
-    tag = "storage deletion",
+    path = "/data/storage/purge/jobs",
+    tag = "data/storage",
     summary = "Submit a permanent purge of one storage scope",
     description = r#"Queues a permanent purge of one storage scope as a job.
 

@@ -56,7 +56,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(tags((
-    name = "placement",
+    name = "data/placement",
     description = "Realm-admin administration of placement policies, bucket defaults and their application"
 )))]
 pub struct PlacementApiDoc;
@@ -586,8 +586,8 @@ async fn bucket_info(
 
 #[utoipa::path(
     post,
-    path = "/admin/placement-policies",
-    tag = "placement",
+    path = "/data/placement/policies",
+    tag = "data/placement",
     summary = "Publish an immutable placement policy",
     description = r#"Publishes an immutable placement policy definition and returns the document holders serve.
 
@@ -673,8 +673,8 @@ pub async fn create_placement_policy(
 
 #[utoipa::path(
     get,
-    path = "/admin/placement-policies/{policy_id}",
-    tag = "placement",
+    path = "/data/placement/policies/{policy_id}",
+    tag = "data/placement",
     summary = "Read one placement policy by reference",
     description = r#"Returns one authenticated placement policy document named by its id and definition digest.
 
@@ -741,8 +741,8 @@ pub async fn get_placement_policy(
 
 #[utoipa::path(
     get,
-    path = "/admin/placement-policies",
-    tag = "placement",
+    path = "/data/placement/policies",
+    tag = "data/placement",
     summary = "List the placement policies this responder holds",
     description = r#"Returns one bounded page of the placement policy documents this node holds.
 
@@ -818,8 +818,8 @@ pub struct PolicyRefQuery {
 
 #[utoipa::path(
     get,
-    path = "/buckets/{bucket}/placement",
-    tag = "placement",
+    path = "/data/buckets/{bucket}/placement",
+    tag = "data/placement",
     summary = "Read a bucket's default placement policies",
     description = r#"Returns the placement policy refs a bucket applies by default, with their generation.
 
@@ -878,8 +878,8 @@ pub async fn get_bucket_placement(
 
 #[utoipa::path(
     put,
-    path = "/buckets/{bucket}/placement",
-    tag = "placement",
+    path = "/data/buckets/{bucket}/placement",
+    tag = "data/placement",
     summary = "Replace a bucket's default placement policies",
     description = r#"Replaces the placement policy refs a bucket applies by default to newly minted versions.
 
@@ -963,8 +963,8 @@ pub async fn put_bucket_placement(
 
 #[utoipa::path(
     post,
-    path = "/buckets/{bucket}/placement/objects",
-    tag = "placement",
+    path = "/data/buckets/{bucket}/placement/objects",
+    tag = "data/placement",
     summary = "Attach an exact policy set to one object",
     description = r#"Mints a successor version of one object that carries exactly the submitted placement refs.
 
@@ -1104,8 +1104,8 @@ fn mutation_response(outcome: SuccessorOutcome) -> ObjectPlacementResponse {
 
 #[utoipa::path(
     post,
-    path = "/buckets/{bucket}/placement/runs",
-    tag = "placement",
+    path = "/data/buckets/{bucket}/placement/runs",
+    tag = "data/placement",
     summary = "Apply the bucket default to local heads",
     description = r#"Runs one resumable pass that applies the bucket's default refs to this responder's current heads.
 
@@ -1222,8 +1222,8 @@ const SCAN_DEFAULT_LIMIT: usize = 128;
 
 #[utoipa::path(
     get,
-    path = "/buckets/{bucket}/placement/coverage",
-    tag = "placement",
+    path = "/data/buckets/{bucket}/placement/coverage",
+    tag = "data/placement",
     summary = "Report responder-local coverage of the bucket default",
     description = r#"Reports how far this responder's own stored objects carry the bucket's default placement refs.
 
@@ -1374,8 +1374,8 @@ fn coverage_response(
 
 #[utoipa::path(
     get,
-    path = "/admin/placement-diagnostics",
-    tag = "placement",
+    path = "/data/placement/diagnostics",
+    tag = "data/placement",
     summary = "Inspect local policy enforcement, violations and cache coverage",
     description = r#"Reports this node's own placement subject, its policy violations and its policy cache figures.
 
@@ -1518,8 +1518,8 @@ pub struct QuarantineResolveResponse {
 
 #[utoipa::path(
     post,
-    path = "/admin/placement-quarantine",
-    tag = "placement",
+    path = "/data/placement/quarantine",
+    tag = "data/placement",
     summary = "Resolve the quarantined copies that block governed admission",
     description = r#"Revalidates or releases the quarantined copies that keep this node from admitting governed data.
 

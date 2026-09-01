@@ -26,9 +26,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "storage-routing", description = "Write routing rules for buckets and groups"))
-)]
+#[openapi()]
 pub struct StorageRoutingApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -214,8 +212,8 @@ pub(crate) async fn ensure_group_admin(
 
 #[utoipa::path(
     get,
-    path = "/buckets/{bucket}/storage-routing",
-    tag = "storage-routing",
+    path = "/data/buckets/{bucket}/storage/routing",
+    tag = "data/storage",
     summary = "Read a bucket's write routing rules",
     description = r#"Returns the write routing rules stored for a bucket on this node, in the order they were submitted.
 
@@ -293,8 +291,8 @@ pub async fn get_bucket_routing(
 
 #[utoipa::path(
     put,
-    path = "/buckets/{bucket}/storage-routing",
-    tag = "storage-routing",
+    path = "/data/buckets/{bucket}/storage/routing",
+    tag = "data/storage",
     summary = "Replace a bucket's write routing rules",
     description = r#"Replaces the whole write routing rule set of a bucket with the submitted list.
 
@@ -401,8 +399,8 @@ pub async fn put_bucket_routing(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/storage-routing",
-    tag = "storage-routing",
+    path = "/data/groups/{group_id}/storage/routing",
+    tag = "data/storage",
     summary = "Read a group's default write target",
     description = r#"Returns the default write target this node holds for a group, or none when the group never set one.
 
@@ -463,8 +461,8 @@ pub async fn get_group_routing(
 
 #[utoipa::path(
     put,
-    path = "/groups/{group_id}/storage-routing",
-    tag = "storage-routing",
+    path = "/data/groups/{group_id}/storage/routing",
+    tag = "data/storage",
     summary = "Set or clear a group's default write target",
     description = r#"Replaces the group's default write target, or clears it when no target is submitted.
 
@@ -753,8 +751,8 @@ pub(crate) mod tests {
     fn openapi_lists_routes() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
-        assert!(openapi["paths"]["/buckets/{bucket}/storage-routing"]["put"].is_object());
-        assert!(openapi["paths"]["/groups/{group_id}/storage-routing"]["put"].is_object());
+        assert!(openapi["paths"]["/data/buckets/{bucket}/storage/routing"]["put"].is_object());
+        assert!(openapi["paths"]["/data/groups/{group_id}/storage/routing"]["put"].is_object());
         assert!(
             openapi["components"]["schemas"]["BucketRoutingResponse"]["properties"]
                 .get("warnings")

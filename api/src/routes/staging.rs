@@ -55,7 +55,7 @@ use utoipa_axum::routes;
 #[derive(OpenApi)]
 #[openapi(
     tags((
-        name = "staging",
+        name = "data/staging",
         description = "Staging source objects into buckets, inline or as background jobs"
     ))
 )]
@@ -248,8 +248,8 @@ pub struct StagingJobListResponse {
 
 #[utoipa::path(
     post,
-    path = "/staging/",
-    tag = "staging",
+    path = "/data/staging",
+    tag = "data/staging",
     summary = "Stage a single source object into a bucket",
     description = r#"Stages one source object into a bucket, either by copying its bytes now or by recording a pointer.
 
@@ -328,8 +328,8 @@ pub async fn stage_blob(
 
 #[utoipa::path(
     post,
-    path = "/staging/batch",
-    tag = "staging",
+    path = "/data/staging/batch",
+    tag = "data/staging",
     summary = "Stage many source objects in one blocking request",
     description = r#"Stages many source objects inside one request, reporting the outcome of each separately.
 
@@ -518,8 +518,8 @@ pub async fn stage_batch(
 
 #[utoipa::path(
     post,
-    path = "/staging/jobs",
-    tag = "staging",
+    path = "/data/staging/jobs",
+    tag = "data/staging",
     summary = "Submit a background staging job",
     description = r#"Records a staging batch as a durable job on this node and returns before any object is read.
 
@@ -696,8 +696,8 @@ pub async fn submit_staging(
 
 #[utoipa::path(
     get,
-    path = "/staging/jobs",
-    tag = "staging",
+    path = "/data/staging/jobs",
+    tag = "data/staging",
     summary = "List your staging jobs on this node",
     description = r#"Returns one page of the calling user's own staging jobs that this node owns, oldest first.
 
@@ -786,8 +786,8 @@ pub async fn list_staging_jobs(
 
 #[utoipa::path(
     get,
-    path = "/staging/jobs/{job_id}",
-    tag = "staging",
+    path = "/data/staging/jobs/{job_id}",
+    tag = "data/staging",
     summary = "Read one staging job and its progress",
     description = r#"Returns one staging job as the node that owns it currently records it, with its progress.
 
@@ -874,8 +874,8 @@ pub async fn get_staging_job(
 
 #[utoipa::path(
     get,
-    path = "/staging/references",
-    tag = "staging",
+    path = "/data/staging/references",
+    tag = "data/staging",
     summary = "List a bucket's objects with their source bindings",
     description = r#"Lists a bucket's live objects in key order, saying for each whether it is stored here or referenced.
 
@@ -2003,9 +2003,9 @@ mod tests {
     fn openapi_includes_staging_path() {
         let openapi = ApiDoc::openapi();
 
-        assert!(openapi.paths.paths.contains_key("/staging/"));
-        assert!(openapi.paths.paths.contains_key("/staging/batch"));
-        assert!(openapi.paths.paths.contains_key("/staging/references"));
+        assert!(openapi.paths.paths.contains_key("/data/staging"));
+        assert!(openapi.paths.paths.contains_key("/data/staging/batch"));
+        assert!(openapi.paths.paths.contains_key("/data/staging/references"));
         assert!(!openapi.paths.paths.contains_key("/blobs/staging"));
     }
 

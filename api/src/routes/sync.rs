@@ -46,7 +46,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "sync", description = "S3 bucket synchronization"))
+    tags((name = "data/sync", description = "S3 bucket synchronization"))
 )]
 pub struct SyncApiDoc;
 
@@ -223,8 +223,8 @@ pub struct SyncListParams {
 
 #[utoipa::path(
     post,
-    path = "/data/sync-relationships",
-    tag = "sync",
+    path = "/data/sync/relationships",
+    tag = "data/sync",
     summary = "Create a bucket sync relationship",
     description = r#"Creates a bucket sync relationship from this node to a bucket on a target node.
 
@@ -439,8 +439,8 @@ pub async fn create_sync(
 
 #[utoipa::path(
     get,
-    path = "/data/sync-relationships",
-    tag = "sync",
+    path = "/data/sync/relationships",
+    tag = "data/sync",
     summary = "List the sync relationships held on this node",
     description = r#"Lists the caller's own sync relationships held on this node, split by direction.
 
@@ -559,8 +559,8 @@ pub async fn list_sync(
 
 #[utoipa::path(
     get,
-    path = "/data/sync-relationships/{id}",
-    tag = "sync",
+    path = "/data/sync/relationships/{id}",
+    tag = "data/sync",
     summary = "Read one sync relationship and its progress",
     description = r#"Reads one sync relationship with this node's replication progress for it.
 
@@ -640,8 +640,8 @@ pub async fn get_sync(
 
 #[utoipa::path(
     patch,
-    path = "/data/sync-relationships/{id}",
-    tag = "sync",
+    path = "/data/sync/relationships/{id}",
+    tag = "data/sync",
     summary = "Change how a relationship handles referenced objects",
     description = r#"Changes how an existing sync relationship handles referenced objects.
 
@@ -773,8 +773,8 @@ pub async fn update_sync(
 
 #[utoipa::path(
     post,
-    path = "/data/sync-relationships/{id}/run",
-    tag = "sync",
+    path = "/data/sync/relationships/{id}/run",
+    tag = "data/sync",
     summary = "Trigger a backfill run of an existing relationship",
     description = r#"Queues one backfill run over the whole scope of an existing relationship.
 
@@ -850,8 +850,8 @@ pub async fn run_sync(
 
 #[utoipa::path(
     delete,
-    path = "/data/sync-relationships/{id}",
-    tag = "sync",
+    path = "/data/sync/relationships/{id}",
+    tag = "data/sync",
     summary = "Delete a sync relationship",
     description = r#"Deletes one end of a sync relationship from the node that holds it.
 

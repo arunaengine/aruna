@@ -27,9 +27,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "sync-quarantine", description = "Rejected replicated sync events"))
-)]
+#[openapi()]
 pub struct SyncQuarantineApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -178,8 +176,8 @@ fn event_summary(event: &DocumentSyncEvent) -> String {
 
 #[utoipa::path(
     get,
-    path = "/admin/sync-quarantine",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine",
+    tag = "data/sync",
     summary = "List rejected sync events held on this node",
     description = r#"Realm-admin evidence console over the replicated sync events this node refused.
 
@@ -264,8 +262,8 @@ pub async fn list_quarantine(
 
 #[utoipa::path(
     get,
-    path = "/admin/sync-quarantine/{record_id}",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine/{record_id}",
+    tag = "data/sync",
     summary = "Inspect one rejected sync event",
     description = r#"Reads one retained row and a summary of the envelope it carried.
 
@@ -337,8 +335,8 @@ pub async fn inspect_quarantine(
 
 #[utoipa::path(
     post,
-    path = "/admin/sync-quarantine/{record_id}/acknowledge",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine/{record_id}/acknowledge",
+    tag = "data/sync",
     summary = "Acknowledge one piece of quarantine evidence",
     description = r#"Marks a retained row as seen by an operator, the only thing that makes it prunable.
 
@@ -400,8 +398,8 @@ pub async fn acknowledge_quarantine(
 
 #[utoipa::path(
     delete,
-    path = "/admin/sync-quarantine",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine",
+    tag = "data/sync",
     summary = "Prune acknowledged quarantine evidence",
     description = r#"Runs one bounded sweep over this node's evidence and deletes the acknowledged rows it scanned.
 

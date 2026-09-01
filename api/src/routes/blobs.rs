@@ -35,7 +35,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "blobs", description = "Blob management and replication"))
+    tags((name = "data/blobs", description = "Blob management and replication"))
 )]
 pub struct BlobsApiDoc;
 
@@ -95,8 +95,8 @@ async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketIn
 
 #[utoipa::path(
     post,
-    path = "/blobs/replicate",
-    tag = "blobs",
+    path = "/data/blobs/replicate",
+    tag = "data/blobs",
     summary = "Queue a replication copy onto another node",
     description = r#"Durably queues replication of a bucket, object or version onto another node.
 
@@ -368,8 +368,8 @@ fn copy_response(
 
 #[utoipa::path(
     get,
-    path = "/blobs/locations",
-    tag = "blobs",
+    path = "/data/blobs/locations",
+    tag = "data/blobs",
     summary = "List the nodes holding one object version",
     description = r#"Lists every node that holds or is expected to hold one object version.
 
@@ -939,7 +939,7 @@ mod tests {
     fn openapi_lists_locations() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
-        assert!(openapi["paths"].get("/blobs/locations").is_some());
+        assert!(openapi["paths"].get("/data/blobs/locations").is_some());
         assert!(
             openapi["components"]["schemas"]["LocationScanLimit"]["enum"]
                 .as_array()
@@ -968,7 +968,7 @@ mod tests {
     fn openapi_includes_replicate_blob_response_schema() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
-        assert!(openapi["paths"].get("/blobs/replicate").is_some());
+        assert!(openapi["paths"].get("/data/blobs/replicate").is_some());
         assert!(
             openapi["components"]["schemas"]["ReplicateBlobResponse"]["properties"]
                 .get("bucket")

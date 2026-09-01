@@ -53,7 +53,7 @@ const MAX_ENTRY_LIMIT: usize = 1000;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "connectors", description = "External source connector registration"))
+    tags((name = "data/connectors", description = "External source connector registration"))
 )]
 pub struct ConnectorsApiDoc;
 
@@ -208,8 +208,8 @@ pub struct ListSourceConnectorsResponse {
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/connectors",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors",
+    tag = "data/connectors",
     summary = "Register a source connector for a group",
     description = r#"Registers an external source connector for a group and stores its credentials write-only.
 
@@ -326,8 +326,8 @@ pub async fn create_source_connector(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/connectors",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors",
+    tag = "data/connectors",
     summary = "List a group's source connectors",
     description = r#"Returns every source connector the group has registered on this node.
 
@@ -407,8 +407,8 @@ pub async fn list_source_connectors(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/connectors/{connector_id}",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
     summary = "Read one source connector",
     description = r#"Returns one stored connector with its name, kind and public configuration.
 
@@ -496,8 +496,8 @@ pub async fn get_source_connector(
 
 #[utoipa::path(
     put,
-    path = "/groups/{group_id}/connectors/{connector_id}",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
     summary = "Replace a source connector's settings and credentials",
     description = r#"Replaces a stored connector's name, kind, public configuration and credentials in full.
 
@@ -623,8 +623,8 @@ pub async fn replace_source_connector(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{group_id}/connectors/{connector_id}",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
     summary = "Delete a source connector",
     description = r#"Removes a source connector record and its stored credentials together.
 
@@ -700,8 +700,8 @@ pub async fn delete_source_connector(
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/connectors/check",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/check",
+    tag = "data/connectors",
     summary = "Test connector settings without registering them",
     description = r#"Probes a candidate connector definition and reports whether the source answered.
 
@@ -808,8 +808,8 @@ pub async fn check_source_connector(
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/connectors/{connector_id}/check",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}/check",
+    tag = "data/connectors",
     summary = "Test a registered connector's stored settings",
     description = r#"Probes a registered connector with its stored credentials and reports the outcome.
 
@@ -900,8 +900,8 @@ pub async fn check_stored_connector(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/connectors/{connector_id}/entries",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}/entries",
+    tag = "data/connectors",
     summary = "Browse the entries under a connector path",
     description = r#"Lists one level below a path at the connector's source, using its stored credentials.
 
@@ -1541,27 +1541,27 @@ mod tests {
 
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors")
+                .get("/data/groups/{group_id}/connectors")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/{connector_id}")
+                .get("/data/groups/{group_id}/connectors/{connector_id}")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/check")
+                .get("/data/groups/{group_id}/connectors/check")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/{connector_id}/check")
+                .get("/data/groups/{group_id}/connectors/{connector_id}/check")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/{connector_id}/entries")
+                .get("/data/groups/{group_id}/connectors/{connector_id}/entries")
                 .is_some()
         );
         assert_eq!(
