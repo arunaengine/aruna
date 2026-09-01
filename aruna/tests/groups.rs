@@ -14,7 +14,7 @@ use ulid::Ulid;
 
 async fn get_members(base_url: &str, token: &str, group_id: &str) -> TestResult<reqwest::Response> {
     Ok(reqwest::Client::new()
-        .get(format!("{base_url}/api/v1/groups/{group_id}/members"))
+        .get(format!("{base_url}/api/v1/access/groups/{group_id}/members"))
         .bearer_auth(token)
         .send()
         .await?)
@@ -42,7 +42,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
     let everyone = UserId::nil(seed.realm_id);
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/api/v1/groups/{}/members",
+            "{}/api/v1/access/groups/{}/members",
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)
@@ -70,7 +70,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
     // Admin invites the member with the default "user" role.
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/api/v1/groups/{}/members",
+            "{}/api/v1/access/groups/{}/members",
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)
@@ -100,7 +100,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
     // The member leaves again.
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/api/v1/groups/{}/leave",
+            "{}/api/v1/access/groups/{}/leave",
             seed.base_url, group.group_id
         ))
         .bearer_auth(&member_token)
@@ -116,7 +116,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
     // The last admin cannot leave their own group.
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/api/v1/groups/{}/leave",
+            "{}/api/v1/access/groups/{}/leave",
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)
@@ -144,7 +144,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 
     // A permission path outside the group is privilege escalation.
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/groups/{group_id}/roles", seed.base_url))
+        .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
         .bearer_auth(&admin_token)
         .json(&CreateGroupRoleRequest {
             name: "escalation".to_string(),
@@ -158,7 +158,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 
     for permission in ["write", "deny"] {
         let response = reqwest::Client::new()
-            .post(format!("{}/api/v1/groups/{group_id}/roles", seed.base_url))
+            .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
             .bearer_auth(&admin_token)
             .json(&CreateGroupRoleRequest {
                 name: format!("public-{permission}"),
@@ -175,7 +175,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
     }
 
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/groups/{group_id}/roles", seed.base_url))
+        .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
         .bearer_auth(&admin_token)
         .json(&CreateGroupRoleRequest {
             name: "nil-assigned-user".to_string(),
@@ -192,7 +192,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 
     // A valid scoped role can be created and deleted.
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/groups/{group_id}/roles", seed.base_url))
+        .post(format!("{}/api/v1/access/groups/{group_id}/roles", seed.base_url))
         .bearer_auth(&admin_token)
         .json(&CreateGroupRoleRequest {
             name: "data-reader".to_string(),
@@ -211,7 +211,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 
     let response = reqwest::Client::new()
         .delete(format!(
-            "{}/api/v1/groups/{group_id}/roles/{}",
+            "{}/api/v1/access/groups/{group_id}/roles/{}",
             seed.base_url, role.role_id
         ))
         .bearer_auth(&admin_token)
@@ -223,7 +223,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
     let admin_role_id = role_by_name(&group.roles, "admin").role_id.clone();
     let response = reqwest::Client::new()
         .delete(format!(
-            "{}/api/v1/groups/{group_id}/roles/{admin_role_id}",
+            "{}/api/v1/access/groups/{group_id}/roles/{admin_role_id}",
             seed.base_url
         ))
         .bearer_auth(&admin_token)
@@ -257,7 +257,7 @@ async fn open_group_endpoints_hide_member_lists_from_non_members() -> TestResult
 
     let response = reqwest::Client::new()
         .get(format!(
-            "{}/api/v1/groups/{}",
+            "{}/api/v1/access/groups/{}",
             seed.base_url, group.group_id
         ))
         .bearer_auth(&outsider_token)
@@ -271,7 +271,7 @@ async fn open_group_endpoints_hide_member_lists_from_non_members() -> TestResult
     // Members keep seeing the assignments.
     let response = reqwest::Client::new()
         .get(format!(
-            "{}/api/v1/groups/{}",
+            "{}/api/v1/access/groups/{}",
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)

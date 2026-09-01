@@ -27,7 +27,7 @@ async fn admin_job_flow() -> TestResult<()> {
         let group = create_group_via_http(&seed.base_url, &bearer, "job-api-flow").await?;
         let client = reqwest::Client::new();
 
-        let config_url = format!("{}/api/v1/admin/compute/config", seed.base_url);
+        let config_url = format!("{}/api/v1/compute/config", seed.base_url);
         let mut config = response_json(
             client.get(&config_url).bearer_auth(&bearer).send().await?,
             StatusCode::OK,
@@ -53,7 +53,7 @@ async fn admin_job_flow() -> TestResult<()> {
         assert_eq!(stored["default_group_quota"]["max_jobs"], 4);
 
         let snapshots_url = format!(
-            "{}/api/v1/admin/compute/snapshots?group_id={}",
+            "{}/api/v1/compute/snapshots?group_id={}",
             seed.base_url, group.group_id
         );
         let snapshots = response_json(
@@ -70,7 +70,7 @@ async fn admin_job_flow() -> TestResult<()> {
 
         let invalid_snapshots = client
             .get(format!(
-                "{}/api/v1/admin/compute/snapshots?group_id=invalid",
+                "{}/api/v1/compute/snapshots?group_id=invalid",
                 seed.base_url
             ))
             .bearer_auth(&bearer)
@@ -78,7 +78,7 @@ async fn admin_job_flow() -> TestResult<()> {
             .await?;
         assert_eq!(invalid_snapshots.status(), StatusCode::BAD_REQUEST);
 
-        let drain_url = format!("{}/api/v1/admin/compute/drain", seed.base_url);
+        let drain_url = format!("{}/api/v1/compute/drain", seed.base_url);
         let drained = response_json(
             client
                 .post(&drain_url)
@@ -112,7 +112,7 @@ async fn admin_job_flow() -> TestResult<()> {
             "idempotency_key": "single-node-job-api-flow",
             "workspace": {"mode": "temporary"}
         });
-        let jobs_url = format!("{}/api/v1/jobs/", seed.base_url);
+        let jobs_url = format!("{}/api/v1/compute/jobs", seed.base_url);
         let submitted = response_json(
             client
                 .post(&jobs_url)
@@ -164,7 +164,7 @@ async fn admin_job_flow() -> TestResult<()> {
             .await?;
         assert_eq!(invalid_list.status(), StatusCode::BAD_REQUEST);
 
-        let status_url = format!("{}/api/v1/jobs/{job_id}", seed.base_url);
+        let status_url = format!("{}/api/v1/compute/jobs/{job_id}", seed.base_url);
         let status = response_json(
             client.get(&status_url).bearer_auth(&bearer).send().await?,
             StatusCode::OK,

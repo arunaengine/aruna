@@ -304,7 +304,7 @@ async fn submission_is_idempotent() {
     assert!(first.created);
     assert_eq!(
         first.status_url,
-        format!("https://node.test/api/v1/jobs/{}", first.job_id)
+        format!("https://node.test/api/v1/compute/jobs/{}", first.job_id)
     );
 
     let (status, Json(replayed)) = submit_purge(

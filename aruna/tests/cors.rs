@@ -20,7 +20,7 @@ async fn rest_preflight_and_actual_requests_carry_cors_headers() -> TestResult<(
     let preflight = client
         .request(
             reqwest::Method::OPTIONS,
-            format!("{}/api/v1/info", seed.base_url),
+            format!("{}/api/v1/system/info", seed.base_url),
         )
         .header(header::ORIGIN, TEST_CORS_ORIGIN)
         .header("access-control-request-method", "GET")
@@ -44,7 +44,7 @@ async fn rest_preflight_and_actual_requests_carry_cors_headers() -> TestResult<(
     assert!(allow_headers.contains("authorization"));
 
     let actual = client
-        .get(format!("{}/api/v1/info", seed.base_url))
+        .get(format!("{}/api/v1/system/info", seed.base_url))
         .header(header::ORIGIN, TEST_CORS_ORIGIN)
         .send()
         .await?;
@@ -58,7 +58,7 @@ async fn rest_preflight_and_actual_requests_carry_cors_headers() -> TestResult<(
     );
 
     let denied = client
-        .get(format!("{}/api/v1/info", seed.base_url))
+        .get(format!("{}/api/v1/system/info", seed.base_url))
         .header(header::ORIGIN, DISALLOWED_ORIGIN)
         .send()
         .await?;

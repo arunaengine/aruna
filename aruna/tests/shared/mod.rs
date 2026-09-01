@@ -386,7 +386,7 @@ pub(crate) async fn create_group_via_http(
 ) -> TestResult<CreateGroupResponse> {
     // One request must succeed: the operation retries storage conflicts itself.
     let response = reqwest::Client::new()
-        .post(format!("{base_url}/api/v1/groups"))
+        .post(format!("{base_url}/api/v1/access/groups"))
         .bearer_auth(bearer_token)
         .json(&CreateGroupRequest {
             name: name.to_string(),
@@ -410,7 +410,7 @@ pub(crate) async fn get_group_via_http(
     group_id: &str,
 ) -> TestResult<GroupInfoResponse> {
     let response = reqwest::Client::new()
-        .get(format!("{base_url}/api/v1/groups/{group_id}"))
+        .get(format!("{base_url}/api/v1/access/groups/{group_id}"))
         .bearer_auth(bearer_token)
         .send()
         .await?;
@@ -467,7 +467,7 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
     let mut interval = Duration::from_millis(100);
     loop {
         let response = client
-            .post(format!("{base_url}/api/v1/users/credentials"))
+            .post(format!("{base_url}/api/v1/access/credentials"))
             .bearer_auth(bearer_token)
             .json(&CreateS3CredentialsRequest {
                 group_id: group_id.to_string(),
@@ -505,7 +505,7 @@ pub(crate) async fn revoke_s3_credentials_via_http(
 ) -> TestResult<()> {
     let response = reqwest::Client::new()
         .delete(format!(
-            "{base_url}/api/v1/users/credentials/{access_key_id}"
+            "{base_url}/api/v1/access/credentials/{access_key_id}"
         ))
         .bearer_auth(bearer_token)
         .send()
@@ -585,7 +585,7 @@ pub(crate) async fn create_onboarding_secret_via_http(
     .await?;
 
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/admin/onboarding/secrets", seed.base_url))
+        .post(format!("{}/api/v1/access/onboarding/secrets", seed.base_url))
         .bearer_auth(token)
         .json(&CreateOnboardingSecretRequest {
             seed_url: seed.base_url.clone(),

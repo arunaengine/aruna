@@ -50,7 +50,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         let http = reqwest::Client::new();
         let add_member = http
             .post(format!(
-                "{}/api/v1/groups/{}/members",
+                "{}/api/v1/access/groups/{}/members",
                 seed.base_url, credential_group.group_id
             ))
             .bearer_auth(&bearer_token)
@@ -146,7 +146,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         let permissions = std::collections::HashMap::from([(public_path.clone(), "read")]);
         let created = http
             .post(format!(
-                "{}/api/v1/groups/{}/roles",
+                "{}/api/v1/access/groups/{}/roles",
                 seed.base_url, group.group_id
             ))
             .bearer_auth(&bearer_token)

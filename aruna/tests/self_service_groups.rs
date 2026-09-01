@@ -10,7 +10,7 @@ use ulid::Ulid;
 
 async fn post_group(base_url: &str, token: &str, name: &str) -> TestResult<reqwest::Response> {
     Ok(reqwest::Client::new()
-        .post(format!("{base_url}/api/v1/groups"))
+        .post(format!("{base_url}/api/v1/access/groups"))
         .bearer_auth(token)
         .json(&CreateGroupRequest {
             name: name.to_string(),

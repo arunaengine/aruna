@@ -26,7 +26,7 @@ async fn post_credentials(
     path_restrictions: Option<Vec<CreateS3PathRestriction>>,
 ) -> TestResult<reqwest::Response> {
     Ok(reqwest::Client::new()
-        .post(format!("{base_url}/api/v1/users/credentials"))
+        .post(format!("{base_url}/api/v1/access/credentials"))
         .bearer_auth(bearer_token)
         .json(
             &aruna_api::routes::credentials::CreateS3CredentialsRequest {
