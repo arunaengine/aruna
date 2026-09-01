@@ -64,19 +64,21 @@ pub struct S3SessionResponse {
 
 #[utoipa::path(
     post,
-    path = "/users/s3-sessions",
-    tag = "credentials",
+    path = "/access/s3/sessions",
+    tag = "access/credentials",
     summary = "Exchange a bearer token for an S3 session",
     description = r#"Issues a short-lived, node-local S3 session for an explicitly selected group.
 
-**Authentication**: bearer token issued for this realm, explicit membership in the requested group,
-and WRITE capability under the effective bearer restrictions on that group's node-local data path.
+**Authentication**: realm bearer token, membership in the requested group, and WRITE under the
+effective token restrictions on that group's data path.
 
 **Behavior**
 - The group is always taken from `group_id` and is never inferred from membership order.
 - The returned access key, signing secret and session token are accepted only by the issuing node.
-- Expiry is the earlier of one hour from issuance and the current bearer expiry.
-- Sessions are stored outside the long-lived credential list and limit.
+- Sessions are stored outside the long-lived credential list and its limit.
+
+**Limits**
+- Expiry is the earlier of one hour from issuance and the bearer token's own expiry.
 - At most four sessions are kept per user and group; a further exchange evicts the oldest one."#,
     request_body(
         content = CreateS3SessionRequest,
@@ -88,7 +90,7 @@ and WRITE capability under the effective bearer restrictions on that group's nod
     responses(
         (
             status = 201,
-            description = "A new node-local temporary S3 session; the secret and token are redacted here and returned in full to the caller",
+            description = "A new node-local S3 session; the secret and token are redacted in this example and returned in full to the caller",
             body = S3SessionResponse,
             example = json!({
                 "access_key_id": "ARUNASESSION0123456789AB",
@@ -111,8 +113,8 @@ and WRITE capability under the effective bearer restrictions on that group's nod
             })
         ),
         (status = 400, description = "group_id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "The bearer token is absent, invalid, expired, or has no remaining lifetime", body = ErrorResponse),
-        (status = 403, description = "The caller is not a group member or lacks effective WRITE capability", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token, or one with no remaining lifetime", body = ErrorResponse),
+        (status = 403, description = "The caller is not a member of the group, or lacks effective WRITE on its data path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -153,25 +155,27 @@ pub async fn create_s3_session(
 
 #[utoipa::path(
     post,
-    path = "/users/s3-sessions/{access_key_id}/refresh",
-    tag = "credentials",
+    path = "/access/s3/sessions/{access_key_id}/refresh",
+    tag = "access/credentials",
     summary = "Rotate an active S3 session",
     description = r#"Rotates the secret and session token of an active S3 session inside its refresh window.
 
-**Authentication**: the owning bearer identity must remain a member of the session's group with
-effective WRITE capability.
+**Authentication**: realm bearer token of the session's owner, who must still be a member of the
+session's group with effective WRITE on its data path.
 
 **Behavior**
-- Refresh is accepted at or after five minutes before expiry, and only when this session has
-  completed an authenticated S3 request since its last issuance.
-- It keeps the access key id, rotates the signing secret and session token in place, and resets
-  activity for the next cycle.
-- The new expiry is capped by the current bearer."#,
-    params(("access_key_id" = String, Path, description = "Temporary access key returned by the session exchange")),
+- The access key id is kept while the signing secret and session token are rotated in place, so the
+  previous pair stops working.
+- Activity is reset for the next cycle, and the new expiry is capped by the bearer token's own.
+
+**Limits**
+- Refresh is accepted at or after five minutes before expiry, and only when the session has
+  completed an authenticated S3 request since its last issuance."#,
+    params(("access_key_id" = String, Path, description = "Access key id returned by the session exchange")),
     responses(
         (
             status = 200,
-            description = "The same session id with rotated temporary secret and token, redacted here",
+            description = "The same access key id with a rotated secret and session token, redacted in this example",
             body = S3SessionResponse,
             example = json!({
                 "access_key_id": "ARUNASESSION0123456789AB",
@@ -193,9 +197,9 @@ effective WRITE capability.
                 }
             })
         ),
-        (status = 401, description = "The bearer token is absent, invalid, expired, or has no remaining lifetime", body = ErrorResponse),
-        (status = 403, description = "The caller is no longer a group member or lacks effective WRITE capability", body = ErrorResponse),
-        (status = 404, description = "The session is absent, purged, foreign, or belongs to another user", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token, or one with no remaining lifetime", body = ErrorResponse),
+        (status = 403, description = "The caller is no longer a member of the group, or lacks effective WRITE on its data path", body = ErrorResponse),
+        (status = 404, description = "Session not found on this node, or it belongs to another user", body = ErrorResponse),
         (status = 409, description = "The session is idle, expired, or not yet in its refresh window", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

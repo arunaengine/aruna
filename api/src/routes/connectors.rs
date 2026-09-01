@@ -53,7 +53,7 @@ const MAX_ENTRY_LIMIT: usize = 1000;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "connectors", description = "External source connector registration"))
+    tags((name = "data/connectors", description = "External source connector registration"))
 )]
 pub struct ConnectorsApiDoc;
 
@@ -208,21 +208,18 @@ pub struct ListSourceConnectorsResponse {
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/connectors",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors",
+    tag = "data/connectors",
     summary = "Register a source connector for a group",
     description = r#"Registers an external source connector for a group and stores its credentials write-only.
 
-**Authentication**: realm bearer token with WRITE on the group's data path; a caller lacking that
-permission and a caller naming a group that does not exist both receive 403.
+**Authentication**: realm bearer token with WRITE on the group's data path.
 
 **Behavior**
-- `secret_config` is write-only: the credentials are stored apart from the connector record and are
-  never returned by any endpoint, so a reader only learns from `has_secret_config` whether any are
-  stored.
-- Nothing is contacted here, so a successful registration is no evidence that the credentials work
-  or that the host is reachable, and an endpoint resolving to a blocked address is only refused when
-  the connector is used.
+- `secret_config` is write-only: no endpoint returns it, and a reader only learns from
+  `has_secret_config` whether any credentials are stored.
+- Nothing is contacted here, so a registration proves neither that the credentials work nor that the
+  endpoint is reachable; an endpoint the egress guard blocks is only refused at use.
 - The record is written on the node that serves the request and is not replicated to the realm's
   other nodes.
 
@@ -234,14 +231,11 @@ permission and a caller naming a group that does not exist both receive 403.
   which in turn forbids any secret.
 - `ftp` and `aruna_native` are refused outright.
 - An unknown or empty config key, an endpoint the HTTP client would parse differently than it is
-  written, and a bucket containing a path or authority separator are refused as well.
-
-**Errors**: the 400 body states only that the request was bad, without the reason; the connector
-check operation reports the reason."#,
+  written, and a bucket containing a path or authority separator are refused as well."#,
     params(("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID")),
     request_body(
         content = CreateSourceConnectorRequest,
-        description = "Connector name, kind, the public configuration for that kind, and the write-only credentials; `secret_config` may be omitted for a source that needs none",
+        description = "Connector definition; `secret_config` may be omitted for a source that needs no credentials",
         example = json!({
             "name": "reference-data",
             "kind": "s3",
@@ -259,7 +253,7 @@ check operation reports the reason."#,
     responses(
         (
             status = 201,
-            description = "Connector registered; the stored credentials are not echoed back",
+            description = "Connector registered; the stored credentials are never echoed back",
             body = SourceConnectorResponse,
             example = json!({
                 "connector_id": "01JCNCTR0123456789ABCDEFGH",
@@ -279,13 +273,13 @@ check operation reports the reason."#,
         ),
         (
             status = 400,
-            description = "The group id is not a ULID, or the name, kind or configuration failed validation",
+            description = "The group id is not a ULID, or the name, kind or configuration failed validation; the body names no reason",
             body = ErrorResponse
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no WRITE on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
             body = ErrorResponse
         )
     ),
@@ -326,19 +320,17 @@ pub async fn create_source_connector(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/connectors",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors",
+    tag = "data/connectors",
     summary = "List a group's source connectors",
     description = r#"Returns every source connector the group has registered on this node.
 
-**Authentication**: realm bearer token with READ on the group's data path; a caller lacking that
-permission and a caller naming a group that does not exist both receive 403.
+**Authentication**: realm bearer token with READ on the group's data path.
 
 **Behavior**
-- Connectors are ordered by connector id and therefore by registration time, and are returned in a
-  single response: there is no paging, no cursor and no limit.
-- Credentials are never included; `has_secret_config` is resolved per connector and only states
-  whether any are stored.
+- Connectors are ordered by connector id and therefore by registration time, and are returned in one
+  response: there is no paging, no cursor and no limit.
+- Credentials are never included; `has_secret_config` only states whether any are stored.
 - This is the node's own view, so a connector registered against another node of the realm is not
   listed here."#,
     params(("group_id" = String, Path, description = "Group whose connectors are listed, as a 26-character ULID")),
@@ -367,10 +359,10 @@ permission and a caller naming a group that does not exist both receive 403.
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no READ on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
             body = ErrorResponse
         )
     ),
@@ -407,18 +399,17 @@ pub async fn list_source_connectors(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/connectors/{connector_id}",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
     summary = "Read one source connector",
     description = r#"Returns one stored connector with its name, kind and public configuration.
 
 **Authentication**: realm bearer token with READ on the group's data path.
 
 **Behavior**
-- The connector is looked up under the group in the path, so a connector id that belongs to a
-  different group reads as not found rather than as forbidden.
-- The credentials are never returned and `has_secret_config` is the only thing a reader learns about
-  them.
+- The connector is looked up under the group in the path, so a connector id belonging to a different
+  group reads as not found rather than as forbidden.
+- Credentials are never returned; `has_secret_config` is all a reader learns about them.
 - Reads this node's own records, so a connector registered against another node of the realm is not
   found here."#,
     params(
@@ -451,10 +442,10 @@ pub async fn list_source_connectors(
             description = "The group id or the connector id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no READ on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
             body = ErrorResponse
         ),
         (
@@ -496,38 +487,32 @@ pub async fn get_source_connector(
 
 #[utoipa::path(
     put,
-    path = "/groups/{group_id}/connectors/{connector_id}",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
     summary = "Replace a source connector's settings and credentials",
     description = r#"Replaces a stored connector's name, kind, public configuration and credentials in full.
 
 **Authentication**: realm bearer token with WRITE on the group's data path.
 
 **Behavior**
-- This is a full replacement, not a patch: name, kind, public configuration and credentials are all
-  taken from the request, so credentials that are not sent again are deleted, and after a request
-  without `secret_config` the connector has none and `has_secret_config` reads false.
+- This is a full replacement, not a patch: credentials that are not sent again are deleted, so after
+  a request without `secret_config` the connector has none and `has_secret_config` reads false.
 - The connector id, the owning group, the creation time and the creator are preserved and the update
   time is refreshed.
-- Changing only the name or the public configuration is allowed even while stored object versions
-  still reference the credentials.
+- Changing the credentials is refused while a stored object version still references them, so a
+  reference always resolves with the credentials it was created against; the name and the public
+  configuration may still change.
 - Nothing is contacted, so a successful replace does not prove that the new credentials work.
 
 **Limits**
-- The same validation rules as registration apply.
-- Changing the credentials is refused while any stored object version still references them, so that
-  a reference can always be resolved with the credentials it was created against.
-
-**Errors**: the 400 body again states only that the request was bad, without the reason. The refusal
-to change referenced credentials is a 409 and stays one until the referencing versions are gone, so
-it is not worth retrying unchanged."#,
+- The same validation rules as registration apply."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to replace, as a 26-character ULID")
     ),
     request_body(
         content = ReplaceSourceConnectorRequest,
-        description = "The complete new connector definition; every field replaces the stored one, and an omitted or empty `secret_config` clears the stored credentials",
+        description = "The complete new connector definition; an omitted or empty `secret_config` clears the stored credentials",
         example = json!({
             "name": "reference-data",
             "kind": "s3",
@@ -565,13 +550,13 @@ it is not worth retrying unchanged."#,
         ),
         (
             status = 400,
-            description = "An id is not a ULID, or the new name, kind or configuration failed validation",
+            description = "An id is not a ULID, or the new name, kind or configuration failed validation; the body names no reason",
             body = ErrorResponse
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no WRITE on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
             body = ErrorResponse
         ),
         (
@@ -581,7 +566,7 @@ it is not worth retrying unchanged."#,
         ),
         (
             status = 409,
-            description = "The credentials are still referenced by a stored object version",
+            description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
             body = ErrorResponse
         )
     ),
@@ -623,8 +608,8 @@ pub async fn replace_source_connector(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{group_id}/connectors/{connector_id}",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
     summary = "Delete a source connector",
     description = r#"Removes a source connector record and its stored credentials together.
 
@@ -633,15 +618,9 @@ pub async fn replace_source_connector(
 **Behavior**
 - After a 204 nothing on this node can resolve the connector any more, and a staged reference that
   would have used it fails from then on.
-- Deleting a connector that is not registered for this group is a 404, not a silent success, so the
-  call is not idempotent once it has succeeded.
-
-**Limits**
-- The deletion is refused while any stored object version still references the connector's
-  credentials, so a referenced connector must be detached before it can be removed.
-
-**Errors**: the refusal to delete a referenced connector is a 409 and stays one until the
-referencing versions are gone, so it is not worth retrying unchanged."#,
+- Repeating the call is a 404, not a silent success, so the delete is not idempotent.
+- The deletion is refused while a stored object version still references the connector's
+  credentials, so a referenced connector must be detached before it can be removed."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to delete, as a 26-character ULID")
@@ -649,17 +628,17 @@ referencing versions are gone, so it is not worth retrying unchanged."#,
     responses(
         (
             status = 204,
-            description = "Connector and credentials deleted; the response has no body and no content type"
+            description = "Connector and credentials deleted; the response has no body"
         ),
         (
             status = 400,
             description = "The group id or the connector id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no WRITE on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
             body = ErrorResponse
         ),
         (
@@ -669,7 +648,7 @@ referencing versions are gone, so it is not worth retrying unchanged."#,
         ),
         (
             status = 409,
-            description = "The credentials are still referenced by a stored object version",
+            description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
             body = ErrorResponse
         )
     ),
@@ -700,39 +679,34 @@ pub async fn delete_source_connector(
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/connectors/check",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/check",
+    tag = "data/connectors",
     summary = "Test connector settings without registering them",
     description = r#"Probes a candidate connector definition and reports whether the source answered.
 
-**Authentication**: realm bearer token with WRITE on the group's data path, the same permission as
-registration, because the request carries credentials and makes the node open a connection to the
-endpoint they name.
+**Authentication**: realm bearer token with WRITE on the group's data path, as for registration,
+because the body carries credentials the node then opens a connection with.
 
 **Behavior**
-- The body is validated with exactly the registration rules, so a malformed body is rejected with
-  400 before anything is contacted, and here the 400 carries the validation reason.
-- Otherwise the node opens the source and reports the outcome inside a 200 response:
-  `{"ok": true, "latency_ms": ...}` when the source answered, `{"ok": false, "error": ...}` when it
-  did not. A failed check is never an HTTP error status.
+- The body is validated with exactly the registration rules, so a malformed body is rejected before
+  anything is contacted.
+- The probe outcome is reported inside a 200 response: `{"ok": true, "latency_ms": ...}` when the
+  source answered, `{"ok": false, "error": ...}` when it did not. A failed check is never an HTTP
+  error status.
 - An `http` source counts as reachable as soon as the endpoint answers, including with a 404 for the
   probe path.
-- Nothing is stored: the credentials in the body are used for this request only and are not written
-  anywhere.
+- Nothing is stored: the credentials in the body serve this request only.
 
-**Errors**: the `error` text comes from a fixed set, since a kind that cannot be staged at all is
-  already refused with 400 before the probe.
-- `connector configuration is invalid`: the settings cannot be turned into a client and the
-  configuration must be corrected.
-- `connector is unreachable`: the endpoint refused, denied, or its address was blocked by the egress
-  policy, which is worth retrying only if the remote is expected to recover.
-- `connector check is unavailable`: this node cannot run source checks at the moment and the call
-  may be retried as is.
-- `connector check timed out`: the check exceeded its five-second budget and may be retried."#,
+**Errors**: a failure `error` comes from a fixed set.
+- `connector configuration is invalid`: the settings cannot be turned into a client.
+- `connector is unreachable`: the endpoint refused or denied, or the egress guard blocked its
+  address; worth retrying only if the remote is expected to recover.
+- `connector check is unavailable`: this node cannot run source checks at the moment; retry as is.
+- `connector check timed out`: the check exceeded its five-second budget."#,
     params(("group_id" = String, Path, description = "Group whose data permission gates the check, as a 26-character ULID")),
     request_body(
         content = SourceConnectorRequest,
-        description = "A candidate connector definition in the same shape as registration; the credentials are used for this one probe and never stored",
+        description = "A candidate connector definition in the shape registration takes; the credentials are never stored",
         example = json!({
             "name": "reference-data",
             "kind": "s3",
@@ -749,7 +723,7 @@ endpoint they name.
     responses(
         (
             status = 200,
-            description = "The probe ran; `ok` says whether the source answered and a failure carries a fixed reason text",
+            description = "The probe ran; `ok` says whether the source answered",
             body = ConnectorCheckResponse,
             examples(
                 ("Reachable" = (
@@ -773,10 +747,10 @@ endpoint they name.
             description = "The group id is not a ULID, or the candidate configuration failed validation; the message names the offending field",
             body = ErrorResponse
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no WRITE on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
             body = ErrorResponse
         )
     ),
@@ -808,8 +782,8 @@ pub async fn check_source_connector(
 
 #[utoipa::path(
     post,
-    path = "/groups/{group_id}/connectors/{connector_id}/check",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}/check",
+    tag = "data/connectors",
     summary = "Test a registered connector's stored settings",
     description = r#"Probes a registered connector with its stored credentials and reports the outcome.
 
@@ -817,11 +791,10 @@ pub async fn check_source_connector(
 unlike the check that takes settings in the body, because the caller supplies no credentials.
 
 **Behavior**
-- The node resolves the stored record and its stored credentials and probes the source root with
-  them, which tells the caller whether the credentials still work without exposing them.
-- The outcome is reported inside a 200 response exactly as for the inline check:
-  `{"ok": true, "latency_ms": ...}` or `{"ok": false, "error": ...}`, with the same fixed reason
-  texts and the same five-second budget.
+- The node probes the source root with the stored credentials, which tells the caller whether they
+  still work without exposing them.
+- The outcome is reported inside a 200 response exactly as for the inline check, with the same fixed
+  reason texts and the same five-second budget.
 - A stored `ftp` connector resolves but always reports `connector kind is not supported`.
 - Nothing is written and the record is left untouched whatever the outcome.
 
@@ -859,10 +832,10 @@ must be replaced."#,
             description = "An id is not a ULID, or the stored record names a kind that cannot be probed at all",
             body = ErrorResponse
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no READ on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
             body = ErrorResponse
         ),
         (
@@ -900,37 +873,33 @@ pub async fn check_stored_connector(
 
 #[utoipa::path(
     get,
-    path = "/groups/{group_id}/connectors/{connector_id}/entries",
-    tag = "connectors",
+    path = "/data/groups/{group_id}/connectors/{connector_id}/entries",
+    tag = "data/connectors",
     summary = "Browse the entries under a connector path",
     description = r#"Lists one level below a path at the connector's source, using its stored credentials.
 
 **Authentication**: realm bearer token with READ on the group's data path.
 
 **Behavior**
-- The listing never descends into subdirectories: directories are returned as entries of kind `dir`
-  and must be browsed with a follow-up request.
+- The listing never descends: a directory is returned as an entry of kind `dir` and is browsed with
+  a follow-up request.
 - `size` and `modified_ms` are omitted for entries whose source reports neither, and `modified_ms`
   is milliseconds since the Unix epoch.
-- An object source that simply holds nothing below the path answers 200 with an empty list, while a
-  source that reports the path itself as gone is a 404.
+- A source that simply holds nothing below the path answers 200 with an empty list, while a source
+  reporting the path itself as gone is a 404.
 - An `http` connector has no listing protocol, so its entries are parsed out of the server's HTML
-  directory index and a server that does not serve one fails with 502.
+  directory index and a server that serves none fails with 502.
 
 **Limits**
-- There is no cursor: `truncated` only says that the source held more entries than the limit
-  allowed, and the only way to see more is a larger `limit`, up to the cap, or a narrower `path`.
-
-**Errors**: a source error, a blocked address or an unparsable index all read as 502 and carry the
-source's own message; retry only when the source is expected to recover, since the same 502 also
-reports a configuration that can never work."#,
+- There is no cursor: `truncated` only says the source held more entries than the limit allowed, and
+  the only way to see more is a larger `limit`, up to the cap, or a narrower `path`."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to browse, as a 26-character ULID"),
         (
             "path" = Option<String>,
             Query,
-            description = "Directory to list, relative to the connector root and without a leading slash; absolute paths and `.` or `..` components are rejected, and omitting it or passing an empty value lists the root"
+            description = "Directory to list, relative to the connector root and without a leading slash; absolute paths and `.` or `..` components are rejected, and an empty or absent value lists the root"
         ),
         (
             "limit" = Option<usize>,
@@ -941,7 +910,7 @@ reports a configuration that can never work."#,
     responses(
         (
             status = 200,
-            description = "The entries directly below the requested path, with `truncated` set when the limit cut the listing short",
+            description = "The entries directly below the requested path",
             body = ConnectorEntriesResponse,
             example = json!({
                 "entries": [
@@ -966,10 +935,10 @@ reports a configuration that can never work."#,
             description = "An id is not a ULID, the path escapes the connector root, or the limit is zero",
             body = ErrorResponse
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "The token belongs to another realm, or the caller has no READ on the group's data path, including when the group does not exist",
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
             body = ErrorResponse
         ),
         (
@@ -979,7 +948,7 @@ reports a configuration that can never work."#,
         ),
         (
             status = 502,
-            description = "The source refused the listing, was blocked, or returned no directory listing; the message repeats the source's reason",
+            description = "The source refused the listing, the egress guard blocked its address, or no directory index could be parsed; the message repeats the source's reason and covers a configuration that can never work as well as a transient failure",
             body = ErrorResponse
         )
     ),
@@ -1541,27 +1510,27 @@ mod tests {
 
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors")
+                .get("/data/groups/{group_id}/connectors")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/{connector_id}")
+                .get("/data/groups/{group_id}/connectors/{connector_id}")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/check")
+                .get("/data/groups/{group_id}/connectors/check")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/{connector_id}/check")
+                .get("/data/groups/{group_id}/connectors/{connector_id}/check")
                 .is_some()
         );
         assert!(
             openapi["paths"]
-                .get("/groups/{group_id}/connectors/{connector_id}/entries")
+                .get("/data/groups/{group_id}/connectors/{connector_id}/entries")
                 .is_some()
         );
         assert_eq!(

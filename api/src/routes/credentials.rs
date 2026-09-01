@@ -28,7 +28,7 @@ mod sessions;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "credentials", description = "User credential management"))
+    tags((name = "access/credentials", description = "User credential management"))
 )]
 pub struct CredentialsApiDoc;
 
@@ -202,22 +202,19 @@ fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRes
 
 #[utoipa::path(
     get,
-    path = "/users/credentials",
-    tag = "credentials",
+    path = "/access/credentials",
+    tag = "access/credentials",
     summary = "List the caller's S3 credentials",
-    description = r#"Lists the S3 credentials of the calling identity held by the node serving the request.
+    description = r#"Lists the caller's own S3 credentials held by the node serving the request.
 
-**Authentication**: realm bearer token that carries no path restrictions; a delegated token is
-refused with 403.
+**Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
-- Self-scoped: the response only ever contains credentials issued to the calling identity.
+- The response only ever contains credentials issued to the calling user, and never a secret access
+  key.
 - Only credentials held by the serving node are listed, so a credential issued on another node of
   the realm does not appear here.
-- Secret access keys are never returned by this operation.
-- Every entry carries the access key id, the group the credential is bound to, expiry and
-  revocation timestamps as RFC 3339 UTC with second precision, the id of the issuing node, the
-  effective path restrictions and the derived status `active`, `expired` or `revoked`.
+- `status` is derived from the timestamps as `active`, `expired` or `revoked`.
 
 **Limits**
 - The listing is not paginated and covers at most 16 active credentials per user, ordered by access
@@ -225,7 +222,7 @@ refused with 403.
     responses(
         (
             status = 200,
-            description = "Credentials of the calling user held by this node, with every secret access key omitted",
+            description = "The caller's credentials held by this node, with every secret access key omitted",
             body = ListS3CredentialsResponse,
             example = json!({
                 "credentials": [
@@ -246,8 +243,8 @@ refused with 403.
                 ]
             })
         ),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm or carries path restrictions", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -279,32 +276,28 @@ pub async fn list_s3_credentials(
 
 #[utoipa::path(
     post,
-    path = "/users/credentials",
-    tag = "credentials",
+    path = "/access/credentials",
+    tag = "access/credentials",
     summary = "Create an S3 credential for a group",
-    description = r#"Issues an S3 access key and a one-time secret bound to a group, for the calling identity.
+    description = r#"Issues an S3 access key and a one-time secret bound to a group, for the calling user.
 
-**Authentication**: realm bearer token with write access to the group's data path. A
-path-restricted (delegated) token may be used; the issued credential inherits the caller's
-restrictions narrowed to the group data root and can never widen them, and every requested allow
-scope is authorized against the caller's own grant before it is written.
+**Authentication**: realm bearer token with WRITE on the group's data path. A path-restricted token
+may be used: the credential inherits the caller's restrictions narrowed to the group data root and
+can never widen them.
 
 **Behavior**
-- Self-scoped: the credential is always issued to the calling identity, so no caller can mint a
-  credential for another user.
-- The secret access key is returned once, in this response only: it is stored sealed and is not
-  retrievable afterwards, so a caller that loses it has to create a new credential, and later
-  listings show only the access key id.
+- The credential is always issued to the calling user, so no caller can mint one for somebody else.
+- The secret access key is returned in this response only: it is stored sealed, later listings show
+  only the access key id, and a lost secret means creating a new credential.
 - The credential is stored on the node that served the request and is accepted by that node's S3
   endpoint.
 
 **Limits**
 - The optional lifetime is given in seconds between 60 and 31536000 and defaults to 31536000.
 - A restriction pattern is relative to the group data root or an absolute path inside it, may name
-  an exact path or a subtree with a trailing `/**`, and takes the permission `READ`, `WRITE` or
-  `DENY` case insensitively; at most 50 restrictions are accepted.
-- A user holds at most 16 active credentials; a further request is refused with 409 until one is
-  revoked or expires."#,
+  an exact path or a subtree with a trailing `/**`, and takes `READ`, `WRITE` or `DENY` case
+  insensitively; at most 50 restrictions are accepted.
+- A user holds at most 16 active credentials."#,
     request_body(
         content = CreateS3CredentialsRequest,
         description = "Group the credential is bound to, an optional lifetime in seconds, and optional path restrictions",
@@ -322,17 +315,17 @@ scope is authorized against the caller's own grant before it is written.
     responses(
         (
             status = 201,
-            description = "Credential created; access_secret is the plaintext secret access key and is shown only in this response, while access_key_id identifies the credential from now on",
+            description = "Credential created; `access_secret` is the plaintext secret access key and is shown only here",
             body = CreateS3CredentialsResponse,
             example = json!({
                 "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
                 "access_secret": "<one-time-secret-shown-only-in-this-response>"
             })
         ),
-        (status = 400, description = "The group id is not a ULID, the requested lifetime is outside 60 to 31536000 seconds, a restriction uses an unsupported wildcard, or more restrictions were requested than are accepted", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm, the caller has no write access to the group data path, or a requested restriction reaches outside the group root or outside the caller's own grant", body = ErrorResponse),
-        (status = 409, description = "The caller already holds the maximum of 16 active credentials; revoke or let one expire before creating another", body = ErrorResponse)
+        (status = 400, description = "The group id is not a ULID, the lifetime is out of range, or a restriction is malformed or exceeds the count limit", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, the caller lacks WRITE on the group data path, or a restriction reaches outside the group root or the caller's own grant", body = ErrorResponse),
+        (status = 409, description = "The caller already holds 16 active credentials; revoke or let one expire first", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -405,27 +398,24 @@ pub async fn create_s3_credentials(
 
 #[utoipa::path(
     delete,
-    path = "/users/credentials/{access_key_id}",
-    tag = "credentials",
+    path = "/access/credentials/{access_key_id}",
+    tag = "access/credentials",
     summary = "Revoke an S3 credential",
     description = r#"Revokes an S3 credential held by the node serving the request.
 
-**Authentication**: realm bearer token that carries no path restrictions; a delegated token is
-refused with 403. A caller may always revoke a credential issued to their own identity; revoking
-another user's credential additionally requires write access on that user's realm administration
-path, so write access to the group the credential is bound to is deliberately not enough.
+**Authentication**: realm bearer token without path restrictions. Revoking one's own credential is
+self-service; revoking another user's needs WRITE on that user's realm administration path, so
+WRITE on the group the credential is bound to is deliberately not enough.
 
 **Behavior**
-- Only credentials held by the node that serves the request can be revoked here, and an access key
-  unknown to this node is answered with 404.
-- The record is not deleted: it keeps appearing in the caller's listing with a revocation timestamp
-  and the `revoked` status.
-- The node stops accepting the key for new S3 requests."#,
-    params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, a ULID as returned when the credential was created or listed")),
+- Only credentials held by the node that serves the request can be revoked here.
+- The record is not deleted: it keeps appearing in the owner's listing with a revocation timestamp
+  and the `revoked` status, and the node stops accepting the key for new S3 requests."#,
+    params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, as returned when it was created or listed")),
     responses(
-        (status = 204, description = "Credential revoked; the response carries no body"),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm, carries path restrictions, or the caller lacks write access on the owning user's administration path", body = ErrorResponse),
+        (status = 204, description = "Credential revoked"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, is path-restricted, or lacks WRITE on the owning user's administration path", body = ErrorResponse),
         (status = 404, description = "This node holds no credential with that access key id", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

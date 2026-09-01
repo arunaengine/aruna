@@ -306,7 +306,7 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
 
     let token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice"));
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/users/register", node.base_url))
+        .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(token.clone())
         .json(&serde_json::json!({
             // "name": "Alice",
@@ -332,7 +332,7 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
         body.id
     );
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/users/register", node.base_url))
+        .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(token)
         .json(&serde_json::json!({}))
         .send()

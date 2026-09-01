@@ -52,10 +52,10 @@ Findings carry `severity`: only `violation` rejects a write. `warning` and
 
 | Route                                                  | Purpose                                                     |
 | ------------------------------------------------------ | ----------------------------------------------------------- |
-| `GET /metadata/profile-validation/capabilities`         | Evaluator identity and the exact supported constraint set.   |
-| `GET /metadata/{document_id}/profile-validation`        | The revision-bound status stored with the current revision.  |
-| `POST /metadata/{document_id}/profile-validation/revalidate` | Re-runs validation against the Profile's current revision. |
-| `POST /metadata/profile-validation/preview`             | The verdict a write would enforce for an unsaved draft.      |
+| `GET /metadata/profile/validation/capabilities`         | Evaluator identity and the exact supported constraint set.   |
+| `GET /metadata/{document_id}/profile/validation`        | The revision-bound status stored with the current revision.  |
+| `POST /metadata/{document_id}/profile/validation/revalidate` | Re-runs validation against the Profile's current revision. |
+| `POST /metadata/profile/validation/preview`             | The verdict a write would enforce for an unsaved draft.      |
 
 A status becomes `stale` when either the Dataset revision or the registered
 Profile revision changes; revalidation repins it.

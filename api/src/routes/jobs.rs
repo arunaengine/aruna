@@ -59,7 +59,7 @@ const MAX_OUTPUT_PREFIXES: usize = 32;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "jobs", description = "Durable background jobs"))
+    tags((name = "compute/jobs", description = "Durable background jobs"))
 )]
 pub struct JobsApiDoc;
 
@@ -359,9 +359,9 @@ pub async fn job_urls(state: &ServerState, job_id: JobId) -> ServerResult<JobUrl
     let api_base_url = rest.api_base_url.trim_end_matches('/');
     Ok(JobUrls {
         owner_node_url: rest.api_base_url.clone(),
-        status_url: format!("{api_base_url}/jobs/{job_id}"),
-        report_url: format!("{api_base_url}/jobs/{job_id}/report"),
-        artifact_url: format!("{api_base_url}/jobs/{job_id}/artifacts/rocrate"),
+        status_url: format!("{api_base_url}/compute/jobs/{job_id}"),
+        report_url: format!("{api_base_url}/compute/jobs/{job_id}/report"),
+        artifact_url: format!("{api_base_url}/compute/jobs/{job_id}/artifacts/rocrate"),
     })
 }
 
@@ -829,21 +829,20 @@ fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> 
 
 #[utoipa::path(
     get,
-    path = "/jobs/",
-    tag = "jobs",
+    path = "/compute/jobs",
+    tag = "compute/jobs",
     summary = "List the caller's jobs on this node",
     description = r#"Pages the jobs the caller submitted to this node, newest first.
 
-**Authentication**: realm bearer token; a path-restricted (delegated) token is refused even for
-its own jobs.
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused even for the
+caller's own jobs.
 
 **Behavior**
-- The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs
-  this node owns. On a user device that includes every local run the owner started there; there is
-  no separate listing for them.
-- Jobs recorded on other nodes are never merged in, so a caller that submitted against another
-  node pages that node's listing instead (submission answers with the `origin_node_url` it was
-  accepted at).
+- The page is self-scoped and node-local: only jobs the caller submitted, and only jobs this node
+  owns. On a user device that includes every local run the owner started there; they have no
+  separate listing.
+- Jobs owned by another node are never merged in, so page that node instead (submission answers
+  with the `origin_node_url` it was accepted at).
 - A distributed execution job is listed where it was admitted or is running; read one by id for
   the replicated family view, which any node holding its records can answer.
 - Jobs the system creates for its own bookkeeping are never listed.
@@ -851,10 +850,9 @@ its own jobs.
 
 **Limits**
 - `limit` defaults to 50 and is capped at 200; `0` is treated as unset.
-- `cursor` is a previous page's `next_cursor`: 24 bytes, base64url without padding, and anything
-  else is rejected with 400.
-- `state` selects one of `queued`, `claimed`, `preparing`, `ready`, `running`, `cancelling`,
-  `indeterminate`, `succeeded`, `failed` or `cancelled`; any other value is rejected with 400."#,
+- `cursor` is a previous page's `next_cursor`: 24 bytes, base64url without padding.
+- `state` is one of `queued`, `claimed`, `preparing`, `ready`, `running`, `cancelling`,
+  `indeterminate`, `succeeded`, `failed` or `cancelled`."#,
     params(
         ("limit" = Option<usize>, Query, description = "Maximum jobs in one page; default 50, at most 200, and 0 is treated as unset"),
         ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from a previous page; absent starts at the newest job"),
@@ -928,14 +926,14 @@ pub async fn list_jobs(
 
 #[utoipa::path(
     post,
-    path = "/jobs/",
-    tag = "jobs",
+    path = "/compute/jobs",
+    tag = "compute/jobs",
     summary = "Submit a container execution job",
     description = r#"Accepts a container execution job for asynchronous execution and returns the id to poll.
 
 **Authentication**: realm bearer token with WRITE on the target group's data; a path-restricted
-(delegated) token is refused. Running in a bucket that already exists additionally requires WRITE
-on that bucket and that it belongs to the same group.
+(delegated) token is refused. An existing workspace bucket additionally needs WRITE on that bucket,
+which must belong to the same group.
 
 **Behavior**
 - A 2xx means the request is durably admitted into its replicated submission family and queued,
@@ -947,59 +945,32 @@ on that bucket and that it belongs to the same group.
   later merge moves the canonical alias.
 - Execution is at-least-once: a partition may admit and run duplicates, whose outputs stay
   retrievable and auditable while one canonical success supplies the result.
-- `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200
-  with the job that already exists and `created` false, while the same key with a different plan
-  is a 409 conflict.
-- On a replay `state` reports what the responder currently reduces for that family, so a running
-  or finished request reads `running`, `succeeded`, `failed`, `cancelled` or `indeterminate`
-  rather than `queued`.
+- `idempotency_key` is scoped to the caller: replaying it with the same plan answers 200 with
+  `created` false and the state this responder currently reduces, so a running or finished request
+  reads `running`, `succeeded`, `failed`, `cancelled` or `indeterminate` rather than `queued`.
+- The group's standing quota is decided against a replicated demand view, but a replay of a key
+  this node already claimed is settled before any quota is read and is never quota-refused.
 - Set `workspace.mode` to `existing` to run in a bucket that already exists; omitting `workspace`
   keeps a per-job workspace bucket.
-- The group's standing quota is decided against a replicated demand view. A replay of an
-  idempotency key this node already claimed is settled before any quota is read and is never
-  quota-refused.
-- On a user device a `realm` request is always forwarded: the inputs are referenced rather than
-  resolved here, the outputs land on the admitting realm holder, and the device itself never
-  executes, admits or stores any part of the job. A device forwards the caller's own bearer token,
-  so a submission it cannot back with one is a 403 rather than a forwarded request.
-
-- `target` `local` is served by a user device only; any other node answers 400. The job runs on this machine for the user the device is enrolled for, and is refused for anyone
-  else with a 403. Nothing about it is forwarded, replicated or offered to the realm, and the
-  response carries no `submission_id`: a local run belongs to no submission family.
-- Inputs must be readable on the device. An input naming `source_node_id` and `version_id` is a
-  realm object: staging fetches that exact version into the run's own workspace bucket, as an
-  ordinary local object and never as a reference, so an unreachable holder fails the run rather
-  than the submission. Any other input this device does not hold is a 400 naming it.
-- Outputs stay in the node-local workspace bucket until the owner publishes them, and the run is
-  listed by this device's own `GET /jobs/`.
-- Mounted inputs and `workspace.mode` `none` are refused, because a device stages files and exposes
-  no S3 endpoint a container could reach, and so is `workspace.mode` `existing`, because a local
-  run's outputs stay in its own workspace bucket.
-- A paused compute plane, a device without a compute backend, and a device that already holds as
-  many unfinished jobs as `ARUNA_COMPUTE_MAX_CONCURRENT` all answer 409; the ceiling is counted in
-  the admitting transaction, so two submissions cannot both pass it.
+- On a user device a `realm` request is always forwarded under the caller's own bearer token: the
+  inputs stay referenced, the outputs land on the admitting realm holder, and the device itself
+  never executes, admits or stores any part of the job.
+- `target` `local` is served by a user device only and runs the job on that machine for the user
+  the device is enrolled for. Nothing about it is forwarded, replicated or offered to the realm,
+  and the response carries no `submission_id`: a local run belongs to no submission family.
+- A local run stages inputs the device holds. An input naming `source_node_id` and `version_id` is
+  fetched at that exact version into the run's own workspace bucket, as an ordinary local object
+  and never as a reference, so an unreachable holder fails the run rather than the submission.
+- A local run's outputs stay in the node-local workspace bucket until the owner publishes them.
+  Mounted inputs, `workspace.mode` `none` and `workspace.mode` `existing` are all refused: a device
+  stages files, exposes no S3 endpoint a container could reach, and keeps those outputs local.
 
 **Limits** (all refused with 400)
 - An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
 - More than 512 inputs, more than 1024 outputs, or more than 32 output prefixes.
 - An empty `dest_key`, or a container path that is not absolute and traversal-free.
-- Two inputs sharing a container path, or two outputs sharing a `dest_key` or container path.
-
-**Errors**
-- Two inputs sharing a `dest_key` are not a transport error: `mode` and `collision_policy` decide
-  the staged result, and only `reject` refuses them, as a 409 from the composition.
-- A quota refusal is a 409 carrying the exact scope, dimension and numbers in `quota`; a demand
-  view that understates the group is refused like an exceeded cap, with `observed` reported at the
-  limit, because a cap that cannot be shown to hold is not evidence of room.
-- A 503 is retryable and the caller may submit again with the same idempotency key: no family
-  holder could admit the request, the demand view could not be read or kept moving under three
-  reads, three admission transactions in a row lost to a concurrent submission of the same group,
-  or the id clock is unhealthy.
-- A device submission whose inputs sit on no holder of its family answers that same 503, and it is
-  the one case retrying does not clear. The family is picked by hashing the request, the holder
-  resolves the referenced inputs against its own objects only, and a holder that cannot read one
-  refuses without naming it, so an unstaged input is indistinguishable here from an unreachable
-  realm. Submit from a node that holds the inputs, or replicate them first."#,
+- Two inputs sharing a container path, or two outputs sharing a `dest_key` or container path. Two
+  inputs sharing a `dest_key` are instead resolved by `mode` and `collision_policy`."#,
     request_body(
         content = SubmitExecutionRequest,
         description = "Container image, command and the inputs and outputs to stage around it",
@@ -1049,12 +1020,12 @@ on that bucket and that it belongs to the same group.
                 "canonical_job_id": "01JJRSTVWXYZ0123456789ABCD",
                 "state": "queued",
                 "origin_node_url": "https://node.example.test/api/v1",
-                "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
+                "status_url": "https://node.example.test/api/v1/compute/jobs/01JJRSTVWXYZ0123456789ABCD"
             })
         ),
         (
             status = 200,
-            description = "Replay of an idempotency key naming this exact plan; nothing new was admitted and `state` reports what the responder currently reduces",
+            description = "Replay of an idempotency key naming this exact plan; nothing new was admitted and `state` reports what this responder currently reduces",
             body = SubmitJobResponse,
             example = json!({
                 "job_id": "01JJRSTVWXYZ0123456789ABCD",
@@ -1063,14 +1034,14 @@ on that bucket and that it belongs to the same group.
                 "canonical_job_id": "01JJRSTVWXYZ0123456789ABCD",
                 "state": "running",
                 "origin_node_url": "https://node.example.test/api/v1",
-                "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
+                "status_url": "https://node.example.test/api/v1/compute/jobs/01JJRSTVWXYZ0123456789ABCD"
             })
         ),
         (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, a workspace request that names no usable bucket, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is bound to a different plan, the group's compute quota refuses the admission, the composition conflicts on a staged key, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is bound to a different plan, the composition conflicts on a staged key under `collision_policy` `reject`, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling, which is counted in the admitting transaction so two submissions cannot both pass it. A quota refusal carries the exact scope, dimension and numbers in `quota`; a demand view that understates the group is refused like an exceeded cap, with `observed` at the limit", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group or on the named existing workspace bucket, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
-        (status = 503, description = "No family holder could admit the request, an unreadable or unsettled demand view, three lost admission transactions, or an unhealthy id clock; retryable", body = ErrorResponse)
+        (status = 503, description = "Retryable, and the caller may submit again with the same idempotency key: no family holder could admit the request, the demand view could not be read or kept moving under three reads, three admission transactions in a row lost to a concurrent submission of the same group, or the id clock is unhealthy. A device submission whose referenced inputs sit on no holder of its family answers the same 503 and retrying does not clear it; submit from a node that holds the inputs, or replicate them first", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1305,40 +1276,34 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
 
 #[utoipa::path(
     get,
-    path = "/jobs/{job_id}",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}",
+    tag = "compute/jobs",
     summary = "Read one job's status",
     description = r#"Returns one job's current status, with the replicated family view for a distributed execution job.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused. Reads are
-self-scoped: only the job's own submitter may read it, and a job belonging to somebody else
-answers 404 rather than 403, so the surface never confirms that an id exists.
+self-scoped: only the job's own submitter may read it, and anybody else's job answers 404, so the
+surface never confirms that an id exists. The one exception is a persistent-id minting job the
+caller joined, readable while the caller holds WRITE on the document it mints for.
 
 **Behavior**
-- The one exception to self-scoping is a persistent-id minting job the caller joined, which stays
-  readable while the caller holds WRITE on the document it mints for.
 - `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or
   `cancelled`.
-- A distributed execution job carries a `family` block reduced from the replicated records: it
-  names the request's `submission_id`, the currently canonical alias, the canonical execution and
-  its exact output VersionIds, how many physical executions and duplicate successes are known, the
-  projection `revision` and digest to detect that the view changed, and the responder that
-  answered.
+- A distributed execution job carries a `family` block reduced from the replicated records: the
+  request's `submission_id`, the currently canonical alias, the canonical execution and its exact
+  output VersionIds, how many physical executions and duplicate successes are known, the projection
+  `revision` and digest to detect that the view changed, and the responder that answered.
 - `family.partial` means this responder could not reduce every record.
-- `family.locally_exhausted` is a responder-local diagnostic (outside the projection digest)
-  meaning every known execution ended without success and no retry is armed here; it is not
-  evidence of a permanent failure.
-- Node identities of other nodes are never disclosed; only the responder names itself, and an
-  output whose owning node's S3 endpoint is unknown here carries `endpoint_url: null` rather than
-  failing the read.
-- A distributed execution job is answered here from the replicated family projection, without
-  routing. Every other kind is answered by the node that owns the job, derived from the id itself:
-  when that is another node the request is forwarded under the caller's own bearer token.
-- `run_crate` appears only for jobs that owe a run crate and reports that side obligation, not the
-  job itself.
-
-**Errors**: a bearer token that cannot be forwarded to the owning node is a 400, and an owner that
-cannot be reached is a retryable 503."#,
+- `family.locally_exhausted` is a responder-local diagnostic outside the projection digest: every
+  known execution ended without success and no retry is armed here. It is not evidence of a
+  permanent failure, so poll again or ask another node.
+- Only the responder names itself; other node identities are never disclosed, and an output whose
+  owning node's S3 endpoint is unknown here carries `endpoint_url: null` rather than failing the
+  read.
+- A distributed execution job is answered from the replicated family projection, without routing.
+  Every other kind is answered by the node that owns the job, derived from the id itself, and
+  forwarded under the caller's own bearer token when that is another node.
+- `run_crate` reports a side obligation of jobs that owe a run crate, not the job itself."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404")),
     responses(
         (
@@ -1502,31 +1467,26 @@ fn decode_report_row(
 
 #[utoipa::path(
     get,
-    path = "/jobs/{job_id}/report",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/report",
+    tag = "compute/jobs",
     summary = "Page a finished RO-Crate job's report",
     description = r#"Pages the frozen per-entry report of a finished RO-Crate import or export job.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
-Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403.
+Self-scoped like the status read: a job submitted by somebody else answers 404.
 
 **Behavior**
 - Only RO-Crate import and export jobs keep a per-entry report; every other kind answers 404.
-- The report exists only once the job is terminal, so while it is still running the answer is 404
+- The report exists only once the job is terminal, so while it is still running the answer is a 404
   carrying a pending marker with the job's current state, and the caller should poll.
-- It is then frozen and immutable, and it disappears again once the job's retention window passes,
-  which is a plain 404.
+- It is then frozen and immutable, and disappears again once the job's retention window passes.
 - Paging is stable against that frozen snapshot: `report_digest` names it and a cursor carries
   both the job and that digest.
 - The read is answered by the node that owns the job, forwarded under the caller's own bearer
   token when this node is not the owner.
 
 **Limits**
-- `limit` defaults to 200 and is capped at 1000; `0` is treated as unset.
-
-**Errors**: a cursor from another job or another report is a 409 rather than a silently different
-page, a malformed cursor or a token that cannot be forwarded is a 400, and an unreachable owner is
-a retryable 503."#,
+- `limit` defaults to 200 and is capped at 1000; `0` is treated as unset."#,
     params(
         ("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404"),
         ("limit" = Option<usize>, Query, description = "Maximum report rows in one page; default 200, at most 1000, and 0 is treated as unset"),
@@ -1576,7 +1536,7 @@ a retryable 503."#,
                 ))
             )
         ),
-        (status = 409, description = "The cursor was issued for a different job or a different frozen report, so it cannot continue this one", body = ErrorResponse),
+        (status = 409, description = "The cursor was issued for a different job or a different frozen report, so it cannot continue this one rather than silently returning a different page", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1891,31 +1851,26 @@ async fn artifact_response(
 
 #[utoipa::path(
     get,
-    path = "/jobs/{job_id}/artifacts/rocrate",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/artifacts/rocrate",
+    tag = "compute/jobs",
     summary = "Download a finished export job's RO-Crate",
-    description = r#"Downloads the packaged RO-Crate an export job produced as a binary `application/zip` body, not JSON.
+    description = r#"Downloads the packaged RO-Crate an export job produced, as a binary `application/zip` body.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
-Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403, and
-a job kind that produces no crate answers 404 as well.
+Self-scoped like the status read: a job submitted by somebody else answers 404, and so does a job
+kind that produces no crate.
 
 **Behavior**
 - A successful answer always carries `Content-Type: application/zip`, `Content-Length`,
   `Accept-Ranges: bytes`, an `ETag` that is the artifact's quoted hex BLAKE3 digest, and a
   `Content-Disposition: attachment` naming the crate file with both an ASCII fallback and a UTF-8
   form; a partial answer adds `Content-Range`.
-- While the export job has not finished the crate is not ready and the answer is 404 with the code
-  `artifact_pending` and the job's current state in its details, so the caller should poll the
-  status instead of retrying blindly.
+- While the export job has not finished the crate is a 404 coded `artifact_pending` with the job's
+  current state, so the caller should poll the status instead of retrying blindly.
 - Downloads are admission-limited, so a saturated node refuses rather than queueing.
 
 **Limits**
-- `Range` accepts one byte range only.
-
-**Errors**: once the artifact's retention window passes it is a 410 and never comes back, a range
-that is not a single satisfiable one is a 416, and a saturated or unreachable owner is a retryable
-503."#,
+- `Range` accepts one byte range only."#,
     params(
         ("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404"),
         ("Range" = Option<String>, Header, description = "One byte range: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`; absent returns the whole crate")
@@ -1945,16 +1900,16 @@ pub async fn get_job_artifact(
 
 #[utoipa::path(
     head,
-    path = "/jobs/{job_id}/artifacts/rocrate",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/artifacts/rocrate",
+    tag = "compute/jobs",
     summary = "Probe a finished export job's RO-Crate headers",
     description = r#"Answers exactly what the download would answer, with the headers but no body.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
-Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403.
+Self-scoped like the status read: a job submitted by somebody else answers 404.
 
 **Behavior**
-- A client can learn a crate's size, digest and filename before fetching it.
+- Lets a client learn a crate's size, digest and filename before fetching it.
 - The headers describe an `application/zip` crate: `Content-Type`, `Content-Length` for the whole
   crate or for the requested range, `Accept-Ranges: bytes`, an `ETag` that is the artifact's
   quoted hex BLAKE3 digest, an attachment `Content-Disposition`, and `Content-Range` when a range
@@ -1965,8 +1920,7 @@ Self-scoped like the status read: a job submitted by somebody else answers 404 i
 - Probing does not consume download capacity.
 
 **Limits**
-- `Range` accepts one byte range only; multiple ranges and unparseable or out-of-bounds values are
-  refused with 416."#,
+- `Range` accepts one byte range only."#,
     params(
         ("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404"),
         ("Range" = Option<String>, Header, description = "One byte range: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`; absent describes the whole crate")
@@ -1996,14 +1950,14 @@ pub async fn head_job_artifact(
 
 #[utoipa::path(
     post,
-    path = "/jobs/{job_id}/cancel",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/cancel",
+    tag = "compute/jobs",
     summary = "Request cancellation of the caller's job",
     description = r#"Records a cancellation request on the caller's job; it does not stop the work synchronously.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
-Self-scoped like the status read: only the submitter may cancel, and a job belonging to somebody
-else answers 404 rather than 403.
+Self-scoped like the status read: only the submitter may cancel, and anybody else's job answers
+404.
 
 **Behavior**
 - Cancellation is asynchronous: 202 means the request was durably recorded on the job, not that
@@ -2019,10 +1973,7 @@ else answers 404 rather than 403.
   claims that a partitioned execution stopped.
 - An execution that already holds a receipt may still finish, and that late success stays visible
   with `cancel_requested` true rather than being erased.
-- Cancellation of any other job stays anchored to the node that owns it.
-
-**Errors**: when the owning node cannot be reached the answer is a retryable 503 and nothing was
-recorded anywhere else."#,
+- Cancellation of any other job stays anchored to the node that owns it."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404")),
     responses(
         (
@@ -2712,8 +2663,8 @@ mod tests {
     #[test]
     fn report_openapi_union() {
         let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
-        let schema = &openapi["paths"]["/jobs/{job_id}/report"]["get"]["responses"]["404"]["content"]
-            ["application/json"]["schema"];
+        let schema = &openapi["paths"]["/compute/jobs/{job_id}/report"]["get"]["responses"]["404"]
+            ["content"]["application/json"]["schema"];
         assert_eq!(
             schema["$ref"],
             "#/components/schemas/ReportUnavailableResponse"
@@ -2848,15 +2799,15 @@ mod tests {
         assert_eq!(urls.owner_node_url, "https://owner.example/api/v1");
         assert_eq!(
             urls.status_url,
-            format!("https://owner.example/api/v1/jobs/{job_id}")
+            format!("https://owner.example/api/v1/compute/jobs/{job_id}")
         );
         assert_eq!(
             urls.report_url,
-            format!("https://owner.example/api/v1/jobs/{job_id}/report")
+            format!("https://owner.example/api/v1/compute/jobs/{job_id}/report")
         );
         assert_eq!(
             urls.artifact_url,
-            format!("https://owner.example/api/v1/jobs/{job_id}/artifacts/rocrate")
+            format!("https://owner.example/api/v1/compute/jobs/{job_id}/artifacts/rocrate")
         );
     }
 
@@ -2944,15 +2895,25 @@ mod tests {
     #[test]
     fn openapi_has_jobs() {
         let openapi = crate::openapi::ApiDoc::openapi();
-        assert!(openapi.paths.paths.contains_key("/jobs/"));
-        assert!(openapi.paths.paths.contains_key("/jobs/{job_id}"));
-        assert!(openapi.paths.paths.contains_key("/jobs/{job_id}/cancel"));
-        assert!(openapi.paths.paths.contains_key("/jobs/{job_id}/report"));
+        assert!(openapi.paths.paths.contains_key("/compute/jobs"));
+        assert!(openapi.paths.paths.contains_key("/compute/jobs/{job_id}"));
         assert!(
             openapi
                 .paths
                 .paths
-                .contains_key("/jobs/{job_id}/artifacts/rocrate")
+                .contains_key("/compute/jobs/{job_id}/cancel")
+        );
+        assert!(
+            openapi
+                .paths
+                .paths
+                .contains_key("/compute/jobs/{job_id}/report")
+        );
+        assert!(
+            openapi
+                .paths
+                .paths
+                .contains_key("/compute/jobs/{job_id}/artifacts/rocrate")
         );
     }
 

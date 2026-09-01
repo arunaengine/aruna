@@ -31,15 +31,18 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     summary = "List the transfers this device still owes",
     description = r#"Lists what this device has not finished exchanging with its realm nodes.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- `uploads` are the local versions a realm node has not pulled yet. A row disappears when the pull is acknowledged, so every listed upload is still owed.
-- `downloads` are the remote versions a folder has decided to fetch but has not written to disk yet.
-- `bytes_done` stays 0 until a transfer settles: a pull moves the bytes in one pass, so there is no partial progress to report.
+- `uploads` are local versions no realm node has pulled yet. A row disappears once the pull is
+  acknowledged, so every listed upload is still owed.
+- `downloads` are remote versions a folder has decided to fetch but has not written to disk yet.
+- `bytes_done` stays 0 until a transfer settles: a pull moves the bytes in one pass, so there is no
+  partial progress to report.
 - The list is node-local and answers while the realm is unreachable."#,
     responses(
-        (status = 200, description = "The transfers this device still owes", body = DeviceTransferList,
+        (status = 200, description = "The uploads not yet pulled and the downloads not yet written", body = DeviceTransferList,
             example = json!({
                 "uploads": [{
                     "id": "01JFOLDER0123456789ABCDEFG:notes/paper.txt",

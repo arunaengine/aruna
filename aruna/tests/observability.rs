@@ -80,7 +80,7 @@ async fn metrics_expose_rest_storage_and_queue_series() -> TestResult<()> {
         let client = reqwest::Client::new();
         // Drive one REST request so the counter has a rest sample.
         client
-            .get(format!("{}/api/v1/info", seed.base_url))
+            .get(format!("{}/api/v1/system/info", seed.base_url))
             .send()
             .await?;
 
@@ -1148,12 +1148,12 @@ async fn gate_survives_outage() -> TestResult<()> {
     // REST is bound without the peers ever becoming reachable.
     let client = process::probe_client();
     let info = client
-        .get(format!("{}/api/v1/info", node.rest_url))
+        .get(format!("{}/api/v1/system/info", node.rest_url))
         .send()
         .await?;
     assert_eq!(info.status(), StatusCode::OK);
     let realm = client
-        .get(format!("{}/api/v1/info/realm", node.rest_url))
+        .get(format!("{}/api/v1/system/realm", node.rest_url))
         .send()
         .await?;
     assert_eq!(realm.status(), StatusCode::OK);

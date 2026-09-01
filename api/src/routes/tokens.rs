@@ -24,7 +24,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "tokens", description = "Bearer token revocation"))
+    tags((name = "access/tokens", description = "Bearer token revocation"))
 )]
 pub struct TokensApiDoc;
 
@@ -39,29 +39,26 @@ pub struct RevokeTokenRequest {
 
 #[utoipa::path(
     post,
-    path = "/users/tokens/revoke",
-    tag = "tokens",
-    summary = "Revoke a bearer token of this realm",
+    path = "/access/tokens/revoke",
+    tag = "access/tokens",
+    summary = "Revoke a realm bearer token",
     description = r#"Records a bearer token of this realm in the replicated revocation set.
 
-**Authentication**: bearer token of this realm. Retiring one's own token is self-service, except
-that a path-restricted (delegated) token is self-service only for the very token it presented. Every
-other revocation, another user's token included, needs WRITE on the token owner's
-`/{realm_id}/admin/u/{user_id}` path, so a delegated token holding that permission may still revoke.
+**Authentication**: realm bearer token. Revoking one's own token is self-service, except that a
+path-restricted token may only revoke the very token it presented; every other revocation needs
+WRITE on the token owner's `/{realm_id}/admin/u/{user_id}` path.
 
 **Behavior**
-- On a user-kind node the revocation is forwarded to a ranked management or server peer under the
-  caller's own token, which is where the permission is then checked, and 503 is returned when no
-  eligible peer accepts it.
-- Otherwise the revocation is recorded in the replicated realm configuration: it takes effect on
-  this node before the response and reaches the other realm nodes asynchronously with that
-  configuration, so a 204 is not proof that every node already refuses the token.
-- Revoking the same token again is accepted and returns 204 again.
+- A user node forwards the revocation to a management or server peer under the caller's own token,
+  which is where the permission is checked.
+- The revocation takes effect here before the response and reaches the other realm nodes with the
+  realm configuration through document sync, so 204 is not proof that every node already refuses the
+  token.
+- Revoking the same token again is accepted and answers 204 again.
 
 **Limits**
-- The token in the body must itself be a well-formed, signed bearer token of this realm whose
-  remaining lifetime still fits the retained revocation window; anything else is refused with 400,
-  including a token of another realm."#,
+- The token in the body must be a well-formed, signed bearer token of this realm whose remaining
+  lifetime still fits the retained revocation window."#,
     request_body(
         content = RevokeTokenRequest,
         description = "The bearer token to revoke, as issued, not its hash",
@@ -70,11 +67,11 @@ other revocation, another user's token included, needs WRITE on the token owner'
         })
     ),
     responses(
-        (status = 204, description = "Revocation recorded, or already recorded by an earlier call; no response body"),
-        (status = 400, description = "The body is not a well-formed bearer token of this realm, or its lifetime exceeds what the revocation set retains", body = ErrorResponse),
-        (status = 401, description = "Missing or unusable bearer token on the request itself", body = ErrorResponse),
+        (status = 204, description = "Revocation recorded, or already recorded by an earlier call"),
+        (status = 400, description = "The body is not a well-formed bearer token of this realm, or its lifetime exceeds the retained revocation window", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token on the request itself", body = ErrorResponse),
         (status = 403, description = "Caller token belongs to another realm, or lacks WRITE on the token owner's realm admin path", body = ErrorResponse),
-        (status = 503, description = "No eligible realm peer accepted the forwarded revocation, or the revocation set is at capacity; retryable, the response carries a Retry-After header", body = ErrorResponse)
+        (status = 503, description = "No eligible realm peer accepted the forwarded revocation, or the revocation set is at capacity; retryable, the response carries Retry-After", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

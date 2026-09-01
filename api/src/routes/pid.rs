@@ -37,7 +37,10 @@ use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "pid", description = "w3id persistent identifier landing and lifecycle"))
+    tags(
+        (name = "pid", description = "w3id persistent identifier landing and lifecycle"),
+        (name = "metadata/pids", description = "Persistent identifiers for metadata documents")
+    )
 )]
 pub struct PidApiDoc;
 
@@ -59,21 +62,14 @@ fn rocrate_location(document_id: Ulid) -> String {
     summary = "Resolve a w3id persistent identifier",
     description = r#"Public landing route for the ordinary identity `https://w3id.org/aruna/{document_id}`.
 
-**Authentication**: none; public route, no bearer token is required or read.
+**Authentication**: none; public route, no bearer token is read.
 
-**Behavior**
-- A Profile's mapping uses `/profile/{document_id}`, so this ordinary path returns 404 for a Profile
-  and never acts as a duplicate PID.
-- An active public identifier answers 302 to the document's RO-Crate read route, which applies its
-  own authorization.
-- A terminal tombstone answers 410.
-- Unknown, malformed, private, `requested`, `processing` and `failed` identifiers answer 404.
-
-**Errors**: when the single PID authority is unreachable the answer is 503 rather than a false 404."#,
+**Behavior**: a Profile resolves under `/profile/{document_id}`, so this path answers 404 for a
+Profile and never acts as a duplicate PID."#,
     params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID, for example 01JMETADATA0123456789ABCDE")),
     responses(
-        (status = 302, description = "Registered identifier; the Location header points at the RO-Crate read route and the body is empty"),
-        (status = 404, description = "No identifier is registered for this document, or the identifier is malformed; the body is empty"),
+        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization"),
+        (status = 404, description = "Unknown, malformed, private or Profile identifier, or a mapping still in `requested`, `processing` or `failed`"),
         (
             status = 410,
             description = "The identifier was withdrawn and stays withdrawn",
@@ -84,7 +80,7 @@ fn rocrate_location(document_id: Ulid) -> String {
                 "status": "withdrawn"
             })
         ),
-        (status = 503, description = "The PID authority is unreachable; retry the same request later")
+        (status = 503, description = "The PID authority is unreachable, which is reported instead of a false 404; retryable")
     ),
     security(())
 )]
@@ -113,19 +109,16 @@ async fn resolve_pid(
     summary = "Resolve a Profile w3id persistent identifier",
     description = r#"Public landing route for the Profile identity `https://w3id.org/aruna/profile/{document_id}`.
 
-**Authentication**: none; public route.
+**Authentication**: none; public route, no bearer token is read.
 
-**Behavior**
-- Resolves only when that exact value is the document's stored automatic primary PID; ordinary
-  Datasets return 404 here.
-- Response privacy, 302 and 410 lifecycle behavior and 503 authority handling are identical to
-  `GET /pid/{document_id}`."#,
+**Behavior**: resolves only when that exact value is the document's stored automatic primary PID.
+Privacy, lifecycle and authority handling match `GET /pid/{document_id}`."#,
     params(("document_id" = String, Path, description = "Profile document ULID")),
     responses(
-        (status = 302, description = "Active public Profile identifier"),
+        (status = 302, description = "Active public Profile identifier; the Location header points at the RO-Crate read route"),
         (status = 404, description = "Unknown, private, non-Profile or non-active identifier"),
-        (status = 410, description = "The exact Profile identifier is terminally retired"),
-        (status = 503, description = "The PID authority is unreachable")
+        (status = 410, description = "The Profile identifier was withdrawn and stays withdrawn"),
+        (status = 503, description = "The PID authority is unreachable; retryable")
     ),
     security(())
 )]
@@ -298,19 +291,17 @@ async fn require_status_visibility(
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}/pids",
-    tag = "pid",
+    tag = "metadata/pids",
     summary = "List a document's typed persistent identifiers",
     description = r#"Returns the one stored automatic w3id record for a document as a typed list.
 
-**Authentication**: optional bearer token; public records may be read anonymously, while a private
-record returns 404 anonymously and requires READ on its frozen document permission path when
-authenticated.
+**Authentication**: optional bearer token; a public record may be read anonymously, a private one
+needs READ on the document's frozen permission path and answers 404 anonymously.
 
 **Behavior**
-- Storage remains keyed 1:1 by document, so the list carries the single automatic w3id record.
-- Stored mapping state is authoritative for `requested`, `processing`, `active`, `failed`,
-  `admin-withdrawn` and `tombstoned`, including its job reference and failure/retry data.
-- A job-read failure is never interpreted as unminted.
+- The stored mapping is authoritative for the `requested`, `processing`, `active`, `failed`,
+  `admin-withdrawn` and `tombstoned` states and for the job and failure fields, so a failed job
+  read is never reported as unminted.
 - A missing or unavailable authority mapping is reported as `unknown`."#,
     params(("document_id" = String, Path, description = "Metadata document ULID")),
     responses(
@@ -334,8 +325,8 @@ authenticated.
             ])
         ),
         (status = 400, description = "Malformed document id", body = ErrorResponse),
-        (status = 403, description = "Authenticated caller lacks READ", body = ErrorResponse),
-        (status = 404, description = "Unknown document or anonymous private status", body = ErrorResponse)
+        (status = 403, description = "Caller lacks READ on the document", body = ErrorResponse),
+        (status = 404, description = "Document not found, or a private record read anonymously", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ())
 )]
@@ -414,8 +405,8 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerR
 - Normal document deletion instead stores `tombstoned`.
 - The transition is terminal and idempotent.
 
-**Limits** (all refused with 400)
-- `provider` must be `w3id`; no other provider is accepted.
+**Limits**
+- `provider` must be `w3id`.
 - `confirm_pid` must equal the stored PID value exactly.
 - `reason` is trimmed first and must then be 1 to 1024 bytes long and free of control characters."#,
     params(("document_id" = String, Path, description = "Document ULID whose PID is withdrawn, for example 01JMETADATA0123456789ABCDE")),
@@ -429,12 +420,12 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerR
         })
     ),
     responses(
-        (status = 204, description = "The withdrawal is durable on the PID authority; the response has no body"),
+        (status = 204, description = "The withdrawal is durable on the PID authority"),
         (status = 400, description = "Malformed id, unsupported provider, wrong confirmation, or invalid reason", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Caller lacks realm PID administration WRITE", body = ErrorResponse),
-        (status = 404, description = "Document not found", body = ErrorResponse),
-        (status = 503, description = "PID authority unreachable, retry later", body = ErrorResponse)
+        (status = 403, description = "Caller lacks WRITE on the realm PID administration path", body = ErrorResponse),
+        (status = 404, description = "No identifier is registered for this document", body = ErrorResponse),
+        (status = 503, description = "The PID authority is unreachable; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

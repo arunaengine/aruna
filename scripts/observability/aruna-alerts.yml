@@ -17,7 +17,6 @@ groups:
             made no measurable progress for ten minutes. Check peer reachability
             and the startup.recovery.degraded events; do not restart the node
             merely because peers are unavailable.
-          runbook: docs/operational-recovery.md
 
   - name: aruna-queues
     rules:
@@ -32,7 +31,6 @@ groups:
           description: >-
             The depth probe stopped at its page cap, so the reported depth is a
             lower bound. Treat this as urgent backlog. Never delete the outbox.
-          runbook: docs/operational-recovery.md
 
       - alert: ArunaOutboxOld
         expr: max by (instance, queue) (aruna_queue_oldest_age_seconds) > 900
@@ -44,7 +42,6 @@ groups:
           description: >-
             Convergence SLO breach. Records are accepted but not draining;
             check peer reachability and the pipeline.drain.summary events.
-          runbook: docs/operational-recovery.md
 
       - alert: ArunaQueueProbeDown
         expr: min by (instance, queue) (aruna_queue_probe_up) == 0
@@ -56,4 +53,3 @@ groups:
           description: >-
             Queue depth and age are no longer observable, so backlog alerts are
             blind. Check the storage worker and the ops listener.
-          runbook: docs/operational-recovery.md

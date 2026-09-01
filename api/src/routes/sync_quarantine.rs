@@ -27,9 +27,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "sync-quarantine", description = "Rejected replicated sync events"))
-)]
+#[openapi()]
 pub struct SyncQuarantineApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -178,28 +176,26 @@ fn event_summary(event: &DocumentSyncEvent) -> String {
 
 #[utoipa::path(
     get,
-    path = "/admin/sync-quarantine",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine",
+    tag = "data/sync",
     summary = "List rejected sync events held on this node",
-    description = r#"Realm-admin evidence console over the replicated sync events this node refused.
+    description = r#"Lists the replicated sync events this node refused, as evidence for a realm administrator.
 
 **Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path,
-because a retained row carries the whole rejected document; a path-restricted (delegated) token is
-refused outright.
+because a retained row carries the whole rejected document; a path-restricted token is refused.
 
 **Behavior**
 - The listing is node-local and never fanned out: each node keeps the events its own replication
   path rejected, so an operator asks the node that saw them.
 - Rows are ordered by their transport identity, publisher then delivery order, not by rejection
   time.
-- Retention is manual: a row stays until an operator acknowledges it and prunes it.
+- Retention is manual: a row stays until an operator acknowledges and prunes it.
 - `usage` reports how much of the node's fixed quarantine budget is consumed, so an operator can
   see a node approaching the point where new rejections can no longer be retained.
 - A page without `next_cursor` is the last one.
 
 **Limits**
-- `limit` defaults to 50 and is clamped to 1..=200.
-- A `cursor` or `topic` that is not valid hex is refused with 400."#,
+- `limit` defaults to 50 and is clamped to 1..=200."#,
     params(
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous page's `next_cursor`, hex encoded. Absent starts at the first row"),
         ("topic" = Option<String>, Query, description = "Hex-encoded sync topic, 64 characters; a shorter even-length hex string matches as a leading prefix. Absent lists every topic"),
@@ -208,7 +204,7 @@ refused outright.
     responses(
         (
             status = 200,
-            description = "Page of retained evidence with the node's current quarantine usage against its fixed capacity",
+            description = "One page of retained evidence, with the node's quarantine usage against its fixed capacity",
             body = QuarantinePageResponse,
             example = json!({
                 "records": [
@@ -238,7 +234,7 @@ refused outright.
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, belongs to another realm, or the caller is not a realm admin for this console", body = ErrorResponse)
+        (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -264,30 +260,24 @@ pub async fn list_quarantine(
 
 #[utoipa::path(
     get,
-    path = "/admin/sync-quarantine/{record_id}",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine/{record_id}",
+    tag = "data/sync",
     summary = "Inspect one rejected sync event",
     description = r#"Reads one retained row and a summary of the envelope it carried.
 
 **Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path,
-because the row carries the whole rejected document; a path-restricted (delegated) token is
-refused.
+because the row carries the whole rejected document; a path-restricted token is refused.
 
 **Behavior**
-- The row is the evidence an operator uses to decide why a replicated event was refused.
-- Evidence is node-local, so only the node that rejected the event can answer for it and an id
-  retained elsewhere is 404 here.
+- Evidence is node-local, so only the node that rejected the event can answer for it.
 - A payload that never decoded into a sync event is still kept, byte for byte, as evidence: such a
   row has no decoded `event` and no `event_id`, `family`, `target` or `origin_node_id`.
-- Inspecting changes nothing: the event stays rejected and the row stays unacknowledged.
-
-**Limits**
-- A `record_id` that is not valid hex is refused with 400."#,
+- Inspecting changes nothing: the event stays rejected and the row stays unacknowledged."#,
     params(("record_id" = String, Path, description = "Hex row id exactly as the listing reported it in `id`: the row's transport identity of topic, publisher and sequence")),
     responses(
         (
             status = 200,
-            description = "The retained row and, when the payload decoded, a readable summary of the sync event it carried",
+            description = "The retained row and, when the payload decoded, a summary of the sync event it carried",
             body = QuarantineInspectResponse,
             example = json!({
                 "record": {
@@ -309,7 +299,7 @@ refused.
         ),
         (status = 400, description = "The row id is not valid hex", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, belongs to another realm, or the caller is not a realm admin for this console", body = ErrorResponse),
+        (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no evidence under that row id; it may have been pruned, or retained by a different node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -337,29 +327,24 @@ pub async fn inspect_quarantine(
 
 #[utoipa::path(
     post,
-    path = "/admin/sync-quarantine/{record_id}/acknowledge",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine/{record_id}/acknowledge",
+    tag = "data/sync",
     summary = "Acknowledge one piece of quarantine evidence",
     description = r#"Marks a retained row as seen by an operator, the only thing that makes it prunable.
 
 **Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path; a
-path-restricted (delegated) token is refused.
+path-restricted token is refused.
 
 **Behavior**
 - This is bookkeeping, not recovery: the rejected event is not replayed, re-applied or accepted,
   nothing is sent back to the publisher, and the document it carried stays exactly as it was.
-- Evidence is node-local, so the acknowledgement applies to this node's copy only and an id
-  retained elsewhere is 404 here.
-- The call is idempotent: acknowledging an already acknowledged row rewrites nothing and answers
-  with the same row.
-
-**Limits**
-- A `record_id` that is not valid hex is refused with 400."#,
+- Evidence is node-local, so the acknowledgement applies to this node's copy only.
+- Acknowledging an already acknowledged row rewrites nothing and answers with the same row."#,
     params(("record_id" = String, Path, description = "Hex row id exactly as the listing reported it in `id`: the row's transport identity of topic, publisher and sequence")),
     responses(
         (
             status = 200,
-            description = "The row after acknowledgement; it now counts as reviewed and a prune pass may delete it",
+            description = "The row after acknowledgement; a prune pass may now delete it",
             body = QuarantineRecordResponse,
             example = json!({
                 "id": "a5d03b267c5480c60614edcfc08d83615fd0d6ce38048282ba9a85e8d9d61b64d8d15044cac756439413aaa60e3fa5cf7e7c500a6433f9512c1700b7f7fc0a950000000000000007",
@@ -378,7 +363,7 @@ path-restricted (delegated) token is refused.
         ),
         (status = 400, description = "The row id is not valid hex", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, belongs to another realm, or the caller is not a realm admin for this console", body = ErrorResponse),
+        (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no evidence under that row id; it may have been pruned, or retained by a different node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -400,28 +385,26 @@ pub async fn acknowledge_quarantine(
 
 #[utoipa::path(
     delete,
-    path = "/admin/sync-quarantine",
-    tag = "sync-quarantine",
+    path = "/data/sync/quarantine",
+    tag = "data/sync",
     summary = "Prune acknowledged quarantine evidence",
     description = r#"Runs one bounded sweep over this node's evidence and deletes the acknowledged rows it scanned.
 
 **Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path; a
-path-restricted (delegated) token is refused.
+path-restricted token is refused.
 
 **Behavior**
 - Only acknowledged rows are removed, so unreviewed evidence is never lost to a sweep, and deletion
-  is permanent: the rejected events are gone from this node and are not replayed by removing them.
-- One call is a page, not the whole store: `scanned` reports how many rows the pass looked at and
-  `pruned` how many it deleted, and the caller repeats the call with the returned `next_cursor`
-  until none comes back.
+  is permanent: the rejected events are gone from this node and removing them replays nothing.
+- One call is a page, not the whole store: repeat it with the returned `next_cursor` until none
+  comes back.
 - Pruning is how a node reclaims its fixed quarantine budget, and a node whose budget is full stops
-  accepting further replicated events on the affected topics until it has room again, so `usage` in
-  the answer is the signal to keep sweeping.
+  accepting further replicated events on the affected topics until it has room again, so `usage` is
+  the signal to keep sweeping.
 
 **Limits**
 - `limit` bounds the rows examined in one pass, not the rows deleted. Default 50, clamped to
-  1..=200.
-- A `cursor` or `topic` that is not valid hex is refused with 400."#,
+  1..=200."#,
     params(
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous pass's `next_cursor`, hex encoded. Absent starts at the first row"),
         ("topic" = Option<String>, Query, description = "Hex-encoded sync topic, 64 characters; a shorter even-length hex string matches as a leading prefix. Absent sweeps every topic"),
@@ -430,7 +413,7 @@ path-restricted (delegated) token is refused.
     responses(
         (
             status = 200,
-            description = "Result of this pass: rows examined, rows deleted, the cursor to continue with while one is returned, and the node's quarantine usage after the deletions",
+            description = "Rows examined and deleted in this pass, the cursor to continue with, and the node's quarantine usage after the deletions",
             body = QuarantinePruneResponse,
             example = json!({
                 "pruned": 1,
@@ -446,7 +429,7 @@ path-restricted (delegated) token is refused.
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, belongs to another realm, or the caller is not a realm admin for this console", body = ErrorResponse)
+        (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

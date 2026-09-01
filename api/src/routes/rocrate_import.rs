@@ -48,9 +48,7 @@ const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "rocrate-import", description = "RO-Crate upload and import"))
-)]
+#[openapi()]
 pub struct RoCrateImportApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -121,47 +119,40 @@ pub struct SubmitImportResponse {
 #[utoipa::path(
     post,
     path = "/metadata/rocrate/uploads",
-    tag = "rocrate-import",
+    tag = "metadata/rocrate",
     summary = "Upload an RO-Crate archive for a later import",
     description = r#"Stores an RO-Crate archive privately on this node so a later import can claim it.
 
-**Authentication**: bearer token issued by this realm; a token from another realm and a
-path-restricted delegated token are both refused with 403.
+**Authentication**: unrestricted bearer token issued by this realm; a token from another realm and
+a path-restricted delegated token are both refused.
 
 **Behavior**
-- Bytes are hashed and spooled while they arrive, so the whole archive never has to fit in memory.
-- The upload is private to the caller: only the same user can later reference it, and only on this
-  node, whose base URL is returned as `owner_node_url`.
-- Uploading only stores the archive; nothing is unpacked, validated or imported until the import
-  endpoint is called with the returned `upload_id`.
-- The upload is single-use, so a second import of the same `upload_id` is refused.
+- Bytes are hashed and spooled as they arrive, so the archive never has to fit in memory.
+- The upload is private to the caller and to this node, whose base URL is returned as
+  `owner_node_url`.
+- Nothing is unpacked, validated or imported until the import route is called with the returned
+  `upload_id`, and the upload is single-use.
 - The upload expires at `expires_at`, one day after creation by default, after which it is swept
   and an import naming it fails.
 
 **Limits**
-- The body is the archive itself, streamed as `application/zip` or `application/vnd.eln+zip`, with
-  media-type parameters such as a version allowed after a semicolon; any other `Content-Type` is
-  rejected with 400 before the body is read.
-- The size cap is the node's configured direct-upload limit, 8 GiB by default: a `Content-Length`
-  above it is refused with 413 before any body byte is read, and without a `Content-Length` the
-  stream is read until the cap is passed and then refused with 413 as well, with the partial spool
-  discarded either way.
+- The body is the archive itself as `application/zip` or `application/vnd.eln+zip`; media-type
+  parameters after a semicolon are allowed, any other type is rejected before the body is read.
+- The size cap is the node's configured direct-upload limit, 8 GiB by default, enforced from
+  `Content-Length` when it is present and otherwise while streaming.
 - A body that delivers nothing for 30 seconds, or a transfer still running after 30 minutes, is
-  aborted and its partial spool discarded as well, but as a failed transfer rather than a 413.
-
-**Errors**: the node bounds concurrent uploads and answers 503 with a `Retry-After` header when its
-upload capacity is exhausted or blob storage is unavailable, which the caller may retry."#,
+  aborted as a failed transfer rather than a 413."#,
     request_body(
         content(
             (String = "application/zip"),
             (String = "application/vnd.eln+zip")
         ),
-        description = "The RO-Crate archive itself, streamed as a raw binary body with Content-Type application/zip or application/vnd.eln+zip; no multipart or form encoding and no wrapper JSON"
+        description = "The RO-Crate archive as a raw binary body; no multipart or form encoding and no wrapper JSON"
     ),
     responses(
         (
             status = 201,
-            description = "The archive was stored privately for this caller on this node; its bytes are not yet unpacked or validated",
+            description = "The archive is stored privately for this caller on this node; its bytes are not yet unpacked or validated",
             body = UploadRoCrateResponse,
             example = json!({
                 "upload_id": "01JABCDEF0123456789ABCDEFG",
@@ -174,7 +165,8 @@ upload capacity is exhausted or blob storage is unavailable, which the caller ma
         (status = 400, description = "Content-Type is neither application/zip nor application/vnd.eln+zip", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is a path-restricted delegated token", body = ErrorResponse),
-        (status = 413, description = "Content-Length exceeds the node's direct-upload cap, or the streamed body passed it; the partial upload is discarded", body = ErrorResponse)
+        (status = 413, description = "The archive exceeds the node's direct-upload cap; the partial spool is discarded", body = ErrorResponse),
+        (status = 503, description = "Upload capacity exhausted or blob storage unavailable; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -247,43 +239,28 @@ pub async fn upload_rocrate(
 #[utoipa::path(
     post,
     path = "/metadata/rocrate/imports",
-    tag = "rocrate-import",
+    tag = "metadata/rocrate",
     summary = "Submit an RO-Crate import job",
     description = r#"Accepts an RO-Crate import plan and durably records it as a job on this node.
 
-**Authentication**: bearer token issued by this realm; a token from another realm and a
-path-restricted delegated token are both refused with 403. The plan is authorized in all three
-parts before the job is taken: READ on the source, WRITE on the target bucket, and WRITE on the
-metadata document path in its group.
+**Authentication**: unrestricted bearer token issued by this realm; a token from another realm and
+a path-restricted delegated token are both refused. The whole plan is authorized before the job is
+taken: READ on the source, WRITE on the target bucket, and WRITE on the metadata document path.
 
 **Behavior**
-- For an upload source, readable means the upload is the caller's own, unclaimed, unexpired and
-  within the import-source cap; an object or connector source needs READ on it.
+- An upload source is readable only when it is the caller's own, unclaimed, unexpired and within
+  the import-source cap; an object or connector source needs READ on it.
 - RO-Crate 1.2 and 1.3 contexts and specification IRIs are accepted, structurally validated, and
   retained in the published metadata and later exports.
-- The 202 means the plan passed those checks and the job was durably recorded, nothing more: no
-  archive has been unpacked, no object written and no metadata document published yet.
-- Progress is followed at `status_url` and the per-entry outcome at `report_url`, both on
-  `owner_node_url`, which is the node that owns the job.
+- Nothing is unpacked, written or published when the job is recorded; progress is followed at
+  `status_url` and the per-entry outcome at `report_url`, both on the owning node.
 - Send `idempotency_key` to make retries safe: a repeat with the same key and the same plan replays
   the original job and returns `created` false.
 
 **Limits**
-- An upload source is single-use, so a second import of an upload already claimed by another job is
-  refused.
 - A caller holds at most 4 active import jobs.
 - Bucket, prefix and metadata paths must be non-empty and within the configured key size, and a
-  prefix or connector path may not contain dot segments, backslashes or control characters.
-
-**Errors**
-- The same `idempotency_key` bound to a different plan, an upload already claimed by another job,
-  and a reached active-job cap are each a 409.
-- The group's standing compute quota refusing this admission is a 409 as well, carrying the exact
-  scope, dimension and numbers in `quota`.
-- A connector source whose staging backend cannot be reached answers 502, which the caller may
-  retry.
-- A 503 carries a `Retry-After` header and means the node could not place the job right now, which
-  the caller may retry unchanged."#,
+  prefix or connector path may not contain dot segments, backslashes or control characters."#,
     request_body(
         content = SubmitImportRequest,
         description = "The import plan: where the archive comes from, which bucket and prefix its payload lands in, and which metadata document the crate is published as",
@@ -307,22 +284,23 @@ metadata document path in its group.
     responses(
         (
             status = 202,
-            description = "The import plan was accepted and durably recorded; the archive is unpacked afterwards and the outcome is read from status_url and report_url",
+            description = "The plan passed authorization and the job is durably recorded; the import itself runs afterwards",
             body = SubmitImportResponse,
             example = json!({
                 "job_id": "01JJOB0123456789ABCDEFGHIJ",
                 "created": true,
                 "owner_node_url": "https://node.example.test/api/v1",
-                "status_url": "https://node.example.test/api/v1/jobs/01JJOB0123456789ABCDEFGHIJ",
-                "report_url": "https://node.example.test/api/v1/jobs/01JJOB0123456789ABCDEFGHIJ/report"
+                "status_url": "https://node.example.test/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHIJ",
+                "report_url": "https://node.example.test/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHIJ/report"
             })
         ),
         (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, or an expired or oversized source", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is a path-restricted delegated token, names another user's upload, or lacks READ on the source or WRITE on the target bucket or metadata path", body = ErrorResponse),
         (status = 404, description = "The upload, source object or version, connector source, or target bucket does not exist", body = ErrorResponse),
-        (status = 409, description = "Idempotency key bound to a different plan, an already claimed upload, a reached active-job cap, or a standing compute quota refusal", body = ErrorResponse),
-        (status = 503, description = "The job could not be placed right now; the response carries Retry-After and the caller may retry the unchanged request", body = ErrorResponse)
+        (status = 409, description = "Idempotency key bound to a different plan, an upload already claimed by another job, a reached active-job cap, or a standing compute quota refusal, which reports the exact scope, dimension and numbers in `quota`", body = ErrorResponse),
+        (status = 502, description = "The connector source's staging backend could not be reached; retryable", body = ErrorResponse),
+        (status = 503, description = "The job could not be placed right now; the unchanged request may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1270,7 +1248,7 @@ mod tests {
         assert!(
             response
                 .status_url
-                .ends_with(&format!("/jobs/{}", response.job_id))
+                .ends_with(&format!("/compute/jobs/{}", response.job_id))
         );
         assert!(response.report_url.ends_with("/report"));
     }

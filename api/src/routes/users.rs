@@ -58,7 +58,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "users", description = "User operations"))
+    tags(
+        (name = "access/users", description = "User operations"),
+        (name = "access/devices", description = "User device administration")
+    )
 )]
 pub struct UsersApiDoc;
 
@@ -546,30 +549,25 @@ async fn register_admin(
 
 #[utoipa::path(
     post,
-    path = "/users/register",
-    tag = "users",
-    summary = "Register the calling OIDC identity",
+    path = "/access/users/register",
+    tag = "access/users",
+    summary = "Register the caller as a realm user",
     description = r#"Registers the subject of the presented OIDC token as a user of this realm.
 
-**Authentication**: an OIDC bearer token from a configured issuer, not an Aruna access token. Any
-holder of a valid one registers themselves; an onboarding secret in the body additionally claims
-the initial realm administrator role.
+**Authentication**: an OIDC bearer token from a configured issuer, not a realm bearer token. Any
+holder of a valid one registers themselves; an onboarding secret in the body additionally claims the
+initial realm administrator role.
 
 **Behavior**
-- Two callers are served: a user registering themselves, and an operator bootstrapping the first
-  realm administrator.
-- Leaving the onboarding secret out is get or create, so a subject that already has a user gets
-  the existing user back unchanged, still with 201.
-- An onboarding secret must have been issued for this realm with the initial administrator
-  purpose, it is consumed single use, and the registered user then claims that role.
-- The registered identity is always the subject of the presented token, never a user id chosen by
-  the caller, and the display name comes from the token.
-- The user document is written on the node that serves the request and replicates to the other
-  realm nodes asynchronously, so it may not be visible elsewhere immediately.
-- No access token is returned here: exchange the same OIDC token at `GET /users/token`.
-
-**Errors**: an onboarding secret issued for another purpose is refused with 403, while one that is
-unknown, expired, already claimed or issued for another realm is refused with 401."#,
+- Without an onboarding secret this is get or create: a subject that already has a user gets the
+  existing one back unchanged, still with 201.
+- The onboarding secret must have been issued for this realm with the initial administrator purpose
+  and is consumed single-use.
+- The registered user is always the subject of the presented token, never a user id chosen by the
+  caller, and the display name comes from the token.
+- The user document is written here and reaches the other realm nodes through document sync, so it
+  may not be visible elsewhere immediately.
+- No access token is returned: exchange the same OIDC token at `GET /access/token`."#,
     request_body(
         content = RegisterUserRequest,
         description = "Optional onboarding secret. Omit it, or send null, for ordinary self service registration; send the secret handed out by the node operator only to claim the initial realm administrator.",
@@ -595,15 +593,15 @@ unknown, expired, already claimed or issued for another realm is refused with 40
     responses(
         (
             status = 201,
-            description = "The user of this OIDC subject, either newly created or already present from an earlier registration",
+            description = "The user of this OIDC subject, newly created or already present from an earlier registration",
             body = RegisterUserResponse,
             example = json!({
                 "id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
                 "name": "Alice Example"
             })
         ),
-        (status = 400, description = "The request body is not valid JSON for this operation", body = ErrorResponse),
-        (status = 401, description = "No OIDC bearer token was presented, it failed validation against the configured issuers, or the onboarding secret is unknown, expired, already claimed or issued for another realm", body = ErrorResponse),
+        (status = 400, description = "Malformed request body", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid OIDC bearer token, or an onboarding secret that is unknown, expired, already claimed or issued for another realm", body = ErrorResponse),
         (status = 403, description = "The onboarding secret was issued for another purpose than the initial realm administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -657,39 +655,34 @@ async fn register_user(
 
 #[utoipa::path(
     get,
-    path = "/users/token",
-    tag = "users",
-    summary = "Issue an access token for the calling identity",
-    description = r#"Mints a realm access token for the calling identity.
+    path = "/access/token",
+    tag = "access/tokens",
+    summary = "Issue a realm bearer token",
+    description = r#"Mints a realm bearer token for the calling user, valid for 24 hours.
 
-**Authentication**: an Aruna access token without path restrictions, which refreshes itself, or an
-OIDC token from a configured issuer whose subject has been registered at `POST /users/register`.
-Self-scoped: the token is always minted for the caller's own identity and can never be requested
-on behalf of somebody else.
+**Authentication**: a realm bearer token without path restrictions, which refreshes itself, or an
+OIDC token from a configured issuer whose subject has been registered at
+`POST /access/users/register`. The token is always minted for the caller and never on behalf of
+somebody else.
 
 **Behavior**
-- The issued token is a realm bearer credential valid for 24 hours.
-- The issued token preserves a bound Aruna session's kind; OIDC and legacy unbound callers receive
-  a `portal` session.
-- Issuance prunes expired and revoked session history and refuses when 256 active sessions remain.
-- It is returned only in this response and is not retrievable afterwards, so a lost token has to
-  be reissued here.
+- The token preserves a bound session's kind; an OIDC or unbound caller receives a `portal` session.
+- The token is returned in this response only, so a lost one has to be reissued here.
 
-**Errors**: a path-restricted (delegated) token is refused with 403, as is a token whose subject is
-an alias rather than the canonical user of that OIDC subject."#,
+**Limits**
+- Issuance prunes expired and revoked sessions first and refuses when 256 active ones remain."#,
     responses(
         (
             status = 200,
-            description = "A freshly issued access token for the caller, valid for 24 hours and shown only here",
+            description = "A freshly issued realm bearer token for the caller, shown only here",
             body = GetTokenResponse,
             example = json!({
                 "token": "<aruna-access-token>"
             })
         ),
-        (status = 400, description = "Not produced by this operation; a request that cannot be authenticated is answered with 401 or 403 instead", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, the OIDC token failed validation, or this node knows no user for the presented identity", body = ErrorResponse),
-        (status = 403, description = "The presented access token carries path restrictions, or its subject is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
-        (status = 409, description = "Active session limit reached", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
+        (status = 403, description = "The presented token is path-restricted, or its user is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -736,30 +729,23 @@ async fn get_token(
 
 #[utoipa::path(
     get,
-    path = "/users/info",
-    tag = "users",
-    summary = "Get the calling user's profile, roles and preferences",
-    description = r#"Describes the calling user: profile, realm roles, group memberships and UI preferences.
+    path = "/access/users/me",
+    tag = "access/users",
+    summary = "Get the calling user's profile",
+    description = r#"Describes the calling user: profile, realm roles, group roles and UI preferences.
 
-**Authentication**: realm bearer token that carries no path restrictions; a delegated token, or a
-token issued by another realm, is refused with 403. Self-scoped: it always describes the caller
-and takes no user id.
+**Authentication**: realm bearer token without path restrictions. It always describes the caller and
+takes no user id.
 
 **Behavior**
-- The response combines the caller's user document, the realm roles whose assignment list contains
-  the caller, and one entry for every group known to this node whose roles list the caller.
-- The preferences are derived from the caller's `ui.theme`, `ui.preferred_profile_path` and
-  `ui.favourite_metadata_ids` attributes, where the favourites attribute is a comma separated
-  list.
-- Group membership is collected from the groups this node holds, so a group that has not
-  replicated here yet is missing.
-
-**Errors**: 404 means this node holds no user document for the caller, which can happen while a
-registration made on another node is still replicating."#,
+- Preferences are derived from the caller's `ui.theme`, `ui.preferred_profile_path` and
+  `ui.favourite_metadata_ids` attributes, the last a comma separated list.
+- Group membership is collected from the groups this node holds, so a group that has not arrived
+  here yet is missing."#,
     responses(
         (
             status = 200,
-            description = "The caller's user document, realm roles, group memberships and UI preferences",
+            description = "The caller's user document, realm roles, group roles and UI preferences",
             body = GetUserInfoResponse,
             example = json!({
                 "user": {
@@ -806,9 +792,9 @@ registration made on another node is still replicating."#,
                 }
             })
         ),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm or carries path restrictions", body = ErrorResponse),
-        (status = 404, description = "This node holds no user document for the calling identity", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
+        (status = 404, description = "This node holds no user document for the caller, which can happen while a registration made elsewhere is still replicating", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -825,28 +811,24 @@ async fn get_user_info(
 
 #[utoipa::path(
     patch,
-    path = "/users/info",
-    tag = "users",
+    path = "/access/users/me",
+    tag = "access/users",
     summary = "Update the calling user's profile",
     description = r#"Updates the calling user's display name and attributes and returns the refreshed profile.
 
-**Authentication**: realm bearer token that carries no path restrictions; a delegated token, or a
-token issued by another realm, is refused with 403. Self-scoped: it always writes the caller's own
+**Authentication**: realm bearer token without path restrictions. It always writes the caller's own
 user document and takes no user id.
 
 **Behavior**
-- Fields left out change nothing.
-- Removals are applied before sets, so a key named in both ends up set to the new value.
+- Fields left out change nothing, and removals are applied before sets, so a key named in both ends
+  up set to the new value.
 - UI preferences are ordinary attributes: `ui.theme`, `ui.preferred_profile_path` and
   `ui.favourite_metadata_ids` as a comma separated list.
-- The write is durable on the node that answers and replicates to the other realm nodes
-  asynchronously.
-- The response is the caller's refreshed profile in the same shape as `GET /users/info`.
+- The write is durable here and reaches the other realm nodes through document sync.
 
 **Limits**
 - The name is trimmed and must be 1 to 256 characters.
-- An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128
-  bytes.
+- An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes.
 - An attribute value is at most 4096 bytes and carries no control characters.
 - A user holds at most 128 attributes."#,
     request_body(
@@ -864,7 +846,7 @@ user document and takes no user id.
     responses(
         (
             status = 200,
-            description = "The caller's profile after the update, with realm roles, group memberships and the recomputed preferences",
+            description = "The caller's profile after the update, with realm roles, group roles and the recomputed preferences",
             body = GetUserInfoResponse,
             example = json!({
                 "user": {
@@ -902,10 +884,10 @@ user document and takes no user id.
                 }
             })
         ),
-        (status = 400, description = "The name is empty or longer than 256 characters, or an attribute key or value is rejected, or the user would hold more than 128 attributes", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm or carries path restrictions", body = ErrorResponse),
-        (status = 404, description = "This node holds no user document for the calling identity", body = ErrorResponse)
+        (status = 400, description = "The name is out of range, an attribute key or value is rejected, or the user would hold more than 128 attributes", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
+        (status = 404, description = "This node holds no user document for the caller", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -961,21 +943,20 @@ async fn patch_user_info(
 
 #[utoipa::path(
     get,
-    path = "/users",
-    tag = "users",
+    path = "/access/users",
+    tag = "access/users",
     summary = "List the users of this realm",
     description = r#"Pages this realm's user documents in user id order.
 
-**Authentication**: realm bearer token with READ on the realm's user administration path, so an
-ordinary member is refused with 403; the realm request policies are evaluated as well and may deny
-a read that the role grant alone would allow.
+**Authentication**: realm bearer token with READ on the realm's user administration path. The realm
+request policies are evaluated as well and may deny a read the role grant alone would allow.
 
 **Behavior**
-- Only users of this realm are listed, from the replica held by the node that serves the request,
-  so a user registered on another node appears once replication has caught up.
+- This is a node-local read of replicated documents, so a user registered on another node appears
+  once it arrives here.
 - Every entry is the full user document including its attributes.
-- Pagination is cursor based: `next_start_after` repeats the last returned user id, and its
-  absence means the end of the listing was reached.
+- Pagination is cursor based: `next_start_after` repeats the last returned user id, and its absence
+  means the end of the listing was reached.
 
 **Limits**
 - `limit` defaults to 100 and is clamped into 1 to 1000."#,
@@ -986,7 +967,7 @@ a read that the role grant alone would allow.
     responses(
         (
             status = 200,
-            description = "One page of this realm's users held by this node, with the cursor for the next page",
+            description = "One page of this realm's users held by this node, with the cursor for the next",
             body = ListUsersResponse,
             example = json!({
                 "users": [
@@ -1003,9 +984,9 @@ a read that the role grant alone would allow.
                 "next_start_after": "01JB2C3D4E5F6G7H8J9KABCDEF@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"
             })
         ),
-        (status = 400, description = "The start_after cursor is not a user id", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm, or the caller has no read access on the realm's user administration path", body = ErrorResponse)
+        (status = 400, description = "The `start_after` cursor is not a user id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1062,22 +1043,21 @@ async fn list_users(
 
 #[utoipa::path(
     get,
-    path = "/users/search",
-    tag = "users",
+    path = "/access/users/search",
+    tag = "access/users",
     summary = "Search this realm's users by name or email",
     description = r#"Pages this realm's users whose display name or email attribute contains the query.
 
 **Authentication**: realm bearer token with READ on the realm's user administration path, the same
-grant as the full listing, so an ordinary member is refused with 403.
+grant as the full listing.
 
 **Behavior**
-- The query is trimmed and matched case insensitively as a substring of the display name and of
-  the email attribute, over the users of this realm held by the node that serves the request; a
-  user registered elsewhere is found once replication has caught up.
+- The query is trimmed and matched case insensitively as a substring of the display name and of the
+  email attribute, over the users this node holds; a user registered elsewhere is found once the
+  document arrives here.
 - A result carries only the user id and the display name, never attributes.
-- Pagination is cursor based: `next_start_after` repeats the last returned user id, and its
-  absence means the scan reached the end of the realm's users rather than that no further match
-  exists on a later page.
+- Pagination is cursor based, and the absence of `next_start_after` means the scan reached the end
+  of the realm's users, not that no further match exists on a later page.
 
 **Limits**
 - `q` must hold at least 2 characters after trimming.
@@ -1090,7 +1070,7 @@ grant as the full listing, so an ordinary member is refused with 403.
     responses(
         (
             status = 200,
-            description = "One page of matching users, reduced to user id and display name, with the cursor for the next page",
+            description = "One page of matching users, reduced to user id and display name, with the cursor for the next",
             body = SearchUsersResponse,
             example = json!({
                 "users": [
@@ -1102,9 +1082,9 @@ grant as the full listing, so an ordinary member is refused with 403.
                 "next_start_after": null
             })
         ),
-        (status = 400, description = "The query is shorter than 2 characters after trimming, or the start_after cursor is not a user id", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm, or the caller has no read access on the realm's user administration path", body = ErrorResponse)
+        (status = 400, description = "The query is shorter than 2 characters after trimming, or the `start_after` cursor is not a user id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1167,27 +1147,25 @@ async fn search_users(
 
 #[utoipa::path(
     post,
-    path = "/users/resolve",
-    tag = "users",
+    path = "/access/users/resolve",
+    tag = "access/users",
     summary = "Resolve user ids to directory entries",
     description = r#"Resolves a batch of user ids to directory entries held by this node.
 
-**Authentication**: realm bearer token with READ on the realm's user administration path, so an
-ordinary member is refused with 403.
+**Authentication**: realm bearer token with READ on the realm's user administration path.
 
 **Behavior**
-- The lookup runs against the replica held by the node that serves the request.
 - Duplicate ids collapse and ids unknown to this node are dropped silently, so the result may be
   shorter than the request and carries no positional mapping; match the entries by user id.
-- Only the directory safe attributes `orcid`, `affiliation` and `department` are exposed, while
-  `email` and every other attribute are withheld here.
+- Only the directory safe attributes `orcid`, `affiliation` and `department` are exposed; `email`
+  and every other attribute are withheld here.
 - The response body is a JSON array, not an object.
 
 **Limits**
 - At most 100 user ids per request."#,
     request_body(
         content = ResolveUsersRequest,
-        description = "Up to 100 user ids, each in the form ulid@realm-id. Duplicates are collapsed and unknown ids are omitted from the result.",
+        description = "Up to 100 user ids, each in the form `<ulid>@<realm>`. Duplicates are collapsed and unknown ids are omitted from the result.",
         example = json!({
             "user_ids": [
                 "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
@@ -1212,8 +1190,8 @@ ordinary member is refused with 403.
             ])
         ),
         (status = 400, description = "More than 100 user ids were sent, or an entry is not a user id", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm, or the caller has no read access on the realm's user administration path", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1268,25 +1246,19 @@ async fn resolve_users(
 
 #[utoipa::path(
     get,
-    path = "/users/{id}",
-    tag = "users",
+    path = "/access/users/{id}",
+    tag = "access/users",
     summary = "Get a user of this realm by id",
     description = r#"Returns one user document of this realm as held by the responding node.
 
-**Authentication**: realm bearer token with READ on the administration path of that specific user,
-so a caller without the grant is refused with 403 whether or not the user exists and existence
-stays hidden; the realm request policies are evaluated as well and may deny a read the role grant
-would allow.
+**Authentication**: realm bearer token with READ on that specific user's administration path. The
+realm request policies are evaluated as well and may deny a read the role grant would allow.
 
 **Behavior**
-- The reply is served from the replica held by the node that receives the request, so a user
-  registered on another node appears once replication has caught up.
-- The response is the full user document including its attributes.
-
-**Errors**: 404 is only reachable for a caller that may read that user. A token issued by another
-trusted realm is answered with 501, because forwarding a read to the owning realm is not
-implemented."#,
-    params(("id" = String, Path, description = "User id in the form ulid@realm-id, as returned by the listing and search operations")),
+- This is a node-local read of a replicated document, so a user registered on another node appears
+  once it arrives here.
+- The response is the full user document including its attributes."#,
+    params(("id" = String, Path, description = "User id in the form `<ulid>@<realm>`, as returned by the listing and search operations")),
     responses(
         (
             status = 200,
@@ -1303,8 +1275,8 @@ implemented."#,
             })
         ),
         (status = 400, description = "Declared for malformed input; in practice an id that is not a user id is refused by the authorization check with 403 instead", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The caller has no read access on that user's administration path; the same answer is given whether or not the user exists", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller lacks READ on that user's administration path; the same answer is given whether or not the user exists", body = ErrorResponse),
         (status = 404, description = "This node holds no user with that id, and the caller is allowed to know that", body = ErrorResponse),
         (status = 501, description = "The token was issued by another trusted realm; forwarding the read to the owning realm is not implemented", body = ErrorResponse)
     ),
@@ -1349,31 +1321,26 @@ async fn get_user(
 
 #[utoipa::path(
     patch,
-    path = "/users/{id}",
-    tag = "users",
+    path = "/access/users/{id}",
+    tag = "access/users",
     summary = "Update a user of this realm by id",
     description = r#"Updates one user's display name and attributes and returns the updated document.
 
-**Authentication**: realm bearer token; a token issued by another realm is refused with 403.
-Updating the caller's own user needs no further grant but refuses a path-restricted (delegated)
-token with 403. Updating anybody else requires WRITE on that user's administration path and
-additionally passes the realm request policies, which may deny the write even when the role grant
-allows it.
+**Authentication**: realm bearer token. Updating the caller's own user needs no further grant but
+refuses a path-restricted token; updating anybody else requires WRITE on that user's administration
+path and additionally passes the realm request policies.
 
 **Behavior**
-- Fields left out change nothing.
-- Removals are applied before sets, so a key named in both ends up set.
-- The write is durable on the node that answers and replicates to the other realm nodes
-  asynchronously.
-- The response is the updated user document.
+- Fields left out change nothing, and removals are applied before sets, so a key named in both ends
+  up set to the new value.
+- The write is durable here and reaches the other realm nodes through document sync.
 
-**Limits** (validation matches the self service profile update)
+**Limits** (the same as for the self-service profile update)
 - The name is trimmed and must be 1 to 256 characters.
-- An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128
-  bytes.
+- An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes.
 - An attribute value is at most 4096 bytes and carries no control characters.
 - A user holds at most 128 attributes."#,
-    params(("id" = String, Path, description = "User id in the form ulid@realm-id of the user to update; the caller's own id for a self service update")),
+    params(("id" = String, Path, description = "User id in the form `<ulid>@<realm>` of the user to update; the caller's own id for a self-service update")),
     request_body(
         content = UpdateUserRequest,
         description = "Optional new display name, attributes to set and attribute keys to remove. Send only what changes.",
@@ -1400,9 +1367,9 @@ allows it.
                 }
             })
         ),
-        (status = 400, description = "The id is not a user id, the name is empty or longer than 256 characters, or an attribute key or value is rejected", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm, a delegated token attempted a self update, or the caller has no write access on that user's administration path", body = ErrorResponse),
+        (status = 400, description = "The id is not a user id, the name is out of range, or an attribute key or value is rejected", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, a path-restricted token attempted a self-update, or the caller lacks WRITE on that user's administration path", body = ErrorResponse),
         (status = 404, description = "This node holds no user with that id", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1537,33 +1504,30 @@ async fn owned_devices(
 
 #[utoipa::path(
     get,
-    path = "/users/me/devices",
-    tag = "users",
+    path = "/access/users/me/devices",
+    tag = "access/users",
     summary = "List the calling user's devices",
-    description = r#"Lists the devices this user has enrolled, plus the device enrollments still in flight.
+    description = r#"Lists the devices the calling user has enrolled, plus the enrollments still in flight.
 
-**Authentication**: realm bearer token. Self-scoped: it always lists the caller's own devices and
-takes no user id, so it grants no view of anybody else's.
+**Authentication**: realm bearer token. It always lists the caller's own devices and takes no user
+id, so it grants no view of anybody else's.
 
 **Behavior**
-- An enrolled device is a realm member of kind `User` whose owner is the caller; it reads
-  `enrolled` and is addressed by its node id.
+- An enrolled device is a realm member of kind `User` owned by the caller; it reads `enrolled` and
+  is addressed by its node id.
 - An enrollment whose secret is still outstanding reads `pending`, or `claimed` once a device has
   redeemed the secret but the realm configuration has not caught up; it is addressed by its
-  enrollment id and carries the secret's expiry.
-- An unclaimed enrollment whose `expires_at` has passed reads `expired`. It stays listed until a
-  later mint or admin listing prunes it, but it is never reported as still in flight.
-- An enrollment is dropped from the list as soon as the device it claimed appears as a member, so
-  one device is listed once.
-- The realm configuration is the authority on ownership, and the outstanding secrets are this
-  node's local state, so a device enrolled elsewhere appears once that configuration replicates
-  here.
-
-**Errors**: 404 means this node holds no configuration document for its realm yet."#,
+  enrollment id.
+- An unclaimed enrollment past its `expires_at` reads `expired` and stays listed until a later mint
+  or admin listing prunes it.
+- An enrollment is dropped as soon as the device it claimed appears as a member, so one device is
+  listed once.
+- The realm configuration is the authority on ownership while outstanding secrets are this node's
+  own state, so a device enrolled elsewhere appears once that configuration arrives here."#,
     responses(
         (
             status = 200,
-            description = "The caller's enrolled devices and in-flight device enrollments",
+            description = "The caller's enrolled devices and in-flight enrollments",
             body = UserDevicesResponse,
             example = json!({
                 "devices": [
@@ -1584,8 +1548,8 @@ takes no user id, so it grants no view of anybody else's.
                 ]
             })
         ),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1601,33 +1565,30 @@ async fn list_user_devices(
 
 #[utoipa::path(
     delete,
-    path = "/users/me/devices/{id}",
-    tag = "users",
+    path = "/access/users/me/devices/{id}",
+    tag = "access/users",
     summary = "Revoke one of the calling user's devices",
     description = r#"Revokes a device enrollment of the calling user, making its secret unredeemable from here on.
 
-**Authentication**: realm bearer token. Self-scoped: only a device owned by the caller can be
-revoked, and a device owned by anybody else answers 404 rather than admitting it exists.
+**Authentication**: realm bearer token. Only a device owned by the caller can be revoked; a device
+owned by anybody else answers 404 rather than admitting it exists.
 
 **Behavior**
-- `id` is what `GET /users/me/devices` reported: an enrollment id while the enrollment is still in
-  flight, or a node id once the device has joined.
-- Revoking an in-flight enrollment deletes the enrollment record on the management node holding it,
-  so the secret can no longer be redeemed. It does not reach back into a completed enrollment.
-- Evicting a device that already joined drops it from the realm configuration and retires the
-  secret it redeemed. The eviction replicates like any other configuration change, and each node
-  closes the device's open connections when it applies the new membership.
-- The eviction is a realm configuration change, so it is served by a management node; a call to any
-  other node is relayed to one, because its peers would refuse the event.
-
-**Errors**: an id that is neither an enrollment id nor a node id of a device owned by the caller
-answers 404, which is also what a caller sees after an earlier revoke."#,
-    params(("id" = String, Path, description = "Enrollment id or node id of the device, as reported by GET /users/me/devices")),
+- `id` is what `GET /access/users/me/devices` reported: an enrollment id while the enrollment is
+  still in flight, or a node id once the device has joined.
+- Revoking an in-flight enrollment deletes the enrollment record, so the secret can no longer be
+  redeemed. It does not reach back into a completed enrollment.
+- Evicting a device that already joined drops it from the realm configuration and retires the secret
+  it redeemed. The change replicates like any other configuration change, and each node closes the
+  device's open connections when it applies the new membership.
+- Eviction is a realm configuration change, so a management node serves it and every other node
+  relays the call to one."#,
+    params(("id" = String, Path, description = "Enrollment id or node id of the device, as reported by `GET /access/users/me/devices`")),
     responses(
-        (status = 204, description = "Device enrollment revoked, or the device evicted from the realm; no response body"),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The token was issued by another realm", body = ErrorResponse),
-        (status = 404, description = "No device of the calling user carries this id", body = ErrorResponse),
+        (status = 204, description = "Device enrollment revoked, or the device evicted from the realm"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "No device of the calling user carries this id, including one an earlier call already revoked", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
@@ -1658,36 +1619,29 @@ async fn revoke_user_device(
 
 #[utoipa::path(
     delete,
-    path = "/admin/devices/{node_id}",
-    tag = "users",
-    summary = "Evict any enrolled device as a realm admin",
+    path = "/access/devices/{node_id}",
+    tag = "access/devices",
+    summary = "Evict any enrolled device",
     description = r#"Evicts one enrolled user device from the realm on behalf of the realm's administration.
 
-**Authentication**: realm bearer token with WRITE on the realm's onboarding administration path. A
-management node serves it, and every other node relays the call to one. This is the same
-authorization the onboarding administration routes carry, so the realm request policies constrain
-it too.
+**Authentication**: realm bearer token with WRITE on the realm's onboarding administration path, the
+same grant the onboarding administration routes carry, so the realm request policies constrain it
+too. A management node serves it, and every other node relays the call to one.
 
 **Behavior**
-- `node_id` is the device's node id, which `GET /users/me/devices` reports to its owner and the
-  realm configuration lists as a node of kind `User`.
-- The device is dropped from the realm configuration and the enrollment secret it redeemed is
+- The device is dropped from the realm configuration and the onboarding secret it redeemed is
   retired, so the eviction cannot be undone by replaying that secret.
-- The eviction replicates like any other configuration change, and each node closes the device's
-  open connections when it applies the new membership.
-- Only an enrolled device is reachable here: a management or server node is not a device and
-  answers 404, so this route can never remove realm infrastructure.
-- The owner's own `DELETE /users/me/devices/{id}` is unchanged and stays self-scoped; this route
-  neither replaces nor requires it.
-
-**Errors**: a node id that names no enrolled device answers 404, which is also what a caller sees
-after an earlier eviction."#,
-    params(("node_id" = String, Path, description = "Node id of the enrolled device to evict")),
+- The change replicates like any other configuration change, and each node closes the device's open
+  connections when it applies the new membership.
+- Only an enrolled device is reachable here: a management or server node is not a device, so this
+  route can never remove realm infrastructure.
+- The owner's own `DELETE /access/users/me/devices/{id}` stays available and unchanged."#,
+    params(("node_id" = String, Path, description = "Node id of the enrolled device to evict, as the realm configuration lists it")),
     responses(
-        (status = 204, description = "Device evicted from the realm; no response body"),
-        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
-        (status = 403, description = "The caller is not a realm onboarding admin", body = ErrorResponse),
-        (status = 404, description = "No enrolled device carries this node id", body = ErrorResponse),
+        (status = 204, description = "Device evicted from the realm"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller lacks WRITE on the realm's onboarding administration path", body = ErrorResponse),
+        (status = 404, description = "No enrolled device carries this node id, including one an earlier call already evicted", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
@@ -2160,7 +2114,7 @@ mod tests {
     ) -> (RegisterUserResponse, String) {
         let oidc_token = sign_oidc_token(issuer, kid, signing_key, subject, Some(name));
         let register = reqwest::Client::new()
-            .post(format!("{}/api/v1/users/register", node.base_url))
+            .post(format!("{}/api/v1/access/users/register", node.base_url))
             .bearer_auth(&oidc_token)
             .json(&RegisterUserRequest { onboarding_secret })
             .send()
@@ -2170,7 +2124,7 @@ mod tests {
         let registered: RegisterUserResponse = register.json().await.unwrap();
 
         let token_response = reqwest::Client::new()
-            .get(format!("{}/api/v1/users/token", node.base_url))
+            .get(format!("{}/api/v1/access/token", node.base_url))
             .bearer_auth(&oidc_token)
             .send()
             .await
@@ -2228,7 +2182,10 @@ mod tests {
         .await;
 
         let response = reqwest::Client::new()
-            .get(format!("{}/api/v1/users/{}", node.base_url, registered.id))
+            .get(format!(
+                "{}/api/v1/access/users/{}",
+                node.base_url, registered.id
+            ))
             .bearer_auth(&aruna_token)
             .send()
             .await
@@ -2298,7 +2255,7 @@ mod tests {
         assert_eq!(body.name, "Admin Alice");
 
         let second_response = reqwest::Client::new()
-            .post(format!("{}/api/v1/users/register", node.base_url))
+            .post(format!("{}/api/v1/access/users/register", node.base_url))
             .bearer_auth(sign_oidc_token(
                 issuer,
                 kid,
@@ -2342,7 +2299,7 @@ mod tests {
         let missing_user_id = UserId::local(Ulid::generate(), node.realm_id);
         let response = reqwest::Client::new()
             .get(format!(
-                "{}/api/v1/users/{}",
+                "{}/api/v1/access/users/{}",
                 node.base_url, missing_user_id
             ))
             .bearer_auth(&admin_token)
@@ -2543,7 +2500,7 @@ mod tests {
         let missing_user_id = UserId::local(Ulid::generate(), node.realm_id);
         let response = reqwest::Client::new()
             .get(format!(
-                "{}/api/v1/users/{}",
+                "{}/api/v1/access/users/{}",
                 node.base_url, missing_user_id
             ))
             .send()
@@ -2641,7 +2598,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .get(format!(
-                "{}/api/v1/users/{}",
+                "{}/api/v1/access/users/{}",
                 node.base_url, node.realm_admin_id
             ))
             .bearer_auth(&token)
@@ -2666,7 +2623,7 @@ mod tests {
 
         let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice"));
         let register = reqwest::Client::new()
-            .post(format!("{}/api/v1/users/register", node.base_url))
+            .post(format!("{}/api/v1/access/users/register", node.base_url))
             .bearer_auth(&oidc_token)
             .json(&RegisterUserRequest {
                 onboarding_secret: None,
@@ -2677,7 +2634,7 @@ mod tests {
         assert_eq!(register.status(), StatusCode::CREATED);
 
         let token_response = reqwest::Client::new()
-            .get(format!("{}/api/v1/users/token", node.base_url))
+            .get(format!("{}/api/v1/access/token", node.base_url))
             .bearer_auth(&oidc_token)
             .send()
             .await
@@ -2710,7 +2667,7 @@ mod tests {
         )
         .await;
         let created = reqwest::Client::new()
-            .post(format!("{}/api/v1/users/sessions", node.base_url))
+            .post(format!("{}/api/v1/access/sessions", node.base_url))
             .bearer_auth(&portal_token)
             .json(&CreateSessionRequest {
                 kind: "assistant".to_string(),
@@ -2724,7 +2681,7 @@ mod tests {
         let assistant: CreateSessionResponse = created.json().await.unwrap();
 
         let refreshed = reqwest::Client::new()
-            .get(format!("{}/api/v1/users/token", node.base_url))
+            .get(format!("{}/api/v1/access/token", node.base_url))
             .bearer_auth(&assistant.token)
             .send()
             .await
@@ -2761,7 +2718,7 @@ mod tests {
             sign_scoped_aruna_token(&node, UserId::from_string(&registered.id).unwrap());
 
         let token_response = reqwest::Client::new()
-            .get(format!("{}/api/v1/users/token", node.base_url))
+            .get(format!("{}/api/v1/access/token", node.base_url))
             .bearer_auth(&scoped_token)
             .send()
             .await
@@ -2826,7 +2783,7 @@ mod tests {
         let alias_token = sign_aruna_token(&node, alias_user_id, None);
 
         let token_response = reqwest::Client::new()
-            .get(format!("{}/api/v1/users/token", node.base_url))
+            .get(format!("{}/api/v1/access/token", node.base_url))
             .bearer_auth(&alias_token)
             .send()
             .await

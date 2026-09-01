@@ -152,20 +152,21 @@ fn rocrate_jsonld(rocrate: &Value) -> ServerResult<String> {
     summary = "Queue a document create on this device",
     description = r#"Queues one RO-Crate create so the device publishes it as soon as the realm is reachable.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for. Any other caller is refused, and a node that is not a user node answers 404.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Only creates of new documents queue. Updates and deletes of documents that already exist in the realm are never queued: they need connectivity and current authorization, and the ordinary metadata routes refuse them while the realm is unreachable.
-- The entry is stored locally and stays visible to its owner through this route until it publishes or is deleted.
-- A background drain forwards each entry in queue order within seconds of the realm becoming reachable, mints the realm document id before the first forward and retries with the same id, so a crash between forward and outcome cannot create a second document.
-- The realm document id is unknown while the entry is pending; the local draft id is the stable reference for the desktop.
+- Only creates of new documents queue. Updates and deletes need connectivity and current
+  authorization, so the ordinary metadata routes refuse them while the realm is unreachable.
+- A background drain forwards each entry in queue order within seconds of the realm becoming
+  reachable. It mints the realm document id before the first forward and retries with the same id,
+  so a crash between forward and outcome cannot create a second document.
+- The realm document id is unknown while the entry is pending; the local draft id is the stable
+  reference for the desktop.
 
 **Limits**
 - The device holds at most 256 queued drafts.
-- `rocrate` must be a JSON-LD object and `path` must not be blank.
-
-**Errors**
-- 409 when the local queue is full."#,
+- `rocrate` must be a JSON-LD object and `path` must not be blank."#,
     request_body(
         content = QueueDraftRequest,
         description = "Group, path, visibility and the RO-Crate payload to publish",
@@ -236,10 +237,12 @@ async fn queue_draft(
     summary = "List the drafts queued on this device",
     description = r#"Lists every authoring intent this device holds, oldest first.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
-- Entries stay listed after they publish or park, so the owner can see what happened before removing them.
+- Entries stay listed after they publish or park, so the owner can see what happened before removing
+  them.
 - The list is node-local and answers while the realm is unreachable."#,
     responses(
         (status = 200, description = "The device's authoring queue in creation order", body = DeviceDraftList,
@@ -281,7 +284,8 @@ async fn list_drafts(
     summary = "Read one queued draft",
     description = r#"Reads the current state of one queued authoring intent.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
 - A published entry carries the realm document id it created."#,
@@ -329,14 +333,13 @@ async fn get_draft(
     summary = "Remove a queued draft",
     description = r#"Removes one authoring intent from the device's queue.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
 - Removing a published entry drops the local record only; the realm document it created stays.
-- A draft whose forward is in flight is refused until its outcome is recorded, because the create may already have applied.
-
-**Errors**
-- 409 while a forward for the draft is in flight."#,
+- A draft whose forward is in flight is refused until its outcome is recorded, because the create
+  may already have applied."#,
     params(("draft_id" = String, Path, description = "Local draft ULID, for example 01JDRAFT0123456789ABCDEFGH")),
     responses(
         (status = 204, description = "The draft is gone from the device queue"),
@@ -373,11 +376,14 @@ async fn delete_draft(
     summary = "Validate a draft without storing it",
     description = r#"Runs the create-time RO-Crate and Profile checks against a draft the device has not stored.
 
-**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled for.
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
 
 **Behavior**
 - The same evaluation a create enforces, so the owner sees the verdict before queueing.
-- Structural checks need nothing but the payload. A draft that names a registered Profile is checked against the copy this device already holds, so an unknown Profile reports as unevaluated rather than failing."#,
+- Structural checks need nothing but the payload. A draft that names a registered Profile is checked
+  against the copy this device already holds, so an unknown Profile reports as unevaluated rather
+  than failing."#,
     request_body(
         content = ProfileValidationPreviewRequest,
         description = "The RO-Crate JSON-LD to evaluate",

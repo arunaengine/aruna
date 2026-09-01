@@ -160,7 +160,7 @@ fn http_base_url(addr: SocketAddr) -> String {
 }
 
 fn info_url(addr: SocketAddr) -> String {
-    format!("{}/api/v1/info", http_base_url(addr))
+    format!("{}/api/v1/system/info", http_base_url(addr))
 }
 
 fn nonzero_timeout(timeout: Duration) -> Duration {

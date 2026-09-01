@@ -37,7 +37,7 @@ use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(tags((
-    name = "compute",
+    name = "compute/admin",
     description = "Realm-admin administration of compute links, quotas, pressure and drain"
 )))]
 pub struct ComputeApiDoc;
@@ -279,28 +279,24 @@ async fn require_config_admin(
 
 #[utoipa::path(
     get,
-    path = "/admin/compute/config",
-    tag = "compute",
+    path = "/compute/config",
+    tag = "compute/admin",
     summary = "Read the realm compute configuration",
     description = r#"Returns the realm compute configuration this node currently holds.
 
-**Authentication**: bearer token issued for this realm, with READ on the realm configuration path.
+**Authentication**: realm bearer token with READ on the realm configuration path.
 
 **Behavior**
-- Reports the operator knowledge no node can measure for itself: the directed bandwidth between
-  placement locations the planner estimates transfers with, the bandwidth to assume for a link
-  nobody configured, how long an availability sample still counts for ranking, the per-rank delay
-  of the leaderless witness schedule, and the standing compute quotas new admissions are decided
-  against.
+- Carries the operator knowledge no node can measure for itself: the directed bandwidth between
+  placement locations the planner estimates transfers with, the bandwidth assumed for an
+  unconfigured link, how long an availability sample counts for ranking, the per-rank delay of the
+  leaderless witness schedule, and the standing compute quotas new admissions are decided against.
 - A node-local read of the replicated realm configuration, so a change written on another node can
   be missing here until it arrives.
-- A quota dimension that is absent is unbounded, never zero, and a group entry replaces the realm
-  default wholesale rather than merging with it.
-
-**Errors**: only a genuinely absent document is a 404; a read or decode failure is a 500, because
-absence was never established."#,
+- An unset quota dimension is unbounded, never zero, and a group entry replaces the realm default
+  wholesale rather than merging with it."#,
     responses(
-        (status = 200, description = "The compute configuration this node currently holds", body = ComputeConfigBody, example = json!({
+        (status = 200, description = "The compute configuration this node holds", body = ComputeConfigBody, example = json!({
             "links": [
                 {
                     "from": "eu-west",
@@ -325,10 +321,10 @@ absence was never established."#,
                 }
             ]
         })),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No READ on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
-        (status = 500, description = "The stored realm configuration could not be read or decoded here; absence was never established", body = ErrorResponse)
+        (status = 500, description = "The stored configuration could not be read or decoded here, so absence was never established", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -348,13 +344,13 @@ pub async fn get_compute_config(
 
 #[utoipa::path(
     put,
-    path = "/admin/compute/config",
-    tag = "compute",
+    path = "/compute/config",
+    tag = "compute/admin",
     summary = "Replace the realm compute configuration",
     description = r#"Replaces the stored realm compute configuration with the submitted one.
 
-**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path.
-A management node serves it, and every other node relays the call to one.
+**Authentication**: realm bearer token with WRITE on the realm configuration path. A management
+node serves the call and every other node relays it to one.
 
 **Behavior**
 - The body replaces the stored configuration wholesale rather than patching it: links and group
@@ -362,11 +358,10 @@ A management node serves it, and every other node relays the call to one.
 - Link direction matters, because asymmetric uplinks between sites are the normal case.
 - Quotas bound new logical admissions only. Lowering one never cancels, pauses or reclaims work
   that is already admitted, queued, preparing or running.
-- The demand view is replicated, so a concurrent partition may overshoot a cap before it converges;
-  the only consequence of an observed overshoot is that further admissions are refused.
-- The change is published through the shared realm-configuration path, so a concurrent update
-  converges instead of one writer silently winning, and it takes effect on other nodes as the
-  configuration propagates.
+- The demand view is replicated, so concurrent partitions may overshoot a cap before converging;
+  the only consequence is that further admissions are refused.
+- The change is published through the shared realm configuration, so a concurrent update converges
+  instead of one writer silently winning, and it takes effect on other nodes as it propagates.
 
 **Limits** (all refused with 400)
 - A duplicate directed link pair and a zero bandwidth are refused instead of clamped, since a zero
@@ -439,8 +434,8 @@ A management node serves it, and every other node relays the call to one.
             ]
         })),
         (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, or a zero witness delay", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
@@ -497,34 +492,31 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
 
 #[utoipa::path(
     get,
-    path = "/admin/compute/snapshots",
-    tag = "compute",
-    summary = "Read the observed compute demand and reservation snapshots",
+    path = "/compute/snapshots",
+    tag = "compute/admin",
+    summary = "Read the observed compute snapshots",
     description = r#"Reports the compute demand and reservation snapshots this node has replicated.
 
-**Authentication**: bearer token issued for this realm, with READ on the realm configuration path.
+**Authentication**: realm bearer token with READ on the realm configuration path.
 
 **Behavior**
-- Two different controls are reported side by side and are never summed: logical admitted demand,
-  which is what the standing group quota is decided against, and exact physical reservations, which
-  is capacity a target actually holds for accepted executions.
-- Every publisher stamps its snapshot with its membership and publisher generations plus the time
-  it observed them, so a stale or superseded advertisement is recognizable rather than silently
-  averaged in.
-- Passing `group_id` adds that group's merged demand next to the standing quota it is judged
-  against; a family that several holders admitted still counts once.
-- `departure` is present only when this node itself departed and reports the executions it could
-  not resolve, which are unresolved rather than finished: a departing node never declares a
-  remotely observed execution terminal, and removal is never blocked because those copies or
-  executions exist.
+- Two controls are reported side by side and never summed: logical admitted demand, which the
+  standing group quota is decided against, and exact physical reservations, which is capacity a
+  target holds for accepted executions.
+- Every publisher stamps its snapshot with its membership and publisher generations and the time it
+  observed them, so a stale or superseded advertisement is recognizable rather than averaged in.
+- `group_id` adds that group's merged demand next to the standing quota it is judged against; a
+  family several holders admitted still counts once.
+- `departure` is present only when this node itself departed, and lists the executions it could not
+  resolve. Unresolved is not finished: a departing node never declares a remotely observed
+  execution terminal, and removal is never blocked because those executions exist.
 
 **Limits**
 - All totals are approximate: they merge what this node has replicated, so a partition may overshoot
   a cap before convergence.
 - `demand_truncated` marks a publisher whose snapshot understates it, either because a group holds
-  more nonterminal families than the snapshot names or because whole groups could not be named at
-  all.
-- `group_id` must be a ULID; any other value is refused with 400."#,
+  more nonterminal families than the snapshot names or because whole groups could not be named.
+- `group_id` must be a ULID."#,
     params(
         ("group_id" = Option<String>, Query, description = "Merge one group's demand and report the standing quota it is judged against")
     ),
@@ -565,10 +557,10 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
             }
         })),
         (status = 400, description = "`group_id` is not a ULID", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No READ on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
-        (status = 500, description = "The stored realm configuration could not be read or decoded here; absence was never established", body = ErrorResponse)
+        (status = 500, description = "The stored configuration could not be read or decoded here, so absence was never established", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -657,23 +649,23 @@ pub async fn get_compute_snapshots(
 
 #[utoipa::path(
     post,
-    path = "/admin/compute/drain",
-    tag = "compute",
+    path = "/compute/drain",
+    tag = "compute/admin",
     summary = "Drain or undrain this node's compute plane",
     description = r#"Sets whether this node advertises its compute plane as draining.
 
-**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path.
+**Authentication**: realm bearer token with WRITE on the realm configuration path.
 
 **Behavior**
-- A drained node advertises itself as draining, so no planner selects it for new executions and it
-  declines launch offers, while everything that already holds a receipt keeps running: draining
-  never cancels admitted, queued, preparing or running work, and it never revokes a reservation.
-- The flag is this node's own operator decision and is stored separately from the departure state a
-  placement change causes, so returning to the placement map cannot silently undrain a node an
-  operator drained; undrain it explicitly with `draining` false.
+- No planner selects a draining node for new executions and it declines launch offers, while
+  everything that already holds a receipt keeps running: draining never cancels admitted, queued,
+  preparing or running work, and never revokes a reservation.
+- The operator drain is stored separately from the departure state a placement change causes, so
+  returning to the placement map cannot silently undrain a node an operator drained; undrain it
+  explicitly with `draining` false.
 - A node that is leaving the realm stays draining regardless.
-- The change is republished in this node's advertisement, so other nodes stop planning here as it
-  propagates, and `changed` is false when the node already had that state."#,
+- `changed` reports that the durable flag moved, not that the advertisement was republished; the
+  advertisement follows, and other nodes stop planning here as it propagates."#,
     request_body(
         content = DrainRequest,
         description = "Whether this node's compute plane should be drained",
@@ -686,8 +678,8 @@ pub async fn get_compute_snapshots(
             "draining": true,
             "changed": true
         })),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 503, description = "The advertisement could not be republished; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

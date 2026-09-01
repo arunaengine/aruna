@@ -57,7 +57,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "groups", description = "Group management operations"))
+    tags((name = "access/groups", description = "Group management operations"))
 )]
 pub struct GroupsApiDoc;
 
@@ -129,7 +129,7 @@ pub struct CreateGroupRoleRequest {
     pub permissions: HashMap<String, String>,
     #[serde(default)]
     pub assigned_users: Vec<String>,
-    /// Public roles apply to every principal — including anonymous requests —
+    /// Public roles apply to every principal, including anonymous requests,
     /// by assigning the Everyone principal (the nil user id).
     #[serde(default)]
     pub public: bool,
@@ -355,23 +355,20 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
 
 #[utoipa::path(
     post,
-    path = "/groups",
-    tag = "groups",
+    path = "/access/groups",
+    tag = "access/groups",
     summary = "Create a group in this realm",
-    description = r#"Creates a group in this realm and makes the caller its owner and sole administrator.
+    description = r#"Creates a group in this realm and makes the caller its sole administrator.
 
-**Authentication**: realm bearer token; a token confined to a path subset is refused.
+**Authentication**: realm bearer token without path restrictions. Creation is self-service up to the
+realm's per-user group quota, from which WRITE on the realm group-admin path exempts the caller.
 
 **Behavior**
-- Group creation is self-service: any unrestricted realm member may create groups up to the realm's
-  per-user group quota, and a caller holding WRITE on the realm group-admin path is exempt from that
-  cap.
-- The caller becomes the owner and the only member of the new group's admin role, next to the
-  default user and viewer roles.
-- On a user-kind node the create is forwarded to a ranked management or server peer under the
-  caller's own token, which is where the quota and the permission are then checked, and 503 is
-  returned when no eligible peer accepts it.
-- The write commits on this node and replicates to the rest of the realm afterwards, so another node
+- The caller becomes the only member of the new group's `admin` role, next to the default `user` and
+  `viewer` roles.
+- A user node forwards the create to a management or server peer under the caller's own token, which
+  is where the quota and the permission are checked.
+- The write commits here and reaches the rest of the realm through document sync, so another node
   may not list the group immediately."#,
     request_body(
         content = CreateGroupRequest,
@@ -383,7 +380,7 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
     responses(
         (
             status = 201,
-            description = "Group created on this node, with its initial roles. Assigned users are listed because the caller is a member.",
+            description = "The group as created, with its initial roles; assigned users are listed because the caller is a member",
             body = CreateGroupResponse,
             example = json!({
                 "display_name": "Proteomics Lab",
@@ -413,11 +410,11 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
                 ]
             })
         ),
-        (status = 400, description = "Request body is not a valid create-group document", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm or is confined to a path subset", body = ErrorResponse),
-        (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter may be retried unchanged", body = ErrorResponse),
-        (status = 503, description = "No eligible realm peer accepted the create forwarded from a user-kind node; retryable, the response carries a Retry-After header", body = ErrorResponse)
+        (status = 400, description = "Malformed request body", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
+        (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter is retryable unchanged", body = ErrorResponse),
+        (status = 503, description = "No eligible realm peer accepted the create forwarded from a user node; retryable, the response carries Retry-After", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -535,31 +532,29 @@ pub async fn create_group(
 
 #[utoipa::path(
     get,
-    path = "/groups",
-    tag = "groups",
+    path = "/access/groups",
+    tag = "access/groups",
     summary = "List the groups of this realm",
     description = r#"Lists this realm's groups, optionally with their roles and permission paths.
 
-**Authentication**: realm bearer token; an anonymous caller is rejected and a token from another
-realm is forbidden.
+**Authentication**: realm bearer token; no group membership is needed, because every realm member
+sees each group's id, realm and display name.
 
 **Behavior**
-- Reads the group directory as replicated to this node, so a group created elsewhere can be missing
-  until it arrives here.
-- Every realm member sees each group's id, realm and display name.
-- `include=roles` additionally returns each group's roles and their permission paths, but the users
-  assigned to a role are only included for groups the caller is a member of; for every other group
-  the `assigned_users` field is omitted and a role that applies to everyone is visible only through
-  its `public` flag."#,
+- This is a node-local read of the replicated group directory, so a group created elsewhere can be
+  missing until it arrives here.
+- `include=roles` adds each group's roles and their permission paths, but `assigned_users` is
+  included only for groups the caller belongs to; elsewhere a role that applies to everyone is
+  visible only through its `public` flag."#,
     params(
         ("limit" = Option<u32>, Query, description = "Maximum number of groups to return; defaults to 100 and is clamped to the range 1-1000"),
         ("offset" = Option<u32>, Query, description = "Number of groups to skip from the start of the directory; defaults to 0"),
-        ("include" = Option<String>, Query, description = "Comma-separated extras. Currently supports roles; blank entries are ignored and any other value is rejected as a bad request")
+        ("include" = Option<String>, Query, description = "Comma-separated extras; only `roles` is supported, blank entries are ignored and any other value is rejected")
     ),
     responses(
         (
             status = 200,
-            description = "Groups visible to the caller, with member-only fields hidden for groups the caller does not belong to",
+            description = "This realm's groups, with member-only fields hidden for groups the caller does not belong to",
             body = ListGroupsResponse,
             example = json!({
                 "groups": [
@@ -581,7 +576,9 @@ realm is forbidden.
                 ]
             })
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse)
+        (status = 400, description = "The `include` parameter names an unsupported extra", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -663,8 +660,8 @@ async fn build_api_groups(
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}",
-    tag = "groups",
+    path = "/access/groups/{id}",
+    tag = "access/groups",
     summary = "Read one group's directory entry",
     description = r#"Returns one group's directory entry together with its roles.
 
@@ -672,16 +669,16 @@ async fn build_api_groups(
 may look up any group in the realm.
 
 **Behavior**
-- Reads the copy replicated to this node.
-- Members receive the full role list including the users assigned to each role.
-- A non-member receives the same roles and permission paths with the `assigned_users` field omitted,
-  and learns only from the `public` flag that a role applies to everyone.
-- A group whose record or authorization document is not present on this node reads as not found."#,
+- A member receives the full role list including the users assigned to each role; a non-member
+  receives the same roles and permission paths with `assigned_users` omitted, and learns only from
+  the `public` flag that a role applies to everyone.
+- This is a node-local read, so a group whose record or authorization document has not arrived here
+  reads as not found."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
             status = 200,
-            description = "The group and its roles, with member lists included only for a caller who is a member",
+            description = "The group and its roles, with `assigned_users` included only for a caller who is a member",
             body = GroupInfoResponse,
             example = json!({
                 "display_name": "Proteomics Lab",
@@ -703,7 +700,7 @@ may look up any group in the realm.
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -778,42 +775,39 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}/usage",
-    tag = "groups",
+    path = "/access/groups/{id}/usage",
+    tag = "access/groups",
     summary = "Read a group's storage usage",
     description = r#"Reports what this node stores for a group next to the realm-wide totals.
 
-**Authentication**: realm bearer token and membership in the group; membership is the only check, so
-a realm administrator who is not a member is forbidden.
+**Authentication**: realm bearer token and membership in the group. Membership is the only check, so
+a realm administrator who is not a member is refused.
 
 **Behavior**
-- The flat counters report what this node stores for the group, while `realm` reports the realm-wide
-  totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes.
-- `stored_blobs` and `stored_bytes` are omitted, from the flat counters and from `realm`: a physical
-  blob copy is content-addressed and shared by every group referencing it, so it is counted per node
-  and per storage backend only, and `/info/usage` reports those node-wide figures.
-- `dataset_count`, `profile_count` and `process_run_count` are exact lifecycle-live
-  metadata-document counts for this group when this node's metadata subsystem can answer; all three
-  are omitted together when it cannot.
-- Classification reads each live registry record's root-only RO-Crate summary from the metadata
-  graph store: a root whose `@type` contains `http://www.w3.org/ns/dx/prof/Profile` is a Profile;
-  otherwise exact `conformsTo` `https://w3id.org/ro/wfrun/process/0.5` is a Process Run; every other
-  root is a Dataset. Document storage paths never participate.
-- `quota` restates the realm quota configuration for this group together with a warning flag
-  evaluated against the group's realm-wide logical bytes; it is omitted when the realm configuration
-  cannot be read, and the document count reported by the realm-wide usage endpoint is never included
-  here.
+- The flat counters report what this node stores for the group, while `realm` reports the totals
+  aggregated from the usage summaries the realm's nodes publish, which trail recent writes.
+- `stored_blobs` and `stored_bytes` are omitted from both: a blob copy is content-addressed and
+  shared by every group referencing it, so it is counted per node and per storage backend only, and
+  `/system/usage` reports those node-wide figures.
+- `dataset_count`, `profile_count` and `process_run_count` are exact lifecycle-live counts when this
+  node's metadata subsystem can answer, and all three are omitted together when it cannot.
+- Classification reads each live registry record's root-only RO-Crate summary: a root whose `@type`
+  contains `http://www.w3.org/ns/dx/prof/Profile` is a Profile, one with exact `conformsTo`
+  `https://w3id.org/ro/wfrun/process/0.5` is a Process Run, and every other root is a Dataset.
+- `quota` restates the realm quota configuration for this group with a warning flag evaluated
+  against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be
+  read.
 
 **Limits**
-- The registry/lifecycle candidate set is bounded by the metadata registry limit and root-summary
-  reads have at most eight in flight, so an over-limit or unreadable set is reported as unavailable
-  rather than partially counted.
-- Full crates are never scanned and no result cache is added."#,
+- The candidate set is bounded by the metadata registry limit and root-summary reads have at most
+  eight in flight, so an over-limit or unreadable set is reported as unavailable rather than
+  partially counted.
+- Full crates are never scanned."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
             status = 200,
-            description = "Local counters for this node, realm-wide totals, and the group's quota status when it is available",
+            description = "This node's counters for the group, the realm-wide totals, and the quota status when it is available",
             body = crate::routes::info::UsageResponse,
             example = json!({
                 "buckets": 3,
@@ -838,7 +832,7 @@ a realm administrator who is not a member is forbidden.
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller is not a member of the group", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
@@ -908,16 +902,16 @@ pub(crate) async fn run_group_usage(
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}/members",
-    tag = "groups",
+    path = "/access/groups/{id}/members",
+    tag = "access/groups",
     summary = "List the members of a group",
     description = r#"Returns every member of a group with the roles that assign them.
 
 **Authentication**: realm bearer token and membership in the group; the member list is never exposed
-to outsiders, so a non-member is forbidden.
+to a non-member.
 
 **Behavior**
-- Every member is returned in one response, sorted by user id, each with the roles that assign them,
+- The whole membership comes back in one response, sorted by user id, with each member's roles
   sorted by role name.
 - A role that applies to everyone contributes no member here, since the principal standing for
   everyone is not a user.
@@ -927,7 +921,7 @@ to outsiders, so a non-member is forbidden.
     responses(
         (
             status = 200,
-            description = "Every member of the group with their roles; names may be null when the user directory cannot resolve them",
+            description = "Every member of the group with their roles; a name is null when the user directory cannot resolve it",
             body = GroupMembersResponse,
             example = json!({
                 "members": [
@@ -948,7 +942,7 @@ to outsiders, so a non-member is forbidden.
                 ]
             })
         ),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller is not a member of the group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1038,24 +1032,22 @@ async fn resolve_member_names(
 
 #[utoipa::path(
     post,
-    path = "/groups/{id}/members",
-    tag = "groups",
+    path = "/access/groups/{id}/members",
+    tag = "access/groups",
     summary = "Add a user to a group",
     description = r#"Assigns a user one or more roles in a group.
 
-**Authentication**: unrestricted realm bearer token with WRITE on the group's administrative path
-for the user being added, so authority can be delegated per member.
+**Authentication**: realm bearer token without path restrictions, carrying WRITE on the group's
+administrative path for the user being added, so authority can be granted per member.
 
 **Behavior**
-- When `role_ids` is omitted or empty the user is assigned the group's role named user, and the
-  request is rejected when that role is missing or ambiguous.
+- When `role_ids` is omitted or empty the user is assigned the group's `user` role, and the request
+  is rejected when that role is missing or ambiguous.
 - Adding a user who already holds the roles is accepted and changes nothing.
-- The response is the group's complete role list after the change, including the users assigned to
-  each role.
-- The change commits on this node and replicates to the rest of the realm afterwards."#,
+- The change commits here and reaches the rest of the realm through document sync."#,
     request_body(
         content = AddGroupMemberRequest,
-        description = "User to add, and optionally the exact roles to assign instead of the default user role.",
+        description = "User to add, and optionally the exact roles to assign instead of the default `user` role.",
         example = json!({
             "user_id": "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             "role_ids": ["01JROLEUSER00123456789ABCD"]
@@ -1065,7 +1057,7 @@ for the user being added, so authority can be delegated per member.
     responses(
         (
             status = 201,
-            description = "The group's roles after the assignment",
+            description = "The group's complete role list after the assignment, with the users assigned to each",
             body = GroupRolesResponse,
             example = json!({
                 "roles": [
@@ -1083,9 +1075,9 @@ for the user being added, so authority can be delegated per member.
                 ]
             })
         ),
-        (status = 400, description = "Malformed ids, a user id standing for everyone, or no default user role to fall back on", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
+        (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path for this member", body = ErrorResponse),
         (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse),
         (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
     ),
@@ -1159,32 +1151,32 @@ pub async fn add_group_member(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{id}/members/{user_id}",
-    tag = "groups",
+    path = "/access/groups/{id}/members/{user_id}",
+    tag = "access/groups",
     summary = "Remove a group member or revoke one role",
     description = r#"Revokes a user's roles in a group, or only the one named by `role_id`.
 
-**Authentication**: unrestricted realm bearer token. Removing yourself needs no group permission;
-removing anyone else requires WRITE on the group's administrative path for that user.
+**Authentication**: realm bearer token without path restrictions. Removing yourself needs no group
+permission; removing anyone else requires WRITE on the group's administrative path for that user.
 
 **Behavior**
-- Without `role_id` the user loses every role in the group, with it only that one assignment is
+- Without `role_id` the user loses every role in the group; with it only that one assignment is
   revoked and the rest are kept.
-- The change commits on this node and replicates to the rest of the realm afterwards.
+- The change commits here and reaches the rest of the realm through document sync.
 
 **Limits**
-- A group must keep at least one administrator, so the request is refused when it would strip the
-  last one."#,
+- A group must keep at least one administrator, so a request that would strip the last one is
+  refused."#,
     params(
         ("id" = String, Path, description = "Group id as a 26-character ULID"),
-        ("user_id" = String, Path, description = "Member to remove, in the realm-qualified user id form `<user ULID>@<realm id>`"),
+        ("user_id" = String, Path, description = "Member to remove, in the form `<ulid>@<realm>`"),
         ("role_id" = Option<String>, Query, description = "Revoke only this role, given as a 26-character ULID; when omitted every role of the user in this group is revoked")
     ),
     responses(
-        (status = 204, description = "The membership or role assignment is gone; no response body is returned"),
+        (status = 204, description = "The membership or role assignment is gone"),
         (status = 400, description = "Malformed group, user or role id, or a user id standing for everyone", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path for this member", body = ErrorResponse),
         (status = 409, description = "The removal would leave the group without an administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1238,25 +1230,27 @@ pub async fn remove_group_member(
 
 #[utoipa::path(
     post,
-    path = "/groups/{id}/leave",
-    tag = "groups",
+    path = "/access/groups/{id}/leave",
+    tag = "access/groups",
     summary = "Leave a group",
     description = r#"Drops every role the calling user holds in the group.
 
-**Authentication**: unrestricted realm bearer token; a token confined to a path subset is refused.
-No group permission is required, because the token's own subject is the only user affected.
+**Authentication**: realm bearer token without path restrictions. No group permission is required,
+because the caller is the only user affected.
 
 **Behavior**
 - Leaving a group the caller does not belong to changes nothing.
-- The change commits on this node and replicates to the rest of the realm afterwards.
+- The change commits here and reaches the rest of the realm through document sync.
 
 **Limits**
 - A group must keep at least one administrator, so the last one cannot leave and must hand the role
   over first."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 204, description = "The caller no longer holds any role in the group; no response body is returned"),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 204, description = "The caller no longer holds any role in the group"),
+        (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted", body = ErrorResponse),
         (status = 409, description = "The caller is the group's last administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1287,25 +1281,26 @@ pub async fn leave_group(
 
 #[utoipa::path(
     post,
-    path = "/groups/{id}/roles",
-    tag = "groups",
+    path = "/access/groups/{id}/roles",
+    tag = "access/groups",
     summary = "Create a role in a group",
     description = r#"Creates a role in a group from permission paths confined to that group.
 
-**Authentication**: unrestricted realm bearer token with WRITE on the group's administrative path.
+**Authentication**: realm bearer token without path restrictions, carrying WRITE on the group's
+administrative path.
 
 **Behavior**
-- Each permission path is granted as read, write or deny, accepted case-insensitively and reported
-  capitalised.
-- The role commits on this node and replicates to the rest of the realm afterwards.
+- Each permission path is granted as `READ`, `WRITE` or `DENY`, accepted case-insensitively and
+  reported capitalised.
+- The role commits here and reaches the rest of the realm through document sync.
 
 **Limits**
-- The name is trimmed, must not be empty and must not be admin or user, which are reserved for the
-  built-in roles.
+- The name is trimmed, must not be empty, and must not be `admin` or `user`, which are reserved for
+  the built-in roles.
 - Every permission path must lie inside the group's own path, so a group administrator cannot mint
   authority over anything else.
-- A public role applies to every principal including anonymous callers and may therefore only carry
-  read grants."#,
+- A public role applies to every principal including anonymous callers, so it may only carry `READ`
+  grants."#,
     request_body(
         content = CreateGroupRoleRequest,
         description = "Role name, the permission paths it grants inside the group, and the users it is assigned to.",
@@ -1338,9 +1333,9 @@ pub async fn leave_group(
                 "public": false
             })
         ),
-        (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than read", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
+        (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than `READ`", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse),
         (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
     ),
@@ -1432,32 +1427,32 @@ pub async fn create_group_role(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{id}/roles/{role_id}",
-    tag = "groups",
+    path = "/access/groups/{id}/roles/{role_id}",
+    tag = "access/groups",
     summary = "Delete a role from a group",
     description = r#"Deletes a role from a group and revokes it from everyone holding it.
 
-**Authentication**: unrestricted realm bearer token with WRITE on the group's administrative path.
+**Authentication**: realm bearer token without path restrictions, carrying WRITE on the group's
+administrative path.
 
 **Behavior**
-- Deleting a role revokes it from every user holding it, which can leave a user with no role in the
+- Deletion revokes the role from every user holding it, which can leave a user with no role in the
   group at all.
-- The change commits on this node and replicates to the rest of the realm afterwards.
+- The change commits here and reaches the rest of the realm through document sync.
 
 **Limits**
-- The built-in admin role is permanent and cannot be deleted, so a group never loses its
-  administrative path."#,
+- The built-in `admin` role is permanent, so a group never loses its administrative path."#,
     params(
         ("id" = String, Path, description = "Group id as a 26-character ULID"),
         ("role_id" = String, Path, description = "Role to delete, as a 26-character ULID")
     ),
     responses(
-        (status = 204, description = "The role and all of its assignments are gone; no response body is returned"),
+        (status = 204, description = "The role and all of its assignments are gone"),
         (status = 400, description = "Malformed group or role id", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path", body = ErrorResponse),
         (status = 404, description = "No such role in this group, or the group is not present on this node", body = ErrorResponse),
-        (status = 409, description = "The built-in admin role cannot be deleted, or this node is a device where group changes are made through the realm", body = ErrorResponse)
+        (status = 409, description = "The built-in `admin` role cannot be deleted, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1542,19 +1537,18 @@ pub struct DataPathsQuery {
 
 #[utoipa::path(
     get,
-    path = "/groups/{id}/data-paths",
-    tag = "groups",
+    path = "/access/groups/{id}/data/paths",
+    tag = "access/groups",
     summary = "Browse the data permission paths of a group",
-    description = r#"Returns one page of the data permission paths that a group's role grants are written against.
+    description = r#"Returns one page of the data permission paths a group's role grants are written against.
 
-**Authentication**: realm bearer token and membership in the group, and every page is additionally
-authorized as a data read: browsing the bucket level needs READ on the group's data root, browsing
-inside a bucket needs READ on that bucket or on the prefix being listed, so a token confined to a
-narrower path sees only what it may read.
+**Authentication**: realm bearer token and membership in the group. Every page is additionally
+authorized as a data read, needing READ on the group's data root at the bucket level and READ on the
+bucket or listed prefix inside one, so a path-restricted token sees only what it may read.
 
 **Behavior**
-- Entries are folders ending at the delimiter and objects as leaves.
-- They are scoped to this node, so a prefix belonging to another node is rejected.
+- Entries are folders ending at the delimiter and objects as leaves, scoped to this node, so a
+  prefix belonging to another node is rejected.
 - Bucket names are globally unique: naming a bucket owned by another group returns an empty page
   instead of an error.
 - Paging is forward-only through an opaque token that must be echoed back unchanged; a response
@@ -1569,7 +1563,7 @@ narrower path sees only what it may read.
     responses(
         (
             status = 200,
-            description = "One page of browsable data permission paths on this node, with a continuation token when more entries remain",
+            description = "One page of data permission paths on this node, with a continuation token when more entries remain",
             body = DataPathsResponse,
             example = json!({
                 "entries": [
@@ -1586,8 +1580,8 @@ narrower path sees only what it may read.
             })
         ),
         (status = 400, description = "Malformed group id, a prefix outside this node's group data path, or an unreadable continuation token", body = ErrorResponse),
-        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, the caller is not a member of the group, or the caller may not read the browsed path", body = ErrorResponse)
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, the caller is not a member of the group, or the caller lacks READ on the browsed path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

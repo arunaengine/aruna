@@ -471,8 +471,7 @@ fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
   deviations from full TES conformance a client must plan for: exactly one executor per task, and
   `PAUSED` is never entered.
 - The organization url is the externally visible base url of the node that answered, taken from the
-  forwarded headers only when the request arrived through a trusted proxy and from the `Host` header
-  otherwise."#,
+  forwarded headers only behind a trusted proxy and from the `Host` header otherwise."#,
     responses((
         status = 200,
         description = "Description of this TES endpoint and its conformance deviations",
@@ -535,32 +534,33 @@ pub async fn service_info(
     summary = "Create a TES task",
     description = r#"Accepts a task for asynchronous execution and returns the id to poll.
 
-**Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by
-this node; a path-restricted credential is rejected. Basic authentication uses the credential's
-group and refuses an `aruna-engine.org/group` tag naming a different group; a bearer token requires
-that tag. The caller needs WRITE on the target group.
+**Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
+node; a path-restricted credential is refused. The caller needs WRITE on the target group. Basic
+authentication takes the group from the credential and refuses an `aruna-engine.org/group` tag
+naming a different one; a bearer token requires that tag.
 
 **Behavior**
 - 200 means the task was durably accepted and queued, never that it started or finished.
 - State runs `QUEUED`, `INITIALIZING`, `RUNNING`, then `COMPLETE`, `EXECUTOR_ERROR`,
   `SYSTEM_ERROR` or `CANCELED`; `CANCELING` shows while a cancellation is in flight and `UNKNOWN`
   when the outcome cannot be determined. `PAUSED` and `PREEMPTED` are never emitted.
+- A permanent, job-specific failure surfaces as `EXECUTOR_ERROR` and suppresses retry, while an
+  infrastructure or retryable error surfaces as `SYSTEM_ERROR` and is re-planned, so the two
+  classes stay distinguishable through the facade.
 - An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller; reusing a key
   bound to a different task is a 409 carrying that task id. A replay is settled before any quota
   is read and is never quota-refused.
 - On a user device this facade only proxies: the task is forwarded to a realm holder that pins the
   outputs to itself and resolves the referenced inputs, and the device never executes a task. The
-  device forwards the caller's own bearer token, so basic authentication is refused with a 403
-  here even though it is accepted on a realm node.
-- An `aruna-engine.org/target` tag of `local` runs the task on the machine instead, and is served
-  by a user device only: any other node refuses it with a 400, and a caller who is not the device's
-  owner with a 403. `realm`, the default, is the behavior above. The tag stays on the task and is
-  reported back with it.
+  device forwards the caller's own bearer token, so basic authentication is refused there even
+  though it is accepted on a realm node.
+- An `aruna-engine.org/target` tag of `local` runs the task on a user device instead, for the owner
+  of that device only. `realm`, the default, is the behavior above; either way the tag stays on the
+  task and is reported back with it.
 - A local task reads objects this device holds and writes each declared output to the device-local
   bucket its `s3://` url names, which must belong to the execution group and grant the owner WRITE;
   the run's own workspace bucket holds the staged inputs. Nothing about it is forwarded or
-  replicated. A paused compute plane, a device without a compute backend and a device already at
-  its configured run ceiling each answer 409.
+  replicated.
 
 **Limits** (all refused with 400)
 - Exactly one executor whose `command` is the full argv.
@@ -574,21 +574,7 @@ that tag. The caller needs WRITE on the target group.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
   stripped from each match before it is appended to the destination url.
 - Unsupported: directory entries, inline input content, wildcards in an input path, volumes,
-  executor stdin/stdout/stderr redirection and resource zones.
-
-**Errors**
-- Admission refusals carry the same status semantics as the native submit surface: a quota or
-  composition refusal is a 409, an unusable input or workspace a 400, a refused routed authority a
-  403.
-- 503 is reserved for an unreachable family holder, a demand view that could not be read or did not
-  settle, admission losing three transactions in a row to concurrent submissions of the same group,
-  and an unhealthy id clock.
-- A task forwarded from a device whose inputs sit on no holder of its family answers that same 503
-  and retrying does not clear it. The family is picked by hashing the request, the holder resolves
-  the referenced inputs against its own objects only, and a holder that cannot read one refuses
-  without naming it, so an unstaged input is indistinguishable here from an unreachable realm.
-  Submit from a node that holds the inputs, or replicate them first.
-- A standing quota decided on an understated demand view is a 409 like an exceeded cap."#,
+  executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
         content = TesTask,
         description = "Task definition: one executor, s3:// inputs and outputs, and optional resources and tags",
@@ -651,8 +637,8 @@ that tag. The caller needs WRITE on the target group.
         (status = 400, description = "Malformed task, an unsupported TES feature, an input that is not a readable object, more outputs than a task may declare, a reserved tag, an unknown target tag value, or the local target on a node that serves no device plane", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
         (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, a path restricted credential, a routed authority refusing the submission, or a local task from someone other than this device's owner", body = TesErrorPayload),
-        (status = 409, description = "The idempotency key tag is already bound to a different task, the group's standing compute quota refuses this admission, the composition conflicts on a staged key, or this device's compute plane is paused, absent or at its run ceiling", body = TesErrorPayload),
-        (status = 503, description = "Retryable admission failure; the caller may create the task again with the same idempotency key", body = TesErrorPayload)
+        (status = 409, description = "The idempotency key tag is already bound to a different task, the composition conflicts on a staged key, or this device's compute plane is paused, absent or at its run ceiling. The group's standing compute quota also refuses this admission when its demand view understates the group, exactly as an exceeded cap does", body = TesErrorPayload),
+        (status = 503, description = "Retryable admission failure, and the caller may create the task again with the same idempotency key: an unreachable family holder, a demand view that could not be read or did not settle, admission losing three transactions in a row to concurrent submissions of the same group, or an unhealthy id clock. A task forwarded from a device whose referenced inputs sit on no holder of its family answers the same 503 and retrying does not clear it; submit from a node that holds the inputs, or replicate them first", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
@@ -763,12 +749,11 @@ pub async fn create_task(
     description = r#"Returns one task of the calling user, projected to the requested view.
 
 **Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
-node; a path-restricted credential is rejected.
+node; a path-restricted credential is refused. Tasks are self scoped: another user's task, a task
+outside the group of the basic credential, and an id that is not a parsable task of this facade all
+answer 404, so the existence of a task is never disclosed.
 
 **Behavior**
-- Tasks are self scoped: a task created by another user, a task outside the group of the basic
-  credential, an id that is not a task of this facade and an id that does not parse are all answered
-  with 404 rather than 403, so the existence of a task is never disclosed.
 - A distributed execution task is reduced from its replicated records by whichever node answers, so
   it carries the same logical view as the native REST status; any other task is read from the node
   that owns it and only that node answers absence.
@@ -789,10 +774,7 @@ node; a path-restricted credential is rejected.
 - Executor logs, including the exit code, appear only once the task is terminal.
 
 **Limits**
-- `view` must be `MINIMAL`, `BASIC` or `FULL`; any other value is a 400.
-
-**Errors**: when the node owning the task cannot be reached the call fails with a retryable 503
-instead of reporting the task as missing."#,
+- `view` must be `MINIMAL`, `BASIC` or `FULL`."#,
     params(
         ("id" = String, Path, description = "TES task id (the JobId): the 26 character ULID returned by task creation"),
         ("view" = Option<String>, Query, description = "Projection to apply: `MINIMAL` (the default), `BASIC` or `FULL`")
@@ -878,7 +860,7 @@ instead of reporting the task as missing."#,
         (status = 400, description = "`view` is not one of MINIMAL, BASIC or FULL", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
         (status = 404, description = "No such task for this caller; also returned for another user's task, a task outside the credential's group and an unparsable id", body = TesErrorPayload),
-        (status = 503, description = "The node owning the task is unreachable, so its state is unknown; the caller may retry", body = TesErrorPayload)
+        (status = 503, description = "The node owning the task is unreachable, so its state is unknown rather than missing; the caller may retry", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
@@ -994,11 +976,10 @@ async fn list_derived(
     description = r#"Lists the tasks the calling user created, newest first.
 
 **Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
-node; a path-restricted credential is rejected.
+node; a path-restricted credential is refused. The listing is keyed by the caller, and a basic
+credential additionally sees only tasks of that credential's group.
 
 **Behavior**
-- The listing is keyed by the caller: another user's tasks are never returned, and a basic
-  credential additionally sees only tasks of that credential's group.
 - Only tasks owned by the node that answers are listed, so tasks submitted through another node of
   the realm are omitted rather than fetched from it.
 - Paging is cursor based and forward only: read `next_page_token` from a page and send it back as
@@ -1016,9 +997,7 @@ node; a path-restricted credential is rejected.
 
 **Limits**
 - `page_size` defaults to 256, is capped at 512, and 0 is treated as unset.
-- An empty `name_prefix` is ignored.
-- An invalid `view`, an unknown `state` name, or a `page_token` that is not a token of this listing
-  is refused with 400."#,
+- An empty `name_prefix` is ignored."#,
     params(
         ("view" = Option<String>, Query, description = "Projection applied to every task in the page: `MINIMAL` (the default), `BASIC` or `FULL`"),
         ("page_size" = Option<usize>, Query, description = "Max tasks per page: default 256, capped at 512, and 0 is treated as unset"),
@@ -1047,7 +1026,7 @@ node; a path-restricted credential is rejected.
                 "next_page_token": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7"
             })
         ),
-        (status = 400, description = "Invalid `view`, `state` or `page_token`", body = TesErrorPayload),
+        (status = 400, description = "An invalid `view`, an unknown `state` name, or a `page_token` that is not a token of this listing", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
@@ -1133,23 +1112,17 @@ pub async fn list_tasks(
     description = r#"Requests cancellation of a task the calling user created.
 
 **Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
-node; a path-restricted credential is rejected.
+node; a path-restricted credential is refused. Self scoped exactly like the read: another user's
+task, a task outside the group of the basic credential and an id that does not parse all answer
+404.
 
 **Behavior**
 - TES addresses this as a POST whose final path segment is the task id followed by the literal
-  `:cancel` action suffix.
-- Cancellation is self scoped exactly like reads: another user's task, a task outside the group of
-  the basic credential and an id that does not parse are all answered with 404 rather than 403.
+  `:cancel` action suffix; a POST that omits the suffix is refused.
 - The request is carried out on the node that owns the task.
 - A 200 records only that cancellation was requested, or that the task had already reached a
   terminal state; the executor may still be winding down, so poll the task until it reports
-  `CANCELED`.
-
-**Limits**
-- A POST that omits the `:cancel` suffix is refused with 400.
-
-**Errors**: when the node owning the task is unreachable the cancellation was not delivered and the
-call fails with a retryable 503."#,
+  `CANCELED`."#,
     params(("id" = String, Path, description = "TES task id (the JobId) followed by the `:cancel` suffix, for example `01JABCDEF0123456789ABCDEFG:cancel`")),
     responses(
         (
@@ -1159,9 +1132,10 @@ call fails with a retryable 503."#,
             content_type = "application/json",
             example = json!({})
         ),
+        (status = 400, description = "The final path segment lacks the `:cancel` action suffix", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
         (status = 404, description = "No such task for this caller; also returned for another user's task, a task outside the credential's group and an unparsable id", body = TesErrorPayload),
-        (status = 503, description = "The node owning the task is unreachable, so the cancellation was not delivered; the caller may retry", body = TesErrorPayload)
+        (status = 503, description = "The node owning the task is unreachable, so the cancellation was not delivered anywhere; the caller may retry", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]

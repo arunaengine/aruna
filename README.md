@@ -20,22 +20,22 @@ ___
 > [!WARNING]
 > Work in progress! You are viewing the upcoming version 3. See the [v2](https://github.com/arunaengine/aruna/tree/v2) branch for the latest stable release. 
 
-Aruna is a federated peer-to-peer data management framework that enables organizations to share and organize data and metadata without handing over control to a central platform. 
+Aruna is a federated peer-to-peer data orchestration engine that enables organizations to share and organize data and metadata without handing over control to a central platform.
 
 ## Features
 
 - **Sovereign trust model**: Each node belongs to one organization. Realms define shared trust between them.
 - **Fine-grained access control**: Path-based permissions with wildcard support and group-based roles.
-- **S3-compatible interface**: Every node exposes an [S3 API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html) for data access.
-- **Virtualized buckets**: Buckets are virtual collections of local and remote data resources, with configurable materialization behavior.
-- **Extensible storage backends**: Support for a variety of storage backends through OpenDAL
+- **S3-compatible API**: Every node exposes an [S3 API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html) for data access.
+- **Virtual buckets**: Buckets are virtual collections of local and remote data resources, with configurable materialization behavior.
+- **Extensible storage backends**: Support for a variety of storage backends through [OpenDAL](https://opendal.apache.org/).
 - **Standardized metadata**: Metadata is stored as [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD enabling rich, interoperable descriptions of datasets, files, and processes.
-- **Powerful metadata manipulation**: RO-Crates can be created, edited and viewed through a SPARQL query.
-- **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering
+- **Powerful metadata manipulation**: RO-Crates can be created, edited and viewed through SPARQL queries and updates.
+- **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering.
 - **Built-in replication and synchronization**: Metadata and data are replicated across nodes with automatic conflict resolution.
-- **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting
-- **AI assistant tools**: Authenticated [MCP](docs/mcp.md) access to Aruna context, data, metadata, and compute operations.
-- **Easy deployment**: Run a node as a single binary or as a multi-cluster deployment.
+- **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting.
+- **AI assistant tools**: Authenticated [MCP](https://modelcontextprotocol.io/) access to Aruna context, data, metadata, and compute operations.
+- **Easy deployment**: Run a node as a single binary or deploy a multi-node cluster.
 
 ## Architecture and Goals
 
@@ -62,7 +62,7 @@ For researchers, the data remains where it is, but becomes easier to find, descr
 
 Aruna serves as a base layer for larger research infrastructures. Distributed full-text search, GA4GH DRS identifiers, OAI-PMH harvesting, GA4GH TES-based compute execution, CEL-based policy enforcement, event subscriptions, and transparent request forwarding all rest on the same foundation: sovereign nodes, shared metadata, verified data exchange, and open interfaces. 
 
-The goal is to support FAIR data practice in a way that matches how research actually works, distributed, collaborative, policy-bound, and owned by many parties at once.
+The goal is to support FAIR data practice in a way that matches how research actually works: distributed, collaborative, policy-bound, and owned by many parties at once.
 
 ## Getting Started
 
@@ -116,7 +116,7 @@ This demo deployment:
 - waits for readiness at `http://127.0.0.1:<port>/swagger-ui`
 - writes per-node logs, `summary.txt` and a private `credentials.txt` to `target/test-deploy/`
 - prints an `ADMIN_TOKEN=...` line for use in authenticated API calls during the session
-- prints a summary listing every node's API, portal, S3 and ops url next to the test logins
+- prints a summary listing every node's API, portal, S3 and ops URLs next to the test logins
 
 `just preview` additionally serves the portal. The portal has its own listener,
 so each node exposes the SPA on a separate port from the REST API; the REST port
@@ -160,7 +160,7 @@ A node started without an `ONBOARDING_SECRET` initializes a new realm on first b
 
 Additional nodes join an existing realm by setting `ONBOARDING_SECRET` on their first boot.
 
-Onboarding only takes effect on a fresh data directory. Once a node has persisted state, later `.env` changes — including a new `ONBOARDING_SECRET` — do not re-bootstrap or re-onboard it. To repeat an onboarding or bootstrap flow, point the node at a fresh `STORAGE_PATH`.
+Onboarding only takes effect on a fresh data directory. Once a node has persisted state, later `.env` changes, including a new `ONBOARDING_SECRET`, do not re-bootstrap or re-onboard it. To repeat an onboarding or bootstrap flow, point the node at a fresh `STORAGE_PATH`.
 
 For a ready-made multi-node onboarding flow, use `just local-cluster` instead of walking through the onboarding APIs manually.
 
@@ -181,14 +181,14 @@ stored bytes; operators should reserve capacity accordingly.
 
 ## License
 
-The API is licensed under either of
+Aruna is licensed under either of
 
  * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
  * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
-at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion for Aruna by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions. 
+at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Aruna by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
 
 ## Feedback & Contributions
 
-If you have any ideas, suggestions, or issues, please don't hesitate to open an issue and/or PR. Contributions to this project are always welcome ! We appreciate your help in making this project better. Please have a look at our [Contributor Guidelines](./CONTRIBUTING.md) as well as our [Code of Conduct](./CODE_OF_CONDUCT.md) for more information.
+If you have any ideas, suggestions, or issues, please don't hesitate to open an issue and/or PR. Contributions to this project are always welcome! We appreciate your help in making this project better. Please have a look at our [Contributor Guidelines](./CONTRIBUTING.md) as well as our [Code of Conduct](./CODE_OF_CONDUCT.md) for more information.

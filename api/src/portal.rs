@@ -639,7 +639,7 @@ mod tests {
         // API and swagger get the anti-clickjacking baseline, but not the strict portal CSP.
         let (router, _state_dir) = setup_api_router().await;
 
-        for path in ["/api/v1/info", "/api-docs/openapi.json"] {
+        for path in ["/api/v1/system/info", "/api-docs/openapi.json"] {
             let response = router
                 .clone()
                 .oneshot(request(Method::GET, path))

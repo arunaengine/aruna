@@ -224,12 +224,13 @@ async fn proxy_request(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers/{id}/proxy/{path}",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/proxy/{path}",
+    tag = "system/assistant",
     summary = "Proxy a provider request",
     description = r#"Forwards one chat request to the provider and streams its answer back unchanged.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - Only the kind's chat path is forwarded: `/v1/messages` for `anthropic`, `/v1/chat/completions` or
@@ -241,8 +242,8 @@ async fn proxy_request(
   upstream.
 - A ChatGPT request whose access token expired refreshes the login once and retries; the retry's
   answer is the one returned.
-- The upstream status, headers and body are streamed through as they arrive, so a streaming answer
-  stays a streaming answer.
+- The upstream status, headers and body are streamed through as they arrive and are never buffered,
+  so a streaming answer stays a streaming answer.
 
 **Limits**
 - The request body is capped at 4 MiB."#,
@@ -272,12 +273,13 @@ pub async fn proxy_post(
 
 #[utoipa::path(
     get,
-    path = "/users/assistant/providers/{id}/proxy/{path}",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/proxy/{path}",
+    tag = "system/assistant",
     summary = "Proxy a provider models request",
     description = r#"Forwards the provider's own model listing and streams its answer back unchanged.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - Only the kind's model path is forwarded: `/models` for `chatgpt` and `/v1/models` for every other
@@ -286,8 +288,7 @@ pub async fn proxy_post(
   headers are stripped from the request and from the answer.
 - A ChatGPT request whose access token expired refreshes the login once and retries; the retry's
   answer is the one returned.
-- The upstream status, headers and body are streamed through unchanged, so the answer is the
-  provider's own shape rather than the filtered list the models route returns."#,
+- The answer is the provider's own shape, not the filtered list the models route returns."#,
     params(
         ("id" = String, Path, description = "Provider id, as a 26-character ULID"),
         ("path" = String, Path, description = "Upstream path to forward, the model path the provider kind allows")

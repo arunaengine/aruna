@@ -48,7 +48,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "info", description = "Node information endpoints"))
+    tags(
+        (name = "system/info", description = "Node information and usage"),
+        (name = "system/realm", description = "Realm configuration, placement and quota")
+    )
 )]
 pub struct InfoApiDoc;
 
@@ -913,10 +916,10 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
 
 #[utoipa::path(
     get,
-    path = "/info/realm",
-    tag = "info",
+    path = "/system/realm",
+    tag = "system/realm",
     summary = "Read the realm's public settings and node topology",
-    description = r#"Answers every caller, but answers a realm member with more.
+    description = r#"Returns the realm's public settings, and its discovery, quota and node topology to a realm member.
 
 **Authentication**: optional bearer token; without a usable token of this realm, and that includes a
 token of another realm or one this node cannot validate, the response is the public part only.
@@ -927,35 +930,30 @@ token of another realm or one this node cannot validate, the response is the pub
   realm's management nodes are: `is_management_node` says whether this node is one, and
   `management_urls` lists the api base urls the management nodes published, this node's own first.
   Only a management node mints enrollments and issues the realm's credentials, so a device or a
-  client that reached any other node follows one of these urls instead. The list comes from the
-  node information documents that reached this node, so it may lag or omit a fresh node.
-- That overview contains only three nullable aggregates: `live_datasets` is the realm's
-  lifecycle-live metadata registry count, never caller-filtered or replica-multiplied; `groups` is
-  the realm's stored group count; and `nodes_configured` is the membership count in this node's
-  replicated realm configuration, never DHT presence or health.
-- A null overview value means this node could not answer and is never encoded as zero. No resource
-  titles, group membership, storage/capacity, bucket/object, or node-health detail is implied by
-  these counts.
+  client that reached any other node follows one of these urls instead.
+- `public_overview` carries three nullable aggregates: `live_datasets`, the realm's lifecycle-live
+  metadata registry count, never caller-filtered or replica-multiplied; `groups`, the realm's
+  stored group count; and `nodes_configured`, the membership count in this node's replicated realm
+  configuration, never DHT presence or health. A null value means this node could not answer and is
+  never encoded as zero.
 - A bearer token of this realm additionally reveals the realm's discovery configuration, its quota
-  policy, the node list and the interface listen addresses, and receives the same public overview.
-- Gated values are absent or empty, never restructured, so one parser handles both.
+  policy, the node list and the interface listen addresses. Gated values are absent or empty, never
+  restructured, so one parser handles both.
 - The node list is the realm's configured membership read from this node's replicated realm
   configuration; `placement` is the node's entry in the placement map and `info` is the last node
-  information document that reached this node, so it may lag or be absent.
+  information document that reached this node, so both may lag or be absent, as may
+  `management_urls`.
 - Liveness is a separate, deliberately conservative signal: presence is resolved through a bounded
   realm lookup with a four second budget, and if that lookup is stale, times out or fails, only this
-  node counts as present.
-- `present` true and `connection_status` `connected` therefore mean the peer was confirmed live by a
-  fresh lookup just now; `configured` means no fresh confirmation, which is not evidence that the
-  peer is down. Stale presence is candidate data and is never reported as a connection.
-- A `user` node is a device and publishes no presence at all, so `present` is always false and
-  `connection_status` is never `connected`. That is the absence of a signal, never a report that
-  the device is down.
-- A device is instead reported from what this node itself saw: `last_seen_ms` is when the device
-  last reached this node over an authorized request, and `connection_status` `seen` means that was
-  within the last three minutes, otherwise `unknown`. Both are this node's own observation, are
-  never realm state, and start empty after a restart; a device that talks to a different realm node
-  is `unknown` here and `seen` there. A node answering about itself reports itself seen now."#,
+  node counts as present. `present` true with `connection_status` `connected` means the peer was
+  confirmed live just now; `configured` means no fresh confirmation, which is not evidence that the
+  peer is down.
+- A `user` node is a device and publishes no presence at all, so `present` is always false. That is
+  the absence of a signal, never a report that the device is down. A device is instead reported
+  from what this node itself saw: `last_seen_ms` is when it last reached this node over an
+  authorized request, and `connection_status` `seen` means within the last three minutes, otherwise
+  `unknown`. Both are this node's own observation, never realm state, and start empty after a
+  restart."#,
     responses(
         (
             status = 200,
@@ -1325,26 +1323,25 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
 
 #[utoipa::path(
     get,
-    path = "/info/realm/placement",
-    tag = "info",
+    path = "/system/realm/placement",
+    tag = "system/realm",
     summary = "Read the realm's placement strategies, bindings and overrides",
     description = r#"Returns the placement policy as stored in this node's copy of the realm configuration.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path. A
-management node serves it, and every other node relays the call to one.
+**Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
+management node serves the call and every other node relays it to one.
 
 **Behavior**
-- The response carries the defined strategies with their replica count, distinctness requirement,
-  affinity rules and shard count; the default strategy; the immutable job-family strategy id; the
-  bindings that map a scope (the realm, a group, a document class or a metadata path prefix) to a
-  strategy; and the per-subject overrides that pin or exclude individual nodes.
+- Carries the defined strategies with their replica count, distinctness requirement, affinity rules
+  and shard count; the default strategy; the immutable job-family strategy id; the bindings that
+  map a scope (the realm, a group, a document class or a metadata path prefix) to a strategy; and
+  the per-subject overrides that pin or exclude individual nodes.
 - This is policy, not a placement result: it says how replicas are chosen, not where any particular
   document currently sits.
 
 **Limits**
-- `job_family_strategy_id` names a strategy that cannot be removed or have its shard count
-  reshaped: those mutations fail with `JobFamilyImmutable`.
-- Removing a strategy that is still referenced fails with `StrategyReferenced`."#,
+- The strategy named by `job_family_strategy_id` cannot be removed or have its shard count
+  reshaped, and a strategy a binding or override still references cannot be removed."#,
     responses(
         (
             status = 200,
@@ -1382,10 +1379,10 @@ management node serves it, and every other node relays the call to one.
                 }
             })
         ),
-        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
-        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
-        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse),
+        (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
+        (status = 500, description = "The stored realm configuration could not be read or decoded here", body = crate::error::ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1414,34 +1411,29 @@ pub async fn get_realm_placement(
 
 #[utoipa::path(
     patch,
-    path = "/info/realm/placement",
-    tag = "info",
+    path = "/system/realm/placement",
+    tag = "system/realm",
     summary = "Apply one change to the realm's placement policy",
     description = r#"Applies exactly one change to the realm's placement policy and returns the whole policy.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path. A
-management node serves it, and every other node relays the call to one.
+**Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
+management node serves the call and every other node relays it to one.
 
 **Behavior**
 - The body carries exactly one change, selected by its `mutation` field: define or replace a
   strategy, remove one, set the default, set or remove a binding for a scope, set or remove a
   per-subject override, or provision a metadata binding for a strategy.
-- Provisioning is idempotent, an existing binding for the same scope and strategy is returned
+- Provisioning is idempotent: an existing binding for the same scope and strategy is returned
   unchanged instead of allocating a second one.
 - The whole placement policy after the change is returned, so a client never has to re-read to learn
   the new state.
-- The change is written to the replicated realm configuration, which means it is durable here when
-  the response is sent and reaches the other realm nodes asynchronously; it does not move any data
-  by itself, existing replicas are relocated by later placement work.
+- The change is written to the replicated realm configuration: it is durable here when the response
+  is sent and reaches the other realm nodes asynchronously. It moves no data by itself; existing
+  replicas are relocated by later placement work.
 
 **Limits**
-- `job_family_strategy_id` identifies the job-family strategy, which cannot be removed or have its
-  shard count reshaped; those mutations fail with `JobFamilyImmutable`.
-
-**Errors**: removing a strategy that a binding or override still points at fails with
-`StrategyReferenced` and is refused with 409 rather than leaving a dangling reference, and a
-concurrent update of the same configuration is also 409, where retrying the request is the expected
-response."#,
+- The strategy named by `job_family_strategy_id` cannot be removed or have its shard count
+  reshaped; those mutations fail with `JobFamilyImmutable`."#,
     request_body(
         content = RealmPlacementMutationRequest,
         description = "Exactly one placement change, discriminated by `mutation`. Ids are ULIDs, node ids are hex-encoded, an override `subject` is a hex-encoded key prefix",
@@ -1511,11 +1503,11 @@ response."#,
             })
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
-        (status = 409, description = "The strategy is still referenced by a binding or override, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
-        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse),
+        (status = 409, description = "The strategy is still referenced by a binding or override (`StrategyReferenced`), so removing it would leave a dangling reference, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
+        (status = 500, description = "The realm configuration could not be read or written here", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
         (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
@@ -1640,44 +1632,39 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
 
 #[utoipa::path(
     put,
-    path = "/info/realm/quota",
-    tag = "info",
+    path = "/system/realm/quota",
+    tag = "system/realm",
     summary = "Replace the realm-wide quota policy",
     description = r#"Replaces the realm-wide quota policy wholesale and echoes back the stored result.
 
-**Authentication**: realm bearer token with WRITE on the realm's configuration admin path; an
-anonymous caller is rejected. A management node serves it, and every other node relays the call to
-one.
+**Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
+management node serves the call and every other node relays it to one.
 
 **Behavior**
 - This replaces the stored policy rather than patching it: overrides absent from the body are
   dropped, so send the complete intended policy.
-- `default_group_quota_bytes` is the pre-grace allowance per group and null means unlimited.
-- `grace_factor_percent` scales that allowance into the hard ceiling a write is refused at, while
+- `default_group_quota_bytes` is the pre-grace allowance per group and null means unlimited;
+  `grace_factor_percent` scales it into the hard ceiling a write is refused at, while
   `warn_threshold_percent` only decides when a group is reported as warning.
 - Per-group overrides replace both values for one group, and per-user overrides cap how many groups
   a user may hold.
-- `max_devices_per_user` caps how many devices one user may enroll; null leaves device enrollment
-  uncapped. Enrolled devices and unclaimed device enrollment secrets both occupy a slot.
+- `max_devices_per_user` caps how many devices one user may enroll, counting unclaimed enrollment
+  secrets as well as enrolled devices; null leaves device enrollment uncapped.
 - `device_requests_per_minute` and `device_concurrent_pulls` bound what one enrolled device may ask
   of each realm node: how many requests it may send per minute and how many it may keep in flight,
   which is what bounds long blob pulls. Both are per device and per node, and null leaves that
   dimension uncapped.
-- Device limits are enforced where a device's requests actually arrive, at the node's inbound
-  network admission, not at REST: an over-budget request is dropped there, so the device sees a
-  transport failure and reports the retryable 503 class to its owner rather than a 429. The 429
-  with `Retry-After` stays the answer of the per-address and per-principal REST limiters.
+- Device limits are enforced where a device's requests arrive, at the node's inbound network
+  admission, not at REST: an over-budget request is dropped there, so the device sees a transport
+  failure and reports the retryable 503 class to its owner rather than a 429.
 - Quota is evaluated against a group's realm-wide logical bytes, which are aggregated from counters
   that replicate between nodes, so enforcement follows a policy change as those counters and the
   realm configuration propagate.
 
 **Limits**
-- `grace_factor_percent` must be at least 100.
-- `warn_threshold_percent` must be between 1 and 100.
-- `max_devices_per_user` must be null or greater than zero; zero is refused rather than read as a
-  ban on device enrollment.
-- `device_requests_per_minute` and `device_concurrent_pulls` must be null or greater than zero;
-  zero would silence every enrolled device and is refused."#,
+- `grace_factor_percent` must be at least 100 and `warn_threshold_percent` between 1 and 100.
+- `max_devices_per_user`, `device_requests_per_minute` and `device_concurrent_pulls` must be null or
+  greater than zero; zero is refused rather than read as a ban on enrollment or a silenced device."#,
     request_body(
         content = RealmQuotaConfig,
         description = "The complete quota policy to store; it replaces the current one, including all override lists",
@@ -1719,6 +1706,7 @@ one.
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
@@ -1838,7 +1826,7 @@ pub struct GroupQuotaStatus {
 
 impl GroupQuotaStatus {
     /// Builds the status from the realm quota config and the group's realm-wide
-    /// `logical_bytes` — the same counter the put-object `QuotaGate` enforces.
+    /// `logical_bytes`, the same counter the put-object `QuotaGate` enforces.
     pub fn resolve(
         quota: &QuotaConfig,
         group_id: &aruna_core::types::GroupId,
@@ -1944,14 +1932,13 @@ pub async fn load_realm_usage(
 
 #[utoipa::path(
     get,
-    path = "/info/usage",
-    tag = "info",
+    path = "/system/usage",
+    tag = "system/info",
     summary = "Report this node's and the realm's storage usage",
     description = r#"Reports this node's own storage counters together with the realm-wide totals.
 
-**Authentication**: realm bearer token; an anonymous caller gets 401 and a token of another realm
-403. No further permission is checked, because the figures are realm-wide totals and not per-caller
-views.
+**Authentication**: realm bearer token. No further permission is checked, because the figures are
+realm-wide totals and not per-caller views.
 
 **Behavior**
 - The flat fields are this node's own counters, while `realm` is the total summed from every realm
@@ -1962,9 +1949,8 @@ views.
   by every group referencing it, so it is attributed to this node and its backend, never to a group;
   the group usage endpoint therefore omits both fields.
 - `metadata_documents` counts the realm's live metadata documents, excluding lifecycle-deleted ones,
-  and is deliberately unfiltered by what the caller may read.
-- It is omitted, never zeroed, when this node has no metadata subsystem or the count cannot be
-  produced, so an absent field means unknown.
+  and is deliberately unfiltered by what the caller may read. It is omitted, never zeroed, when this
+  node has no metadata subsystem or the count cannot be produced, so an absent field means unknown.
 - `quota` is not reported here, it belongs to the per-group usage view."#,
     responses(
         (
@@ -1989,7 +1975,7 @@ views.
                 "metadata_documents": 4096
             })
         ),
-        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a member of this realm", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -2180,10 +2166,10 @@ async fn backend_statuses(
 
 #[utoipa::path(
     get,
-    path = "/info",
-    tag = "info",
+    path = "/system/info",
+    tag = "system/info",
     summary = "Report this node's health, version and service status",
-    description = r#"The health check of a single node, answered locally and never routed to a peer.
+    description = r#"Health-checks this single node, answered locally and never routed to a peer.
 
 **Authentication**: optional bearer token; every caller is answered, but the amount of detail
 depends on the token, and a token of another realm or one that cannot be validated here counts as
@@ -2191,11 +2177,11 @@ anonymous.
 
 **Behavior**
 - The route always returns 200 for a node that is serving requests at all.
-- Anonymous callers see only what is needed to health check the node and learn where to
-  authenticate: node status, realm id, api version and the public interface urls.
+- An anonymous caller sees only what health-checks the node and says where to authenticate: node
+  status, realm id, api version and the public interface urls.
 - A bearer token of this realm adds the node's own identity and capability kind, its listen
   addresses, its peer connections and the network service summary.
-- A token with WRITE on the realm's configuration admin path additionally reveals the blob and
+- A token with WRITE on the realm configuration admin path additionally reveals the blob and
   database services, every registered storage backend with its quota and used bytes, the portal
   deployment state, operational warnings and the last error of each peer connection.
 - Gated values are absent or empty rather than restructured, so the same parser works at every
@@ -2802,7 +2788,7 @@ mod tests {
     fn openapi_includes_info_path() {
         let openapi = ApiDoc::openapi();
 
-        assert!(openapi.paths.paths.contains_key("/info"));
+        assert!(openapi.paths.paths.contains_key("/system/info"));
     }
 
     async fn seed_usage_state(state: &Arc<ServerState>) {
@@ -3041,7 +3027,7 @@ mod tests {
     fn openapi_includes_realm_quota_path() {
         let openapi = ApiDoc::openapi();
 
-        assert!(openapi.paths.paths.contains_key("/info/realm/quota"));
+        assert!(openapi.paths.paths.contains_key("/system/realm/quota"));
     }
 
     #[test]
@@ -3578,7 +3564,7 @@ mod tests {
         let response = crate::routes::rest_router(state)
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/info/realm/placement")
+                    .uri("/system/realm/placement")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3590,7 +3576,7 @@ mod tests {
     #[test]
     fn openapi_registers_realm_placement_get_patch_and_schemas() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let path = &openapi["paths"]["/info/realm/placement"];
+        let path = &openapi["paths"]["/system/realm/placement"];
         assert!(path.get("get").is_some());
         assert!(path.get("patch").is_some());
         assert!(

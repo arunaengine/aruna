@@ -9,7 +9,7 @@ use rmcp::service::{RequestContext, RoleServer};
 const PROFILE_PREFIX: &str = "aruna://profiles/";
 const PROFILE_TEMPLATE: &str = "aruna://profiles/{id}";
 const DOCS_URI: &str = "aruna://docs/metadata-profiles";
-const PROFILE_DOCS: &str = include_str!("../../../docs/metadata-profiles.md");
+const PROFILE_DOCS: &str = include_str!("metadata_profiles.md");
 const NOT_FOUND: &str = "no such resource; this server serves aruna://docs/metadata-profiles and \
                          aruna://profiles/{id}, where {id} is a bare 26-character Profile document \
                          ULID from the list_profiles tool";

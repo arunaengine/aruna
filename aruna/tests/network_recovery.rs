@@ -24,7 +24,7 @@ use std::time::Duration;
 
 async fn realm_info(base_url: &str, token: &str) -> TestResult<Value> {
     let response = reqwest::Client::new()
-        .get(format!("{base_url}/api/v1/info/realm"))
+        .get(format!("{base_url}/api/v1/system/realm"))
         .bearer_auth(token)
         .send()
         .await?;

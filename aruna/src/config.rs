@@ -1520,7 +1520,7 @@ async fn bootstrap_onboarded_node_state(
 
     let response = onboarding_bootstrap_client(timeout)?
         .post(format!(
-            "{}/api/v1/onboarding/bootstrap",
+            "{}/api/v1/access/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
         ))
         .json(&BootstrapOnboardingRequest {
@@ -1695,7 +1695,7 @@ async fn refresh_onboarding_bootstrap(
 
     let response = onboarding_bootstrap_client(timeout)?
         .post(format!(
-            "{}/api/v1/onboarding/bootstrap",
+            "{}/api/v1/access/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
         ))
         .json(&BootstrapOnboardingRequest {

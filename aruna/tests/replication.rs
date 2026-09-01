@@ -223,7 +223,7 @@ impl ReplicationHarness {
         request: CreateSyncRequest,
     ) -> TestResult<SyncRelationshipResponse> {
         let response = reqwest::Client::new()
-            .post(format!("{}/api/v1/data/sync-relationships", base_url))
+            .post(format!("{}/api/v1/data/sync/relationships", base_url))
             .bearer_auth(bearer_token)
             .json(&request)
             .send()
@@ -247,7 +247,7 @@ impl ReplicationHarness {
     ) -> TestResult<SyncDetailResponse> {
         let response = reqwest::Client::new()
             .get(format!(
-                "{base_url}/api/v1/data/sync-relationships/{relationship_id}"
+                "{base_url}/api/v1/data/sync/relationships/{relationship_id}"
             ))
             .bearer_auth(bearer_token)
             .send()
@@ -273,7 +273,7 @@ impl ReplicationHarness {
         .await?;
         let response = reqwest::Client::new()
             .post(format!(
-                "{}/api/v1/groups/{}/members",
+                "{}/api/v1/access/groups/{}/members",
                 self.seed.base_url, self.group_id
             ))
             .bearer_auth(&self.seed_token)
@@ -303,7 +303,9 @@ impl ReplicationHarness {
                 let member_token = member_token.clone();
                 async move {
                     reqwest::Client::new()
-                        .get(format!("{base_url}/api/v1/groups/{group_id}/members"))
+                        .get(format!(
+                            "{base_url}/api/v1/access/groups/{group_id}/members"
+                        ))
                         .bearer_auth(member_token)
                         .send()
                         .await
@@ -318,7 +320,7 @@ impl ReplicationHarness {
     async fn remove_member(&self, user_id: UserId) -> TestResult<()> {
         let response = reqwest::Client::new()
             .delete(format!(
-                "{}/api/v1/groups/{}/members/{user_id}",
+                "{}/api/v1/access/groups/{}/members/{user_id}",
                 self.seed.base_url, self.group_id
             ))
             .bearer_auth(&self.seed_token)
@@ -974,7 +976,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
 
         let delete_response = reqwest::Client::new()
             .delete(format!(
-                "{}/api/v1/data/sync-relationships/{}",
+                "{}/api/v1/data/sync/relationships/{}",
                 harness.seed.base_url, relationship.id
             ))
             .bearer_auth(&harness.seed_token)
@@ -1014,7 +1016,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         .await?;
         let status_after_delete = reqwest::Client::new()
             .get(format!(
-                "{}/api/v1/data/sync-relationships/{}",
+                "{}/api/v1/data/sync/relationships/{}",
                 harness.seed.base_url, relationship.id
             ))
             .bearer_auth(&harness.seed_token)
@@ -1071,7 +1073,10 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             device_concurrent_pulls: None,
         };
         let quota_response = reqwest::Client::new()
-            .put(format!("{}/api/v1/info/realm/quota", harness.seed.base_url))
+            .put(format!(
+                "{}/api/v1/system/realm/quota",
+                harness.seed.base_url
+            ))
             .bearer_auth(&harness.seed_token)
             .json(&quota)
             .send()
@@ -1083,7 +1088,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             Duration::from_millis(200),
             || async {
                 let Ok(response) = reqwest::Client::new()
-                    .get(format!("{}/api/v1/info/realm", harness.joiner.base_url))
+                    .get(format!("{}/api/v1/system/realm", harness.joiner.base_url))
                     .bearer_auth(&harness.seed_token)
                     .send()
                     .await

@@ -24,7 +24,7 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "audit", description = "Audit trail reads"))
+    tags((name = "metadata/audit", description = "Audit trail reads"))
 )]
 pub struct AuditApiDoc;
 
@@ -88,41 +88,33 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
 
 #[utoipa::path(
     get,
-    path = "/audit",
-    tag = "audit",
+    path = "/metadata/audit",
+    tag = "metadata/audit",
     summary = "List a group's metadata audit trail",
     description = r#"Returns a group's metadata audit trail as a realm-wide merged page, oldest first.
 
-**Authentication**: bearer token of this realm. On a server or management node the caller needs
-WRITE on the group's admin path; on a user-kind node the read is forwarded to the realm under the
-caller's own token and every peer re-checks that same group-admin authority, so a bearer token must
-be present there.
+**Authentication**: realm bearer token with WRITE on the group's admin path. A user-kind node
+forwards the read under the caller's own token and every peer re-checks that same authority.
 
 **Behavior**
-- Audit rows are node-local, so a page is a realm fan-out: every sync-eligible realm node is asked
-  for its slice and the slices are merged in trail order under a 30 second deadline.
-- Partial results are part of the contract: `partial` is true when a node did not answer in time,
-  when realm membership or its digest changed under the read, or when a peer's slice was rejected.
-- A partial page never carries `next_cursor` because a caller must not page over an incomplete
-  merge.
-- `missing_nodes` names up to 64 nodes that did not contribute and `missing_overflow` counts the
-  ones beyond that bound.
-- A complete page without `next_cursor` is the end of the trail.
-- A `cursor` is bound to this realm, the realm membership digest, the group and the document filter.
-
-**Errors**: a cursor whose realm, membership digest, group or document filter no longer matches is
-rejected with 400. Concurrent audit reads are admission-limited, so a saturated node answers 503
-rather than queueing."#,
+- Audit rows are node-local, so a page merges a slice from every sync-eligible realm node under a
+  30 second deadline.
+- `partial` is true when a node did not answer in time, realm membership or its digest changed
+  under the read, or a peer's slice was rejected.
+- A partial page never carries `next_cursor`, so an absent cursor on a complete page is the end of
+  the trail.
+- `missing_nodes` names up to 64 nodes that did not contribute; `missing_overflow` counts the rest.
+- A `cursor` is bound to this realm, the membership digest, the group and the document filter."#,
     params(
-        ("group_id" = String, Query, description = "ULID of the group whose audit trail is read; required"),
-        ("document_id" = Option<String>, Query, description = "ULID of one metadata document; narrows the trail to that document. Default: the whole group trail"),
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous page's `next_cursor`. Absent starts at the beginning of the trail"),
+        ("group_id" = String, Query, description = "ULID of the group whose audit trail is read"),
+        ("document_id" = Option<String>, Query, description = "Narrows the trail to one metadata document ULID; the default is the whole group trail"),
+        ("cursor" = Option<String>, Query, description = "Continuation token from a previous page's `next_cursor`; absent starts at the oldest record"),
         ("limit" = Option<usize>, Query, description = "Maximum records in one page. Default 50, clamped to 1..=200")
     ),
     responses(
         (
             status = 200,
-            description = "Merged audit page, oldest first. `partial` reports whether some node's rows are missing; a partial page carries no continuation token",
+            description = "Merged audit page, oldest first",
             body = AuditPageResponse,
             examples(
                 ("Complete page" = (
@@ -168,10 +160,10 @@ rather than queueing."#,
                 ))
             )
         ),
-        (status = 400, description = "Malformed group or document id, or a cursor that does not belong to this query", body = ErrorResponse),
-        (status = 401, description = "Missing or unusable bearer token, or a forwarded token the realm peers rejected", body = ErrorResponse),
+        (status = 400, description = "Malformed group or document id, or a cursor that no longer matches this realm, membership digest, group or document filter", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token, or a forwarded token the realm peers rejected", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the group's admin path", body = ErrorResponse),
-        (status = 503, description = "Audit reads are saturated, the realm configuration is unavailable, or the deadline expired before a merge could complete; retryable, the response carries a Retry-After header", body = ErrorResponse)
+        (status = 503, description = "Concurrent audit reads are admission-limited and this node is saturated, the realm configuration is unreadable, or the merge deadline expired; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

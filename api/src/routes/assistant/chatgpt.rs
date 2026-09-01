@@ -179,12 +179,13 @@ async fn exchange_tokens(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers/chatgpt/login",
-    tag = "assistant",
+    path = "/system/assistant/providers/chatgpt/login",
+    tag = "system/assistant",
     summary = "Start ChatGPT device login",
     description = r#"Starts a ChatGPT device login and registers the provider in a pending state.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. The provider is registered for the calling user alone.
 
 **Behavior**
 - The node asks the ChatGPT issuer for a device code and returns the user code together with the
@@ -192,8 +193,8 @@ async fn exchange_tokens(
 - The provider record is created right away with status `pending`, the fixed model set this node
   knows and `gpt-5.6-sol` as its default model.
 - The device code and its identifier are sealed with the provider and never reach the response.
-- The login is completed by polling `POST /users/assistant/providers/{id}/login/poll`; nothing here
-  waits for the user.
+- The login is completed by polling
+  `POST /system/assistant/providers/{id}/login/poll`; nothing here waits for the user.
 - `label` falls back to `ChatGPT` when it is omitted or blank.
 
 **Limits**
@@ -304,20 +305,21 @@ pub async fn start_login(
 
 #[utoipa::path(
     post,
-    path = "/users/assistant/providers/{id}/login/poll",
-    tag = "assistant",
+    path = "/system/assistant/providers/{id}/login/poll",
+    tag = "system/assistant",
     summary = "Poll ChatGPT device login",
     description = r#"Reports how far a ChatGPT device login has come, and completes it once it has.
 
-**Authentication**: realm bearer token without path restrictions; a delegated token is refused.
+**Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
+refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - `status` is `pending` while the user has not confirmed the code, `ready` once the tokens are
   sealed into the provider, `denied` when the user declined, and `expired` after the window closed.
 - On the first `ready` the tokens and the account id are sealed, the device code is dropped and the
   provider becomes usable; a provider that is already ready answers without asking the issuer.
-- A provider of another kind is not a login and reads as 404, as does one of another user.
-- Nothing here retries on its own: the caller polls until it sees a terminal status.
+- Each call performs at most one upstream poll and never retries on its own: the caller polls until
+  it sees a terminal status.
 
 **Limits**
 - Poll no faster than the `interval_seconds` the login route returned."#,
