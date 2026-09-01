@@ -880,7 +880,9 @@ pub(crate) async fn export_profile_routed(
     if !is_sync_eligible(&config, local_node) {
         return export_profile_as_owner(context, &config, realm_id, local_node, profile_id).await;
     }
-    let config_digest = config.digest().map_err(|_| MetadataReadError::Unavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataReadError::Unavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, profile_id)
         .map_err(|_| MetadataReadError::Unavailable)?;
     let holders =
@@ -924,7 +926,10 @@ pub(crate) async fn export_profile_routed(
 /// Any answer is the exact revision that was asked for, so a lagging holder's
 /// not-found never outranks a holder that served that revision.
 fn collect_profile_export(
-    responses: Vec<(NodeId, Result<ExportMetadataRoCrateResult, MetadataReadError>)>,
+    responses: Vec<(
+        NodeId,
+        Result<ExportMetadataRoCrateResult, MetadataReadError>,
+    )>,
     holder_count: usize,
     timed_out: bool,
 ) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
@@ -990,7 +995,7 @@ async fn export_profile_as_owner(
 /// Serves one registered Profile with no caller at all. The `profiles/` path,
 /// the graph IRI and the revision fence are the whole authorization; every
 /// other document is reported as not found.
-pub(crate) async fn export_profile_local(
+pub async fn export_profile_local(
     context: &DriverContext,
     realm_id: RealmId,
     profile_id: Ulid,
@@ -1024,6 +1029,13 @@ pub(crate) async fn export_profile_local(
     })
 }
 
+/// Whether a peer may ask the validation channel at all. The fetch vouches for
+/// no user, so an owner-bound device is refused and only infrastructure peers
+/// of this realm are admitted.
+pub fn admits_profile_peer(config: &RealmConfigDocument, peer: NodeId, realm_id: RealmId) -> bool {
+    ensure_peer_trust(config, peer, realm_id, PeerTrust::Vouched(None)).is_ok()
+}
+
 /// Answers a peer's Profile fetch. Every gate fails closed and none of them
 /// reads a caller identity, because the channel never carries one.
 pub(crate) async fn apply_forwarded_profile(
@@ -1051,9 +1063,9 @@ pub(crate) async fn apply_forwarded_profile(
     if config.digest().ok() != Some(config_digest) {
         return Err(MetadataReadError::Unavailable);
     }
-    // The fetch vouches for no user, so only infrastructure peers may ask.
-    ensure_peer_trust(&config, peer, realm_id, PeerTrust::Vouched(None))
-        .map_err(|_| MetadataReadError::Forbidden)?;
+    if !admits_profile_peer(&config, peer, realm_id) {
+        return Err(MetadataReadError::Forbidden);
+    }
     if !holds_metadata_id(&config, realm_id, net_handle.node_id(), profile_id) {
         return Err(MetadataReadError::Unavailable);
     }

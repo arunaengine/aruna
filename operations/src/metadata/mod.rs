@@ -34,7 +34,8 @@ pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 pub(crate) use handle::{MetadataWritePeerError, transport_message_kind};
 pub use protocol::{
-    MetadataAuthToken, MetadataAuthTokenError, MetadataPathWinner, PersistentIdResolution,
+    MetadataAuthToken, MetadataAuthTokenError, MetadataPathWinner, MetadataReadError,
+    PersistentIdResolution,
 };
 
 /// Primes the metadata caches off the boot path so the first user query
