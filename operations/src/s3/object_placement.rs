@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_head_not_found() {
+    fn missing_head_missing() {
         let mut operation = operation();
         operation.start();
         operation.step(read_result(None));

@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_needs_group_admin() {
+    fn owned_needs_admin() {
         // A group-owned rule is decided against its owner's roles: a realm-config
         // admin alone does not publish it, and its own admin does.
         let document = owned_document(1);

@@ -2121,7 +2121,7 @@ mod route_tests {
     }
 
     #[tokio::test]
-    async fn unknown_key_not_found() {
+    async fn unknown_key_missing() {
         let owner = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id());
         let (_dir, state, _) = setup(owner).await;
 
@@ -2161,7 +2161,7 @@ mod route_tests {
     }
 
     #[test]
-    fn openapi_lists_object_placement() {
+    fn openapi_lists_objects() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
         let path = &openapi["paths"]["/data/buckets/{bucket}/placement/objects"];
         assert!(path.get("get").is_some());

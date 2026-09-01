@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_needs_no_read() {
+    fn empty_skips_read() {
         let mut operation = PolicyNamesOperation::new(realm(), &[]);
         assert!(operation.start().is_empty());
         assert!(operation.is_complete());
