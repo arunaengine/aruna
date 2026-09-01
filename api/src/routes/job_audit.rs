@@ -225,8 +225,8 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
 
 #[utoipa::path(
     get,
-    path = "/jobs/{job_id}/audit",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/audit",
+    tag = "compute/jobs",
     summary = "Page the immutable records of one external job",
     description = r#"Pages the immutable records of one external job, ordered by stable record key.
 

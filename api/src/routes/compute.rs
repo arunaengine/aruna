@@ -37,7 +37,7 @@ use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(tags((
-    name = "compute",
+    name = "compute/admin",
     description = "Realm-admin administration of compute links, quotas, pressure and drain"
 )))]
 pub struct ComputeApiDoc;
@@ -279,8 +279,8 @@ async fn require_config_admin(
 
 #[utoipa::path(
     get,
-    path = "/admin/compute/config",
-    tag = "compute",
+    path = "/compute/config",
+    tag = "compute/admin",
     summary = "Read the realm compute configuration",
     description = r#"Returns the realm compute configuration this node currently holds.
 
@@ -348,8 +348,8 @@ pub async fn get_compute_config(
 
 #[utoipa::path(
     put,
-    path = "/admin/compute/config",
-    tag = "compute",
+    path = "/compute/config",
+    tag = "compute/admin",
     summary = "Replace the realm compute configuration",
     description = r#"Replaces the stored realm compute configuration with the submitted one.
 
@@ -497,8 +497,8 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
 
 #[utoipa::path(
     get,
-    path = "/admin/compute/snapshots",
-    tag = "compute",
+    path = "/compute/snapshots",
+    tag = "compute/admin",
     summary = "Read the observed compute demand and reservation snapshots",
     description = r#"Reports the compute demand and reservation snapshots this node has replicated.
 
@@ -657,8 +657,8 @@ pub async fn get_compute_snapshots(
 
 #[utoipa::path(
     post,
-    path = "/admin/compute/drain",
-    tag = "compute",
+    path = "/compute/drain",
+    tag = "compute/admin",
     summary = "Drain or undrain this node's compute plane",
     description = r#"Sets whether this node advertises its compute plane as draining.
 

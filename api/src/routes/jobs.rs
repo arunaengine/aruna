@@ -59,7 +59,7 @@ const MAX_OUTPUT_PREFIXES: usize = 32;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "jobs", description = "Durable background jobs"))
+    tags((name = "compute/jobs", description = "Durable background jobs"))
 )]
 pub struct JobsApiDoc;
 
@@ -829,8 +829,8 @@ fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> 
 
 #[utoipa::path(
     get,
-    path = "/jobs/",
-    tag = "jobs",
+    path = "/compute/jobs",
+    tag = "compute/jobs",
     summary = "List the caller's jobs on this node",
     description = r#"Pages the jobs the caller submitted to this node, newest first.
 
@@ -928,8 +928,8 @@ pub async fn list_jobs(
 
 #[utoipa::path(
     post,
-    path = "/jobs/",
-    tag = "jobs",
+    path = "/compute/jobs",
+    tag = "compute/jobs",
     summary = "Submit a container execution job",
     description = r#"Accepts a container execution job for asynchronous execution and returns the id to poll.
 
@@ -1305,8 +1305,8 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
 
 #[utoipa::path(
     get,
-    path = "/jobs/{job_id}",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}",
+    tag = "compute/jobs",
     summary = "Read one job's status",
     description = r#"Returns one job's current status, with the replicated family view for a distributed execution job.
 
@@ -1502,8 +1502,8 @@ fn decode_report_row(
 
 #[utoipa::path(
     get,
-    path = "/jobs/{job_id}/report",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/report",
+    tag = "compute/jobs",
     summary = "Page a finished RO-Crate job's report",
     description = r#"Pages the frozen per-entry report of a finished RO-Crate import or export job.
 
@@ -1891,8 +1891,8 @@ async fn artifact_response(
 
 #[utoipa::path(
     get,
-    path = "/jobs/{job_id}/artifacts/rocrate",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/artifacts/rocrate",
+    tag = "compute/jobs",
     summary = "Download a finished export job's RO-Crate",
     description = r#"Downloads the packaged RO-Crate an export job produced as a binary `application/zip` body, not JSON.
 
@@ -1945,8 +1945,8 @@ pub async fn get_job_artifact(
 
 #[utoipa::path(
     head,
-    path = "/jobs/{job_id}/artifacts/rocrate",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/artifacts/rocrate",
+    tag = "compute/jobs",
     summary = "Probe a finished export job's RO-Crate headers",
     description = r#"Answers exactly what the download would answer, with the headers but no body.
 
@@ -1996,8 +1996,8 @@ pub async fn head_job_artifact(
 
 #[utoipa::path(
     post,
-    path = "/jobs/{job_id}/cancel",
-    tag = "jobs",
+    path = "/compute/jobs/{job_id}/cancel",
+    tag = "compute/jobs",
     summary = "Request cancellation of the caller's job",
     description = r#"Records a cancellation request on the caller's job; it does not stop the work synchronously.
 
@@ -2712,8 +2712,8 @@ mod tests {
     #[test]
     fn report_openapi_union() {
         let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
-        let schema = &openapi["paths"]["/jobs/{job_id}/report"]["get"]["responses"]["404"]["content"]
-            ["application/json"]["schema"];
+        let schema = &openapi["paths"]["/compute/jobs/{job_id}/report"]["get"]["responses"]["404"]
+            ["content"]["application/json"]["schema"];
         assert_eq!(
             schema["$ref"],
             "#/components/schemas/ReportUnavailableResponse"
@@ -2944,15 +2944,25 @@ mod tests {
     #[test]
     fn openapi_has_jobs() {
         let openapi = crate::openapi::ApiDoc::openapi();
-        assert!(openapi.paths.paths.contains_key("/jobs/"));
-        assert!(openapi.paths.paths.contains_key("/jobs/{job_id}"));
-        assert!(openapi.paths.paths.contains_key("/jobs/{job_id}/cancel"));
-        assert!(openapi.paths.paths.contains_key("/jobs/{job_id}/report"));
+        assert!(openapi.paths.paths.contains_key("/compute/jobs"));
+        assert!(openapi.paths.paths.contains_key("/compute/jobs/{job_id}"));
         assert!(
             openapi
                 .paths
                 .paths
-                .contains_key("/jobs/{job_id}/artifacts/rocrate")
+                .contains_key("/compute/jobs/{job_id}/cancel")
+        );
+        assert!(
+            openapi
+                .paths
+                .paths
+                .contains_key("/compute/jobs/{job_id}/report")
+        );
+        assert!(
+            openapi
+                .paths
+                .paths
+                .contains_key("/compute/jobs/{job_id}/artifacts/rocrate")
         );
     }
 
