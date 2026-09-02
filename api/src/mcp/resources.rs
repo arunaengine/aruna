@@ -9,10 +9,12 @@ use rmcp::service::{RequestContext, RoleServer};
 const PROFILE_PREFIX: &str = "aruna://profiles/";
 const PROFILE_TEMPLATE: &str = "aruna://profiles/{id}";
 const DOCS_URI: &str = "aruna://docs/metadata-profiles";
+const AUTHORING_URI: &str = "aruna://docs/dataset-authoring";
 const PROFILE_DOCS: &str = include_str!("metadata_profiles.md");
-const NOT_FOUND: &str = "no such resource; this server serves aruna://docs/metadata-profiles and \
-                         aruna://profiles/{id}, where {id} is a bare 26-character Profile document \
-                         ULID from the list_profiles tool";
+const AUTHORING_DOCS: &str = include_str!("dataset_authoring.md");
+const NOT_FOUND: &str = "no such resource; this server serves aruna://docs/metadata-profiles, \
+                         aruna://docs/dataset-authoring, and aruna://profiles/{id}, where {id} is \
+                         a bare 26-character Profile document ULID from the list_profiles tool";
 
 pub(crate) async fn list_resources(
     _server: &McpServer,
@@ -24,6 +26,14 @@ pub(crate) async fn list_resources(
             .with_description("Aruna Profile authoring and validation documentation")
             .with_mime_type("text/markdown")
             .with_size(PROFILE_DOCS.len() as u64),
+        Resource::new(AUTHORING_URI, "dataset-authoring")
+            .with_title("Aruna dataset authoring")
+            .with_description(
+                "How to build a dataset from a bucket: inventory, derive, ask once, validate, \
+                 create",
+            )
+            .with_mime_type("text/markdown")
+            .with_size(AUTHORING_DOCS.len() as u64),
     ]))
 }
 
@@ -47,6 +57,12 @@ pub(crate) async fn read_resource(
     if request.uri == DOCS_URI {
         return Ok(ReadResourceResult::new(vec![
             ResourceContents::text(PROFILE_DOCS, DOCS_URI).with_mime_type("text/markdown"),
+        ])
+        .into());
+    }
+    if request.uri == AUTHORING_URI {
+        return Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(AUTHORING_DOCS, AUTHORING_URI).with_mime_type("text/markdown"),
         ])
         .into());
     }
