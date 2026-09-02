@@ -771,7 +771,11 @@ impl CompleteMultipartUploadOperation {
             GatedBucket::observe(bucket.as_ref())
                 .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
-        match write_gate(self.gate_context.as_ref(), &refs) {
+        let group_id = bucket
+            .as_ref()
+            .map(|bucket| bucket.group_id)
+            .or_else(|| self.upload_record.as_ref().map(|upload| upload.group_id));
+        match write_gate(self.gate_context.as_ref(), &refs, group_id) {
             Ok(None) => self.compose_blob(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -806,7 +810,7 @@ impl CompleteMultipartUploadOperation {
             Ok(outcome) => outcome,
             Err(error) => return self.schedule_error(PolicyGateError::from(error).into()),
         };
-        match gate_decision(outcome.decision) {
+        match gate_decision(outcome) {
             Ok(()) => self.compose_blob(),
             Err(error) => self.schedule_error(error.into()),
         }

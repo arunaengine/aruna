@@ -461,7 +461,10 @@ impl PutObjectOperation {
             GatedBucket::observe(bucket.as_ref())
                 .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
-        match write_gate(self.gate_context.as_ref(), &refs) {
+        let group_id = bucket
+            .as_ref()
+            .map_or(self.config.group_id, |bucket| bucket.group_id);
+        match write_gate(self.gate_context.as_ref(), &refs, Some(group_id)) {
             Ok(None) => self.check_purge_fence_before_write(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -496,7 +499,7 @@ impl PutObjectOperation {
             Ok(outcome) => outcome,
             Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
         };
-        match gate_decision(outcome.decision) {
+        match gate_decision(outcome) {
             Ok(()) => self.check_purge_fence_before_write(),
             Err(error) => self.emit_error(error.into()),
         }

@@ -107,9 +107,9 @@ fn managed_copy_error(error: &ManagedCopyError) -> S3Error {
 /// discloses which policy decided.
 fn policy_gate_error(error: &PolicyGateError, action: &str) -> S3Error {
     match error {
-        PolicyGateError::Denied { .. } | PolicyGateError::NoSubject => {
-            placement_denied_error(action)
-        }
+        PolicyGateError::Denied { .. }
+        | PolicyGateError::ForeignPolicy { .. }
+        | PolicyGateError::NoSubject => placement_denied_error(action),
         PolicyGateError::Unavailable { .. }
         | PolicyGateError::Required { .. }
         | PolicyGateError::Drift

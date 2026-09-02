@@ -585,6 +585,7 @@ fn policy_denied() -> ServerError {
 
 fn map_gate_error(error: PolicyGateError) -> ServerError {
     match error {
+        PolicyGateError::ForeignPolicy { .. } => foreign_policy(),
         PolicyGateError::Denied { .. }
         | PolicyGateError::NoSubject
         | PolicyGateError::Invalid

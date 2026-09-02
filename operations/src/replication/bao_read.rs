@@ -340,11 +340,13 @@ pub async fn managed_read(
         }
         // The refs are only a hint: this node decides on its own resolution,
         // which also caches the verified publication for every later read.
-        let Some(gate) = write_gate(destination.as_ref(), &refs)? else {
+        // No bucket names the destination of a read, so the owning group is
+        // checked by the write that registers the copy these bytes become.
+        let Some(gate) = write_gate(destination.as_ref(), &refs, None)? else {
             return Err(BaoReadError::NoDestination);
         };
         let outcome = drive(gate, context).await.map_err(PolicyGateError::from)?;
-        gate_decision(outcome.decision)?;
+        gate_decision(outcome)?;
         request.known_refs = union_refs(&request.known_refs, &refs)?;
         taught = refs;
     }
@@ -1216,7 +1218,9 @@ impl IncomingBaoReadOperation {
             now_ms: self.now_ms,
             admitting: true,
         };
-        match write_gate(Some(&context), &self.version_refs) {
+        // The bucket the peer would write into is its own, so only that node
+        // can check who owns it; here the subject decides.
+        match write_gate(Some(&context), &self.version_refs, None) {
             Ok(None) => self.send_accepted(location),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -1239,7 +1243,7 @@ impl IncomingBaoReadOperation {
         let decision = gate
             .finalize()
             .map_err(PolicyGateError::from)
-            .and_then(|outcome| gate_decision(outcome.decision));
+            .and_then(gate_decision);
         match decision {
             Ok(()) => self.send_accepted(location),
             Err(PolicyGateError::Denied { policy_ids })

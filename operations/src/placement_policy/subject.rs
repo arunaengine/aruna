@@ -160,7 +160,9 @@ impl SubjectScanOperation {
         if let SubjectScanMode::Depart = self.config.mode {
             return self.transition(record, ManagedCopyState::UnresolvedDeparted);
         }
-        match write_gate(self.gate_context().as_ref(), &record.policies) {
+        // A copy row names its bucket but not the owning group, so revalidation
+        // re-checks the subject alone; ownership is decided when a copy lands.
+        match write_gate(self.gate_context().as_ref(), &record.policies, None) {
             Ok(None) => self.decide(record, Ok(())),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -184,7 +186,7 @@ impl SubjectScanOperation {
         let decision = gate
             .finalize()
             .map_err(PolicyGateError::from)
-            .and_then(|outcome| gate_decision(outcome.decision));
+            .and_then(gate_decision);
         self.decide(record, decision)
     }
 

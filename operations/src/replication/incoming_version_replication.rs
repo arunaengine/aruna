@@ -862,7 +862,7 @@ impl IncomingVersionReplicationOperation {
             .gated_bucket
             .take()
             .map(|gated| gated.sealed_under(self.gate_context.as_ref(), !refs.is_empty()));
-        match write_gate(self.gate_context.as_ref(), &refs) {
+        match write_gate(self.gate_context.as_ref(), &refs, self.destination_group_id) {
             Ok(None) => self.reply_negotiation(result),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -902,7 +902,7 @@ impl IncomingVersionReplicationOperation {
             Ok(outcome) => outcome,
             Err(error) => return self.reject_negotiation(PolicyGateError::from(error).into()),
         };
-        match gate_decision(outcome.decision) {
+        match gate_decision(outcome) {
             Ok(()) => self.reply_negotiation(result),
             Err(error) => self.reject_negotiation(error.into()),
         }
