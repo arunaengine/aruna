@@ -7,7 +7,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, blob_bucket_permission_path,
-    blob_object_permission_path,
+    blob_object_permission_path, key_content_type,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -15,9 +15,10 @@ use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOpe
 use aruna_operations::s3::get_object::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
+use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::list_objects_v2::{
-    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
+    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Object, ListObjectsV2Operation,
 };
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
@@ -31,9 +32,15 @@ use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
+/// Upper bound on one aggregation's scan, so a huge bucket answers partially
+/// rather than holding the tool open.
+const MAX_SCAN_OBJECTS: usize = 50_000;
+const SCAN_PAGE_KEYS: usize = 1_000;
+const DEFAULT_BUCKETS: usize = 200;
+const MAX_BUCKETS: usize = 1_000;
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct BucketOutput {
@@ -113,6 +120,108 @@ pub struct ReadObjectOutput {
     pub content_type: String,
     pub truncated: bool,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct StatObjectInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. Call
+    /// `list_buckets` for the readable names; this is not an `s3://` URL.
+    pub bucket: String,
+    /// Object key inside the bucket, for example `results/run-1/chart.png`.
+    /// Relative, with no leading slash, no `..` segment, and no control
+    /// character. Call `list_objects` for the keys in a bucket.
+    pub key: String,
+    /// Exact version to describe, as the 26-character ULID `list_job_outputs`
+    /// or a previous write returned. Omit it for the key's latest version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct StatObjectOutput {
+    pub bucket: String,
+    pub key: String,
+    /// Version described, which for an omitted `version_id` is the latest one.
+    pub version_id: Option<String>,
+    pub filename: String,
+    pub size: u64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    /// The stored type, or the type the key's extension implies. Never null, so
+    /// a caller can decide how to render the object before fetching it.
+    pub content_type: String,
+    /// Node that owns this version; S3 reads of it go to that node's endpoint.
+    pub node_id: String,
+}
+
+/// Calendar unit one aggregation bucket spans, in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketUnit {
+    Day,
+    Week,
+    Month,
+}
+
+impl BucketUnit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct AggregateObjectsInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. Call
+    /// `list_buckets` for the readable names.
+    pub bucket: String,
+    /// Optional key prefix filter, for example `reads/2026/`. Matched literally
+    /// from the start of the key, with no wildcards and no leading slash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Calendar unit each bucket spans, in UTC: `day`, `week` (starting
+    /// Monday), or `month`. Objects are counted by their last modification.
+    pub bucket_by: BucketUnit,
+    /// Optional inclusive lower bound as RFC 3339, for example
+    /// `2026-01-01T00:00:00Z`. Objects modified earlier are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Optional exclusive upper bound as RFC 3339, for example
+    /// `2026-02-01T00:00:00Z`. Objects modified at or after it are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    /// Maximum number of buckets to return, oldest first. Defaults to 200 and is
+    /// clamped to the range 1 to 1000; a longer series sets `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_buckets: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct TimeBucketOutput {
+    /// Start of the bucket in RFC 3339 UTC; it spans one `bucket_by` unit.
+    pub start: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AggregateObjectsOutput {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub bucket_by: String,
+    pub buckets: Vec<TimeBucketOutput>,
+    /// Totals over every object in the window, including buckets the answer
+    /// dropped.
+    pub total_count: u64,
+    pub total_bytes: u64,
+    /// Objects the scan examined before filtering.
+    pub scanned: usize,
+    /// The scan hit its object cap or the series exceeded `max_buckets`, so the
+    /// answer covers only part of the prefix.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -294,16 +403,7 @@ impl McpServer {
             .objects
             .into_iter()
             .map(|object| {
-                let size = object
-                    .location
-                    .as_ref()
-                    .map(|location| location.blob_size)
-                    .or_else(|| {
-                        object
-                            .source_metadata
-                            .as_ref()
-                            .map(|metadata| metadata.content_length)
-                    });
+                let size = entry_size(&object);
                 let etag = object
                     .location
                     .as_ref()
@@ -319,15 +419,7 @@ impl McpServer {
                     .source_metadata
                     .as_ref()
                     .and_then(|metadata| metadata.content_type.clone());
-                let last_modified = object
-                    .version_created_at
-                    .or(object.last_refresh)
-                    .or_else(|| {
-                        object
-                            .source_metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.last_modified)
-                    })
+                let last_modified = entry_time(&object)
                     .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
                 ObjectOutput {
                     key: object.head.key,
@@ -367,6 +459,219 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("read_object", &input)?;
         Ok(Json(read_text(self, &auth, input, extras).await?))
+    }
+
+    #[tool(
+        description = "Describe one object without reading its bytes: size, etag, last_modified, content type, filename, and the owning node. Pass version_id to describe the exact version a job wrote, as list_job_outputs reports it; omit it for the latest version. The content type is never null, so use this to decide whether an object is an image, JSON, or text before fetching it. Binary objects are fetched through the S3 surface with the bucket, key, and version_id, not through this tool.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn stat_object(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<StatObjectInput>,
+    ) -> Result<Json<StatObjectOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let extras = tool_extras("stat_object", &input)?;
+        validate_key(&input.key)?;
+        let version_id = input
+            .version_id
+            .as_deref()
+            .map(|version_id| {
+                super::parse_ulid(
+                    "version_id",
+                    version_id,
+                    "copy it from a list_job_outputs entry or a write_object answer, or omit it \
+                     for the latest version",
+                )
+            })
+            .transpose()?;
+        let bucket_info = self.bucket_info(&input.bucket).await?;
+        authorize_tool(
+            &self.state,
+            &auth,
+            blob_object_permission_path(
+                self.state.get_realm_id(),
+                bucket_info.group_id,
+                self.state.get_node_id(),
+                &input.bucket,
+                &input.key,
+            ),
+            Permission::READ,
+            extras,
+        )
+        .await
+        .map_err(|error| object_error(error, "read"))?;
+        let result = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: input.bucket.clone(),
+                key: input.key.clone(),
+                version_id,
+            }),
+            &self.state.get_ctx(),
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(map_head_error)?
+        .ok_or_else(|| internal_error("object head did not finish"))?;
+        let size = result
+            .location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.content_length)
+            })
+            .unwrap_or(0);
+        let etag = result
+            .location
+            .as_ref()
+            .and_then(|location| location.hashes.get(HASH_MD5))
+            .map(hex::encode)
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.etag.clone())
+            });
+        let last_modified = result
+            .version_created_at
+            .or(result.last_refresh)
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.last_modified)
+            })
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+        let content_type = result
+            .metadata
+            .get(OBJECT_CONTENT_TYPE_KEY)
+            .cloned()
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.content_type.clone())
+            })
+            .unwrap_or_else(|| key_content_type(&input.key).to_string());
+        Ok(Json(StatObjectOutput {
+            filename: filename_of(&input.key),
+            version_id: result
+                .version_id
+                .or(result.resolved_version_id)
+                .map(|version_id| version_id.to_string()),
+            bucket: input.bucket,
+            key: input.key,
+            size,
+            etag,
+            last_modified,
+            content_type,
+            node_id: self.state.get_node_id().to_string(),
+        }))
+    }
+
+    #[tool(
+        description = "Count objects and bytes per calendar bucket over one bucket and optional key prefix, so a question such as documents per week is answered in one call instead of paging list_objects. Objects are bucketed by their last modification in UTC, with weeks starting Monday, and an optional since and until window bounds the range. The scan stops after 50000 objects and the series after max_buckets, both reported as truncated.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn aggregate_objects(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<AggregateObjectsInput>,
+    ) -> Result<Json<AggregateObjectsOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let extras = tool_extras("aggregate_objects", &input)?;
+        let since = parse_bound("since", input.since.as_deref())?;
+        let until = parse_bound("until", input.until.as_deref())?;
+        if let (Some(since), Some(until)) = (since, until)
+            && since > until
+        {
+            return Err(bad_request("since must not be later than until"));
+        }
+        let max_buckets = input
+            .max_buckets
+            .unwrap_or(DEFAULT_BUCKETS)
+            .clamp(1, MAX_BUCKETS);
+        let bucket_info = self.bucket_info(&input.bucket).await?;
+        authorize_tool(
+            &self.state,
+            &auth,
+            blob_bucket_permission_path(
+                self.state.get_realm_id(),
+                bucket_info.group_id,
+                self.state.get_node_id(),
+                &input.bucket,
+            ),
+            Permission::READ,
+            extras,
+        )
+        .await
+        .map_err(|error| object_error(error, "read"))?;
+        let mut samples = Vec::new();
+        let mut cursor = None;
+        let mut scanned = 0usize;
+        let mut scan_truncated = false;
+        loop {
+            let page = drive(
+                ListObjectsV2Operation::new(ListObjectsV2Input {
+                    bucket: input.bucket.clone(),
+                    group_id: bucket_info.group_id,
+                    continuation_token: cursor,
+                    max_keys: Some(SCAN_PAGE_KEYS),
+                    prefix: input.prefix.clone(),
+                    delimiter: None,
+                    start_after: None,
+                }),
+                &self.state.get_ctx(),
+            )
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(internal_error)?
+            .ok_or_else(|| internal_error("object listing did not finish"))?;
+            scanned = scanned.saturating_add(page.objects.len());
+            for object in &page.objects {
+                let Some(at) = entry_time(object) else {
+                    continue;
+                };
+                let at = chrono::DateTime::<chrono::Utc>::from(at);
+                if since.is_some_and(|since| at < since) || until.is_some_and(|until| at >= until) {
+                    continue;
+                }
+                samples.push(ObjectSample {
+                    at,
+                    bytes: entry_size(object).unwrap_or(0),
+                });
+            }
+            cursor = page.continuation_token;
+            if cursor.is_none() {
+                break;
+            }
+            if scanned >= MAX_SCAN_OBJECTS {
+                scan_truncated = true;
+                break;
+            }
+        }
+        let folded = fold_buckets(&samples, input.bucket_by, max_buckets);
+        Ok(Json(AggregateObjectsOutput {
+            bucket: input.bucket,
+            prefix: input.prefix,
+            bucket_by: input.bucket_by.as_str().to_string(),
+            buckets: folded.buckets,
+            total_count: folded.total_count,
+            total_bytes: folded.total_bytes,
+            scanned,
+            truncated: scan_truncated || folded.truncated,
+        }))
     }
 
     #[tool(
@@ -436,6 +741,120 @@ impl McpServer {
         .and_then(|result| result.transpose())
         .map_err(map_bucket_error)?
         .ok_or_else(|| internal_error("bucket lookup did not finish"))
+    }
+}
+
+fn entry_size(object: &ListObjectsV2Object) -> Option<u64> {
+    object
+        .location
+        .as_ref()
+        .map(|location| location.blob_size)
+        .or_else(|| {
+            object
+                .source_metadata
+                .as_ref()
+                .map(|metadata| metadata.content_length)
+        })
+}
+
+fn entry_time(object: &ListObjectsV2Object) -> Option<std::time::SystemTime> {
+    object
+        .version_created_at
+        .or(object.last_refresh)
+        .or_else(|| {
+            object
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_modified)
+        })
+}
+
+pub(crate) fn filename_of(key: &str) -> String {
+    key.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(key)
+        .to_string()
+}
+
+fn parse_bound(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, CallToolResult> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|time| time.with_timezone(&chrono::Utc))
+                .map_err(|_| {
+                    bad_request(format!(
+                        "{field} must be an RFC 3339 timestamp such as 2026-01-01T00:00:00Z"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+struct ObjectSample {
+    at: chrono::DateTime<chrono::Utc>,
+    bytes: u64,
+}
+
+struct FoldedBuckets {
+    buckets: Vec<TimeBucketOutput>,
+    total_count: u64,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+/// Start of the UTC calendar bucket holding `at`. Weeks start on Monday, as ISO
+/// 8601 defines them.
+fn bucket_start(
+    at: chrono::DateTime<chrono::Utc>,
+    unit: BucketUnit,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Datelike;
+    let date = at.date_naive();
+    let start = match unit {
+        BucketUnit::Day => date,
+        BucketUnit::Week => {
+            date - chrono::Duration::days(i64::from(date.weekday().num_days_from_monday()))
+        }
+        BucketUnit::Month => date.with_day(1).unwrap_or(date),
+    };
+    start.and_time(chrono::NaiveTime::MIN).and_utc()
+}
+
+/// Folds samples into calendar buckets. Totals cover every sample, so a series
+/// cut to `max_buckets` still reports the whole window.
+fn fold_buckets(samples: &[ObjectSample], unit: BucketUnit, max_buckets: usize) -> FoldedBuckets {
+    let mut totals: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
+    let mut total_count = 0u64;
+    let mut total_bytes = 0u64;
+    for sample in samples {
+        let entry = totals
+            .entry(bucket_start(sample.at, unit).timestamp())
+            .or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(sample.bytes);
+        total_count = total_count.saturating_add(1);
+        total_bytes = total_bytes.saturating_add(sample.bytes);
+    }
+    let truncated = totals.len() > max_buckets;
+    let buckets = totals
+        .into_iter()
+        .take(max_buckets)
+        .map(|(start, (count, bytes))| TimeBucketOutput {
+            start: chrono::DateTime::from_timestamp(start, 0)
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_default(),
+            count,
+            bytes,
+        })
+        .collect();
+    FoldedBuckets {
+        buckets,
+        total_count,
+        total_bytes,
+        truncated,
     }
 }
 
@@ -773,6 +1192,38 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
     }
 }
 
+fn map_head_error(error: HeadObjectError) -> CallToolResult {
+    match error {
+        HeadObjectError::NoSuchKey | HeadObjectError::DeleteMarker => explained(
+            crate::error::ServerError::NotFound,
+            "the bucket holds no readable object under that key; call list_objects for the keys \
+             it does hold",
+        ),
+        HeadObjectError::NoSuchVersion => explained(
+            crate::error::ServerError::NotFound,
+            "that version does not exist for the key; copy version_id from a list_job_outputs \
+             entry or omit it for the latest version",
+        ),
+        HeadObjectError::StorageError(error) => internal_error(error),
+        HeadObjectError::ConversionError(error) => internal_error(error),
+        HeadObjectError::InvalidState { current, expected } => internal_error(format!(
+            "invalid object head state {current:?}; expected {expected:?}"
+        )),
+        HeadObjectError::InvalidStateEvent {
+            state,
+            expected,
+            received,
+        } => internal_error(format!(
+            "unexpected object head event in {state:?}: expected {expected}, got {received:?}"
+        )),
+        HeadObjectError::NoTransactionFound => internal_error("object head transaction is missing"),
+        HeadObjectError::ResolveReferenceError(error) => internal_error(error),
+        HeadObjectError::StagingSourceError(error) => internal_error(error),
+        HeadObjectError::ManagedCopyError(error) => internal_error(error),
+        HeadObjectError::HeadObjectFailed => internal_error("object head failed"),
+    }
+}
+
 fn map_put_error(error: PutObjectError) -> CallToolResult {
     match error {
         error @ (PutObjectError::MissingBody
@@ -914,6 +1365,117 @@ mod tests {
         );
         assert_eq!(
             body(map_put_error(PutObjectError::PutObjectFailed))["code"],
+            "Internal error"
+        );
+    }
+
+    fn sample(at: &str, bytes: u64) -> ObjectSample {
+        ObjectSample {
+            at: chrono::DateTime::parse_from_rfc3339(at)
+                .expect("fixture timestamp")
+                .with_timezone(&chrono::Utc),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn weeks_start_monday() {
+        // A Sunday belongs to the week that began on the preceding Monday.
+        let samples = [
+            sample("2026-01-04T23:59:59Z", 10),
+            sample("2026-01-05T00:00:00Z", 20),
+            sample("2026-01-11T12:00:00Z", 30),
+        ];
+        let folded = fold_buckets(&samples, BucketUnit::Week, 10);
+        assert_eq!(
+            folded.buckets,
+            vec![
+                TimeBucketOutput {
+                    start: "2025-12-29T00:00:00+00:00".to_string(),
+                    count: 1,
+                    bytes: 10,
+                },
+                TimeBucketOutput {
+                    start: "2026-01-05T00:00:00+00:00".to_string(),
+                    count: 2,
+                    bytes: 50,
+                },
+            ]
+        );
+        assert_eq!(folded.total_count, 3);
+        assert_eq!(folded.total_bytes, 60);
+        assert!(!folded.truncated);
+    }
+
+    #[test]
+    fn months_and_days() {
+        let samples = [
+            sample("2026-01-31T23:00:00Z", 1),
+            sample("2026-02-01T00:00:00Z", 2),
+        ];
+        let months = fold_buckets(&samples, BucketUnit::Month, 10);
+        assert_eq!(months.buckets.len(), 2);
+        assert_eq!(months.buckets[0].start, "2026-01-01T00:00:00+00:00");
+        assert_eq!(months.buckets[1].start, "2026-02-01T00:00:00+00:00");
+        let days = fold_buckets(&samples, BucketUnit::Day, 10);
+        assert_eq!(days.buckets[0].start, "2026-01-31T00:00:00+00:00");
+    }
+
+    #[test]
+    fn folds_empty_window() {
+        let folded = fold_buckets(&[], BucketUnit::Day, 1);
+        assert!(folded.buckets.is_empty());
+        assert_eq!(folded.total_count, 0);
+        assert!(!folded.truncated);
+    }
+
+    #[test]
+    fn caps_bucket_count() {
+        // Beyond the cap the series is cut, but the totals still cover it.
+        let samples = [
+            sample("2026-01-01T00:00:00Z", 1),
+            sample("2026-01-02T00:00:00Z", 2),
+            sample("2026-01-03T00:00:00Z", 4),
+        ];
+        let folded = fold_buckets(&samples, BucketUnit::Day, 2);
+        assert_eq!(folded.buckets.len(), 2);
+        assert!(folded.truncated);
+        assert_eq!(folded.total_count, 3);
+        assert_eq!(folded.total_bytes, 7);
+    }
+
+    #[test]
+    fn bound_rejects_garbage() {
+        assert!(parse_bound("since", Some("yesterday")).is_err());
+        assert!(parse_bound("since", None).unwrap().is_none());
+        assert!(
+            parse_bound("until", Some("2026-01-01T00:00:00Z"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn filenames_drop_prefix() {
+        assert_eq!(filename_of("results/run-1/chart.png"), "chart.png");
+        assert_eq!(filename_of("chart.png"), "chart.png");
+        assert_eq!(filename_of("results/"), "results");
+    }
+
+    #[test]
+    fn head_error_categories() {
+        assert_eq!(
+            body(map_head_error(HeadObjectError::NoSuchKey))["code"],
+            "Not found"
+        );
+        assert!(
+            body(map_head_error(HeadObjectError::NoSuchVersion))["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("version_id")
+        );
+        assert_eq!(
+            body(map_head_error(HeadObjectError::HeadObjectFailed))["code"],
             "Internal error"
         );
     }

@@ -573,6 +573,161 @@ async fn data_guard_keys() {
 }
 
 #[tokio::test]
+async fn stat_reports_version() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let written = call(
+        &client,
+        "write_object",
+        json!({
+            "bucket": "mcp-data",
+            "key": "reports/summary.json",
+            "text": "{\"ok\":true}",
+            "content_type": "application/json"
+        }),
+    )
+    .await;
+    assert!(!is_error(&written));
+    let version_id = written.structured_content.as_ref().unwrap()["version_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let stat = call(
+        &client,
+        "stat_object",
+        json!({
+            "bucket": "mcp-data",
+            "key": "reports/summary.json",
+            "version_id": version_id
+        }),
+    )
+    .await;
+    assert!(!is_error(&stat));
+    let body = stat.structured_content.as_ref().unwrap();
+    assert_eq!(body["version_id"], json!(version_id));
+    assert_eq!(body["content_type"], "application/json");
+    assert_eq!(body["filename"], "summary.json");
+    assert_eq!(body["size"], json!(11));
+
+    let bad_version = call(
+        &client,
+        "stat_object",
+        json!({ "bucket": "mcp-data", "key": "reports/summary.json", "version_id": "nope" }),
+    )
+    .await;
+    assert!(is_error(&bad_version));
+    assert_eq!(code(&bad_version), "Bad request");
+
+    let missing = call(
+        &client,
+        "stat_object",
+        json!({ "bucket": "mcp-data", "key": "reports/absent.json" }),
+    )
+    .await;
+    assert!(is_error(&missing));
+    assert_eq!(code(&missing), "Not found");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_rejects_window() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let bad_unit = call(
+        &client,
+        "aggregate_objects",
+        json!({ "bucket": "mcp-data", "bucket_by": "fortnight" }),
+    )
+    .await;
+    assert!(is_error(&bad_unit));
+
+    let bad_since = call(
+        &client,
+        "aggregate_objects",
+        json!({ "bucket": "mcp-data", "bucket_by": "week", "since": "last tuesday" }),
+    )
+    .await;
+    assert!(is_error(&bad_since));
+    assert_eq!(code(&bad_since), "Bad request");
+
+    let inverted = call(
+        &client,
+        "aggregate_objects",
+        json!({
+            "bucket": "mcp-data",
+            "bucket_by": "week",
+            "since": "2026-02-01T00:00:00Z",
+            "until": "2026-01-01T00:00:00Z"
+        }),
+    )
+    .await;
+    assert!(is_error(&inverted));
+    assert_eq!(code(&inverted), "Bad request");
+
+    let empty = call(
+        &client,
+        "aggregate_objects",
+        json!({ "bucket": "mcp-data", "bucket_by": "week" }),
+    )
+    .await;
+    assert!(!is_error(&empty));
+    let body = empty.structured_content.as_ref().unwrap();
+    assert_eq!(body["bucket_by"], "week");
+    assert_eq!(body["total_count"], json!(0));
+    assert_eq!(body["truncated"], json!(false));
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn outputs_explain_missing() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let bad_id = call(&client, "list_job_outputs", json!({ "id": "nope" })).await;
+    assert!(is_error(&bad_id));
+    assert_eq!(code(&bad_id), "Bad request");
+
+    // An id this node cannot resolve is absent or unroutable; either answer must
+    // carry the code and name the way back to a usable id.
+    let unknown = call(
+        &client,
+        "list_job_outputs",
+        json!({ "id": ulid::Ulid::generate().to_string() }),
+    )
+    .await;
+    assert!(is_error(&unknown));
+    let code = code(&unknown);
+    assert!(
+        code == "Not found" || code == "Service unavailable",
+        "unexpected code {code}"
+    );
+    let reason = unknown.structured_content.as_ref().unwrap()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(reason.contains("list_jobs"), "{reason}");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
 async fn metadata_explains_refusals() {
     let fixture = setup_fixture().await;
     let (url, shutdown, task) = start_server(fixture.state.clone()).await;

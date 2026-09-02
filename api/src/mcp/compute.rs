@@ -4,11 +4,15 @@ use super::{
     parse_ulid, request_auth, server_error, tool_extras,
 };
 use aruna_core::compute::runtimes::{QUICK_RUNTIMES, QuickRuntime, quick_runtime};
-use aruna_core::structs::{JobPayload, Permission, blob_group_permission_path};
+use aruna_core::structs::{
+    JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, blob_group_permission_path, key_content_type,
+};
+use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::family_report;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_job_routed,
 };
+use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -128,6 +132,39 @@ pub struct GetJobInput {
     pub id: String,
 }
 
+/// One object a job wrote, with everything a caller needs to render or fetch it.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct JobArtifactOutput {
+    pub job_id: String,
+    /// Physical execution that produced the object.
+    pub execution_id: String,
+    pub bucket: String,
+    pub key: String,
+    /// The exact version this execution created; the key's latest version may be
+    /// a later, unrelated write, so always fetch this version.
+    pub version_id: String,
+    pub filename: String,
+    pub container_path: String,
+    /// The stored type, or the type the key's extension implies. Never null.
+    pub content_type: String,
+    pub size: u64,
+    pub digest: Option<String>,
+    /// Node that owns this version. Null when the answer does not name it.
+    pub node_id: Option<String>,
+    /// Node-local S3 endpoint owning this exact version. Use it with bucket,
+    /// key, and version_id to retrieve the bytes.
+    pub endpoint_url: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct JobOutputsOutput {
+    pub job_id: String,
+    pub state: String,
+    pub workspace_bucket: Option<String>,
+    pub outputs: Vec<JobArtifactOutput>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListJobsInput {
     /// Optional filter: keep only jobs submitted for this group's bare
@@ -179,7 +216,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Stage one script into an existing bucket and submit it as a container job, returning job_id and the state at accept. Use it for plain Python, Deno, or Bash work, and submit_job when a specific image, entrypoint, or workspace mode is needed. The script is written under `.aruna/scripts/<run id>/` in `bucket`, which also serves as the run workspace, so the caller needs write permission on that bucket and on the group. Poll get_job with the returned job_id for state, result, and log tails.",
+        description = "Stage one script into an existing bucket and submit it as a container job, returning job_id and the state at accept. Use it for plain Python, Deno, or Bash work, and submit_job when a specific image, entrypoint, or workspace mode is needed. The script is written under `.aruna/scripts/<run id>/` in `bucket`, which also serves as the run workspace, so the caller needs write permission on that bucket and on the group. Poll get_job with the returned job_id for state, result, and log tails. A file the script writes is kept only when it is declared in outputs as {container_path, dest_key}: to produce a chart, choose runtime `python-uv` with dependencies [\"matplotlib\"], write the figure to /work/chart.png, and pass outputs [{\"container_path\": \"/work/chart.png\", \"dest_key\": \"results/<run>/chart.png\"}]. Once the job succeeds, call list_job_outputs for the captured objects with their content type and version_id.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn run_script(
@@ -322,6 +359,77 @@ impl McpServer {
     }
 
     #[tool(
+        description = "List the objects one owned job wrote, each with content type, filename, size, bucket, key, the exact version_id, the owning node's S3 endpoint, and the execution that produced it. Call it once get_job reports succeeded. The entries are metadata only: fetch the bytes through the S3 surface with bucket, key, and version_id, which is how an image such as a captured chart is displayed. A job that captured nothing answers with an empty list rather than an error.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn list_job_outputs(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<GetJobInput>,
+    ) -> Result<Json<JobOutputsOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        compute_probe(
+            self,
+            &auth,
+            Permission::READ,
+            tool_extras("list_job_outputs", &input)?,
+        )
+        .await?;
+        let job_id = parse_job(&input.id)?;
+        let (view, outputs) =
+            if let Some(report) = family_report(&self.state.get_ctx(), &auth, job_id).await {
+                let report = report
+                    .map_err(crate::routes::jobs::map_job_route)
+                    .map_err(job_error)?;
+                let outputs = report
+                    .outputs
+                    .iter()
+                    .map(|output| {
+                        (
+                            crate::routes::jobs::output_response(
+                                output,
+                                report.output_endpoints.get(&output.node_id),
+                            ),
+                            Some(output.node_id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (crate::routes::jobs::job_view_response(&report.job), outputs)
+            } else {
+                let routed = read_job_routed(
+                    &self.state.get_ctx(),
+                    &auth,
+                    job_id,
+                    crate::routes::jobs::forwarded_job_auth(request_bearer(&parts))
+                        .map_err(server_error)?,
+                )
+                .await
+                .map_err(crate::routes::jobs::map_job_route)
+                .map_err(job_error)?;
+                let view = crate::routes::jobs::job_view_response(&routed.job);
+                let outputs = result_outputs(view.result.as_ref())?
+                    .into_iter()
+                    .map(|output| (output, None))
+                    .collect::<Vec<_>>();
+                (view, outputs)
+            };
+        let mut artifacts = Vec::with_capacity(outputs.len());
+        for (output, node_id) in outputs {
+            artifacts.push(artifact_output(self, &view.job_id, output, node_id).await);
+        }
+        Ok(Json(JobOutputsOutput {
+            job_id: view.job_id,
+            state: view.state,
+            workspace_bucket: view.workspace_bucket,
+            outputs: artifacts,
+        }))
+    }
+
+    #[tool(
         description = "List the caller's own jobs on this node, newest first, with optional group, state, and limit filters. Each entry carries job_id, kind, state, attempts, timestamps, progress, and any error, but never the run crate or the family detail; call get_job for those. Only the first page is returned, at most 200 entries. Use it to recover a job_id that was not kept from the submission.",
         annotations(
             read_only_hint = true,
@@ -444,6 +552,77 @@ impl McpServer {
     }
 }
 
+/// Outputs of a job with no replicated family live in its own result payload.
+fn result_outputs(
+    result: Option<&serde_json::Value>,
+) -> Result<Vec<crate::routes::jobs::JobOutputResponse>, CallToolResult> {
+    let Some(outputs) = result.and_then(|result| result.get("outputs")) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(outputs.clone()).map_err(internal_error)
+}
+
+/// Adds the facts a caller needs to render an object: the stored content type,
+/// the filename, and when the version was written. A version owned by another
+/// node keeps the type its key implies, since only its owner can be asked.
+async fn artifact_output(
+    server: &McpServer,
+    job_id: &str,
+    output: crate::routes::jobs::JobOutputResponse,
+    node_id: Option<aruna_core::NodeId>,
+) -> JobArtifactOutput {
+    let local = node_id.is_none_or(|node_id| node_id == server.state.get_node_id());
+    let head = match (local, Ulid::from_string(&output.version_id)) {
+        (true, Ok(version_id)) => drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: output.bucket.clone(),
+                key: output.key.clone(),
+                version_id: Some(version_id),
+            }),
+            &server.state.get_ctx(),
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .ok()
+        .flatten(),
+        _ => None,
+    };
+    let content_type = head
+        .as_ref()
+        .and_then(|head| head.metadata.get(OBJECT_CONTENT_TYPE_KEY).cloned())
+        .or_else(|| {
+            head.as_ref()
+                .and_then(|head| head.source_metadata.as_ref())
+                .and_then(|metadata| metadata.content_type.clone())
+        })
+        .unwrap_or_else(|| {
+            if output.content_type.is_empty() {
+                key_content_type(&output.key).to_string()
+            } else {
+                output.content_type.clone()
+            }
+        });
+    let last_modified = head
+        .as_ref()
+        .and_then(|head| head.version_created_at)
+        .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+    JobArtifactOutput {
+        job_id: job_id.to_string(),
+        execution_id: output.execution_id,
+        filename: super::data::filename_of(&output.key),
+        bucket: output.bucket,
+        key: output.key,
+        version_id: output.version_id,
+        container_path: output.container_path,
+        content_type,
+        size: output.size,
+        digest: output.digest,
+        node_id: node_id.map(|node_id| node_id.to_string()),
+        endpoint_url: output.endpoint_url,
+        last_modified,
+    }
+}
+
 fn request_bearer(
     parts: &http::request::Parts,
 ) -> Option<crate::auth::ValidatedArunaBearerTokenCarrier> {
@@ -483,6 +662,13 @@ fn job_error(error: crate::error::ServerError) -> CallToolResult {
         crate::error::ServerError::Forbidden => {
             explained(error, "the caller does not own that job")
         }
+        // Only a provably invalid id is absence here; an owner this node cannot
+        // reach is unavailable, which a caller may retry.
+        error @ crate::error::ServerError::ServiceUnavailableReason(_) => explained(
+            error,
+            "the node that owns that job did not answer; retry, and call list_jobs to confirm the \
+             id",
+        ),
         error => server_error(error),
     }
 }

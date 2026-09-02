@@ -282,6 +282,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "reqwest 0.13.4",
+ "rmcp",
  "rustls",
  "serde",
  "serde_json",

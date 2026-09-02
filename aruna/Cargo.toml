@@ -60,4 +60,8 @@ rand = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 tempfile = { workspace = true }
