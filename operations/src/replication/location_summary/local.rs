@@ -1,7 +1,7 @@
 use super::LocationSummaryError;
 use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::blob::managed_copy::{
-    CopyRequest, read_effect, registration_for, serve_reads, split_serve_reads,
+    CopyRequest, read_effect, registration_for, serve_reads, split_reads,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm_peer::ensure_realm_peer;
@@ -22,8 +22,8 @@ use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, GroupAuthorizationDocument, GroupStorageBackend, ManagedCopyKey,
-    Permission, PlacementPolicyRef, RealmConfigDocument, VersionKey, blob_bucket_permission_path,
-    blob_object_permission_path,
+    NodeSubjectRecord, Permission, PlacementPolicyRef, RealmConfigDocument, VersionKey,
+    blob_bucket_permission_path, blob_object_permission_path,
 };
 use aruna_core::types::{Effects, UserId};
 use smallvec::smallvec;
@@ -629,18 +629,25 @@ impl LocationSummaryOperation {
         let Some((key, location)) = self.pending_copy.take() else {
             return self.answer();
         };
-        let Ok((copy, subject)) = split_serve_reads(values) else {
+        let Ok((copy, subject)) = split_reads(values) else {
             return self.answer();
         };
         let Ok(record) = registration_for(copy.as_deref(), &self.copy_request(&key)) else {
             return self.answer();
         };
         self.summary.origin = record.origin;
-        self.summary.compliance = match record.state.is_serveable()
-            && record.subject_generation == subject.subject.generation
-        {
-            true => CopyCompliance::Allowed,
-            false => CopyCompliance::Quarantined,
+        // A subject row that is missing or unreadable leaves the copy held but
+        // unserveable, which is a quarantine verdict rather than an omission.
+        let subject = subject.and_then(|value| NodeSubjectRecord::from_bytes(&value).ok());
+        self.summary.compliance = match subject {
+            Some(subject)
+                if record.state.is_serveable()
+                    && record.subject_generation == subject.subject.generation
+                    && !subject.serving_blocked =>
+            {
+                CopyCompliance::Allowed
+            }
+            _ => CopyCompliance::Quarantined,
         };
         self.describe(location)
     }
@@ -956,8 +963,8 @@ mod tests {
     }
 
     /// Copy row plus subject row, the pair a governed answer reads at once.
-    fn serve_batch(record: &aruna_core::structs::ManagedCopyRecord) -> Event {
-        let subject =
+    fn serve_batch(record: &aruna_core::structs::ManagedCopyRecord, blocked: bool) -> Event {
+        let mut subject =
             aruna_core::structs::NodeSubjectRecord::seed(aruna_core::structs::PlacementSubject {
                 node_id: node_id(5),
                 generation: 1,
@@ -967,6 +974,7 @@ mod tests {
                 local_to_controller: true,
             })
             .expect("subject is valid");
+        subject.serving_blocked = blocked;
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -1021,14 +1029,42 @@ mod tests {
         let mut operation = authorized(Some(version_id));
         operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
         operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
-        operation.step(serve_batch(&copy_record(
-            version_id,
-            aruna_core::structs::ManagedCopyState::Quarantined(
-                aruna_core::structs::ManagedCopyQuarantine::PolicyViolation,
+        operation.step(serve_batch(
+            &copy_record(
+                version_id,
+                aruna_core::structs::ManagedCopyState::Quarantined(
+                    aruna_core::structs::ManagedCopyQuarantine::PolicyViolation,
+                ),
+                CopyOrigin::Replicate,
+                true,
             ),
-            CopyOrigin::Replicate,
+            false,
+        ));
+        verify(&mut operation);
+
+        let summary = operation.finalize().unwrap().summary;
+        assert!(summary.held);
+        assert_eq!(summary.origin, CopyOrigin::Replicate);
+        assert_eq!(summary.compliance, CopyCompliance::Quarantined);
+    }
+
+    #[test]
+    fn reports_blocked_copy() {
+        // Revalidation blocks serving; the copy is still held and reported with
+        // its origin rather than dropped from the answer.
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let mut operation = authorized(Some(version_id));
+        operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
+        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
+        operation.step(serve_batch(
+            &copy_record(
+                version_id,
+                aruna_core::structs::ManagedCopyState::Registered,
+                CopyOrigin::Replicate,
+                true,
+            ),
             true,
-        )));
+        ));
         verify(&mut operation);
 
         let summary = operation.finalize().unwrap().summary;
@@ -1043,12 +1079,15 @@ mod tests {
         let mut operation = authorized(Some(version_id));
         operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
         operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
-        operation.step(serve_batch(&copy_record(
-            version_id,
-            aruna_core::structs::ManagedCopyState::Registered,
-            CopyOrigin::Write,
-            true,
-        )));
+        operation.step(serve_batch(
+            &copy_record(
+                version_id,
+                aruna_core::structs::ManagedCopyState::Registered,
+                CopyOrigin::Write,
+                true,
+            ),
+            false,
+        ));
         verify(&mut operation);
 
         let summary = operation.finalize().unwrap().summary;

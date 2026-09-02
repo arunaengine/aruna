@@ -212,14 +212,23 @@ pub fn serve_reads(
     }))
 }
 
+/// Splits the `serve_reads` answer into its two raw values, leaving the verdict
+/// to the caller: a reporting read describes a copy it may not serve.
+pub fn split_reads(
+    values: Vec<(Key, Option<Value>)>,
+) -> Result<(Option<Value>, Option<Value>), ManagedCopyError> {
+    let mut values = values.into_iter();
+    let (_, copy) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    let (_, subject) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    Ok((copy, subject))
+}
+
 /// Splits the `serve_reads` answer. A missing subject row is not an admission:
 /// a node that never advertised a subject serves nothing governed.
 pub fn split_serve_reads(
     values: Vec<(Key, Option<Value>)>,
 ) -> Result<(Option<Value>, NodeSubjectRecord), ManagedCopyError> {
-    let mut values = values.into_iter();
-    let (_, copy) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
-    let (_, subject) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    let (copy, subject) = split_reads(values)?;
     let subject = subject.ok_or(ManagedCopyError::NoSubject)?;
     let record = NodeSubjectRecord::from_bytes(subject.as_ref())?;
     if record.serving_blocked {
