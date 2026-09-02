@@ -1007,6 +1007,7 @@ mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
@@ -1171,6 +1172,89 @@ mod test {
 
         assert_eq!(summary.logical_size, Some(1_000_000));
         assert!(summary.referenced);
+    }
+
+    fn drifted_delete_op() -> DeleteObjectOperation {
+        let version_id = Ulid::from_bytes([2u8; 16]);
+        let mut op = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Some(version_id),
+            group_id: Ulid::from_bytes([1u8; 16]),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            deleted_by: test_user_id(),
+        });
+        op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+        op.target_version = Some(VersionSummary {
+            version_id,
+            materialized_hash: Some([4u8; 32]),
+            logical_size: None,
+            referenced: false,
+            deleted: false,
+        });
+        op.existing_pointer = Some(CurrentVersionPointer::new(version_id));
+        op.target_size = Some(34_788_022);
+        op
+    }
+
+    #[test]
+    fn drifted_counter_commits() {
+        // A counter below the deleted object's size must clamp, not abort the
+        // transaction and strand the object.
+        let mut op = drifted_delete_op();
+        let effects = op.start_usage_update();
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the counter read, got {effects:?}")
+        };
+        let stored = aruna_core::structs::UsageCounters {
+            objects: 1,
+            logical_bytes: 1_096_145,
+            ..Default::default()
+        }
+        .to_bytes()
+        .unwrap();
+        let values = reads
+            .iter()
+            .map(|(_, key)| {
+                (
+                    key.clone(),
+                    Some(aruna_core::types::Value::from(stored.clone())),
+                )
+            })
+            .collect();
+
+        let effects =
+            op.handle_usage_update(Event::Storage(StorageEvent::BatchReadResult { values }));
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the clamped counter write, got {effects:?}")
+        };
+        assert_ne!(op.state, DeleteObjectState::Error);
+        let counters: Vec<aruna_core::structs::UsageCounters> = writes
+            .iter()
+            .filter(|(key_space, ..)| key_space == USAGE_STATS_KEYSPACE)
+            .map(|(_, _, value)| {
+                aruna_core::structs::UsageCounters::from_bytes(value.as_ref()).unwrap()
+            })
+            .collect();
+        assert_eq!(counters.len(), reads.len());
+        assert!(counters.iter().all(|counters| counters.logical_bytes == 0));
+        // The dirty markers still ride the same transaction.
+        assert!(
+            writes
+                .iter()
+                .any(|(key_space, ..)| key_space == USAGE_NODE_STATS_KEYSPACE)
+        );
+
+        let effects = op.handle_usage_update(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert_eq!(op.state, DeleteObjectState::WriteDeleteAudit);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { .. })]
+        ));
     }
 
     fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {

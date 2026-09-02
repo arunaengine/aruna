@@ -179,7 +179,13 @@ impl UsageCounters {
         Ok(postcard::from_bytes(bytes)?)
     }
 
-    pub fn apply(&mut self, delta: &UsageDelta) -> Result<(), UsageCounterError> {
+    /// Applies `delta`, saturating every decrement at zero. Growth stays strict
+    /// because quota admission reads these counters; the returned shortfalls
+    /// name the counters that were already below what the caller removed.
+    pub fn apply(
+        &mut self,
+        delta: &UsageDelta,
+    ) -> Result<Vec<CounterShortfall>, UsageCounterError> {
         let buckets = apply_delta("buckets", self.buckets, delta.buckets)?;
         let objects = apply_delta("objects", self.objects, delta.objects)?;
         let stored_blobs = apply_delta("stored_blobs", self.stored_blobs, delta.stored_blobs)?;
@@ -191,13 +197,23 @@ impl UsageCounters {
             delta.referenced_bytes,
         )?;
 
-        self.buckets = buckets;
-        self.objects = objects;
-        self.stored_blobs = stored_blobs;
-        self.stored_bytes = stored_bytes;
-        self.logical_bytes = logical_bytes;
-        self.referenced_bytes = referenced_bytes;
-        Ok(())
+        self.buckets = buckets.0;
+        self.objects = objects.0;
+        self.stored_blobs = stored_blobs.0;
+        self.stored_bytes = stored_bytes.0;
+        self.logical_bytes = logical_bytes.0;
+        self.referenced_bytes = referenced_bytes.0;
+        Ok([
+            buckets.1,
+            objects.1,
+            stored_blobs.1,
+            stored_bytes.1,
+            logical_bytes.1,
+            referenced_bytes.1,
+        ]
+        .into_iter()
+        .flatten()
+        .collect())
     }
 
     pub fn add(&mut self, other: &Self) -> Result<(), UsageCounterError> {
@@ -253,12 +269,6 @@ impl UsageDelta {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum UsageCounterError {
-    #[error("usage counter {field} would underflow: {value} + ({delta})")]
-    Underflow {
-        field: &'static str,
-        value: u64,
-        delta: i128,
-    },
     #[error("usage counter {field} would overflow: {value} + {delta}")]
     Overflow {
         field: &'static str,
@@ -267,29 +277,39 @@ pub enum UsageCounterError {
     },
 }
 
-fn apply_delta(field: &'static str, value: u64, delta: i128) -> Result<u64, UsageCounterError> {
+/// A decrement that would have gone below zero. The counter is clamped to zero
+/// and `missing` reports what the stored value was short of, so a drifted
+/// counter is a reported repair item and never a refused deletion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CounterShortfall {
+    pub field: &'static str,
+    pub missing: u64,
+}
+
+fn apply_delta(
+    field: &'static str,
+    value: u64,
+    delta: i128,
+) -> Result<(u64, Option<CounterShortfall>), UsageCounterError> {
     if delta >= 0 {
         let amount = u64::try_from(delta).map_err(|_| UsageCounterError::Overflow {
             field,
             value,
             delta: delta as u128,
         })?;
-        add_counter(field, value, amount)
-    } else {
-        let amount =
-            u64::try_from(delta.unsigned_abs()).map_err(|_| UsageCounterError::Underflow {
-                field,
-                value,
-                delta,
-            })?;
-        value
-            .checked_sub(amount)
-            .ok_or(UsageCounterError::Underflow {
-                field,
-                value,
-                delta,
-            })
+        return Ok((add_counter(field, value, amount)?, None));
     }
+    let amount = u64::try_from(delta.unsigned_abs()).unwrap_or(u64::MAX);
+    Ok(match value.checked_sub(amount) {
+        Some(result) => (result, None),
+        None => (
+            0,
+            Some(CounterShortfall {
+                field,
+                missing: amount - value,
+            }),
+        ),
+    })
 }
 
 fn add_counter(field: &'static str, value: u64, delta: u64) -> Result<u64, UsageCounterError> {
@@ -305,26 +325,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_rejects_underflow() {
+    fn apply_clamps_decrement() {
+        // A drifted counter must not refuse the deletion that discovered it.
         let mut counters = UsageCounters {
             objects: 1,
+            logical_bytes: 100,
+            ..Default::default()
+        };
+        let shortfalls = counters
+            .apply(&UsageDelta {
+                objects: -5,
+                logical_bytes: -400,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(counters.objects, 0);
+        assert_eq!(counters.logical_bytes, 0);
+        assert_eq!(
+            shortfalls,
+            vec![
+                CounterShortfall {
+                    field: "objects",
+                    missing: 4,
+                },
+                CounterShortfall {
+                    field: "logical_bytes",
+                    missing: 300,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_rejects_overflow() {
+        // Growth stays strict: quota admission reads these counters.
+        let mut counters = UsageCounters {
+            logical_bytes: u64::MAX,
             ..Default::default()
         };
         let error = counters.apply(&UsageDelta {
-            objects: -5,
-            logical_bytes: 10,
+            logical_bytes: 1,
             ..Default::default()
         });
+
         assert!(matches!(
             error,
-            Err(UsageCounterError::Underflow {
-                field: "objects",
-                value: 1,
-                delta: -5,
+            Err(UsageCounterError::Overflow {
+                field: "logical_bytes",
+                ..
             })
         ));
-        assert_eq!(counters.objects, 1);
-        assert_eq!(counters.logical_bytes, 0);
+        assert_eq!(counters.logical_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn decrement_within_range() {
+        let mut counters = UsageCounters {
+            objects: 3,
+            logical_bytes: 900,
+            ..Default::default()
+        };
+        let shortfalls = counters
+            .apply(&UsageDelta {
+                objects: -1,
+                logical_bytes: -400,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(shortfalls.is_empty());
+        assert_eq!(counters.objects, 2);
+        assert_eq!(counters.logical_bytes, 500);
     }
 
     #[test]

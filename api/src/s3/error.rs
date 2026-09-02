@@ -90,6 +90,18 @@ fn purge_in_progress_error() -> S3Error {
     error
 }
 
+/// A usage accounting failure. Decrements saturate, so only a real accounting
+/// fault reaches here; the caller gets one stable code instead of a Rust error.
+fn usage_accounting_error() -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("UsageAccountingFailed".into()),
+        "The request was not applied because this node could not update its usage counters."
+            .to_string(),
+    );
+    error.set_status_code(http::StatusCode::INTERNAL_SERVER_ERROR);
+    error
+}
+
 /// One stable mapping for every managed-copy outcome, so a caller cannot tell
 /// an absent registration from a quarantined or blocked one.
 fn managed_copy_error(error: &ManagedCopyError) -> S3Error {
@@ -285,6 +297,7 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::PolicyGate(ref error) => policy_gate_error(error, "PutObject"),
             PutObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
+            PutObjectError::UsageUpdateError(_) => usage_accounting_error(),
             err => internal_error(err),
         }
     }
@@ -530,6 +543,7 @@ impl IntoS3Error for DeleteObjectError {
         match self {
             DeleteObjectError::NoSuchVersion => no_such_version_error(),
             DeleteObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
+            DeleteObjectError::UsageUpdateError(_) => usage_accounting_error(),
             err => internal_error(err),
         }
     }
@@ -756,6 +770,27 @@ mod tests {
         assert_eq!(denied.status_code(), Some(http::StatusCode::FORBIDDEN));
         let rendered = format!("{denied:?}");
         assert!(!rendered.contains(&policy_id.to_string()));
+    }
+
+    #[test]
+    fn maps_usage_failure() {
+        // The counter fault must not leak a Rust error string to an S3 client.
+        let error = DeleteObjectError::UsageUpdateError(
+            aruna_operations::usage_stats::UsageUpdateError::UnexpectedEvent(
+                aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished),
+            ),
+        )
+        .into_s3_error();
+
+        assert_eq!(
+            *error.code(),
+            S3ErrorCode::Custom("UsageAccountingFailed".into())
+        );
+        assert_eq!(
+            error.status_code(),
+            Some(http::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(!format!("{error:?}").contains("UnexpectedEvent"));
     }
 
     #[test]
