@@ -144,8 +144,6 @@ pub struct ServerState {
     portal: Arc<RwLock<PortalRuntimeState>>,
     // Per-node Prometheus registry shared with the S3 server and ops listener.
     metrics: Arc<NodeMetrics>,
-    // True when this node can mount S3 inputs (Kubernetes with a CSI driver).
-    s3_mounts_available: bool,
     rocrate_limits: RoCrateLimits,
     // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
     trusted_proxies: Vec<ipnet::IpNet>,
@@ -280,7 +278,6 @@ impl ServerState {
             interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
             portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
             metrics: Arc::new(NodeMetrics::new()),
-            s3_mounts_available: false,
             rocrate_limits: RoCrateLimits::default(),
             trusted_proxies: Vec::new(),
             rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
@@ -332,17 +329,6 @@ impl ServerState {
     pub fn with_metrics(mut self, metrics: Arc<NodeMetrics>) -> Self {
         self.metrics = metrics;
         self
-    }
-
-    /// Records whether this node can mount S3 inputs, gating TES between mounted
-    /// and snapshot staging. Call before serving.
-    pub fn with_s3_mounts(mut self, available: bool) -> Self {
-        self.s3_mounts_available = available;
-        self
-    }
-
-    pub fn s3_mounts_available(&self) -> bool {
-        self.s3_mounts_available
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {

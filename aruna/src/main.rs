@@ -223,7 +223,6 @@ struct Runtime {
     config: Config,
     driver_ctx: Arc<DriverContext>,
     net_handle: NetHandle,
-    s3_mounts_available: bool,
     shutdown: Shutdown,
     metrics: Arc<NodeMetrics>,
     readiness: Readiness,
@@ -279,7 +278,7 @@ async fn setup_runtime() -> Result<Runtime, Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let (compute_handle, s3_mounts_available) = build_compute_registry(&config)
+    let compute_handle = build_compute_registry(&config)
         .await
         .map_err(std::io::Error::other)?;
 
@@ -339,7 +338,6 @@ async fn setup_runtime() -> Result<Runtime, Box<dyn std::error::Error>> {
         config,
         driver_ctx,
         net_handle,
-        s3_mounts_available,
         shutdown,
         metrics,
         readiness,
@@ -640,7 +638,6 @@ async fn bind_servers(
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
     metrics: Arc<NodeMetrics>,
-    s3_mounts_available: bool,
     shutdown: &Shutdown,
 ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
@@ -670,7 +667,6 @@ async fn bind_servers(
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
     .with_assistant_proxy(config.assistant_proxy)
-    .with_s3_mounts(s3_mounts_available)
     .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
         config.rate_limits.ip_per_minute,
@@ -919,7 +915,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config,
         driver_ctx,
         net_handle,
-        s3_mounts_available,
         shutdown,
         metrics,
         readiness,
@@ -946,7 +941,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.clone(),
         jobs_runtime.clone(),
         metrics.clone(),
-        s3_mounts_available,
         &shutdown,
     )
     .await?;
@@ -1057,12 +1051,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn build_compute_registry(
     config: &Config,
-) -> Result<(Option<Arc<aruna_compute::ExecutorRegistry>>, bool), String> {
+) -> Result<Option<Arc<aruna_compute::ExecutorRegistry>>, String> {
     let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
     let result = match selected.trim() {
         // A supervisor that turns compute off writes a disabling value rather
         // than unsetting the key, which an inherited environment would refill.
-        "none" | "off" | "" => return Ok((None, false)),
+        "none" | "off" | "" => return Ok(None),
         "docker" => build_docker(config).await,
         "apptainer" => build_apptainer(config).await,
         "kubernetes" => build_kubernetes(config).await,
@@ -1080,10 +1074,7 @@ async fn build_compute_registry(
             return Err(error);
         }
     };
-    // S3 mounts are a local deployment property: Kubernetes with a CSI driver.
-    let s3_mounts_available =
-        registry.is_some() && selected == "kubernetes" && read_mount_driver().is_some();
-    Ok((registry, s3_mounts_available))
+    Ok(registry)
 }
 
 fn read_mount_driver() -> Option<String> {
