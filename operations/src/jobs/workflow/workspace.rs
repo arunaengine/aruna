@@ -12,10 +12,11 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
     InputMode, InputSelection, InputSource, JobError, JobInputFact, JobRecord,
-    MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection, PathRestriction,
-    Permission, PlacementPolicyRef, UserAccess, VersionedObjectArn, WorkspaceMode,
-    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
-    ensure_confined_relative_path, workspace_credential_id,
+    MAX_EXECUTION_OUTPUTS, OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject,
+    OutputSelection, PathRestriction, Permission, PlacementPolicyRef, UserAccess,
+    VersionedObjectArn, WorkspaceMode, blob_bucket_permission_path, blob_group_permission_path,
+    blob_object_permission_path, ensure_confined_relative_path, key_content_type,
+    workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -885,7 +886,8 @@ async fn put_file_output(
         quota_ceiling,
         routing,
     })
-    .with_inherited_policies(inherited.to_vec());
+    .with_inherited_policies(inherited.to_vec())
+    .with_metadata(output_metadata(key));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -1093,6 +1095,15 @@ fn output_read_error(error: &BackendError) -> JobError {
     } else {
         JobError::permanent(message)
     }
+}
+
+/// A captured output carries the type its destination key implies, so a chart
+/// or a JSON result is served as itself instead of an opaque download.
+fn output_metadata(key: &str) -> HashMap<String, String> {
+    HashMap::from([(
+        OBJECT_CONTENT_TYPE_KEY.to_string(),
+        key_content_type(key).to_string(),
+    )])
 }
 
 /// Exact identity of one written output: the version this write created and the
@@ -1831,6 +1842,22 @@ mod tests {
             size: 0,
             digest: None,
         }
+    }
+
+    #[test]
+    fn capture_sets_type() {
+        // The captured put must name the type, or a chart serves as a download.
+        let metadata = output_metadata("results/run-1/chart.png");
+        assert_eq!(
+            metadata.get(OBJECT_CONTENT_TYPE_KEY).map(String::as_str),
+            Some("image/png")
+        );
+        assert_eq!(
+            output_metadata("out/blob")
+                .get(OBJECT_CONTENT_TYPE_KEY)
+                .map(String::as_str),
+            Some("application/octet-stream")
+        );
     }
 
     // Both input mappings must retry only transient drift: a job that waits on a

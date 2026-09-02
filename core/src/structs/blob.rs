@@ -23,6 +23,48 @@ pub const HIDDEN_BLOB_PREFIX: &str = "_jobs";
 pub const MULTIPART_PART_PREFIX: &str = "_parts";
 pub const OBJECT_CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
 
+/// MIME type implied by a key's extension, for writers that have no declared
+/// type. A captured `chart.png` must serve as an image rather than a download.
+pub fn key_content_type(key: &str) -> &'static str {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    let extension = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => extension.to_ascii_lowercase(),
+        _ => return "application/octet-stream",
+    };
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "jsonld" => "application/ld+json",
+        "yaml" | "yml" => "application/yaml",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "txt" | "log" => "text/plain; charset=utf-8",
+        "md" => "text/markdown; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "ts" => "text/x.typescript; charset=utf-8",
+        "py" => "text/x-python; charset=utf-8",
+        "sh" => "application/x-sh",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "zst" => "application/zstd",
+        "parquet" => "application/vnd.apache.parquet",
+        "arrow" => "application/vnd.apache.arrow.file",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
 pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {
     for component in path.components() {
         match component {
@@ -1244,7 +1286,7 @@ mod tests {
         BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
         HashPathIndexKey, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
         ManagedCopyState, VersionKey, blob_bucket_permission_path, blob_group_permission_path,
-        blob_object_permission_path,
+        blob_object_permission_path, key_content_type,
     };
     use crate::NodeId;
     use crate::errors::ConversionError;
@@ -1919,5 +1961,17 @@ mod tests {
         let restored = BucketCorsConfiguration::from_bytes(&config.to_bytes().unwrap()).unwrap();
 
         assert_eq!(config, restored);
+    }
+
+    #[test]
+    fn maps_key_extension() {
+        assert_eq!(key_content_type("results/run/chart.PNG"), "image/png");
+        assert_eq!(key_content_type("summary.json"), "application/json");
+        assert_eq!(key_content_type("notes.md"), "text/markdown; charset=utf-8");
+        // No extension, a dotfile, and an unknown suffix all stay opaque.
+        assert_eq!(key_content_type("data/blob"), "application/octet-stream");
+        assert_eq!(key_content_type(".bashrc"), "application/octet-stream");
+        assert_eq!(key_content_type("a.unknown"), "application/octet-stream");
+        assert_eq!(key_content_type("dir.png/file"), "application/octet-stream");
     }
 }

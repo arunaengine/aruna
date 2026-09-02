@@ -286,6 +286,10 @@ pub struct JobOutputResponse {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_path: String,
     pub size: u64,
+    /// Type the key's extension implies, so a caller can tell a chart from a
+    /// log without a second call. `stat_object` reports the stored type.
+    #[serde(default)]
+    pub content_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Node-local S3 endpoint owning this exact version. Use it with the
@@ -506,11 +510,12 @@ pub(crate) fn output_response(
 ) -> JobOutputResponse {
     JobOutputResponse {
         bucket: output.bucket.clone(),
-        key: output.key.clone(),
         version_id: output.version_id.to_string(),
         execution_id: output.execution_id.to_string(),
         container_path: output.container_path.clone(),
         size: output.size,
+        content_type: aruna_core::structs::key_content_type(&output.key).to_string(),
+        key: output.key.clone(),
         digest: output.digest.clone(),
         endpoint_url: endpoint_url.cloned(),
     }
