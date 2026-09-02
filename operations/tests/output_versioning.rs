@@ -1,18 +1,24 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aruna_blob::blob::BlobHandler;
+use aruna_compute::ExecutorBackend;
 use aruna_core::UserId;
-use aruna_core::compute::TaskInput;
+use aruna_core::compute::{
+    AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
+    LogTails, NOBODY, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
+};
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     Actor, AttemptControl, AttemptIntent, Backend, BackendConfig, BucketInfo, ExecutionSpec,
     FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, InputMode, InputSelection,
-    InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RoutingSnapshot,
+    InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState, OutputDestination,
+    OutputSelection, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RoutingSnapshot,
+    WorkspaceMode,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::{GroupId, NodeId};
@@ -21,9 +27,12 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::store::{insert_job, record_attempt_intent, reserve_output_commits};
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::jobs::workflow::workspace::{load_inputs, load_pinned_mounts, stage_inputs};
+use aruna_operations::jobs::workflow::workspace::{
+    capture_outputs, load_inputs, load_pinned_mounts, stage_inputs,
+};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
+use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::list_object_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
@@ -33,12 +42,16 @@ use aruna_operations::s3::put_object::{
 use aruna_storage::storage;
 use futures_util::StreamExt;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 const BUCKET: &str = "outputs";
 const KEY: &str = "run/result.txt";
 const WORKSPACE: &str = "ws-run";
 const INPUT_PATH: &str = "/in/data.csv";
+const RESULTS: &str = "results";
+const OUTPUT_PATH: &str = "/out/report.txt";
+const OUTPUT_BYTES: &[u8] = b"captured-report";
 
 struct Harness {
     _temp_dir: TempDir,
@@ -141,22 +154,31 @@ fn execution_spec(group_id: GroupId) -> ExecutionSpec {
 
 /// One claimed job whose attempt intent and control row are already write-ahead,
 /// which is the state every output capture starts from.
-async fn seed_execution(harness: &Harness) -> (JobId, AttemptControl) {
+async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, AttemptControl) {
     let job_id = mint_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )
     .unwrap();
     let token = Ulid::generate();
+    // Mounted inputs are the none-mode contract: such a run owns no bucket.
+    let mounted = spec
+        .inputs
+        .iter()
+        .any(|input| input.mode == InputMode::Mount);
     let mut record = JobRecord::new(
         job_id,
-        JobPayload::Execution(execution_spec(harness.group_id)),
+        JobPayload::Execution(spec),
         harness.created_by,
         harness.node_id,
         1,
         1,
         None,
     );
+    record.workspace_mode = match mounted {
+        true => WorkspaceMode::None,
+        false => WorkspaceMode::Kept,
+    };
     record.state = JobState::Running;
     record.claim = Some(JobClaim {
         holder_node_id: harness.node_id,
@@ -182,7 +204,7 @@ async fn seed_execution(harness: &Harness) -> (JobId, AttemptControl) {
     )
     .await
     .unwrap();
-    (job_id, commit.control)
+    (commit.record, commit.control)
 }
 
 fn body(bytes: &[u8]) -> BackendStream<Result<bytes::Bytes, StreamError>> {
@@ -429,7 +451,8 @@ async fn mounts_stage_pinned() {
 async fn replay_reuses_version() {
     // A capture interrupted after its reservation must replay into the same version.
     let harness = setup().await;
-    let (job_id, control) = seed_execution(&harness).await;
+    let (record, control) = seed_execution(&harness, execution_spec(harness.group_id)).await;
+    let job_id = record.job_id;
     let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
 
     let reserved = reserve_output_commits(&harness.driver.storage_handle, job_id, &destinations)
@@ -459,8 +482,9 @@ async fn executions_keep_versions() {
     // Two physical executions writing one key keep two independent exact versions.
     let harness = setup().await;
     let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
-    let (first_job, _) = seed_execution(&harness).await;
-    let (second_job, _) = seed_execution(&harness).await;
+    let (first, _) = seed_execution(&harness, execution_spec(harness.group_id)).await;
+    let (second, _) = seed_execution(&harness, execution_spec(harness.group_id)).await;
+    let (first_job, second_job) = (first.job_id, second.job_id);
 
     let first = reserve_output_commits(&harness.driver.storage_handle, first_job, &destinations)
         .await
@@ -503,7 +527,8 @@ async fn executions_keep_versions() {
 async fn exact_version_survives() {
     // A later unrelated write may take S3 latest; the output stays exact-retrievable.
     let harness = setup().await;
-    let (job_id, _) = seed_execution(&harness).await;
+    let (record, _) = seed_execution(&harness, execution_spec(harness.group_id)).await;
+    let job_id = record.job_id;
     let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
 
     let reserved = reserve_output_commits(&harness.driver.storage_handle, job_id, &destinations)
@@ -524,5 +549,145 @@ async fn exact_version_survives() {
     assert_eq!(
         exact.location.unwrap().blob_size,
         b"job-output".len() as u64
+    );
+}
+
+/// A terminal attempt whose declared output is one fixed byte string.
+struct StubBackend;
+
+#[async_trait::async_trait]
+impl ExecutorBackend for StubBackend {
+    fn kind(&self) -> ExecutorKind {
+        ExecutorKind::Docker
+    }
+    fn run_identity(&self) -> UserSpec {
+        NOBODY
+    }
+    async fn health(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn resolve_image(
+        &self,
+        image: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<String, BackendError> {
+        Ok(image.to_string())
+    }
+    async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn submit(
+        &self,
+        _context: &FenceContext,
+        _spec: &TaskSpec,
+        _cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError> {
+        Err(BackendError::Unavailable("stub submit".to_string()))
+    }
+    async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
+        Err(BackendError::Unavailable("stub status".to_string()))
+    }
+    async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
+        Ok(CancelEvidence::AlreadyGone)
+    }
+    async fn fetch_logs(
+        &self,
+        _context: &FenceContext,
+        _limits: &LogLimits,
+    ) -> Result<LogTails, BackendError> {
+        Ok(LogTails::default())
+    }
+    async fn fetch_output(
+        &self,
+        _context: &FenceContext,
+        _path: &str,
+    ) -> Result<TaskOutput, BackendError> {
+        Ok(TaskOutput {
+            size: OUTPUT_BYTES.len() as u64,
+            chunks: Box::pin(futures_util::stream::iter(vec![Ok(
+                bytes::Bytes::from_static(OUTPUT_BYTES),
+            )])),
+        })
+    }
+    async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
+        ReconcileEvidence::Absent
+    }
+    async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
+
+/// Every bucket this group owns after a run.
+async fn list_buckets(harness: &Harness) -> Vec<String> {
+    drive(
+        ListBucketsOperation::new(ListBucketsInput {
+            group_id: harness.group_id,
+            prefix: None,
+            continuation_token: None,
+            max_buckets: None,
+        }),
+        &harness.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap()
+    .buckets
+    .into_iter()
+    .map(|(name, _)| name)
+    .collect()
+}
+
+#[tokio::test]
+async fn captures_without_workspace() {
+    // A none-mode run reads its pinned input through file staging and writes
+    // the output into the bucket it named, creating no bucket of its own.
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    create_bucket(&harness, RESULTS).await;
+    let pinned = put_version(&harness, b"input-bytes", None).await;
+    let mut spec = pinned_spec(&harness, pinned.version_id, InputMode::Mount);
+    spec.file_outputs.push(OutputSelection {
+        container_path: OUTPUT_PATH.to_string(),
+        path_prefix: None,
+        destination_node_id: Some(harness.node_id),
+        destination: OutputDestination::S3 {
+            bucket: RESULTS.to_string(),
+            key: "report.txt".to_string(),
+        },
+        name: None,
+        description: None,
+    });
+    let (record, control) = seed_execution(&harness, spec.clone()).await;
+    let fence = FenceContext {
+        attempt: AttemptRef::new(record.job_id.to_string().to_lowercase(), 1),
+        attempt_epoch: control.attempt_epoch,
+        controller_generation: 1,
+    };
+    let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend);
+
+    let mut inputs = load_pinned_mounts(&harness.driver, &spec, &record, harness.node_id)
+        .await
+        .unwrap();
+    assert_eq!(read_input(inputs.remove(0)).await, b"input-bytes");
+    let outputs = capture_outputs(
+        &harness.driver,
+        &backend,
+        &fence,
+        &spec,
+        &record,
+        harness.node_id,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].bucket, RESULTS);
+    assert_eq!(outputs[0].size, OUTPUT_BYTES.len() as u64);
+    let buckets = list_buckets(&harness).await;
+    assert!(buckets.contains(&RESULTS.to_string()), "{buckets:?}");
+    assert!(
+        buckets.iter().all(|bucket| !bucket.starts_with("ws-")),
+        "{buckets:?}"
     );
 }
