@@ -246,6 +246,7 @@ async fn setup() -> Fixture {
             created_by: owner,
             created_at: UNIX_EPOCH,
             status: MultipartUploadStatus::Open,
+            completing_since_ms: None,
             checksum_hint: None,
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
