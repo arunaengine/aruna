@@ -35,7 +35,7 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::ids::{self, workspace_of};
-use super::plan::{network_access, staging_mode};
+use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::driver::{DriverContext, drive, gate_context, now_ms};
 use crate::jobs::records::verify::FamilyView;
@@ -579,7 +579,7 @@ pub(crate) async fn local_capability(
             .executor_constraint
             .as_deref()
             .is_some_and(|kind| kind.trim() != capability.kind.trim())
-        || !capability.supports(staging_mode(spec))
+        || !capability.supports(REALM_STAGING)
         || !capability.limits.fits(&spec.resources)
     {
         return Err(LaunchDecline::Unauthorized);

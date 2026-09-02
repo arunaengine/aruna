@@ -13,10 +13,10 @@ use aruna_core::scheduling::{
     TargetCandidate,
 };
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, InputMode, InputSource, JobInputFact,
-    LogicalJobSpec, NodeInfoDocument, Permission, PlacementPolicyRef, PlacementSubject,
-    PolicyResolution, RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn,
-    WorkspaceMode, blob_group_permission_path, storage_subject,
+    AuthContext, BlobVersion, BlobVersionState, InputSource, JobInputFact, LogicalJobSpec,
+    NodeInfoDocument, Permission, PlacementPolicyRef, PlacementSubject, PolicyResolution,
+    RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn, WorkspaceMode,
+    blob_group_permission_path, storage_subject,
 };
 use aruna_core::types::NodeId;
 use thiserror::Error;
@@ -32,6 +32,11 @@ use crate::request_policy::PolicyRequestExtras;
 
 /// Tag that pins the container network mode, shared with the executor path.
 const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
+
+/// A launch pins every input to one version and a pinned mount is delivered as
+/// staged files, so every realm job stages files. An S3 mount serves the head
+/// only and is reachable outside this lifecycle alone.
+pub(crate) const REALM_STAGING: StagingMode = StagingMode::Files;
 
 #[derive(Debug, PartialEq, Error)]
 pub enum PlanBuildError {
@@ -69,21 +74,7 @@ pub async fn build_plan(
     output_policies.sort_unstable();
     output_policies.dedup();
     let policies = resolve_policies(context, spec, &inputs, &output_policies, now_ms, local).await;
-    let request = PlanRequest {
-        submission_id: spec.submission_id,
-        request_digest: spec.request_digest,
-        spec_digest: spec.spec_digest,
-        admitted: true,
-        resources: spec.resources,
-        executor_constraint: spec.payload.executor_constraint.clone(),
-        required_labels: ids::required_labels(&spec.payload)?,
-        staging: staging_mode(spec),
-        network: network_access(spec),
-        inputs,
-        output_policies,
-        policies,
-        now_ms,
-    };
+    let request = plan_request(spec, inputs, output_policies, policies, now_ms)?;
     let mut planner = Planner::new(&request, &config.compute)?;
     let scan = candidates(context, config, spec, &documents, excluded, &mut planner).await?;
     debug!(
@@ -93,6 +84,31 @@ pub async fn build_plan(
         "Screened the realm advertisements for one planning round"
     );
     Ok(planner.finish(unread))
+}
+
+/// The pinned facts one round screens every advertisement against.
+fn plan_request(
+    spec: &LogicalJobSpec,
+    inputs: Vec<ResolvedInput>,
+    output_policies: Vec<PlacementPolicyRef>,
+    policies: BTreeMap<Ulid, PolicyResolution>,
+    now_ms: u64,
+) -> Result<PlanRequest, PlanBuildError> {
+    Ok(PlanRequest {
+        submission_id: spec.submission_id,
+        request_digest: spec.request_digest,
+        spec_digest: spec.spec_digest,
+        admitted: true,
+        resources: spec.resources,
+        executor_constraint: spec.payload.executor_constraint.clone(),
+        required_labels: ids::required_labels(&spec.payload)?,
+        staging: REALM_STAGING,
+        network: network_access(spec),
+        inputs,
+        output_policies,
+        policies,
+        now_ms,
+    })
 }
 
 /// Node-info documents of every sync-eligible realm member that has one, and
@@ -391,20 +407,6 @@ async fn resolve_policies(
     resolved
 }
 
-/// Mounted inputs need an S3 mount at the target; everything else is staged as
-/// files into the workspace.
-pub(crate) fn staging_mode(spec: &LogicalJobSpec) -> StagingMode {
-    match spec
-        .payload
-        .inputs
-        .iter()
-        .any(|input| input.mode == InputMode::Mount)
-    {
-        true => StagingMode::S3Mount,
-        false => StagingMode::Files,
-    }
-}
-
 /// Network mode pinned by the request tag, defaulting to no egress.
 pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
     match spec.payload.tags.get(NETWORK_TAG_KEY).map(String::as_str) {
@@ -421,8 +423,10 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+    use aruna_core::scheduling::plan_execution;
     use aruna_core::structs::{
-        AdvertisementEpoch, NodeUrls, NodeUtilization, node_info_storage_key,
+        AdvertisementEpoch, InputMode, InputSelection, NodeUrls, NodeUtilization,
+        node_info_storage_key,
     };
 
     /// A realm of `members` servers, each advertising eight backends, which is
@@ -477,21 +481,8 @@ mod tests {
 
     /// The pinned facts of one round, with the candidates left to the scan.
     fn facts(spec: &LogicalJobSpec) -> PlanRequest {
-        PlanRequest {
-            submission_id: spec.submission_id,
-            request_digest: spec.request_digest,
-            spec_digest: spec.spec_digest,
-            admitted: true,
-            resources: spec.resources,
-            executor_constraint: None,
-            required_labels: Vec::new(),
-            staging: staging_mode(spec),
-            network: network_access(spec),
-            inputs: Vec::new(),
-            output_policies: Vec::new(),
-            policies: BTreeMap::new(),
-            now_ms: 2_000,
-        }
+        plan_request(spec, Vec::new(), Vec::new(), BTreeMap::new(), 2_000)
+            .expect("request is well formed")
     }
 
     async fn publish(context: &DriverContext, document: &NodeInfoDocument) {
@@ -607,5 +598,69 @@ mod tests {
             .expect("every page continues the scan");
 
         assert_eq!((scan.pages, scan.scanned), (2, 1_031));
+    }
+
+    /// One Docker-shaped site: file staging only, no S3 mount.
+    fn docker(node_id: NodeId) -> ExecutorCapability {
+        let subject = PlacementSubject {
+            node_id,
+            generation: 1,
+            location: "eu".to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        };
+        let mut capability =
+            ExecutorCapability::new("docker".to_string(), subject).expect("subject is valid");
+        capability.file_staging = true;
+        capability
+    }
+
+    fn mounted(spec: &mut LogicalJobSpec) {
+        spec.payload.inputs.push(InputSelection {
+            source: InputSource::S3 {
+                bucket: "inputs".to_string(),
+                key: "reads.fastq".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "in/reads.fastq".to_string(),
+            mode: InputMode::Mount,
+            container_path: Some("/in/reads.fastq".to_string()),
+            name: None,
+            description: None,
+        });
+    }
+
+    #[test]
+    fn mounts_plan_files() {
+        // A mounted input must not narrow a job to S3-mount sites: the launch
+        // pins every input, and a pinned mount is delivered as staged files.
+        let family = Family::new([4u8; 32]);
+        let mut spec = family.spec();
+        mounted(&mut spec);
+        let request = facts(&spec);
+        assert_eq!(request.staging, StagingMode::Files);
+        let candidate = TargetCandidate {
+            node_id: node(1),
+            node_kind: RealmNodeKind::Server,
+            active: true,
+            compute_draining: false,
+            group_allowed: true,
+            capability: docker(node(1)),
+            load_permille: Some(100),
+        };
+
+        let plan = plan_execution(&request, &[candidate], &family.config.compute)
+            .expect("request is well formed");
+
+        assert_eq!(
+            plan.selected.map(|selection| selection.target),
+            Some(ExecutionTargetId {
+                node_id: node(1),
+                executor_kind: "docker".to_string(),
+            })
+        );
+        assert!(plan.rejected.is_empty(), "{:?}", plan.rejected);
     }
 }
