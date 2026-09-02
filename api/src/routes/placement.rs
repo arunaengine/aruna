@@ -643,6 +643,32 @@ fn bulk_status(status: PolicyBulkStatus) -> String {
 /// This node's advertised placement subject, without which nothing governed may
 /// be minted here. A node that is blocked or draining is refused up front, so a
 /// run is never started where the first mint would immediately stop it.
+/// The boundary check the operations repeat: realm configuration writers and
+/// the admins of the bucket's group may change its placement.
+async fn ensure_placement_writer(
+    state: &ServerState,
+    auth: &AuthContext,
+    bucket: &str,
+) -> ServerResult<()> {
+    let realm_id = auth.realm_id;
+    let config_admin = aruna_core::structs::policy_admin_path(realm_id);
+    if crate::auth::permission_granted(
+        state,
+        auth,
+        config_admin.clone(),
+        aruna_core::structs::Permission::WRITE,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let path = match crate::routes::groups::get_bucket_group(state, bucket).await? {
+        Some(group_id) => aruna_core::structs::group_admin_path(realm_id, group_id),
+        None => config_admin,
+    };
+    crate::auth::ensure_permission(state, auth, path, aruna_core::structs::Permission::WRITE).await
+}
+
 async fn local_subject(
     state: &ServerState,
     realm_id: aruna_core::structs::RealmId,
@@ -1041,6 +1067,7 @@ pub async fn put_bucket_placement(
     Json(request): Json<BucketPlacementRequest>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
     let policies = refs_from(request.policies)?;
@@ -1221,6 +1248,7 @@ pub async fn mint_object_placement(
     Json(request): Json<ObjectPlacementRequest>,
 ) -> ServerResult<Json<ObjectPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
     let subject = local_subject(&state, auth.realm_id).await?;
@@ -1359,6 +1387,7 @@ pub async fn run_bucket_placement(
     Json(request): Json<BulkRunRequest>,
 ) -> ServerResult<Json<BulkRunResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
     let subject = local_subject(&state, auth.realm_id).await?;
@@ -1858,7 +1887,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
+mod test_routes {
     use super::{ObjectPlacementQuery, get_object_placement};
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;

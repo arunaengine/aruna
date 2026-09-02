@@ -818,6 +818,25 @@ pub async fn update_group(
     }
     let group_id = parse_group_id(&group_id)?;
     refuse_group_edit(&state).await?;
+    // The operation decides again; the boundary refuses early for anyone who is
+    // neither a group admin nor a realm groups administrator.
+    let group_admin = format!("/{realm_id}/g/{group_id}/admin");
+    if !crate::auth::permission_granted(
+        &state,
+        &auth,
+        group_admin,
+        aruna_core::structs::Permission::WRITE,
+    )
+    .await?
+    {
+        crate::auth::ensure_permission(
+            &state,
+            &auth,
+            format!("/{realm_id}/admin/groups"),
+            aruna_core::structs::Permission::WRITE,
+        )
+        .await?;
+    }
 
     drive(
         UpdateGroupOperation::new(UpdateGroupConfig {
@@ -1908,7 +1927,10 @@ async fn list_bucket_objects(
     })
 }
 
-async fn get_bucket_group(state: &ServerState, bucket: &str) -> ServerResult<Option<Ulid>> {
+pub(crate) async fn get_bucket_group(
+    state: &ServerState,
+    bucket: &str,
+) -> ServerResult<Option<Ulid>> {
     match drive(
         GetBucketInfoOperation::new(bucket.to_string()),
         &state.get_ctx(),
