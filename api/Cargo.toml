@@ -11,6 +11,7 @@ rust-version.workspace = true
 aruna-core = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-operations = { workspace = true }
+aruna-tasks = { workspace = true }
 
 # General
 ahash = { workspace = true }
@@ -64,7 +65,6 @@ s3s = { workspace = true }
 [dev-dependencies]
 aruna-net = { workspace = true }
 aruna-storage = { workspace = true }
-aruna-tasks = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",

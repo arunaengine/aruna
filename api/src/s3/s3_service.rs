@@ -9,7 +9,9 @@ use crate::s3::checksum::{
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::{IntoS3Error, gate_context_error, routing_inputs_error};
-use crate::s3::multipart_join::{CompletionFailure, CompletionRegistry, await_completion};
+use crate::s3::multipart_join::{
+    CompletionFailure, CompletionRegistry, await_completion, completion_registry,
+};
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
@@ -276,7 +278,7 @@ impl ArunaS3Service {
             realm_id,
             node_id,
             rocrate_limits: RoCrateLimits::default(),
-            completions: Arc::new(CompletionRegistry::default()),
+            completions: Arc::new(completion_registry()),
         }
     }
 
@@ -3540,7 +3542,7 @@ mod tests {
                 realm_id,
                 node_id,
                 rocrate_limits: RoCrateLimits::default(),
-                completions: Arc::new(CompletionRegistry::default()),
+                completions: Arc::new(completion_registry()),
             },
         )
     }
