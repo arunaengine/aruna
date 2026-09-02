@@ -173,14 +173,43 @@ pub async fn validate_submission(
     group_id: GroupId,
     jsonld: &str,
 ) -> Result<MetadataProfileValidationStatus, MetadataError> {
-    let status =
-        assess_submission(context, document_id, ProfileScope::Group(group_id), jsonld).await?;
-    if status.state == MetadataProfileValidationState::Invalid {
-        return Err(MetadataError::ProfileValidation(status.findings));
+    match assess_write(context, document_id, ProfileScope::Group(group_id), jsonld).await {
+        Ok(verdict) => write_verdict(verdict),
+        // An untagged crate never depended on the evaluator, so a node without
+        // one keeps accepting it instead of refusing every write.
+        Err(error) if untagged_without_evaluator(&error, jsonld) => {
+            Ok(not_profiled_status(document_id))
+        }
+        Err(error) => Err(error),
     }
-    Ok(status)
 }
 
+fn untagged_without_evaluator(error: &MetadataError, jsonld: &str) -> bool {
+    matches!(
+        error,
+        MetadataError::ProfileValidation(findings)
+            if findings
+                .iter()
+                .any(|finding| finding.code == "validator_unavailable")
+    ) && !submission_has_profile_tag(jsonld)
+}
+
+/// A write refuses exactly what the preview reports: structural violations
+/// first, since a malformed crate makes the Profile findings secondary.
+fn write_verdict(
+    verdict: MetadataProfilePreview,
+) -> Result<MetadataProfileValidationStatus, MetadataError> {
+    if !verdict.structural_violations.is_empty() {
+        return Err(MetadataError::Validation(verdict.structural_violations));
+    }
+    if verdict.status.state == MetadataProfileValidationState::Invalid {
+        return Err(MetadataError::ProfileValidation(verdict.status.findings));
+    }
+    Ok(verdict.status)
+}
+
+/// Profile verdict only. The write path uses `assess_write`, which also carries
+/// the structural findings; a render is never rejected and skips them.
 async fn assess_submission(
     context: &DriverContext,
     document_id: Ulid,
@@ -191,10 +220,51 @@ async fn assess_submission(
     let Some(requested_iri) = single_profile_tag(&data, &root)? else {
         return Ok(not_profiled_status(document_id));
     };
-    let profile = resolve_registered_profile(context, &requested_iri, scope).await?;
+    Ok(
+        evaluate_tagged(context, document_id, scope, &requested_iri, jsonld)
+            .await?
+            .status,
+    )
+}
+
+/// The full verdict a create or replace enforces: Profile findings plus the
+/// structural findings, which an untagged crate only gets from a bare
+/// structural pass.
+async fn assess_write(
+    context: &DriverContext,
+    document_id: Ulid,
+    scope: ProfileScope,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let (data, root) = data_graph(jsonld)?;
+    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
+        let metadata = evaluator_handle(context, None)?;
+        let structural = metadata
+            .preview_crate_structure(jsonld.to_string())
+            .await
+            .map_err(|error| shacl_failure(error, None))?;
+        return Ok(MetadataProfilePreview {
+            status: not_profiled_status(document_id),
+            structural_violations: structural.into_iter().map(structural_violation).collect(),
+        });
+    };
+    evaluate_tagged(context, document_id, scope, &requested_iri, jsonld).await
+}
+
+async fn evaluate_tagged(
+    context: &DriverContext,
+    document_id: Ulid,
+    scope: ProfileScope,
+    requested_iri: &str,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let profile = resolve_registered_profile(context, requested_iri, scope).await?;
     let metadata = evaluator_handle(context, Some(profile.revision))?;
     let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
-    Ok(profiled_status(document_id, &profile, assessment.findings))
+    Ok(MetadataProfilePreview {
+        status: profiled_status(document_id, &profile, assessment.findings),
+        structural_violations: assessment.structural,
+    })
 }
 
 /// Profile verdict for a merged render. A merge is never rejected, so an
@@ -252,25 +322,7 @@ pub async fn preview_submission(
     group_id: Option<GroupId>,
     jsonld: &str,
 ) -> Result<MetadataProfilePreview, MetadataError> {
-    let (data, root) = data_graph(jsonld)?;
-    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
-        let metadata = evaluator_handle(context, None)?;
-        let structural = metadata
-            .preview_crate_structure(jsonld.to_string())
-            .await
-            .map_err(|error| shacl_failure(error, None))?;
-        return Ok(MetadataProfilePreview {
-            status: not_profiled_status(Ulid::nil()),
-            structural_violations: structural.into_iter().map(structural_violation).collect(),
-        });
-    };
-    let profile = resolve_registered_profile(context, &requested_iri, group_id.into()).await?;
-    let metadata = evaluator_handle(context, Some(profile.revision))?;
-    let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
-    Ok(MetadataProfilePreview {
-        status: profiled_status(Ulid::nil(), &profile, assessment.findings),
-        structural_violations: assessment.structural,
-    })
+    assess_write(context, Ulid::nil(), group_id.into(), jsonld).await
 }
 
 struct ProfileAssessment {
@@ -1031,6 +1083,101 @@ mod tests {
             severity: EncodedTerm(format!("<{SH}{severity}>")),
             messages: Vec::new(),
         }
+    }
+
+    fn violation() -> MetadataValidationViolation {
+        MetadataValidationViolation {
+            code: "incomplete_root".to_string(),
+            message: "the root data entity needs a description".to_string(),
+            pointer: "/@graph/1".to_string(),
+            entity_id: Some("./".to_string()),
+        }
+    }
+
+    #[test]
+    fn refuses_untagged_structure() {
+        // The preview reports these for an untagged crate; the write must too.
+        let error = write_verdict(MetadataProfilePreview {
+            status: not_profiled_status(Ulid::nil()),
+            structural_violations: vec![violation()],
+        })
+        .expect_err("a structural violation must refuse the write");
+        let MetadataError::Validation(violations) = error else {
+            panic!("expected structural violations");
+        };
+        assert_eq!(violations, vec![violation()]);
+    }
+
+    #[test]
+    fn refuses_profiled_structure() {
+        // A Profile-scoped evaluation reports structure alongside its findings.
+        let mut status = not_profiled_status(Ulid::nil());
+        status.state = MetadataProfileValidationState::Valid;
+        let error = write_verdict(MetadataProfilePreview {
+            status,
+            structural_violations: vec![violation()],
+        })
+        .expect_err("a valid Profile verdict must not hide broken structure");
+        assert!(matches!(error, MetadataError::Validation(_)));
+    }
+
+    #[test]
+    fn refuses_invalid_profile() {
+        let mut status = not_profiled_status(Ulid::nil());
+        status.state = MetadataProfileValidationState::Invalid;
+        status.findings = vec![limit_finding("budget".to_string(), Ulid::nil())];
+        let error = write_verdict(MetadataProfilePreview {
+            status,
+            structural_violations: Vec::new(),
+        })
+        .expect_err("an invalid Profile verdict must refuse the write");
+        assert!(matches!(error, MetadataError::ProfileValidation(_)));
+        let accepted = write_verdict(MetadataProfilePreview {
+            status: not_profiled_status(Ulid::nil()),
+            structural_violations: Vec::new(),
+        })
+        .expect("a clean verdict is accepted");
+        assert_eq!(accepted.state, MetadataProfileValidationState::NotProfiled);
+    }
+
+    fn crate_with_tag(tag: Option<&str>) -> String {
+        let mut root = serde_json::json!({
+            "@id": "https://example.test/dataset",
+            "@type": "Dataset",
+            "name": "Fixture"
+        });
+        if let Some(tag) = tag {
+            root["conformsTo"] = serde_json::json!({"@id": tag});
+        }
+        serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": "https://example.test/dataset"}
+                },
+                root
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn keeps_untagged_writable() {
+        // A node without an evaluator must still accept an untagged crate.
+        let untagged = crate_with_tag(None);
+        let tagged = crate_with_tag(Some(
+            "https://w3id.org/aruna/profile/01J00000000000000000000000",
+        ));
+        let unavailable = unavailable_error("validator_unavailable", "no evaluator", None);
+        assert!(untagged_without_evaluator(&unavailable, &untagged));
+        assert!(!untagged_without_evaluator(&unavailable, &tagged));
+        assert!(!untagged_without_evaluator(
+            &MetadataError::InvalidInput("broken".to_string()),
+            &untagged
+        ));
     }
 
     #[test]

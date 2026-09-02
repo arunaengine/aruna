@@ -440,6 +440,44 @@ async fn preview_reports_structural() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[tokio::test]
+async fn create_refuses_structural() -> Result<(), Box<dyn std::error::Error>> {
+    // The write must refuse exactly what preview_reports_structural reports.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let document_id = mint(&test, group_id, "datasets/structural-write")?;
+    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let jsonld = json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": graph_iri}
+            },
+            {"@id": graph_iri, "@type": "Dataset", "name": "No description"}
+        ]
+    })
+    .to_string();
+    let error = create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/structural-write",
+        jsonld,
+    )
+    .await
+    .expect_err("an incomplete root data entity must be rejected");
+    let CreateMetadataDocumentError::MetadataError(MetadataError::Validation(violations)) = error
+    else {
+        panic!("expected structural violations");
+    };
+    assert!(!violations.is_empty());
+    assert_eq!(event_count(&test, document_id).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn binds_untargeted_root() -> Result<(), Box<dyn std::error::Error>> {
     // Portal Profiles leave root shapes untargeted, with or without a crate base.
     let test = build_context(false).await?;
