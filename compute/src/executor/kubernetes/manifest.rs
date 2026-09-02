@@ -778,6 +778,40 @@ mod tests {
     }
 
     #[test]
+    fn stages_pinned_input() {
+        // A version-pinned input is delivered as a read-only copy in the
+        // per-attempt workspace; no CSI volume can serve a version.
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.inputs
+            .push(TaskInput::from_bytes("/in/data.csv", "a,b"));
+        spec.output_paths.push("/out/report.txt".to_string());
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.mount_path == "/in/data.csv")
+            .unwrap();
+        assert_eq!(mount.name, "workspace");
+        assert_eq!(mount.sub_path.as_deref(), Some("in/data.csv"));
+        assert_eq!(mount.read_only, Some(true));
+
+        let volumes: Vec<_> = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .map(|volume| volume.name)
+            .collect();
+        assert_eq!(volumes, ["workspace", "marker", "tools"]);
+        assert_eq!(pod.init_containers.unwrap().len(), 1);
+        assert!(pod.containers[0].startup_probe.is_some());
+    }
+
+    #[test]
     fn uses_configured_driver() {
         let mut config = config();
         config.s3_mount_driver = Some("s3.csi.example.org".to_string());

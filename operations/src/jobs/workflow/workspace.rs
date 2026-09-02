@@ -314,6 +314,95 @@ async fn mint_credential(
     })
 }
 
+/// True when the launch bound an input to an exact source version. A mount
+/// serves the current head only, so such a job is staged instead of mounted.
+pub fn pinned_inputs(spec: &ExecutionSpec) -> bool {
+    spec.inputs.iter().any(|input| {
+        let InputSource::S3 { version_id, .. } = &input.source;
+        version_id.is_some()
+    })
+}
+
+/// One mounted input resolved to the object it names.
+struct MountSource {
+    path: String,
+    bucket: String,
+    key: String,
+    version: Option<Ulid>,
+}
+
+/// Validate one mounted input and authorize the caller against the object it
+/// names. Shared by the mounted and the staged delivery of the same input.
+async fn mount_source(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    input: &InputSelection,
+) -> Result<MountSource, JobError> {
+    if input.mode != InputMode::Mount {
+        return Err(JobError::permanent("mounted job contains a snapshot input"));
+    }
+    let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    ensure_confined_relative_path(Path::new(key))
+        .map_err(|error| JobError::permanent(format!("invalid mounted input key: {error}")))?;
+    let path = input
+        .container_path
+        .clone()
+        .ok_or_else(|| JobError::permanent("mounted input has no container path"))?;
+    let version = version_id
+        .as_deref()
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| JobError::permanent(format!("invalid input version_id for {bucket}/{key}")))?;
+    let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| bucket_lookup_error("input", error))?
+        .ok_or_else(|| JobError::permanent(format!("input bucket {bucket} not found")))?;
+    if bucket_info.group_id != spec.group_id {
+        return Err(JobError::permanent(
+            "input bucket is outside the execution group",
+        ));
+    }
+    let allowed = Box::pin(drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: record.created_by,
+                realm_id: record.created_by.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            path: blob_object_permission_path(
+                record.created_by.realm_id,
+                spec.group_id,
+                node_id,
+                bucket,
+                key,
+            ),
+            required_permission: Permission::READ,
+        }),
+        context,
+    ))
+    .await
+    .map_err(|error| authorization_error("input", error))?;
+    if !allowed {
+        return Err(JobError::permanent(format!(
+            "input {bucket}/{key} access denied"
+        )));
+    }
+    Ok(MountSource {
+        path,
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version,
+    })
+}
+
 /// Validate mounted inputs and resolve the exact S3 objects exposed to the task.
 pub async fn prepare_mounts(
     context: &DriverContext,
@@ -323,65 +412,11 @@ pub async fn prepare_mounts(
 ) -> Result<Vec<S3Mount>, JobError> {
     let mut mounts = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
-        if input.mode != InputMode::Mount {
-            return Err(JobError::permanent("mounted job contains a snapshot input"));
-        }
-        let InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &input.source;
-        if version_id.is_some() {
-            return Err(JobError::permanent(
-                "mounted input versions are not supported",
-            ));
-        }
-        ensure_confined_relative_path(Path::new(key))
-            .map_err(|error| JobError::permanent(format!("invalid mounted input key: {error}")))?;
-        let path = input
-            .container_path
-            .clone()
-            .ok_or_else(|| JobError::permanent("mounted input has no container path"))?;
-        let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(|error| bucket_lookup_error("input", error))?
-            .ok_or_else(|| JobError::permanent(format!("input bucket {bucket} not found")))?;
-        if bucket_info.group_id != spec.group_id {
-            return Err(JobError::permanent(
-                "input bucket is outside the execution group",
-            ));
-        }
-        let allowed = Box::pin(drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: record.created_by,
-                    realm_id: record.created_by.realm_id,
-                    path_restrictions: None,
-                    session: None,
-                },
-                path: blob_object_permission_path(
-                    record.created_by.realm_id,
-                    spec.group_id,
-                    node_id,
-                    bucket,
-                    key,
-                ),
-                required_permission: Permission::READ,
-            }),
-            context,
-        ))
-        .await
-        .map_err(|error| authorization_error("input", error))?;
-        if !allowed {
-            return Err(JobError::permanent(format!(
-                "input {bucket}/{key} access denied"
-            )));
-        }
+        let source = Box::pin(mount_source(context, spec, record, node_id, input)).await?;
         match Box::pin(drive(
             HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
+                bucket: source.bucket.clone(),
+                key: source.key.clone(),
                 version_id: None,
             }),
             context,
@@ -397,7 +432,8 @@ pub async fn prepare_mounts(
                 | HeadObjectError::DeleteMarker,
             ) => {
                 return Err(JobError::permanent(format!(
-                    "input {bucket}/{key} not found"
+                    "input {}/{} not found",
+                    source.bucket, source.key
                 )));
             }
             Err(error) => {
@@ -405,12 +441,67 @@ pub async fn prepare_mounts(
             }
         }
         mounts.push(S3Mount {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            path,
+            bucket: source.bucket,
+            key: source.key,
+            path: source.path,
         });
     }
     Ok(mounts)
+}
+
+/// Open one stream per mounted input at the version the launch pinned, so the
+/// backend stages exactly those bytes read-only at the container path.
+pub async fn load_pinned_mounts(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+) -> Result<Vec<TaskInput>, JobError> {
+    let mut files = Vec::with_capacity(spec.inputs.len());
+    let mut total_bytes = 0u64;
+    for input in &spec.inputs {
+        let source = Box::pin(mount_source(context, spec, record, node_id, input)).await?;
+        let get = Box::pin(drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: source.bucket.clone(),
+                key: source.key.clone(),
+                version_id: source.version,
+                range: None,
+                group_id: spec.group_id,
+                user_identity: record.created_by,
+                node_id,
+            }),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(source_input_error)?
+        .ok_or_else(|| {
+            JobError::permanent(format!("input {}/{} not found", source.bucket, source.key))
+        })?;
+        let size = get
+            .location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .or_else(|| {
+                get.source_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.content_length)
+            })
+            .ok_or_else(|| {
+                JobError::retryable(format!(
+                    "input {}/{} has no size",
+                    source.bucket, source.key
+                ))
+            })?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAX_TRANSFER_BYTES)
+            .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
+        let stream = get.blob.map(|chunk| chunk.map_err(std::io::Error::other));
+        files.push(TaskInput::from_stream(source.path, size, Box::pin(stream)));
+    }
+    Ok(files)
 }
 
 /// Snapshot each declared input into the workspace bucket by copying resolved
@@ -2300,6 +2391,33 @@ mod tests {
             over.message
                 .starts_with("workspace credential restrictions invalid")
         );
+    }
+
+    #[test]
+    fn detects_sealed_versions() {
+        // The pin is what routes a mounted job to staged delivery, so an
+        // unpinned input must keep its mount and a pinned one must not.
+        let mut spec = spec(Vec::new());
+        let mut input = InputSelection {
+            source: InputSource::S3 {
+                bucket: "input".to_string(),
+                key: "data.csv".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "data.csv".to_string(),
+            mode: InputMode::Mount,
+            container_path: Some("/data.csv".to_string()),
+            name: None,
+            description: None,
+        };
+        spec.inputs.push(input.clone());
+        assert!(!pinned_inputs(&spec));
+
+        let InputSource::S3 { version_id, .. } = &mut input.source;
+        *version_id = Some(Ulid::from_bytes([7; 16]).to_string());
+        spec.inputs.push(input);
+        assert!(pinned_inputs(&spec));
     }
 
     #[test]

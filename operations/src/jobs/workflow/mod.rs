@@ -47,7 +47,8 @@ use crate::placement_policy::subject::read_local_subject;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
-    merge_outputs, mint_input_credential, prepare_mounts, stage_inputs,
+    load_pinned_mounts, merge_outputs, mint_input_credential, pinned_inputs, prepare_mounts,
+    stage_inputs,
 };
 
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
@@ -471,6 +472,14 @@ async fn mounted_task(
     record: &JobRecord,
     node_id: NodeId,
 ) -> Result<PreparedTask, JobError> {
+    if pinned_inputs(spec) {
+        return Ok(PreparedTask {
+            inputs: Box::pin(load_pinned_mounts(context, spec, record, node_id)).await?,
+            mounts: Vec::new(),
+            secrets: BTreeMap::new(),
+            staging: StagingMode::Files,
+        });
+    }
     let mounts = Box::pin(prepare_mounts(context, spec, record, node_id)).await?;
     let mut secrets = BTreeMap::new();
     if !mounts.is_empty() {
@@ -499,6 +508,9 @@ async fn mounted_task(
     })
 }
 
+/// Build the attempt's inputs. A workspace job stages its snapshot copies; a
+/// mounted job mounts its inputs, except when the launch pinned them to a
+/// version, which only the staged read-only copy can deliver.
 async fn prepare_task(
     context: &DriverContext,
     spec: &ExecutionSpec,
