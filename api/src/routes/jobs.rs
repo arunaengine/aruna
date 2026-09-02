@@ -88,8 +88,8 @@ pub struct ExecutionInputRequest {
     /// then required. A realm run refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_node_id: Option<String>,
-    /// Destination key inside the workspace bucket, for example `reads.fastq.gz`.
-    /// Must not be empty and must be unique across the declared inputs.
+    /// Input name, for example `reads.fastq.gz`; it names no bucket key. Must
+    /// not be empty and must be unique across the declared inputs.
     pub dest_key: String,
     /// Absolute container path; defaults to `/inputs/<dest_key>`. It must be
     /// absolute, must not be `/`, must carry no `.` or `..` component, and must

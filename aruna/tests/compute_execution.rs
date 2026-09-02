@@ -160,7 +160,7 @@ fn execution_spec(
             source_node_id: None,
             dest_key: "inputs/data.txt".to_string(),
             mode: InputMode::Snapshot,
-            container_path: None,
+            container_path: Some("/inputs/data.txt".to_string()),
             name: None,
             description: None,
         }],

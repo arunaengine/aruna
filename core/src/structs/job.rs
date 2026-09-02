@@ -251,10 +251,10 @@ pub struct InputSelection {
     pub source: InputSource,
     /// Node-local endpoint that owns the source object once the job is sealed.
     pub source_node_id: Option<crate::NodeId>,
-    /// Destination key inside the workspace bucket (16.4 non-overlapping).
+    /// Input name, unique across the run; nothing copies it into a bucket.
     pub dest_key: String,
     pub mode: InputMode,
-    /// Absolute path exposed to a TES executor; native workspace inputs omit it.
+    /// Absolute path inside the container; submission refuses an input without one.
     pub container_path: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,

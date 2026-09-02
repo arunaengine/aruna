@@ -419,7 +419,7 @@ mod tests {
             source_node_id: source,
             dest_key: "reads.fastq".to_string(),
             mode: InputMode::Snapshot,
-            container_path: None,
+            container_path: Some("/inputs/reads.fastq".to_string()),
             name: None,
             description: None,
         }

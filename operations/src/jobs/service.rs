@@ -131,6 +131,18 @@ pub(crate) fn validate_execution(
 ) -> Result<(), SubmitJobError> {
     spec.inputs =
         aruna_core::structs::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
+    // Nothing copies an input into a bucket any more, so one that names no
+    // container path would reach nobody.
+    if let Some(input) = spec
+        .inputs
+        .iter()
+        .find(|input| input.container_path.is_none())
+    {
+        return Err(SubmitJobError::InvalidWorkspace(format!(
+            "input {} needs a container path",
+            input.dest_key
+        )));
+    }
     // One bound governs declaration, expansion, the local result, and the
     // immutable output record, so a valid success is always publishable.
     if spec.file_outputs.len() + spec.workspace_outputs.len() > MAX_EXECUTION_OUTPUTS {

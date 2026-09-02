@@ -346,7 +346,7 @@ fn absent_input() -> InputSelection {
         source_node_id: None,
         dest_key: "input.fastq".to_string(),
         mode: InputMode::Snapshot,
-        container_path: None,
+        container_path: Some("/inputs/input.fastq".to_string()),
         name: None,
         description: None,
     }
