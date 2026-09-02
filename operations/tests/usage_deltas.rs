@@ -6,15 +6,20 @@ use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_NODE_STATS_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
+};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    Backend, BackendConfig, BucketInfo, GroupQuotaOverride, MultipartChecksumType,
-    NodeUsageSnapshot, QuotaConfig, RealmId, RoutingSnapshot, UsageCounters, node_usage_group_key,
-    usage_global_shard_keys, usage_group_key,
+    AuthContext, Backend, BackendConfig, BlobHeadKey, BucketInfo, CurrentVersionPointer,
+    GroupQuotaOverride, MultipartChecksumType, NODE_SUBJECT_KEY, NodeSubjectRecord,
+    NodeUsageSnapshot, PlacementSubject, PolicyRefMode, QuotaConfig, RealmId, RoutingSnapshot,
+    UsageCounters, node_usage_group_key, usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::types::NodeId;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::blob::blob_keyspace_helper::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
@@ -23,6 +28,9 @@ use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
     CompleteMultipartUploadOperation, CompleteMultipartUploadResult,
 };
+use aruna_operations::s3::copy_object::{
+    CopyObjectInput, CopyObjectResultData, CopySourceConditions,
+};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_multipart_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
@@ -30,6 +38,9 @@ use aruna_operations::s3::create_multipart_upload::{
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
+};
+use aruna_operations::s3::policy_successor::{
+    MintPolicySuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
@@ -931,5 +942,206 @@ async fn multipart_completion_is_gated_like_put() {
 
     // The rejected completion left the group counter unchanged.
     assert_eq!(read_group(&h.driver, group_id).await.logical_bytes, 25);
+    assert_matches_rebuild(&h.driver).await;
+}
+
+async fn copy_object(
+    h: &Harness,
+    bucket: &str,
+    source_key: &str,
+    dest_key: &str,
+    group_id: Ulid,
+) -> CopyObjectResultData {
+    aruna_operations::s3::copy_object::copy_object(
+        &h.driver,
+        CopyObjectInput {
+            source_bucket: bucket.to_string(),
+            source_key: source_key.to_string(),
+            source_version_id: None,
+            source_group_id: group_id,
+            source_auth_context: AuthContext {
+                user_id: h.created_by,
+                realm_id: h.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            dest_bucket: bucket.to_string(),
+            dest_key: dest_key.to_string(),
+            user_id: h.created_by,
+            group_id,
+            realm_id: h.realm_id,
+            node_id: h.node_id,
+            quota_ceiling: None,
+            conditions: CopySourceConditions::default(),
+            metadata: None,
+            restrictions: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn copy_adds_object() {
+    // The copy shares the source blob, so it adds one live key and its own
+    // logical bytes without a second stored copy.
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let data = b"copied bytes";
+    put_object(&h, "bucket", "source.txt", group_id, data).await;
+    copy_object(&h, "bucket", "source.txt", "dest.txt", group_id).await;
+
+    let size = data.len() as u64;
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.objects, 2);
+    assert_eq!(global.stored_blobs, 1);
+    assert_eq!(global.stored_bytes, size);
+    assert_eq!(global.logical_bytes, 2 * size);
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, 2);
+    assert_eq!(group.logical_bytes, 2 * size);
+
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn copy_keeps_object() {
+    // Copying onto a key that is already live only moves its head, so the
+    // object count stays while the new version's bytes still count.
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let source = b"source";
+    let existing = b"existing-destination";
+    put_object(&h, "bucket", "source.txt", group_id, source).await;
+    put_object(&h, "bucket", "dest.txt", group_id, existing).await;
+    copy_object(&h, "bucket", "source.txt", "dest.txt", group_id).await;
+
+    let expected = (2 * source.len() + existing.len()) as u64;
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.objects, 2);
+    assert_eq!(global.stored_blobs, 2);
+    assert_eq!(global.logical_bytes, expected);
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, 2);
+    assert_eq!(group.logical_bytes, expected);
+
+    assert_matches_rebuild(&h.driver).await;
+}
+
+async fn read_key(ctx: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Vec<u8>> {
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("unexpected read event");
+    };
+    value.map(|value| value.to_vec())
+}
+
+/// The advertised subject a governed mutation is evaluated against, which
+/// production wiring publishes before any placement rule can be attached.
+async fn seed_subject(h: &Harness) -> PlacementSubject {
+    let record = NodeSubjectRecord::seed(PlacementSubject {
+        node_id: h.node_id,
+        generation: 1,
+        location: "eu-west".to_string(),
+        labels: BTreeMap::new(),
+        executor_kind: None,
+        local_to_controller: true,
+    })
+    .unwrap();
+    h.driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: NODE_SUBJECT_KEY.to_vec().into(),
+            value: record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    record.subject
+}
+
+#[tokio::test]
+async fn mint_books_bytes() {
+    // Editing an object's placement rules mints a successor over the same
+    // blob: its bytes count like any other version, and the head only moves.
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let data = b"governed bytes";
+    put_object(&h, "bucket", "ruled.txt", group_id, data).await;
+    let size = data.len() as u64;
+    assert_eq!(read_group(&h.driver, group_id).await.logical_bytes, size);
+
+    let subject = seed_subject(&h).await;
+    let info = BucketInfo::from_bytes(
+        &read_key(&h.driver, S3_BUCKET_KEYSPACE, b"bucket".to_vec())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let head = CurrentVersionPointer::from_bytes(
+        &read_key(
+            &h.driver,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("bucket", "ruled.txt").to_bytes().unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+
+    let outcome = drive(
+        MintPolicySuccessorOperation::new(SuccessorPlan {
+            context: HeadAliasContext::new(h.realm_id, group_id, h.node_id, "bucket", "ruled.txt"),
+            mutation_id: Ulid::generate(),
+            expected_head: head,
+            bucket_identity: info.identity(),
+            target_refs: Vec::new(),
+            mode: PolicyRefMode::Replace,
+            successor_version_id: Ulid::generate(),
+            created_at: std::time::SystemTime::now(),
+            auth_context: AuthContext {
+                user_id: h.created_by,
+                realm_id: h.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            subject,
+            resolved: BTreeMap::new(),
+            intent: None,
+            sealed_default: None,
+        }),
+        &h.driver,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, SuccessorOutcome::Minted { .. }));
+
+    // The successor is a second version of one blob: bytes grow, the object
+    // count and the stored counters do not.
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.objects, 1);
+    assert_eq!(global.stored_blobs, 1);
+    assert_eq!(global.stored_bytes, size);
+    assert_eq!(global.logical_bytes, 2 * size);
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, 1);
+    assert_eq!(group.logical_bytes, 2 * size);
+
     assert_matches_rebuild(&h.driver).await;
 }
