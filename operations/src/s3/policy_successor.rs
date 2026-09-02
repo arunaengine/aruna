@@ -14,6 +14,7 @@ use crate::blob::managed_copy::{
 use crate::placement_policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -22,13 +23,14 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
-    ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE,
-    PlacementDecision, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
-    PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationParams,
-    PolicyMutationRecord, PolicyRefMode, PolicyResolution, VersionKey, evaluate_placement,
+    AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketIdentity,
+    CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
+    POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
+    PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
+    PolicyMutationParams, PolicyMutationRecord, PolicyRefMode, PolicyResolution, UsageDelta,
+    VersionKey, evaluate_placement,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -130,6 +132,12 @@ pub enum SuccessorError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Purge(#[from] PurgeFenceError),
+    #[error(transparent)]
+    Usage(#[from] UsageUpdateError),
+    /// The successor's usage delta commits with its records, so a mint without
+    /// a transaction would leave the counters short.
+    #[error("the successor mint requires a transaction")]
+    NoTransaction,
     #[error("mutation {0} is recorded with different parameters")]
     MutationConflict(Ulid),
     #[error("the object head is no longer the expected version")]
@@ -170,6 +178,7 @@ enum MintState {
     ReadSuccessor,
     ScanCopies,
     WriteRecords,
+    UpdateUsage,
     Done,
 }
 
@@ -182,6 +191,10 @@ pub struct SuccessorMint {
     predecessor: Option<BlobVersion>,
     sealed_refs: Vec<PlacementPolicyRef>,
     outcome: Option<SuccessorOutcome>,
+    /// Owner read from the bucket record inside this transaction.
+    group_id: Option<GroupId>,
+    /// The successor's counter change, committed with its records.
+    usage: Option<UsageCounterUpdate>,
     /// Whether a batch write was emitted, so the caller knows to commit.
     wrote: bool,
 }
@@ -194,6 +207,8 @@ impl SuccessorMint {
             predecessor: None,
             sealed_refs: Vec::new(),
             outcome: None,
+            group_id: None,
+            usage: None,
             wrote: false,
         }
     }
@@ -237,9 +252,9 @@ impl SuccessorMint {
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return Err(SuccessorError::InvalidEvent);
                 };
-                self.state = MintState::Done;
-                Ok(None)
+                self.start_usage(txn_id)
             }
+            MintState::UpdateUsage => self.handle_usage(event, txn_id),
             MintState::Done => Err(SuccessorError::InvalidEvent),
         }
     }
@@ -347,6 +362,7 @@ impl SuccessorMint {
         if bucket.identity() != self.plan.bucket_identity {
             return Err(SuccessorError::BucketChanged);
         }
+        self.group_id = Some(bucket.group_id);
         let admitted = subject.is_some_and(|record| {
             record.subject.generation == self.plan.subject.generation
                 && !record.serving_blocked
@@ -608,6 +624,13 @@ impl SuccessorMint {
                 receipt.to_bytes()?.into(),
             ));
         }
+        let Some(group_id) = self.group_id else {
+            return Err(SuccessorError::BucketChanged);
+        };
+        self.usage = Some(UsageCounterUpdate::for_group(
+            group_id,
+            successor_usage(&successor, location.as_ref()),
+        ));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
             refs: self.sealed_refs.clone(),
@@ -618,6 +641,61 @@ impl SuccessorMint {
         Ok(Some(smallvec![Effect::Storage(
             StorageEffect::BatchWrite { writes, txn_id }
         )]))
+    }
+
+    /// The counters move inside the mint's transaction, so a committed
+    /// successor can never leave the owning group's usage short.
+    fn start_usage(&mut self, txn_id: Option<TxnId>) -> Result<Option<Effects>, SuccessorError> {
+        let Some(mut update) = self.usage.take().filter(|update| !update.is_noop()) else {
+            self.state = MintState::Done;
+            return Ok(None);
+        };
+        let Some(txn_id) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        self.state = MintState::UpdateUsage;
+        let effects = update.start(txn_id);
+        self.usage = Some(update);
+        Ok(Some(effects))
+    }
+
+    fn handle_usage(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let Some(txn_id) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        let Some(update) = self.usage.as_mut() else {
+            return Err(SuccessorError::InvalidEvent);
+        };
+        match update.step(event, txn_id)? {
+            Some(effects) => Ok(Some(effects)),
+            None => {
+                self.state = MintState::Done;
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// The successor is a second stored version of the same bytes: it books its own
+/// size, the head only moves between live versions so the object count holds,
+/// and nothing new is stored, so no `stored_*` counter and no quota gate apply.
+fn successor_usage(successor: &BlobVersion, location: Option<&BackendLocation>) -> UsageDelta {
+    match &successor.state {
+        BlobVersionState::Reference {
+            cached_metadata, ..
+        } => UsageDelta {
+            referenced_bytes: i128::from(cached_metadata.content_length),
+            ..Default::default()
+        },
+        BlobVersionState::Materialized { .. } => UsageDelta {
+            logical_bytes: location.map_or(0, |location| i128::from(location.blob_size)),
+            ..Default::default()
+        },
+        BlobVersionState::Deleted => UsageDelta::default(),
     }
 }
 
@@ -835,7 +913,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
@@ -844,9 +922,9 @@ mod tests {
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
         PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationRecord,
         PolicyRefMode, PolicyResolution, RealmId, StoragePurgeFence, StoragePurgeScope,
-        VerifiedPolicy, VersionKey, checksum::HASH_BLAKE3,
+        UsageCounters, VerifiedPolicy, VersionKey, checksum::HASH_BLAKE3, usage_group_key,
     };
-    use aruna_core::types::{Key, NodeId, UserId, Value};
+    use aruna_core::types::{Key, NodeId, TxnId, UserId, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
     use ulid::Ulid;
@@ -1106,6 +1184,37 @@ mod tests {
             .into_iter()
             .map(|(key_space, key, value)| (key_space, key.to_vec(), value.to_vec()))
             .collect()
+    }
+
+    /// Runs the embedded counter update from the record batch to its own write
+    /// and returns the counters the owning group would commit.
+    fn group_counters(mint: &mut SuccessorMint, txn_id: TxnId) -> UsageCounters {
+        let effect = first_effect(
+            mint.step(
+                Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }),
+                Some(txn_id),
+            )
+            .expect("the usage update starts"),
+        );
+        let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = effect else {
+            panic!("expected the counter read");
+        };
+        let values = reads.into_iter().map(|(_, key)| (key, None)).collect();
+        let effect = first_effect(
+            mint.step(
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+                Some(txn_id),
+            )
+            .expect("the counters are written"),
+        );
+        let group_key = usage_group_key(bucket().group_id);
+        batch_writes(effect)
+            .into_iter()
+            .find(|(space, key, _)| space == USAGE_STATS_KEYSPACE && *key == group_key)
+            .map(|(_, _, value)| UsageCounters::from_bytes(&value).expect("counters decode"))
+            .expect("the group counter is written")
     }
 
     fn first_effect(effects: Option<aruna_core::types::Effects>) -> Effect {
@@ -1552,12 +1661,53 @@ mod tests {
     }
 
     #[test]
-    fn reference_skips_registration() {
-        // A reference claims no managed copy, so it registers nothing.
+    fn books_successor_bytes() {
+        // The successor stores a second version of the same bytes, so its size
+        // is booked while the head only moves between two live versions.
         let policy = verified(1, Some(node_id()));
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);
-        let reference = BlobVersion::reference(
+        drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
+        let txn_id = Ulid::generate();
+        let row = copy_row(Vec::new(), ManagedCopyState::Registered);
+        mint.step(copies(vec![row]), Some(txn_id))
+            .expect("scan decides");
+
+        let counters = group_counters(&mut mint, txn_id);
+        assert_eq!(counters.logical_bytes, location().blob_size);
+        assert_eq!(counters.objects, 0);
+        assert_eq!(counters.stored_bytes, 0);
+        assert_eq!(counters.referenced_bytes, 0);
+    }
+
+    #[test]
+    fn blocked_skips_usage() {
+        // Nothing was minted, so the blocked receipt moves no counter.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Union));
+        mint.plan.resolved = resolution(&policy);
+        mint.plan.intent = Some(intent());
+        drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
+        let txn_id = Ulid::generate();
+        mint.step(copies(Vec::new()), Some(txn_id))
+            .expect("scan decides");
+
+        let effects = mint
+            .step(
+                Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }),
+                Some(txn_id),
+            )
+            .expect("the mint settles");
+        assert_eq!(effects, None);
+        assert_eq!(mint.state, MintState::Done);
+    }
+
+    const REFERENCE_BYTES: u64 = 1;
+
+    fn reference() -> BlobVersion {
+        BlobVersion::reference(
             aruna_core::structs::VersionSourceBinding {
                 strategy: aruna_core::structs::StagingStrategy::Reference,
                 descriptor: aruna_core::structs::PortableSourceDescriptor {
@@ -1571,7 +1721,7 @@ mod tests {
                 connector_id: None,
             },
             aruna_core::structs::SourceMetadata {
-                content_length: 1,
+                content_length: REFERENCE_BYTES,
                 content_type: None,
                 etag: None,
                 last_modified: None,
@@ -1580,8 +1730,31 @@ mod tests {
             UNIX_EPOCH,
             user_id(),
             UNIX_EPOCH,
-        );
-        let effect = drive_to_copy(&mut mint, &reference).expect("writes follow");
+        )
+    }
+
+    #[test]
+    fn books_reference_bytes() {
+        // A reference successor carries no local bytes, so it books the source
+        // size against the referenced counter instead of the logical one.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
+        mint.plan.resolved = resolution(&policy);
+        drive_to_copy(&mut mint, &reference()).expect("writes follow");
+
+        let counters = group_counters(&mut mint, Ulid::generate());
+        assert_eq!(counters.referenced_bytes, REFERENCE_BYTES);
+        assert_eq!(counters.logical_bytes, 0);
+        assert_eq!(counters.objects, 0);
+    }
+
+    #[test]
+    fn reference_skips_registration() {
+        // A reference claims no managed copy, so it registers nothing.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
+        mint.plan.resolved = resolution(&policy);
+        let effect = drive_to_copy(&mut mint, &reference()).expect("writes follow");
         let writes = batch_writes(effect);
 
         assert!(
