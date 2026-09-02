@@ -24,6 +24,7 @@ use aruna_operations::placement_policy::diagnostics::{
 use aruna_operations::placement_policy::list::{
     ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
 };
+use aruna_operations::placement_policy::names::PolicyNamesOperation;
 use aruna_operations::placement_policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
@@ -35,6 +36,9 @@ use aruna_operations::s3::bucket_placement::{
     PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation,
 };
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::object_placement::{
+    ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation,
+};
 use aruna_operations::s3::policy_bulk::{BulkConfig, BulkError, PolicyBulkOperation};
 use aruna_operations::s3::policy_coverage::{
     CoverageError, CoverageInput, CoverageScope, PolicyCoverageOperation,
@@ -57,7 +61,7 @@ use utoipa_axum::routes;
 #[derive(OpenApi)]
 #[openapi(tags((
     name = "data/placement",
-    description = "Realm-admin administration of placement policies, bucket defaults and their application"
+    description = "Placement policies, bucket defaults and their application: realm admins publish realm-wide policies, group admins the ones their own group owns"
 )))]
 pub struct PlacementApiDoc;
 
@@ -67,7 +71,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_placement_policy))
         .routes(routes!(get_placement_diagnostics))
         .routes(routes!(get_bucket_placement, put_bucket_placement))
-        .routes(routes!(mint_object_placement))
+        .routes(routes!(get_object_placement, mint_object_placement))
         .routes(routes!(run_bucket_placement))
         .routes(routes!(get_placement_coverage))
         .routes(routes!(resolve_placement_quarantine))
@@ -75,11 +79,17 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 /// A rule reference: the immutable policy id plus the digest of its definition.
 /// Both are required, because an id alone could be answered with other bytes.
+/// `name` and `owner_group_id` are what this node resolved for the id and are
+/// null when it holds no such rule; a request body may omit both.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct PolicyRefBody {
     pub policy_id: String,
     /// Lowercase hex of the 32-byte definition digest.
     pub digest: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub owner_group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -107,6 +117,9 @@ pub struct CreatePolicyRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_id: Option<String>,
     pub name: String,
+    /// Group that owns the rule; omitted or null publishes a realm-wide rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<String>,
     pub allowed: Vec<SelectorBody>,
 }
 
@@ -115,6 +128,8 @@ pub struct PolicyResponse {
     pub policy_id: String,
     pub digest: String,
     pub name: String,
+    /// Group that owns the rule; null is realm-wide.
+    pub owner_group_id: Option<String>,
     pub allowed: Vec<SelectorBody>,
     /// The node that published the definition under realm-admin authority.
     pub publisher: String,
@@ -124,6 +139,11 @@ pub struct PolicyResponse {
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct PolicyListQuery {
+    /// Lists the realm-wide rules plus this group's own, readable by that
+    /// group's administrators. Omitted, the page needs realm-configuration
+    /// read and carries every rule this node holds.
+    #[serde(default)]
+    pub group_id: Option<String>,
     /// Opaque continuation returned by the previous page.
     #[serde(default)]
     pub cursor: Option<String>,
@@ -156,6 +176,23 @@ pub struct BucketPlacementResponse {
     pub bucket: String,
     pub policies: Vec<PolicyRefBody>,
     pub generation: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct ObjectPlacementQuery {
+    /// Object key within the bucket, without a leading slash.
+    pub key: String,
+}
+
+/// What the object's current head carries, and the generation an exact-set
+/// mutation has to present.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ObjectPlacementView {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+    pub generation: u64,
+    pub policies: Vec<PolicyRefBody>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -323,8 +360,35 @@ impl From<PlacementPolicyRef> for PolicyRefBody {
         Self {
             policy_id: value.policy_id.to_string(),
             digest: hex::encode(value.digest),
+            name: None,
+            owner_group_id: None,
         }
     }
+}
+
+/// Joins refs with what this node holds for them. An id this node does not
+/// hold stays a plain reference rather than failing the response.
+async fn named_refs(
+    state: &ServerState,
+    realm_id: aruna_core::structs::RealmId,
+    refs: Vec<PlacementPolicyRef>,
+) -> ServerResult<Vec<PolicyRefBody>> {
+    let names = drive(PolicyNamesOperation::new(realm_id, &refs), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    Ok(refs
+        .into_iter()
+        .map(|policy_ref| {
+            let named = names.get(&policy_ref.policy_id);
+            PolicyRefBody {
+                name: named.map(|named| named.name.clone()),
+                owner_group_id: named
+                    .and_then(|named| named.owner_group_id)
+                    .map(|group_id| group_id.to_string()),
+                ..PolicyRefBody::from(policy_ref)
+            }
+        })
+        .collect())
 }
 
 impl TryFrom<SelectorBody> for PlacementSelector {
@@ -393,6 +457,10 @@ fn policy_response(document: &PlacementPolicyDocument) -> ServerResult<PolicyRes
         policy_id: policy_ref.policy_id.to_string(),
         digest: hex::encode(policy_ref.digest),
         name: document.policy.name.clone(),
+        owner_group_id: document
+            .policy
+            .owner_group_id
+            .map(|group_id| group_id.to_string()),
         allowed: document
             .policy
             .allowed
@@ -448,6 +516,7 @@ fn map_default_error(error: PutBucketPlacementError) -> ServerError {
             ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
         }
         PutBucketPlacementError::Policy(_) => policy_denied(),
+        PutBucketPlacementError::ForeignPolicy { .. } => foreign_policy(),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -473,6 +542,41 @@ fn map_successor_error(error: SuccessorError) -> ServerError {
     }
 }
 
+/// Bucket defaults name policy ids: a realm-configuration reader may see them,
+/// and so may an administrator of the group that owns the bucket, who is also
+/// the one allowed to change them.
+async fn ensure_placement_read(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: aruna_core::types::GroupId,
+) -> ServerResult<()> {
+    let realm_reader = crate::auth::permission_granted(
+        state,
+        auth,
+        aruna_core::structs::policy_admin_path(auth.realm_id),
+        aruna_core::structs::Permission::READ,
+    )
+    .await?;
+    if realm_reader {
+        return Ok(());
+    }
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        aruna_core::structs::group_admin_path(auth.realm_id, group_id),
+        aruna_core::structs::Permission::READ,
+    )
+    .await
+}
+
+/// A group-owned rule governs only its owner's buckets. The reason is readable
+/// because the caller supplied the reference or already reads the default.
+fn foreign_policy() -> ServerError {
+    ServerError::BadRequestReason(
+        "a placement policy owned by another group cannot govern this bucket".to_string(),
+    )
+}
+
 /// A refusal never names a policy, a ref or a node; only its retryability is
 /// disclosed.
 fn policy_denied() -> ServerError {
@@ -481,6 +585,7 @@ fn policy_denied() -> ServerError {
 
 fn map_gate_error(error: PolicyGateError) -> ServerError {
     match error {
+        PolicyGateError::ForeignPolicy { .. } => foreign_policy(),
         PolicyGateError::Denied { .. }
         | PolicyGateError::NoSubject
         | PolicyGateError::Invalid
@@ -503,6 +608,7 @@ fn map_mutation_error(error: PolicyMutationError) -> ServerError {
             ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
         }
         PolicyMutationError::Successor(error) => map_successor_error(error),
+        PolicyMutationError::ForeignPolicy { .. } => foreign_policy(),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -512,6 +618,7 @@ fn map_bulk_error(error: BulkError) -> ServerError {
         BulkError::Unauthorized => ServerError::Forbidden,
         BulkError::NoSuchBucket => ServerError::NotFound,
         BulkError::BucketChanged => ServerError::Conflict(error.to_string()),
+        BulkError::ForeignPolicy { .. } => foreign_policy(),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -534,21 +641,35 @@ fn bulk_status(status: PolicyBulkStatus) -> String {
     .to_string()
 }
 
-/// Runs the operation's own realm-admin check first, so a bucket name or this
-/// node's subject state is never an oracle for a caller the operation refuses.
-async fn ensure_config_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<()> {
-    crate::auth::ensure_permission(
-        state,
-        auth,
-        aruna_core::structs::policy_admin_path(auth.realm_id),
-        aruna_core::structs::Permission::WRITE,
-    )
-    .await
-}
-
 /// This node's advertised placement subject, without which nothing governed may
 /// be minted here. A node that is blocked or draining is refused up front, so a
 /// run is never started where the first mint would immediately stop it.
+/// The boundary check the operations repeat: realm configuration writers and
+/// the admins of the bucket's group may change its placement.
+async fn ensure_placement_writer(
+    state: &ServerState,
+    auth: &AuthContext,
+    bucket: &str,
+) -> ServerResult<()> {
+    let realm_id = auth.realm_id;
+    let config_admin = aruna_core::structs::policy_admin_path(realm_id);
+    if crate::auth::permission_granted(
+        state,
+        auth,
+        config_admin.clone(),
+        aruna_core::structs::Permission::WRITE,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let path = match crate::routes::groups::get_bucket_group(state, bucket).await? {
+        Some(group_id) => aruna_core::structs::group_admin_path(realm_id, group_id),
+        None => config_admin,
+    };
+    crate::auth::ensure_permission(state, auth, path, aruna_core::structs::Permission::WRITE).await
+}
+
 async fn local_subject(
     state: &ServerState,
     realm_id: aruna_core::structs::RealmId,
@@ -591,12 +712,17 @@ async fn bucket_info(
     summary = "Publish an immutable placement policy",
     description = r#"Publishes an immutable placement policy definition and returns the document holders serve.
 
-**Authentication**: realm bearer token with WRITE on the realm-configuration path
-`/{realm_id}/admin/config`, checked inside the operation before anything else is read.
+**Authentication**: realm bearer token. A realm-wide rule (no `owner_group_id`) needs WRITE on the
+realm-configuration path `/{realm_id}/admin/config`; a group-owned rule needs WRITE on
+`/{realm_id}/g/{owner_group_id}/admin`. The check runs inside the operation before anything else is
+read, and every verifier re-runs the same check against its own replicated view.
 
 **Behavior**
 - A definition is immutable: omitting `policy_id` mints one, and republishing an id with the same
-  selectors returns the stored document unchanged.
+  selectors returns the stored document unchanged. The owner is part of the definition, so binding
+  a rule to a group mints a different digest and therefore a different reference.
+- A group-owned rule may only be referenced by that group's own buckets and objects; a reference
+  from another group's bucket is refused.
 - The document is committed on a holder of the bucket its id resolves to; when this node holds none,
   the publication is forwarded to a current holder under the caller's own token, and that holder
   re-runs the same admin check, so a relay never becomes the author.
@@ -604,6 +730,7 @@ async fn bucket_info(
   later reference must name."#,
     request_body(content = CreatePolicyRequest, example = json!({
         "name": "eu-residency",
+        "owner_group_id": "01JMETADATA0123456789ABCDE",
         "allowed": [
             { "location": "eu-west" }
         ]
@@ -613,6 +740,7 @@ async fn bucket_info(
             "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
             "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
             "name": "eu-residency",
+            "owner_group_id": "01JMETADATA0123456789ABCDE",
             "allowed": [
                 { "location": "eu-west" }
             ],
@@ -622,7 +750,7 @@ async fn bucket_info(
         })),
         (status = 400, description = "The definition is invalid, or an id, node id or digest could not be parsed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, no WRITE on the realm-configuration path for a realm-wide rule, or no WRITE on the owning group's admin path for a group-owned one", body = ErrorResponse),
         (status = 409, description = "The policy id already carries a different definition, which is never replaced", body = ErrorResponse),
         (status = 503, description = "No holder could commit the publication; nothing was written", body = ErrorResponse)
     ),
@@ -645,8 +773,14 @@ pub async fn create_placement_policy(
         .into_iter()
         .map(TryInto::try_into)
         .collect::<ServerResult<Vec<PlacementSelector>>>()?;
-    let policy = PlacementPolicy::new(policy_id, request.name, allowed)
+    let mut policy = PlacementPolicy::new(policy_id, request.name, allowed)
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    if let Some(owner_group_id) = request.owner_group_id.as_deref() {
+        let owner = Ulid::from_string(owner_group_id).map_err(|_| ServerError::BadRequest)?;
+        policy = policy
+            .owned_by(owner)
+            .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    }
     let config = CreatePolicyConfig {
         actor: Actor {
             node_id: state.get_node_id(),
@@ -692,6 +826,7 @@ realm-configuration permission.
             "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
             "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
             "name": "eu-residency",
+            "owner_group_id": "01JMETADATA0123456789ABCDE",
             "allowed": [
                 { "location": "eu-west" }
             ],
@@ -717,6 +852,8 @@ pub async fn get_placement_policy(
     let policy_ref = PolicyRefBody {
         policy_id,
         digest: query.digest,
+        name: None,
+        owner_group_id: None,
     }
     .try_into()?;
     let (authentic, _) = drive(
@@ -739,8 +876,10 @@ pub async fn get_placement_policy(
     summary = "List the placement policies this responder holds",
     description = r#"Returns one bounded page of the placement policy documents this node holds.
 
-**Authentication**: realm bearer token with READ on the realm-configuration path, checked inside the
-operation, so the listing is no existence oracle.
+**Authentication**: realm bearer token. Without `group_id` the caller needs READ on the
+realm-configuration path and sees every rule this node holds; with it the caller needs READ on
+`/{realm_id}/g/{group_id}/admin` and the page holds the realm-wide rules plus that group's own.
+The check runs inside the operation, so the listing is no existence oracle.
 
 **Behavior**
 - Policy documents replicate only to the holders their id resolves to, so a page names what this
@@ -758,6 +897,7 @@ operation, so the listing is no existence oracle.
                     "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
                     "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
                     "name": "eu-residency",
+                    "owner_group_id": null,
                     "allowed": [
                         { "location": "eu-west" }
                     ],
@@ -771,7 +911,7 @@ operation, so the listing is no existence oracle.
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse)
+        (status = 403, description = "Token from another realm, or no READ on the path the query names", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -784,6 +924,12 @@ pub async fn list_placement_policies(
     let page = drive(
         ListPoliciesOperation::new(ListPoliciesInput {
             auth_context: auth,
+            group_id: query
+                .group_id
+                .as_deref()
+                .map(Ulid::from_string)
+                .transpose()
+                .map_err(|_| ServerError::BadRequest)?,
             start_after: decode_cursor(query.cursor)?,
             limit: query.limit.unwrap_or(POLICY_LIST_DEFAULT),
         }),
@@ -818,8 +964,9 @@ pub struct PolicyRefQuery {
     summary = "Read a bucket's default placement policies",
     description = r#"Returns the placement policy references a bucket applies by default, with their generation.
 
-**Authentication**: realm bearer token with READ on the realm-configuration path, because the
-default names policy ids.
+**Authentication**: realm bearer token with READ on the realm-configuration path, or READ on
+`/{realm_id}/g/{group}/admin` for the group that owns the bucket, because the default names policy
+ids.
 
 **Behavior**
 - This is a node-local read of the replicated bucket record: a default written on another node can
@@ -840,7 +987,7 @@ default names policy ids.
             "generation": 3
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or neither realm-configuration read nor admin read on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -851,22 +998,12 @@ pub async fn get_bucket_placement(
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    // Bucket defaults name policy ids; only realm-config readers may see them.
-    crate::auth::ensure_permission(
-        &state,
-        &auth,
-        aruna_core::structs::policy_admin_path(auth.realm_id),
-        aruna_core::structs::Permission::READ,
-    )
-    .await?;
     let info = bucket_info(&state, &bucket).await?;
+    ensure_placement_read(&state, &auth, info.group_id).await?;
+    let policies = named_refs(&state, auth.realm_id, info.placement_policies).await?;
     Ok(Json(BucketPlacementResponse {
         bucket,
-        policies: info
-            .placement_policies
-            .into_iter()
-            .map(Into::into)
-            .collect(),
+        policies,
         generation: info.placement_policy_generation,
     }))
 }
@@ -878,11 +1015,14 @@ pub async fn get_bucket_placement(
     summary = "Replace a bucket's default placement policies",
     description = r#"Replaces the placement policy references a bucket applies by default to newly minted versions.
 
-**Authentication**: realm bearer token with WRITE on the realm-configuration path, checked inside
-the operation.
+**Authentication**: realm bearer token with WRITE on the realm-configuration path, or WRITE on
+`/{realm_id}/g/{group}/admin` for the group that owns the bucket. Both are checked inside the
+operation.
 
 **Behavior**
 - The submitted list replaces the whole default set; an empty list clears it.
+- Every reference must be realm-wide or owned by the bucket's own group; a rule another group owns
+  is refused whoever attaches it.
 - Every reference is resolved and authenticated through the ordinary policy read before it can
   become a default, so one no holder can supply leaves the stored default untouched.
 - A real change advances `placement_policy_generation` exactly once inside the same transaction;
@@ -912,9 +1052,9 @@ the operation.
             ],
             "generation": 4
         })),
-        (status = 400, description = "A reference could not be parsed, the set is not a valid reference set, or a placement rule refuses it under a fixed reason that names no policy, reference or node", body = ErrorResponse),
+        (status = 400, description = "A reference could not be parsed, the set is not a valid reference set, a referenced rule is owned by another group, or a placement rule refuses it under a fixed reason that names no policy, reference or node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The stored generation is not the expected one, or the counter is exhausted", body = ErrorResponse),
         (status = 503, description = "A referenced policy could not be authenticated; nothing was changed", body = ErrorResponse)
@@ -928,7 +1068,8 @@ pub async fn put_bucket_placement(
     Json(request): Json<BucketPlacementRequest>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    ensure_config_admin(&state, &auth).await?;
+    ensure_placement_writer(&state, &auth, &bucket).await?;
+    let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
     let policies = refs_from(request.policies)?;
     let stored = drive(
@@ -945,10 +1086,96 @@ pub async fn put_bucket_placement(
     )
     .await
     .map_err(map_default_error)?;
+    let policies = named_refs(&state, realm_id, stored.policies).await?;
     Ok(Json(BucketPlacementResponse {
         bucket,
-        policies: stored.policies.into_iter().map(Into::into).collect(),
+        policies,
         generation: stored.generation,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/placement/objects",
+    tag = "data/placement",
+    summary = "Read the placement rules one object's head carries",
+    description = r#"Returns the placement references the object's current version carries, with the generation an exact-set change has to present.
+
+**Authentication**: realm bearer token with READ on the object.
+
+**Behavior**
+- This is a node-local read of the head this node stores: a version written on another node is
+  reported only once it has arrived here.
+- `generation` is the head pointer's counter, which `POST /data/buckets/{bucket}/placement/objects`
+  takes as `expected_generation`; `version_id` is what it takes as `expected_version_id`.
+- Every reference carries the `name` and `owner_group_id` this node resolved for its id, and null
+  for both when it holds no such rule.
+- An object with no references is governed by nothing and returns an empty list."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name as used by the S3 surface"),
+        ObjectPlacementQuery
+    ),
+    responses(
+        (status = 200, description = "The references the current head carries", body = ObjectPlacementView, example = json!({
+            "bucket": "datasets",
+            "key": "raw/sample.fastq",
+            "version_id": "01K2ZK4Q0X3D5M6P7R8S9T0V3B",
+            "generation": 7,
+            "policies": [
+                {
+                    "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                    "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+                    "name": "eu-residency",
+                    "owner_group_id": null
+                }
+            ]
+        })),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the object", body = ErrorResponse),
+        (status = 404, description = "No bucket of that name is known to this node, or the key has no current version here", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_object_placement(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Query(query): Query<ObjectPlacementQuery>,
+) -> ServerResult<Json<ObjectPlacementView>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let info = bucket_info(&state, &bucket).await?;
+    crate::auth::ensure_permission(
+        &state,
+        &auth,
+        aruna_core::structs::blob_object_permission_path(
+            auth.realm_id,
+            info.group_id,
+            state.get_node_id(),
+            &bucket,
+            &query.key,
+        ),
+        aruna_core::structs::Permission::READ,
+    )
+    .await?;
+    let placement = drive(
+        ObjectPlacementOperation::new(ObjectPlacementInput {
+            bucket: bucket.clone(),
+            key: query.key.clone(),
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        ObjectPlacementError::NoSuchKey => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    let policies = named_refs(&state, auth.realm_id, placement.policies).await?;
+    Ok(Json(ObjectPlacementView {
+        bucket,
+        key: query.key,
+        version_id: placement.version_id.to_string(),
+        generation: placement.generation,
+        policies,
     }))
 }
 
@@ -959,12 +1186,17 @@ pub async fn put_bucket_placement(
     summary = "Attach an exact policy set to one object",
     description = r#"Mints a successor version of one object that carries exactly the submitted placement references.
 
-**Authentication**: realm bearer token with WRITE on the realm-configuration path, checked inside
-the operation.
+**Authentication**: realm bearer token with WRITE on the realm-configuration path, or WRITE on
+`/{realm_id}/g/{group}/admin` for the group that owns the bucket. Both are checked inside the
+operation.
 
 **Behavior**
 - This is an exact replacement, not a union: the successor carries exactly the submitted references,
   so an explicit mutation may tighten or relax.
+- Every reference must be realm-wide or owned by the bucket's own group; a rule another group owns
+  is refused whoever attaches it.
+- `expected_version_id` and `expected_generation` come from
+  `GET /data/buckets/{bucket}/placement/objects`.
 - Nothing stored is rewritten; a new version is minted that carries the new references and the
   predecessor's bytes, and the predecessor keeps its own.
 - The mutation advances the head only while it still is exactly `expected_version_id` at
@@ -1001,9 +1233,9 @@ the operation.
                 }
             ]
         })),
-        (status = 400, description = "An id, version id or reference could not be parsed, or a placement rule refuses the destination under a fixed reason that names no policy, reference or node", body = ErrorResponse),
+        (status = 400, description = "An id, version id or reference could not be parsed, a referenced rule is owned by another group, or a placement rule refuses the destination under a fixed reason that names no policy, reference or node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No such bucket, or the expected head version no longer exists", body = ErrorResponse),
         (status = 409, description = "The head moved, the bucket changed, the mutation id was reused with other parameters, or the assigned version id is taken", body = ErrorResponse),
         (status = 503, description = "A referenced policy could not be authenticated, this node advertises no placement subject or is not admitting governed data, or its subject moved during the mutation; nothing was written and the call may be retried", body = ErrorResponse)
@@ -1017,7 +1249,8 @@ pub async fn mint_object_placement(
     Json(request): Json<ObjectPlacementRequest>,
 ) -> ServerResult<Json<ObjectPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    ensure_config_admin(&state, &auth).await?;
+    ensure_placement_writer(&state, &auth, &bucket).await?;
+    let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
     let subject = local_subject(&state, auth.realm_id).await?;
     let mutation_id =
@@ -1049,40 +1282,32 @@ pub async fn mint_object_placement(
     )
     .await
     .map_err(map_mutation_error)?;
-    Ok(Json(mutation_response(outcome)))
+    let mut response = mutation_response(&outcome);
+    response.policies = named_refs(&state, realm_id, outcome.refs()).await?;
+    Ok(Json(response))
 }
 
-fn mutation_response(outcome: SuccessorOutcome) -> ObjectPlacementResponse {
-    match outcome {
+/// Everything but the refs, which the caller resolves names for.
+fn mutation_response(outcome: &SuccessorOutcome) -> ObjectPlacementResponse {
+    let (outcome, version_id, materialized, blocked_reason) = match outcome {
         SuccessorOutcome::Minted {
             version_id,
-            refs,
             materialized,
-        } => ObjectPlacementResponse {
-            outcome: "minted".to_string(),
-            version_id: Some(version_id.to_string()),
-            materialized: Some(materialized),
-            blocked_reason: None,
-            policies: refs.into_iter().map(Into::into).collect(),
-        },
+            ..
+        } => ("minted", Some(*version_id), Some(*materialized), None),
         SuccessorOutcome::Replayed {
             version_id,
-            refs,
             materialized,
-        } => ObjectPlacementResponse {
-            outcome: "replayed".to_string(),
-            version_id: Some(version_id.to_string()),
-            materialized: Some(materialized),
-            blocked_reason: None,
-            policies: refs.into_iter().map(Into::into).collect(),
-        },
-        SuccessorOutcome::Blocked(reason) => ObjectPlacementResponse {
-            outcome: "blocked".to_string(),
-            version_id: None,
-            materialized: None,
-            blocked_reason: Some(blocked_reason(reason)),
-            policies: Vec::new(),
-        },
+            ..
+        } => ("replayed", Some(*version_id), Some(*materialized), None),
+        SuccessorOutcome::Blocked(reason) => ("blocked", None, None, Some(blocked_reason(*reason))),
+    };
+    ObjectPlacementResponse {
+        outcome: outcome.to_string(),
+        version_id: version_id.map(|version_id| version_id.to_string()),
+        materialized,
+        blocked_reason,
+        policies: Vec::new(),
     }
 }
 
@@ -1093,10 +1318,12 @@ fn mutation_response(outcome: SuccessorOutcome) -> ObjectPlacementResponse {
     summary = "Apply the bucket default to local heads",
     description = r#"Runs one resumable pass applying the bucket's default references to this responder's current heads.
 
-**Authentication**: realm bearer token with WRITE on the realm-configuration path, checked inside
-the operation.
+**Authentication**: realm bearer token with WRITE on the realm-configuration path, or WRITE on
+`/{realm_id}/g/{group}/admin` for the group that owns the bucket. Both are checked inside the
+operation.
 
 **Behavior**
+- Every sealed reference must be realm-wide or owned by the bucket's own group.
 - The first call under an `operation_id` seals the run against the bucket's exact identity,
   generation and default reference set; repeating that id resumes the sealed run, and every later
   pass is bound to what was sealed.
@@ -1145,11 +1372,11 @@ the operation.
             "cursor": "6b0d",
             "complete": false
         })),
-        (status = 400, description = "The operation id or cursor could not be parsed", body = ErrorResponse),
+        (status = 400, description = "The operation id or cursor could not be parsed, or the sealed default references a rule owned by another group", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
-        (status = 409, description = "The run was sealed against a different bucket record", body = ErrorResponse),
+        (status = 409, description = "The run was sealed against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
         (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1161,7 +1388,9 @@ pub async fn run_bucket_placement(
     Json(request): Json<BulkRunRequest>,
 ) -> ServerResult<Json<BulkRunResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    ensure_config_admin(&state, &auth).await?;
+    ensure_placement_writer(&state, &auth, &bucket).await?;
+    let realm_id = auth.realm_id;
+    let info = bucket_info(&state, &bucket).await?;
     let subject = local_subject(&state, auth.realm_id).await?;
     let operation_id =
         Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
@@ -1169,6 +1398,7 @@ pub async fn run_bucket_placement(
         PolicyBulkOperation::new(BulkConfig {
             operation_id,
             bucket,
+            group_id: info.group_id,
             auth_context: auth,
             subject,
             start_after: decode_cursor(request.cursor)?,
@@ -1180,11 +1410,12 @@ pub async fn run_bucket_placement(
     )
     .await
     .map_err(map_bulk_error)?;
+    let target_policies = named_refs(&state, realm_id, report.target_refs).await?;
     Ok(Json(BulkRunResponse {
         operation_id: report.operation_id.to_string(),
         status: bulk_status(report.status),
         generation: report.generation,
-        target_policies: report.target_refs.into_iter().map(Into::into).collect(),
+        target_policies,
         observed: report.observed,
         covered: report.covered,
         minted: report.minted,
@@ -1634,6 +1865,8 @@ mod tests {
         let body = PolicyRefBody {
             policy_id: Ulid::from_bytes([5u8; 16]).to_string(),
             digest: "00".to_string(),
+            name: None,
+            owner_group_id: None,
         };
         assert!(PlacementPolicyRef::try_from(body).is_err());
     }
@@ -1650,6 +1883,323 @@ mod tests {
         assert_eq!(
             PlacementSelector::try_from(body).expect("selector parses"),
             selector
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_routes {
+    use super::{ObjectPlacementQuery, get_object_placement};
+    use crate::error::ServerError;
+    use crate::openapi::ApiDoc;
+    use crate::server_state::ServerState;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        Actor, AuthContext, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
+        PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, PlacementSelector,
+        PolicyPublicationClaim, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        VerifiedPolicy, VersionKey, placement_policy_key,
+    };
+    use aruna_core::types::UserId;
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_storage::FjallStorage;
+    use axum::Extension;
+    use axum::extract::{Path, Query, State};
+    use byteview::ByteView;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use tempfile::TempDir;
+    use ulid::Ulid;
+
+    const BUCKET: &str = "datasets";
+    const KEY: &str = "raw/sample.fastq";
+
+    fn node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[3u8; 32]).public()
+    }
+
+    fn realm_id() -> RealmId {
+        RealmId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
+
+    fn policy() -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([4u8; 16]),
+            "eu-residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some("eu-west".to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    async fn write_fixture(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: ByteView::from(key),
+                value: ByteView::from(value),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected fixture write event: {other:?}"),
+        }
+    }
+
+    /// One governed object whose head this node holds, plus the rule its ref
+    /// names, so a name can be resolved locally.
+    async fn setup(owner: UserId) -> (TempDir, Arc<ServerState>, Ulid) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let realm_id = realm_id();
+        let state = Arc::new(
+            ServerState::new(
+                Arc::new(DriverContext {
+                    storage_handle: storage,
+                    net_handle: None,
+                    blob_handle: None,
+                    metadata_handle: None,
+                    task_handle: None,
+                    compute_handle: None,
+                }),
+                realm_id,
+                node_id(),
+                NodeCapabilities::user_node(realm_id).expect("capabilities"),
+                false,
+                None,
+                JobsRuntime::new(),
+            )
+            .await,
+        );
+        let group_id = Ulid::from_bytes([11u8; 16]);
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        write_fixture(
+            &state,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .expect("realm auth serializes"),
+        )
+        .await;
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        write_fixture(
+            &state,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group_auth.to_bytes(&actor).expect("group auth serializes"),
+        )
+        .await;
+        write_fixture(
+            &state,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            Group {
+                display_name: "placement-group".to_string(),
+                group_id,
+                realm_id,
+                roles: group_auth.roles.keys().copied().collect(),
+                owner,
+            }
+            .to_bytes(&actor)
+            .expect("group serializes"),
+        )
+        .await;
+        write_fixture(
+            &state,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .expect("realm config serializes"),
+        )
+        .await;
+        write_fixture(
+            &state,
+            S3_BUCKET_KEYSPACE,
+            BUCKET.as_bytes().to_vec(),
+            BucketInfo {
+                group_id,
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: owner,
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+            }
+            .to_bytes()
+            .expect("bucket serializes"),
+        )
+        .await;
+
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        let policy = policy();
+        let version = BlobVersion::materialized(
+            [7u8; 32],
+            BackendRef::node_default(),
+            SystemTime::UNIX_EPOCH,
+            owner,
+            None,
+        )
+        .with_policies(vec![policy.policy_ref()])
+        .expect("refs seal");
+        write_fixture(
+            &state,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(BUCKET, KEY).to_bytes().expect("head key"),
+            CurrentVersionPointer::new_with_generation(version_id, 7)
+                .to_bytes()
+                .expect("pointer serializes"),
+        )
+        .await;
+        write_fixture(
+            &state,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(BUCKET, KEY, version_id)
+                .to_bytes()
+                .expect("version key"),
+            version.to_bytes().expect("version serializes"),
+        )
+        .await;
+        let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let publication = PolicyPublicationClaim::new(
+            realm_id,
+            &policy,
+            secret.public(),
+            owner,
+            Ulid::from_bytes([5u8; 16]),
+            7,
+            [0u8; 32],
+        )
+        .sign(&secret);
+        let document = PlacementPolicyDocument::new(realm_id, &policy, publication);
+        write_fixture(
+            &state,
+            aruna_core::keyspaces::PLACEMENT_POLICY_KEYSPACE,
+            placement_policy_key(policy.policy().policy_id),
+            document.to_bytes().expect("document serializes"),
+        )
+        .await;
+        (dir, state, version_id)
+    }
+
+    fn auth(owner: UserId) -> AuthContext {
+        AuthContext {
+            user_id: owner,
+            realm_id: realm_id(),
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_object_refs() {
+        // The head generation and version id are exactly what an exact-set
+        // change presents, and a ref this node holds carries its name.
+        let owner = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id());
+        let (_dir, state, version_id) = setup(owner).await;
+
+        let Ok(axum::Json(view)) = get_object_placement(
+            State(state),
+            Extension(Some(auth(owner))),
+            Path(BUCKET.to_string()),
+            Query(ObjectPlacementQuery {
+                key: KEY.to_string(),
+            }),
+        )
+        .await
+        else {
+            panic!("the object placement read must succeed");
+        };
+
+        assert_eq!(view.bucket, BUCKET);
+        assert_eq!(view.key, KEY);
+        assert_eq!(view.version_id, version_id.to_string());
+        assert_eq!(view.generation, 7);
+        assert_eq!(view.policies.len(), 1);
+        assert_eq!(view.policies[0].name.as_deref(), Some("eu-residency"));
+        assert!(view.policies[0].owner_group_id.is_none());
+        assert_eq!(
+            PlacementPolicyRef::try_from(view.policies[0].clone()).expect("ref parses"),
+            policy().policy_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_key_missing() {
+        let owner = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id());
+        let (_dir, state, _) = setup(owner).await;
+
+        let error = get_object_placement(
+            State(state),
+            Extension(Some(auth(owner))),
+            Path(BUCKET.to_string()),
+            Query(ObjectPlacementQuery {
+                key: "raw/missing.fastq".to_string(),
+            }),
+        )
+        .await
+        .expect_err("an unknown key has no head");
+
+        assert!(matches!(error, ServerError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn refuses_foreign_reader() {
+        // A realm member outside the bucket's group holds no READ on the object.
+        let owner = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id());
+        let (_dir, state, _) = setup(owner).await;
+        let outsider = UserId::local(Ulid::from_bytes([6u8; 16]), realm_id());
+
+        let error = get_object_placement(
+            State(state),
+            Extension(Some(auth(outsider))),
+            Path(BUCKET.to_string()),
+            Query(ObjectPlacementQuery {
+                key: KEY.to_string(),
+            }),
+        )
+        .await
+        .expect_err("a caller without READ is refused");
+
+        assert!(matches!(error, ServerError::Forbidden));
+    }
+
+    #[test]
+    fn openapi_lists_objects() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let path = &openapi["paths"]["/data/buckets/{bucket}/placement/objects"];
+        assert!(path.get("get").is_some());
+        assert!(path.get("post").is_some());
+        assert!(
+            openapi["components"]["schemas"]
+                .get("ObjectPlacementView")
+                .is_some()
         );
     }
 }

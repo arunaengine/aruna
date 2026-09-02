@@ -35,7 +35,10 @@ use aruna_tasks::TaskHandle;
 use axum::http::{HeaderValue, header};
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
-use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
+use rmcp::model::{
+    CallToolRequestParams, ClientInfo, GetPromptRequestParams, ProtocolVersion,
+    ReadResourceRequestParams, ResourceContents,
+};
 use rmcp::service::RunningService;
 use rmcp::transport::{
     StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -615,6 +618,16 @@ async fn metadata_explains_refusals() {
     assert!(is_error(&empty_path));
     assert_eq!(code(&empty_path), "Bad request");
 
+    // A group scope resolves that group's non-public Profiles, so it needs READ.
+    let foreign_scope = call(
+        &client,
+        "validate_dataset",
+        json!({ "group_id": unknown, "rocrate": { "@graph": [] } }),
+    )
+    .await;
+    assert!(is_error(&foreign_scope));
+    assert_eq!(code(&foreign_scope), "Forbidden");
+
     client.cancel().await.unwrap();
     shutdown.cancel();
     task.await.unwrap().unwrap();
@@ -664,6 +677,124 @@ async fn compute_validates_input() {
     .await;
     assert!(is_error(&bad_runtime));
     assert_eq!(code(&bad_runtime), "Bad request");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_names_bucket() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let prompts = client.list_prompts(None).await.unwrap();
+    let prompt = prompts
+        .prompts
+        .iter()
+        .find(|prompt| prompt.name == "create-dataset")
+        .unwrap();
+    let names: Vec<&str> = prompt
+        .arguments
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|argument| argument.name.as_str())
+        .collect();
+    assert!(names.contains(&"bucket"));
+    assert!(names.contains(&"prefix"));
+    for argument in prompt.arguments.as_ref().unwrap() {
+        if argument.name == "bucket" || argument.name == "prefix" {
+            assert_ne!(argument.required, Some(true));
+        }
+    }
+
+    let result = client
+        .get_prompt(
+            GetPromptRequestParams::new("create-dataset").with_arguments(arguments(json!({
+                "group_id": fixture.group_id.to_string(),
+                "bucket": "mcp-data",
+                "prefix": "reads/2026/"
+            }))),
+        )
+        .await
+        .unwrap();
+    let text = result.messages[0].content.as_text().unwrap().text.clone();
+    assert!(text.contains("mcp-data"));
+    assert!(text.contains("reads/2026/"));
+    assert!(text.contains("aruna://docs/dataset-authoring"));
+    assert!(text.contains("license"));
+    assert!(text.contains("creator"));
+    assert!(text.contains("Never invent"));
+    assert!(text.contains("s3://bucket/key"));
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_derives_group() {
+    // A bucket alone names the owner; neither argument is refused.
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let result = client
+        .get_prompt(
+            GetPromptRequestParams::new("create-dataset")
+                .with_arguments(arguments(json!({ "bucket": "mcp-data" }))),
+        )
+        .await
+        .unwrap();
+    let text = result.messages[0].content.as_text().unwrap().text.clone();
+    assert!(text.contains("the group that owns bucket mcp-data"));
+
+    let error = client
+        .get_prompt(GetPromptRequestParams::new("create-dataset"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("group_id"));
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn authoring_docs_resource() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+    let uri = "aruna://docs/dataset-authoring";
+
+    let resources = client.list_resources(None).await.unwrap();
+    assert!(
+        resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri == uri)
+    );
+
+    let read = client
+        .read_resource(ReadResourceRequestParams::new(uri))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &read.contents[0] else {
+        panic!("dataset authoring docs must be text");
+    };
+    assert!(text.contains("## Inventory the bucket"));
+    assert!(text.contains("next_cursor"));
+    assert!(text.contains("https://w3id.org/aruna/profile/"));
+
+    let missing = client
+        .read_resource(ReadResourceRequestParams::new("aruna://docs/nothing"))
+        .await;
+    assert!(missing.is_err());
 
     client.cancel().await.unwrap();
     shutdown.cancel();

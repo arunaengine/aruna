@@ -14,7 +14,7 @@ use aruna_core::structs::{
     BucketIdentity, BucketInfo, NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementDecision,
     PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmId, evaluate_placement,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -22,6 +22,7 @@ use tracing::debug;
 use ulid::Ulid;
 
 use super::cache::PolicyCacheStats;
+use super::foreign_owner;
 use super::read::ReadPolicyError;
 use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation};
 
@@ -32,6 +33,9 @@ pub struct PolicyGateConfig {
     /// Refs of the governed record; every one of them must admit the subject.
     pub refs: Vec<PlacementPolicyRef>,
     pub subject: PlacementSubject,
+    /// Group owning the destination bucket. `None` where the destination names
+    /// no bucket of this realm, which skips the ownership check alone.
+    pub group_id: Option<GroupId>,
     pub now_ms: u64,
 }
 
@@ -39,6 +43,9 @@ pub struct PolicyGateConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyGateOutcome {
     pub decision: PlacementDecision,
+    /// The first resolved rule another group owns, refused whatever the
+    /// decision says.
+    pub foreign_owner: Option<Ulid>,
     pub stats: PolicyCacheStats,
 }
 
@@ -50,6 +57,7 @@ pub struct PolicyGateOperation {
     current: Option<PlacementPolicyRef>,
     resolver: Option<ResolvePolicyOperation>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
+    foreign_owner: Option<Ulid>,
     stats: PolicyCacheStats,
     state: GateState,
     result: Option<Result<PolicyGateOutcome, ReadPolicyError>>,
@@ -71,6 +79,7 @@ impl PolicyGateOperation {
             current: None,
             resolver: None,
             resolved: BTreeMap::new(),
+            foreign_owner: None,
             stats: PolicyCacheStats::default(),
             state: GateState::Init,
             result: None,
@@ -131,14 +140,21 @@ impl PolicyGateOperation {
     }
 
     fn evaluate(&mut self) -> Effects {
+        // A rule another group owns governs its owner's buckets only, whatever
+        // its selectors admit.
+        self.foreign_owner = self
+            .config
+            .group_id
+            .and_then(|group_id| foreign_owner(&self.resolved, group_id));
         let decision = evaluate_placement(&self.config.refs, &self.resolved, &self.config.subject);
         self.decide(decision)
     }
 
     fn decide(&mut self, decision: PlacementDecision) -> Effects {
-        let allowed = decision == PlacementDecision::Allowed;
+        let allowed = decision == PlacementDecision::Allowed && self.foreign_owner.is_none();
         self.result = Some(Ok(PolicyGateOutcome {
             decision,
+            foreign_owner: self.foreign_owner,
             stats: self.stats,
         }));
         self.state = GateState::Finish;
@@ -182,6 +198,9 @@ pub enum PolicyGateError {
     /// Ids stay out of the message: a public caller must not learn them.
     #[error("placement policy denies this destination")]
     Denied { policy_ids: Vec<Ulid> },
+    /// A group-owned rule governs only its owner's buckets.
+    #[error("placement policy {policy_id} belongs to another group")]
+    ForeignPolicy { policy_id: Ulid },
     #[error("a referenced placement policy is not available")]
     Unavailable { policy_ids: Vec<Ulid> },
     #[error("a referenced placement policy is invalid or its digest does not match")]
@@ -209,9 +228,11 @@ pub enum PolicyGateError {
 /// Builds the gate for one governed destination. `Ok(None)` means the ref set
 /// is empty, so the ungoverned path runs unchanged and performs no extra I/O.
 /// A node that stopped admitting governed data refuses only a governed write.
+/// `group_id` owns the destination bucket; `None` skips the ownership check.
 pub fn write_gate(
     context: Option<&GateContext>,
     refs: &[PlacementPolicyRef],
+    group_id: Option<GroupId>,
 ) -> Result<Option<PolicyGateOperation>, PolicyGateError> {
     let refs = PlacementPolicyRef::canonical_set(refs)?;
     if refs.is_empty() {
@@ -228,14 +249,19 @@ pub fn write_gate(
         local_node_id: context.subject.node_id,
         refs,
         subject: context.subject.clone(),
+        group_id,
         now_ms: context.now_ms,
     })))
 }
 
-/// Every non-`Allowed` decision blocks. Nothing here is reinterpreted as a
+/// Every non-`Allowed` decision blocks, and a rule another group owns blocks
+/// before the subject is weighed at all. Nothing here is reinterpreted as a
 /// grant, and an incomplete evaluation is never reported as a denial.
-pub fn gate_decision(decision: PlacementDecision) -> Result<(), PolicyGateError> {
-    match decision {
+pub fn gate_decision(outcome: PolicyGateOutcome) -> Result<(), PolicyGateError> {
+    if let Some(policy_id) = outcome.foreign_owner {
+        return Err(PolicyGateError::ForeignPolicy { policy_id });
+    }
+    match outcome.decision {
         PlacementDecision::Allowed => Ok(()),
         PlacementDecision::Denied { policy_ids } => Err(PolicyGateError::Denied { policy_ids }),
         PlacementDecision::Unavailable { policy_ids } => {
@@ -443,6 +469,24 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
+    /// The same rule under one group's ownership.
+    fn owned_policy(seed: u8, location: &str, owner: GroupId) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(owner)
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
     fn subject(location: &str) -> PlacementSubject {
         PlacementSubject {
             node_id: node(9),
@@ -463,12 +507,26 @@ mod tests {
         }
     }
 
+    /// The group owning the destination every gate test writes into.
+    fn group() -> GroupId {
+        Ulid::from_bytes([2u8; 16])
+    }
+
     fn operation(refs: Vec<PlacementPolicyRef>, location: &str) -> PolicyGateOperation {
+        gate_for(refs, location, Some(group()))
+    }
+
+    fn gate_for(
+        refs: Vec<PlacementPolicyRef>,
+        location: &str,
+        group_id: Option<GroupId>,
+    ) -> PolicyGateOperation {
         PolicyGateOperation::new(PolicyGateConfig {
             realm_id: realm(),
             local_node_id: node(9),
             refs,
             subject: subject(location),
+            group_id,
             now_ms: 1_000,
         })
     }
@@ -510,6 +568,72 @@ mod tests {
             }
         );
         assert_eq!(outcome.stats.hits, 2);
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // The subject satisfies the rule, so only its owning group refuses it.
+        let owner = Ulid::from_bytes([8u8; 16]);
+        let rule = owned_policy(1, "eu-west", owner);
+        let mut operation = operation(vec![rule.policy_ref()], "eu-west");
+        operation.start();
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
+        operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            owner,
+        ));
+
+        let outcome = operation.finalize().expect("gate decides");
+        assert_eq!(outcome.decision, PlacementDecision::Allowed);
+        assert_eq!(
+            gate_decision(outcome),
+            Err(PolicyGateError::ForeignPolicy {
+                policy_id: rule.policy().policy_id
+            })
+        );
+    }
+
+    #[test]
+    fn allows_own_group() {
+        // An unowned realm-wide rule and one the destination's own group owns
+        // both govern this write.
+        let realm_wide = policy(1, "eu-west");
+        let owned = owned_policy(2, "eu-west", group());
+        let mut operation = operation(vec![realm_wide.policy_ref(), owned.policy_ref()], "eu-west");
+        operation.start();
+        operation.step(cached(&PolicyCacheEntry::verified(
+            &document(&realm_wide),
+            10,
+        )));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&owned), 10)));
+        operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            group(),
+        ));
+
+        let outcome = operation.finalize().expect("gate decides");
+        assert_eq!(outcome.foreign_owner, None);
+        assert_eq!(gate_decision(outcome), Ok(()));
+    }
+
+    #[test]
+    fn skips_unknown_group() {
+        // Subject revalidation names no destination bucket, so ownership is
+        // decided by the write that registers the copy instead.
+        let owner = Ulid::from_bytes([8u8; 16]);
+        let rule = owned_policy(1, "eu-west", owner);
+        let mut operation = gate_for(vec![rule.policy_ref()], "eu-west", None);
+        operation.start();
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
+        operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            owner,
+        ));
+
+        let outcome = operation.finalize().expect("gate decides");
+        assert_eq!(outcome.foreign_owner, None);
+        assert_eq!(gate_decision(outcome), Ok(()));
     }
 
     #[test]
@@ -583,12 +707,12 @@ mod tests {
         blocked.admitting = false;
         let governed = vec![policy(1, "eu-west").policy_ref()];
 
-        assert_eq!(write_gate(Some(&blocked), &[]), Ok(None));
+        assert_eq!(write_gate(Some(&blocked), &[], Some(group())), Ok(None));
         assert_eq!(
-            write_gate(Some(&blocked), &governed).err(),
+            write_gate(Some(&blocked), &governed, Some(group())).err(),
             Some(PolicyGateError::AdmissionStopped)
         );
-        assert!(write_gate(Some(&context("eu-west")), &governed).is_ok());
+        assert!(write_gate(Some(&context("eu-west")), &governed, Some(group())).is_ok());
     }
 
     #[test]

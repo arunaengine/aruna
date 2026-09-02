@@ -2213,7 +2213,13 @@ async fn merge_batch_event(
             )));
         }
     };
-    let mut status = assess_render(context, event.record.document_id, &render).await;
+    let mut status = assess_render(
+        context,
+        event.record.document_id,
+        event.record.group_id,
+        &render,
+    )
+    .await;
     let findings = violation_count(&status);
     let raw_plan = crate::metadata::raw::prepare_merged_event(
         context,

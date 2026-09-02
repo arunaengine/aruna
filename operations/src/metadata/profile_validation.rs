@@ -15,7 +15,7 @@ use aruna_core::storage_entries::{
     metadata_profile_validation_status_key, metadata_profile_validation_status_write_entry,
 };
 use aruna_core::structs::MetadataRegistryRecord;
-use aruna_core::types::TxnId;
+use aruna_core::types::{GroupId, TxnId};
 use aruna_core::util::unix_timestamp_millis as now_ms;
 use craqle::{CrateViolation, ShaclValidationResult};
 use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -24,10 +24,8 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::MetadataHandle;
-use crate::metadata::api::{
-    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
-};
-use crate::metadata::forward::export_rocrate_routed;
+use crate::metadata::api::ExportMetadataRoCrateResult;
+use crate::metadata::forward::export_profile_routed;
 use crate::metadata::profile_shacl::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
@@ -120,6 +118,34 @@ struct ResolvedProfile {
     shapes: Vec<String>,
 }
 
+/// Which registered Profiles a validation may resolve.
+///
+/// Usability is a property of the registry row alone: a Profile serves the
+/// Datasets of its own group, and everyone once it is public. Whoever reaches
+/// validation already proved WRITE on the Dataset's path in that group, or READ
+/// on the group's metadata for a preview, so no caller identity takes part in
+/// the decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileScope {
+    /// Datasets of this group, so its own Profiles resolve as well.
+    Group(GroupId),
+    /// No group is known, so only public Profiles resolve.
+    PublicOnly,
+}
+
+impl ProfileScope {
+    fn may_use(self, record: &MetadataRegistryRecord) -> bool {
+        record.public
+            || matches!(self, ProfileScope::Group(group_id) if group_id == record.group_id)
+    }
+}
+
+impl From<Option<GroupId>> for ProfileScope {
+    fn from(group_id: Option<GroupId>) -> Self {
+        group_id.map_or(ProfileScope::PublicOnly, ProfileScope::Group)
+    }
+}
+
 pub fn evaluator_name() -> &'static str {
     EVALUATOR_NAME
 }
@@ -144,9 +170,11 @@ pub(crate) fn submission_has_profile_tag(jsonld: &str) -> bool {
 pub async fn validate_submission(
     context: &DriverContext,
     document_id: Ulid,
+    group_id: GroupId,
     jsonld: &str,
 ) -> Result<MetadataProfileValidationStatus, MetadataError> {
-    let status = assess_submission(context, document_id, jsonld).await?;
+    let status =
+        assess_submission(context, document_id, ProfileScope::Group(group_id), jsonld).await?;
     if status.state == MetadataProfileValidationState::Invalid {
         return Err(MetadataError::ProfileValidation(status.findings));
     }
@@ -156,13 +184,14 @@ pub async fn validate_submission(
 async fn assess_submission(
     context: &DriverContext,
     document_id: Ulid,
+    scope: ProfileScope,
     jsonld: &str,
 ) -> Result<MetadataProfileValidationStatus, MetadataError> {
     let (data, root) = data_graph(jsonld)?;
     let Some(requested_iri) = single_profile_tag(&data, &root)? else {
         return Ok(not_profiled_status(document_id));
     };
-    let profile = resolve_registered_profile(context, &requested_iri).await?;
+    let profile = resolve_registered_profile(context, &requested_iri, scope).await?;
     let metadata = evaluator_handle(context, Some(profile.revision))?;
     let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
     Ok(profiled_status(document_id, &profile, assessment.findings))
@@ -173,9 +202,10 @@ async fn assess_submission(
 pub(crate) async fn assess_render(
     context: &DriverContext,
     document_id: Ulid,
+    group_id: GroupId,
     jsonld: &str,
 ) -> MetadataProfileValidationStatus {
-    match assess_submission(context, document_id, jsonld).await {
+    match assess_submission(context, document_id, ProfileScope::Group(group_id), jsonld).await {
         Ok(status) => status,
         Err(MetadataError::ProfileValidation(findings)) => {
             let mut status = stale_status(document_id, "profile_unavailable");
@@ -215,9 +245,11 @@ impl MetadataProfilePreview {
     }
 }
 
-/// Validates a draft without reading or writing any stored document.
+/// Validates a draft without reading or writing any stored document. Without a
+/// group only public Profiles resolve, exactly as a foreign group's write would.
 pub async fn preview_submission(
     context: &DriverContext,
+    group_id: Option<GroupId>,
     jsonld: &str,
 ) -> Result<MetadataProfilePreview, MetadataError> {
     let (data, root) = data_graph(jsonld)?;
@@ -232,7 +264,7 @@ pub async fn preview_submission(
             structural_violations: structural.into_iter().map(structural_violation).collect(),
         });
     };
-    let profile = resolve_registered_profile(context, &requested_iri).await?;
+    let profile = resolve_registered_profile(context, &requested_iri, group_id.into()).await?;
     let metadata = evaluator_handle(context, Some(profile.revision))?;
     let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
     Ok(MetadataProfilePreview {
@@ -571,8 +603,16 @@ pub async fn revalidate_current(
     };
     let merged = merged_jsonld(&raw).map(str::to_owned);
     let mut status = match merged.as_deref() {
-        Some(jsonld) => assess_render(context, record.document_id, jsonld).await,
-        None => assess_submission(context, record.document_id, &raw.jsonld).await?,
+        Some(jsonld) => assess_render(context, record.document_id, record.group_id, jsonld).await,
+        None => {
+            assess_submission(
+                context,
+                record.document_id,
+                ProfileScope::Group(record.group_id),
+                &raw.jsonld,
+            )
+            .await?
+        }
     };
     status.dataset_revision = raw.winning_event_id;
     status.dataset_digest = Some(digest);
@@ -653,6 +693,7 @@ fn merged_jsonld(raw: &MetadataRawRevision) -> Option<&str> {
 async fn resolve_registered_profile(
     context: &DriverContext,
     requested_iri: &str,
+    scope: ProfileScope,
 ) -> Result<ResolvedProfile, MetadataError> {
     let Some(profile_id) = profile_id_from_iri(requested_iri) else {
         return Err(profile_not_registered(requested_iri));
@@ -668,29 +709,27 @@ async fn resolve_registered_profile(
             ));
         }
     };
-    if !record.public || record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id) {
+    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id)
+        || !scope.may_use(&record)
+    {
         return Err(profile_not_registered(requested_iri));
     }
-    let exported = export_rocrate_routed(
-        &Arc::new(context.clone()),
-        record.realm_id,
-        ExportMetadataRoCrateRequest {
-            document_id: profile_id,
-            auth: None,
-            view: MetadataRoCrateExportView::Raw,
-            limit: None,
-            offset: None,
-            after: None,
-        },
-        None,
-        u64::MAX,
-    )
+    let revision = record.last_event_id;
+    if let Some(shapes) = cached_shapes(context, profile_id, revision) {
+        return Ok(ResolvedProfile {
+            id: profile_id,
+            requested_iri: requested_iri.to_string(),
+            revision,
+            shapes: shapes.as_ref().clone(),
+        });
+    }
+    let exported = export_profile_routed(&Arc::new(context.clone()), record.realm_id, profile_id, revision)
         .await
         .map_err(|_| {
             unavailable_error(
                 "profile_unavailable",
                 "the registered Profile revision is temporarily unavailable; retry or remove the Profile tag",
-                Some(record.last_event_id),
+                Some(revision),
             )
         })?;
     let ExportMetadataRoCrateResult::Raw {
@@ -702,46 +741,61 @@ async fn resolve_registered_profile(
         return Err(unavailable_error(
             "profile_unavailable",
             "the registered Profile revision cannot be read; retry or remove the Profile tag",
-            Some(record.last_event_id),
+            Some(revision),
         ));
     };
-    if !holder_record.public
-        || holder_record.document_id != record.document_id
-        || holder_record.last_event_id != record.last_event_id
+    // Usability was decided from the registry row above, so the holder copy is
+    // only fenced on identity and revision here.
+    if holder_record.document_id != record.document_id
+        || holder_record.last_event_id != revision
+        || raw.revision.winning_event_id != revision
     {
         return Err(unavailable_error(
             "profile_unavailable",
             "the registered Profile revision is changing; retry or remove the Profile tag",
-            Some(record.last_event_id),
+            Some(revision),
         ));
     }
     let raw = raw.revision;
-    if raw.winning_event_id != record.last_event_id {
-        return Err(unavailable_error(
-            "profile_unavailable",
-            "the registered Profile revision is changing; retry or remove the Profile tag",
-            Some(record.last_event_id),
-        ));
-    }
     let (profile_data, profile_root) = data_graph(&raw.jsonld).map_err(|_| {
         unavailable_error(
             "profile_unavailable",
             "the registered Profile cannot be read; retry or remove the Profile tag",
-            Some(record.last_event_id),
+            Some(revision),
         )
     })?;
     if !has_type(&profile_data, &profile_root, DX_PROFILE) {
         return Err(profile_not_registered(requested_iri));
     }
-    let shapes = profile_shapes(&profile_data).map_err(|message| {
-        unavailable_error("profile_unavailable", &message, Some(record.last_event_id))
-    })?;
+    let shapes = profile_shapes(&profile_data)
+        .map_err(|message| unavailable_error("profile_unavailable", &message, Some(revision)))?;
+    cache_shapes(context, profile_id, revision, &shapes);
     Ok(ResolvedProfile {
         id: profile_id,
         requested_iri: requested_iri.to_string(),
-        revision: record.last_event_id,
+        revision,
         shapes,
     })
+}
+
+fn cached_shapes(
+    context: &DriverContext,
+    profile_id: Ulid,
+    revision: Ulid,
+) -> Option<Arc<Vec<String>>> {
+    context
+        .metadata_handle
+        .as_ref()?
+        .profile_cache()
+        .get(profile_id, revision)
+}
+
+fn cache_shapes(context: &DriverContext, profile_id: Ulid, revision: Ulid, shapes: &[String]) {
+    if let Some(metadata) = context.metadata_handle.as_ref() {
+        metadata
+            .profile_cache()
+            .insert(profile_id, revision, Arc::new(shapes.to_vec()));
+    }
 }
 
 async fn read_registry(

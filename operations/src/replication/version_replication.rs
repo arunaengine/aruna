@@ -1033,6 +1033,8 @@ pub struct ReplicateObjectVersionOperation {
     reference_metadata: Option<SourceMetadata>,
     group_inputs: GroupRoutingInputs,
     bucket_rules: Vec<StorageRoutingRule>,
+    /// Group owning the destination bucket, read with its routing rules.
+    bucket_group: Option<GroupId>,
     sync: Option<SyncTransferContext>,
     writer_auth_context: Option<AuthContext>,
     reference_advance: Option<ReferenceAdvance>,
@@ -1066,6 +1068,7 @@ impl ReplicateObjectVersionOperation {
             reference_metadata: None,
             group_inputs: GroupRoutingInputs::default(),
             bucket_rules: Vec::new(),
+            bucket_group: None,
             sync: None,
             writer_auth_context: None,
             reference_advance: None,
@@ -1493,6 +1496,7 @@ impl ReplicateObjectVersionOperation {
         }
         match parse_read(event, BucketInfo::from_bytes) {
             Ok(record) => {
+                self.bucket_group = record.as_ref().map(|info| info.group_id);
                 self.bucket_rules = record.map(|info| info.storage_routing).unwrap_or_default();
                 self.read_reference_source()
             }
@@ -1503,7 +1507,11 @@ impl ReplicateObjectVersionOperation {
     /// A reference materializes real bytes on this node, so it passes the same
     /// destination gate an ordinary write does, before the source is read.
     fn read_reference_source(&mut self) -> Effects {
-        match write_gate(self.gate_context.as_ref(), &self.version_policies) {
+        match write_gate(
+            self.gate_context.as_ref(),
+            &self.version_policies,
+            self.bucket_group,
+        ) {
             Ok(None) => self.open_reference_source(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -1537,7 +1545,7 @@ impl ReplicateObjectVersionOperation {
         let decision = gate
             .finalize()
             .map_err(PolicyGateError::from)
-            .and_then(|outcome| gate_decision(outcome.decision));
+            .and_then(gate_decision);
         match decision {
             Ok(()) => self.open_reference_source(),
             Err(error) => self.fail(error.into()),

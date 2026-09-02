@@ -4,11 +4,7 @@ use super::{
     parse_ulid, request_auth, server_error, tool_extras,
 };
 use aruna_core::StructuredId;
-use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, WatchEvent, WatchEventDetail,
-    WatchEventKind,
-};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_forward_document, mint_local_document,
@@ -23,7 +19,7 @@ use aruna_operations::metadata::forward::{
     update_metadata_document_routed,
 };
 use aruna_operations::metadata::profile_validation::preview_submission;
-use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::notifications::watch::emit::emit_metadata_created;
 use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
@@ -75,6 +71,12 @@ pub struct ValidateInput {
     /// `conformsTo` IRI on the root, and File entities use `s3://bucket/key`
     /// contentUrl values.
     pub rocrate: JsonPayload,
+    /// The group the draft would be saved in, from list_groups. A Profile of
+    /// that group is checked even while it is not public; without it only
+    /// public Profiles resolve and a group Profile reports
+    /// `profile_not_registered`.
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -342,7 +344,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Run the structural and Profile checks a metadata write applies and return the verdict without storing anything. Call it before create_dataset and replace_dataset and repair every reported item until `accepted` is true. Structural violations carry a code and a JSON pointer, Profile findings carry the failing SHACL rule and its focus node. It creates and changes nothing.",
+        description = "Run the structural and Profile checks a metadata write applies and return the verdict without storing anything. Call it before create_dataset and replace_dataset and repair every reported item until `accepted` is true. Pass the group_id the dataset will be saved in, otherwise only public Profiles are resolved; the caller must be able to read that group's metadata. Structural violations carry a code and a JSON pointer, Profile findings carry the failing SHACL rule and its focus node. It creates and changes nothing.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -355,15 +357,25 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ValidateInput>,
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
-        metadata_probe(
-            self,
-            &auth,
-            "validate_dataset",
-            tool_extras("validate_dataset", &input)?,
-        )
-        .await?;
+        let extras = tool_extras("validate_dataset", &input)?;
+        let group_id = input.group_id.as_deref().map(parse_group).transpose()?;
+        // A group scope resolves that group's non-public Profiles.
+        match group_id {
+            Some(group_id) => {
+                authorize_tool(
+                    &self.state,
+                    &auth,
+                    metadata_group_path(self, group_id),
+                    Permission::READ,
+                    extras,
+                )
+                .await
+                .map_err(server_error)?;
+            }
+            None => metadata_probe(self, &auth, "validate_dataset", extras).await?,
+        }
         let jsonld = rocrate_json(&input.rocrate.0)?;
-        let preview = preview_submission(&self.state.get_ctx(), &jsonld)
+        let preview = preview_submission(&self.state.get_ctx(), group_id, &jsonld)
             .await
             .map_err(crate::routes::metadata::map_metadata_error)
             .map_err(server_error)?;
@@ -469,21 +481,16 @@ impl McpServer {
         .await
         .map_err(crate::routes::metadata::map_metadata_write_error)
         .map_err(server_error)?;
+        let event_id = created.event_id;
         let record = created.record;
-        emit_resource_watch_event(
+        emit_metadata_created(
             ctx.as_ref(),
-            WatchEvent {
-                event_id: Ulid::generate(),
-                realm_id: self.state.get_realm_id(),
-                kind: WatchEventKind::MetadataCreated,
-                path: format!("meta/{}/{}", record.group_id, record.document_path),
-                actor: auth.user_id,
-                occurred_at_ms: unix_timestamp_millis(),
-                detail: WatchEventDetail::MetadataCreated {
-                    group_id: record.group_id,
-                    document_id: record.document_id,
-                },
-            },
+            self.state.get_realm_id(),
+            auth.user_id,
+            record.group_id,
+            record.document_id,
+            &record.document_path,
+            event_id,
         )
         .await;
         let summary = crate::routes::metadata::MetadataDocumentSummary::from(&record);

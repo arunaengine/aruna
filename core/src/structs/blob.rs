@@ -788,6 +788,25 @@ impl ManagedCopyKey {
     }
 }
 
+/// Why this node holds a copy, recorded when the registration is written.
+/// Provenance for readers only: nothing evaluates it and it grants nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CopyOrigin {
+    /// A client wrote the object here.
+    Write,
+    /// An incoming replica a bucket sync relationship placed here.
+    Sync { relationship_id: Ulid },
+    /// An incoming replica an explicit copy request placed here.
+    Replicate,
+    /// A compute job staged the bytes here to run against them.
+    Staging,
+    /// A read-driven reference advance materialized the bytes here.
+    Reference,
+    /// This node did not record a cause for the copy.
+    #[default]
+    Unknown,
+}
+
 /// This node's registration of one logical version copy. Local inventory only:
 /// it never claims anything about copies held elsewhere in the realm.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -802,6 +821,7 @@ pub struct ManagedCopyRecord {
     pub subject_generation: u64,
     pub registered_at_ms: u64,
     pub state: ManagedCopyState,
+    pub origin: CopyOrigin,
 }
 
 impl ManagedCopyRecord {
@@ -821,6 +841,7 @@ impl ManagedCopyRecord {
             subject_generation: 0,
             registered_at_ms,
             state,
+            origin: CopyOrigin::Unknown,
         })
     }
 
@@ -828,6 +849,11 @@ impl ManagedCopyRecord {
     /// the row can never match a node that advertises a subject.
     pub fn sealed_under(mut self, subject_generation: u64) -> Self {
         self.subject_generation = subject_generation;
+        self
+    }
+
+    pub fn from_origin(mut self, origin: CopyOrigin) -> Self {
+        self.origin = origin;
         self
     }
 

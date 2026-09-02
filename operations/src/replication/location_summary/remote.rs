@@ -197,6 +197,41 @@ mod tests {
     }
 
     #[test]
+    fn carries_peer_verdict() {
+        // Provenance and the peer's own compliance verdict survive the wire.
+        let stream_id = Ulid::from_bytes([5u8; 16]);
+        let relationship_id = Ulid::from_bytes([6u8; 16]);
+        let answer = crate::replication::protocol::LocationSummary {
+            held: true,
+            origin: aruna_core::structs::CopyOrigin::Sync { relationship_id },
+            compliance: crate::replication::protocol::CopyCompliance::Quarantined,
+            ..crate::replication::protocol::LocationSummary::absent()
+        };
+        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        operation.start();
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
+        ));
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
+            stream_id,
+        }));
+
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::MessageReceived {
+                stream_id,
+                payload:
+                    crate::replication::protocol::VersionReplicationMessage::LocationSummaryResponse(
+                        answer.clone(),
+                    )
+                    .to_bytes()
+                    .unwrap(),
+            },
+        ));
+
+        assert_eq!(operation.finalize(), Ok(answer));
+    }
+
+    #[test]
     fn remote_close_rejects() {
         let stream_id = Ulid::from_bytes([5u8; 16]);
         let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));

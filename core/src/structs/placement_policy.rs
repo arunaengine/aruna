@@ -1,12 +1,13 @@
 use crate::NodeId;
 use crate::structs::{DEFAULT_LOCATION, LabelMatch, MAX_NODE_LOCATION_LEN};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
 
 /// Domain separator for the canonical placement-policy digest.
-pub const POLICY_DIGEST_DOMAIN: &[u8] = b"aruna-placement-policy-v1";
+pub const POLICY_DIGEST_DOMAIN: &[u8] = b"aruna-placement-policy-v2";
 /// Domain separator for the advertised placement-subject digest.
 pub const SUBJECT_DIGEST_DOMAIN: &[u8] = b"aruna-placement-subject-v1";
 /// Maximum policy name length in bytes, after trimming.
@@ -35,6 +36,8 @@ pub const MAX_POLICY_REF_INPUT: usize = 2 * MAX_POLICY_REFS;
 pub enum PlacementPolicyError {
     #[error("policy id must not be nil")]
     NilPolicyId,
+    #[error("owner group id must not be nil")]
+    NilOwnerGroup,
     #[error("policy name must be 1..={MAX_POLICY_NAME_LEN} bytes")]
     InvalidName,
     #[error("policy must define 1..={MAX_POLICY_SELECTORS} selectors")]
@@ -74,6 +77,10 @@ pub enum PlacementPolicyError {
 pub struct PlacementPolicy {
     pub policy_id: Ulid,
     pub name: String,
+    /// Group that owns the rule; `None` is realm-wide. An owned rule may only
+    /// be referenced by that group's own buckets and objects, and its
+    /// publication is authorized against that group's admin path.
+    pub owner_group_id: Option<GroupId>,
     /// OR across selectors; fields inside one selector are ANDed.
     pub allowed: Vec<PlacementSelector>,
 }
@@ -176,15 +183,34 @@ impl PlacementPolicy {
         let policy = Self {
             policy_id,
             name,
+            owner_group_id: None,
             allowed,
         };
         policy.validate()?;
         Ok(policy.canonical())
     }
 
+    /// Binds the rule to one group. Only that group's buckets may reference it,
+    /// and only that group's admins may publish it.
+    pub fn owned_by(self, owner_group_id: GroupId) -> Result<Self, PlacementPolicyError> {
+        if owner_group_id.is_nil() {
+            return Err(PlacementPolicyError::NilOwnerGroup);
+        }
+        Ok(Self {
+            owner_group_id: Some(owner_group_id),
+            ..self
+        })
+    }
+
     pub fn validate(&self) -> Result<(), PlacementPolicyError> {
         if self.policy_id.is_nil() {
             return Err(PlacementPolicyError::NilPolicyId);
+        }
+        if self
+            .owner_group_id
+            .is_some_and(|group_id| group_id.is_nil())
+        {
+            return Err(PlacementPolicyError::NilOwnerGroup);
         }
         let name = self.name.trim();
         if name.is_empty() || name.len() > MAX_POLICY_NAME_LEN {
@@ -217,6 +243,7 @@ impl PlacementPolicy {
         Self {
             policy_id: self.policy_id,
             name: self.name.trim().to_string(),
+            owner_group_id: self.owner_group_id,
             allowed: keyed.into_iter().map(|(_, selector)| selector).collect(),
         }
     }
@@ -228,6 +255,13 @@ impl PlacementPolicy {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&canonical.policy_id.to_bytes());
         write_field(&mut bytes, Some(&canonical.name));
+        match canonical.owner_group_id {
+            Some(group_id) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&group_id.to_bytes());
+            }
+            None => bytes.push(0),
+        }
         bytes.extend_from_slice(&(canonical.allowed.len() as u64).to_le_bytes());
         for selector in &canonical.allowed {
             encode_selector(selector, &mut bytes);
@@ -628,6 +662,7 @@ mod tests {
         PlacementPolicy {
             policy_id: Ulid::generate(),
             name: "eu-only".to_string(),
+            owner_group_id: None,
             allowed,
         }
     }

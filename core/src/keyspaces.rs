@@ -84,6 +84,9 @@ pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
 pub const MANAGED_COPY_KEYSPACE: &str = "managed_copies";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
+/// Node-local trail of S3 deletions: delete markers, per-version deletes and
+/// completed purge jobs. Written inside the transaction that performs them.
+pub const BLOB_DELETE_AUDIT_KEYSPACE: &str = "blob_delete_audit";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const USER_ACCESS_OWNER_KEYSPACE: &str = "user_access_owner";

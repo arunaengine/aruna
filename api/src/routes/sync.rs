@@ -197,9 +197,31 @@ pub struct SyncRunResponse {
     pub queued: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+/// The two states a caller may set. `failed` and `detached` are outcomes the
+/// node records itself and are never requested.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiSyncState {
+    Enabled,
+    Paused,
+}
+
+impl From<ApiSyncState> for SyncState {
+    fn from(value: ApiSyncState) -> Self {
+        match value {
+            ApiSyncState::Enabled => Self::Enabled,
+            ApiSyncState::Paused => Self::Paused,
+        }
+    }
+}
+
+/// Both fields are optional; a body may carry either or both.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 pub struct UpdateSyncRequest {
-    pub reference_handling: ApiReferenceHandling,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_handling: Option<ApiReferenceHandling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ApiSyncState>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema, PartialEq, Eq)]
@@ -631,8 +653,8 @@ pub async fn get_sync(
     patch,
     path = "/data/sync/relationships/{id}",
     tag = "data/sync",
-    summary = "Change how a relationship handles referenced objects",
-    description = r#"Changes how an existing sync relationship handles referenced objects.
+    summary = "Pause, resume or change a relationship's reference handling",
+    description = r#"Pauses or resumes an existing sync relationship and changes how it handles referenced objects.
 
 **Authentication**: realm bearer token; a token confined to a path subset is refused. Only the
 creator may change a relationship, and READ on the source bucket is checked as well.
@@ -640,29 +662,47 @@ creator may change a relationship, and READ on the source bucket is checked as w
 **Behavior**
 - Only the source side can be changed: a mirror this node merely holds as a target reads as not
   found, so the call must go to the node that owns the source bucket.
-- Submitting the value the relationship already has returns it unchanged and touches nothing.
+- The body may carry `reference_handling`, `state`, or both; an omitted field stays as it is.
+- `state` of `paused` stops the relationship from queueing further work and copies nothing new;
+  no data is removed on either side, and `enabled` resumes it. Resuming a relationship that had
+  failed also clears its last error and consecutive-failure count.
+- Returning a relationship to `enabled` from any other state also queues one catch-up backfill over
+  its whole scope, because versions written while it was paused or failed were never queued and are
+  otherwise never replicated. A 200 therefore means that job is durably queued as well, and the
+  relationship's `pending_jobs` returns to zero when it has drained.
+- A resume that stores the new state but cannot queue that job answers 500 with the state already
+  changed; the backfill is then queued by calling the run endpoint.
+- Submitting the values the relationship already has returns it unchanged and touches nothing.
 - Otherwise the target's mirror is updated before the local record, so an unreachable target leaves
-  the stored value as it was and the caller may retry.
+  the stored values as they were and the caller may retry.
 - The new handling applies to versions replicated after the change; objects already copied or
   already left as references are not rewritten, and a relationship that has ever used `preserve`
   keeps serving the references it handed out even after switching to `materialize`.
 
 **Limits**
-- Reference handling is the only mutable field; mode, endpoints and delete behavior are fixed at
-  creation.
-- A relationship in `reference` mode accepts only `preserve`."#,
+- Reference handling and state are the only mutable fields; mode, endpoints and delete behavior are
+  fixed at creation.
+- A relationship in `reference` mode accepts only `preserve`.
+- `failed` and `detached` are outcomes the node records itself and cannot be requested."#,
     params(("id" = String, Path, description = "Relationship id as a 26-character ULID; must name a relationship whose source bucket is on this node")),
     request_body(
         content = UpdateSyncRequest,
-        description = "The new reference handling: `materialize` copies referenced source bytes, `preserve` replicates the reference itself, `skip` leaves referenced objects out of the sync.",
-        example = json!({
-            "reference_handling": "preserve"
-        })
+        description = "Optional new reference handling (`materialize` copies referenced source bytes, `preserve` replicates the reference itself, `skip` leaves referenced objects out of the sync) and optional new state (`enabled` or `paused`).",
+        examples(
+            ("Change reference handling" = (
+                summary = "Replicate the reference itself instead of copying the source bytes",
+                value = json!({"reference_handling": "preserve"})
+            )),
+            ("Pause the relationship" = (
+                summary = "Stop queueing further replication work without deleting anything",
+                value = json!({"state": "paused"})
+            ))
+        )
     ),
     responses(
         (
             status = 200,
-            description = "The relationship after the change, or unchanged when the requested handling was already in effect",
+            description = "The relationship after the change, or unchanged when the requested values were already in effect; a resume also has its catch-up backfill queued by now",
             body = SyncRelationshipResponse,
             example = json!({
                 "id": "01JSYNC0123456789ABCDEFGHJ",
@@ -688,6 +728,7 @@ creator may change a relationship, and READ on the source bucket is checked as w
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no READ on the source bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
+        (status = 500, description = "The change could not be stored, or a resume stored the new state but failed to queue its catch-up backfill; that backfill is then queued with the run endpoint", body = ErrorResponse),
         (status = 502, description = "The target node could not be reached to update its mirror; the stored handling is unchanged and the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -707,16 +748,26 @@ pub async fn update_sync(
     ensure_creator(&auth, &relationship)?;
     ensure_source_read(&state, &auth, &relationship).await?;
 
-    let handling = ReferenceHandling::from(request.reference_handling);
-    if relationship.mode == SyncMode::Reference && handling != ReferenceHandling::Preserve {
-        return Err(ServerError::BadRequestReason(
-            "reference sync mode requires preserve reference handling".to_string(),
-        ));
+    let was_enabled = relationship.state == SyncState::Enabled;
+    let mut changed = false;
+    if let Some(requested) = request.reference_handling {
+        let handling = ReferenceHandling::from(requested);
+        if relationship.mode == SyncMode::Reference && handling != ReferenceHandling::Preserve {
+            return Err(ServerError::BadRequestReason(
+                "reference sync mode requires preserve reference handling".to_string(),
+            ));
+        }
+        if relationship.reference_handling != handling {
+            relationship.set_reference_handling(handling);
+            changed = true;
+        }
     }
-    if relationship.reference_handling == handling {
+    if let Some(requested) = request.state {
+        changed |= apply_state(&mut relationship, requested.into());
+    }
+    if !changed {
         return Ok(Json(map_relationship(&relationship)));
     }
-    relationship.set_reference_handling(handling);
     let source_group_id = load_bucket(
         &state,
         relationship
@@ -756,6 +807,11 @@ pub async fn update_sync(
         }
     };
     clear_repair(&state, &updated, SyncMirrorRepairIntent::Reconcile).await;
+    // Nothing was queued while the relationship was not enabled, so resuming it
+    // has to catch up on the versions written in the meantime.
+    if !was_enabled && updated.state == SyncState::Enabled {
+        queue_relationship(&state, &auth, &updated).await?;
+    }
     Ok(Json(map_relationship(&updated)))
 }
 
@@ -1249,6 +1305,20 @@ fn filter_relationships(
         .collect()
 }
 
+/// Applies a requested state and reports whether anything changed. Resuming a
+/// stalled relationship clears its failure, exactly as a run does.
+fn apply_state(relationship: &mut SyncRelationship, requested: SyncState) -> bool {
+    if relationship.state == requested {
+        return false;
+    }
+    if requested == SyncState::Enabled && matches!(relationship.state, SyncState::Failed { .. }) {
+        relationship.status.last_error = None;
+        relationship.status.counters.consecutive_failures = 0;
+    }
+    relationship.state = requested;
+    true
+}
+
 fn ensure_creator(auth: &AuthContext, relationship: &SyncRelationship) -> ServerResult<()> {
     if relationship.created_by == auth.user_id {
         Ok(())
@@ -1558,6 +1628,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn state_toggles_link() {
+        // Pausing and resuming are the only state changes a caller may request,
+        // and resuming a stalled relationship clears its recorded failure.
+        let mut relationship = test_relationship();
+        assert!(apply_state(&mut relationship, SyncState::Paused));
+        assert_eq!(relationship.state, SyncState::Paused);
+        assert!(!apply_state(&mut relationship, SyncState::Paused));
+
+        relationship.state = SyncState::Failed {
+            reason: "peer gone".to_string(),
+        };
+        relationship.status.last_error = Some("peer gone".to_string());
+        relationship.status.counters.consecutive_failures = 3;
+        assert!(apply_state(&mut relationship, SyncState::Enabled));
+        assert_eq!(relationship.state, SyncState::Enabled);
+        assert!(relationship.status.last_error.is_none());
+        assert_eq!(relationship.status.counters.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn refuses_foreign_pause() {
+        // Only the creator may pause a relationship, even with realm auth.
+        let (_storage_dir, state, mut auth, relationship) = test_state().await;
+        drive(
+            StoreSyncRelationshipOperation::new(
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        auth.user_id = UserId::local(Ulid::from_bytes([9u8; 16]), auth.realm_id);
+
+        let error = update_sync(
+            State(state),
+            Extension(Some(auth)),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "sync-test-token",
+            ))),
+            Path(relationship.id.to_string()),
+            Json(UpdateSyncRequest {
+                reference_handling: None,
+                state: Some(ApiSyncState::Paused),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::Forbidden));
+    }
+
+    /// Both ends on the fixture node, so the mirror write stays local.
+    fn local_relationship(node_id: NodeId) -> SyncRelationship {
+        let mut relationship = test_relationship();
+        relationship.target =
+            ArunaArn::s3_object_prefix(relationship.source.realm_id, node_id, "target", "replica/")
+                .unwrap();
+        relationship
+    }
+
+    async fn store_link(state: &ServerState, relationship: &SyncRelationship) {
+        drive(
+            StoreSyncRelationshipOperation::new(
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn patch(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+        relationship: &SyncRelationship,
+        request: UpdateSyncRequest,
+    ) -> ServerResult<Json<SyncRelationshipResponse>> {
+        update_sync(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "sync-test-token",
+            ))),
+            Path(relationship.id.to_string()),
+            Json(request),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn resume_queues_backfill() {
+        // Nothing is queued while a relationship is paused, so versions written
+        // in the meantime only replicate if resuming catches up on them.
+        let (_storage_dir, state, auth, _) = test_state().await;
+        let mut relationship = local_relationship(state.get_node_id());
+        relationship.state = SyncState::Paused;
+        store_link(&state, &relationship).await;
+        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 0);
+
+        let Json(response) = patch(
+            &state,
+            &auth,
+            &relationship,
+            UpdateSyncRequest {
+                reference_handling: None,
+                state: Some(ApiSyncState::Enabled),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.state, "enabled");
+        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 1);
+    }
+
+    #[tokio::test]
+    async fn edit_skips_backfill() {
+        // An enabled relationship already queues its own work, so an unrelated
+        // edit must not enqueue a full pass over its scope.
+        let (_storage_dir, state, auth, _) = test_state().await;
+        let relationship = local_relationship(state.get_node_id());
+        store_link(&state, &relationship).await;
+
+        let Json(response) = patch(
+            &state,
+            &auth,
+            &relationship,
+            UpdateSyncRequest {
+                reference_handling: Some(ApiReferenceHandling::Preserve),
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.reference_handling, ApiReferenceHandling::Preserve);
+        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 0);
+    }
+
     #[tokio::test]
     async fn rejects_invalid_id() {
         let (_storage_dir, state, auth, _) = test_state().await;
@@ -1631,7 +1843,8 @@ mod tests {
                     Extension(None),
                     Path("invalid".to_string()),
                     Json(UpdateSyncRequest {
-                        reference_handling: ApiReferenceHandling::Materialize,
+                        reference_handling: Some(ApiReferenceHandling::Materialize),
+                        state: None,
                     }),
                 )
                 .await,

@@ -1370,7 +1370,8 @@ async fn stage_one_input(
         quota_ceiling,
         routing,
     })
-    .with_inherited_policies(get.source_policies.clone());
+    .with_inherited_policies(get.source_policies.clone())
+    .with_origin(aruna_core::structs::CopyOrigin::Staging);
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }

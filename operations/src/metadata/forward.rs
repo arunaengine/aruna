@@ -76,6 +76,7 @@ use crate::node_info::read_node_info_documents;
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
+use crate::realm_peer::{PeerTrust, ensure_peer_trust};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 use crate::revoke_token::{
@@ -850,6 +851,228 @@ fn ensure_export_limit(
         return Err(MetadataApiError::ServiceUnavailable);
     }
     Ok(())
+}
+
+/// The only document path the Profile validation channel serves. Serving
+/// nothing else is the whole authorization of a fetch that asserts no user.
+const PROFILE_DOCUMENT_PREFIX: &str = "profiles/";
+
+/// Reads one registered Profile at an exact revision so a holder can validate a
+/// Dataset without a caller present.
+///
+/// An infrastructure node reads locally or asks a holder over the purpose-bound
+/// channel, which carries no user. A device holds no bucket, so it reads its own
+/// replica or asks under its owner's authority and never sees more.
+pub(crate) async fn export_profile_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    profile_id: Ulid,
+    expected_revision: Ulid,
+) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return export_profile_local(context.as_ref(), realm_id, profile_id, expected_revision)
+            .await;
+    };
+    let local_node = net_handle.node_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataReadError::Unavailable)?;
+    if !is_sync_eligible(&config, local_node) {
+        return export_as_owner(context, &config, realm_id, local_node, profile_id).await;
+    }
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    let placement = resolve_metadata_id(&config, realm_id, None, profile_id)
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    let holders =
+        read_holder_sets(&config, &placement).map_err(|_| MetadataReadError::Unavailable)?;
+    let holder_count = holders.len();
+    let context = Arc::clone(context);
+    let metadata = context.metadata_handle.clone();
+    let (responses, timed_out) = read_holders(holders, move |holder| {
+        let context = context.clone();
+        let metadata = metadata.clone();
+        Box::pin(async move {
+            if holder == local_node {
+                return export_profile_local(
+                    context.as_ref(),
+                    realm_id,
+                    profile_id,
+                    expected_revision,
+                )
+                .await;
+            }
+            let Some(metadata) = metadata else {
+                return Err(MetadataReadError::Unavailable);
+            };
+            metadata
+                .request_export(
+                    holder,
+                    MetadataTransportMessage::ForwardExportProfile {
+                        config_digest,
+                        profile_id,
+                        expected_revision,
+                    },
+                )
+                .await
+                .unwrap_or(Err(MetadataReadError::Unavailable))
+        })
+    })
+    .await;
+    collect_profile_export(responses, holder_count, timed_out)
+}
+
+/// Any answer is the exact revision that was asked for, so a lagging holder's
+/// not-found never outranks a holder that served that revision.
+fn collect_profile_export(
+    responses: Vec<(
+        NodeId,
+        Result<ExportMetadataRoCrateResult, MetadataReadError>,
+    )>,
+    holder_count: usize,
+    timed_out: bool,
+) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+    let mut not_found = 0usize;
+    let mut success = None;
+    let mut unavailable = timed_out;
+    for (_, response) in responses {
+        match response {
+            Ok(export) => {
+                success.get_or_insert(export);
+            }
+            Err(MetadataReadError::NotFound) => not_found += 1,
+            Err(_) => unavailable = true,
+        }
+    }
+    if let Some(export) = success {
+        return Ok(export);
+    }
+    if !unavailable && holder_count > 0 && not_found == holder_count {
+        Err(MetadataReadError::NotFound)
+    } else {
+        Err(MetadataReadError::Unavailable)
+    }
+}
+
+/// A device never joins the validation channel: it reads its own replica first
+/// and otherwise asks a holder as its owner, so it learns nothing its owner
+/// may not read.
+async fn export_as_owner(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    local_node: NodeId,
+    profile_id: Ulid,
+) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+    let owner = crate::mutate_realm_placement::node_kind(config, local_node)
+        .and_then(|kind| kind.owner())
+        .ok_or(MetadataReadError::Unavailable)?;
+    let auth = AuthContext {
+        user_id: owner,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    export_rocrate_routed(
+        context,
+        realm_id,
+        ExportMetadataRoCrateRequest {
+            document_id: profile_id,
+            auth: Some(auth.clone()),
+            view: MetadataRoCrateExportView::Raw,
+            limit: None,
+            offset: None,
+            after: None,
+        },
+        Some(MetadataAuthToken::internal(auth)),
+        u64::MAX,
+    )
+    .await
+    .map_err(read_error)
+}
+
+/// Serves one registered Profile with no caller at all. The `profiles/` path,
+/// the graph IRI and the revision fence are the whole authorization; every
+/// other document is reported as not found.
+pub async fn export_profile_local(
+    context: &DriverContext,
+    realm_id: RealmId,
+    profile_id: Ulid,
+    expected_revision: Ulid,
+) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+    let record = load_record_by_document(context, profile_id)
+        .await
+        .map_err(read_error)?;
+    if record.realm_id != realm_id
+        || record.document_id != profile_id
+        || !record.document_path.starts_with(PROFILE_DOCUMENT_PREFIX)
+        || record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id)
+    {
+        return Err(MetadataReadError::NotFound);
+    }
+    if record.last_event_id != expected_revision {
+        return Err(MetadataReadError::Unavailable);
+    }
+    let raw = load_raw_view(context, profile_id, None)
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        .ok_or(MetadataReadError::NotFound)?;
+    if raw.revision.winning_event_id != expected_revision {
+        return Err(MetadataReadError::Unavailable);
+    }
+    let dataset_digest = raw.revision.dataset_digest;
+    Ok(ExportMetadataRoCrateResult::Raw {
+        record,
+        raw,
+        dataset_digest,
+    })
+}
+
+/// Whether a peer may ask the validation channel at all. The fetch vouches for
+/// no user, so an owner-bound device is refused and only infrastructure peers
+/// of this realm are admitted.
+pub fn admits_profile_peer(config: &RealmConfigDocument, peer: NodeId, realm_id: RealmId) -> bool {
+    ensure_peer_trust(config, peer, realm_id, PeerTrust::Vouched(None)).is_ok()
+}
+
+/// Answers a peer's Profile fetch. Every gate fails closed and none of them
+/// reads a caller identity, because the channel never carries one.
+pub(crate) async fn apply_forwarded_profile(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+    local_limit: u64,
+) -> Result<(ExportMetadataRoCrateResult, u64), MetadataReadError> {
+    let MetadataTransportMessage::ForwardExportProfile {
+        config_digest,
+        profile_id,
+        expected_revision,
+    } = message
+    else {
+        return Err(MetadataReadError::Unavailable);
+    };
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataReadError::Unavailable)?;
+    if config.digest().ok() != Some(config_digest) {
+        return Err(MetadataReadError::Unavailable);
+    }
+    if !admits_profile_peer(&config, peer, realm_id) {
+        return Err(MetadataReadError::Forbidden);
+    }
+    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), profile_id) {
+        return Err(MetadataReadError::Unavailable);
+    }
+    let export =
+        export_profile_local(context.as_ref(), realm_id, profile_id, expected_revision).await?;
+    ensure_export_limit(&export, local_limit).map_err(read_error)?;
+    Ok((export, local_limit))
 }
 
 /// Creates locally when the origin holds the bucket, otherwise at a holder.

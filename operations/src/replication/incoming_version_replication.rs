@@ -2,7 +2,7 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read,
     build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
 };
-use crate::blob::managed_copy::{ManagedCopyError, register_effect};
+use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
 use crate::placement_policy::{
@@ -34,10 +34,10 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
-    PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey,
-    ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits,
-    RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
+    BucketInfo, CopyOrigin, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey,
+    NodeRouting, PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate,
+    ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend,
+    RoCrateLimits, RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
     blob_bucket_permission_path, blob_object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;
@@ -862,7 +862,7 @@ impl IncomingVersionReplicationOperation {
             .gated_bucket
             .take()
             .map(|gated| gated.sealed_under(self.gate_context.as_ref(), !refs.is_empty()));
-        match write_gate(self.gate_context.as_ref(), &refs) {
+        match write_gate(self.gate_context.as_ref(), &refs, self.destination_group_id) {
             Ok(None) => self.reply_negotiation(result),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -902,7 +902,7 @@ impl IncomingVersionReplicationOperation {
             Ok(outcome) => outcome,
             Err(error) => return self.reject_negotiation(PolicyGateError::from(error).into()),
         };
-        match gate_decision(outcome.decision) {
+        match gate_decision(outcome) {
             Ok(()) => self.reply_negotiation(result),
             Err(error) => self.reject_negotiation(error.into()),
         }
@@ -973,6 +973,21 @@ impl IncomingVersionReplicationOperation {
     fn check_drift(&mut self) -> Effects {
         self.state = IncomingVersionReplicationState::CheckDrift;
         smallvec![drift_reads(&self.manifest.bucket, self.txn_id)]
+    }
+
+    /// Why this replica lands here, from what this node itself observed: an
+    /// advance of a reference it serves, a standing relationship the sender
+    /// names, or an explicitly requested copy.
+    fn copy_origin(&self) -> CopyOrigin {
+        if self.manifest.reference_advance.is_some() {
+            return CopyOrigin::Reference;
+        }
+        match self.manifest.origin.as_ref() {
+            Some(origin) => CopyOrigin::Sync {
+                relationship_id: origin.relationship_id,
+            },
+            None => CopyOrigin::Replicate,
+        }
     }
 
     /// Subject generation the gate admitted this replica under; zero when the
@@ -1376,12 +1391,15 @@ impl IncomingVersionReplicationOperation {
                 Err(err) => return self.fail(err),
             };
             match register_effect(
-                version_key,
-                self.local_node_id,
-                &location,
-                &self.gated_refs,
-                self.sealed_subject(),
-                self.manifest.version_id.timestamp_ms(),
+                CopyRegistration {
+                    version: version_key,
+                    node_id: self.local_node_id,
+                    location: &location,
+                    policies: &self.gated_refs,
+                    origin: self.copy_origin(),
+                    subject_generation: self.sealed_subject(),
+                    registered_at_ms: self.manifest.version_id.timestamp_ms(),
+                },
                 self.txn_id,
             ) {
                 Ok(register) => self.pending_version_effects.push_back(register),

@@ -4,8 +4,8 @@ use crate::blob::blob_keyspace_helper::{
 };
 use crate::blob::cleanup::PendingCleanup;
 use crate::blob::managed_copy::{
-    CopyRequest, ManagedCopyError, register_effect, serve_reads, split_serve_reads,
-    validate_registration,
+    CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
+    split_serve_reads, validate_registration,
 };
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::{
@@ -30,9 +30,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, ManagedCopyKey, PathRestriction, PlacementPolicyError,
-    PlacementPolicyRef, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta,
-    VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
+    BucketInfo, CopyOrigin, CurrentVersionPointer, ManagedCopyKey, PathRestriction,
+    PlacementPolicyError, PlacementPolicyRef, RealmId, RoCrateLimits, RoutingError,
+    RoutingSnapshot, UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -211,6 +211,8 @@ pub struct PutObjectOperation {
     /// before the replay may hand back its location.
     replay_policies: Vec<PlacementPolicyRef>,
     replay_location: Option<BackendLocation>,
+    /// Recorded on the registration so a reader learns why the copy is here.
+    origin: CopyOrigin,
 }
 
 impl PutObjectOperation {
@@ -246,7 +248,15 @@ impl PutObjectOperation {
             gated_bucket: None,
             replay_policies: Vec::new(),
             replay_location: None,
+            origin: CopyOrigin::Write,
         }
+    }
+
+    /// Why this write places a copy here. A plain client write records itself;
+    /// compute input staging names itself instead.
+    pub fn with_origin(mut self, origin: CopyOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// The destination this write is evaluated against. Omitting it leaves the
@@ -451,7 +461,10 @@ impl PutObjectOperation {
             GatedBucket::observe(bucket.as_ref())
                 .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
-        match write_gate(self.gate_context.as_ref(), &refs) {
+        let group_id = bucket
+            .as_ref()
+            .map_or(self.config.group_id, |bucket| bucket.group_id);
+        match write_gate(self.gate_context.as_ref(), &refs, Some(group_id)) {
             Ok(None) => self.check_purge_fence_before_write(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -486,7 +499,7 @@ impl PutObjectOperation {
             Ok(outcome) => outcome,
             Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
         };
-        match gate_decision(outcome.decision) {
+        match gate_decision(outcome) {
             Ok(()) => self.check_purge_fence_before_write(),
             Err(error) => self.emit_error(error.into()),
         }
@@ -926,16 +939,19 @@ impl PutObjectOperation {
             return self.emit_error(PutObjectError::MissingOutput);
         };
         let effect = match register_effect(
-            VersionKey::new(
-                self.config.request.bucket.clone(),
-                self.config.request.key.clone(),
-                version_id,
-            ),
-            self.config.node_id,
-            &location,
-            &self.sealed_policies,
-            self.sealed_subject(),
-            version_id.timestamp_ms(),
+            CopyRegistration {
+                version: VersionKey::new(
+                    self.config.request.bucket.clone(),
+                    self.config.request.key.clone(),
+                    version_id,
+                ),
+                node_id: self.config.node_id,
+                location: &location,
+                policies: &self.sealed_policies,
+                origin: self.origin,
+                subject_generation: self.sealed_subject(),
+                registered_at_ms: version_id.timestamp_ms(),
+            },
             self.txn_id,
         ) {
             Ok(effect) => effect,
@@ -3613,6 +3629,24 @@ mod gate_test {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
+    /// The same rule under one group's ownership.
+    fn owned_policy(location: &str, owner: Ulid) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(owner)
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
     fn gate(location: &str) -> GateContext {
         GateContext {
             realm_id: realm(),
@@ -3916,6 +3950,36 @@ mod gate_test {
         assert!(matches!(
             operation.finalize(),
             Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
+        ));
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // A copy inherits a rule another group owns into this group's bucket;
+        // the subject satisfies it, so only the ownership refuses the write.
+        let rule = owned_policy("eu-west", Ulid::from_bytes([8u8; 16]));
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        operation.start();
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(!materializes(&effects));
+
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(read(Some(ByteView::from(cached))));
+        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            Ulid::from_bytes([8u8; 16]),
+        ));
+
+        assert!(!materializes(&effects));
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::ForeignPolicy { .. }
+            ))
         ));
     }
 

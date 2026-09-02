@@ -11,7 +11,7 @@ use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BucketIdentity, CurrentVersionPointer, Permission, PlacementPolicyRef,
-    PlacementSubject, PolicyRefMode, PolicyResolution, policy_admin_path,
+    PlacementSubject, PolicyRefMode, PolicyResolution, group_admin_path, policy_admin_path,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -23,6 +23,7 @@ use ulid::Ulid;
 
 use crate::blob::blob_keyspace_helper::HeadAliasContext;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement_policy::foreign_owner;
 use crate::placement_policy::read::ReadPolicyError;
 use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
@@ -48,8 +49,11 @@ pub struct PolicyMutationConfig {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PolicyMutationError {
-    #[error("caller may not administer the realm configuration")]
+    #[error("caller may not administer placement for this bucket")]
     Unauthorized,
+    /// A group-owned rule governs only its owner's buckets.
+    #[error("placement policy {policy_id} belongs to another group")]
+    ForeignPolicy { policy_id: Ulid },
     /// The ref was not authenticated, so no version was minted.
     #[error("placement policy {policy_id} could not be resolved")]
     PolicyUnavailable {
@@ -68,6 +72,7 @@ pub enum PolicyMutationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MutationState {
     Init,
+    AuthorizeGroup,
     Authorize,
     Resolve,
     Mint,
@@ -108,6 +113,20 @@ impl PolicyMutationOperation {
         self.successor_version_id
     }
 
+    fn authorize(&self, path: String) -> Effects {
+        let auth_config = CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path,
+            required_permission: Permission::WRITE,
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(auth_config),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
+    }
+
     fn fail(&mut self, error: PolicyMutationError) -> Effects {
         let cleanup = self.abort();
         self.state = MutationState::Error;
@@ -136,7 +155,10 @@ impl PolicyMutationOperation {
                 if let Some(resolver) = self.resolver.take() {
                     self.resolved = resolver.into_resolutions();
                 }
-                self.start_mint()
+                match foreign_owner(&self.resolved, self.config.context.group_id) {
+                    Some(policy_id) => self.fail(PolicyMutationError::ForeignPolicy { policy_id }),
+                    None => self.start_mint(),
+                }
             }
             ResolveStep::Failed(policy_ref, source) => {
                 self.resolver = None;
@@ -180,23 +202,34 @@ impl Operation for PolicyMutationOperation {
 
     fn start(&mut self) -> Effects {
         self.state = MutationState::Authorize;
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
-            path: policy_admin_path(self.config.auth_context.realm_id),
-            required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+        self.authorize(policy_admin_path(self.config.auth_context.realm_id))
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             MutationState::Init => self.start(),
             MutationState::Authorize => {
+                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
+                else {
+                    return self.fail(PolicyMutationError::InvalidEvent);
+                };
+                match allowed {
+                    Ok(true) => self.resolve_refs(),
+                    // A group administrator governs that group's own objects.
+                    Ok(false) => {
+                        self.state = MutationState::AuthorizeGroup;
+                        self.authorize(group_admin_path(
+                            self.config.auth_context.realm_id,
+                            self.config.context.group_id,
+                        ))
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Policy mutation authorization check failed");
+                        self.fail(PolicyMutationError::Unauthorized)
+                    }
+                }
+            }
+            MutationState::AuthorizeGroup => {
                 let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
                 else {
                     return self.fail(PolicyMutationError::InvalidEvent);
@@ -269,9 +302,9 @@ impl Operation for PolicyMutationOperation {
 
     fn expected_error(error: &Self::Error) -> bool {
         match error {
-            PolicyMutationError::Unauthorized | PolicyMutationError::PolicyUnavailable { .. } => {
-                true
-            }
+            PolicyMutationError::Unauthorized
+            | PolicyMutationError::ForeignPolicy { .. }
+            | PolicyMutationError::PolicyUnavailable { .. } => true,
             PolicyMutationError::Successor(error) => {
                 MintPolicySuccessorOperation::expected_error(error)
             }
@@ -375,14 +408,81 @@ mod tests {
         })
     }
 
+    fn group_id() -> Ulid {
+        Ulid::from_bytes([2u8; 16])
+    }
+
+    fn owned(seed: u8, owner: Ulid) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: Some(node_id()),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(owner)
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
     #[test]
     fn denies_non_admin() {
+        // Neither realm-configuration write nor admin write on the object's
+        // group leaves nothing to open.
         let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
         operation.start();
+        operation.step(authorized(false));
         let effects = operation.step(authorized(false));
 
         assert!(effects.is_empty(), "a denied caller opens no transaction");
         assert_eq!(operation.finalize(), Err(PolicyMutationError::Unauthorized));
+    }
+
+    #[test]
+    fn accepts_group_admin() {
+        // The bucket's own group administers its objects' rules.
+        let policy = owned(1, group_id());
+        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        operation.start();
+        operation.step(authorized(false));
+        operation.step(authorized(true));
+        operation.step(cached(&policy));
+        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+            realm_id(),
+            group_id(),
+        ));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // A rule another group owns never governs this object.
+        let foreign = Ulid::from_bytes([9u8; 16]);
+        let policy = owned(1, foreign);
+        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        operation.start();
+        operation.step(authorized(true));
+        operation.step(cached(&policy));
+        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+            realm_id(),
+            foreign,
+        ));
+
+        assert!(effects.is_empty(), "a foreign rule opens no transaction");
+        assert_eq!(
+            operation.finalize(),
+            Err(PolicyMutationError::ForeignPolicy {
+                policy_id: Ulid::from_bytes([1u8; 16])
+            })
+        );
     }
 
     #[test]

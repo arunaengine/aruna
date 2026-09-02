@@ -9,6 +9,7 @@
 
 use crate::blob::blob_keyspace_helper::HeadAliasContext;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement_policy::foreign_owner;
 use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
     MintPolicySuccessorOperation, SealedDefault, SuccessorError, SuccessorOutcome, SuccessorPlan,
@@ -23,9 +24,9 @@ use aruna_core::structs::{
     POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, Permission, PlacementPolicyRef,
     PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkRun,
     PolicyBulkStatus, PolicyIntentOutcome, PolicyRefMode, PolicyResolution, VersionKey,
-    policy_admin_path,
+    group_admin_path, policy_admin_path,
 };
-use aruna_core::types::{Effects, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -40,6 +41,8 @@ pub const BULK_PAGE_LIMIT: usize = 128;
 pub struct BulkConfig {
     pub operation_id: Ulid,
     pub bucket: String,
+    /// Group the bucket belongs to, so a group administrator may run it.
+    pub group_id: GroupId,
     pub auth_context: AuthContext,
     pub subject: PlacementSubject,
     pub start_after: Option<Key>,
@@ -85,6 +88,9 @@ pub enum BulkError {
     NoSuchBucket,
     #[error("caller may not administer the realm configuration")]
     Unauthorized,
+    /// A group-owned rule governs only its owner's buckets.
+    #[error("placement policy {policy_id} belongs to another group")]
+    ForeignPolicy { policy_id: Ulid },
     #[error("the run was sealed against a different bucket record")]
     BucketChanged,
     #[error("unexpected event during the bulk pass")]
@@ -95,6 +101,7 @@ pub enum BulkError {
 enum BulkState {
     Init,
     Authorize,
+    AuthorizeGroup,
     StartSeal,
     ReadSeal,
     WriteRun,
@@ -205,6 +212,27 @@ impl PolicyBulkOperation {
         self.config.limit.clamp(1, BULK_PAGE_LIMIT)
     }
 
+    fn authorize(&self, path: String) -> Effects {
+        let auth_config = CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path,
+            required_permission: Permission::WRITE,
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(auth_config),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
+    }
+
+    fn start_seal(&mut self) -> Effects {
+        self.state = BulkState::StartSeal;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
     fn fail(&mut self, error: BulkError) -> Effects {
         let cleanup = self.abort();
         self.state = BulkState::Error;
@@ -262,6 +290,11 @@ impl PolicyBulkOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.fail(error.into()),
         };
+        // The authorized group was read before this transaction: a bucket
+        // recreated for another group must not inherit that admin's authority.
+        if bucket.group_id != self.config.group_id {
+            return self.fail(BulkError::BucketChanged);
+        }
         let stored = match run_value
             .as_ref()
             .map(|value| PolicyBulkRun::from_bytes(value.as_ref()))
@@ -368,7 +401,10 @@ impl PolicyBulkOperation {
                 if let Some(resolver) = self.resolver.take() {
                     self.resolved.extend(resolver.into_resolutions());
                 }
-                self.scan_heads()
+                match foreign_owner(&self.resolved, self.config.group_id) {
+                    Some(policy_id) => self.fail(BulkError::ForeignPolicy { policy_id }),
+                    None => self.scan_heads(),
+                }
             }
         }
     }
@@ -745,17 +781,7 @@ impl Operation for PolicyBulkOperation {
 
     fn start(&mut self) -> Effects {
         self.state = BulkState::Authorize;
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
-            path: policy_admin_path(self.config.auth_context.realm_id),
-            required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+        self.authorize(policy_admin_path(self.config.auth_context.realm_id))
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -776,12 +802,28 @@ impl Operation for PolicyBulkOperation {
                     return self.fail(BulkError::InvalidEvent);
                 };
                 match allowed {
-                    Ok(true) => {
-                        self.state = BulkState::StartSeal;
-                        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                            read: false
-                        })]
+                    Ok(true) => self.start_seal(),
+                    // A group administrator governs that group's own buckets.
+                    Ok(false) => {
+                        self.state = BulkState::AuthorizeGroup;
+                        self.authorize(group_admin_path(
+                            self.config.auth_context.realm_id,
+                            self.config.group_id,
+                        ))
                     }
+                    Err(error) => {
+                        warn!(error = %error, "Bulk policy authorization check failed");
+                        self.fail(BulkError::Unauthorized)
+                    }
+                }
+            }
+            BulkState::AuthorizeGroup => {
+                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
+                else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                match allowed {
+                    Ok(true) => self.start_seal(),
                     Ok(false) => self.fail(BulkError::Unauthorized),
                     Err(error) => {
                         warn!(error = %error, "Bulk policy authorization check failed");
@@ -914,7 +956,10 @@ impl Operation for PolicyBulkOperation {
     fn expected_error(error: &Self::Error) -> bool {
         matches!(
             error,
-            BulkError::Unauthorized | BulkError::NoSuchBucket | BulkError::BucketChanged
+            BulkError::Unauthorized
+                | BulkError::ForeignPolicy { .. }
+                | BulkError::NoSuchBucket
+                | BulkError::BucketChanged
         )
     }
 }
@@ -924,7 +969,7 @@ impl Operation for PolicyBulkOperation {
 /// keeps the object as a resumable gap.
 #[cfg(test)]
 mod tests {
-    use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, PolicyBulkOperation};
+    use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
     use crate::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -935,12 +980,13 @@ mod tests {
     use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::effects::StorageEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
         PLACEMENT_POLICY_CACHE_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
+    use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         Actor, AuthContext, Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion,
@@ -949,7 +995,7 @@ mod tests {
         PolicyBlockedReason, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkStatus,
         PolicyIntentOutcome, RealmId, RoutingSnapshot, VerifiedPolicy, VersionKey,
     };
-    use aruna_core::types::{GroupId, Key, NodeId, UserId};
+    use aruna_core::types::{GroupId, Key, NodeId, UserId, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -1176,6 +1222,7 @@ mod tests {
         BulkConfig {
             operation_id,
             bucket: BUCKET.to_string(),
+            group_id: fixture.group_id,
             auth_context: auth(fixture),
             subject: subject(fixture.node_id, "eu-west"),
             start_after: None,
@@ -1319,6 +1366,64 @@ mod tests {
             panic!("unexpected storage read result");
         };
         value.map(|value| PolicyBulkIntent::from_bytes(value.as_ref()).expect("intent decodes"))
+    }
+
+    fn bulk_config(group_id: GroupId) -> BulkConfig {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        BulkConfig {
+            operation_id: Ulid::generate(),
+            bucket: BUCKET.to_string(),
+            group_id,
+            auth_context: AuthContext {
+                user_id: UserId::local(Ulid::generate(), realm_id),
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            subject: subject(iroh::SecretKey::from_bytes(&[7u8; 32]).public(), "eu-west"),
+            start_after: None,
+            limit: BULK_PAGE_LIMIT,
+            now_ms: 1_000,
+            created_at: SystemTime::now(),
+        }
+    }
+
+    fn stored_bucket(group_id: GroupId) -> Value {
+        let bucket = BucketInfo {
+            group_id,
+            created_at: UNIX_EPOCH,
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        };
+        Value::from(bucket.to_bytes().expect("bucket encodes"))
+    }
+
+    #[test]
+    fn rejects_regrouped_bucket() {
+        // A bucket deleted and recreated for another group must not stay under
+        // the authority of the group this run authorized.
+        let mut operation = PolicyBulkOperation::new(bulk_config(Ulid::generate()));
+        operation.state = BulkState::ReadSeal;
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    Key::from(Vec::<u8>::new()),
+                    Some(stored_bucket(Ulid::generate())),
+                ),
+                (Key::from(Vec::<u8>::new()), None),
+            ],
+        }));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Write { .. })))
+        );
+        assert_eq!(operation.finalize(), Err(BulkError::BucketChanged));
     }
 
     #[tokio::test]

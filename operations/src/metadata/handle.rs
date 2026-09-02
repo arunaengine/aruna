@@ -56,6 +56,7 @@ use ulid::Ulid;
 
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
+use super::profile_cache::ProfileCache;
 use super::profile_shacl::{
     ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
 };
@@ -292,6 +293,7 @@ struct MetadataInner {
     document_sync_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
     query_cache: MetadataQueryCache,
+    profile_cache: ProfileCache,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
@@ -900,6 +902,7 @@ impl MetadataHandle {
                 document_sync_persist_policy: metadata_options.document_sync_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
                 query_cache: MetadataQueryCache::new(),
+                profile_cache: ProfileCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
@@ -1004,6 +1007,16 @@ impl MetadataHandle {
 
     pub(super) fn query_cache(&self) -> &MetadataQueryCache {
         &self.inner.query_cache
+    }
+
+    pub(super) fn profile_cache(&self) -> &ProfileCache {
+        &self.inner.profile_cache
+    }
+
+    /// Profile revisions this node fetched for validation since start. A
+    /// second validation of the same revision must not raise it.
+    pub fn profile_loads(&self) -> u64 {
+        self.inner.profile_cache.loads()
     }
 
     pub(crate) fn visibility_generation(&self) -> u64 {
@@ -1804,6 +1817,39 @@ impl MetadataHandle {
             forward @ MetadataTransportMessage::ForwardExportDocument { .. } => {
                 Box::pin(async {
                     match super::forward::apply_forwarded_export(
+                        context,
+                        peer,
+                        forward,
+                        metadata_bytes,
+                    )
+                    .await
+                    {
+                        Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
+                            Ok(bytes) => {
+                                let length = bytes.len() as u64;
+                                if length > metadata_body_limit(metadata_bytes) {
+                                    MetadataTransportMessage::ForwardedExport {
+                                        result: Err(MetadataReadError::Unavailable),
+                                    }
+                                } else {
+                                    response_body = Some(bytes);
+                                    MetadataTransportMessage::ForwardedExport { result: Ok(length) }
+                                }
+                            }
+                            Err(_) => MetadataTransportMessage::ForwardedExport {
+                                result: Err(MetadataReadError::Unavailable),
+                            },
+                        },
+                        Err(error) => {
+                            MetadataTransportMessage::ForwardedExport { result: Err(error) }
+                        }
+                    }
+                })
+                .await
+            }
+            forward @ MetadataTransportMessage::ForwardExportProfile { .. } => {
+                Box::pin(async {
+                    match super::forward::apply_forwarded_profile(
                         context,
                         peer,
                         forward,
@@ -4903,6 +4949,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedWriteUnavailable => "forwarded_write_unavailable",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
+        MetadataTransportMessage::ForwardExportProfile { .. } => "forward_export_profile",
         MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
         MetadataTransportMessage::QueryDocument { .. } => "query_document",
         MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
@@ -7100,6 +7147,8 @@ async fn send_export_request(
 {
     let metadata_bytes = match &message {
         MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => *metadata_bytes,
+        // The channel carries one Profile document; the holder caps the body.
+        MetadataTransportMessage::ForwardExportProfile { .. } => u64::MAX,
         _ => {
             return Err(MetadataRequestError::definitely_not_sent(
                 MetadataError::InvalidInput("expected a metadata export request".to_string()),

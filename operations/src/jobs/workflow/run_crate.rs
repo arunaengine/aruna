@@ -24,6 +24,7 @@ use crate::create_metadata_document::{
 use crate::driver::drive;
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use crate::notifications::watch::emit::emit_metadata_created;
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
@@ -174,6 +175,16 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     {
         Ok(result) => {
             let resource = result.record.document_id.to_string();
+            emit_metadata_created(
+                &ctx.driver,
+                parent.created_by.realm_id,
+                parent.created_by,
+                result.record.group_id,
+                result.record.document_id,
+                &result.record.document_path,
+                result.event_id,
+            )
+            .await;
             (
                 RunCrateStatus::Written {
                     resource: resource.clone(),

@@ -163,6 +163,9 @@ pub struct WatchResponse {
     pub path_prefix: String,
     pub events: Vec<String>,
     pub created_at_ms: u64,
+    /// False when the owner may no longer read the watched prefix, so the watch
+    /// no longer delivers. Its details are withheld while it is unauthorized.
+    pub authorized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -218,7 +221,14 @@ fn watch_response(subscription: &WatchSubscription) -> WatchResponse {
             .map(|kind| kind.name().to_string())
             .collect(),
         created_at_ms: subscription.created_at_ms,
+        authorized: watch_authorized(subscription),
     }
+}
+
+/// The holder withholds the details of a watch its owner may no longer read but
+/// keeps the row, so an emptied prefix is the "no longer delivering" marker.
+fn watch_authorized(subscription: &WatchSubscription) -> bool {
+    !subscription.path_prefix.is_empty()
 }
 
 fn record_watch_creation_denial(state: &ServerState, reason: WatchAuthorizationMetricReason) {
@@ -1079,6 +1089,8 @@ user's own subscriptions and a path-restricted token is refused.
   recorded at creation.
 - Authorization is re-evaluated when an event is delivered, so a listed watch may stop producing
   notifications after a permission change without disappearing here.
+- Such a watch is reported with `authorized` false and without its prefix, events or creation time,
+  so its owner can still see it and delete it to release quota.
 
 **Limits**
 - The list is complete and unpaginated, because a user may hold at most 50 watches."#,
@@ -1093,7 +1105,15 @@ user's own subscriptions and a path-restricted token is refused.
                         "id": "01JWATCH0123456789ABCDEFGH",
                         "path_prefix": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/",
                         "events": ["data_uploaded"],
-                        "created_at_ms": 1775744591123_i64
+                        "created_at_ms": 1775744591123_i64,
+                        "authorized": true
+                    },
+                    {
+                        "id": "01JWATCH0123456789ABCDEFGJ",
+                        "path_prefix": "",
+                        "events": [],
+                        "created_at_ms": 0,
+                        "authorized": false
                     }
                 ]
             })
@@ -1144,6 +1164,8 @@ permission path, evaluated against the caller's current grants at creation time.
 **Limits**
 - The prefix must be non-empty and at most 1024 bytes, must carry no leading slash, must keep the
   slash after the bucket or metadata group, and at least one event name must be given.
+- A metadata prefix that ends right after the group, `meta/{group_id}/`, watches every dataset of
+  that group.
 - Metadata and data event kinds cannot be combined, because their canonical namespaces differ.
 - A user may hold at most 50 watches."#,
     request_body(
@@ -1163,7 +1185,8 @@ permission path, evaluated against the caller's current grants at creation time.
                 "id": "01JWATCH0123456789ABCDEFGH",
                 "path_prefix": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/",
                 "events": ["data_uploaded"],
-                "created_at_ms": 1775744591123_i64
+                "created_at_ms": 1775744591123_i64,
+                "authorized": true
             })
         ),
         (status = 400, description = "Invalid or non-canonical path prefix, prefix longer than 1024 bytes, empty event list, or invalid event name", body = ErrorResponse),
@@ -2206,6 +2229,56 @@ mod tests {
             .await
             .expect("list after delete succeeds");
         assert!(empty.watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lists_unauthorized_watch() {
+        // Losing READ stops delivery; the row stays listed so its owner can see
+        // and delete it, with its details withheld.
+        let realm_id = realm_id(31);
+        let holder = node(31);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let owner = UserId::new(Ulid::generate(), realm_id);
+        let reader = UserId::new(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
+        install_group_authorization(&state, realm_id, group_id, owner, &[reader]).await;
+
+        let (status, created) = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(reader, realm_id))),
+            bearer(),
+            Json(CreateWatchRequest {
+                path_prefix: format!("meta/{group_id}/"),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect("group wide watch is accepted");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(created.authorized);
+
+        let (_, listed) = list_watches(
+            State(state.clone()),
+            Extension(Some(auth_for(reader, realm_id))),
+        )
+        .await
+        .expect("list succeeds");
+        assert_eq!(listed.watches.len(), 1);
+        assert!(listed.watches[0].authorized);
+
+        install_group_authorization(&state, realm_id, group_id, owner, &[]).await;
+
+        let (_, listed) = list_watches(
+            State(state.clone()),
+            Extension(Some(auth_for(reader, realm_id))),
+        )
+        .await
+        .expect("list after revocation succeeds");
+        assert_eq!(listed.watches.len(), 1);
+        assert_eq!(listed.watches[0].id, created.id);
+        assert!(!listed.watches[0].authorized);
+        assert!(listed.watches[0].path_prefix.is_empty());
     }
 
     #[tokio::test]

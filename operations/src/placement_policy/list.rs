@@ -9,9 +9,9 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, Permission, PlacementPolicyDocument, RealmId, policy_admin_path,
+    AuthContext, Permission, PlacementPolicyDocument, RealmId, group_admin_path, policy_admin_path,
 };
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -26,6 +26,11 @@ pub const POLICY_LIST_LIMIT: usize = 200;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListPoliciesInput {
     pub auth_context: AuthContext,
+    /// Names a group: the page then holds the realm-wide rules plus that
+    /// group's own, and administering the group is enough to read it. Without
+    /// it the caller must administer the realm configuration and sees every
+    /// rule this node holds.
+    pub group_id: Option<GroupId>,
     /// Exclusive cursor: the storage key of the last policy of the previous page.
     pub start_after: Option<Key>,
     pub limit: usize,
@@ -109,8 +114,15 @@ impl ListPoliciesOperation {
                 Ok(document) => document,
                 Err(error) => return self.fail(error.into()),
             };
-            // A row stored for another realm is not this caller's rule.
-            if document.realm_id == realm_id {
+            // A row stored for another realm, or owned by a group the caller
+            // did not ask about, is not part of this page.
+            let visible = document.realm_id == realm_id
+                && match (self.input.group_id, document.policy.owner_group_id) {
+                    (_, None) => true,
+                    (Some(group_id), Some(owner)) => owner == group_id,
+                    (None, Some(_)) => true,
+                };
+            if visible {
                 policies.push(document);
             }
         }
@@ -130,9 +142,13 @@ impl Operation for ListPoliciesOperation {
 
     fn start(&mut self) -> Effects {
         self.state = ListState::Authorize;
+        let realm_id = self.input.auth_context.realm_id;
         let auth_config = CheckPermissionsConfig {
             auth_context: self.input.auth_context.clone(),
-            path: policy_admin_path(self.input.auth_context.realm_id),
+            path: match self.input.group_id {
+                Some(group_id) => group_admin_path(realm_id, group_id),
+                None => policy_admin_path(realm_id),
+            },
             required_permission: Permission::READ,
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -230,6 +246,7 @@ mod tests {
                 path_restrictions: None,
                 session: None,
             },
+            group_id: None,
             start_after: None,
             limit: 16,
         })
@@ -294,6 +311,84 @@ mod tests {
         assert_eq!(
             page.cursor,
             Some(Key::from(placement_policy_key(Ulid::from_bytes([2u8; 16]))))
+        );
+    }
+
+    #[test]
+    fn scopes_to_group() {
+        // A group's page holds the realm-wide rules plus that group's own, and
+        // nothing another group owns.
+        let group_id = Ulid::from_bytes([9u8; 16]);
+        let owned = |seed: u8, owner: Ulid| {
+            let policy = PlacementPolicy::new(
+                Ulid::from_bytes([seed; 16]),
+                format!("residency-{seed}"),
+                vec![PlacementSelector {
+                    node_id: Some(node_id()),
+                    location: None,
+                    labels: Vec::new(),
+                    executor_kind: None,
+                }],
+            )
+            .expect("policy is valid")
+            .owned_by(owner)
+            .expect("owner is valid");
+            VerifiedPolicy::verify(policy).expect("policy verifies")
+        };
+        let rows = vec![
+            (
+                Key::from(placement_policy_key(Ulid::from_bytes([1u8; 16]))),
+                Key::from(
+                    signed_document(realm_id(), &policy(1), 9)
+                        .to_bytes()
+                        .expect("document encodes"),
+                ),
+            ),
+            (
+                Key::from(placement_policy_key(Ulid::from_bytes([2u8; 16]))),
+                Key::from(
+                    signed_document(realm_id(), &owned(2, group_id), 9)
+                        .to_bytes()
+                        .expect("document encodes"),
+                ),
+            ),
+            (
+                Key::from(placement_policy_key(Ulid::from_bytes([3u8; 16]))),
+                Key::from(
+                    signed_document(realm_id(), &owned(3, Ulid::from_bytes([8u8; 16])), 9)
+                        .to_bytes()
+                        .expect("document encodes"),
+                ),
+            ),
+        ];
+        let mut operation = ListPoliciesOperation::new(ListPoliciesInput {
+            auth_context: AuthContext {
+                user_id: UserId::nil(realm_id()),
+                realm_id: realm_id(),
+                path_restrictions: None,
+                session: None,
+            },
+            group_id: Some(group_id),
+            start_after: None,
+            limit: 16,
+        });
+        operation.start();
+        operation.step(authorized(true));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: rows,
+            next_start_after: None,
+        }));
+
+        let ids: Vec<_> = operation
+            .finalize()
+            .expect("page returned")
+            .policies
+            .iter()
+            .map(|document| document.policy.policy_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Ulid::from_bytes([1u8; 16]), Ulid::from_bytes([2u8; 16])]
         );
     }
 

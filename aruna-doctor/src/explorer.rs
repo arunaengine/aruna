@@ -2524,6 +2524,7 @@ mod tests {
             policy: PlacementPolicy {
                 policy_id,
                 name: "eu-only".to_string(),
+                owner_group_id: None,
                 allowed: Vec::new(),
             },
             publication: PolicyPublication {

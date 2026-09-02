@@ -1,6 +1,9 @@
-use aruna_core::structs::{WatchEvent, watch_path_matches};
-use aruna_core::types::UserId;
+use aruna_core::structs::{
+    RealmId, WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
+};
+use aruna_core::types::{GroupId, UserId};
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
@@ -88,6 +91,39 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
             warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
         }
     }
+}
+
+/// Post-commit, best-effort `metadata_created` emission shared by every dataset
+/// creation path, so an import or a job notifies exactly like `POST /metadata`.
+///
+/// `event_id` is the durable create event id, and its own timestamp dates the
+/// event, so a retried create that returns the same acceptance keeps the whole
+/// inbox key stable and notifies subscribers once.
+pub async fn emit_metadata_created(
+    context: &DriverContext,
+    realm_id: RealmId,
+    actor: UserId,
+    group_id: GroupId,
+    document_id: Ulid,
+    document_path: &str,
+    event_id: Ulid,
+) {
+    emit_resource_watch_event(
+        context,
+        WatchEvent {
+            event_id,
+            realm_id,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/{document_path}"),
+            actor,
+            occurred_at_ms: event_id.timestamp_ms(),
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        },
+    )
+    .await;
 }
 
 async fn include_local_holder_from_subscriptions(
@@ -356,6 +392,46 @@ mod tests {
         assert!(metrics.render().await.contains(
             "aruna_notification_watch_delivery_suppressions_total{reason=\"permission_denied\"} 1"
         ));
+    }
+
+    #[tokio::test]
+    async fn group_prefix_delivers() {
+        // A `meta/{group}/` watch fires for a dataset created anywhere in it,
+        // and a retried create carrying the same event id delivers once.
+        let realm = RealmId([1u8; 32]);
+        let (_dir, ctx, _net) = ctx_with_net(realm, [86u8; 32]).await;
+        let owner = UserId::new(Ulid::generate(), realm);
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        install_authorization(&ctx, realm, group_id, owner).await;
+        create_watch_subscription(
+            &ctx.storage_handle,
+            owner,
+            format!("meta/{group_id}/"),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            1,
+        )
+        .await
+        .expect("subscription creates");
+
+        let actor = UserId::new(Ulid::generate(), realm);
+        let document_id = Ulid::generate();
+        let event_id = Ulid::generate();
+        for _ in 0..2 {
+            emit_metadata_created(
+                &ctx,
+                realm,
+                actor,
+                group_id,
+                document_id,
+                "datasets/project",
+                event_id,
+            )
+            .await;
+        }
+
+        let rows = read_inbox_rows(&ctx).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recipient, owner);
     }
 
     #[tokio::test]

@@ -382,12 +382,45 @@ pub(crate) fn s3_checksum_algorithm_from_core(
     }
 }
 
+/// Names the first bucket-naming rule `name` violates, mirroring the rules the
+/// S3 framework enforces at path parse time so the node can answer with a
+/// reason instead of a bare `InvalidBucketName` code.
+pub(crate) fn bucket_name_reason(name: &str) -> Option<&'static str> {
+    if name.len() < 3 {
+        return Some("Bucket names must contain at least 3 characters.");
+    }
+    if name.len() > 63 {
+        return Some("Bucket names must contain at most 63 characters.");
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+    }) {
+        return Some("Bucket names may only contain lowercase letters, digits, dots and dashes.");
+    }
+    let ends_alphanumeric =
+        |byte: Option<u8>| byte.is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !ends_alphanumeric(name.bytes().next()) || !ends_alphanumeric(name.bytes().next_back()) {
+        return Some("Bucket names must start and end with a letter or a digit.");
+    }
+    if name.contains("..") {
+        return Some("Bucket names must not contain two dots in a row.");
+    }
+    if name.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some("Bucket names must not look like an IP address.");
+    }
+    if name.starts_with("xn--") {
+        return Some("Bucket names must not start with xn--.");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        S3ChecksumAlgorithm, checksum_response_hashes, declared_trailer_algorithm,
-        get_s3_operation_permission, is_anonymous_object_read_operation, parse_copy_source,
-        parse_copy_source_range, parse_multipart_part_number, validate_object_key,
+        S3ChecksumAlgorithm, bucket_name_reason, checksum_response_hashes,
+        declared_trailer_algorithm, get_s3_operation_permission,
+        is_anonymous_object_read_operation, parse_copy_source, parse_copy_source_range,
+        parse_multipart_part_number, validate_object_key,
     };
     use crate::s3::auth::Action;
     use crate::s3::checksum::parse_upload_checksum_request;
@@ -658,5 +691,53 @@ mod tests {
             parse_multipart_part_number(10_000, S3ErrorCode::InvalidPart).unwrap(),
             10_000
         );
+    }
+
+    #[test]
+    fn names_broken_rule() {
+        // One sentence per rule; the portal mirrors the same table.
+        assert_eq!(
+            bucket_name_reason("b1"),
+            Some("Bucket names must contain at least 3 characters.")
+        );
+        assert_eq!(
+            bucket_name_reason(&"a".repeat(64)),
+            Some("Bucket names must contain at most 63 characters.")
+        );
+        assert_eq!(
+            bucket_name_reason("Bucket"),
+            Some("Bucket names may only contain lowercase letters, digits, dots and dashes.")
+        );
+        assert_eq!(
+            bucket_name_reason("bucket_name"),
+            Some("Bucket names may only contain lowercase letters, digits, dots and dashes.")
+        );
+        assert_eq!(
+            bucket_name_reason("-bucket"),
+            Some("Bucket names must start and end with a letter or a digit.")
+        );
+        assert_eq!(
+            bucket_name_reason("bucket."),
+            Some("Bucket names must start and end with a letter or a digit.")
+        );
+        assert_eq!(
+            bucket_name_reason("a..b"),
+            Some("Bucket names must not contain two dots in a row.")
+        );
+        assert_eq!(
+            bucket_name_reason("192.168.0.1"),
+            Some("Bucket names must not look like an IP address.")
+        );
+        assert_eq!(
+            bucket_name_reason("xn--abc"),
+            Some("Bucket names must not start with xn--.")
+        );
+    }
+
+    #[test]
+    fn accepts_valid_names() {
+        for name in ["abc", "my-bucket", "my.bucket-1", &"a".repeat(63)] {
+            assert_eq!(bucket_name_reason(name), None, "rejected {name}");
+        }
     }
 }

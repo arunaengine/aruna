@@ -162,7 +162,14 @@ impl CreateMultipartUploadOperation {
             Err(error) => return self.emit_error(error.into()),
         };
         self.sealed_policies = GatedBucket::observe(bucket.as_ref()).policies;
-        match write_gate(self.gate_context.as_ref(), &self.sealed_policies) {
+        let group_id = bucket
+            .as_ref()
+            .map_or(self.input.group_id, |bucket| bucket.group_id);
+        match write_gate(
+            self.gate_context.as_ref(),
+            &self.sealed_policies,
+            Some(group_id),
+        ) {
             Ok(None) => self.start_transaction(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
@@ -197,7 +204,7 @@ impl CreateMultipartUploadOperation {
             Ok(outcome) => outcome,
             Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
         };
-        match gate_decision(outcome.decision) {
+        match gate_decision(outcome) {
             Ok(()) => {
                 self.sealed_subject = self
                     .gate_context

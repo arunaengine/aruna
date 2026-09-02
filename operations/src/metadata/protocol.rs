@@ -446,6 +446,16 @@ pub enum MetadataTransportMessage {
     ForwardedBucketCreated {
         result: Result<(), SyncRefusal>,
     },
+    /// One registered Profile document a holder serves for validation. It
+    /// deliberately carries no caller token: the responder admits
+    /// infrastructure peers only and answers nothing outside `profiles/`, so
+    /// no user identity is ever asserted across the hop. Appended last so
+    /// every existing postcard discriminant stays stable.
+    ForwardExportProfile {
+        config_digest: [u8; 32],
+        profile_id: Ulid,
+        expected_revision: Ulid,
+    },
 }
 
 /// One document as a holder serves it to a device.
@@ -879,6 +889,26 @@ mod tests {
             auth_token: MetadataAuthToken::bearer("revoke-token").unwrap(),
             token: "target-token".to_string(),
         });
+    }
+
+    #[test]
+    fn tokenless_profile_export() {
+        // The validation channel asserts no user at all; a token field here
+        // would be a peer-asserted identity the responder cannot verify.
+        let value = serde_json::to_value(MetadataTransportMessage::ForwardExportProfile {
+            config_digest: [0; 32],
+            profile_id: Ulid::nil(),
+            expected_revision: Ulid::nil(),
+        })
+        .unwrap();
+        let fields = value
+            .as_object()
+            .and_then(|variants| variants.values().next())
+            .and_then(|variant| variant.as_object())
+            .unwrap();
+
+        assert!(!fields.contains_key("auth_token"));
+        assert!(!fields.contains_key("auth_context"));
     }
 
     #[test]

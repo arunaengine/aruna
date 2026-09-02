@@ -542,6 +542,21 @@ pub enum RealmPlacementMutationRequest {
         strategy_id: String,
         group_id: Option<String>,
     },
+    SetNodeAttributes {
+        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<RealmPlacementNodeLabel>>,
+    },
+}
+
+/// One node placement label. Absent from a request means unchanged; a present
+/// list replaces the whole set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPlacementNodeLabel {
+    pub key: String,
+    pub value: String,
 }
 
 enum RealmPlacementAction {
@@ -772,6 +787,20 @@ impl RealmPlacementMutationRequest {
             Self::RemoveOverride { subject } => {
                 RealmPlacementMutation::RemoveOverride(parse_subject(&subject)?)
             }
+            Self::SetNodeAttributes {
+                node_id,
+                location,
+                labels,
+            } => RealmPlacementMutation::SetNodeAttributes {
+                node_id: parse_node_id(&node_id)?,
+                location,
+                labels: labels.map(|labels| {
+                    labels
+                        .into_iter()
+                        .map(|label| (label.key, label.value))
+                        .collect()
+                }),
+            },
             Self::ProvisionMetadataBinding {
                 strategy_id,
                 group_id,
@@ -796,6 +825,12 @@ fn parse_ulid(value: &str, field: &str) -> ServerResult<Ulid> {
 fn parse_subject(value: &str) -> ServerResult<Vec<u8>> {
     hex::decode(value)
         .map_err(|_| ServerError::BadRequestReason("subject must be valid hex".to_string()))
+}
+
+fn parse_node_id(value: &str) -> ServerResult<aruna_core::NodeId> {
+    value
+        .parse::<aruna_core::NodeId>()
+        .map_err(|_| ServerError::BadRequestReason(format!("invalid node_id: {value}")))
 }
 
 fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_core::NodeId>> {
@@ -1325,8 +1360,8 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     get,
     path = "/system/realm/placement",
     tag = "system/realm",
-    summary = "Read the realm's placement strategies, bindings and overrides",
-    description = r#"Returns the placement policy as stored in this node's copy of the realm configuration.
+    summary = "Read record placement strategies, bindings and overrides",
+    description = r#"Returns the record placement strategies as stored in this node's copy of the realm configuration.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
 management node serves the call and every other node relays it to one.
@@ -1336,8 +1371,10 @@ management node serves the call and every other node relays it to one.
   and shard count; the default strategy; the immutable job-family strategy id; the bindings that
   map a scope (the realm, a group, a document class or a metadata path prefix) to a strategy; and
   the per-subject overrides that pin or exclude individual nodes.
-- This is policy, not a placement result: it says how replicas are chosen, not where any particular
-  document currently sits.
+- Strategies place metadata records and job families. They never decide where S3 object bytes may
+  live; that is what the placement policy documents under `/data/placement/policies` do.
+- This is a rule set, not a placement result: it says how replicas are chosen, not where any
+  particular document currently sits.
 
 **Limits**
 - The strategy named by `job_family_strategy_id` cannot be removed or have its shard count
@@ -1345,7 +1382,7 @@ management node serves the call and every other node relays it to one.
     responses(
         (
             status = 200,
-            description = "The realm's placement policy as this management node has it",
+            description = "The realm's record placement strategies as this management node has them",
             body = RealmPlacementConfigResponse,
             example = json!({
                 "strategies": [
@@ -1413,8 +1450,8 @@ pub async fn get_realm_placement(
     patch,
     path = "/system/realm/placement",
     tag = "system/realm",
-    summary = "Apply one change to the realm's placement policy",
-    description = r#"Applies exactly one change to the realm's placement policy and returns the whole policy.
+    summary = "Apply one change to the record placement strategies",
+    description = r#"Applies exactly one change to the realm's record placement strategies and returns all of them.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
 management node serves the call and every other node relays it to one.
@@ -1422,10 +1459,16 @@ management node serves the call and every other node relays it to one.
 **Behavior**
 - The body carries exactly one change, selected by its `mutation` field: define or replace a
   strategy, remove one, set the default, set or remove a binding for a scope, set or remove a
-  per-subject override, or provision a metadata binding for a strategy.
+  per-subject override, edit a node's placement attributes, or provision a metadata binding for a
+  strategy.
+- `set_node_attributes` edits the location and labels of a node the realm already places. An
+  omitted field keeps its stored value and a present `labels` list replaces the whole set. A real
+  change advances that node's storage subject, which makes it revalidate its registered copies and
+  quarantine the ones its new attributes no longer admit, and it serves no governed data until that
+  walk finishes. Submitting the values already stored changes nothing.
 - Provisioning is idempotent: an existing binding for the same scope and strategy is returned
   unchanged instead of allocating a second one.
-- The whole placement policy after the change is returned, so a client never has to re-read to learn
+- The whole strategy set after the change is returned, so a client never has to re-read to learn
   the new state.
 - The change is written to the replicated realm configuration: it is durable here when the response
   is sent and reaches the other realm nodes asynchronously. It moves no data by itself; existing
@@ -1433,7 +1476,10 @@ management node serves the call and every other node relays it to one.
 
 **Limits**
 - The strategy named by `job_family_strategy_id` cannot be removed or have its shard count
-  reshaped; those mutations fail with `JobFamilyImmutable`."#,
+  reshaped; those mutations fail with `JobFamilyImmutable`.
+- `set_node_attributes` refuses an unknown node, a location longer than 64 bytes, a derived label
+  key (`aruna-engine.org/kind`, `.../location`, `.../node`, `.../storage-class/*`), and any edit
+  while that node is draining."#,
     request_body(
         content = RealmPlacementMutationRequest,
         description = "Exactly one placement change, discriminated by `mutation`. Ids are ULIDs, node ids are hex-encoded, an override `subject` is a hex-encoded key prefix",
@@ -1453,7 +1499,7 @@ management node serves the call and every other node relays it to one.
                 })
             )),
             ("Bind a scope" = (
-                summary = "Route every metadata document of one group through that strategy",
+                summary = "Place every metadata document of one group with that strategy",
                 value = json!({
                     "mutation": "set_binding",
                     "binding": {
@@ -1469,13 +1515,22 @@ management node serves the call and every other node relays it to one.
                     "strategy_id": "01JABCDEF0123456789ABCDEFG",
                     "group_id": null
                 })
+            )),
+            ("Edit node attributes" = (
+                summary = "Move a node to another location and replace its labels; the node revalidates its copies",
+                value = json!({
+                    "mutation": "set_node_attributes",
+                    "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                    "location": "eu-west",
+                    "labels": [{"key": "tier", "value": "hot"}]
+                })
             ))
         )
     ),
     responses(
         (
             status = 200,
-            description = "The complete placement policy after the change was applied",
+            description = "The complete strategy set after the change was applied",
             body = RealmPlacementConfigResponse,
             example = json!({
                 "strategies": [
@@ -1502,7 +1557,7 @@ management node serves the call and every other node relays it to one.
                 }
             })
         ),
-        (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
+        (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, a node the realm does not place, a location or label the placement map refuses, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),

@@ -4,10 +4,10 @@ use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BackendLocation, MAX_POLICY_REF_INPUT, MultipartChecksumType,
-    MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, PlacementSubject, RealmId,
-    ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata, VersionSourceBinding,
-    VersionedObjectArn,
+    ArunaArn, AuthContext, BackendLocation, CopyOrigin, MAX_POLICY_REF_INPUT,
+    MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef,
+    PlacementSubject, RealmId, ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata,
+    VersionSourceBinding, VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -493,12 +493,29 @@ pub enum LocationCopyStorage {
     },
 }
 
+/// Whether the answering node considers the copy it holds admissible under the
+/// rules the version carries. It names no policy either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CopyCompliance {
+    /// The node evaluated the copy and would serve it.
+    Allowed,
+    /// The node holds the copy but is not serving it, because it no longer
+    /// matches the rules the copy carries.
+    Quarantined,
+    /// The node reported no verdict, so nothing is claimed either way.
+    #[default]
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LocationSummary {
     /// The version the answering node resolved; `None` means it knows none.
     pub version_id: Option<Ulid>,
     pub held: bool,
     pub storage: Option<LocationCopyStorage>,
+    /// Why the answering node holds the copy, from its own registration.
+    pub origin: CopyOrigin,
+    pub compliance: CopyCompliance,
     /// Whether the resolved version carries stored bytes at all. A delete
     /// marker or a reference-only version never will, anywhere.
     pub materialized: bool,
@@ -515,6 +532,8 @@ impl LocationSummary {
             version_id: None,
             held: false,
             storage: None,
+            origin: CopyOrigin::Unknown,
+            compliance: CopyCompliance::Unknown,
             materialized: false,
             group_id: None,
             blob_size: None,

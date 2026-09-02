@@ -17,12 +17,16 @@ use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
     RealmId, RealmNodeKind,
 };
+use aruna_core::types::UserId;
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_local_document,
 };
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use aruna_operations::metadata::MetadataReadError;
+use aruna_operations::metadata::forward::{
+    MetadataWriteError, admits_profile_peer, create_metadata_document_routed, export_profile_local,
+};
 use aruna_operations::metadata::profile_validation::{
     current_validation_status, load_validation_status, preview_submission, profile_public_iri,
     revalidate_current,
@@ -369,6 +373,7 @@ async fn preview_stores_nothing() -> Result<(), Box<dyn std::error::Error>> {
 
     let rejected = preview_submission(
         test.context.as_ref(),
+        Some(group_id),
         &crate_json(draft_id, Some(&tag), false, true),
     )
     .await?;
@@ -390,6 +395,7 @@ async fn preview_stores_nothing() -> Result<(), Box<dyn std::error::Error>> {
 
     let accepted = preview_submission(
         test.context.as_ref(),
+        Some(group_id),
         &crate_json(draft_id, Some(&tag), true, true),
     )
     .await?;
@@ -420,7 +426,7 @@ async fn preview_reports_structural() -> Result<(), Box<dyn std::error::Error>> 
         ]
     })
     .to_string();
-    let preview = preview_submission(test.context.as_ref(), &jsonld).await?;
+    let preview = preview_submission(test.context.as_ref(), Some(group_id), &jsonld).await?;
     assert!(!preview.accepted());
     assert_eq!(
         preview.status.state,
@@ -445,6 +451,7 @@ async fn binds_untargeted_root() -> Result<(), Box<dyn std::error::Error>> {
         let document_id = mint(&test, group_id, &path)?;
         let preview = preview_submission(
             test.context.as_ref(),
+            Some(group_id),
             &portal_crate(document_id, &tag, false),
         )
         .await?;
@@ -459,6 +466,7 @@ async fn binds_untargeted_root() -> Result<(), Box<dyn std::error::Error>> {
         );
         let complete = preview_submission(
             test.context.as_ref(),
+            Some(group_id),
             &portal_crate(document_id, &tag, true),
         )
         .await?;
@@ -488,6 +496,7 @@ async fn rejects_crate_local() -> Result<(), Box<dyn std::error::Error>> {
     let document_id = mint(&test, group_id, "datasets/crate-local")?;
     let preview = preview_submission(
         test.context.as_ref(),
+        Some(group_id),
         &portal_crate(document_id, &tag, true),
     )
     .await?;
@@ -589,26 +598,19 @@ async fn rejects_graph_alias() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn rejects_private_profile() -> Result<(), Box<dyn std::error::Error>> {
+    // The Dataset lives in a second group, so only the foreign-group rule
+    // can refuse it.
     let test = build_context(false).await?;
-    let group_id = Ulid::generate();
-    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
-    update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id: profile_id,
-            public: false,
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
-                jsonld: profile_json(profile_id, minimum_shape()),
-            },
-        }),
-        test.context.as_ref(),
-    )
-    .await?;
-    let document_id = mint(&test, group_id, "datasets/private-probe")?;
+    let owner_group = Ulid::generate();
+    let other_group = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, owner_group, minimum_shape()).await?;
+    seed_group(&test, other_group).await?;
+    make_private(&test, owner_group, profile_id).await?;
+    let document_id = mint(&test, other_group, "datasets/private-probe")?;
 
     let error = preview_submission(
         test.context.as_ref(),
+        Some(other_group),
         &crate_json(
             document_id,
             Some(&profile_public_iri(profile_id)),
@@ -627,6 +629,283 @@ async fn rejects_private_profile() -> Result<(), Box<dyn std::error::Error>> {
             .any(|finding| finding.code == "profile_not_registered")
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn accepts_group_profile() -> Result<(), Box<dyn std::error::Error>> {
+    // A group's own Profile validates its Datasets while it is not public.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
+    let revision = make_private(&test, group_id, profile_id).await?;
+    let document_id = mint(&test, group_id, "datasets/group-profile")?;
+
+    let created = create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/group-profile",
+        crate_json(
+            document_id,
+            Some(&profile_public_iri(profile_id)),
+            true,
+            true,
+        ),
+    )
+    .await?;
+    let status = load_validation_status(test.context.as_ref(), document_id, None)
+        .await?
+        .expect("an accepted create commits its status");
+    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.profile_id, Some(profile_id));
+    assert_eq!(status.profile_revision, Some(revision));
+    assert_eq!(status.dataset_revision, created.event_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_foreign_profile() -> Result<(), Box<dyn std::error::Error>> {
+    // A private Profile of another group answers exactly as an unknown one.
+    let test = build_context(false).await?;
+    let owner_group = Ulid::generate();
+    let other_group = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, owner_group, minimum_shape()).await?;
+    seed_group(&test, other_group).await?;
+    make_private(&test, owner_group, profile_id).await?;
+    let document_id = mint(&test, other_group, "datasets/foreign-profile")?;
+
+    let error = create_crate(
+        &test,
+        other_group,
+        document_id,
+        "datasets/foreign-profile",
+        crate_json(
+            document_id,
+            Some(&profile_public_iri(profile_id)),
+            true,
+            true,
+        ),
+    )
+    .await
+    .expect_err("a foreign group's private Profile must not resolve");
+    assert_profile_code(error, "profile_not_registered");
+    assert_eq!(event_count(&test, document_id).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_crosses_groups() -> Result<(), Box<dyn std::error::Error>> {
+    // Publishing a Profile keeps it usable by every group's Datasets.
+    let test = build_context(false).await?;
+    let owner_group = Ulid::generate();
+    let other_group = Ulid::generate();
+    let (profile_id, revision) = register_profile(&test, owner_group, minimum_shape()).await?;
+    seed_group(&test, other_group).await?;
+    let document_id = mint(&test, other_group, "datasets/public-profile")?;
+
+    create_crate(
+        &test,
+        other_group,
+        document_id,
+        "datasets/public-profile",
+        crate_json(
+            document_id,
+            Some(&profile_public_iri(profile_id)),
+            true,
+            true,
+        ),
+    )
+    .await?;
+    let status = load_validation_status(test.context.as_ref(), document_id, None)
+        .await?
+        .expect("an accepted create commits its status");
+    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.profile_revision, Some(revision));
+    Ok(())
+}
+
+#[tokio::test]
+async fn preview_needs_group() -> Result<(), Box<dyn std::error::Error>> {
+    // Without a group the preview resolves public Profiles only.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
+    make_private(&test, group_id, profile_id).await?;
+    let draft_id = mint(&test, group_id, "datasets/preview-group")?;
+    let jsonld = crate_json(draft_id, Some(&profile_public_iri(profile_id)), true, true);
+
+    let error = preview_submission(test.context.as_ref(), None, &jsonld)
+        .await
+        .expect_err("a group Profile does not resolve without its group");
+    let MetadataError::ProfileValidation(findings) = error else {
+        panic!("expected structured Profile validation findings");
+    };
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.code == "profile_not_registered")
+    );
+
+    let preview = preview_submission(test.context.as_ref(), Some(group_id), &jsonld).await?;
+    assert!(preview.accepted(), "{:#?}", preview.status);
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_resolves_group() -> Result<(), Box<dyn std::error::Error>> {
+    // Materialization has no caller at all, so the merged render reaches the
+    // group's own Profile through the validation channel.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
+    make_private(&test, group_id, profile_id).await?;
+    let document_id = mint(&test, group_id, "datasets/render-group")?;
+    create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/render-group",
+        crate_json(
+            document_id,
+            Some(&profile_public_iri(profile_id)),
+            true,
+            true,
+        ),
+    )
+    .await?;
+    drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
+    process_metadata_materialization_batch(test.context.as_ref()).await?;
+
+    let status = load_validation_status(test.context.as_ref(), document_id, None)
+        .await?
+        .expect("materialization writes a status");
+    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.profile_id, Some(profile_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn channel_refuses_datasets() -> Result<(), Box<dyn std::error::Error>> {
+    // Serving `profiles/` and nothing else is the whole authorization of a
+    // fetch that carries no caller.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    seed_group(&test, group_id).await?;
+    let document_id = mint(&test, group_id, "datasets/not-a-profile")?;
+    let created = create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/not-a-profile",
+        crate_json(document_id, None, true, true),
+    )
+    .await?;
+
+    let refusal = export_profile_local(
+        test.context.as_ref(),
+        test.actor.realm_id,
+        document_id,
+        created.record.last_event_id,
+    )
+    .await
+    .expect_err("a Dataset is never served on the validation channel");
+    assert_eq!(refusal, MetadataReadError::NotFound);
+    Ok(())
+}
+
+#[test]
+fn channel_refuses_devices() {
+    // A device may vouch for its owner only, so it never joins a channel that
+    // asserts no user.
+    let realm_id = RealmId([53u8; 32]);
+    let server = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+    let device = iroh::SecretKey::from_bytes(&[12u8; 32]).public();
+    let stranger = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(server, RealmNodeKind::Server);
+    config.ensure_node(
+        device,
+        RealmNodeKind::User {
+            owner: UserId::local(Ulid::generate(), realm_id),
+        },
+    );
+
+    assert!(admits_profile_peer(&config, server, realm_id));
+    assert!(!admits_profile_peer(&config, device, realm_id));
+    assert!(!admits_profile_peer(&config, stranger, realm_id));
+    assert!(!admits_profile_peer(&config, server, RealmId([54u8; 32])));
+}
+
+#[tokio::test]
+async fn channel_fences_revision() -> Result<(), Box<dyn std::error::Error>> {
+    // A holder answers the exact revision the requester read, or nothing.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, revision) = register_profile(&test, group_id, minimum_shape()).await?;
+
+    export_profile_local(
+        test.context.as_ref(),
+        test.actor.realm_id,
+        profile_id,
+        revision,
+    )
+    .await
+    .expect("the requested revision is served");
+    let refusal = export_profile_local(
+        test.context.as_ref(),
+        test.actor.realm_id,
+        profile_id,
+        Ulid::generate(),
+    )
+    .await
+    .expect_err("a mismatched revision is refused");
+    assert_eq!(refusal, MetadataReadError::Unavailable);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cache_skips_refetch() -> Result<(), Box<dyn std::error::Error>> {
+    // One fetch serves every validation of the same Profile revision.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
+    let draft_id = mint(&test, group_id, "datasets/cache")?;
+    let jsonld = crate_json(draft_id, Some(&profile_public_iri(profile_id)), true, true);
+    let metadata = test
+        .context
+        .metadata_handle
+        .as_ref()
+        .ok_or("metadata handle is configured")?;
+
+    let before = metadata.profile_loads();
+    preview_submission(test.context.as_ref(), Some(group_id), &jsonld).await?;
+    let after = metadata.profile_loads();
+    preview_submission(test.context.as_ref(), Some(group_id), &jsonld).await?;
+
+    assert_eq!(after, before + 1);
+    assert_eq!(metadata.profile_loads(), after);
+    Ok(())
+}
+
+async fn make_private(
+    test: &TestContext,
+    group_id: Ulid,
+    profile_id: Ulid,
+) -> Result<Ulid, Box<dyn std::error::Error>> {
+    let updated = update_metadata_document(
+        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            actor: test.actor.clone(),
+            group_id,
+            document_id: profile_id,
+            public: false,
+            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: profile_json(profile_id, minimum_shape()),
+            },
+        }),
+        test.context.as_ref(),
+    )
+    .await?;
+    Ok(updated.last_event_id)
 }
 
 #[tokio::test]

@@ -67,6 +67,7 @@ use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use crate::notifications::watch::emit::emit_metadata_created;
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -1035,9 +1036,19 @@ async fn create_document(
     )
     .await
     {
-        Ok(_) => {
+        Ok(created) => {
             checkpoint.created = true;
             checkpoint.phase = ImportPhase::Cleanup;
+            emit_metadata_created(
+                &ctx.driver,
+                spec.auth_context.realm_id,
+                spec.auth_context.user_id,
+                created.record.group_id,
+                created.record.document_id,
+                &created.record.document_path,
+                created.event_id,
+            )
+            .await;
             Ok(())
         }
         Err(error) => Err(classify_metadata(error)),

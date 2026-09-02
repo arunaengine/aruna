@@ -215,7 +215,7 @@ pub(crate) async fn ensure_group_admin(
     path = "/data/buckets/{bucket}/storage/routing",
     tag = "data/storage",
     summary = "Read a bucket's write routing rules",
-    description = r#"Returns the write routing rules stored for a bucket on this node, in submission order.
+    description = r#"Returns the write routing rules that pick the storage backend for new writes to a bucket on this node, in submission order.
 
 **Authentication**: realm bearer token with WRITE on the owning group's admin path. Routing decides
 where a group's bytes physically land, so the write rights that suffice for objects are not enough.

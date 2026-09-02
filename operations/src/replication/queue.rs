@@ -3626,6 +3626,28 @@ mod tests {
     }
 
     #[test]
+    fn paused_link_stops() {
+        // A paused relationship queues nothing until it is resumed.
+        let mut paused = relationship(13, 2, None, true);
+        paused.state = SyncState::Paused;
+
+        let job = relationship_job(
+            node(1),
+            RelationshipJobTarget {
+                bucket: "bucket",
+                key: "key",
+                version_id: Ulid::from(14u128),
+                delete_marker: false,
+            },
+            paused,
+            None,
+            &[],
+        );
+
+        assert!(job.is_none());
+    }
+
+    #[test]
     fn reference_job_queues() {
         let mut reference = relationship(11, 2, Some("photos/"), true);
         reference.mode = SyncMode::Reference;

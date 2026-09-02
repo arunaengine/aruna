@@ -7,8 +7,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
 use aruna_core::structs::{
-    BackendLocation, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY,
-    NodeSubjectRecord, PlacementPolicyError, PlacementPolicyRef, VersionKey,
+    BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState,
+    NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyError, PlacementPolicyRef, VersionKey,
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 use smallvec::smallvec;
@@ -39,25 +39,26 @@ pub enum ManagedCopyError {
     InvalidEvent,
 }
 
+/// One local registration. `subject_generation` is the one the gate admitted
+/// under, so the row names the subject that allowed the copy, and `origin`
+/// records why the copy is here.
+pub struct CopyRegistration<'a> {
+    pub version: VersionKey,
+    pub node_id: NodeId,
+    pub location: &'a BackendLocation,
+    pub policies: &'a [PlacementPolicyRef],
+    pub origin: CopyOrigin,
+    pub subject_generation: u64,
+    pub registered_at_ms: u64,
+}
+
 /// Registers one local copy. A staging or partial location is refused, so a
 /// half-written blob stays unregistered and therefore unservable.
 pub fn register_effect(
-    version: VersionKey,
-    node_id: NodeId,
-    location: &BackendLocation,
-    policies: &[PlacementPolicyRef],
-    subject_generation: u64,
-    registered_at_ms: u64,
+    registration: CopyRegistration<'_>,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ManagedCopyError> {
-    let (key_space, key, value) = register_entry(
-        version,
-        node_id,
-        location,
-        policies,
-        subject_generation,
-        registered_at_ms,
-    )?;
+    let (key_space, key, value) = register_entry(registration)?;
     Ok(Effect::Storage(StorageEffect::Write {
         key_space,
         key,
@@ -67,28 +68,23 @@ pub fn register_effect(
 }
 
 /// The same registration as a batch entry, for a transaction that commits the
-/// copy together with the version it belongs to. `subject_generation` is the
-/// one the gate admitted under, so the row names the subject that allowed it.
+/// copy together with the version it belongs to.
 pub fn register_entry(
-    version: VersionKey,
-    node_id: NodeId,
-    location: &BackendLocation,
-    policies: &[PlacementPolicyRef],
-    subject_generation: u64,
-    registered_at_ms: u64,
+    registration: CopyRegistration<'_>,
 ) -> Result<(String, Key, Value), ManagedCopyError> {
-    if location.staging || location.partial {
+    if registration.location.staging || registration.location.partial {
         return Err(ManagedCopyError::UnstableCopy);
     }
     let record = ManagedCopyRecord::new(
-        version,
-        node_id,
-        location.clone(),
-        policies.to_vec(),
-        registered_at_ms,
+        registration.version,
+        registration.node_id,
+        registration.location.clone(),
+        registration.policies.to_vec(),
+        registration.registered_at_ms,
         ManagedCopyState::Registered,
     )?
-    .sealed_under(subject_generation);
+    .sealed_under(registration.subject_generation)
+    .from_origin(registration.origin);
     Ok((
         MANAGED_COPY_KEYSPACE.to_string(),
         record.key().to_bytes()?.into(),
@@ -157,6 +153,26 @@ pub fn validate_registration(
     request: &CopyRequest<'_>,
 ) -> Result<ManagedCopyRecord, ManagedCopyError> {
     let record = check_serveable(value)?;
+    matched(record, request)
+}
+
+/// The registration of exactly this copy whatever its state, for a caller that
+/// reports a copy the node holds but does not serve instead of hiding it.
+/// Serving never uses this: it must fail closed on a non-serveable row.
+pub fn registration_for(
+    value: Option<&[u8]>,
+    request: &CopyRequest<'_>,
+) -> Result<ManagedCopyRecord, ManagedCopyError> {
+    let Some(value) = value else {
+        return Err(ManagedCopyError::Unregistered);
+    };
+    matched(ManagedCopyRecord::from_bytes(value)?, request)
+}
+
+fn matched(
+    record: ManagedCopyRecord,
+    request: &CopyRequest<'_>,
+) -> Result<ManagedCopyRecord, ManagedCopyError> {
     let refs = PlacementPolicyRef::canonical_set(request.refs)?;
     let matches = &record.key() == request.key
         && request
@@ -196,14 +212,23 @@ pub fn serve_reads(
     }))
 }
 
+/// Splits the `serve_reads` answer into its two raw values, leaving the verdict
+/// to the caller: a reporting read describes a copy it may not serve.
+pub fn split_reads(
+    values: Vec<(Key, Option<Value>)>,
+) -> Result<(Option<Value>, Option<Value>), ManagedCopyError> {
+    let mut values = values.into_iter();
+    let (_, copy) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    let (_, subject) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    Ok((copy, subject))
+}
+
 /// Splits the `serve_reads` answer. A missing subject row is not an admission:
 /// a node that never advertised a subject serves nothing governed.
 pub fn split_serve_reads(
     values: Vec<(Key, Option<Value>)>,
 ) -> Result<(Option<Value>, NodeSubjectRecord), ManagedCopyError> {
-    let mut values = values.into_iter();
-    let (_, copy) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
-    let (_, subject) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    let (copy, subject) = split_reads(values)?;
     let subject = subject.ok_or(ManagedCopyError::NoSubject)?;
     let record = NodeSubjectRecord::from_bytes(subject.as_ref())?;
     if record.serving_blocked {
@@ -350,6 +375,7 @@ mod tests {
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+    use aruna_core::structs::CopyOrigin;
     use aruna_core::structs::{
         BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
         ManagedCopyState, NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, VersionKey,
@@ -386,6 +412,22 @@ mod tests {
         }
     }
 
+    fn registration(
+        location: &BackendLocation,
+        origin: CopyOrigin,
+        registered_at_ms: u64,
+    ) -> super::CopyRegistration<'_> {
+        super::CopyRegistration {
+            version: version(),
+            node_id: node_id(),
+            location,
+            policies: &[],
+            origin,
+            subject_generation: 1,
+            registered_at_ms,
+        }
+    }
+
     fn record(state: ManagedCopyState) -> ManagedCopyRecord {
         ManagedCopyRecord::new(
             version(),
@@ -403,7 +445,7 @@ mod tests {
         // A staging or partial write must never become a serveable registration.
         for location in [location(true, false), location(false, true)] {
             assert_eq!(
-                register_effect(version(), node_id(), &location, &[], 1, 7, None),
+                register_effect(registration(&location, CopyOrigin::Write, 7), None),
                 Err(ManagedCopyError::UnstableCopy)
             );
         }
@@ -411,14 +453,15 @@ mod tests {
 
     #[test]
     fn joins_caller_txn() {
+        // The registration also seals the provenance a reader later reports.
         let txn_id = Ulid::from_bytes([8u8; 16]);
+        let relationship_id = Ulid::from_bytes([3u8; 16]);
         let effect = register_effect(
-            version(),
-            node_id(),
-            &location(false, false),
-            &[],
-            1,
-            7,
+            registration(
+                &location(false, false),
+                CopyOrigin::Sync { relationship_id },
+                7,
+            ),
             Some(txn_id),
         )
         .expect("effect builds");
@@ -437,6 +480,38 @@ mod tests {
         let stored = ManagedCopyRecord::from_bytes(value.as_ref()).expect("record decodes");
         assert_eq!(stored.state, ManagedCopyState::Registered);
         assert_eq!(stored.node_id, node_id());
+        assert_eq!(stored.origin, CopyOrigin::Sync { relationship_id });
+    }
+
+    #[test]
+    fn reports_unserveable_row() {
+        // A reporting caller sees a quarantined registration that serving must
+        // refuse, so a held copy can be listed instead of hidden.
+        let quarantined = record(ManagedCopyState::Quarantined(
+            ManagedCopyQuarantine::PolicyViolation,
+        ));
+        let bytes = quarantined.to_bytes().expect("record encodes");
+        let key = quarantined.key();
+        let request = CopyRequest {
+            key: &key,
+            node_id: Some(node_id()),
+            blake3: None,
+            refs: &[],
+            subject_generation: None,
+        };
+
+        assert_eq!(
+            super::registration_for(Some(&bytes), &request),
+            Ok(quarantined.clone())
+        );
+        assert_eq!(
+            validate_registration(Some(&bytes), &request),
+            Err(ManagedCopyError::NotServeable(quarantined.state))
+        );
+        assert_eq!(
+            super::registration_for(None, &request),
+            Err(ManagedCopyError::Unregistered)
+        );
     }
 
     #[test]
@@ -719,12 +794,7 @@ mod tests {
     fn caller_supplies_time() {
         // Registration must not read a clock inside the sans-I/O operation.
         let effect = register_effect(
-            version(),
-            node_id(),
-            &location(false, false),
-            &[],
-            1,
-            42,
+            registration(&location(false, false), CopyOrigin::Write, 42),
             None,
         )
         .expect("effect builds");
@@ -740,7 +810,7 @@ mod tests {
 /// be serveable, and a governed read must fail closed without its registration.
 #[cfg(test)]
 mod driver_tests {
-    use super::{ManagedCopyError, register_effect, scan_effect, version_scope};
+    use super::{CopyRegistration, ManagedCopyError, register_effect, scan_effect, version_scope};
     use crate::driver::{DriverContext, drive};
     use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
     use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
@@ -891,12 +961,15 @@ mod driver_tests {
 
     async fn write_copy(context: &DriverContext, record: &ManagedCopyRecord) {
         let Effect::Storage(effect) = register_effect(
-            record.version.clone(),
-            record.node_id,
-            &record.location,
-            &record.policies,
-            record.subject_generation,
-            record.registered_at_ms,
+            CopyRegistration {
+                version: record.version.clone(),
+                node_id: record.node_id,
+                location: &record.location,
+                policies: &record.policies,
+                origin: record.origin,
+                subject_generation: record.subject_generation,
+                registered_at_ms: record.registered_at_ms,
+            },
             None,
         )
         .expect("effect builds") else {

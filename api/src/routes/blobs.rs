@@ -2,7 +2,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, blob_bucket_permission_path, blob_object_permission_path,
+    AuthContext, BucketInfo, CopyOrigin, Permission, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
 use aruna_operations::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
 use aruna_operations::driver::{drive, drive_until};
@@ -11,7 +12,7 @@ use aruna_operations::replication::location_summary::{
     RelationshipReplicaNodesOperation, RemoteLocationSummaryOperation,
 };
 use aruna_operations::replication::protocol::{
-    LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
 };
 use aruna_operations::replication::queue::QueueBlobReplicationOperation;
 use aruna_operations::replication::version_replication::{
@@ -257,6 +258,60 @@ pub enum BlobCopyStorage {
     GroupBackend,
 }
 
+/// Why the holding node has this copy, as that node recorded it when the copy
+/// was registered.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlobCopyOrigin {
+    /// A client wrote the object on that node.
+    Write,
+    /// A bucket sync relationship placed the copy there.
+    Sync,
+    /// An explicit copy request placed it there.
+    Replicate,
+    /// A compute job staged the bytes there to run against them.
+    Staging,
+    /// A read-driven reference advance materialized the bytes there.
+    Reference,
+    /// The node recorded no cause, or did not report one.
+    Unknown,
+}
+
+/// Whether the holding node would serve this copy under the rules the version
+/// carries. It names no rule either way.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlobCopyCompliance {
+    Allowed,
+    /// The node holds the copy but is not serving it, because it no longer
+    /// matches the rules the copy carries.
+    Quarantined,
+    Unknown,
+}
+
+impl From<CopyOrigin> for BlobCopyOrigin {
+    fn from(value: CopyOrigin) -> Self {
+        match value {
+            CopyOrigin::Write => Self::Write,
+            CopyOrigin::Sync { .. } => Self::Sync,
+            CopyOrigin::Replicate => Self::Replicate,
+            CopyOrigin::Staging => Self::Staging,
+            CopyOrigin::Reference => Self::Reference,
+            CopyOrigin::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<CopyCompliance> for BlobCopyCompliance {
+    fn from(value: CopyCompliance) -> Self {
+        match value {
+            CopyCompliance::Allowed => Self::Allowed,
+            CopyCompliance::Quarantined => Self::Quarantined,
+            CopyCompliance::Unknown => Self::Unknown,
+        }
+    }
+}
+
 /// One copy of a version at one destination. A node reached under several
 /// destination paths has one entry per path, so `node_id` may repeat and only
 /// the whole `(node_id, bucket, key)` triple identifies an entry.
@@ -274,6 +329,10 @@ pub struct BlobCopyResponse {
     pub storage_class: Option<String>,
     pub group_backend_id: Option<String>,
     pub group_backend_name: Option<String>,
+    pub origin: BlobCopyOrigin,
+    /// The relationship that placed the copy; set only when `origin` is `sync`.
+    pub sync_relationship_id: Option<String>,
+    pub compliance: BlobCopyCompliance,
 }
 
 /// Why an answer could not cover every node that might hold a copy.
@@ -326,6 +385,9 @@ fn pending_copy(destination: &Destination, state: BlobCopyState) -> BlobCopyResp
         storage_class: None,
         group_backend_id: None,
         group_backend_name: None,
+        origin: BlobCopyOrigin::Unknown,
+        sync_relationship_id: None,
+        compliance: BlobCopyCompliance::Unknown,
     }
 }
 
@@ -336,6 +398,12 @@ fn copy_response(
 ) -> BlobCopyResponse {
     let base = BlobCopyResponse {
         local,
+        origin: summary.origin.into(),
+        sync_relationship_id: match summary.origin {
+            CopyOrigin::Sync { relationship_id } => Some(relationship_id.to_string()),
+            _ => None,
+        },
+        compliance: summary.compliance.into(),
         ..pending_copy(destination, BlobCopyState::Pending)
     };
     let unstored = summary.version_id.is_some() && !summary.materialized;
@@ -376,6 +444,11 @@ fn copy_response(
   replication work, and the nodes the durable holder index names for these bytes.
 - One entry is returned per destination, so a node reached under two bucket-and-key pairs appears
   twice; copies are ordered local first, then by node, bucket and key.
+- Every answered copy carries the `origin` the holding node recorded when it registered the copy,
+  the `sync_relationship_id` when that origin is a bucket sync, and a `compliance` verdict. A copy
+  the holding node holds but refuses to serve because it no longer matches the rules the version
+  carries is listed as `present` with compliance `quarantined` rather than omitted; no rule is
+  named either way. A destination that has not answered yet reports all three as unknown.
 - A destination that does not answer never fails the request: the reply stays 200 with `complete`
   false and the reason in `limits`, and a copy may then be missing rather than genuinely absent.
 
@@ -406,7 +479,10 @@ fn copy_response(
                         "storage": "node-managed",
                         "storage_class": "standard",
                         "group_backend_id": null,
-                        "group_backend_name": null
+                        "group_backend_name": null,
+                        "origin": "write",
+                        "sync_relationship_id": null,
+                        "compliance": "allowed"
                     },
                     {
                         "node_id": "2a3b4c5d6e7f89900a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f6789",
@@ -417,7 +493,10 @@ fn copy_response(
                         "storage": null,
                         "storage_class": null,
                         "group_backend_id": null,
-                        "group_backend_name": null
+                        "group_backend_name": null,
+                        "origin": "unknown",
+                        "sync_relationship_id": null,
+                        "compliance": "unknown"
                     }
                 ],
                 "complete": false,
@@ -723,8 +802,8 @@ fn add_candidate(candidates: &mut BTreeSet<Destination>, destination: Destinatio
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobCopyState, BlobCopyStorage, BlobLocationsQuery, blob_locations, copy_response,
-        pending_copy,
+        BlobCopyCompliance, BlobCopyOrigin, BlobCopyState, BlobCopyStorage, BlobLocationsQuery,
+        blob_locations, copy_response, pending_copy,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -734,12 +813,14 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::CopyOrigin;
     use aruna_core::structs::{
         Actor, AuthContext, BucketInfo, GroupAuthorizationDocument, NodeCapabilities,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::location_summary::LocationSummaryError;
+    use aruna_operations::replication::protocol::CopyCompliance;
     use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
     use aruna_storage::FjallStorage;
     use axum::Extension;
@@ -766,6 +847,8 @@ mod tests {
                 storage: Some(LocationCopyStorage::NodeManaged {
                     storage_class: Some("cold".to_string()),
                 }),
+                origin: CopyOrigin::Write,
+                compliance: CopyCompliance::Allowed,
                 materialized: true,
                 group_id: None,
                 blob_size: None,
@@ -792,6 +875,8 @@ mod tests {
                     backend_id,
                     name: Some("lab-minio".to_string()),
                 }),
+                origin: CopyOrigin::Write,
+                compliance: CopyCompliance::Allowed,
                 materialized: true,
                 group_id: None,
                 blob_size: None,
@@ -818,6 +903,8 @@ mod tests {
                 version_id: Some(Ulid::from_bytes([1u8; 16])),
                 held: false,
                 storage: None,
+                origin: CopyOrigin::Unknown,
+                compliance: CopyCompliance::Unknown,
                 materialized: false,
                 group_id: None,
                 blob_size: None,
@@ -830,6 +917,46 @@ mod tests {
         assert_eq!(
             serde_json::to_value(BlobCopyState::NotStored).unwrap(),
             serde_json::json!("not-stored")
+        );
+    }
+
+    #[test]
+    fn lists_quarantined_copy() {
+        // A copy the holder refuses to serve is present with its verdict, and a
+        // sync-placed copy names the relationship that put it there.
+        let relationship_id = Ulid::from_bytes([6u8; 16]);
+        let copy = copy_response(
+            &(node_id(), "raw".to_string(), "a.tar".to_string()),
+            false,
+            LocationSummary {
+                version_id: Some(Ulid::from_bytes([1u8; 16])),
+                held: true,
+                storage: Some(LocationCopyStorage::NodeManaged {
+                    storage_class: None,
+                }),
+                origin: CopyOrigin::Sync { relationship_id },
+                compliance: CopyCompliance::Quarantined,
+                materialized: true,
+                group_id: None,
+                blob_size: None,
+                hashes: Default::default(),
+            },
+        );
+
+        assert_eq!(copy.state, BlobCopyState::Present);
+        assert_eq!(copy.origin, BlobCopyOrigin::Sync);
+        assert_eq!(copy.compliance, BlobCopyCompliance::Quarantined);
+        assert_eq!(
+            copy.sync_relationship_id.as_deref(),
+            Some(&*relationship_id.to_string())
+        );
+        assert_eq!(
+            serde_json::to_value(BlobCopyCompliance::Quarantined).unwrap(),
+            serde_json::json!("quarantined")
+        );
+        assert_eq!(
+            serde_json::to_value(BlobCopyOrigin::Sync).unwrap(),
+            serde_json::json!("sync")
         );
     }
 

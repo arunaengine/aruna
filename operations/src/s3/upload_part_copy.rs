@@ -65,7 +65,7 @@ pub async fn upload_part_copy(
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| UploadPartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
-    let sealed = validate_destination_upload(context, &input).await?;
+    let destination_upload = validate_destination_upload(context, &input).await?;
 
     let source = drive(
         GetObjectOperation::new(GetObjectInput {
@@ -120,8 +120,18 @@ pub async fn upload_part_copy(
 
     // No byte of a governed source lands here before this node is admitted for
     // the union the finished part will carry.
-    let refs = union_refs(&sealed, &source.source_policies).map_err(UploadPartError::from)?;
-    gate_part(context, input.source_auth_context.realm_id, &refs).await?;
+    let refs = union_refs(
+        &destination_upload.placement_policies,
+        &source.source_policies,
+    )
+    .map_err(UploadPartError::from)?;
+    gate_part(
+        context,
+        input.source_auth_context.realm_id,
+        &refs,
+        destination_upload.group_id,
+    )
+    .await?;
 
     // Sealed before the bytes land: a lost merge must not let the completed
     // object drop the refs its source carried.
@@ -165,15 +175,18 @@ async fn gate_part(
     context: &DriverContext,
     realm_id: RealmId,
     refs: &[PlacementPolicyRef],
+    group_id: GroupId,
 ) -> Result<(), UploadPartCopyError> {
     let destination = gate_context(context, realm_id, now_ms()).await?;
-    let Some(gate) = write_gate(destination.as_ref(), refs).map_err(UploadPartError::from)? else {
+    let Some(gate) =
+        write_gate(destination.as_ref(), refs, Some(group_id)).map_err(UploadPartError::from)?
+    else {
         return Ok(());
     };
     let outcome = drive(gate, context)
         .await
         .map_err(|error| UploadPartError::from(PolicyGateError::from(error)))?;
-    gate_decision(outcome.decision).map_err(UploadPartError::from)?;
+    gate_decision(outcome).map_err(UploadPartError::from)?;
     Ok(())
 }
 
@@ -262,7 +275,7 @@ async fn merge_upload_policies(
 async fn validate_destination_upload(
     context: &DriverContext,
     input: &UploadPartCopyInput,
-) -> Result<Vec<PlacementPolicyRef>, UploadPartCopyError> {
+) -> Result<MultipartUpload, UploadPartCopyError> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -300,7 +313,7 @@ async fn validate_destination_upload(
             UploadPartError::UploadNotOpen,
         ));
     }
-    Ok(record.placement_policies)
+    Ok(record)
 }
 
 #[cfg(test)]

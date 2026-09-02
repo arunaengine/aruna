@@ -12,14 +12,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BLOB_DELETE_AUDIT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartObjectMetadataKey, PathRestriction, RealmId, ReclaimCandidate,
-    ReclaimCandidateKey, UsageDelta, VersionKey,
+    AuthContext, BackendLocation, BlobDeleteAuditKind, BlobDeleteAuditRecord, BlobHeadKey,
+    BlobLocationKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
+    MultipartObjectMetadataKey, PathRestriction, RealmId, ReclaimCandidate, ReclaimCandidateKey,
+    UsageDelta, VersionKey, delete_audit_key,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -49,6 +50,7 @@ pub enum DeleteObjectState {
     WriteBlobVersion,
     WriteLiveReplicationObligation,
     UpdateUsage,
+    WriteDeleteAudit,
     CommitTransaction,
     Finish,
     Error,
@@ -717,8 +719,7 @@ impl DeleteObjectOperation {
         let delta = self.usage_delta();
         let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta);
         if update.is_noop() {
-            self.state = DeleteObjectState::CommitTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+            return self.write_delete_audit();
         }
         self.state = DeleteObjectState::UpdateUsage;
         let effects = update.start(txn_id);
@@ -735,12 +736,54 @@ impl DeleteObjectOperation {
         };
         match update.step(event, txn_id) {
             Ok(Some(effects)) => effects,
-            Ok(None) => {
-                self.state = DeleteObjectState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
+            Ok(None) => self.write_delete_audit(),
             Err(err) => self.emit_error(err.into()),
         }
+    }
+
+    /// The delete trail is written inside the same transaction, so a committed
+    /// deletion can never lack its record and an aborted one never leaves one.
+    fn write_delete_audit(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(DeleteObjectError::NoTransactionFound);
+        };
+        let (kind, version_id) = match self.version_id {
+            Some(marker) => (BlobDeleteAuditKind::DeleteMarker, Some(marker)),
+            None => (BlobDeleteAuditKind::DeleteVersion, self.input.version_id),
+        };
+        let record = BlobDeleteAuditRecord {
+            realm_id: self.input.realm_id,
+            group_id: self.input.group_id,
+            node_id: self.input.node_id,
+            user_id: self.input.deleted_by,
+            kind,
+            bucket: self.input.bucket.clone(),
+            key: self.input.key.clone(),
+            version_id,
+            occurred_at_ms: aruna_core::util::unix_timestamp_millis(),
+        };
+        let value = match record.to_bytes() {
+            Ok(value) => value,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.state = DeleteObjectState::WriteDeleteAudit;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_DELETE_AUDIT_KEYSPACE.to_string(),
+            key: delete_audit_key(self.input.group_id, Ulid::generate()).into(),
+            value: value.into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_delete_audit(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(DeleteObjectError::NoTransactionFound);
+        };
+        self.state = DeleteObjectState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn delete_next_multipart_part(&mut self) -> Effects {
@@ -920,6 +963,7 @@ impl Operation for DeleteObjectOperation {
                 self.handle_live_replication_obligation_written(event)
             }
             DeleteObjectState::UpdateUsage => self.handle_usage_update(event),
+            DeleteObjectState::WriteDeleteAudit => self.handle_delete_audit(event),
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteObjectState::Finish => smallvec![],
             DeleteObjectState::Error => self.abort(),
@@ -1015,6 +1059,63 @@ mod test {
             crate::replication::queue::LiveReplicationObligationRecord::from_bytes(value.as_ref())
                 .expect("obligation decodes");
         assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
+    }
+
+    fn audit_op(version_id: Option<Ulid>) -> DeleteObjectOperation {
+        let mut operation = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "reports/a.csv".to_string(),
+            version_id,
+            group_id: Ulid::from_bytes([2u8; 16]),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: test_node_id(),
+            deleted_by: test_user_id(),
+        });
+        operation.txn_id = Some(Ulid::generate());
+        operation
+    }
+
+    fn audit_record(effects: &[Effect]) -> aruna_core::structs::BlobDeleteAuditRecord {
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects
+        else {
+            panic!("expected one audit write, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_DELETE_AUDIT_KEYSPACE);
+        aruna_core::structs::BlobDeleteAuditRecord::from_bytes(value.as_ref())
+            .expect("audit record decodes")
+    }
+
+    #[test]
+    fn audits_delete_marker() {
+        let marker = Ulid::generate();
+        let mut operation = audit_op(None);
+        operation.version_id = Some(marker);
+
+        let record = audit_record(&operation.write_delete_audit());
+        assert_eq!(
+            record.kind,
+            aruna_core::structs::BlobDeleteAuditKind::DeleteMarker
+        );
+        assert_eq!(record.version_id, Some(marker));
+        assert_eq!(record.bucket, "bucket");
+        assert_eq!(record.key, "reports/a.csv");
+    }
+
+    #[test]
+    fn audits_version_delete() {
+        let version_id = Ulid::generate();
+        let mut operation = audit_op(Some(version_id));
+
+        let record = audit_record(&operation.write_delete_audit());
+        assert_eq!(
+            record.kind,
+            aruna_core::structs::BlobDeleteAuditKind::DeleteVersion
+        );
+        assert_eq!(record.version_id, Some(version_id));
     }
 
     fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {
@@ -1118,14 +1219,22 @@ mod test {
 
     #[test]
     fn marker_queues_nothing() {
+        // No reclaim candidate without a location; the delete trail still rides
+        // the same transaction.
         let mut op = candidate_op(None);
 
         let effects = op.write_reclaim_candidate();
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, txn_id, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the audit write, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_DELETE_AUDIT_KEYSPACE);
+        assert_eq!(*txn_id, op.txn_id);
     }
 
     async fn read_value(

@@ -1444,8 +1444,16 @@ mod serve_tests {
     }
 
     fn registration() -> Vec<u8> {
-        let (_, _, value) = register_entry(version(), node(), &location(), &[policy_ref()], 1, 7)
-            .expect("registration builds");
+        let (_, _, value) = register_entry(crate::blob::managed_copy::CopyRegistration {
+            version: version(),
+            node_id: node(),
+            location: &location(),
+            policies: &[policy_ref()],
+            origin: aruna_core::structs::CopyOrigin::Write,
+            subject_generation: 1,
+            registered_at_ms: 7,
+        })
+        .expect("registration builds");
         value.as_ref().to_vec()
     }
 

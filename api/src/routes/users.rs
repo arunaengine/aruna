@@ -175,6 +175,9 @@ pub struct UserInfoPreferencesResponse {
     pub preferred_profile_path: Option<String>,
     pub favourite_metadata_ids: Vec<String>,
     pub theme: Option<String>,
+    /// Which dashboard section leads: `personal` or `realm`. Absent when the
+    /// attribute is unset or carries an unknown value.
+    pub dashboard_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -267,6 +270,11 @@ fn user_preferences_from_attributes(
             })
             .unwrap_or_default(),
         theme: attributes.get("ui.theme").cloned(),
+        dashboard_scope: attributes
+            .get("ui.dashboard_scope")
+            .map(|value| value.trim())
+            .filter(|value| matches!(*value, "personal" | "realm"))
+            .map(ToOwned::to_owned),
     }
 }
 
@@ -738,8 +746,9 @@ async fn get_token(
 takes no user id.
 
 **Behavior**
-- Preferences are derived from the caller's `ui.theme`, `ui.preferred_profile_path` and
-  `ui.favourite_metadata_ids` attributes, the last a comma separated list.
+- Preferences are derived from the caller's `ui.theme`, `ui.preferred_profile_path`,
+  `ui.favourite_metadata_ids` (a comma separated list) and `ui.dashboard_scope` (`personal` or
+  `realm`, absent when unset or unknown) attributes.
 - Group membership is collected from the groups this node holds, so a group that has not arrived
   here yet is missing."#,
     responses(
@@ -788,7 +797,8 @@ takes no user id.
                 "preferences": {
                     "preferred_profile_path": "datasets/proteomics",
                     "favourite_metadata_ids": ["01JMETADATA0123456789ABCDE"],
-                    "theme": "dark"
+                    "theme": "dark",
+                    "dashboard_scope": "personal"
                 }
             })
         ),
@@ -822,8 +832,8 @@ user document and takes no user id.
 **Behavior**
 - Fields left out change nothing, and removals are applied before sets, so a key named in both ends
   up set to the new value.
-- UI preferences are ordinary attributes: `ui.theme`, `ui.preferred_profile_path` and
-  `ui.favourite_metadata_ids` as a comma separated list.
+- UI preferences are ordinary attributes: `ui.theme`, `ui.preferred_profile_path`,
+  `ui.favourite_metadata_ids` as a comma separated list, and `ui.dashboard_scope`.
 - The write is durable here and reaches the other realm nodes through document sync.
 
 **Limits**
@@ -880,7 +890,8 @@ user document and takes no user id.
                 "preferences": {
                     "preferred_profile_path": null,
                     "favourite_metadata_ids": [],
-                    "theme": "dark"
+                    "theme": "dark",
+                    "dashboard_scope": null
                 }
             })
         ),
@@ -2923,7 +2934,10 @@ mod resolve_tests {
 
 #[cfg(test)]
 mod device_tests {
-    use super::{UserDeviceResponse, evict_device, list_user_devices, revoke_user_device};
+    use super::{
+        UserDeviceResponse, evict_device, list_user_devices, revoke_user_device,
+        user_preferences_from_attributes,
+    };
     use crate::error::ServerError;
     use crate::server_state::ServerState;
     use aruna_core::UserId;
@@ -3286,5 +3300,24 @@ mod device_tests {
             .await,
             Err(ServerError::NotFound)
         ));
+    }
+
+    #[test]
+    fn decodes_dashboard_scope() {
+        // Only the two documented values decode; anything else reads as unset.
+        let scope = |value: &str| {
+            user_preferences_from_attributes(&std::collections::HashMap::from([(
+                "ui.dashboard_scope".to_string(),
+                value.to_string(),
+            )]))
+            .dashboard_scope
+        };
+        assert_eq!(scope("personal").as_deref(), Some("personal"));
+        assert_eq!(scope(" realm ").as_deref(), Some("realm"));
+        assert_eq!(scope("everything"), None);
+        assert_eq!(
+            user_preferences_from_attributes(&std::collections::HashMap::new()).dashboard_scope,
+            None
+        );
     }
 }

@@ -12,6 +12,7 @@ pub mod diagnostics;
 pub mod forward;
 pub mod gate;
 pub mod list;
+pub mod names;
 pub mod quarantine;
 pub mod read;
 pub mod resolve;
@@ -34,6 +35,7 @@ pub use list::{
     ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
     POLICY_LIST_LIMIT, PolicyListPage,
 };
+pub use names::{MAX_NAMED_REFS, PolicyName, PolicyNamesError, PolicyNamesOperation};
 pub use quarantine::{
     QuarantineError, QuarantineResolution, ResolveQuarantineConfig, ResolveQuarantineOperation,
 };
@@ -48,6 +50,30 @@ pub use subject::{
 };
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 
+use aruna_core::structs::PolicyResolution;
+use aruna_core::types::GroupId;
+use std::collections::BTreeMap;
+use ulid::Ulid;
+
+/// The first resolved rule another group owns. A group-owned rule governs only
+/// its owner's own buckets, so a reference from elsewhere is refused whoever
+/// attaches it; a rule that could not be resolved is decided by the gate.
+pub fn foreign_owner(
+    resolved: &BTreeMap<Ulid, PolicyResolution>,
+    group_id: GroupId,
+) -> Option<Ulid> {
+    resolved
+        .iter()
+        .find_map(|(policy_id, resolution)| match resolution {
+            PolicyResolution::Known(policy) => policy
+                .policy()
+                .owner_group_id
+                .is_some_and(|owner| owner != group_id)
+                .then_some(*policy_id),
+            PolicyResolution::Unresolved => None,
+        })
+}
+
 /// What production wiring establishes before a governed write is possible: an
 /// advertised subject and the policies this node has already resolved.
 #[cfg(test)]
@@ -60,7 +86,7 @@ pub(crate) mod fixtures {
         NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyDocument, PlacementSubject,
         PolicyPublicationClaim, RealmConfigDocument, RealmId, RealmNodeKind, VerifiedPolicy,
     };
-    use aruna_core::types::{Key, NodeId, UserId};
+    use aruna_core::types::{GroupId, Key, NodeId, UserId};
     use std::collections::BTreeMap;
 
     use super::cache::{PolicyCacheEntry, cache_key};
@@ -79,6 +105,16 @@ pub(crate) mod fixtures {
     }
 
     pub fn authority(realm_id: RealmId) -> Event {
+        authority_view(realm_id, None)
+    }
+
+    /// The same realm view plus the owning group's roles, which a group-owned
+    /// rule is authenticated against.
+    pub fn group_authority(realm_id: RealmId, group_id: GroupId) -> Event {
+        authority_view(realm_id, Some(group_id))
+    }
+
+    fn authority_view(realm_id: RealmId, group_id: Option<GroupId>) -> Event {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
         config.seed_default_placement();
         for seed in [1, 9] {
@@ -89,9 +125,27 @@ pub(crate) mod fixtures {
         }
         let (config_value, auth_value) = realm_view(&config, admin_user(realm_id));
         let key: Key = Vec::new().into();
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key.clone(), Some(config_value)), (key, Some(auth_value))],
-        })
+        let mut values = vec![
+            (key.clone(), Some(config_value)),
+            (key.clone(), Some(auth_value)),
+        ];
+        if let Some(group_id) = group_id {
+            let document = super::tests::group_authorization(realm_id, group_id);
+            values.push((
+                key,
+                Some(
+                    document
+                        .to_bytes(&aruna_core::structs::Actor {
+                            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+                            user_id: admin_user(realm_id),
+                            realm_id,
+                        })
+                        .expect("group authorization encodes")
+                        .into(),
+                ),
+            ));
+        }
+        Event::Storage(StorageEvent::BatchReadResult { values })
     }
 
     pub async fn seed_gate(
@@ -226,6 +280,28 @@ mod tests {
             realm_id,
             roles: HashMap::from([(role.role_id, role)]),
             operation_restrictions: HashMap::new(),
+        }
+    }
+
+    /// Group authorization granting the policy fixtures' admin user write on
+    /// that group's admin path, which a group-owned publication needs.
+    pub(crate) fn group_authorization(
+        realm_id: RealmId,
+        group_id: Ulid,
+    ) -> aruna_core::structs::GroupAuthorizationDocument {
+        let role = Role {
+            role_id: Ulid::from_bytes([4u8; 16]),
+            name: "group_admin".to_string(),
+            permissions: HashMap::from([(
+                format!("/{realm_id}/g/{group_id}/**"),
+                Permission::WRITE,
+            )]),
+            assigned_users: HashSet::from([admin_user(realm_id)]),
+        };
+        aruna_core::structs::GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(role.role_id, role)]),
+            policies: Vec::new(),
         }
     }
 

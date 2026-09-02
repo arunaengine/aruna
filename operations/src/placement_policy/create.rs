@@ -11,7 +11,7 @@ use aruna_core::structs::{
     Actor, AuthContext, Permission, PlacementPolicy, PlacementPolicyDocument, PlacementPolicyError,
     PlacementRef, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
     RealmConfigDocument, VerifiedPolicy, placement_policy_change, placement_policy_target,
-    policy_admin_path,
+    policy_authority_path,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, Value};
@@ -86,7 +86,9 @@ pub enum CreatePolicyError {
     /// unsigned policy would carry no provenance a fetcher could verify.
     #[error("policy publication could not be signed: {0}")]
     PublicationUnavailable(String),
-    #[error("caller may not administer the realm configuration")]
+    /// Realm-wide rules need realm-configuration write; a group-owned rule
+    /// needs admin write on the group it names.
+    #[error("caller may not publish a rule under this ownership")]
     Unauthorized,
     #[error("realm config document missing")]
     RealmConfigMissing,
@@ -318,7 +320,10 @@ impl Operation for CreatePolicyOperation {
         self.state = CreatePolicyState::Authorize;
         let auth_config = CheckPermissionsConfig {
             auth_context: self.config.auth_context.clone(),
-            path: policy_admin_path(self.config.actor.realm_id),
+            path: policy_authority_path(
+                self.config.actor.realm_id,
+                self.config.policy.owner_group_id,
+            ),
             required_permission: Permission::WRITE,
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -627,6 +632,7 @@ mod tests {
                 &RealmConfigDocument::from_bytes(&realm_config).expect("config decodes"),
                 &aruna_core::structs::RealmAuthorizationDocument::from_bytes(&realm_auth)
                     .expect("authorization decodes"),
+                None,
             ),
             Ok(())
         );
@@ -702,6 +708,100 @@ mod tests {
         .await
         .expect("policy resolves");
         assert_eq!(read.policy.policy(), &created.policy);
+    }
+
+    /// A realm role granting the admin user write on one group's admin path,
+    /// so a group-owned publication has an authority to check against.
+    async fn seed_group_admin(context: &DriverContext, actor: &Actor, group_id: Ulid) {
+        let target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let document = aruna_core::structs::GroupAuthorizationDocument {
+            group_id,
+            roles: std::collections::HashMap::from([(
+                Ulid::from_bytes([4u8; 16]),
+                aruna_core::structs::Role {
+                    role_id: Ulid::from_bytes([4u8; 16]),
+                    name: "group_admin".to_string(),
+                    permissions: std::collections::HashMap::from([(
+                        format!("/{}/g/{group_id}/**", actor.realm_id),
+                        Permission::WRITE,
+                    )]),
+                    assigned_users: std::collections::HashSet::from([actor.user_id]),
+                },
+            )]),
+            policies: Vec::new(),
+        };
+        let _ = context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: document.to_bytes(actor).expect("document encodes").into(),
+                txn_id: None,
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn publishes_group_owner() {
+        // A group administrator publishes a rule its own group owns, and an
+        // independent verifier accepts it against that group's roles.
+        let (_dir, context, actor) = setup().await;
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        seed_group_admin(&context, &actor, group_id).await;
+        let owned = policy("eu-west")
+            .owned_by(group_id)
+            .expect("owner is valid");
+
+        let document = drive(CreatePolicyOperation::new(config(&actor, owned)), &context)
+            .await
+            .expect("policy is created");
+
+        assert_eq!(document.policy.owner_group_id, Some(group_id));
+        let realm_config = read_document(
+            &context,
+            DocumentSyncTarget::RealmConfig {
+                realm_id: actor.realm_id,
+            },
+        )
+        .await;
+        let realm_auth = read_document(
+            &context,
+            DocumentSyncTarget::RealmAuthorization {
+                realm_id: actor.realm_id,
+            },
+        )
+        .await;
+        let group_auth = read_document(
+            &context,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+        )
+        .await;
+        let group_auth = aruna_core::structs::GroupAuthorizationDocument::from_bytes(&group_auth)
+            .expect("group authorization decodes");
+        assert_eq!(
+            verify_policy_authority(
+                &document,
+                &RealmConfigDocument::from_bytes(&realm_config).expect("config decodes"),
+                &aruna_core::structs::RealmAuthorizationDocument::from_bytes(&realm_auth)
+                    .expect("authorization decodes"),
+                Some(&group_auth),
+            ),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn denies_foreign_group() {
+        // Administering one group is no authority over another group's rules.
+        let (_dir, context, actor) = setup().await;
+        seed_group_admin(&context, &actor, Ulid::from_bytes([7u8; 16])).await;
+        let owned = policy("eu-west")
+            .owned_by(Ulid::from_bytes([8u8; 16]))
+            .expect("owner is valid");
+
+        let denied = drive(CreatePolicyOperation::new(config(&actor, owned)), &context).await;
+
+        assert_eq!(denied, Err(CreatePolicyError::Unauthorized));
     }
 
     #[tokio::test]
