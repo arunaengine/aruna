@@ -30,6 +30,13 @@ use crate::placement::placement_ref_for_target;
 
 pub const MAX_GROUP_NAME_LEN: usize = 256;
 
+/// The one group-name rule: trimmed, non-empty and at most
+/// `MAX_GROUP_NAME_LEN` bytes. `None` means the name is refused.
+pub fn normalize_group_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty() && trimmed.len() <= MAX_GROUP_NAME_LEN).then(|| trimmed.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateGroupConfig {
     pub actor: Actor,
@@ -121,11 +128,7 @@ impl UpdateGroupOperation {
     }
 
     fn trimmed_name(&self) -> Result<String, UpdateGroupError> {
-        let trimmed = self.config.display_name.trim();
-        if trimmed.is_empty() || trimmed.len() > MAX_GROUP_NAME_LEN {
-            return Err(UpdateGroupError::InvalidDisplayName);
-        }
-        Ok(trimmed.to_string())
+        normalize_group_name(&self.config.display_name).ok_or(UpdateGroupError::InvalidDisplayName)
     }
 
     fn document_ref(&self) -> DocumentSyncTarget {

@@ -41,7 +41,9 @@ use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation}
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
 };
-use aruna_operations::update_group::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
+use aruna_operations::update_group::{
+    UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -378,7 +380,7 @@ realm's per-user group quota, from which WRITE on the realm group-admin path exe
   may not list the group immediately.
 
 **Limits**
-- The name is trimmed and must be 1 to 256 characters.
+- The name is trimmed and must be 1 to 256 bytes.
 - Names need not be unique."#,
     request_body(
         content = CreateGroupRequest,
@@ -420,7 +422,7 @@ realm's per-user group quota, from which WRITE on the realm group-admin path exe
                 ]
             })
         ),
-        (status = 400, description = "Malformed request body, or a name that is empty or longer than 256 characters", body = ErrorResponse),
+        (status = 400, description = "Malformed request body, or a name that is empty, blank or longer than 256 bytes once trimmed; the name is checked here, so a user node refuses it without forwarding", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter is retryable unchanged", body = ErrorResponse),
@@ -441,6 +443,11 @@ pub async fn create_group(
     if auth.realm_id != realm_id {
         return Err(ServerError::Forbidden);
     }
+    // Checked before the forwarding branch so a user node answers the same 400
+    // a management node does, instead of a forwarding failure.
+    let name = normalize_group_name(&request.name).ok_or_else(|| {
+        ServerError::BadRequestReason(CreateGroupError::InvalidDisplayName.to_string())
+    })?;
 
     let ctx = state.get_ctx();
     // A device originates no realm administration, so the create travels to an
@@ -453,7 +460,7 @@ pub async fn create_group(
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
             .map_err(map_metadata_api_error)?
             .ok_or(ServerError::Unauthorized)?;
-        let forwarded = forward_group_create(&ctx, realm_id, auth_token, request.name)
+        let forwarded = forward_group_create(&ctx, realm_id, auth_token, name)
             .await
             .map_err(|err| match err {
                 ForwardGroupError::Conflict(reason) => ServerError::Conflict(reason),
@@ -491,7 +498,7 @@ pub async fn create_group(
         event = "request.group.create.authorized",
         realm_id = %realm_id,
         user_id = %auth.user_id,
-        group_name = %request.name,
+        group_name = %name,
         "Authorized group creation request"
     );
 
@@ -500,7 +507,7 @@ pub async fn create_group(
         "otel.kind" = "internal",
         realm_id = %realm_id,
         user_id = %auth.user_id,
-        group_name = %request.name,
+        group_name = %name,
         group_id = field::Empty,
     );
     let result = drive(
@@ -510,7 +517,7 @@ pub async fn create_group(
                 user_id: auth.user_id,
                 realm_id,
             },
-            display_name: request.name,
+            display_name: name,
             owner_cap,
         }),
         &state.get_ctx(),
@@ -2420,7 +2427,28 @@ mod tests {
         let error = new_group(&state, admin, &"n".repeat(257))
             .await
             .unwrap_err();
-        assert!(matches!(error, ServerError::BadRequest));
+        assert!(matches!(error, ServerError::BadRequestReason(_)));
+    }
+
+    #[tokio::test]
+    async fn device_rejects_name() {
+        // A user node validates the name itself, so an invalid one answers 400
+        // instead of failing at the ingress it would otherwise forward to.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let node_id = state.get_node_id().to_string();
+        update_config(&state, |config| {
+            for node in &mut config.nodes {
+                if node.node_id == node_id {
+                    node.kind = RealmNodeKind::User { owner: admin };
+                }
+            }
+        })
+        .await;
+
+        for name in ["   ".to_string(), "n".repeat(257)] {
+            let error = new_group(&state, admin, &name).await.unwrap_err();
+            assert!(matches!(error, ServerError::BadRequestReason(_)));
+        }
     }
 
     #[tokio::test]

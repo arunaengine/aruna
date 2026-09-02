@@ -29,7 +29,7 @@ use tracing::{trace, warn};
 use ulid::Ulid;
 
 use crate::placement::placement_ref_for_target;
-use crate::update_group::MAX_GROUP_NAME_LEN;
+use crate::update_group::{MAX_GROUP_NAME_LEN, normalize_group_name};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -614,11 +614,10 @@ impl Operation for CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.start", level = "debug", skip(self), fields(group_name = %self.config.display_name))]
     fn start(&mut self) -> Effects {
-        let trimmed = self.config.display_name.trim();
-        if trimmed.is_empty() || trimmed.len() > MAX_GROUP_NAME_LEN {
+        let Some(trimmed) = normalize_group_name(&self.config.display_name) else {
             return self.fail(CreateGroupError::InvalidDisplayName);
-        }
-        self.config.display_name = trimmed.to_string();
+        };
+        self.config.display_name = trimmed;
         self.state = CreateGroupState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
