@@ -624,10 +624,7 @@ pub async fn capture_outputs(
             )
         })
         .collect();
-    // Plan section 10: an output inherits the union of its inputs' refs and the
-    // destination default, so a result can never be less constrained than what
-    // produced it.
-    let inherited = Box::pin(staged_input_policies(context, spec, record)).await?;
+    let inherited = Box::pin(input_policies(context, spec, record)).await?;
     let mut outputs = Vec::with_capacity(selections.len());
     for (selection, (destination_node_id, bucket, key)) in selections.iter().zip(&destinations) {
         let Some(version_id) = reserved
@@ -655,25 +652,46 @@ pub async fn capture_outputs(
     Ok(outputs)
 }
 
-/// Union of the refs every staged input carries. Read from the workspace copies
-/// themselves, so a restarted capture inherits exactly what staging sealed.
-async fn staged_input_policies(
+/// Where one input's refs are read from: the workspace copy of a staged job,
+/// and the pinned source object itself for a mounted one, which owns no copy.
+fn policy_source(workspace: &str, input: &InputSelection) -> Result<HeadObjectInput, JobError> {
+    if !workspace.is_empty() {
+        return Ok(HeadObjectInput {
+            bucket: workspace.to_string(),
+            key: input.dest_key.clone(),
+            version_id: None,
+        });
+    }
+    let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    let version = version_id
+        .as_deref()
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| JobError::permanent(format!("invalid input version_id for {bucket}/{key}")))?;
+    Ok(HeadObjectInput {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version,
+    })
+}
+
+/// Union of the refs every input carries, so an output can never be less
+/// constrained than what produced it. A restarted capture reads the same
+/// workspace copies or the same pinned versions again.
+async fn input_policies(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
 ) -> Result<Vec<PlacementPolicyRef>, JobError> {
-    let bucket = super::job_bucket(record);
-    if bucket.is_empty() {
-        return Ok(Vec::new());
-    }
+    let workspace = super::job_bucket(record);
     let mut refs = Vec::new();
     for input in &spec.inputs {
         let head = Box::pin(drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.clone(),
-                key: input.dest_key.clone(),
-                version_id: None,
-            }),
+            HeadObjectOperation::new(policy_source(&workspace, input)?),
             context,
         ))
         .await
@@ -2445,6 +2463,36 @@ mod tests {
         *version_id = Some(Ulid::from_bytes([7; 16]).to_string());
         spec.inputs.push(input);
         assert!(pinned_inputs(&spec));
+    }
+
+    #[test]
+    fn reads_pinned_source() {
+        // A mounted job owns no workspace copy, so its outputs inherit the refs
+        // of the exact source version the launch pinned.
+        let version = Ulid::from_bytes([7; 16]);
+        let input = InputSelection {
+            source: InputSource::S3 {
+                bucket: "input".to_string(),
+                key: "data.csv".to_string(),
+                version_id: Some(version.to_string()),
+            },
+            source_node_id: None,
+            dest_key: "in/data.csv".to_string(),
+            mode: InputMode::Mount,
+            container_path: Some("/in/data.csv".to_string()),
+            name: None,
+            description: None,
+        };
+
+        let mounted = policy_source("", &input).unwrap();
+        assert_eq!(mounted.bucket, "input");
+        assert_eq!(mounted.key, "data.csv");
+        assert_eq!(mounted.version_id, Some(version));
+
+        let staged = policy_source("ws-1", &input).unwrap();
+        assert_eq!(staged.bucket, "ws-1");
+        assert_eq!(staged.key, "in/data.csv");
+        assert_eq!(staged.version_id, None);
     }
 
     #[test]
