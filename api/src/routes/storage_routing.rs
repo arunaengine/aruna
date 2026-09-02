@@ -2,7 +2,8 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{
-    AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule, target_warnings,
+    AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule,
+    blob_bucket_permission_path, target_warnings,
 };
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::group_routing::{
@@ -194,8 +195,25 @@ async fn group_of_bucket(state: &ServerState, bucket: &str) -> ServerResult<Ulid
     }
 }
 
-/// Routing decides where a group's bytes physically land, so it takes group
-/// admin rights, not the write rights that suffice for objects.
+/// The bucket overview shows the backend a bucket writes to, so reading the
+/// rules takes the same right as reading the bucket itself.
+async fn ensure_bucket_read(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: Ulid,
+    bucket: &str,
+) -> ServerResult<()> {
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
+        Permission::READ,
+    )
+    .await
+}
+
+/// Routing decides where a group's bytes physically land, so changing it takes
+/// group admin rights, not the write rights that suffice for objects.
 pub(crate) async fn ensure_group_admin(
     state: &ServerState,
     auth: &AuthContext,
@@ -217,8 +235,8 @@ pub(crate) async fn ensure_group_admin(
     summary = "Read a bucket's write routing rules",
     description = r#"Returns the write routing rules that pick the storage backend for new writes to a bucket on this node, in submission order.
 
-**Authentication**: realm bearer token with WRITE on the owning group's admin path. Routing decides
-where a group's bytes physically land, so the write rights that suffice for objects are not enough.
+**Authentication**: realm bearer token with READ on the bucket. Reading where a bucket's bytes land
+is part of describing the bucket; changing the rules still takes group admin write.
 
 **Behavior**
 - Node-local read of the replicated bucket record: rules written on another node can be missing
@@ -252,7 +270,7 @@ where a group's bytes physically land, so the write rights that suffice for obje
             })
         ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -264,7 +282,7 @@ pub async fn get_bucket_routing(
 ) -> ServerResult<Json<BucketRoutingResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = group_of_bucket(&state, &bucket).await?;
-    ensure_group_admin(&state, &auth, group_id).await?;
+    ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
 
     let rules = drive(
         GetBucketRoutingOperation::new(bucket.clone()),
