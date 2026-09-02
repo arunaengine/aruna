@@ -3629,6 +3629,24 @@ mod gate_test {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
+    /// The same rule under one group's ownership.
+    fn owned_policy(location: &str, owner: Ulid) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(owner)
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
     fn gate(location: &str) -> GateContext {
         GateContext {
             realm_id: realm(),
@@ -3932,6 +3950,36 @@ mod gate_test {
         assert!(matches!(
             operation.finalize(),
             Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
+        ));
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // A copy inherits a rule another group owns into this group's bucket;
+        // the subject satisfies it, so only the ownership refuses the write.
+        let rule = owned_policy("eu-west", Ulid::from_bytes([8u8; 16]));
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        operation.start();
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(!materializes(&effects));
+
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(read(Some(ByteView::from(cached))));
+        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            Ulid::from_bytes([8u8; 16]),
+        ));
+
+        assert!(!materializes(&effects));
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::ForeignPolicy { .. }
+            ))
         ));
     }
 

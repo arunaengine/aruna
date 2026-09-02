@@ -469,6 +469,24 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
+    /// The same rule under one group's ownership.
+    fn owned_policy(seed: u8, location: &str, owner: GroupId) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(owner)
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
     fn subject(location: &str) -> PlacementSubject {
         PlacementSubject {
             node_id: node(9),
@@ -550,6 +568,72 @@ mod tests {
             }
         );
         assert_eq!(outcome.stats.hits, 2);
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // The subject satisfies the rule, so only its owning group refuses it.
+        let owner = Ulid::from_bytes([8u8; 16]);
+        let rule = owned_policy(1, "eu-west", owner);
+        let mut operation = operation(vec![rule.policy_ref()], "eu-west");
+        operation.start();
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
+        operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            owner,
+        ));
+
+        let outcome = operation.finalize().expect("gate decides");
+        assert_eq!(outcome.decision, PlacementDecision::Allowed);
+        assert_eq!(
+            gate_decision(outcome),
+            Err(PolicyGateError::ForeignPolicy {
+                policy_id: rule.policy().policy_id
+            })
+        );
+    }
+
+    #[test]
+    fn allows_own_group() {
+        // An unowned realm-wide rule and one the destination's own group owns
+        // both govern this write.
+        let realm_wide = policy(1, "eu-west");
+        let owned = owned_policy(2, "eu-west", group());
+        let mut operation = operation(vec![realm_wide.policy_ref(), owned.policy_ref()], "eu-west");
+        operation.start();
+        operation.step(cached(&PolicyCacheEntry::verified(
+            &document(&realm_wide),
+            10,
+        )));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&owned), 10)));
+        operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            group(),
+        ));
+
+        let outcome = operation.finalize().expect("gate decides");
+        assert_eq!(outcome.foreign_owner, None);
+        assert_eq!(gate_decision(outcome), Ok(()));
+    }
+
+    #[test]
+    fn skips_unknown_group() {
+        // Subject revalidation names no destination bucket, so ownership is
+        // decided by the write that registers the copy instead.
+        let owner = Ulid::from_bytes([8u8; 16]);
+        let rule = owned_policy(1, "eu-west", owner);
+        let mut operation = gate_for(vec![rule.policy_ref()], "eu-west", None);
+        operation.start();
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
+        operation.step(crate::placement_policy::fixtures::group_authority(
+            realm(),
+            owner,
+        ));
+
+        let outcome = operation.finalize().expect("gate decides");
+        assert_eq!(outcome.foreign_owner, None);
+        assert_eq!(gate_decision(outcome), Ok(()));
     }
 
     #[test]
