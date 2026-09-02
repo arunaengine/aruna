@@ -4,11 +4,15 @@ use std::collections::HashMap;
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
+use aruna_core::compute::TaskInput;
+use aruna_core::effects::StorageEffect;
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    AttemptControl, AttemptIntent, Backend, BackendConfig, BucketInfo, ExecutionSpec,
-    FIRST_GRANTABLE_HANDLE, JobClaim, JobId, JobPayload, JobRecord, JobState, RealmId,
-    RoutingSnapshot,
+    Actor, AttemptControl, AttemptIntent, Backend, BackendConfig, BucketInfo, ExecutionSpec,
+    FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, InputMode, InputSelection,
+    InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RoutingSnapshot,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::{GroupId, NodeId};
@@ -17,6 +21,7 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::store::{insert_job, record_attempt_intent, reserve_output_commits};
 use aruna_operations::jobs::submit::mint_job_id;
+use aruna_operations::jobs::workflow::workspace::{load_inputs, load_pinned_mounts, stage_inputs};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
 use aruna_operations::s3::list_object_versions::{
@@ -26,11 +31,14 @@ use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_storage::storage;
+use futures_util::StreamExt;
 use tempfile::TempDir;
 use ulid::Ulid;
 
 const BUCKET: &str = "outputs";
 const KEY: &str = "run/result.txt";
+const WORKSPACE: &str = "ws-run";
+const INPUT_PATH: &str = "/in/data.csv";
 
 struct Harness {
     _temp_dir: TempDir,
@@ -84,14 +92,14 @@ async fn setup() -> Harness {
         created_by: UserId::local(Ulid::generate(), realm_id),
         group_id: Ulid::generate(),
     };
-    create_bucket(&harness).await;
+    create_bucket(&harness, BUCKET).await;
     harness
 }
 
-async fn create_bucket(harness: &Harness) {
+async fn create_bucket(harness: &Harness, bucket: &str) {
     drive(
         CreateBucketOperation::new(
-            BUCKET.to_string(),
+            bucket.to_string(),
             BucketInfo {
                 group_id: harness.group_id,
                 created_at: std::time::SystemTime::now(),
@@ -255,6 +263,166 @@ async fn list_versions(harness: &Harness) -> Vec<Ulid> {
             ListObjectVersionsItem::DeleteMarker { .. } => None,
         })
         .collect()
+}
+
+/// The realm documents an input read authorizes against.
+async fn seed_auth(harness: &Harness) {
+    let actor = Actor {
+        node_id: harness.node_id,
+        user_id: harness.created_by,
+        realm_id: harness.realm_id,
+    };
+    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(harness.realm_id);
+    let group_auth = GroupAuthorizationDocument::new_default_group_doc(
+        harness.created_by,
+        harness.realm_id,
+        harness.group_id,
+    );
+    let group = Group {
+        display_name: "inputs".to_string(),
+        group_id: harness.group_id,
+        realm_id: harness.realm_id,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner: harness.created_by,
+    };
+    let realm_config = RealmConfigDocument::default_for_realm(harness.realm_id, Vec::new());
+    for (key_space, key, value) in [
+        (
+            AUTH_KEYSPACE,
+            harness.realm_id.as_bytes().to_vec(),
+            realm_auth.to_bytes(&actor).unwrap(),
+        ),
+        (
+            AUTH_KEYSPACE,
+            harness.group_id.to_bytes().to_vec(),
+            group_auth.to_bytes(&actor).unwrap(),
+        ),
+        (
+            REALM_CONFIG_KEYSPACE,
+            harness.realm_id.as_bytes().to_vec(),
+            realm_config.to_bytes(&actor).unwrap(),
+        ),
+        (
+            GROUP_KEYSPACE,
+            harness.group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
+        ),
+    ] {
+        harness
+            .driver
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+    }
+}
+
+/// One execution reading the object at exactly the version the launch sealed.
+fn pinned_spec(harness: &Harness, version: Ulid, mode: InputMode) -> ExecutionSpec {
+    let mut spec = execution_spec(harness.group_id);
+    spec.inputs.push(InputSelection {
+        source: InputSource::S3 {
+            bucket: BUCKET.to_string(),
+            key: KEY.to_string(),
+            version_id: Some(version.to_string()),
+        },
+        source_node_id: None,
+        dest_key: INPUT_PATH[1..].to_string(),
+        mode,
+        container_path: Some(INPUT_PATH.to_string()),
+        name: None,
+        description: None,
+    });
+    spec
+}
+
+fn job_record(harness: &Harness, spec: &ExecutionSpec) -> JobRecord {
+    JobRecord::new(
+        JobId::from_bytes([4u8; 16]),
+        JobPayload::Execution(spec.clone()),
+        harness.created_by,
+        harness.node_id,
+        1,
+        1,
+        None,
+    )
+}
+
+async fn read_input(input: TaskInput) -> Vec<u8> {
+    let mut stream = input.take_stream().unwrap();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    bytes
+}
+
+/// Snapshot the pinned input into the run workspace and reopen it exactly as a
+/// launch does, so the bytes are the ones the container would receive.
+async fn staged_bytes(harness: &Harness, version: Ulid) -> Vec<u8> {
+    let spec = pinned_spec(harness, version, InputMode::Snapshot);
+    let record = job_record(harness, &spec);
+    create_bucket(harness, WORKSPACE).await;
+    stage_inputs(&harness.driver, &spec, &record, WORKSPACE, harness.node_id)
+        .await
+        .unwrap();
+    let mut inputs = load_inputs(&harness.driver, &spec, &record, WORKSPACE, harness.node_id)
+        .await
+        .unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].path, INPUT_PATH);
+    read_input(inputs.remove(0)).await
+}
+
+#[tokio::test]
+async fn stages_pinned_version() {
+    // A later write to the same key must not reach a launch sealed on the first.
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    let first = put_version(&harness, b"first-version", None).await;
+    put_version(&harness, b"second-version", None).await;
+
+    assert_eq!(
+        staged_bytes(&harness, first.version_id).await,
+        b"first-version"
+    );
+}
+
+#[tokio::test]
+async fn stages_later_version() {
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    put_version(&harness, b"first-version", None).await;
+    let second = put_version(&harness, b"second-version", None).await;
+
+    assert_eq!(
+        staged_bytes(&harness, second.version_id).await,
+        b"second-version"
+    );
+}
+
+#[tokio::test]
+async fn mounts_stage_pinned() {
+    // A mounted input the launch pinned is staged read-only instead of mounted:
+    // a mount serves the current head and could never serve this version.
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    let first = put_version(&harness, b"first-version", None).await;
+    put_version(&harness, b"second-version", None).await;
+    let spec = pinned_spec(&harness, first.version_id, InputMode::Mount);
+    let record = job_record(&harness, &spec);
+
+    let mut inputs = load_pinned_mounts(&harness.driver, &spec, &record, harness.node_id)
+        .await
+        .unwrap();
+
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].path, INPUT_PATH);
+    assert_eq!(read_input(inputs.remove(0)).await, b"first-version");
 }
 
 #[tokio::test]
