@@ -618,6 +618,16 @@ async fn metadata_explains_refusals() {
     assert!(is_error(&empty_path));
     assert_eq!(code(&empty_path), "Bad request");
 
+    // A group scope resolves that group's non-public Profiles, so it needs READ.
+    let foreign_scope = call(
+        &client,
+        "validate_dataset",
+        json!({ "group_id": unknown, "rocrate": { "@graph": [] } }),
+    )
+    .await;
+    assert!(is_error(&foreign_scope));
+    assert_eq!(code(&foreign_scope), "Forbidden");
+
     client.cancel().await.unwrap();
     shutdown.cancel();
     task.await.unwrap().unwrap();

@@ -122,8 +122,9 @@ struct ResolvedProfile {
 ///
 /// Usability is a property of the registry row alone: a Profile serves the
 /// Datasets of its own group, and everyone once it is public. Whoever reaches
-/// validation already proved WRITE on the Dataset's path in that group, so no
-/// caller identity takes part in the decision.
+/// validation already proved WRITE on the Dataset's path in that group, or READ
+/// on the group's metadata for a preview, so no caller identity takes part in
+/// the decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileScope {
     /// Datasets of this group, so its own Profiles resolve as well.

@@ -344,7 +344,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Run the structural and Profile checks a metadata write applies and return the verdict without storing anything. Call it before create_dataset and replace_dataset and repair every reported item until `accepted` is true. Pass the group_id the dataset will be saved in, otherwise only public Profiles are resolved. Structural violations carry a code and a JSON pointer, Profile findings carry the failing SHACL rule and its focus node. It creates and changes nothing.",
+        description = "Run the structural and Profile checks a metadata write applies and return the verdict without storing anything. Call it before create_dataset and replace_dataset and repair every reported item until `accepted` is true. Pass the group_id the dataset will be saved in, otherwise only public Profiles are resolved; the caller must be able to read that group's metadata. Structural violations carry a code and a JSON pointer, Profile findings carry the failing SHACL rule and its focus node. It creates and changes nothing.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -357,14 +357,23 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ValidateInput>,
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
-        metadata_probe(
-            self,
-            &auth,
-            "validate_dataset",
-            tool_extras("validate_dataset", &input)?,
-        )
-        .await?;
+        let extras = tool_extras("validate_dataset", &input)?;
         let group_id = input.group_id.as_deref().map(parse_group).transpose()?;
+        // A group scope resolves that group's non-public Profiles.
+        match group_id {
+            Some(group_id) => {
+                authorize_tool(
+                    &self.state,
+                    &auth,
+                    metadata_group_path(self, group_id),
+                    Permission::READ,
+                    extras,
+                )
+                .await
+                .map_err(server_error)?;
+            }
+            None => metadata_probe(self, &auth, "validate_dataset", extras).await?,
+        }
         let jsonld = rocrate_json(&input.rocrate.0)?;
         let preview = preview_submission(&self.state.get_ctx(), group_id, &jsonld)
             .await
@@ -472,6 +481,7 @@ impl McpServer {
         .await
         .map_err(crate::routes::metadata::map_metadata_write_error)
         .map_err(server_error)?;
+        let event_id = created.event_id;
         let record = created.record;
         emit_metadata_created(
             ctx.as_ref(),
@@ -480,8 +490,8 @@ impl McpServer {
             record.group_id,
             record.document_id,
             &record.document_path,
+            event_id,
         )
-        let event_id = created.event_id;
         .await;
         let summary = crate::routes::metadata::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
@@ -490,7 +500,6 @@ impl McpServer {
     }
 
     #[tool(
-            event_id,
         description = "Replace one document's entire RO-Crate and optionally change its visibility, returning the updated registry summary. The crate is replaced, not merged, so read the current one with get_dataset and edit that. Validate the result with validate_dataset before writing. Use create_dataset when the document does not exist yet.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]

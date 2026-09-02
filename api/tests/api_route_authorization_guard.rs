@@ -147,11 +147,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "metadata.rs",
-        "preview_profile_validation",
-        "realm bearer; nothing stored is read except the realm-public registered Profile, nothing is written",
-    ),
-    (
-        "metadata.rs",
         "profile_validation_capabilities",
         "realm bearer read of static evaluator capabilities; no resource is addressed",
     ),

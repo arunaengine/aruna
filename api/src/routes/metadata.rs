@@ -885,7 +885,7 @@ pub async fn create_metadata_document(
         }
     };
     if !user_origin {
-        ensure_metadata_write_scope(&state, &auth, group_id).await?;
+        ensure_metadata_scope(&state, &auth, group_id, Permission::WRITE).await?;
         ensure_permission(
             &state,
             auth.clone(),
@@ -1255,8 +1255,8 @@ pub async fn profile_validation_capabilities()
     summary = "Preview the Profile verdict for a draft",
     description = r#"Runs the Profile and structural verdict for a draft crate without storing it.
 
-**Authentication**: realm bearer token; no document permission is checked because only the
-registered Profile is read.
+**Authentication**: realm bearer token; a `group_id` additionally needs READ on that group's
+metadata path, because the group's own Profiles resolve for it.
 
 **Behavior**
 - Applies the exact verdict `POST /metadata` and `PUT /metadata/{document_id}/rocrate` would
@@ -1319,6 +1319,7 @@ registered Profile is read.
             })),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or READ is denied on the named group's metadata", body = ErrorResponse),
         (status = 503, description = "The Profile or the evaluator is temporarily unavailable; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1328,12 +1329,17 @@ pub async fn preview_profile_validation(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<ProfileValidationPreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
-    require_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
     let group_id = request
         .group_id
         .as_deref()
         .map(parse_group_id)
         .transpose()?;
+    // A group scope resolves that group's non-public Profiles, so it needs READ
+    // on the group's metadata.
+    if let Some(group_id) = group_id {
+        ensure_metadata_scope(&state, &auth, group_id, Permission::READ).await?;
+    }
     let jsonld = serialize_jsonld_object(&request.rocrate)?;
     let preview = run_preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
@@ -3170,13 +3176,14 @@ pub(crate) fn bearer_token_to_string(
     bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 
-async fn ensure_metadata_write_scope(
+async fn ensure_metadata_scope(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
+    permission: Permission,
 ) -> ServerResult<()> {
     let path = format!("/{}/g/{group_id}/meta/**", state.get_realm_id());
-    ensure_permission(state, auth.clone(), path, Permission::WRITE).await
+    ensure_permission(state, auth.clone(), path, permission).await
 }
 
 async fn ensure_record_writable(
@@ -4598,6 +4605,72 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    fn draft_crate() -> Value {
+        json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                    "about": { "@id": "./" }
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "Draft Dataset",
+                    "description": "validated before it is saved",
+                    "datePublished": "2026-01-01"
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn preview_refuses_stranger() {
+        // A group scope resolves that group's non-public Profiles, so a
+        // same-realm caller without READ on its metadata must be refused.
+        let test = setup_state().await;
+        let realm_id = test.state.get_realm_id();
+        let stranger = AuthContext {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+
+        let result = preview_profile_validation(
+            State(test.state.clone()),
+            Extension(Some(stranger)),
+            Json(ProfileValidationPreviewRequest {
+                rocrate: draft_crate(),
+                group_id: Some(test.group_id.to_string()),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn preview_admits_member() {
+        let test = setup_state().await;
+
+        let (status, Json(preview)) = preview_profile_validation(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(ProfileValidationPreviewRequest {
+                rocrate: draft_crate(),
+                group_id: Some(test.group_id.to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preview.state, "not_profiled");
     }
 
     #[tokio::test]
