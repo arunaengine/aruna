@@ -94,8 +94,8 @@ pub struct RunScriptInput {
     /// is added automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<crate::routes::jobs::ExecutionInputRequest>>,
-    /// Container paths written back into `bucket` after the run. Omit when the
-    /// script only prints to stdout.
+    /// Container paths written back after the run, into `bucket` unless an
+    /// entry names one of its own. Omit when the script only prints to stdout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<crate::routes::jobs::ExecutionOutputRequest>>,
     /// Whole CPU cores reserved. Defaults to 1; `0` is refused and the group's
@@ -280,7 +280,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Submit the complete native execution request: image, command, environment, resources, staged inputs, captured outputs, and workspace mode, which is `none` (the default: the run touches no bucket of its own and every input is read from where it lives) or `existing` (the run works inside a bucket the caller already owns, which is what `outputs` and `output_prefixes` resolve against; a run never creates a bucket). Use run_script instead for a plain Python, Deno, or Bash script. Returns job_id, whether this call created the job, and the family state at accept. Poll get_job with job_id; a replay under the same idempotency_key returns the existing job rather than a second one.",
+        description = "Submit the complete native execution request: image, command, environment, resources, staged inputs, captured outputs, and workspace mode, which is `none` (the default: the run touches no bucket of its own and every input is read from where it lives) or `existing` (the run works inside a bucket the caller already owns; a run never creates a bucket). Under `none` every entry in outputs must name the bucket it lands in, as {container_path, dest_key, bucket}; under `existing` an output that leaves bucket out resolves its dest_key in the workspace bucket, which is also what output_prefixes resolve against. Every bucket an output names must belong to the group and grant the caller write permission. Use run_script instead for a plain Python, Deno, or Bash script. Returns job_id, whether this call created the job, and the family state at accept. Poll get_job with job_id; a replay under the same idempotency_key returns the existing job rather than a second one.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_job(

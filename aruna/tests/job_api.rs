@@ -113,6 +113,25 @@ async fn admin_job_flow() -> TestResult<()> {
             "workspace": {"mode": "none"}
         });
         let jobs_url = format!("{}/api/v1/compute/jobs", seed.base_url);
+        // Without a workspace an output has nowhere to land unless it names one.
+        let unbucketed = client
+            .post(&jobs_url)
+            .bearer_auth(&bearer)
+            .json(&json!({
+                "group_id": group.group_id,
+                "image": "busybox:latest",
+                "command": ["true"],
+                "workspace": {"mode": "none"},
+                "outputs": [{"container_path": "/out/report.txt", "dest_key": "report.txt"}]
+            }))
+            .send()
+            .await?;
+        assert_eq!(unbucketed.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            unbucketed.text().await?.contains("/out/report.txt"),
+            "the refusal must name the output"
+        );
+
         let submitted = response_json(
             client
                 .post(&jobs_url)

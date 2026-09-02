@@ -9,8 +9,8 @@ use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
     ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
     JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
-    Permission, WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path,
-    blob_group_permission_path,
+    OutputDestination, OutputSelection, Permission, WorkspaceMode, WorkspaceOutput,
+    blob_bucket_permission_path, blob_group_permission_path,
 };
 use aruna_core::types::NodeId;
 use aruna_operations::device::compute::{
@@ -132,9 +132,14 @@ pub struct ExecutionOutputRequest {
     /// Absolute container path captured after the task exits, for example
     /// `/work/result.json`. Must be unique across the declared outputs.
     pub container_path: String,
-    /// Destination key inside the workspace bucket, for example
-    /// `results/result.json`. Must not be empty and must be unique.
+    /// Destination key this output is written to, for example
+    /// `results/result.json`. Must not be empty and must be unique per bucket.
     pub dest_key: String,
+    /// Destination bucket of this output, for example `project-data`. Required
+    /// when `workspace.mode` is `none`, and defaults to the workspace bucket
+    /// under `existing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
 }
 
 /// Which bucket a run works inside. `none` creates and touches no bucket of its
@@ -224,15 +229,15 @@ pub struct SubmitExecutionRequest {
     /// Objects staged into the container before the run, at most 512.
     #[serde(default)]
     pub inputs: Vec<ExecutionInputRequest>,
-    /// Container paths captured into the workspace bucket after the run, at
-    /// most 1024.
+    /// Container paths captured after the run, at most 1024. Each names the
+    /// bucket it lands in, or falls back to the workspace bucket.
     #[serde(default)]
     pub outputs: Vec<ExecutionOutputRequest>,
     #[serde(default)]
     /// Workspace prefixes to inventory at completion. Only objects this
     /// execution itself wrote under a prefix are reported: a version another
-    /// writer produced is never attributed to this job. This route declares no
-    /// file outputs, so a non-empty list is refused; leave it empty.
+    /// writer produced is never attributed to this job. A non-empty list needs
+    /// `workspace.mode` `existing` and at least one bucket-qualified output.
     pub output_prefixes: Vec<String>,
     /// How a destination key already claimed by another declared input or by an
     /// object in the workspace bucket is resolved. Defaults to `reject`.
@@ -717,7 +722,10 @@ fn workspace_request(
     }
 }
 
-async fn validate_existing_workspace(
+/// A bucket the run writes into: it must exist, belong to the execution group,
+/// and grant the caller WRITE. Both the workspace and every explicit output
+/// destination pass this gate.
+async fn validate_owned_bucket(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
@@ -810,14 +818,100 @@ fn collision_policy(policy: CollisionPolicyRequest) -> CollisionPolicy {
     }
 }
 
-fn native_output(output: ExecutionOutputRequest) -> ServerResult<WorkspaceOutput> {
+/// A declared output either names its own destination bucket or resolves its
+/// key against the workspace bucket the run works inside.
+enum MappedOutput {
+    Explicit(OutputSelection),
+    Workspace(WorkspaceOutput),
+}
+
+fn native_output(
+    output: ExecutionOutputRequest,
+    mode: WorkspaceMode,
+) -> ServerResult<MappedOutput> {
     if output.dest_key.is_empty() {
         return Err(ServerError::BadRequest);
     }
-    Ok(WorkspaceOutput {
-        container_path: container_path(&output.container_path)?,
-        dest_key: output.dest_key,
-    })
+    let container_path = container_path(&output.container_path)?;
+    let bucket = output
+        .bucket
+        .map(|bucket| bucket.trim().to_string())
+        .filter(|bucket| !bucket.is_empty());
+    match (bucket, mode) {
+        (Some(bucket), _) => Ok(MappedOutput::Explicit(OutputSelection {
+            container_path,
+            path_prefix: None,
+            destination_node_id: None,
+            destination: OutputDestination::S3 {
+                bucket,
+                key: output.dest_key,
+            },
+            name: None,
+            description: None,
+        })),
+        (None, WorkspaceMode::Existing) => Ok(MappedOutput::Workspace(WorkspaceOutput {
+            container_path,
+            dest_key: output.dest_key,
+        })),
+        (None, WorkspaceMode::None) => Err(ServerError::BadRequestMessage(format!(
+            "output `{container_path}` needs a bucket when `workspace.mode` is `none`"
+        ))),
+    }
+}
+
+/// Splits the declared outputs into bucket-qualified destinations and workspace
+/// intents. Container paths are unique across both, destinations within each.
+fn native_outputs(
+    outputs: Vec<ExecutionOutputRequest>,
+    mode: WorkspaceMode,
+) -> ServerResult<(Vec<OutputSelection>, Vec<WorkspaceOutput>)> {
+    let mut explicit: Vec<OutputSelection> = Vec::new();
+    let mut workspace: Vec<WorkspaceOutput> = Vec::new();
+    let mut paths: Vec<String> = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let mapped = native_output(output, mode)?;
+        let path = match &mapped {
+            MappedOutput::Explicit(output) => &output.container_path,
+            MappedOutput::Workspace(output) => &output.container_path,
+        };
+        if paths.iter().any(|existing| existing == path) {
+            return Err(ServerError::BadRequest);
+        }
+        paths.push(path.clone());
+        match mapped {
+            MappedOutput::Explicit(output) => {
+                if explicit
+                    .iter()
+                    .any(|existing| existing.destination == output.destination)
+                {
+                    return Err(ServerError::BadRequest);
+                }
+                explicit.push(output);
+            }
+            MappedOutput::Workspace(output) => {
+                if workspace
+                    .iter()
+                    .any(|existing| existing.dest_key == output.dest_key)
+                {
+                    return Err(ServerError::BadRequest);
+                }
+                workspace.push(output);
+            }
+        }
+    }
+    Ok((explicit, workspace))
+}
+
+/// Every bucket the run writes into, the workspace bucket first.
+fn output_buckets(workspace: Option<&str>, outputs: &[OutputSelection]) -> Vec<String> {
+    let mut buckets: Vec<String> = workspace.map(str::to_string).into_iter().collect();
+    for output in outputs {
+        let OutputDestination::S3 { bucket, .. } = &output.destination;
+        if !buckets.contains(bucket) {
+            buckets.push(bucket.clone());
+        }
+    }
+    buckets
 }
 
 fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> {
@@ -937,8 +1031,8 @@ pub async fn list_jobs(
     description = r#"Accepts a container execution job for asynchronous execution and returns the id to poll.
 
 **Authentication**: realm bearer token with WRITE on the target group's data; a path-restricted
-(delegated) token is refused. An existing workspace bucket additionally needs WRITE on that bucket,
-which must belong to the same group.
+(delegated) token is refused. An existing workspace bucket and every bucket an output names
+additionally need WRITE on that bucket, which must belong to the same group.
 
 **Behavior**
 - A 2xx means the request is durably admitted into its replicated submission family and queued,
@@ -956,8 +1050,11 @@ which must belong to the same group.
 - The group's standing quota is decided against a replicated demand view, but a replay of a key
   this node already claimed is settled before any quota is read and is never quota-refused.
 - A run never creates a bucket. Omitting `workspace` (or `workspace.mode` `none`) captures the
-  declared outputs to the buckets they name; `workspace.mode` `existing` runs inside a bucket the
-  caller already owns, which is where `outputs` and `output_prefixes` resolve their `dest_key`.
+  declared outputs to the buckets they name, so every output needs its own `bucket`;
+  `workspace.mode` `existing` runs inside a bucket the caller already owns, which is where an
+  output without a `bucket` and `output_prefixes` resolve their `dest_key`.
+- Every bucket a run writes into, the workspace and each output destination alike, must exist,
+  belong to the execution group, and grant the caller WRITE.
 - On a user device a `realm` request is always forwarded under the caller's own bearer token: the
   inputs stay referenced, the outputs land on the admitting realm holder, and the device itself
   never executes, admits or stores any part of the job.
@@ -975,45 +1072,79 @@ which must belong to the same group.
 - An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
 - More than 512 inputs, more than 1024 outputs, or more than 32 output prefixes.
 - An empty `dest_key`, or a container path that is not absolute and traversal-free.
-- Two inputs sharing a container path, or two outputs sharing a `dest_key` or container path. Two
-  inputs sharing a `dest_key` are instead resolved by `mode` and `collision_policy`."#,
+- An output without a `bucket` under `workspace.mode` `none`, named in the message.
+- Two inputs sharing a container path, or two outputs sharing a container path or one destination.
+  Two inputs sharing a `dest_key` are instead resolved by `mode` and `collision_policy`."#,
     request_body(
         content = SubmitExecutionRequest,
-        description = "Container image, command and the inputs and outputs to stage around it",
-        example = json!({
-            "group_id": "01JABCDEF0123456789ABCDEFG",
-            "image": "registry.example.test/tools/fastqc:0.12.1",
-            "command": ["fastqc", "--outdir", "/outputs", "/inputs/reads.fastq"],
-            "env": {
-                "FASTQC_THREADS": "2"
-            },
-            "tags": {
-                "aruna-engine.org/label/accelerator": "gpu"
-            },
-            "workdir": "/work",
-            "cpu_cores": 2,
-            "ram_bytes": 4294967296_i64,
-            "max_walltime_ms": 3600000,
-            "inputs": [
-                {
-                    "bucket": "project-data",
-                    "key": "raw/reads.fastq",
-                    "dest_key": "reads.fastq"
-                }
-            ],
-            "outputs": [
-                {
-                    "container_path": "/outputs/reads_fastqc.html",
-                    "dest_key": "reports/reads_fastqc.html"
-                }
-            ],
-            "output_prefixes": ["reports/"],
-            "idempotency_key": "fastqc-reads-2026-04-09",
-            "workspace": {
-                "mode": "existing",
-                "bucket": "project-data"
-            }
-        })
+        description = "Container image, command and the inputs and outputs to stage around it. Without a workspace every output names the bucket it lands in; inside an existing workspace an output may leave `bucket` out and resolve against it.",
+        examples(
+            ("Capture outputs without a workspace" = (
+                summary = "Workspace mode `none`: the run touches no bucket of its own and each output names its destination",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "image": "registry.example.test/tools/fastqc:0.12.1",
+                    "command": ["fastqc", "--outdir", "/outputs", "/inputs/reads.fastq"],
+                    "env": {
+                        "FASTQC_THREADS": "2"
+                    },
+                    "workdir": "/work",
+                    "cpu_cores": 2,
+                    "ram_bytes": 4294967296_i64,
+                    "max_walltime_ms": 3600000,
+                    "inputs": [
+                        {
+                            "bucket": "project-data",
+                            "key": "raw/reads.fastq",
+                            "dest_key": "reads.fastq"
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "container_path": "/outputs/reads_fastqc.html",
+                            "dest_key": "reports/reads_fastqc.html",
+                            "bucket": "project-results"
+                        }
+                    ],
+                    "idempotency_key": "fastqc-reads-2026-04-09",
+                    "workspace": {
+                        "mode": "none"
+                    }
+                })
+            )),
+            ("Run inside an existing bucket" = (
+                summary = "Workspace mode `existing`: an output without a `bucket` resolves its `dest_key` in the workspace",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "image": "registry.example.test/tools/fastqc:0.12.1",
+                    "command": ["fastqc", "--outdir", "/outputs", "/inputs/reads.fastq"],
+                    "tags": {
+                        "aruna-engine.org/label/accelerator": "gpu"
+                    },
+                    "workdir": "/work",
+                    "cpu_cores": 2,
+                    "ram_bytes": 4294967296_i64,
+                    "inputs": [
+                        {
+                            "bucket": "project-data",
+                            "key": "raw/reads.fastq",
+                            "dest_key": "reads.fastq"
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "container_path": "/outputs/reads_fastqc.html",
+                            "dest_key": "reports/reads_fastqc.html"
+                        }
+                    ],
+                    "idempotency_key": "fastqc-reads-2026-04-09-ws",
+                    "workspace": {
+                        "mode": "existing",
+                        "bucket": "project-data"
+                    }
+                })
+            ))
+        )
     ),
     responses(
         (
@@ -1044,10 +1175,10 @@ which must belong to the same group.
                 "status_url": "https://node.example.test/api/v1/compute/jobs/01JJRSTVWXYZ0123456789ABCD"
             })
         ),
-        (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, a workspace request that names no usable bucket, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
+        (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, an output without a `bucket` while `workspace.mode` is `none`, a workspace or output bucket that does not exist or belongs to another group, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
         (status = 409, description = "The idempotency key is bound to a different plan, the composition conflicts on a staged key under `collision_policy` `reject`, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling, which is counted in the admitting transaction so two submissions cannot both pass it. A quota refusal carries the exact scope, dimension and numbers in `quota`; a demand view that understates the group is refused like an exceeded cap, with `observed` at the limit", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group or on the named existing workspace bucket, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group, on the named existing workspace bucket or on a bucket an output writes into, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
         (status = 503, description = "Retryable, and the caller may submit again with the same idempotency key: no family holder could admit the request, the demand view could not be read or kept moving under three reads, three admission transactions in a row lost to a concurrent submission of the same group, or the id clock is unhealthy. A device submission whose referenced inputs sit on no holder of its family answers the same 503 and retrying does not clear it; submit from a node that holds the inputs, or replicate them first", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1103,9 +1234,6 @@ pub(crate) async fn submit_execution(
         extras.clone(),
     )
     .await?;
-    if let Some(bucket) = workspace_bucket.as_deref() {
-        validate_existing_workspace(state, &auth, group_id, bucket, extras).await?;
-    }
 
     if request.inputs.len() > MAX_PLAN_INPUTS || request.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(ServerError::BadRequest);
@@ -1122,15 +1250,9 @@ pub(crate) async fn submit_execution(
         }
         inputs.push(input);
     }
-    let mut workspace_outputs: Vec<WorkspaceOutput> = Vec::with_capacity(request.outputs.len());
-    for output in request.outputs {
-        let output = native_output(output)?;
-        if workspace_outputs.iter().any(|existing| {
-            existing.dest_key == output.dest_key || existing.container_path == output.container_path
-        }) {
-            return Err(ServerError::BadRequest);
-        }
-        workspace_outputs.push(output);
+    let (file_outputs, workspace_outputs) = native_outputs(request.outputs, workspace_mode)?;
+    for bucket in output_buckets(workspace_bucket.as_deref(), &file_outputs) {
+        validate_owned_bucket(state, &auth, group_id, &bucket, extras.clone()).await?;
     }
 
     let spec = ExecutionSpec {
@@ -1152,7 +1274,7 @@ pub(crate) async fn submit_execution(
         },
         executor_constraint: request.executor_constraint,
         inputs,
-        file_outputs: Vec::new(),
+        file_outputs,
         workspace_outputs,
         output_prefixes,
         collision_policy: collision_policy(request.collision_policy),
@@ -3197,28 +3319,131 @@ mod tests {
         assert!(native_input(traversal, ExecutionTarget::Realm).is_err());
     }
 
+    fn output_request(path: &str, key: &str, bucket: Option<&str>) -> ExecutionOutputRequest {
+        ExecutionOutputRequest {
+            container_path: path.to_string(),
+            dest_key: key.to_string(),
+            bucket: bucket.map(str::to_string),
+        }
+    }
+
     #[test]
     fn maps_native_output() {
-        let mapped = native_output(ExecutionOutputRequest {
-            container_path: "/out/report.txt".to_string(),
-            dest_key: "outputs/report.txt".to_string(),
-        })
+        let (explicit, workspace) = native_outputs(
+            vec![output_request(
+                "/out/report.txt",
+                "outputs/report.txt",
+                None,
+            )],
+            WorkspaceMode::Existing,
+        )
         .unwrap();
-        assert_eq!(mapped.container_path, "/out/report.txt");
-        assert_eq!(mapped.dest_key, "outputs/report.txt");
+        assert!(explicit.is_empty());
+        assert_eq!(workspace[0].container_path, "/out/report.txt");
+        assert_eq!(workspace[0].dest_key, "outputs/report.txt");
 
         assert!(
-            native_output(ExecutionOutputRequest {
-                container_path: "relative/path".to_string(),
-                dest_key: "k".to_string(),
-            })
+            native_outputs(
+                vec![output_request("relative/path", "k", None)],
+                WorkspaceMode::Existing
+            )
             .is_err()
         );
         assert!(
-            native_output(ExecutionOutputRequest {
-                container_path: "/out".to_string(),
-                dest_key: String::new(),
-            })
+            native_outputs(
+                vec![output_request("/out", "", None)],
+                WorkspaceMode::Existing
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn maps_bucket_output() {
+        // Without a workspace every output resolves against the bucket it names.
+        let (explicit, workspace) = native_outputs(
+            vec![
+                output_request("/out/report.txt", "reports/report.txt", Some("results")),
+                output_request("/out/run.log", "logs/run.log", Some("archive")),
+            ],
+            WorkspaceMode::None,
+        )
+        .unwrap();
+        assert!(workspace.is_empty());
+        assert_eq!(explicit.len(), 2);
+        assert_eq!(explicit[0].container_path, "/out/report.txt");
+        assert!(explicit[0].path_prefix.is_none());
+        assert!(explicit[0].destination_node_id.is_none());
+        assert_eq!(
+            explicit[0].destination,
+            OutputDestination::S3 {
+                bucket: "results".to_string(),
+                key: "reports/report.txt".to_string(),
+            }
+        );
+        assert_eq!(
+            output_buckets(None, &explicit),
+            ["results".to_string(), "archive".to_string()]
+        );
+        assert_eq!(
+            output_buckets(Some("results"), &explicit),
+            ["results".to_string(), "archive".to_string()]
+        );
+    }
+
+    #[test]
+    fn refuses_output_without_bucket() {
+        let error = native_outputs(
+            vec![output_request("/out/report.txt", "reports/r.txt", None)],
+            WorkspaceMode::None,
+        )
+        .expect_err("a none-mode output has nowhere to land");
+        let ServerError::BadRequestMessage(message) = error else {
+            panic!("expected a described bad request");
+        };
+        assert!(message.contains("/out/report.txt"), "{message}");
+        assert!(message.contains("bucket"), "{message}");
+    }
+
+    #[test]
+    fn mixes_output_destinations() {
+        // Inside a workspace an output may still pin its own bucket.
+        let (explicit, workspace) = native_outputs(
+            vec![
+                output_request("/out/report.txt", "reports/report.txt", Some("results")),
+                output_request("/out/run.log", "logs/run.log", None),
+            ],
+            WorkspaceMode::Existing,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit[0].destination,
+            OutputDestination::S3 {
+                bucket: "results".to_string(),
+                key: "reports/report.txt".to_string(),
+            }
+        );
+        assert_eq!(workspace[0].dest_key, "logs/run.log");
+
+        // The same container path may only be captured once.
+        assert!(
+            native_outputs(
+                vec![
+                    output_request("/out/report.txt", "a", Some("results")),
+                    output_request("/out/report.txt", "b", None),
+                ],
+                WorkspaceMode::Existing
+            )
+            .is_err()
+        );
+        assert!(
+            native_outputs(
+                vec![
+                    output_request("/out/a.txt", "same", Some("results")),
+                    output_request("/out/b.txt", "same", Some("results")),
+                ],
+                WorkspaceMode::None
+            )
             .is_err()
         );
     }
