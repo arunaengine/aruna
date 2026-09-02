@@ -1365,6 +1365,49 @@ mod tests {
     }
 
     #[test]
+    fn refuses_pathless_input() {
+        // Nothing copies an input into a bucket, so it must land in the container.
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: vec![aruna_core::structs::InputSelection {
+                source: aruna_core::structs::InputSource::S3 {
+                    bucket: "data".to_string(),
+                    key: "in.txt".to_string(),
+                    version_id: None,
+                },
+                source_node_id: None,
+                dest_key: "in.txt".to_string(),
+                mode: aruna_core::structs::InputMode::Snapshot,
+                container_path: None,
+                name: None,
+                description: None,
+            }],
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+
+        let error = validate_execution(&mut spec, WorkspaceMode::None, None).unwrap_err();
+
+        assert!(
+            matches!(error, SubmitJobError::InvalidWorkspace(message) if message.contains("in.txt"))
+        );
+        spec.inputs[0].container_path = Some("/in.txt".to_string());
+        assert!(validate_execution(&mut spec, WorkspaceMode::None, None).is_ok());
+    }
+
+    #[test]
     fn validates_artifact_size() {
         assert!(artifact_size_matches(None, 0));
         assert!(!artifact_size_matches(None, 1));
