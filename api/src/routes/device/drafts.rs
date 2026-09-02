@@ -15,9 +15,11 @@ use utoipa_axum::routes;
 
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::{ProfileValidationPreviewRequest, ProfileValidationPreviewResponse};
+use crate::routes::metadata::{
+    ProfileValidationPreviewRequest, ProfileValidationPreviewResponse, ensure_metadata_scope,
+};
 use crate::server_state::ServerState;
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::{AuthContext, Permission};
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
 use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
@@ -190,7 +192,7 @@ for.
             })),
         (status = 400, description = "Malformed group id, blank path or a non-object payload", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
+        (status = 403, description = "The caller is not the user this device is enrolled for, or READ is denied on the named group's metadata", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The device already holds the maximum number of queued drafts", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -384,8 +386,8 @@ for.
 - Structural checks need nothing but the payload. A draft that names a registered Profile is checked
   against the copy this device already holds, so an unknown Profile reports as unevaluated rather
   than failing.
-- `group_id` names the group the draft would be saved in, and a Profile of that group is resolved
-  under the device owner's own authority. Without it only public Profiles resolve."#,
+- `group_id` names the group the draft would be saved in; the owner needs READ on that group's
+  metadata, and a Profile of that group then resolves. Without it only public Profiles resolve."#,
     request_body(
         content = ProfileValidationPreviewRequest,
         description = "The RO-Crate JSON-LD to evaluate",
@@ -414,12 +416,17 @@ async fn preview_draft(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<ProfileValidationPreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
-    require_owner(&state, auth).await?;
+    let auth = require_owner(&state, auth).await?;
     let group_id = request
         .group_id
         .as_deref()
         .map(parse_group_id)
         .transpose()?;
+    // A group scope resolves that group's non-public Profiles, so the owner
+    // still needs READ on the group's metadata.
+    if let Some(group_id) = group_id {
+        ensure_metadata_scope(&state, &auth, group_id, Permission::READ).await?;
+    }
     let jsonld = rocrate_jsonld(&request.rocrate)?;
     let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
@@ -429,11 +436,103 @@ async fn preview_draft(
 
 #[cfg(test)]
 mod tests {
-    use super::DeviceDraft;
-    use aruna_core::structs::RealmId;
+    use super::{DeviceDraft, preview_draft};
+    use crate::error::ServerError;
+    use crate::routes::metadata::ProfileValidationPreviewRequest;
+    use crate::server_state::ServerState;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::structs::{
+        Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
     use aruna_core::types::UserId;
     use aruna_operations::device::repository::{IntakeEntry, IntakeState};
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use axum::extract::State;
+    use axum::{Extension, Json};
+    use std::sync::Arc;
     use ulid::Ulid;
+
+    /// A user node enrolled for `owner`, holding only the realm configuration.
+    async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        let state = Arc::new(
+            ServerState::new(
+                Arc::new(DriverContext {
+                    storage_handle: storage,
+                    net_handle: None,
+                    blob_handle: None,
+                    metadata_handle: None,
+                    task_handle: Some(TaskHandle::new()),
+                    compute_handle: None,
+                }),
+                realm_id,
+                node_id,
+                NodeCapabilities::user_node(realm_id).unwrap(),
+                false,
+                None,
+                JobsRuntime::new(),
+            )
+            .await,
+        );
+        let actor = Actor {
+            node_id,
+            user_id: owner,
+            realm_id,
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(node_id, RealmNodeKind::User { owner });
+        let event = state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let auth = AuthContext {
+            user_id: owner,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        (dir, state, auth)
+    }
+
+    #[tokio::test]
+    async fn preview_refuses_group() {
+        // Owning the device does not prove READ on an arbitrary group's Profiles.
+        let (_dir, state, auth) = user_node().await;
+
+        let result = preview_draft(
+            State(state),
+            Extension(Some(auth)),
+            Json(ProfileValidationPreviewRequest {
+                rocrate: serde_json::json!({
+                    "@context": "https://w3id.org/ro/crate/1.2/context",
+                    "@graph": []
+                }),
+                group_id: Some(Ulid::generate().to_string()),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
 
     fn entry() -> IntakeEntry {
         IntakeEntry::new(

@@ -3176,7 +3176,7 @@ pub(crate) fn bearer_token_to_string(
     bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 
-async fn ensure_metadata_scope(
+pub(crate) async fn ensure_metadata_scope(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
