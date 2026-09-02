@@ -788,6 +788,35 @@ mod tests {
     }
 
     #[test]
+    fn crate_meets_builtin_profile() {
+        // The built-in shapes must accept what this generator writes.
+        use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
+        use crate::metadata::profile_shacl::{ProfileShaclEngine, ProfileShapes};
+
+        let (record, spec) = execution_record();
+        let jsonld =
+            build_run_crate_jsonld(&record, &spec, Ulid::from_bytes(record.job_id.to_bytes()));
+        let directory = tempfile::tempdir().unwrap();
+        let engine = ProfileShaclEngine::open(directory.path()).unwrap();
+        let report = engine
+            .evaluate(
+                &ProfileShapes {
+                    graph_iri: format!("{PROCESS_PROFILE}#shapes/{BUILTIN_REVISION}"),
+                    sources: vec![builtin_shapes(PROCESS_PROFILE).unwrap().to_string()],
+                },
+                &jsonld,
+            )
+            .unwrap();
+        let blocking: Vec<_> = report
+            .results
+            .iter()
+            .filter(|result| !result.severity.0.contains("Warning"))
+            .collect();
+        assert!(blocking.is_empty(), "{blocking:#?}");
+        assert!(report.structural.is_empty(), "{:#?}", report.structural);
+    }
+
+    #[test]
     fn command_quotes_arguments() {
         let (_, mut spec) = execution_record();
         spec.entrypoint = Some(vec!["/bin/echo".to_string()]);

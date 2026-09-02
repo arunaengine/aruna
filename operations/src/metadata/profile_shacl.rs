@@ -17,7 +17,6 @@ use craqle::{
 use oxrdf::{NamedNode, NamedOrBlankNode, Term};
 use oxttl::TurtleParser;
 use tracing::warn;
-use ulid::Ulid;
 
 /// Every candidate is prepared against one scratch graph that never exists, so
 /// the encoded crate root is the same constant for every document and shapes
@@ -48,11 +47,10 @@ const MAX_CACHED_PROFILES: usize = 64;
 
 type ShapeTriple = (EncodedTerm, EncodedTerm, EncodedTerm);
 
-/// One registered Profile revision and the Turtle shapes it publishes.
+/// One Profile revision and the Turtle shapes it publishes.
 #[derive(Clone, Debug)]
 pub(crate) struct ProfileShapes {
-    pub profile_id: Ulid,
-    pub revision: Ulid,
+    /// Graph the shapes are installed under, unique per Profile revision.
     pub graph_iri: String,
     pub sources: Vec<String>,
 }
@@ -78,7 +76,6 @@ pub(crate) enum ProfileShaclError {
 }
 
 struct CachedProfile {
-    key: (Ulid, Ulid),
     graph: GraphId,
     policies: Vec<(RoCrateVersion, CompiledRoCratePolicy)>,
 }
@@ -154,8 +151,8 @@ impl ProfileShaclEngine {
         cached: &mut VecDeque<CachedProfile>,
         profile: &ProfileShapes,
     ) -> Result<usize, ProfileShaclError> {
-        let key = (profile.profile_id, profile.revision);
-        if let Some(index) = cached.iter().position(|entry| entry.key == key) {
+        let graph = GraphId::new(&profile.graph_iri);
+        if let Some(index) = cached.iter().position(|entry| entry.graph == graph) {
             return Ok(index);
         }
         while cached.len() >= MAX_CACHED_PROFILES {
@@ -166,7 +163,6 @@ impl ProfileShaclEngine {
                 warn!(error = %error, graph = %evicted.graph, "Evicting a cached Profile shapes graph failed");
             }
         }
-        let graph = GraphId::new(&shapes_graph_iri(profile));
         let present = self
             .node
             .contains_graph(&graph)
@@ -178,7 +174,6 @@ impl ProfileShaclEngine {
                 .map_err(|error| classify(&error))?;
         }
         cached.push_back(CachedProfile {
-            key,
             graph,
             policies: Vec::new(),
         });
@@ -217,10 +212,6 @@ impl ProfileShaclEngine {
         entry.policies.push((version, policy.clone()));
         Ok(policy)
     }
-}
-
-fn shapes_graph_iri(profile: &ProfileShapes) -> String {
-    format!("{}#shapes/{}", profile.graph_iri, profile.revision)
 }
 
 fn shapes_changes(
@@ -521,19 +512,5 @@ mod tests {
             classify(&cancelled),
             ProfileShaclError::Unavailable { .. }
         ));
-    }
-
-    #[test]
-    fn binds_profile_revision() {
-        let profile = ProfileShapes {
-            profile_id: Ulid::from_parts(1, 1),
-            revision: Ulid::from_parts(2, 2),
-            graph_iri: "https://w3id.org/aruna/profile".to_string(),
-            sources: Vec::new(),
-        };
-        assert_eq!(
-            shapes_graph_iri(&profile),
-            format!("https://w3id.org/aruna/profile#shapes/{}", profile.revision)
-        );
     }
 }

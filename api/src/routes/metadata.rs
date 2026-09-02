@@ -231,7 +231,7 @@ impl From<MetadataProfileValidationStatus> for ProfileValidationStatusResponse {
             .to_string(),
             profile_id: status.profile_id.map(|id| id.to_string()),
             profile_iri: status.profile_iri,
-            profile_revision: status.profile_revision.map(|revision| revision.to_string()),
+            profile_revision: status.profile_revision,
             evaluator: status.evaluator,
             validated_at_ms: status.validated_at_ms,
             findings: status.findings.into_iter().map(Into::into).collect(),
@@ -1267,7 +1267,10 @@ metadata path, because the group's own Profiles resolve for it.
   crate-local form with the root as `./`.
 - `group_id` names the group the draft would be saved in. A Profile of that group resolves even
   while it is not public; without it only public Profiles resolve, so a group Profile reports
-  `profile_not_registered`."#,
+  `profile_not_registered`.
+- A built-in Profile such as `https://w3id.org/ro/wfrun/process/0.5` resolves from shapes the node
+  ships, in any group and with no registry row: `profile_id` is absent and `profile_revision` is
+  `builtin`."#,
     request_body(content = ProfileValidationPreviewRequest,
         example = json!({
             "group_id": "01JGROUP00000000000000000",

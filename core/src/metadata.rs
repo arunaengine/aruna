@@ -12,25 +12,37 @@ use crate::types::{GroupId, UserId};
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 
-/// Supported RO-Crate specification IRIs and the RO-Crate community profiles
-/// (workflow run crates, Workflow RO-Crate) are version markers, not Profiles.
+/// The community Profile the node carries shapes for, so a crate tagged with it
+/// is validated without a realm document registering it.
+pub const PROCESS_RUN_CRATE_PROFILE_IRI: &str = "https://w3id.org/ro/wfrun/process/0.5";
+
+/// Whether the node validates this IRI from its own embedded shapes.
+pub fn is_builtin_profile(iri: &str) -> bool {
+    iri == PROCESS_RUN_CRATE_PROFILE_IRI
+}
+
+/// Supported RO-Crate specification IRIs and the remaining RO-Crate community
+/// profiles (workflow run crates, Workflow RO-Crate) are version markers, not
+/// Profiles. A built-in Profile is deliberately not a marker: it has to reach
+/// validation as a Profile tag for its embedded shapes to run.
 pub fn is_rocrate_specification(iri: &str) -> bool {
-    matches!(
-        iri,
-        "https://w3id.org/ro/crate/1.2" | "https://w3id.org/ro/crate/1.3"
-    ) || iri.starts_with("https://w3id.org/ro/wfrun/")
-        || iri.starts_with("https://w3id.org/workflowhub/workflow-ro-crate/")
+    !is_builtin_profile(iri)
+        && (matches!(
+            iri,
+            "https://w3id.org/ro/crate/1.2" | "https://w3id.org/ro/crate/1.3"
+        ) || iri.starts_with("https://w3id.org/ro/wfrun/")
+            || iri.starts_with("https://w3id.org/workflowhub/workflow-ro-crate/"))
 }
 
 #[cfg(test)]
 mod specification_tests {
-    use super::is_rocrate_specification;
+    use super::{PROCESS_RUN_CRATE_PROFILE_IRI, is_builtin_profile, is_rocrate_specification};
 
     #[test]
     fn community_profiles_are_markers() {
         assert!(is_rocrate_specification("https://w3id.org/ro/crate/1.3"));
         assert!(is_rocrate_specification(
-            "https://w3id.org/ro/wfrun/process/0.5"
+            "https://w3id.org/ro/wfrun/workflow/0.5"
         ));
         assert!(is_rocrate_specification(
             "https://w3id.org/workflowhub/workflow-ro-crate/1.0"
@@ -39,6 +51,14 @@ mod specification_tests {
             "https://w3id.org/aruna/profile/01J"
         ));
         assert!(!is_rocrate_specification("https://example.org/profile"));
+    }
+
+    #[test]
+    fn builtin_profile_tags() {
+        // The built-in Profile must tag, so it is never a bare version marker.
+        assert!(is_builtin_profile(PROCESS_RUN_CRATE_PROFILE_IRI));
+        assert!(!is_rocrate_specification(PROCESS_RUN_CRATE_PROFILE_IRI));
+        assert!(!is_builtin_profile("https://w3id.org/ro/wfrun/process/0.4"));
     }
 }
 
@@ -1194,7 +1214,8 @@ pub struct MetadataProfileValidationFinding {
     pub path: Option<String>,
     pub rule: String,
     pub message: String,
-    pub profile_revision: Option<Ulid>,
+    /// Registry event id of the evaluated Profile revision, or `builtin`.
+    pub profile_revision: Option<String>,
     pub completeness: MetadataProfileValidationCompleteness,
 }
 
@@ -1213,9 +1234,10 @@ pub struct MetadataProfileValidationStatus {
     /// The last event merged into the validated render; display only.
     pub dataset_revision: Ulid,
     pub state: MetadataProfileValidationState,
+    /// Absent for a built-in Profile, which no registry row defines.
     pub profile_id: Option<Ulid>,
     pub profile_iri: Option<String>,
-    pub profile_revision: Option<Ulid>,
+    pub profile_revision: Option<String>,
     pub evaluator: String,
     pub validated_at_ms: Option<u64>,
     pub findings: Vec<MetadataProfileValidationFinding>,
