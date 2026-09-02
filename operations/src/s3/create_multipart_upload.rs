@@ -278,6 +278,7 @@ impl CreateMultipartUploadOperation {
             metadata: self.metadata.clone(),
             placement_policies: self.sealed_policies.clone(),
             subject_generation: self.sealed_subject,
+            completing_since_ms: None,
         };
         let value = match record.to_bytes() {
             Ok(value) => value,

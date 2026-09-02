@@ -260,6 +260,7 @@ async fn complete_upload(
             object_size: Some(object_size),
             created_by: h.created_by,
             quota_ceiling: None,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &h.driver,
     )
@@ -591,6 +592,7 @@ async fn aborted_multipart_upload_leaves_counters_untouched() {
             bucket: "bucket".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &h.driver,
     )
@@ -894,6 +896,7 @@ async fn try_complete_multipart(
             object_size: Some(data.len() as u64),
             created_by: h.created_by,
             quota_ceiling,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &h.driver,
     )

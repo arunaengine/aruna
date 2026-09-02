@@ -36,6 +36,11 @@ pub enum MultipartUploadStatus {
     Aborting,
 }
 
+/// How long one completion attempt owns an upload. A request whose connection
+/// died leaves the record `Completing`, so a later attempt takes it over once
+/// the lease lapses instead of failing forever with `NoSuchUpload`.
+pub const COMPLETION_LEASE_MS: u64 = 15 * 60 * 1000;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub upload_id: Ulid,
@@ -58,6 +63,9 @@ pub struct MultipartUpload {
     /// Subject generation the CreateMultipartUpload gate admitted this upload
     /// under. Every part re-checks it before writing bytes; zero is ungoverned.
     pub subject_generation: u64,
+    /// When the current completion attempt claimed the record, in epoch ms.
+    /// Only meaningful while the status is `Completing`.
+    pub completing_since_ms: Option<u64>,
 }
 
 impl MultipartUpload {
@@ -86,6 +94,13 @@ impl MultipartUpload {
         let changed = merged != self.placement_policies;
         self.placement_policies = merged;
         Ok(changed)
+    }
+
+    /// Whether a `Completing` record may be taken over: an unstamped record is
+    /// stale by definition, so a crash before the stamp cannot strand it.
+    pub fn completion_stale(&self, now_ms: u64) -> bool {
+        self.completing_since_ms
+            .is_none_or(|since| now_ms.saturating_sub(since) >= COMPLETION_LEASE_MS)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {

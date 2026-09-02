@@ -834,6 +834,7 @@ mod test {
             metadata: std::collections::HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
+            completing_since_ms: None,
         };
 
         let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {

@@ -150,6 +150,17 @@ fn no_such_upload_error() -> S3Error {
     s3_error!(NoSuchUpload, "The specified upload does not exist.")
 }
 
+/// A completion already owns the upload. It must never read as `NoSuchUpload`:
+/// the upload exists and the same request succeeds once the holder is done.
+fn completion_lease_error() -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::OperationAborted,
+        "The upload is being completed, retry shortly.".to_string(),
+    );
+    error.set_status_code(http::StatusCode::CONFLICT);
+    error
+}
+
 fn incomplete_body_error() -> S3Error {
     s3_error!(
         IncompleteBody,
@@ -334,6 +345,7 @@ impl IntoS3Error for CompleteMultipartUploadError {
             CompleteMultipartUploadError::NoSuchUpload
             | CompleteMultipartUploadError::UploadTargetMismatch
             | CompleteMultipartUploadError::UploadNotOpen => no_such_upload_error(),
+            CompleteMultipartUploadError::CompletionInProgress => completion_lease_error(),
             CompleteMultipartUploadError::MissingParts => {
                 s3_error!(InvalidRequest, "You must specify at least one part.")
             }
@@ -394,6 +406,7 @@ impl IntoS3Error for AbortMultipartUploadError {
             AbortMultipartUploadError::NoSuchUpload
             | AbortMultipartUploadError::UploadTargetMismatch
             | AbortMultipartUploadError::UploadNotOpen => no_such_upload_error(),
+            AbortMultipartUploadError::CompletionInProgress => completion_lease_error(),
             err => internal_error(err),
         }
     }
@@ -659,6 +672,23 @@ mod tests {
             CopyObjectError::Get(GetObjectError::ReferenceAdvanceExhausted).into_s3_error();
         assert_eq!(*copied.code(), *exhausted.code());
         assert_eq!(copied.status_code(), exhausted.status_code());
+    }
+
+    // A live completion lease is a retryable 409, never a 404: the upload exists
+    // and the same request succeeds once the holder releases it.
+    #[test]
+    fn maps_completion_lease() {
+        for error in [
+            CompleteMultipartUploadError::CompletionInProgress.into_s3_error(),
+            AbortMultipartUploadError::CompletionInProgress.into_s3_error(),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::OperationAborted);
+            assert_eq!(error.status_code(), Some(http::StatusCode::CONFLICT));
+            assert_eq!(
+                error.message(),
+                Some("The upload is being completed, retry shortly.")
+            );
+        }
     }
 
     // UploadNotOpen from upload/complete/abort maps to NoSuchUpload (404).

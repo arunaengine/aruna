@@ -51,6 +51,8 @@ pub enum AbortMultipartUploadError {
     UploadTargetMismatch,
     #[error("The multipart upload is no longer open.")]
     UploadNotOpen,
+    #[error("The upload is being completed, retry shortly.")]
+    CompletionInProgress,
     #[error("AbortMultipartUpload failed")]
     AbortMultipartUploadFailed,
 }
@@ -60,6 +62,8 @@ pub struct AbortMultipartUploadInput {
     pub bucket: String,
     pub key: String,
     pub upload_id: Ulid,
+    /// Wall clock (epoch ms) an in-progress completion lease is judged against.
+    pub now_ms: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,14 +130,25 @@ impl AbortMultipartUploadOperation {
         self.emit_error(error)
     }
 
+    /// A completion whose lease lapsed left the record stranded, so an abort may
+    /// reclaim it; a live lease still owns the upload and is refused.
     fn validate_upload(&self, record: &MultipartUpload) -> Result<(), AbortMultipartUploadError> {
         if record.bucket != self.input.bucket || record.key != self.input.key {
             return Err(AbortMultipartUploadError::UploadTargetMismatch);
         }
-        if !self.allow_in_progress && record.status != MultipartUploadStatus::Open {
-            return Err(AbortMultipartUploadError::UploadNotOpen);
+        if self.allow_in_progress {
+            return Ok(());
         }
-        Ok(())
+        match record.status {
+            MultipartUploadStatus::Open => Ok(()),
+            MultipartUploadStatus::Completing if record.completion_stale(self.input.now_ms) => {
+                Ok(())
+            }
+            MultipartUploadStatus::Completing => {
+                Err(AbortMultipartUploadError::CompletionInProgress)
+            }
+            MultipartUploadStatus::Aborting => Err(AbortMultipartUploadError::UploadNotOpen),
+        }
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -464,6 +479,16 @@ impl Operation for AbortMultipartUploadOperation {
         )
     }
 
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            AbortMultipartUploadError::NoSuchUpload
+                | AbortMultipartUploadError::UploadTargetMismatch
+                | AbortMultipartUploadError::UploadNotOpen
+                | AbortMultipartUploadError::CompletionInProgress
+        )
+    }
+
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.state {
             AbortMultipartUploadState::Finish => Ok(self.output),
@@ -500,6 +525,7 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
             upload_id: Ulid::from_bytes([1u8; 16]),
+            now_ms: 1_000,
         }
     }
 
@@ -520,6 +546,7 @@ mod tests {
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
+            completing_since_ms: None,
         });
         operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
         operation.state = AbortMultipartUploadState::CommitMarkTransaction;

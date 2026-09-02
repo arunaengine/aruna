@@ -238,6 +238,7 @@ async fn abort_uploads(
                     bucket: upload.bucket,
                     key: upload.key,
                     upload_id: upload.upload_id,
+                    now_ms: crate::driver::now_ms(),
                 })
                 .including_in_progress(),
                 &ctx.driver,

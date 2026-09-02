@@ -2962,6 +2962,7 @@ mod tests {
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
+            completing_since_ms: None,
         };
 
         let decoded = decode_entry(

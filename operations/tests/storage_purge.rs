@@ -332,6 +332,7 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
                 object_size: None,
                 created_by: context.user_id,
                 quota_ceiling: None,
+                now_ms: aruna_operations::driver::now_ms(),
             }),
             &context.driver,
         )
@@ -775,6 +776,7 @@ async fn seed_upload(
         metadata: HashMap::new(),
         placement_policies: Vec::new(),
         subject_generation: 0,
+        completing_since_ms: None,
     };
     write_value(
         storage,
