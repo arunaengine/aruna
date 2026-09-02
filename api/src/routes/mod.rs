@@ -10,6 +10,7 @@ use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 pub mod assistant;
 pub mod audit;
 pub mod blobs;
+pub mod bucket_usage;
 pub mod compute;
 pub mod connectors;
 pub mod credentials;
@@ -50,6 +51,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(info::router())
         .merge(onboarding::router())
         .merge(blobs::router())
+        .merge(bucket_usage::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage_deletion::router())
@@ -174,6 +176,7 @@ mod tests {
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
         ("GET", "/data/buckets/{bucket}/storage/routing"),
+        ("GET", "/data/buckets/{bucket}/usage"),
         ("GET", "/data/sync/relationships"),
         ("GET", "/data/sync/relationships/{id}"),
         ("GET", "/device/compute"),
