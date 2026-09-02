@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataProfileValidationSeverity,
-    MetadataProfileValidationState,
+    MetadataProfileValidationState, PROCESS_RUN_CRATE_PROFILE_IRI,
 };
 use aruna_core::storage_entries::metadata_event_log_prefix;
 use aruna_core::structs::{
@@ -84,7 +84,7 @@ async fn tagged_create_rejects_atomically_and_can_be_retried()
     };
     assert!(findings.iter().any(|finding| {
         finding.rule == "http://www.w3.org/ns/shacl#minCount"
-            && finding.profile_revision == Some(profile_revision)
+            && finding.profile_revision == Some(profile_revision.to_string())
     }));
     assert_eq!(event_count(&test, document_id).await?, 0);
 
@@ -103,7 +103,7 @@ async fn tagged_create_rejects_atomically_and_can_be_retried()
     assert_eq!(status.state, MetadataProfileValidationState::Valid);
     assert_eq!(status.dataset_revision, created.event_id);
     assert_eq!(status.profile_id, Some(profile_id));
-    assert_eq!(status.profile_revision, Some(profile_revision));
+    assert_eq!(status.profile_revision, Some(profile_revision.to_string()));
 
     let removable_id = mint(&test, group_id, "datasets/removable-tag")?;
     create_crate(
@@ -216,7 +216,7 @@ async fn unsupported_registered_constraint_rejects_without_mutation()
         findings.iter().any(|finding| {
             finding.code == "unsupported_constraint"
                 && finding.rule == "http://www.w3.org/ns/shacl#SPARQLConstraintComponent"
-                && finding.profile_revision == Some(revision)
+                && finding.profile_revision == Some(revision.to_string())
         }),
         "{findings:#?}"
     );
@@ -269,7 +269,7 @@ async fn enforces_core_constraints() -> Result<(), Box<dyn std::error::Error>> {
         findings
             .iter()
             .all(|finding| finding.code == "constraint_violation"
-                && finding.profile_revision == Some(revision)),
+                && finding.profile_revision == Some(revision.to_string())),
         "{findings:#?}"
     );
     for rule in [
@@ -387,7 +387,7 @@ async fn preview_stores_nothing() -> Result<(), Box<dyn std::error::Error>> {
         rejected.status.findings.iter().any(|finding| {
             finding.rule == "http://www.w3.org/ns/shacl#minCount"
                 && finding.focus_node.as_deref() == Some("./")
-                && finding.profile_revision == Some(revision)
+                && finding.profile_revision == Some(revision.to_string())
         }),
         "{:#?}",
         rejected.status.findings
@@ -404,6 +404,83 @@ async fn preview_stores_nothing() -> Result<(), Box<dyn std::error::Error>> {
 
     assert!(!graph_exists(&test, draft_id).await?);
     assert_eq!(event_count(&test, draft_id).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
+    // The Process Run Crate profile validates without any realm document.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let document_id = mint(&test, group_id, "datasets/run")?;
+
+    let rejected = preview_submission(
+        test.context.as_ref(),
+        Some(group_id),
+        &run_crate_json(document_id, false),
+    )
+    .await?;
+    assert!(!rejected.accepted());
+    assert_eq!(
+        rejected.status.state,
+        MetadataProfileValidationState::Invalid
+    );
+    assert_eq!(rejected.status.profile_id, None);
+    assert_eq!(
+        rejected.status.profile_iri.as_deref(),
+        Some(PROCESS_RUN_CRATE_PROFILE_IRI)
+    );
+    assert_eq!(rejected.status.profile_revision.as_deref(), Some("builtin"));
+    assert!(
+        rejected.status.findings.iter().any(|finding| {
+            finding.path.as_deref() == Some("http://schema.org/instrument")
+                && finding.severity == MetadataProfileValidationSeverity::Violation
+        }),
+        "{:#?}",
+        rejected.status.findings
+    );
+
+    let refused = create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/run",
+        run_crate_json(document_id, false),
+    )
+    .await
+    .expect_err("a run crate without an instrument must be refused");
+    assert_profile_code(refused, "constraint_violation");
+    assert_eq!(event_count(&test, document_id).await?, 0);
+
+    let accepted = preview_submission(
+        test.context.as_ref(),
+        Some(group_id),
+        &run_crate_json(document_id, true),
+    )
+    .await?;
+    assert!(accepted.accepted(), "{:#?}", accepted.status.findings);
+    assert!(
+        accepted.status.findings.iter().any(|finding| {
+            finding.path.as_deref() == Some("http://schema.org/softwareVersion")
+                && finding.severity == MetadataProfileValidationSeverity::Warning
+        }),
+        "{:#?}",
+        accepted.status.findings
+    );
+
+    create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/run",
+        run_crate_json(document_id, true),
+    )
+    .await?;
+    let status = load_validation_status(test.context.as_ref(), document_id, None)
+        .await?
+        .expect("a built-in verdict is durable");
+    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.profile_revision.as_deref(), Some("builtin"));
     Ok(())
 }
 
@@ -696,7 +773,7 @@ async fn accepts_group_profile() -> Result<(), Box<dyn std::error::Error>> {
         .expect("an accepted create commits its status");
     assert_eq!(status.state, MetadataProfileValidationState::Valid);
     assert_eq!(status.profile_id, Some(profile_id));
-    assert_eq!(status.profile_revision, Some(revision));
+    assert_eq!(status.profile_revision, Some(revision.to_string()));
     assert_eq!(status.dataset_revision, created.event_id);
     Ok(())
 }
@@ -758,7 +835,7 @@ async fn public_crosses_groups() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .expect("an accepted create commits its status");
     assert_eq!(status.state, MetadataProfileValidationState::Valid);
-    assert_eq!(status.profile_revision, Some(revision));
+    assert_eq!(status.profile_revision, Some(revision.to_string()));
     Ok(())
 }
 
@@ -990,13 +1067,13 @@ async fn profile_revision_change_invalidates_and_revalidation_repins()
         stale.stale_reason.as_deref(),
         Some("profile_revision_changed")
     );
-    assert_eq!(stale.profile_revision, Some(original_revision));
+    assert_eq!(stale.profile_revision, Some(original_revision.to_string()));
 
     let refreshed = revalidate_current(test.context.as_ref(), &created.record).await?;
     assert_eq!(refreshed.state, MetadataProfileValidationState::Valid);
     assert_eq!(
         refreshed.profile_revision,
-        Some(updated_profile.last_event_id)
+        Some(updated_profile.last_event_id.to_string())
     );
     assert_eq!(refreshed.dataset_revision, created.event_id);
     Ok(())
@@ -1242,6 +1319,58 @@ fn crate_json(document_id: Ulid, tag: Option<&str>, valid: bool, extra: bool) ->
                 "about": {"@id": graph_iri}
             },
             root
+        ]
+    })
+    .to_string()
+}
+
+/// A Process Run Crate the built-in Profile is meant to accept. `complete`
+/// adds the instrument the profile requires.
+fn run_crate_json(document_id: Ulid, complete: bool) -> String {
+    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let mut action = json!({
+        "@id": "#run-1",
+        "@type": "CreateAction",
+        "name": "Variant calling",
+        "description": "/usr/bin/tool --in in.txt",
+        "startTime": "2026-08-19T09:00:00+00:00",
+        "endTime": "2026-08-19T09:05:00+00:00",
+        "agent": {"@id": "#agent-1"},
+        "result": [{"@id": "s3://runs/out.txt"}],
+        "actionStatus": {"@id": "http://schema.org/CompletedActionStatus"}
+    });
+    if complete {
+        action["instrument"] = json!({"@id": "#software-1"});
+    }
+    json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": graph_iri}
+            },
+            {
+                "@id": graph_iri,
+                "@type": "Dataset",
+                "name": "Variant calling",
+                "description": "Call variants for sample one",
+                "datePublished": "2026-08-19",
+                "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                "hasPart": [{"@id": "s3://runs/out.txt"}],
+                "mentions": {"@id": "#run-1"},
+                "conformsTo": {"@id": PROCESS_RUN_CRATE_PROFILE_IRI}
+            },
+            action,
+            {"@id": "#agent-1", "@type": "Person", "name": "Ada"},
+            {
+                "@id": "#software-1",
+                "@type": "SoftwareApplication",
+                "name": "tool",
+                "url": "https://example.test/tool"
+            },
+            {"@id": "s3://runs/out.txt", "@type": "File", "name": "out.txt"}
         ]
     })
     .to_string()

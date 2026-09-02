@@ -404,6 +404,51 @@ async fn mcp_transport_contract() {
             .is_some_and(|items| !items.is_empty())
     );
 
+    // The built-in Process Run Crate profile resolves with no realm document.
+    let builtin = client
+        .call_tool(
+            CallToolRequestParams::new("validate_dataset").with_arguments(arguments(json!({
+                "rocrate": {
+                    "@context": "https://w3id.org/ro/crate/1.2/context",
+                    "@graph": [
+                        {
+                            "@id": "ro-crate-metadata.json",
+                            "@type": "CreativeWork",
+                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                            "about": { "@id": "./" }
+                        },
+                        {
+                            "@id": "./",
+                            "@type": "Dataset",
+                            "name": "Unfinished run",
+                            "description": "Tagged with the built-in run profile",
+                            "datePublished": "2026-08-19",
+                            "mentions": { "@id": "#run-1" },
+                            "conformsTo": { "@id": "https://w3id.org/ro/wfrun/process/0.5" }
+                        },
+                        { "@id": "#run-1", "@type": "CreateAction", "name": "Run" }
+                    ]
+                }
+            }))),
+        )
+        .await
+        .unwrap();
+    let builtin = builtin.structured_content.as_ref().unwrap();
+    assert_eq!(builtin["accepted"], false);
+    assert_eq!(
+        builtin["profile_iri"],
+        "https://w3id.org/ro/wfrun/process/0.5"
+    );
+    assert_eq!(builtin["profile_revision"], "builtin");
+    assert!(
+        builtin["findings"].as_array().is_some_and(|findings| {
+            findings
+                .iter()
+                .any(|finding| finding["path"] == "http://schema.org/instrument")
+        }),
+        "{builtin:#?}"
+    );
+
     let written = client
         .call_tool(
             CallToolRequestParams::new("write_object").with_arguments(arguments(json!({
