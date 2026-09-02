@@ -381,16 +381,16 @@ pub async fn deletion_preflight(
     post,
     path = "/data/storage/purge/jobs",
     tag = "data/storage",
-    summary = "Submit a permanent purge of one storage scope",
-    description = r#"Queues a permanent purge of one storage scope as a job.
+    summary = "Delete one storage scope permanently on this node (purge job)",
+    description = r#"Queues the permanent deletion of one storage scope, which the portal calls Delete permanently, as a node-local purge job.
 
 **Authentication**: realm bearer token with WRITE on the selected scope.
 
 **Behavior**
 - The purge runs as a job: a 201 means it was durably queued, never that anything was deleted yet,
   so poll the returned `status_url`.
-- Deletion is permanent and no version survives it, which is what the preflight route reports on
-  beforehand.
+- Deletion is permanent and node-local: no version survives it here, copies other nodes hold are
+  untouched, and the preflight route reports on it beforehand.
 - An `idempotency_key` makes a retried submission return the retained job instead of queuing a
   second purge."#,
     request_body(
@@ -428,7 +428,7 @@ pub async fn deletion_preflight(
         ),
         (status = 400, description = "Invalid scope or idempotency key", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller cannot purge the selected scope", body = ErrorResponse),
+        (status = 403, description = "The caller may not delete the selected scope permanently", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 409, description = "The idempotency key is retained for a purge of a different scope", body = ErrorResponse)
     ),

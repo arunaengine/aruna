@@ -1360,8 +1360,8 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     get,
     path = "/system/realm/placement",
     tag = "system/realm",
-    summary = "Read the realm's placement strategies, bindings and overrides",
-    description = r#"Returns the placement strategies as stored in this node's copy of the realm configuration.
+    summary = "Read the realm's record placement strategies, bindings and overrides",
+    description = r#"Returns the record placement strategies as stored in this node's copy of the realm configuration.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
 management node serves the call and every other node relays it to one.
@@ -1382,7 +1382,7 @@ management node serves the call and every other node relays it to one.
     responses(
         (
             status = 200,
-            description = "The realm's placement strategies as this management node has them",
+            description = "The realm's record placement strategies as this management node has them",
             body = RealmPlacementConfigResponse,
             example = json!({
                 "strategies": [
@@ -1450,8 +1450,8 @@ pub async fn get_realm_placement(
     patch,
     path = "/system/realm/placement",
     tag = "system/realm",
-    summary = "Apply one change to the realm's placement strategies",
-    description = r#"Applies exactly one change to the realm's placement strategies and returns all of them.
+    summary = "Apply one change to the realm's record placement strategies",
+    description = r#"Applies exactly one change to the realm's record placement strategies and returns all of them.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
 management node serves the call and every other node relays it to one.
@@ -1499,7 +1499,7 @@ management node serves the call and every other node relays it to one.
                 })
             )),
             ("Bind a scope" = (
-                summary = "Route every metadata document of one group through that strategy",
+                summary = "Place every metadata document of one group with that strategy",
                 value = json!({
                     "mutation": "set_binding",
                     "binding": {

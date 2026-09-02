@@ -2,7 +2,7 @@
 
 A Profile is an ordinary Aruna metadata document that additionally declares the
 type `http://www.w3.org/ns/dx/prof/Profile` on its root entity and carries its
-SHACL shapes as Turtle. A Dataset that tags a registered Profile is validated
+SHACL shapes as Turtle. A Dataset that tags a Profile it may use (a public one, or a group-only Profile of its own group) is validated
 against that Profile's exact revision before the write is accepted.
 
 ## Registering a Profile
@@ -119,7 +119,7 @@ ill-formed shapes. Such a finding rejects the write and marks the status
 | `constraint_violation`   | 400  | no    | The document does not satisfy a Profile constraint.  |
 | `unsupported_constraint` | 400  | no    | The Profile uses a construct outside the subset.     |
 | `validation_limit`       | 400  | no    | A validation budget was exhausted.                   |
-| `profile_not_registered` | 400  | no    | The tagged IRI is not a registered Profile.          |
+| `profile_not_registered` | 400  | no    | The tagged IRI is not a registered Profile, or names a group-only Profile of another group.          |
 | `profile_unavailable`    | 503  | yes   | The Profile or its revision is temporarily missing.  |
 | `validator_unavailable`  | 503  | yes   | The evaluator is disabled or temporarily unusable.   |
 

@@ -61,7 +61,7 @@ use utoipa_axum::routes;
 #[derive(OpenApi)]
 #[openapi(tags((
     name = "data/placement",
-    description = "Realm-admin administration of placement policies, bucket defaults and their application"
+    description = "Placement policies, bucket defaults and their application: realm admins publish realm-wide policies, group admins the ones their own group owns"
 )))]
 pub struct PlacementApiDoc;
 
