@@ -182,6 +182,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
                 result.record.group_id,
                 result.record.document_id,
                 &result.record.document_path,
+                result.event_id,
             )
             .await;
             (

@@ -915,6 +915,7 @@ pub async fn create_metadata_document(
     )
     .await
     .map_err(map_metadata_write_error)?;
+    let event_id = created.event_id;
     let result = created.record;
 
     // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
@@ -926,6 +927,7 @@ pub async fn create_metadata_document(
         result.group_id,
         result.document_id,
         &result.document_path,
+        event_id,
     )
     .await;
 

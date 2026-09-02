@@ -1046,6 +1046,7 @@ async fn create_document(
                 created.record.group_id,
                 created.record.document_id,
                 &created.record.document_path,
+                created.event_id,
             )
             .await;
             Ok(())

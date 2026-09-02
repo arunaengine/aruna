@@ -481,6 +481,7 @@ impl McpServer {
             record.document_id,
             &record.document_path,
         )
+        let event_id = created.event_id;
         .await;
         let summary = crate::routes::metadata::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
@@ -489,6 +490,7 @@ impl McpServer {
     }
 
     #[tool(
+            event_id,
         description = "Replace one document's entire RO-Crate and optionally change its visibility, returning the updated registry summary. The crate is replaced, not merged, so read the current one with get_dataset and edit that. Validate the result with validate_dataset before writing. Use create_dataset when the document does not exist yet.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
