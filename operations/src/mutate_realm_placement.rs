@@ -25,6 +25,7 @@ use aruna_core::structs::{
     NodePlacementEntry, Permission, PlacementBinding, PlacementOverride, PlacementRef,
     PlacementScope, PlacementStrategy, RealmConfigDocument, RealmNodeKind, StrategyBinding,
     TransitionPlan, normalize_node_placement_input, policy_admin_path, reserved_label,
+    storage_subject,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -116,16 +117,9 @@ impl RealmPlacementMutation {
                 node_id,
                 location,
                 labels,
-            } => {
-                let mut entry = placement_entry(document, *node_id)?.clone();
-                if let Some(location) = location {
-                    entry.location = location.trim().to_string();
-                }
-                if let Some(labels) = labels {
-                    entry.labels = labels.clone();
-                }
-                AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
-            }
+            } => AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: attributes_entry(document, *node_id, location.as_ref(), labels.as_ref())?,
+            },
             Self::RemoveNode(node_id) => {
                 AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id: *node_id }
             }
@@ -326,14 +320,23 @@ impl RealmPlacementMutation {
                         MutateRealmPlacementError::InvalidInput(error.to_string())
                     })?;
                 }
-                match labels.as_ref().and_then(reserved_label) {
-                    Some(label) => Err(MutateRealmPlacementError::InvalidInput(format!(
+                if let Some(label) = labels.as_ref().and_then(reserved_label) {
+                    return Err(MutateRealmPlacementError::InvalidInput(format!(
                         "placement label {label} is derived and cannot be set"
-                    ))),
-                    None => Ok(()),
+                    )));
                 }
+                ensure_subject(&attributes_entry(
+                    document,
+                    *node_id,
+                    location.as_ref(),
+                    labels.as_ref(),
+                )?)
             }
-            Self::UpsertNode(entry) if entry.draining => {
+            Self::UpsertNode(entry) => {
+                ensure_subject(entry)?;
+                if !entry.draining {
+                    return Ok(());
+                }
                 let unchanged = if let Some(current) = document.placement_entry(entry.node_id) {
                     entry.effective_location() == current.effective_location()
                         && entry.weight == current.weight
@@ -627,6 +630,32 @@ fn placement_entry(
     document.placement_entry(node_id).ok_or_else(|| {
         MutateRealmPlacementError::InvalidInput(format!("node {node_id} has no placement entry"))
     })
+}
+
+/// The entry an attribute edit resolves to: the stored one with the requested
+/// fields applied, so validation and reduction judge the same result.
+fn attributes_entry(
+    document: &RealmConfigDocument,
+    node_id: NodeId,
+    location: Option<&String>,
+    labels: Option<&BTreeMap<String, String>>,
+) -> Result<NodePlacementEntry, MutateRealmPlacementError> {
+    let mut entry = placement_entry(document, node_id)?.clone();
+    if let Some(location) = location {
+        entry.location = location.trim().to_string();
+    }
+    if let Some(labels) = labels {
+        entry.labels = labels.clone();
+    }
+    Ok(entry)
+}
+
+/// Refuses attributes whose derived storage subject the node could never
+/// advance to. The generation is not part of that validation.
+fn ensure_subject(entry: &NodePlacementEntry) -> Result<(), MutateRealmPlacementError> {
+    storage_subject(entry, 1)
+        .validate()
+        .map_err(|error| MutateRealmPlacementError::InvalidInput(error.to_string()))
 }
 
 fn require_strategy(
@@ -2176,6 +2205,80 @@ mod tests {
             set_attributes(node(1), None, Some(labels)).validate(&document),
             Err(MutateRealmPlacementError::InvalidInput(reason))
                 if reason.contains("derived")
+        ));
+    }
+
+    fn label_map(count: usize) -> BTreeMap<String, String> {
+        (0..count)
+            .map(|index| (format!("tier-{index}"), "hot".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn rejects_label_count() {
+        // The derived location label counts too, so the cap is reached one
+        // operator label early on a node that declares a location.
+        let document = placed_document(placed_entry(node(1)));
+        assert!(matches!(
+            set_attributes(node(1), None, Some(label_map(33))).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(_))
+        ));
+        assert!(
+            set_attributes(node(1), None, Some(label_map(31)))
+                .validate(&document)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_blank_label() {
+        let document = placed_document(placed_entry(node(1)));
+        let labels = BTreeMap::from([("   ".to_string(), "hot".to_string())]);
+        assert!(matches!(
+            set_attributes(node(1), None, Some(labels)).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_colliding_labels() {
+        // Two keys that trim to one are ambiguous rather than merged.
+        let document = placed_document(placed_entry(node(1)));
+        let labels = BTreeMap::from([
+            ("tier".to_string(), "hot".to_string()),
+            (" tier".to_string(), "cold".to_string()),
+        ]);
+        assert!(matches!(
+            set_attributes(node(1), None, Some(labels)).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_valid_change() {
+        let document = placed_document(placed_entry(node(1)));
+        assert!(
+            set_attributes(node(1), Some("us-east"), None)
+                .validate(&document)
+                .is_ok()
+        );
+        assert!(
+            set_attributes(node(1), None, Some(label_map(2)))
+                .validate(&document)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn upsert_rejects_labels() {
+        // Onboarding writes the joiner's entry, so its labels are bounded here
+        // as well; the reducer only refuses derived keys.
+        let document = placed_document(placed_entry(node(1)));
+        let mut entry = placed_entry(node(2));
+        entry.labels = label_map(33);
+        assert!(matches!(
+            RealmPlacementMutation::UpsertNode(entry).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(_))
         ));
     }
 
