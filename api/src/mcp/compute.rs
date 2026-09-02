@@ -75,7 +75,7 @@ pub struct RunScriptInput {
     /// may use; the caller needs write permission on the group.
     pub group_id: String,
     /// Name of an existing bucket in that group, for example `project-data`.
-    /// It serves as the run workspace: the script is staged under
+    /// It is the run's workspace: the script is staged under
     /// `.aruna/scripts/<run id>/` and outputs are written back into it. Call
     /// `list_buckets` for readable names.
     pub bucket: String,
@@ -216,7 +216,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Stage one script into an existing bucket and submit it as a container job, returning job_id and the state at accept. Use it for plain Python, Deno, or Bash work, and submit_job when a specific image, entrypoint, or workspace mode is needed. The script is written under `.aruna/scripts/<run id>/` in `bucket`, which also serves as the run workspace, so the caller needs write permission on that bucket and on the group. Poll get_job with the returned job_id for state, result, and log tails. A file the script writes is kept only when it is declared in outputs as {container_path, dest_key}: to produce a chart, choose runtime `python-uv` with dependencies [\"matplotlib\"], write the figure to /work/chart.png, and pass outputs [{\"container_path\": \"/work/chart.png\", \"dest_key\": \"results/<run>/chart.png\"}]. Once the job succeeds, call list_job_outputs for the captured objects with their content type and version_id.",
+        description = "Stage one script into an existing bucket and submit it as a container job, returning job_id and the state at accept. Use it for plain Python, Deno, or Bash work, and submit_job when a specific image or entrypoint is needed, or when the run should touch no bucket at all (workspace mode `none`). The script is written under `.aruna/scripts/<run id>/` in `bucket`, which is the run's workspace (mode `existing`), so the caller needs write permission on that bucket and on the group. Poll get_job with the returned job_id for state, result, and log tails. A file the script writes is kept only when it is declared in outputs as {container_path, dest_key}: to produce a chart, choose runtime `python-uv` with dependencies [\"matplotlib\"], write the figure to /work/chart.png, and pass outputs [{\"container_path\": \"/work/chart.png\", \"dest_key\": \"results/<run>/chart.png\"}]. Once the job succeeds, call list_job_outputs for the captured objects with their content type and version_id.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn run_script(
@@ -280,7 +280,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Submit the complete native execution request: image, command, environment, resources, staged inputs, captured outputs, and workspace mode. Use run_script instead for a plain Python, Deno, or Bash script. Returns job_id, whether this call created the job, and the family state at accept. Poll get_job with job_id; a replay under the same idempotency_key returns the existing job rather than a second one.",
+        description = "Submit the complete native execution request: image, command, environment, resources, staged inputs, captured outputs, and workspace mode, which is `none` (the default: the run touches no bucket of its own and every input is read from where it lives) or `existing` (the run works inside a bucket the caller already owns, which is what `outputs` and `output_prefixes` resolve against; a run never creates a bucket). Use run_script instead for a plain Python, Deno, or Bash script. Returns job_id, whether this call created the job, and the family state at accept. Poll get_job with job_id; a replay under the same idempotency_key returns the existing job rather than a second one.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_job(
@@ -680,8 +680,8 @@ fn submit_error(error: crate::error::ServerError) -> CallToolResult {
             error,
             "check group_id as a 26-character ULID, a non-blank image, cpu_cores above 0, \
              ram_bytes between 1 and 9223372036854775807, unique input container_path and output \
-             dest_key values, an existing same-group bucket for workspace mode `existing`, and an \
-             empty output_prefixes list",
+             dest_key values, an existing same-group bucket for workspace mode `existing`, and no \
+             outputs or output_prefixes under workspace mode `none`",
         ),
         crate::error::ServerError::Forbidden => explained(
             error,

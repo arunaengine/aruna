@@ -110,7 +110,7 @@ async fn admin_job_flow() -> TestResult<()> {
             "cpu_cores": 1,
             "ram_bytes": 1_048_576,
             "idempotency_key": "single-node-job-api-flow",
-            "workspace": {"mode": "temporary"}
+            "workspace": {"mode": "none"}
         });
         let jobs_url = format!("{}/api/v1/compute/jobs", seed.base_url);
         let submitted = response_json(

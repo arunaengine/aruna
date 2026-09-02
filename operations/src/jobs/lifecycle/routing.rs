@@ -162,9 +162,6 @@ pub(crate) fn status_view(
     let (mode, bucket) = workspace_of(&spec.payload);
     let workspace_bucket = match mode {
         WorkspaceMode::Existing => bucket,
-        WorkspaceMode::Temporary | WorkspaceMode::Kept => Some(
-            aruna_core::structs::JobRecord::workspace_bucket_name(projection.canonical_job_id),
-        ),
         WorkspaceMode::None => None,
     };
     let terminal = projection

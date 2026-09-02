@@ -137,24 +137,25 @@ pub struct ExecutionOutputRequest {
     pub dest_key: String,
 }
 
-/// Where a run's staged inputs and captured outputs live. `temporary` discards
-/// the workspace after the run, `kept` retains it in a new bucket, and
-/// `existing` reuses the named bucket.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
+/// Which bucket a run works inside. `none` creates and touches no bucket of its
+/// own, and `existing` runs inside the named bucket the caller already owns.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceModeRequest {
-    Temporary,
-    Kept,
+    #[default]
+    None,
     Existing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
 pub struct WorkspaceRequest {
-    /// `temporary` discards the workspace after the run, `kept` retains it in a
-    /// new bucket, and `existing` reuses the named bucket.
+    /// `none` runs without a bucket of its own, `existing` runs inside the named
+    /// bucket. An omitted workspace block is `none`.
     pub mode: WorkspaceModeRequest,
-    /// Required by `existing` mode and refused by the other two. The bucket must
-    /// exist, belong to the same group, and be writable by the caller.
+    /// Required by `existing` mode and refused by `none`. The bucket must exist,
+    /// belong to the same group, and be writable by the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
 }
@@ -241,8 +242,8 @@ pub struct SubmitExecutionRequest {
     /// of starting a second one. A different request under a used key is a 409.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    /// Where staged inputs and captured outputs live. Absent means a kept
-    /// workspace in a new bucket.
+    /// Which bucket the run works inside. Absent means `none`: the run touches
+    /// no bucket of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRequest>,
     /// `realm` (the default) admits the job into the realm; `local` runs it on
@@ -700,15 +701,15 @@ pub(crate) fn map_submit_error(
     }
 }
 
+/// An omitted workspace block runs without a bucket of the run's own.
 fn workspace_request(
     workspace: Option<WorkspaceRequest>,
 ) -> ServerResult<(WorkspaceMode, Option<String>)> {
     let Some(workspace) = workspace else {
-        return Ok((WorkspaceMode::Kept, None));
+        return Ok((WorkspaceMode::None, None));
     };
     match (workspace.mode, workspace.bucket) {
-        (WorkspaceModeRequest::Temporary, None) => Ok((WorkspaceMode::Temporary, None)),
-        (WorkspaceModeRequest::Kept, None) => Ok((WorkspaceMode::Kept, None)),
+        (WorkspaceModeRequest::None, None) => Ok((WorkspaceMode::None, None)),
         (WorkspaceModeRequest::Existing, Some(bucket)) if !bucket.trim().is_empty() => {
             Ok((WorkspaceMode::Existing, Some(bucket)))
         }
@@ -883,8 +884,7 @@ caller's own jobs.
                             "total": 5,
                             "unit": "phases"
                         },
-                        "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
-                        "workspace_mode": "kept"
+                        "workspace_mode": "none"
                     }
                 ],
                 "next_cursor": "RqTuvSDYgez8DstU9tg0ZST62xQ3JtJW"
@@ -955,20 +955,21 @@ which must belong to the same group.
   reads `running`, `succeeded`, `failed`, `cancelled` or `indeterminate` rather than `queued`.
 - The group's standing quota is decided against a replicated demand view, but a replay of a key
   this node already claimed is settled before any quota is read and is never quota-refused.
-- Set `workspace.mode` to `existing` to run in a bucket that already exists; omitting `workspace`
-  keeps a per-job workspace bucket.
+- A run never creates a bucket. Omitting `workspace` (or `workspace.mode` `none`) captures the
+  declared outputs to the buckets they name; `workspace.mode` `existing` runs inside a bucket the
+  caller already owns, which is where `outputs` and `output_prefixes` resolve their `dest_key`.
 - On a user device a `realm` request is always forwarded under the caller's own bearer token: the
   inputs stay referenced, the outputs land on the admitting realm holder, and the device itself
   never executes, admits or stores any part of the job.
 - `target` `local` is served by a user device only and runs the job on that machine for the user
   the device is enrolled for. Nothing about it is forwarded, replicated or offered to the realm,
   and the response carries no `submission_id`: a local run belongs to no submission family.
-- A local run stages inputs the device holds. An input naming `source_node_id` and `version_id` is
-  fetched at that exact version into the run's own workspace bucket, as an ordinary local object
-  and never as a reference, so an unreachable holder fails the run rather than the submission.
-- A local run's outputs stay in the node-local workspace bucket until the owner publishes them.
-  Mounted inputs, `workspace.mode` `none` and `workspace.mode` `existing` are all refused: a device
-  stages files, exposes no S3 endpoint a container could reach, and keeps those outputs local.
+- A local run stages inputs the device holds, each pinned to the version it resolves to at accept
+  time. An input naming `source_node_id` and `version_id` is read at that exact version, so an
+  unreachable holder fails the run rather than the submission.
+- A local run's outputs stay node-local until the owner publishes them. A mounted input and
+  `workspace.mode` `existing` are both refused: a device stages files, exposes no S3 endpoint a
+  container could reach, and names no workspace bucket.
 
 **Limits** (all refused with 400)
 - An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
@@ -1009,7 +1010,8 @@ which must belong to the same group.
             "output_prefixes": ["reports/"],
             "idempotency_key": "fastqc-reads-2026-04-09",
             "workspace": {
-                "mode": "kept"
+                "mode": "existing",
+                "bucket": "project-data"
             }
         })
     ),
@@ -1331,12 +1333,11 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                 },
                 "result": {
                     "exit_code": 0,
-                    "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
                     "stdout": "",
                     "stderr": "",
                     "outputs": [
                         {
-                            "bucket": "ws-01jjrstvwxyz0123456789abcd",
+                            "bucket": "project-reports",
                             "key": "reports/reads_fastqc.html",
                             "version_id": "01JJRSVERSION0123456789ABC",
                             "execution_id": "01JJRSEXEC0123456789ABCDEF",
@@ -1347,8 +1348,7 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                         }
                     ]
                 },
-                "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
-                "workspace_mode": "kept",
+                "workspace_mode": "none",
                 "run_crate": {
                     "status": "written",
                     "resource": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#run/01JJRSTVWXYZ0123456789ABCD"
@@ -1366,7 +1366,7 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                     "duplicate_successes": 1,
                     "outputs": [
                         {
-                            "bucket": "ws-01jjrstvwxyz0123456789abcd",
+                            "bucket": "project-reports",
                             "key": "reports/reads_fastqc.html",
                             "version_id": "01JJRSVERSION0123456789ABC",
                             "execution_id": "01JJRSEXEC0123456789ABCDEF",
@@ -1998,8 +1998,7 @@ Self-scoped like the status read: only the submitter may cancel, and anybody els
                     "total": 5,
                     "unit": "phases"
                 },
-                "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
-                "workspace_mode": "kept"
+                "workspace_mode": "none"
             })
         ),
         (
@@ -2020,8 +2019,7 @@ Self-scoped like the status read: only the submitter may cancel, and anybody els
                     "total": 5,
                     "unit": "phases"
                 },
-                "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
-                "workspace_mode": "kept"
+                "workspace_mode": "none"
             })
         ),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
@@ -2137,7 +2135,7 @@ mod tests {
                 last_error: None,
                 result: None,
                 workspace_bucket: None,
-                workspace_mode: WorkspaceMode::Kept,
+                workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
             },
             spec: LogicalJobSpec {
@@ -3238,17 +3236,33 @@ mod tests {
     }
 
     #[test]
-    fn workspace_defaults_kept() {
+    fn workspace_defaults_none() {
+        // An omitted block, like an explicit `none`, gives the run no bucket.
         assert_eq!(
             workspace_request(None).unwrap(),
-            (WorkspaceMode::Kept, None)
+            (WorkspaceMode::None, None)
+        );
+        assert_eq!(
+            workspace_request(Some(WorkspaceRequest {
+                mode: WorkspaceModeRequest::None,
+                bucket: None,
+            }))
+            .unwrap(),
+            (WorkspaceMode::None, None)
         );
         let record = job_for(job_id(1), user(2), 1);
-        assert_eq!(job_status_response(&record).workspace_mode, "kept");
+        assert_eq!(job_status_response(&record).workspace_mode, "none");
         assert!(
             workspace_request(Some(WorkspaceRequest {
                 mode: WorkspaceModeRequest::Existing,
                 bucket: None,
+            }))
+            .is_err()
+        );
+        assert!(
+            workspace_request(Some(WorkspaceRequest {
+                mode: WorkspaceModeRequest::None,
+                bucket: Some("shared".to_string()),
             }))
             .is_err()
         );

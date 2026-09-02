@@ -145,14 +145,12 @@ pub fn seal_workspace(
     Ok(())
 }
 
-/// The workspace the sealed spec asks for. An unknown or absent mode is the
-/// per-job kept workspace, which is what an unsealed spec always meant.
+/// The workspace the sealed spec asks for. An unknown or absent mode owns no
+/// bucket, which is what a run without a named bucket always meant.
 pub fn workspace_of(spec: &ExecutionSpec) -> (WorkspaceMode, Option<String>) {
     let mode = match spec.tags.get(WORKSPACE_MODE_TAG).map(String::as_str) {
-        Some("temporary") => WorkspaceMode::Temporary,
         Some("existing") => WorkspaceMode::Existing,
-        Some("none") => WorkspaceMode::None,
-        _ => WorkspaceMode::Kept,
+        _ => WorkspaceMode::None,
     };
     (mode, spec.tags.get(WORKSPACE_BUCKET_TAG).cloned())
 }

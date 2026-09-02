@@ -460,9 +460,6 @@ fn materialize_local(
             return Err(LaunchDecline::Unauthorized);
         }
         WorkspaceMode::Existing => (mode, bucket),
-        WorkspaceMode::Temporary | WorkspaceMode::Kept => {
-            (mode, Some(JobRecord::workspace_bucket_name(spec.job_id)))
-        }
         WorkspaceMode::None => (mode, None),
     };
     let mut record = JobRecord::new(

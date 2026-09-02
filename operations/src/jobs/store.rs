@@ -1814,25 +1814,7 @@ pub async fn transition_to_preparing(
     .await
 }
 
-/// Record the durable workspace bucket name on a claimed execution job; no state
-/// change so `Preparing` can persist the bucket before flipping it `Active`.
-pub async fn set_workspace_bucket(
-    storage: &StorageHandle,
-    job_id: JobId,
-    token: Ulid,
-    bucket: String,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
-        guard_token(record, token)?;
-        record.workspace_bucket = Some(bucket.clone());
-        record.updated_at_ms = now_ms;
-        Ok(JobMutation::Persist)
-    })
-    .await
-}
-
-/// `Preparing -> Ready`: workspace prepared and credentials minted.
+/// `Preparing -> Ready`: inputs staged and credentials minted.
 pub async fn transition_to_ready(
     storage: &StorageHandle,
     job_id: JobId,

@@ -1289,21 +1289,20 @@ pub struct JobClaim {
     pub lease_expires_at_ms: u64,
 }
 
+/// Which bucket a run writes into: none of its own, or one the caller owns.
+/// Stored records changed shape here, because the per-run `ws-` workspace
+/// variants are gone and their encodings no longer decode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceMode {
-    Temporary,
     #[default]
-    Kept,
-    Existing,
     None,
+    Existing,
 }
 
 impl WorkspaceMode {
     pub fn name(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Temporary => "temporary",
-            Self::Kept => "kept",
             Self::Existing => "existing",
         }
     }
@@ -1333,7 +1332,7 @@ pub struct JobRecord {
     pub execution_class: JobExecutionClass,
     pub plan_digest: Option<[u8; 32]>,
     pub attempt_intent: Option<AttemptIntent>,
-    /// Durable workspace/run bucket name (`ws-{jobid}`) for execution jobs.
+    /// The caller's bucket an `Existing`-mode run works inside.
     pub workspace_bucket: Option<String>,
     pub workspace_mode: WorkspaceMode,
     /// Resolved source facts copied from the sealed family for physical staging.
@@ -1389,11 +1388,6 @@ impl JobRecord {
             retention_ms: DEFAULT_JOB_RETENTION_MS,
             locally_exhausted: false,
         }
-    }
-
-    /// The run bucket name for an execution job, deterministic from the id.
-    pub fn workspace_bucket_name(job_id: JobId) -> String {
-        format!("ws-{}", job_id.to_string().to_lowercase())
     }
 
     /// No further attempt will be started here: either the job is terminal or it
@@ -3607,7 +3601,7 @@ mod tests {
         let bytes = record.to_bytes().unwrap();
         let retention = postcard::to_allocvec(&record.retention_ms).unwrap();
         let digest = postcard::to_allocvec(&Option::<[u8; 32]>::None).unwrap();
-        let mode = postcard::to_allocvec(&WorkspaceMode::Kept).unwrap();
+        let mode = postcard::to_allocvec(&WorkspaceMode::Existing).unwrap();
 
         for trim in [
             retention.len(),

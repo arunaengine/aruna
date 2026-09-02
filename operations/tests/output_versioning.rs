@@ -27,9 +27,7 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::store::{insert_job, record_attempt_intent, reserve_output_commits};
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::jobs::workflow::workspace::{
-    capture_outputs, load_inputs, load_pinned_mounts, stage_inputs,
-};
+use aruna_operations::jobs::workflow::workspace::{capture_outputs, load_direct_inputs};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
@@ -47,7 +45,7 @@ use ulid::Ulid;
 
 const BUCKET: &str = "outputs";
 const KEY: &str = "run/result.txt";
-const WORKSPACE: &str = "ws-run";
+const WORKSPACE: &str = "run-workspace";
 const INPUT_PATH: &str = "/in/data.csv";
 const RESULTS: &str = "results";
 const OUTPUT_PATH: &str = "/out/report.txt";
@@ -161,11 +159,6 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
     )
     .unwrap();
     let token = Ulid::generate();
-    // Mounted inputs are the none-mode contract: such a run owns no bucket.
-    let mounted = spec
-        .inputs
-        .iter()
-        .any(|input| input.mode == InputMode::Mount);
     let mut record = JobRecord::new(
         job_id,
         JobPayload::Execution(spec),
@@ -175,10 +168,6 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
         1,
         None,
     );
-    record.workspace_mode = match mounted {
-        true => WorkspaceMode::None,
-        false => WorkspaceMode::Kept,
-    };
     record.state = JobState::Running;
     record.claim = Some(JobClaim {
         holder_node_id: harness.node_id,
@@ -383,16 +372,12 @@ async fn read_input(input: TaskInput) -> Vec<u8> {
     bytes
 }
 
-/// Snapshot the pinned input into the run workspace and reopen it exactly as a
-/// launch does, so the bytes are the ones the container would receive.
+/// Open the pinned input exactly as a launch does, so the bytes are the ones
+/// the container would receive.
 async fn staged_bytes(harness: &Harness, version: Ulid) -> Vec<u8> {
     let spec = pinned_spec(harness, version, InputMode::Snapshot);
     let record = job_record(harness, &spec);
-    create_bucket(harness, WORKSPACE).await;
-    stage_inputs(&harness.driver, &spec, &record, WORKSPACE, harness.node_id)
-        .await
-        .unwrap();
-    let mut inputs = load_inputs(&harness.driver, &spec, &record, WORKSPACE, harness.node_id)
+    let mut inputs = load_direct_inputs(&harness.driver, &spec, &record, harness.node_id)
         .await
         .unwrap();
     assert_eq!(inputs.len(), 1);
@@ -438,7 +423,7 @@ async fn mounts_stage_pinned() {
     let spec = pinned_spec(&harness, first.version_id, InputMode::Mount);
     let record = job_record(&harness, &spec);
 
-    let mut inputs = load_pinned_mounts(&harness.driver, &spec, &record, harness.node_id)
+    let mut inputs = load_direct_inputs(&harness.driver, &spec, &record, harness.node_id)
         .await
         .unwrap();
 
@@ -638,27 +623,32 @@ async fn list_buckets(harness: &Harness) -> Vec<String> {
     .collect()
 }
 
-#[tokio::test]
-async fn captures_without_workspace() {
-    // A none-mode run reads its pinned input through file staging and writes
-    // the output into the bucket it named, creating no bucket of its own.
-    let harness = setup().await;
-    seed_auth(&harness).await;
-    create_bucket(&harness, RESULTS).await;
-    let pinned = put_version(&harness, b"input-bytes", None).await;
-    let mut spec = pinned_spec(&harness, pinned.version_id, InputMode::Mount);
+/// One run that stages its pinned input and captures its declared output, with
+/// the bucket the record names (empty for a run that owns none).
+async fn run_capture(
+    harness: &Harness,
+    mode: InputMode,
+    key: &str,
+    workspace: Option<&str>,
+) -> Vec<aruna_core::structs::OutputObject> {
+    let pinned = put_version(harness, b"input-bytes", None).await;
+    let mut spec = pinned_spec(harness, pinned.version_id, mode);
     spec.file_outputs.push(OutputSelection {
         container_path: OUTPUT_PATH.to_string(),
         path_prefix: None,
         destination_node_id: Some(harness.node_id),
         destination: OutputDestination::S3 {
             bucket: RESULTS.to_string(),
-            key: "report.txt".to_string(),
+            key: key.to_string(),
         },
         name: None,
         description: None,
     });
-    let (record, control) = seed_execution(&harness, spec.clone()).await;
+    let (mut record, control) = seed_execution(harness, spec.clone()).await;
+    if let Some(bucket) = workspace {
+        record.workspace_mode = WorkspaceMode::Existing;
+        record.workspace_bucket = Some(bucket.to_string());
+    }
     let fence = FenceContext {
         attempt: AttemptRef::new(record.job_id.to_string().to_lowercase(), 1),
         attempt_epoch: control.attempt_epoch,
@@ -666,11 +656,13 @@ async fn captures_without_workspace() {
     };
     let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend);
 
-    let mut inputs = load_pinned_mounts(&harness.driver, &spec, &record, harness.node_id)
+    let mut inputs = load_direct_inputs(&harness.driver, &spec, &record, harness.node_id)
         .await
         .unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].path, INPUT_PATH);
     assert_eq!(read_input(inputs.remove(0)).await, b"input-bytes");
-    let outputs = capture_outputs(
+    capture_outputs(
         &harness.driver,
         &backend,
         &fence,
@@ -679,15 +671,66 @@ async fn captures_without_workspace() {
         harness.node_id,
     )
     .await
-    .unwrap();
+    .unwrap()
+}
 
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].bucket, RESULTS);
-    assert_eq!(outputs[0].size, OUTPUT_BYTES.len() as u64);
+/// Whether the object exists at all, at any version.
+async fn object_exists(harness: &Harness, bucket: &str, key: &str) -> bool {
+    matches!(
+        drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+            }),
+            &harness.driver,
+        )
+        .await,
+        Ok(Some(Ok(_)))
+    )
+}
+
+#[tokio::test]
+async fn captures_without_workspace() {
+    // A none-mode run reads its pinned input through file staging whatever the
+    // input mode, and writes the output into the bucket it named.
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    create_bucket(&harness, RESULTS).await;
+
+    for (mode, key) in [
+        (InputMode::Mount, "mounted.txt"),
+        (InputMode::Snapshot, "snapshot.txt"),
+    ] {
+        let outputs = run_capture(&harness, mode, key, None).await;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].bucket, RESULTS);
+        assert_eq!(outputs[0].size, OUTPUT_BYTES.len() as u64);
+    }
+
     let buckets = list_buckets(&harness).await;
     assert!(buckets.contains(&RESULTS.to_string()), "{buckets:?}");
     assert!(
         buckets.iter().all(|bucket| !bucket.starts_with("ws-")),
         "{buckets:?}"
+    );
+}
+
+#[tokio::test]
+async fn existing_keeps_clean() {
+    // An existing-mode run reads its input from the source bucket; the bucket it
+    // works inside never receives a staged copy.
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    create_bucket(&harness, RESULTS).await;
+    create_bucket(&harness, WORKSPACE).await;
+
+    let outputs = run_capture(&harness, InputMode::Snapshot, "report.txt", Some(WORKSPACE)).await;
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].bucket, RESULTS);
+    assert!(
+        !object_exists(&harness, WORKSPACE, &INPUT_PATH[1..]).await,
+        "the workspace bucket must hold no copy of the input"
     );
 }

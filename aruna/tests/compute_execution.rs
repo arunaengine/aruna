@@ -275,9 +275,9 @@ async fn wait_run_crate(
     }
 }
 
-// Full happy path: workspace bucket, staged input, a container that reads the
-// input and writes an output via workspace S3 creds, terminal success, durable
-// output, and a run crate.
+// Full happy path: an input staged from the bucket it lives in, a container that
+// reads it and writes an output, terminal success, durable output, and a run
+// crate. The run creates no bucket of its own.
 #[tokio::test]
 async fn execution_end_to_end() -> TestResult<()> {
     let Some(backend) = docker_or_skip().await else {
@@ -342,7 +342,6 @@ async fn execution_end_to_end() -> TestResult<()> {
     assert_eq!(state, JobState::Succeeded, "container job must succeed");
 
     // The output copied from the container is durable at its declared URL.
-    let bucket = JobRecord::workspace_bucket_name(job_id);
     let client = s3_client(&fixture.endpoint, &fixture.s3);
     let output = client
         .get_object()
@@ -350,20 +349,11 @@ async fn execution_end_to_end() -> TestResult<()> {
         .key("outputs/result.txt")
         .send()
         .await
-        .expect("output object durable in workspace");
+        .expect("output object durable at its declared URL");
     let body = output.body.collect().await.unwrap().into_bytes();
     let expected = source_payload().to_ascii_uppercase();
     assert_eq!(body.len(), expected.len(), "output size must match");
     assert_eq!(&body[..], expected, "output bytes must match");
-
-    // The staged input is durable too.
-    client
-        .get_object()
-        .bucket(&bucket)
-        .key("inputs/data.txt")
-        .send()
-        .await
-        .expect("staged input durable in workspace");
 
     // The run crate obligation ran and wrote a crate at runs/{JobId}.
     let crate_status = wait_run_crate(&fixture.compute_ctx, job_id, Duration::from_secs(30)).await;

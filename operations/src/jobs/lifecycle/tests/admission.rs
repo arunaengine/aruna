@@ -198,7 +198,7 @@ async fn refuses_undeliverable_submit() {
         payload(),
         user(),
         Some("idempotency".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         None,
@@ -261,7 +261,7 @@ fn identity_is_deterministic() {
     // The same normalized request yields one identity everywhere, and the
     // sealed workspace choice is part of the digest it commits to.
     let mut spec = payload();
-    seal_workspace(&mut spec, WorkspaceMode::Kept, None).expect("workspace seals");
+    seal_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace seals");
     let request = SubmissionRequest {
         created_by: user(),
         spec: spec.clone(),
@@ -366,7 +366,7 @@ async fn device_skips_materialization() {
         spec.clone(),
         user(),
         Some("device".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
@@ -393,7 +393,7 @@ async fn device_skips_materialization() {
         spec,
         user(),
         Some("server".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
@@ -424,7 +424,7 @@ async fn device_needs_bearer() {
         payload(),
         user(),
         Some("device".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         None,
@@ -440,6 +440,6 @@ fn refuses_reserved_tags() {
     // A caller may not preset the reserved scheduling tags and steer another
     // workspace than the one the ingress sealed.
     let mut spec = payload();
-    seal_workspace(&mut spec, WorkspaceMode::Kept, None).expect("workspace seals");
-    assert!(seal_workspace(&mut spec, WorkspaceMode::Kept, None).is_err());
+    seal_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace seals");
+    assert!(seal_workspace(&mut spec, WorkspaceMode::None, None).is_err());
 }

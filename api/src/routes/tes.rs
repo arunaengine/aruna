@@ -1227,13 +1227,13 @@ fn resolve_task_group(task: &TesTask, credential_group: Option<Ulid>) -> Result<
     Ok(group_id)
 }
 
-/// How a task reads its inputs and whether a run owns a bucket. A realm run
-/// reads the buckets its inputs live in and creates none of its own; a device
-/// refuses mounts, so a local run stages a kept snapshot instead.
+/// How a task reads its inputs. No run owns a bucket: a realm run reads the
+/// buckets its inputs live in, and a device refuses mounts, so a local run
+/// stages the same objects as files.
 fn target_modes(target: ExecutionTarget) -> (InputMode, WorkspaceMode) {
     match target {
         ExecutionTarget::Realm => (InputMode::Mount, WorkspaceMode::None),
-        ExecutionTarget::Local => (InputMode::Snapshot, WorkspaceMode::Kept),
+        ExecutionTarget::Local => (InputMode::Snapshot, WorkspaceMode::None),
     }
 }
 
@@ -3145,7 +3145,7 @@ mod tests {
                 last_error: None,
                 result: None,
                 workspace_bucket: Some("ws".to_string()),
-                workspace_mode: WorkspaceMode::Kept,
+                workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
             },
             spec,
@@ -3526,8 +3526,8 @@ mod tests {
 
     #[tokio::test]
     async fn maps_target_modes() {
-        // A realm run reads the buckets its inputs live in and owns no bucket
-        // of its own; a device refuses mounts, so a local run snapshots.
+        // Neither target owns a bucket; a device refuses mounts, so a local
+        // run snapshots the same objects instead.
         let (_dir, state) = build_state().await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = sealed(&state, group);
@@ -3546,7 +3546,7 @@ mod tests {
         assert_eq!(local.inputs[0].mode, InputMode::Snapshot);
         assert_eq!(
             target_modes(ExecutionTarget::Local),
-            (InputMode::Snapshot, WorkspaceMode::Kept)
+            (InputMode::Snapshot, WorkspaceMode::None)
         );
 
         // The handle-less fixture has no family holder, so 503 is the honest

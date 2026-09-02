@@ -723,7 +723,7 @@ mod tests {
                 last_error: None,
                 result: Some(serde_json::json!({ "exit_code": 0 })),
                 workspace_bucket: Some("workspace".to_string()),
-                workspace_mode: WorkspaceMode::Kept,
+                workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
             },
             run_crate: Some(r#"{"status":"pending"}"#.to_string()),

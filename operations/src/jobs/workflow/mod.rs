@@ -18,8 +18,9 @@ use aruna_core::compute::{
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
-    AttemptControl, AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord,
-    JobRecordError, JobResultPayload, OutputObject, PhysicalExecutionState, WorkspaceMode,
+    AttemptControl, AttemptIntent, ExecutionSpec, InputMode, JobError, JobId, JobPayload,
+    JobRecord, JobRecordError, JobResultPayload, OutputObject, PhysicalExecutionState,
+    WorkspaceMode,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::NodeId;
@@ -33,9 +34,8 @@ use super::store::{
     ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
     complete_cancelled, complete_execution, fail_execution, mark_indeterminate,
     read_attempt_control, read_job_record, record_attempt_intent, record_attempt_started,
-    record_attempt_tombstone, renew_lease, requeue_before_attempt, set_workspace_bucket,
-    transition_external_to_running, transition_to_cancelling, transition_to_preparing,
-    transition_to_ready,
+    record_attempt_tombstone, renew_lease, requeue_before_attempt, transition_external_to_running,
+    transition_to_cancelling, transition_to_preparing, transition_to_ready,
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
@@ -46,9 +46,8 @@ use crate::jobs::lifecycle::updates::{
 use crate::placement_policy::subject::read_local_subject;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
-    capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
-    load_pinned_mounts, merge_outputs, mint_input_credential, pinned_inputs, prepare_mounts,
-    stage_inputs,
+    capture_outputs, check_workspace_bucket, collect_outputs, ensure_group_write,
+    load_direct_inputs, merge_outputs, mint_input_credential, pinned_inputs, prepare_mounts,
 };
 
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
@@ -138,20 +137,17 @@ pub async fn run_execution_job(
 
     // Boxed so the large per-stage futures never inflate caller stacks.
     let mut prepare_and_submit = Box::pin(async {
-        let prepared = match Box::pin(prepare_task(
-            &context, &spec, &record, node_id, &bucket, token,
-        ))
-        .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                Box::pin(requeue_or_fail_pre_submit(
-                    &context, job_id, token, &record, error, false,
-                ))
-                .await;
-                return None;
-            }
-        };
+        let prepared =
+            match Box::pin(prepare_task(&context, &spec, &record, node_id, &bucket)).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    Box::pin(requeue_or_fail_pre_submit(
+                        &context, job_id, token, &record, error, false,
+                    ))
+                    .await;
+                    return None;
+                }
+            };
 
         // Preparing -> Ready.
         if transition_to_ready(storage, job_id, token, unix_timestamp_millis())
@@ -425,30 +421,23 @@ async fn sealed_site(
     })
 }
 
+/// Authorize the bucket an `Existing`-mode run works inside before anything is
+/// staged. A `None`-mode run touches no bucket, so it has nothing to authorize.
 async fn prepare_workspace(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
     bucket: &str,
-    token: ulid::Ulid,
-) -> Result<Vec<TaskInput>, JobError> {
+) -> Result<(), JobError> {
+    if record.workspace_mode != WorkspaceMode::Existing {
+        return Ok(());
+    }
     Box::pin(ensure_group_write(context, spec, record, node_id)).await?;
-    Box::pin(ensure_workspace_bucket(
+    Box::pin(check_workspace_bucket(
         context, spec, record, node_id, bucket,
     ))
-    .await?;
-    set_workspace_bucket(
-        &context.storage_handle,
-        record.job_id,
-        token,
-        bucket.to_string(),
-        unix_timestamp_millis(),
-    )
     .await
-    .map_err(|error| JobError::retryable(format!("workspace bucket record failed: {error}")))?;
-    Box::pin(stage_inputs(context, spec, record, bucket, node_id)).await?;
-    Box::pin(load_inputs(context, spec, record, bucket, node_id)).await
 }
 
 pub(super) struct PreparedTask {
@@ -458,23 +447,34 @@ pub(super) struct PreparedTask {
     staging: StagingMode,
 }
 
+/// The bucket a run works inside, empty when it owns none.
 pub(super) fn job_bucket(record: &JobRecord) -> String {
-    match (&record.workspace_bucket, record.workspace_mode) {
-        (Some(bucket), _) => bucket.clone(),
-        (None, WorkspaceMode::None) => String::new(),
-        (None, _) => JobRecord::workspace_bucket_name(record.job_id),
-    }
+    record.workspace_bucket.clone().unwrap_or_default()
 }
 
-async fn mounted_task(
+/// True when every input is an unpinned mount, the only shape an S3 mount can
+/// deliver: a mount serves the current head of the object it names.
+fn mountable(spec: &ExecutionSpec) -> bool {
+    !spec.inputs.is_empty()
+        && spec
+            .inputs
+            .iter()
+            .all(|input| input.mode == InputMode::Mount)
+        && !pinned_inputs(spec)
+}
+
+/// Build the attempt's inputs. Every input is read straight from its source,
+/// except an unpinned mounted spec, which the container reaches over S3.
+/// Nothing is copied for an attempt, so an adopted one restages the same way.
+pub(super) async fn prepare_inputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
 ) -> Result<PreparedTask, JobError> {
-    if pinned_inputs(spec) {
+    if !mountable(spec) {
         return Ok(PreparedTask {
-            inputs: Box::pin(load_pinned_mounts(context, spec, record, node_id)).await?,
+            inputs: Box::pin(load_direct_inputs(context, spec, record, node_id)).await?,
             mounts: Vec::new(),
             secrets: BTreeMap::new(),
             staging: StagingMode::Files,
@@ -508,47 +508,15 @@ async fn mounted_task(
     })
 }
 
-/// Build the attempt's inputs. A workspace job stages its snapshot copies; a
-/// mounted job mounts its inputs, except when the launch pinned them to a
-/// version, which only the staged read-only copy can deliver.
 async fn prepare_task(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
     bucket: &str,
-    token: ulid::Ulid,
 ) -> Result<PreparedTask, JobError> {
-    if record.workspace_mode == WorkspaceMode::None {
-        return Box::pin(mounted_task(context, spec, record, node_id)).await;
-    }
-    Ok(PreparedTask {
-        inputs: Box::pin(prepare_workspace(
-            context, spec, record, node_id, bucket, token,
-        ))
-        .await?,
-        mounts: Vec::new(),
-        secrets: BTreeMap::new(),
-        staging: StagingMode::Files,
-    })
-}
-
-pub(super) async fn reload_task(
-    context: &DriverContext,
-    spec: &ExecutionSpec,
-    record: &JobRecord,
-    node_id: NodeId,
-    bucket: &str,
-) -> Result<PreparedTask, JobError> {
-    if record.workspace_mode == WorkspaceMode::None {
-        return Box::pin(mounted_task(context, spec, record, node_id)).await;
-    }
-    Ok(PreparedTask {
-        inputs: Box::pin(load_inputs(context, spec, record, bucket, node_id)).await?,
-        mounts: Vec::new(),
-        secrets: BTreeMap::new(),
-        staging: StagingMode::Files,
-    })
+    Box::pin(prepare_workspace(context, spec, record, node_id, bucket)).await?;
+    Box::pin(prepare_inputs(context, spec, record, node_id)).await
 }
 
 pub(super) fn build_task_spec(
@@ -710,7 +678,7 @@ async fn recover_failed_submit(
         }
         RecoveryAction::RetrySame => {
             let status = match Box::pin(retry_same_submit(
-                context, backend, fence, spec, bucket, record, cancel,
+                context, backend, fence, spec, record, cancel,
             ))
             .await
             {
@@ -800,7 +768,6 @@ async fn retry_same_submit(
     backend: &Arc<dyn ExecutorBackend>,
     fence: &FenceContext,
     spec: &ExecutionSpec,
-    bucket: &str,
     record: &JobRecord,
     cancel: &CancellationToken,
 ) -> Result<AttemptStatus, BackendError> {
@@ -809,7 +776,7 @@ async fn retry_same_submit(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| BackendError::Unavailable("execution needs a net handle".to_string()))?;
-    let prepared = Box::pin(reload_task(context, spec, record, node_id, bucket))
+    let prepared = Box::pin(prepare_inputs(context, spec, record, node_id))
         .await
         .map_err(|error| BackendError::Unavailable(error.message))?;
     let pinned_image = record
@@ -2158,7 +2125,7 @@ mod tests {
         let context = context(storage);
         let spec = execution_spec();
         let job_id = job_id();
-        let record = JobRecord::new(
+        let mut record = JobRecord::new(
             job_id,
             JobPayload::Execution(spec.clone()),
             UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
@@ -2167,17 +2134,11 @@ mod tests {
             1,
             None,
         );
-        let bucket = JobRecord::workspace_bucket_name(job_id);
+        record.workspace_mode = WorkspaceMode::Existing;
+        let bucket = "shared-workspace".to_string();
+        record.workspace_bucket = Some(bucket.clone());
 
-        let Err(error) = prepare_workspace(
-            &context,
-            &spec,
-            &record,
-            node_id(7),
-            &bucket,
-            Ulid::generate(),
-        )
-        .await
+        let Err(error) = prepare_workspace(&context, &spec, &record, node_id(7), &bucket).await
         else {
             panic!("workspace preparation unexpectedly succeeded");
         };
@@ -2192,7 +2153,7 @@ mod tests {
                 .unwrap(),
                 Some(Err(GetBucketInfoError::NotFound))
             ),
-            "authorization must fail before workspace creation"
+            "a run never creates the bucket it names"
         );
 
         let Err(error) = Box::pin(mint_workspace_credential(

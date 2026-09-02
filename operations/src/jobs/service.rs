@@ -156,33 +156,15 @@ pub(crate) fn validate_execution(
                 "existing mode requires a bucket".to_string(),
             ));
         }
-        WorkspaceMode::Temporary | WorkspaceMode::Kept if workspace_bucket.is_some() => {
-            return Err(SubmitJobError::InvalidWorkspace(
-                "bucket is only valid for existing mode".to_string(),
-            ));
-        }
         _ => {}
     }
+    // Without a bucket of its own a run has nowhere to resolve a relative
+    // output key against, so every output must name its own destination.
     if workspace_mode == WorkspaceMode::None
-        && (spec
-            .inputs
-            .iter()
-            .any(|input| input.mode != aruna_core::structs::InputMode::Mount)
-            || !spec.workspace_outputs.is_empty()
-            || !spec.output_prefixes.is_empty())
+        && (!spec.workspace_outputs.is_empty() || !spec.output_prefixes.is_empty())
     {
         return Err(SubmitJobError::InvalidWorkspace(
-            "none mode requires mounted inputs and explicit output destinations".to_string(),
-        ));
-    }
-    if workspace_mode != WorkspaceMode::None
-        && spec
-            .inputs
-            .iter()
-            .any(|input| input.mode == aruna_core::structs::InputMode::Mount)
-    {
-        return Err(SubmitJobError::InvalidWorkspace(
-            "mounted inputs require none workspace mode".to_string(),
+            "none mode requires explicit output destinations".to_string(),
         ));
     }
     Ok(())
@@ -1332,8 +1314,8 @@ mod tests {
             UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
             node_id(),
             None,
-            WorkspaceMode::Kept,
-            None,
+            WorkspaceMode::Existing,
+            Some("shared".to_string()),
             1,
             None,
         )
@@ -1349,7 +1331,7 @@ mod tests {
         spec.workspace_outputs.pop();
         spec.output_prefixes.push("out/".to_string());
         assert!(matches!(
-            validate_execution(&mut spec, WorkspaceMode::Kept, None),
+            validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")),
             Err(SubmitJobError::InvalidWorkspace(_))
         ));
         spec.output_prefixes.clear();
@@ -1360,8 +1342,8 @@ mod tests {
                 UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
                 node_id(),
                 None,
-                WorkspaceMode::Kept,
-                None,
+                WorkspaceMode::Existing,
+                Some("shared".to_string()),
                 1,
                 None,
             )

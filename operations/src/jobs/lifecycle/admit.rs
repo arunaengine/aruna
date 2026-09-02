@@ -517,9 +517,6 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
     record.workspace_mode = mode;
     record.workspace_bucket = match mode {
         WorkspaceMode::Existing => bucket,
-        WorkspaceMode::Temporary | WorkspaceMode::Kept => {
-            Some(JobRecord::workspace_bucket_name(spec.job_id))
-        }
         WorkspaceMode::None => None,
     };
     record
