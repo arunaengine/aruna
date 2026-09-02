@@ -1375,7 +1375,7 @@ operation.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
-        (status = 409, description = "The run was sealed against a different bucket record", body = ErrorResponse),
+        (status = 409, description = "The run was sealed against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
         (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
