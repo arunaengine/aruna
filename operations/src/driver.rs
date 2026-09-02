@@ -1074,7 +1074,7 @@ pub async fn drive_until<O: Operation>(
                 // A committed transaction must not be rolled back, so its abort
                 // effects stay suppressed; backend reservations are released by
                 // dropping `holds`, never by this path.
-                if !committed {
+                if !committed || operation.abort_after_commit() {
                     queue.extend(operation.abort().into_iter().filter(|effect| {
                         !matches!(
                             transaction_effect(effect),
@@ -1128,7 +1128,7 @@ pub async fn drive_until<O: Operation>(
                                 error: StorageError::CommitFailed,
                             })
                         } else {
-                            if !committed {
+                            if !committed || operation.abort_after_commit() {
                                 queue.extend(operation.abort().into_iter().filter(|effect| {
                                     !matches!(
                                         transaction_effect(effect),
@@ -1183,7 +1183,25 @@ pub async fn drive_until<O: Operation>(
         Some(cleanup_deadline.unwrap_or(deadline)),
     )
     .await;
-    operation.finalize()
+    let result = operation.finalize();
+    if let Err(error) = &result {
+        if O::expected_error(error) {
+            debug!(
+                event = "operation.rejected",
+                operation = %type_name::<O>(),
+                error = ?error,
+                "Operation rejected"
+            );
+        } else {
+            error!(
+                event = "operation.failed",
+                operation = %type_name::<O>(),
+                error = ?error,
+                "Operation failed"
+            );
+        }
+    }
+    result
 }
 
 #[tracing::instrument(

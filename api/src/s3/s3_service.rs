@@ -9,6 +9,7 @@ use crate::s3::checksum::{
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::{IntoS3Error, gate_context_error, routing_inputs_error};
+use crate::s3::multipart_join::{CompletionFailure, CompletionRegistry, await_completion};
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
@@ -31,7 +32,7 @@ use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{
-    DriverContext, bucket_snapshot, drive, gate_context, now_ms, routing_snapshot,
+    DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
 };
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
@@ -134,8 +135,8 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
-use tracing::{debug, error, warn};
+use std::time::{Duration, SystemTime};
+use tracing::{Instrument, debug, error, warn};
 
 #[derive(Debug)]
 struct ObjectResponseFields {
@@ -244,12 +245,20 @@ fn restrictions_reach(restrictions: Option<&[PathRestriction]>, bucket_path: &st
     })
 }
 
+/// Ceiling on one CompleteMultipartUpload. Composing a huge object is
+/// legitimately slow, so the bound only has to stop an operation that never
+/// finishes; on expiry the record reopens and the composed blob is rolled back.
+const COMPLETION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
+
 #[derive(Clone)]
 pub struct ArunaS3Service {
     state: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: NodeId,
     rocrate_limits: RoCrateLimits,
+    /// Detached CompleteMultipartUpload tasks, shared by every clone of the
+    /// service so a retry on another connection joins the running completion.
+    completions: Arc<CompletionRegistry>,
 }
 
 impl Debug for ArunaS3Service {
@@ -267,6 +276,7 @@ impl ArunaS3Service {
             realm_id,
             node_id,
             rocrate_limits: RoCrateLimits::default(),
+            completions: Arc::new(CompletionRegistry::default()),
         }
     }
 
@@ -704,17 +714,13 @@ impl ArunaS3Service {
     /// into a single blob and hashes it, so the ETag is a real content MD5 that
     /// clients such as rclone can verify end-to-end; aws-cli and boto3 treat
     /// ETags as opaque tokens and are unaffected by the missing suffix.
-    async fn complete_multipart_upload_response(
+    fn complete_multipart_upload_response(
         &self,
-        group_id: ulid::Ulid,
         bucket: String,
         key: String,
         checksum_request: &UploadChecksumRequest,
-        replication_auth: AuthContext,
         result: CompleteMultipartUploadResult,
-    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let replication_bucket = bucket.clone();
-        let replication_key = key.clone();
+    ) -> S3Response<CompleteMultipartUploadOutput> {
         let mut output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
@@ -734,17 +740,7 @@ impl ArunaS3Service {
             Some(result.part_count),
         ));
 
-        self.complete_put(
-            replication_auth,
-            group_id,
-            replication_bucket,
-            replication_key,
-            result.version_id,
-            result.location.blob_size,
-        )
-        .await;
-
-        Ok(S3Response::new(output))
+        S3Response::new(output)
     }
 
     async fn put_object_response(
@@ -2218,6 +2214,7 @@ impl S3 for ArunaS3Service {
             object_size: req.input.mpu_object_size.map(checked_size).transpose()?,
             created_by: user_access.user_identity,
             quota_ceiling,
+            now_ms: now_ms(),
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_restrictions(replication_auth.path_restrictions.clone());
@@ -2225,21 +2222,52 @@ impl S3 for ArunaS3Service {
             operation = operation.with_gate(gate);
         }
 
-        let result = drive(operation, &self.state)
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to complete multipart upload"))?;
+        // The completion outlives its request: a dropped connection must not
+        // cancel it, and a retry joins it instead of racing a second one.
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let service = self.clone();
+        let deadline = tokio::time::Instant::now() + COMPLETION_DEADLINE;
+        let work = async move {
+            let outcome = match drive_until(operation, &service.state, deadline)
+                .await
+                .and_then(|result| result.transpose())
+            {
+                Ok(Some(result)) => {
+                    service
+                        .complete_put(
+                            replication_auth,
+                            group_id,
+                            bucket,
+                            key,
+                            result.version_id,
+                            result.location.blob_size,
+                        )
+                        .await;
+                    Ok(result)
+                }
+                Ok(None) => Err(CompletionFailure::new(&s3_error!(
+                    InternalError,
+                    "Failed to complete multipart upload"
+                ))),
+                Err(error) => Err(CompletionFailure::new(&error.into_s3_error())),
+            };
+            Arc::new(outcome)
+        };
+        let joined = self.completions.join(
+            (req.input.bucket.clone(), upload_id),
+            work.instrument(tracing::Span::current()),
+        );
 
-        self.complete_multipart_upload_response(
-            group_id,
-            req.input.bucket,
-            req.input.key,
-            &checksum_request,
-            replication_auth,
-            result,
-        )
-        .await
+        match await_completion(joined).await.as_ref() {
+            Ok(result) => Ok(self.complete_multipart_upload_response(
+                req.input.bucket,
+                req.input.key,
+                &checksum_request,
+                result.clone(),
+            )),
+            Err(failure) => Err(failure.to_s3_error()),
+        }
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -2263,6 +2291,7 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket,
             key: req.input.key,
             upload_id,
+            now_ms: now_ms(),
         });
 
         drive(operation, &self.state)
@@ -3511,6 +3540,7 @@ mod tests {
                 realm_id,
                 node_id,
                 rocrate_limits: RoCrateLimits::default(),
+                completions: Arc::new(CompletionRegistry::default()),
             },
         )
     }

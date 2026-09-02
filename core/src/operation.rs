@@ -21,6 +21,13 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     {
         false
     }
+
+    /// Whether a deadline must still run `abort` after one of the operation's
+    /// transactions committed. Only an operation whose `abort` protects already
+    /// committed work may opt in.
+    fn abort_after_commit(&self) -> bool {
+        false
+    }
 }
 
 pub trait SubOperation: Send + std::fmt::Debug {
