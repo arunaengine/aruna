@@ -1360,7 +1360,7 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     get,
     path = "/system/realm/placement",
     tag = "system/realm",
-    summary = "Read the realm's record placement strategies, bindings and overrides",
+    summary = "Read record placement strategies, bindings and overrides",
     description = r#"Returns the record placement strategies as stored in this node's copy of the realm configuration.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
@@ -1450,7 +1450,7 @@ pub async fn get_realm_placement(
     patch,
     path = "/system/realm/placement",
     tag = "system/realm",
-    summary = "Apply one change to the realm's record placement strategies",
+    summary = "Apply one change to the record placement strategies",
     description = r#"Applies exactly one change to the realm's record placement strategies and returns all of them.
 
 **Authentication**: realm bearer token with WRITE on the realm configuration admin path. A

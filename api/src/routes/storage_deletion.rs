@@ -381,7 +381,7 @@ pub async fn deletion_preflight(
     post,
     path = "/data/storage/purge/jobs",
     tag = "data/storage",
-    summary = "Delete one storage scope permanently on this node (purge job)",
+    summary = "Delete one storage scope permanently on this node",
     description = r#"Queues the permanent deletion of one storage scope, which the portal calls Delete permanently, as a node-local purge job.
 
 **Authentication**: realm bearer token with WRITE on the selected scope.

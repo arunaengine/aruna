@@ -653,7 +653,7 @@ pub async fn get_sync(
     patch,
     path = "/data/sync/relationships/{id}",
     tag = "data/sync",
-    summary = "Pause, resume, or change how a relationship handles referenced objects",
+    summary = "Pause, resume or change a relationship's reference handling",
     description = r#"Pauses or resumes an existing sync relationship and changes how it handles referenced objects.
 
 **Authentication**: realm bearer token; a token confined to a path subset is refused. Only the
