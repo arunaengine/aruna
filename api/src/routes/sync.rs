@@ -666,6 +666,12 @@ creator may change a relationship, and READ on the source bucket is checked as w
 - `state` of `paused` stops the relationship from queueing further work and copies nothing new;
   no data is removed on either side, and `enabled` resumes it. Resuming a relationship that had
   failed also clears its last error and consecutive-failure count.
+- Returning a relationship to `enabled` from any other state also queues one catch-up backfill over
+  its whole scope, because versions written while it was paused or failed were never queued and are
+  otherwise never replicated. A 200 therefore means that job is durably queued as well, and the
+  relationship's `pending_jobs` returns to zero when it has drained.
+- A resume that stores the new state but cannot queue that job answers 500 with the state already
+  changed; the backfill is then queued by calling the run endpoint.
 - Submitting the values the relationship already has returns it unchanged and touches nothing.
 - Otherwise the target's mirror is updated before the local record, so an unreachable target leaves
   the stored values as they were and the caller may retry.
@@ -696,7 +702,7 @@ creator may change a relationship, and READ on the source bucket is checked as w
     responses(
         (
             status = 200,
-            description = "The relationship after the change, or unchanged when the requested values were already in effect",
+            description = "The relationship after the change, or unchanged when the requested values were already in effect; a resume also has its catch-up backfill queued by now",
             body = SyncRelationshipResponse,
             example = json!({
                 "id": "01JSYNC0123456789ABCDEFGHJ",
@@ -722,6 +728,7 @@ creator may change a relationship, and READ on the source bucket is checked as w
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no READ on the source bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
+        (status = 500, description = "The change could not be stored, or a resume stored the new state but failed to queue its catch-up backfill; that backfill is then queued with the run endpoint", body = ErrorResponse),
         (status = 502, description = "The target node could not be reached to update its mirror; the stored handling is unchanged and the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -741,6 +748,7 @@ pub async fn update_sync(
     ensure_creator(&auth, &relationship)?;
     ensure_source_read(&state, &auth, &relationship).await?;
 
+    let was_enabled = relationship.state == SyncState::Enabled;
     let mut changed = false;
     if let Some(requested) = request.reference_handling {
         let handling = ReferenceHandling::from(requested);
@@ -799,6 +807,11 @@ pub async fn update_sync(
         }
     };
     clear_repair(&state, &updated, SyncMirrorRepairIntent::Reconcile).await;
+    // Nothing was queued while the relationship was not enabled, so resuming it
+    // has to catch up on the versions written in the meantime.
+    if !was_enabled && updated.state == SyncState::Enabled {
+        queue_relationship(&state, &auth, &updated).await?;
+    }
     Ok(Json(map_relationship(&updated)))
 }
 
@@ -1666,6 +1679,95 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ServerError::Forbidden));
+    }
+
+    /// Both ends on the fixture node, so the mirror write stays local.
+    fn local_relationship(node_id: NodeId) -> SyncRelationship {
+        let mut relationship = test_relationship();
+        relationship.target =
+            ArunaArn::s3_object_prefix(relationship.source.realm_id, node_id, "target", "replica/")
+                .unwrap();
+        relationship
+    }
+
+    async fn store_link(state: &ServerState, relationship: &SyncRelationship) {
+        drive(
+            StoreSyncRelationshipOperation::new(
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn patch(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+        relationship: &SyncRelationship,
+        request: UpdateSyncRequest,
+    ) -> ServerResult<Json<SyncRelationshipResponse>> {
+        update_sync(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "sync-test-token",
+            ))),
+            Path(relationship.id.to_string()),
+            Json(request),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn resume_queues_backfill() {
+        // Nothing is queued while a relationship is paused, so versions written
+        // in the meantime only replicate if resuming catches up on them.
+        let (_storage_dir, state, auth, _) = test_state().await;
+        let mut relationship = local_relationship(state.get_node_id());
+        relationship.state = SyncState::Paused;
+        store_link(&state, &relationship).await;
+        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 0);
+
+        let Json(response) = patch(
+            &state,
+            &auth,
+            &relationship,
+            UpdateSyncRequest {
+                reference_handling: None,
+                state: Some(ApiSyncState::Enabled),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.state, "enabled");
+        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 1);
+    }
+
+    #[tokio::test]
+    async fn edit_skips_backfill() {
+        // An enabled relationship already queues its own work, so an unrelated
+        // edit must not enqueue a full pass over its scope.
+        let (_storage_dir, state, auth, _) = test_state().await;
+        let relationship = local_relationship(state.get_node_id());
+        store_link(&state, &relationship).await;
+
+        let Json(response) = patch(
+            &state,
+            &auth,
+            &relationship,
+            UpdateSyncRequest {
+                reference_handling: Some(ApiReferenceHandling::Preserve),
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.reference_handling, ApiReferenceHandling::Preserve);
+        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 0);
     }
 
     #[tokio::test]
