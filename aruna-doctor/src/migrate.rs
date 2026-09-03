@@ -1,29 +1,38 @@
-//! Rewrites records stored before per-run workspace buckets were dropped and
-//! multipart completions gained a lease. Safe to repeat: a current record is
-//! left untouched.
+//! Re-encodes the stored job-family rows that embed a physical execution result
+//! from the shape before it carried stdout and stderr tails. Safe to repeat: a
+//! row already in the current shape is left untouched.
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use aruna_core::keyspaces::{JOB_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
-use aruna_core::structs::{
-    AttemptIntent, CapturedInput, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
-    JobProgress, JobRecord, JobResultPayload, JobState, MultipartUpload, WorkspaceMode,
+use aruna_core::keyspaces::{
+    JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
+    JOB_FAMILY_RECORD_KEYSPACE,
 };
-use aruna_core::types::{NodeId, UserId};
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
+use aruna_core::structs::{
+    ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
+    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
+    PhysicalExecutionState, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
+    WitnessBudgetRecord,
+};
+use aruna_core::types::NodeId;
+use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use ulid::Ulid;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
     pub database_path: String,
-    pub uploads_scanned: usize,
-    pub uploads_patched: usize,
-    pub jobs_scanned: usize,
-    pub jobs_rewritten: usize,
-    /// Unfinished runs settled because the workspace bucket they would have
-    /// captured into no longer exists.
-    pub jobs_failed: usize,
+    pub records_scanned: usize,
+    pub records_rewritten: usize,
+    pub pending_scanned: usize,
+    pub pending_rewritten: usize,
+    pub conflicts_scanned: usize,
+    pub conflicts_rewritten: usize,
+    /// Derived projection rows dropped. The reader rebuilds a missing one from
+    /// the immutable records, so clearing them needs no re-encode.
+    pub projections_cleared: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -40,41 +49,41 @@ pub async fn migrate(database_path: String) -> Result<(), CliError> {
 
 fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
-    let uploads = db.keyspace(S3_MULTIPART_UPLOAD_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let jobs = db.keyspace(JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let record_rows = db.keyspace(JOB_FAMILY_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let pending_rows = db.keyspace(JOB_FAMILY_PENDING_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let conflict_rows =
+        db.keyspace(JOB_FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let cache_rows = db.keyspace(
+        JOB_FAMILY_PROJECTION_KEYSPACE,
+        KeyspaceCreateOptions::default,
+    )?;
 
-    let mut uploads_scanned = 0;
-    let mut patched = Vec::new();
-    for entry in db.read_tx().iter(&uploads) {
-        let (key, value) = entry.into_inner()?;
-        uploads_scanned += 1;
-        if let Some(value) =
-            patched_upload(value.as_ref()).map_err(|error| decode_error(&key, error))?
-        {
-            patched.push((key.to_vec(), value));
-        }
-    }
-
-    let mut jobs_scanned = 0;
-    let mut jobs_failed = 0;
-    let mut rewritten = Vec::new();
-    for entry in db.read_tx().iter(&jobs) {
-        let (key, value) = entry.into_inner()?;
-        jobs_scanned += 1;
-        if let Some((value, settled)) =
-            rewritten_job(value.as_ref()).map_err(|error| decode_error(&key, error))?
-        {
-            jobs_failed += usize::from(settled);
-            rewritten.push((key.to_vec(), value));
-        }
-    }
+    let records = rewrites::<JobRecordEnvelope, LegacyEnvelope>(
+        &db,
+        &record_rows,
+        JOB_FAMILY_RECORD_KEYSPACE,
+    )?;
+    let pending =
+        rewrites::<PendingRecord, LegacyPending>(&db, &pending_rows, JOB_FAMILY_PENDING_KEYSPACE)?;
+    let conflicts = rewrites::<ConflictRecord, LegacyConflict>(
+        &db,
+        &conflict_rows,
+        JOB_FAMILY_CONFLICT_KEYSPACE,
+    )?;
+    let projections = keys(&db, &cache_rows)?;
 
     let mut txn = db.write_tx()?;
-    for (key, value) in &patched {
-        txn.insert(uploads.clone(), key.clone(), value.clone());
+    for (keyspace, rows) in [
+        (&record_rows, &records.rows),
+        (&pending_rows, &pending.rows),
+        (&conflict_rows, &conflicts.rows),
+    ] {
+        for (key, value) in rows {
+            txn.insert(keyspace.clone(), key.clone(), value.clone());
+        }
     }
-    for (key, value) in &rewritten {
-        txn.insert(jobs.clone(), key.clone(), value.clone());
+    for key in &projections {
+        txn.remove(cache_rows.clone(), key.clone());
     }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
@@ -82,227 +91,275 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
 
     Ok(MigrateOutput {
         database_path: database_path.to_string(),
-        uploads_scanned,
-        uploads_patched: patched.len(),
-        jobs_scanned,
-        jobs_rewritten: rewritten.len(),
-        jobs_failed,
+        records_scanned: records.scanned,
+        records_rewritten: records.rows.len(),
+        pending_scanned: pending.scanned,
+        pending_rewritten: pending.rows.len(),
+        conflicts_scanned: conflicts.scanned,
+        conflicts_rewritten: conflicts.rows.len(),
+        projections_cleared: projections.len(),
     })
 }
 
-fn decode_error(key: &[u8], error: impl std::fmt::Display) -> ExplorerError {
-    ExplorerError::Decode(format!("{}: {error}", hex::encode(key)))
+/// Rows of one keyspace that must be written back, plus how many were read.
+struct Rewrites {
+    scanned: usize,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-/// A record written before the completion lease lacks its trailing `None`.
-fn patched_upload(value: &[u8]) -> Result<Option<Vec<u8>>, aruna_core::errors::ConversionError> {
-    if MultipartUpload::from_bytes(value).is_ok() {
-        return Ok(None);
-    }
-    let mut patched = value.to_vec();
-    patched.push(0);
-    MultipartUpload::from_bytes(&patched)?;
-    Ok(Some(patched))
-}
-
-/// Message a settled run carries, so its submitter knows to resubmit it.
-const WORKSPACE_DROPPED: &str =
-    "per-run workspace buckets were dropped during an upgrade; submit the run again";
-
-/// The pre-drop layout of `JobRecord`: identical except for the mode, which is
-/// decoded as the legacy enum so a dropped per-run bucket stays visible.
-#[derive(Deserialize)]
-struct LegacyJobRecord {
-    job_id: JobId,
-    payload: JobPayload,
-    state: JobState,
-    created_by: UserId,
-    owner_node_id: NodeId,
-    created_at_ms: u64,
-    started_at_ms: Option<u64>,
-    updated_at_ms: u64,
-    due_at_ms: u64,
-    finished_at_ms: Option<u64>,
-    attempts: u32,
-    next_attempt_epoch: u64,
-    has_run: bool,
-    last_error: Option<JobError>,
-    progress: JobProgress,
-    cancel_requested: bool,
-    claim: Option<JobClaim>,
-    dedup_key: Option<Vec<u8>>,
-    result: Option<JobResultPayload>,
-    execution_class: JobExecutionClass,
-    plan_digest: Option<[u8; 32]>,
-    attempt_intent: Option<AttemptIntent>,
-    workspace_bucket: Option<String>,
-    workspace_mode: LegacyWorkspaceMode,
-    captured_inputs: Vec<CapturedInput>,
-    report_digest: Option<[u8; 32]>,
-    retention_ms: u64,
-    locally_exhausted: bool,
-}
-
-/// Variant order of the dropped enum; a current record reads as its first two.
-#[derive(Deserialize)]
-enum LegacyWorkspaceMode {
-    Temporary,
-    Kept,
-    Existing,
-    None,
-}
-
-impl LegacyJobRecord {
-    /// Rebuilds the current record. A run that would have captured into a
-    /// per-run bucket which no longer exists is settled rather than left to
-    /// succeed without its workspace outputs.
-    fn into_record(self) -> (JobRecord, bool) {
-        let kept_bucket = matches!(
-            self.workspace_mode,
-            LegacyWorkspaceMode::Kept | LegacyWorkspaceMode::Existing
-        )
-        .then_some(self.workspace_bucket.clone())
-        .flatten();
-        // A dropped bucket is only ever a `Temporary` one, and a current
-        // record reads as `Temporary` exactly when it has no bucket at all.
-        let stranded = match self.workspace_mode {
-            LegacyWorkspaceMode::Temporary => self.workspace_bucket.is_some(),
-            LegacyWorkspaceMode::Kept => self.workspace_bucket.is_none(),
-            _ => false,
-        };
-        let settle = stranded && !self.state.is_terminal();
-        let workspace_mode = match kept_bucket {
-            Some(_) => WorkspaceMode::Existing,
-            None => WorkspaceMode::None,
-        };
-        let mut record = JobRecord {
-            job_id: self.job_id,
-            payload: self.payload,
-            state: self.state,
-            created_by: self.created_by,
-            owner_node_id: self.owner_node_id,
-            created_at_ms: self.created_at_ms,
-            started_at_ms: self.started_at_ms,
-            updated_at_ms: self.updated_at_ms,
-            due_at_ms: self.due_at_ms,
-            finished_at_ms: self.finished_at_ms,
-            attempts: self.attempts,
-            next_attempt_epoch: self.next_attempt_epoch,
-            has_run: self.has_run,
-            last_error: self.last_error,
-            progress: self.progress,
-            cancel_requested: self.cancel_requested,
-            claim: self.claim,
-            dedup_key: self.dedup_key,
-            result: self.result,
-            execution_class: self.execution_class,
-            plan_digest: self.plan_digest,
-            attempt_intent: self.attempt_intent,
-            workspace_bucket: kept_bucket,
-            workspace_mode,
-            captured_inputs: self.captured_inputs,
-            report_digest: self.report_digest,
-            retention_ms: self.retention_ms,
-            locally_exhausted: self.locally_exhausted,
-        };
-        if settle {
-            record.state = JobState::Failed;
-            record.last_error = Some(JobError::permanent(WORKSPACE_DROPPED));
-            record.finished_at_ms = Some(record.updated_at_ms);
-            record.claim = None;
+fn rewrites<Current, Legacy>(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+    name: &str,
+) -> Result<Rewrites, ExplorerError>
+where
+    Current: Serialize + for<'a> Deserialize<'a> + From<Legacy>,
+    Legacy: for<'a> Deserialize<'a>,
+{
+    let mut scanned = 0;
+    let mut rows = Vec::new();
+    for entry in db.read_tx().iter(keyspace) {
+        let (key, value) = entry.into_inner()?;
+        scanned += 1;
+        match rewritten::<Current, Legacy>(value.as_ref()) {
+            Ok(Some(bytes)) => rows.push((key.to_vec(), bytes)),
+            Ok(None) => {}
+            Err(error) => return Err(decode_error(name, &key, error)),
         }
-        (record, settle)
+    }
+    Ok(Rewrites { scanned, rows })
+}
+
+fn keys(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+) -> Result<Vec<Vec<u8>>, ExplorerError> {
+    let mut keys = Vec::new();
+    for entry in db.read_tx().iter(keyspace) {
+        keys.push(entry.into_inner()?.0.to_vec());
+    }
+    Ok(keys)
+}
+
+/// Rewrites one row into the current shape. `None` means the row already round
+/// trips through the current type, so the migration leaves it alone.
+fn rewritten<Current, Legacy>(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::Error>
+where
+    Current: Serialize + for<'a> Deserialize<'a> + From<Legacy>,
+    Legacy: for<'a> Deserialize<'a>,
+{
+    if let Ok(current) = postcard::from_bytes::<Current>(value)
+        && postcard::to_allocvec(&current)? == value
+    {
+        return Ok(None);
+    }
+    let legacy: Legacy = postcard::from_bytes(value)?;
+    Ok(Some(postcard::to_allocvec(&Current::from(legacy))?))
+}
+
+fn decode_error(name: &str, key: &[u8], error: impl std::fmt::Display) -> ExplorerError {
+    ExplorerError::Decode(format!("{name}/{}: {error}", hex::encode(key)))
+}
+
+/// Previous shape of `PhysicalExecutionResult`, before the bounded stdout and
+/// stderr tails were added.
+#[derive(Serialize, Deserialize)]
+struct LegacyResult {
+    exit_code: Option<i32>,
+    output_digest: Option<[u8; 32]>,
+    message: Option<ResultMessage>,
+}
+
+/// Previous shape of `ExecutionUpdate`: identical except for its result.
+#[derive(Serialize, Deserialize)]
+struct LegacyUpdate {
+    execution_id: Ulid,
+    submission_id: SubmissionId,
+    request_digest: [u8; 32],
+    executor_node_id: NodeId,
+    sequence: u64,
+    previous_digest: [u8; 32],
+    state: PhysicalExecutionState,
+    observed_at_ms: u64,
+    result: Option<LegacyResult>,
+}
+
+/// Previous shape of `JobFamilyRecord`: only the update variant differs.
+#[derive(Serialize, Deserialize)]
+enum LegacyFamilyRecord {
+    Spec(Box<LogicalJobSpec>),
+    Claim(SubmissionClaim),
+    Budget(WitnessBudgetRecord),
+    Launch(Box<LaunchIntent>),
+    Receipt(Box<ExecutionReceipt>),
+    Update(Box<LegacyUpdate>),
+    Output(Box<ExecutionOutputRecord>),
+    Cancel(JobCancelRecord),
+}
+
+/// Previous shape of `JobRecordEnvelope`.
+#[derive(Serialize, Deserialize)]
+struct LegacyEnvelope {
+    realm_id: RealmId,
+    record: LegacyFamilyRecord,
+    published_by: NodeId,
+    signature: iroh::Signature,
+}
+
+/// Previous shape of `PendingRecord`.
+#[derive(Serialize, Deserialize)]
+struct LegacyPending {
+    envelope: LegacyEnvelope,
+    need: PendingNeed,
+    first_seen_ms: u64,
+    attempts: u32,
+}
+
+/// Previous shape of `ConflictRecord`.
+#[derive(Serialize, Deserialize)]
+struct LegacyConflict {
+    envelope: LegacyEnvelope,
+    retained: [u8; 32],
+    observed_at_ms: u64,
+    relayed_by: Option<NodeId>,
+}
+
+impl From<LegacyResult> for PhysicalExecutionResult {
+    fn from(legacy: LegacyResult) -> Self {
+        Self {
+            exit_code: legacy.exit_code,
+            output_digest: legacy.output_digest,
+            message: legacy.message,
+            stdout: None,
+            stderr: None,
+        }
     }
 }
 
-/// Only an `Existing` run keeps a bucket; a dropped `ws-` bucket is gone. The
-/// flag reports whether the run was settled as failed.
-fn rewritten_job(value: &[u8]) -> Result<Option<(Vec<u8>, bool)>, postcard::Error> {
-    let legacy: LegacyJobRecord = postcard::from_bytes(value)?;
-    let (record, settled) = legacy.into_record();
-    let bytes = postcard::to_allocvec(&record)?;
-    if bytes == value {
-        return Ok(None);
+impl From<LegacyUpdate> for ExecutionUpdate {
+    fn from(legacy: LegacyUpdate) -> Self {
+        Self {
+            execution_id: legacy.execution_id,
+            submission_id: legacy.submission_id,
+            request_digest: legacy.request_digest,
+            executor_node_id: legacy.executor_node_id,
+            sequence: legacy.sequence,
+            previous_digest: legacy.previous_digest,
+            state: legacy.state,
+            observed_at_ms: legacy.observed_at_ms,
+            result: legacy.result.map(Into::into),
+        }
     }
-    Ok(Some((bytes, settled)))
+}
+
+impl From<LegacyFamilyRecord> for JobFamilyRecord {
+    fn from(legacy: LegacyFamilyRecord) -> Self {
+        match legacy {
+            LegacyFamilyRecord::Spec(spec) => Self::Spec(spec),
+            LegacyFamilyRecord::Claim(claim) => Self::Claim(claim),
+            LegacyFamilyRecord::Budget(budget) => Self::Budget(budget),
+            LegacyFamilyRecord::Launch(launch) => Self::Launch(launch),
+            LegacyFamilyRecord::Receipt(receipt) => Self::Receipt(receipt),
+            LegacyFamilyRecord::Update(update) => Self::Update(Box::new((*update).into())),
+            LegacyFamilyRecord::Output(output) => Self::Output(output),
+            LegacyFamilyRecord::Cancel(cancel) => Self::Cancel(cancel),
+        }
+    }
+}
+
+impl From<LegacyEnvelope> for JobRecordEnvelope {
+    fn from(legacy: LegacyEnvelope) -> Self {
+        Self {
+            realm_id: legacy.realm_id,
+            record: legacy.record.into(),
+            published_by: legacy.published_by,
+            signature: legacy.signature,
+        }
+    }
+}
+
+impl From<LegacyPending> for PendingRecord {
+    fn from(legacy: LegacyPending) -> Self {
+        Self {
+            envelope: legacy.envelope.into(),
+            need: legacy.need,
+            first_seen_ms: legacy.first_seen_ms,
+            attempts: legacy.attempts,
+        }
+    }
+}
+
+impl From<LegacyConflict> for ConflictRecord {
+    fn from(legacy: LegacyConflict) -> Self {
+        Self {
+            envelope: legacy.envelope.into(),
+            retained: legacy.retained,
+            observed_at_ms: legacy.observed_at_ms,
+            relayed_by: legacy.relayed_by,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::migrate_output;
-    use aruna_core::keyspaces::{JOB_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
-    use aruna_core::structs::{
-        BackendRef, JobId, JobPayload, JobRecord, JobState, MultipartUpload, MultipartUploadStatus,
-        RealmId, WorkspaceMode,
+    use super::{
+        LegacyConflict, LegacyEnvelope, LegacyFamilyRecord, LegacyPending, LegacyResult,
+        LegacyUpdate, migrate_output,
     };
-    use aruna_core::types::UserId;
+    use aruna_core::keyspaces::{
+        JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
+        JOB_FAMILY_RECORD_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, RealmId,
+        ResultMessage, SubmissionId,
+    };
+    use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::path::Path;
-    use std::time::UNIX_EPOCH;
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    fn owner() -> UserId {
-        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]))
+    const REALM: RealmId = RealmId([3u8; 32]);
+
+    fn secret() -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&[7u8; 32])
     }
 
-    fn upload() -> MultipartUpload {
-        MultipartUpload {
-            upload_id: Ulid::from_bytes([4u8; 16]),
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            bucket: "data".to_string(),
-            key: "reads/pending.fastq".to_string(),
-            group_id: Ulid::from_bytes([5u8; 16]),
-            created_by: owner(),
-            created_at: UNIX_EPOCH,
-            status: MultipartUploadStatus::Open,
-            checksum_hint: None,
-            metadata: HashMap::new(),
-            placement_policies: Vec::new(),
-            subject_generation: 0,
-            completing_since_ms: None,
+    /// A terminal update in the shape stored before the tails existed.
+    fn legacy_update() -> LegacyUpdate {
+        LegacyUpdate {
+            execution_id: Ulid::from_bytes([1u8; 16]),
+            submission_id: SubmissionId([2u8; 32]),
+            request_digest: [3u8; 32],
+            executor_node_id: secret().public(),
+            sequence: 1,
+            previous_digest: [4u8; 32],
+            state: PhysicalExecutionState::Succeeded,
+            observed_at_ms: 1_000,
+            result: Some(LegacyResult {
+                exit_code: Some(0),
+                output_digest: Some([5u8; 32]),
+                message: ResultMessage::tail("boom"),
+            }),
         }
     }
 
-    fn job(mode: WorkspaceMode, bucket: Option<&str>, state: JobState) -> JobRecord {
-        let payload = JobPayload::Probe {
-            steps: 1,
-            step_sleep_ms: 0,
-            fail_at: None,
-            panic_at: None,
-            cleanup_marker: None,
-        };
-        let node = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
-        let mut record = JobRecord::new(
-            JobId::from_bytes([3u8; 16]),
-            payload,
-            owner(),
-            node,
-            0,
-            0,
-            None,
-        );
-        record.workspace_mode = mode;
-        record.workspace_bucket = bucket.map(str::to_string);
-        record.state = state;
-        record
+    fn legacy_envelope() -> LegacyEnvelope {
+        LegacyEnvelope {
+            realm_id: REALM,
+            record: LegacyFamilyRecord::Update(Box::new(legacy_update())),
+            published_by: secret().public(),
+            signature: secret().sign(b"legacy"),
+        }
     }
 
-    /// An old record differs from a current one only in the mode's discriminant.
-    fn legacy_job(discriminant: u8, bucket: Option<&str>, state: JobState) -> Vec<u8> {
-        let mut bytes = job(WorkspaceMode::None, bucket, state).to_bytes().unwrap();
-        let existing = job(WorkspaceMode::Existing, bucket, state)
-            .to_bytes()
-            .unwrap();
-        let index = bytes
-            .iter()
-            .zip(&existing)
-            .position(|(a, b)| a != b)
-            .unwrap();
-        bytes[index] = discriminant;
-        bytes
+    /// The same update in the current shape, so a current row is recognisable.
+    fn current_envelope() -> JobRecordEnvelope {
+        let update: ExecutionUpdate = legacy_update().into();
+        JobRecordEnvelope::sign(REALM, JobFamilyRecord::Update(Box::new(update)), &secret())
+            .expect("record signs")
     }
 
     fn write(path: &Path, keyspace: &str, entries: Vec<(&[u8], Vec<u8>)>) {
@@ -332,95 +389,112 @@ mod tests {
     }
 
     #[test]
-    fn patches_legacy_uploads() {
+    fn rewrites_legacy_updates() {
+        // A hand-encoded legacy row must decode as the current shape with empty
+        // tails, and a row already current must stay byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
-        let current = upload().to_bytes().unwrap();
-        let mut legacy = current.clone();
-        legacy.pop();
+        let legacy = postcard::to_allocvec(&legacy_envelope()).unwrap();
+        let current = postcard::to_allocvec(&current_envelope()).unwrap();
         write(
             &path,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            JOB_FAMILY_RECORD_KEYSPACE,
             vec![(b"old", legacy), (b"new", current.clone())],
         );
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
-        assert_eq!((output.uploads_scanned, output.uploads_patched), (2, 1));
-        for value in read(&path, S3_MULTIPART_UPLOAD_KEYSPACE).into_values() {
-            assert_eq!(value, current);
-        }
+        assert_eq!((output.records_scanned, output.records_rewritten), (2, 1));
+        let rows = read(&path, JOB_FAMILY_RECORD_KEYSPACE);
+        assert_eq!(rows[b"new".as_slice()], current);
+        let migrated: JobRecordEnvelope =
+            postcard::from_bytes(&rows[b"old".as_slice()]).expect("row decodes");
+        let JobFamilyRecord::Update(update) = &migrated.record else {
+            panic!("the row is an update");
+        };
+        let result = update.result.as_ref().expect("terminal result");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.message.as_ref().map(ResultMessage::as_str),
+            Some("boom")
+        );
+        assert!(result.stdout.is_none() && result.stderr.is_none());
+
         let again = migrate_output(path.to_str().unwrap()).unwrap();
-        assert_eq!(again.uploads_patched, 0);
+        assert_eq!(again.records_rewritten, 0);
     }
 
     #[test]
-    fn rewrites_legacy_jobs() {
-        // The dropped enum read Temporary 0, Kept 1, Existing 2, None 3.
+    fn rewrites_held_envelopes() {
+        // Pending and conflict rows wrap the same envelope, so both shapes are
+        // re-encoded too.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let pending = postcard::to_allocvec(&LegacyPending {
+            envelope: legacy_envelope(),
+            need: PendingNeed::LocalView,
+            first_seen_ms: 9,
+            attempts: 2,
+        })
+        .unwrap();
+        let conflict = postcard::to_allocvec(&LegacyConflict {
+            envelope: legacy_envelope(),
+            retained: [6u8; 32],
+            observed_at_ms: 11,
+            relayed_by: None,
+        })
+        .unwrap();
+        write(&path, JOB_FAMILY_PENDING_KEYSPACE, vec![(b"p", pending)]);
+        write(&path, JOB_FAMILY_CONFLICT_KEYSPACE, vec![(b"c", conflict)]);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!((output.pending_scanned, output.pending_rewritten), (1, 1));
+        assert_eq!(
+            (output.conflicts_scanned, output.conflicts_rewritten),
+            (1, 1)
+        );
+        let rows = read(&path, JOB_FAMILY_PENDING_KEYSPACE);
+        let migrated: PendingRecord =
+            postcard::from_bytes(&rows[b"p".as_slice()]).expect("row decodes");
+        assert_eq!(migrated.attempts, 2);
+
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!((again.pending_rewritten, again.conflicts_rewritten), (0, 0));
+    }
+
+    #[test]
+    fn clears_projection_cache() {
+        // The projection row is derived, so the migration drops it and the node
+        // rebuilds it from the immutable records.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let cache = postcard::to_allocvec(&ProjectionCache::invalidated(None)).unwrap();
+        write(&path, JOB_FAMILY_PROJECTION_KEYSPACE, vec![(b"f", cache)]);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(output.projections_cleared, 1);
+        assert!(read(&path, JOB_FAMILY_PROJECTION_KEYSPACE).is_empty());
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(again.projections_cleared, 0);
+    }
+
+    #[test]
+    fn fails_unknown_row() {
+        // A row that decodes with neither shape names its keyspace and key
+        // rather than being skipped.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         write(
             &path,
-            JOB_KEYSPACE,
-            vec![
-                (
-                    b"temporary",
-                    legacy_job(0, Some("ws-run"), JobState::Queued),
-                ),
-                (
-                    b"finished",
-                    legacy_job(0, Some("ws-run"), JobState::Succeeded),
-                ),
-                (b"kept", legacy_job(1, Some("ws-kept"), JobState::Queued)),
-                (b"stranded", legacy_job(1, None, JobState::Running)),
-                (b"existing", legacy_job(2, Some("shared"), JobState::Queued)),
-                (b"none", legacy_job(3, None, JobState::Queued)),
-            ],
+            JOB_FAMILY_RECORD_KEYSPACE,
+            vec![(b"bad", vec![0xff, 0xff, 0xff])],
         );
 
-        let output = migrate_output(path.to_str().unwrap()).unwrap();
+        let error = migrate_output(path.to_str().unwrap()).unwrap_err();
 
-        assert_eq!(
-            (
-                output.jobs_scanned,
-                output.jobs_rewritten,
-                output.jobs_failed
-            ),
-            (6, 5, 2)
-        );
-        let records: BTreeMap<Vec<u8>, JobRecord> = read(&path, JOB_KEYSPACE)
-            .into_iter()
-            .map(|(key, value)| (key, JobRecord::from_bytes(&value).unwrap()))
-            .collect();
-        let settled = |key: &[u8]| {
-            let record = &records[key];
-            (record.workspace_mode, record.workspace_bucket.clone())
-        };
-        assert_eq!(settled(b"temporary"), (WorkspaceMode::None, None));
-        assert_eq!(settled(b"finished"), (WorkspaceMode::None, None));
-        assert_eq!(
-            settled(b"kept"),
-            (WorkspaceMode::Existing, Some("ws-kept".to_string()))
-        );
-        assert_eq!(settled(b"stranded"), (WorkspaceMode::None, None));
-        // An unfinished run whose per-run bucket is gone must not run on and
-        // report success without its workspace outputs.
-        for key in [b"temporary".as_slice(), b"stranded".as_slice()] {
-            assert_eq!(records[key].state, JobState::Failed);
-            assert!(records[key].last_error.is_some());
-            assert_eq!(
-                records[key].finished_at_ms,
-                Some(records[key].updated_at_ms)
-            );
-            assert!(records[key].claim.is_none());
-        }
-        assert_eq!(records[b"finished".as_slice()].state, JobState::Succeeded);
-        assert_eq!(
-            settled(b"existing"),
-            (WorkspaceMode::Existing, Some("shared".to_string()))
-        );
-        assert_eq!(settled(b"none"), (WorkspaceMode::None, None));
-        let again = migrate_output(path.to_str().unwrap()).unwrap();
-        assert_eq!(again.jobs_rewritten, 0);
+        assert!(error.to_string().contains(JOB_FAMILY_RECORD_KEYSPACE));
+        assert!(error.to_string().contains(&hex::encode(b"bad")));
     }
 }

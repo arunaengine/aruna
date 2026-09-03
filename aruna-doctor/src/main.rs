@@ -99,8 +99,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: ReclaimCommands,
     },
-    /// Rewrite job and multipart records stored before per-run workspace
-    /// buckets were dropped. Run with the node stopped; safe to repeat.
+    /// Rewrite job family records stored before execution results carried
+    /// stdout and stderr tails. Run with the node stopped; safe to repeat.
     Migrate {
         database_path: String,
     },
