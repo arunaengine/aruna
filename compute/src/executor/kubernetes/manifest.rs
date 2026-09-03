@@ -110,23 +110,23 @@ pub fn job_manifest(
                 }));
             }
         }
-        // Mounted jobs have no workspace PVC, so give the task a writable
-        // working directory that read-only inputs nest beneath.
-        if let Some(workdir) = spec.workdir.as_deref() {
-            let scratch = normalize_container_path(workdir).map_err(BackendError::InvalidSpec)?;
-            let taken = layout.mounts.iter().any(|input| input.path == scratch)
-                || layout.output_parents.contains(&scratch);
-            if !taken {
-                let empty_dir = match spec.resources.disk_bytes {
-                    Some(bytes) => json!({"sizeLimit":bytes.to_string()}),
-                    None => json!({}),
-                };
-                volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
-                mounts.push(json!({"name":"scratch","mountPath":scratch}));
-            }
-        }
     } else if spec.staging_mode == StagingMode::DirectS3 {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
+    }
+    // Tools write caches relative to the working directory, so the non-root
+    // task gets a writable one that read-only inputs nest beneath.
+    if let Some(workdir) = spec.workdir.as_deref() {
+        let scratch = normalize_container_path(workdir).map_err(BackendError::InvalidSpec)?;
+        let taken = layout.mounts.iter().any(|input| input.path == scratch)
+            || layout.output_parents.contains(&scratch);
+        if !taken {
+            let empty_dir = match spec.resources.disk_bytes {
+                Some(bytes) => json!({"sizeLimit":bytes.to_string()}),
+                None => json!({}),
+            };
+            volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
+            mounts.push(json!({"name":"scratch","mountPath":scratch}));
+        }
     }
     // The credential Secret rides `envFrom`, which any inline entry of the same
     // name would shadow, so the stored secret always wins here too.
@@ -848,6 +848,27 @@ mod tests {
             .find(|volume| volume.name == "scratch")
             .unwrap();
         assert!(volume.empty_dir.is_some());
+    }
+
+    #[test]
+    fn files_workdir_writable() {
+        // Staged jobs mount inputs read-only, so the workdir needs its own scratch.
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::Files;
+        spec.workdir = Some("/work".to_string());
+        spec.inputs.push(TaskInput::from_bytes("/work/quickruns/hello.py", "print(1)"));
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let mounts = pod.containers[0].volume_mounts.clone().unwrap();
+        let scratch = mounts.iter().find(|mount| mount.mount_path == "/work").unwrap();
+        assert_eq!(scratch.name, "scratch");
+        assert_ne!(scratch.read_only, Some(true));
+        let script = mounts
+            .iter()
+            .find(|mount| mount.mount_path == "/work/quickruns/hello.py")
+            .unwrap();
+        assert_eq!(script.read_only, Some(true));
     }
 
     #[test]
