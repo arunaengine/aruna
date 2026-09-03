@@ -43,6 +43,33 @@ fn reduces_any_order() {
 }
 
 #[test]
+fn carries_log_tails() {
+    // The reduced result must carry the bounded stdout and stderr tails, so a
+    // node that never ran the container still answers a status read with them.
+    let family = Family::new([7u8; 32]);
+    let records = family.run(1, 0, PhysicalExecutionState::Succeeded);
+    let projection = project(&family, &records);
+
+    let canonical = projection
+        .canonical_execution_id
+        .expect("a success is canonical");
+    let result = projection
+        .executions
+        .iter()
+        .find(|execution| execution.execution_id == canonical)
+        .and_then(|execution| execution.result.as_ref())
+        .expect("the canonical execution has a result");
+    assert_eq!(
+        result.stdout.as_ref().map(|tail| tail.as_str()),
+        Some("out tail")
+    );
+    assert_eq!(
+        result.stderr.as_ref().map(|tail| tail.as_str()),
+        Some("err tail")
+    );
+}
+
+#[test]
 fn picks_canonical_success() {
     // Two successful executions of one family: the smallest canonical key wins
     // and the other stays visible as a duplicate success.

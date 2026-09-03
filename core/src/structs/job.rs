@@ -20,6 +20,7 @@ use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
 use crate::types::{GroupId, Key, UserId};
+use crate::util::tail_str;
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
 pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
@@ -2086,6 +2087,15 @@ impl ResultMessage {
         }
     }
 
+    /// The last bytes that fit the cap, cut on a char boundary. `None` for an
+    /// empty stream, so nothing captured stays distinguishable from a blank one.
+    pub fn tail(text: &str) -> Option<Self> {
+        if text.is_empty() {
+            return None;
+        }
+        Some(Self(tail_str(text, MAX_RESULT_MESSAGE_BYTES).to_string()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -2167,6 +2177,10 @@ pub struct PhysicalExecutionResult {
     pub exit_code: Option<i32>,
     pub output_digest: Option<[u8; 32]>,
     pub message: Option<ResultMessage>,
+    /// Bounded tail of the run's stdout: its last bytes, never the whole stream.
+    pub stdout: Option<ResultMessage>,
+    /// Bounded tail of the run's stderr: its last bytes, never the whole stream.
+    pub stderr: Option<ResultMessage>,
 }
 
 /// Monotonic state publication by the fenced executor. `previous_digest` roots
@@ -3856,6 +3870,8 @@ mod tests {
                 exit_code: Some(0),
                 output_digest: Some(output_record().digest().expect("output digests")),
                 message: None,
+                stdout: None,
+                stderr: None,
             }),
             ..sample_update()
         }
@@ -3892,6 +3908,8 @@ mod tests {
                     exit_code: Some(0),
                     output_digest: Some([16u8; 32]),
                     message: None,
+                    stdout: None,
+                    stderr: None,
                 }),
             }],
             outputs: OutputSet::canonical(vec![sample_output()]).expect("canonical outputs"),
@@ -4999,6 +5017,26 @@ mod tests {
         );
         let over = postcard::to_allocvec(&"m".repeat(MAX_RESULT_MESSAGE_BYTES + 1)).unwrap();
         assert!(postcard::from_bytes::<ResultMessage>(&over).is_err());
+    }
+
+    #[test]
+    fn keeps_message_tail() {
+        // An overlong stream keeps its end, and a cut inside a character moves
+        // forward to the next boundary rather than producing invalid UTF-8.
+        assert_eq!(ResultMessage::tail(""), None);
+        assert_eq!(
+            ResultMessage::tail("short").map(|tail| tail.as_str().to_string()),
+            Some("short".to_string())
+        );
+        let text = format!("{}end", "m".repeat(MAX_RESULT_MESSAGE_BYTES));
+        let tail = ResultMessage::tail(&text).expect("non-empty tail");
+        assert_eq!(tail.as_str().len(), MAX_RESULT_MESSAGE_BYTES);
+        assert!(tail.as_str().ends_with("end"));
+        // 6000 bytes of three-byte characters: the cut at 1904 is inside one.
+        let wide = "€".repeat(2000);
+        let tail = ResultMessage::tail(&wide).expect("non-empty tail");
+        assert_eq!(tail.as_str().len(), MAX_RESULT_MESSAGE_BYTES - 1);
+        assert!(wide.ends_with(tail.as_str()));
     }
 
     #[test]

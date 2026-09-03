@@ -10,7 +10,7 @@ use aruna_core::keyspaces::JOB_FAMILY_ALIAS_KEYSPACE;
 use aruna_core::structs::{
     AuthContext, ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobProgress,
     JobProjection, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState,
-    PhysicalExecutionState, WorkspaceMode,
+    PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
 use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
@@ -259,12 +259,19 @@ fn result_view(projection: &JobProjection, bucket: Option<String>) -> Option<ser
             } else {
                 Vec::new()
             },
-            stdout: String::new(),
-            stderr: String::new(),
+            stdout: tail_text(result.and_then(|result| result.stdout.as_ref())),
+            stderr: tail_text(result.and_then(|result| result.stderr.as_ref())),
             output_digest: result.and_then(|result| result.output_digest),
         }
         .to_public_json(),
     )
+}
+
+/// A missing tail reads as an empty stream, which is what a run with no output
+/// produced anyway.
+fn tail_text(tail: Option<&ResultMessage>) -> String {
+    tail.map(|tail| tail.as_str().to_string())
+        .unwrap_or_default()
 }
 
 /// Only a signed permanent execution failure becomes a logical failure.

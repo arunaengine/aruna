@@ -8,7 +8,7 @@ use aruna_core::structs::{
     JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope, JobRetryPolicy,
     LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
     PhysicalExecutionState, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
-    SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+    ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::types::UserId;
 use ulid::Ulid;
@@ -224,6 +224,8 @@ impl Family {
                 exit_code: Some(0),
                 output_digest: Some(digest),
                 message: None,
+                stdout: ResultMessage::tail("out tail"),
+                stderr: ResultMessage::tail("err tail"),
             }),
         }
     }

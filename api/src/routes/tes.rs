@@ -11,7 +11,8 @@ use aruna_core::compute::{
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
-    OutputDestination, OutputSelection, WorkspaceMode, blob_group_permission_path,
+    OutputDestination, OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
+    blob_group_permission_path,
 };
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
@@ -1624,8 +1625,8 @@ fn family_record(report: &FamilyReport) -> JobRecord {
             } else {
                 Vec::new()
             },
-            stdout: String::new(),
-            stderr: String::new(),
+            stdout: result_tail(report, |result| result.stdout.as_ref()),
+            stderr: result_tail(report, |result| result.stderr.as_ref()),
             output_digest: report
                 .canonical_result
                 .as_ref()
@@ -1633,6 +1634,20 @@ fn family_record(report: &FamilyReport) -> JobRecord {
         }
     });
     record
+}
+
+/// One bounded log tail of the canonical result. A missing tail reads as an
+/// empty stream, which is what a run with no output produced anyway.
+fn result_tail(
+    report: &FamilyReport,
+    pick: impl Fn(&PhysicalExecutionResult) -> Option<&ResultMessage>,
+) -> String {
+    report
+        .canonical_result
+        .as_ref()
+        .and_then(pick)
+        .map(|tail| tail.as_str().to_string())
+        .unwrap_or_default()
 }
 
 /// Details a TES tag exposes at read time. They come from the same family and
@@ -3166,10 +3181,12 @@ mod tests {
             conflicts: 0,
             state: LogicalJobState::Succeeded,
             canonical_execution_id: Some(execution_id),
-            canonical_result: Some(aruna_core::structs::PhysicalExecutionResult {
+            canonical_result: Some(PhysicalExecutionResult {
                 exit_code: Some(0),
                 output_digest: Some([12u8; 32]),
                 message: None,
+                stdout: ResultMessage::tail("out tail"),
+                stderr: ResultMessage::tail("err tail"),
             }),
             executions: 2,
             duplicate_successes: 1,
@@ -3216,6 +3233,9 @@ mod tests {
             task.logs[0].outputs[0].url,
             format!("s3://dest/out/r.txt?versionId={version_id}")
         );
+        // The tails ride the replicated result, so any node answers with them.
+        assert_eq!(task.logs[0].logs[0].stdout.as_deref(), Some("out tail"));
+        assert_eq!(task.logs[0].logs[0].stderr.as_deref(), Some("err tail"));
 
         let mut running = report.clone();
         running.job.state = JobState::Running;
