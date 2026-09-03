@@ -1769,7 +1769,9 @@ async fn sweep_reclaims_upload() {
 
     let mut stale = read_upload(&context, upload.upload_id).await.unwrap();
     stale.status = MultipartUploadStatus::Completing;
-    stale.completing_since_ms = Some(now - 2 * 60 * 60 * 1000);
+    // Past the completion deadline plus the sweep margin, so no live request
+    // can still own the record.
+    stale.completing_since_ms = Some(now - 3 * 60 * 60 * 1000);
     write_upload(&context, &stale).await;
 
     let outcome = sweep_stale_uploads(&context.driver, now).await.unwrap();

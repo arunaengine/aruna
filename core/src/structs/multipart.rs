@@ -41,6 +41,11 @@ pub enum MultipartUploadStatus {
 /// the lease lapses instead of failing forever with `NoSuchUpload`.
 pub const COMPLETION_LEASE_MS: u64 = 15 * 60 * 1000;
 
+/// Ceiling on one CompleteMultipartUpload. Composing a huge object is
+/// legitimately slow, so the bound only has to stop an operation that never
+/// finishes; nothing may reclaim the upload while a request still owns it.
+pub const COMPLETION_DEADLINE_MS: u64 = 2 * 60 * 60 * 1000;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub upload_id: Ulid,

@@ -25,10 +25,11 @@ use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, OBJECT_CONTENT_TYPE_KEY, PathRestriction,
-    Permission, RealmId, RoCrateLimits, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
-    UserAccess, WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
-    blob_object_permission_path, data_watch_resource_path,
+    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, COMPLETION_DEADLINE_MS,
+    OBJECT_CONTENT_TYPE_KEY, PathRestriction, Permission, RealmId, RoCrateLimits, SyncMode,
+    SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, WatchEvent, WatchEventDetail,
+    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
+    data_watch_resource_path,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -247,10 +248,10 @@ fn restrictions_reach(restrictions: Option<&[PathRestriction]>, bucket_path: &st
     })
 }
 
-/// Ceiling on one CompleteMultipartUpload. Composing a huge object is
-/// legitimately slow, so the bound only has to stop an operation that never
-/// finishes; on expiry the record reopens and the composed blob is rolled back.
-const COMPLETION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
+/// On expiry the record reopens and the composed blob is rolled back. The
+/// cleanup sweep waits out the same deadline, so it never aborts a live
+/// completion.
+const COMPLETION_DEADLINE: Duration = Duration::from_millis(COMPLETION_DEADLINE_MS);
 
 #[derive(Clone)]
 pub struct ArunaS3Service {

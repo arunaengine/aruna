@@ -10,9 +10,9 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend,
-    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
-    RoCrateLimits, WriteOwner,
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, COMPLETION_DEADLINE_MS,
+    GroupStorageBackend, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    MultipartUploadStatus, RealmId, RoCrateLimits, WriteOwner,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
@@ -31,8 +31,10 @@ const MAX_CLEANUP_RETRIES: u8 = 3;
 /// An `Open` upload nobody added to or aborted is abandoned; S3 lifecycle rules
 /// use the same order of magnitude.
 const UPLOAD_OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-/// A `Completing` upload long past its lease lost the request that owned it.
-const UPLOAD_COMPLETING_TTL_MS: u64 = 60 * 60 * 1000;
+/// A `Completing` upload past the completion deadline lost the request that
+/// owned it; the margin keeps the sweep off a completion still running.
+const UPLOAD_COMPLETING_TTL_MS: u64 =
+    COMPLETION_DEADLINE_MS + BLOB_CLEANUP_AFTER.as_millis() as u64;
 /// Aborts are transactional, so one run reclaims a bounded slice of the backlog.
 const UPLOAD_SWEEP_BATCH: usize = 32;
 
