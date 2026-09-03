@@ -1254,7 +1254,9 @@ mod tests {
         METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataBearerToken,
         MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-        MetadataGraphLifecycleRecord, MetadataQueryResults, apply_raw_upsert,
+        MetadataGraphLifecycleRecord, MetadataProfileValidationCompleteness,
+        MetadataProfileValidationSeverity, MetadataProfileValidationState,
+        MetadataProfileValidationStatus, MetadataQueryResults, apply_raw_upsert,
         compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
@@ -1684,5 +1686,72 @@ mod tests {
         let rendered = format!("{token:?}");
         assert!(!rendered.contains("super-secret-value"));
         assert!(format!("{:?}", Some(token)).contains("redacted"));
+    }
+
+    #[test]
+    fn legacy_revision_decodes() {
+        // A Ulid postcard-encodes as its 26 character text, so rows written
+        // while the revision was a Ulid decode into the current String field.
+        #[derive(serde::Serialize)]
+        struct LegacyFinding {
+            code: String,
+            severity: MetadataProfileValidationSeverity,
+            focus_node: Option<String>,
+            path: Option<String>,
+            rule: String,
+            message: String,
+            profile_revision: Option<Ulid>,
+            completeness: MetadataProfileValidationCompleteness,
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacyStatus {
+            document_id: Ulid,
+            dataset_revision: Ulid,
+            state: MetadataProfileValidationState,
+            profile_id: Option<Ulid>,
+            profile_iri: Option<String>,
+            profile_revision: Option<Ulid>,
+            evaluator: String,
+            validated_at_ms: Option<u64>,
+            findings: Vec<LegacyFinding>,
+            completeness: MetadataProfileValidationCompleteness,
+            stale_reason: Option<String>,
+            dataset_digest: Option<[u8; 32]>,
+        }
+
+        let revision = Ulid::generate();
+        let legacy = LegacyStatus {
+            document_id: Ulid::generate(),
+            dataset_revision: Ulid::generate(),
+            state: MetadataProfileValidationState::Invalid,
+            profile_id: Some(Ulid::generate()),
+            profile_iri: Some("https://example.org/profile".to_string()),
+            profile_revision: Some(revision),
+            evaluator: "shacl".to_string(),
+            validated_at_ms: Some(7),
+            findings: vec![LegacyFinding {
+                code: "missing".to_string(),
+                severity: MetadataProfileValidationSeverity::Violation,
+                focus_node: None,
+                path: None,
+                rule: "rule".to_string(),
+                message: "message".to_string(),
+                profile_revision: Some(revision),
+                completeness: MetadataProfileValidationCompleteness::Complete,
+            }],
+            completeness: MetadataProfileValidationCompleteness::Complete,
+            stale_reason: None,
+            dataset_digest: Some([3u8; 32]),
+        };
+
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded: MetadataProfileValidationStatus = postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.profile_revision, Some(revision.to_string()));
+        assert_eq!(
+            decoded.findings[0].profile_revision,
+            Some(revision.to_string())
+        );
     }
 }
