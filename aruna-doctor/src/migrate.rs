@@ -11,7 +11,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{NodeId, UserId};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Serialize)]
@@ -21,6 +21,9 @@ pub struct MigrateOutput {
     pub uploads_patched: usize,
     pub jobs_scanned: usize,
     pub jobs_rewritten: usize,
+    /// Unfinished runs settled because the workspace bucket they would have
+    /// captured into no longer exists.
+    pub jobs_failed: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -53,13 +56,15 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     }
 
     let mut jobs_scanned = 0;
+    let mut jobs_failed = 0;
     let mut rewritten = Vec::new();
     for entry in db.read_tx().iter(&jobs) {
         let (key, value) = entry.into_inner()?;
         jobs_scanned += 1;
-        if let Some(value) =
+        if let Some((value, settled)) =
             rewritten_job(value.as_ref()).map_err(|error| decode_error(&key, error))?
         {
+            jobs_failed += usize::from(settled);
             rewritten.push((key.to_vec(), value));
         }
     }
@@ -81,6 +86,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         uploads_patched: patched.len(),
         jobs_scanned,
         jobs_rewritten: rewritten.len(),
+        jobs_failed,
     })
 }
 
@@ -99,9 +105,13 @@ fn patched_upload(value: &[u8]) -> Result<Option<Vec<u8>>, aruna_core::errors::C
     Ok(Some(patched))
 }
 
-/// The pre-drop layout of `JobRecord`: identical except for the mode, so the
-/// re-encoded bytes form a current record.
-#[derive(Serialize, Deserialize)]
+/// Message a settled run carries, so its submitter knows to resubmit it.
+const WORKSPACE_DROPPED: &str =
+    "per-run workspace buckets were dropped during an upgrade; submit the run again";
+
+/// The pre-drop layout of `JobRecord`: identical except for the mode, which is
+/// decoded as the legacy enum so a dropped per-run bucket stays visible.
+#[derive(Deserialize)]
 struct LegacyJobRecord {
     job_id: JobId,
     payload: JobPayload,
@@ -126,8 +136,7 @@ struct LegacyJobRecord {
     plan_digest: Option<[u8; 32]>,
     attempt_intent: Option<AttemptIntent>,
     workspace_bucket: Option<String>,
-    #[serde(deserialize_with = "legacy_mode")]
-    workspace_mode: WorkspaceMode,
+    workspace_mode: LegacyWorkspaceMode,
     input_facts: Vec<JobInputFact>,
     report_digest: Option<[u8; 32]>,
     retention_ms: u64,
@@ -143,27 +152,79 @@ enum LegacyWorkspaceMode {
     None,
 }
 
-fn legacy_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<WorkspaceMode, D::Error> {
-    Ok(match LegacyWorkspaceMode::deserialize(deserializer)? {
-        LegacyWorkspaceMode::Temporary | LegacyWorkspaceMode::None => WorkspaceMode::None,
-        LegacyWorkspaceMode::Kept | LegacyWorkspaceMode::Existing => WorkspaceMode::Existing,
-    })
+impl LegacyJobRecord {
+    /// Rebuilds the current record. A run that would have captured into a
+    /// per-run bucket which no longer exists is settled rather than left to
+    /// succeed without its workspace outputs.
+    fn into_record(self) -> (JobRecord, bool) {
+        let kept_bucket = matches!(
+            self.workspace_mode,
+            LegacyWorkspaceMode::Kept | LegacyWorkspaceMode::Existing
+        )
+        .then_some(self.workspace_bucket.clone())
+        .flatten();
+        // A dropped bucket is only ever a `Temporary` one, and a current
+        // record reads as `Temporary` exactly when it has no bucket at all.
+        let stranded = match self.workspace_mode {
+            LegacyWorkspaceMode::Temporary => self.workspace_bucket.is_some(),
+            LegacyWorkspaceMode::Kept => self.workspace_bucket.is_none(),
+            _ => false,
+        };
+        let settle = stranded && !self.state.is_terminal();
+        let workspace_mode = match kept_bucket {
+            Some(_) => WorkspaceMode::Existing,
+            None => WorkspaceMode::None,
+        };
+        let mut record = JobRecord {
+            job_id: self.job_id,
+            payload: self.payload,
+            state: self.state,
+            created_by: self.created_by,
+            owner_node_id: self.owner_node_id,
+            created_at_ms: self.created_at_ms,
+            started_at_ms: self.started_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            due_at_ms: self.due_at_ms,
+            finished_at_ms: self.finished_at_ms,
+            attempts: self.attempts,
+            next_attempt_epoch: self.next_attempt_epoch,
+            has_run: self.has_run,
+            last_error: self.last_error,
+            progress: self.progress,
+            cancel_requested: self.cancel_requested,
+            claim: self.claim,
+            dedup_key: self.dedup_key,
+            result: self.result,
+            execution_class: self.execution_class,
+            plan_digest: self.plan_digest,
+            attempt_intent: self.attempt_intent,
+            workspace_bucket: kept_bucket,
+            workspace_mode,
+            input_facts: self.input_facts,
+            report_digest: self.report_digest,
+            retention_ms: self.retention_ms,
+            locally_exhausted: self.locally_exhausted,
+        };
+        if settle {
+            record.state = JobState::Failed;
+            record.last_error = Some(JobError::permanent(WORKSPACE_DROPPED));
+            record.finished_at_ms = Some(record.updated_at_ms);
+            record.claim = None;
+        }
+        (record, settle)
+    }
 }
 
-/// Only an `Existing` run keeps a bucket; a dropped `ws-` bucket is gone.
-fn rewritten_job(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::Error> {
-    let mut record: LegacyJobRecord = postcard::from_bytes(value)?;
-    match (record.workspace_mode, record.workspace_bucket.is_some()) {
-        (WorkspaceMode::Existing, false) => record.workspace_mode = WorkspaceMode::None,
-        (WorkspaceMode::None, true) => record.workspace_bucket = None,
-        _ => {}
-    }
+/// Only an `Existing` run keeps a bucket; a dropped `ws-` bucket is gone. The
+/// flag reports whether the run was settled as failed.
+fn rewritten_job(value: &[u8]) -> Result<Option<(Vec<u8>, bool)>, postcard::Error> {
+    let legacy: LegacyJobRecord = postcard::from_bytes(value)?;
+    let (record, settled) = legacy.into_record();
     let bytes = postcard::to_allocvec(&record)?;
     if bytes == value {
         return Ok(None);
     }
-    postcard::from_bytes::<JobRecord>(&bytes)?;
-    Ok(Some(bytes))
+    Ok(Some((bytes, settled)))
 }
 
 #[cfg(test)]
@@ -171,8 +232,8 @@ mod tests {
     use super::migrate_output;
     use aruna_core::keyspaces::{JOB_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
     use aruna_core::structs::{
-        BackendRef, JobId, JobPayload, JobRecord, MultipartUpload, MultipartUploadStatus, RealmId,
-        WorkspaceMode,
+        BackendRef, JobId, JobPayload, JobRecord, JobState, MultipartUpload, MultipartUploadStatus,
+        RealmId, WorkspaceMode,
     };
     use aruna_core::types::UserId;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -205,7 +266,7 @@ mod tests {
         }
     }
 
-    fn job(mode: WorkspaceMode, bucket: Option<&str>) -> JobRecord {
+    fn job(mode: WorkspaceMode, bucket: Option<&str>, state: JobState) -> JobRecord {
         let payload = JobPayload::Probe {
             steps: 1,
             step_sleep_ms: 0,
@@ -225,13 +286,16 @@ mod tests {
         );
         record.workspace_mode = mode;
         record.workspace_bucket = bucket.map(str::to_string);
+        record.state = state;
         record
     }
 
     /// An old record differs from a current one only in the mode's discriminant.
-    fn legacy_job(discriminant: u8, bucket: Option<&str>) -> Vec<u8> {
-        let mut bytes = job(WorkspaceMode::None, bucket).to_bytes().unwrap();
-        let existing = job(WorkspaceMode::Existing, bucket).to_bytes().unwrap();
+    fn legacy_job(discriminant: u8, bucket: Option<&str>, state: JobState) -> Vec<u8> {
+        let mut bytes = job(WorkspaceMode::None, bucket, state).to_bytes().unwrap();
+        let existing = job(WorkspaceMode::Existing, bucket, state)
+            .to_bytes()
+            .unwrap();
         let index = bytes
             .iter()
             .zip(&existing)
@@ -299,16 +363,31 @@ mod tests {
             &path,
             JOB_KEYSPACE,
             vec![
-                (b"temporary", legacy_job(0, Some("ws-run"))),
-                (b"kept", legacy_job(1, Some("ws-kept"))),
-                (b"existing", legacy_job(2, Some("shared"))),
-                (b"none", legacy_job(3, None)),
+                (
+                    b"temporary",
+                    legacy_job(0, Some("ws-run"), JobState::Queued),
+                ),
+                (
+                    b"finished",
+                    legacy_job(0, Some("ws-run"), JobState::Succeeded),
+                ),
+                (b"kept", legacy_job(1, Some("ws-kept"), JobState::Queued)),
+                (b"stranded", legacy_job(1, None, JobState::Running)),
+                (b"existing", legacy_job(2, Some("shared"), JobState::Queued)),
+                (b"none", legacy_job(3, None, JobState::Queued)),
             ],
         );
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
-        assert_eq!((output.jobs_scanned, output.jobs_rewritten), (4, 3));
+        assert_eq!(
+            (
+                output.jobs_scanned,
+                output.jobs_rewritten,
+                output.jobs_failed
+            ),
+            (6, 5, 2)
+        );
         let records: BTreeMap<Vec<u8>, JobRecord> = read(&path, JOB_KEYSPACE)
             .into_iter()
             .map(|(key, value)| (key, JobRecord::from_bytes(&value).unwrap()))
@@ -318,10 +397,24 @@ mod tests {
             (record.workspace_mode, record.workspace_bucket.clone())
         };
         assert_eq!(settled(b"temporary"), (WorkspaceMode::None, None));
+        assert_eq!(settled(b"finished"), (WorkspaceMode::None, None));
         assert_eq!(
             settled(b"kept"),
             (WorkspaceMode::Existing, Some("ws-kept".to_string()))
         );
+        assert_eq!(settled(b"stranded"), (WorkspaceMode::None, None));
+        // An unfinished run whose per-run bucket is gone must not run on and
+        // report success without its workspace outputs.
+        for key in [b"temporary".as_slice(), b"stranded".as_slice()] {
+            assert_eq!(records[key].state, JobState::Failed);
+            assert!(records[key].last_error.is_some());
+            assert_eq!(
+                records[key].finished_at_ms,
+                Some(records[key].updated_at_ms)
+            );
+            assert!(records[key].claim.is_none());
+        }
+        assert_eq!(records[b"finished".as_slice()].state, JobState::Succeeded);
         assert_eq!(
             settled(b"existing"),
             (WorkspaceMode::Existing, Some("shared".to_string()))
