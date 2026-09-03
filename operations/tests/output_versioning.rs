@@ -16,9 +16,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     Actor, AttemptControl, AttemptIntent, Backend, BackendConfig, BucketInfo, ExecutionSpec,
     FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, InputMode, InputSelection,
-    InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState, OutputDestination,
+    InputSource, JobClaim, JobId, JobInputFact, JobPayload, JobRecord, JobState, OutputDestination,
     OutputSelection, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RoutingSnapshot,
-    WorkspaceMode,
+    WorkspaceMode, checksum::HASH_BLAKE3,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::{GroupId, NodeId};
@@ -159,6 +159,7 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
     )
     .unwrap();
     let token = Ulid::generate();
+    let input_facts = seal_facts(harness, &spec).await;
     let mut record = JobRecord::new(
         job_id,
         JobPayload::Execution(spec),
@@ -168,6 +169,7 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
         1,
         None,
     );
+    record.input_facts = input_facts;
     record.state = JobState::Running;
     record.claim = Some(JobClaim {
         holder_node_id: harness.node_id,
@@ -194,6 +196,39 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
     .await
     .unwrap();
     (commit.record, commit.control)
+}
+
+/// The facts admission seals for a run. A capture inherits its output refs
+/// from them, so a seeded record carries the same ones.
+async fn seal_facts(harness: &Harness, spec: &ExecutionSpec) -> Vec<JobInputFact> {
+    let mut facts = Vec::with_capacity(spec.inputs.len());
+    for input in &spec.inputs {
+        let InputSource::S3 { version_id, .. } = &input.source;
+        let version = version_id
+            .as_deref()
+            .map(|version| Ulid::from_string(version).unwrap());
+        let head = head_object(harness, version).await;
+        let location = head.location.as_ref().expect("input is materialized");
+        facts.push(JobInputFact {
+            destination_key: input.dest_key.clone(),
+            source_node_id: harness.node_id,
+            version_id: head
+                .resolved_version_id
+                .or(head.version_id)
+                .expect("input has a version"),
+            blake3: <[u8; 32]>::try_from(
+                location
+                    .hashes
+                    .get(HASH_BLAKE3)
+                    .expect("blake3 is stored")
+                    .as_slice(),
+            )
+            .expect("blake3 is 32 bytes"),
+            bytes: location.blob_size,
+            policies: head.source_policies.clone(),
+        });
+    }
+    facts
 }
 
 fn body(bytes: &[u8]) -> BackendStream<Result<bytes::Bytes, StreamError>> {

@@ -578,7 +578,7 @@ pub async fn capture_outputs(
             )
         })
         .collect();
-    let inherited = Box::pin(input_policies(context, spec)).await?;
+    let inherited = Box::pin(input_policies(context, spec, record)).await?;
     let mut outputs = Vec::with_capacity(selections.len());
     for (selection, (destination_node_id, bucket, key)) in selections.iter().zip(&destinations) {
         let Some(version_id) = reserved
@@ -606,52 +606,29 @@ pub async fn capture_outputs(
     Ok(outputs)
 }
 
-/// Where one input's refs are read from: the source object itself, which no run
-/// copies any more.
-fn policy_source(input: &InputSelection) -> Result<HeadObjectInput, JobError> {
-    let InputSource::S3 {
-        bucket,
-        key,
-        version_id,
-    } = &input.source;
-    let version = version_id
-        .as_deref()
-        .map(Ulid::from_string)
-        .transpose()
-        .map_err(|_| JobError::permanent(format!("invalid input version_id for {bucket}/{key}")))?;
-    Ok(HeadObjectInput {
-        bucket: bucket.clone(),
-        key: key.clone(),
-        version_id: version,
-    })
-}
-
 /// Union of the refs every input carries, so an output can never be less
-/// constrained than what produced it. A restarted capture reads the same
-/// pinned versions again.
+/// constrained than what produced it. The refs come from the sealed facts, so a
+/// node that holds no copy of an input still inherits its constraints.
 async fn input_policies(
     context: &DriverContext,
     spec: &ExecutionSpec,
+    record: &JobRecord,
 ) -> Result<Vec<PlacementPolicyRef>, JobError> {
     let mut refs = Vec::new();
     for input in &spec.inputs {
-        let head = Box::pin(drive(
-            HeadObjectOperation::new(policy_source(input)?),
-            context,
-        ))
-        .await
-        .and_then(|result| result.transpose());
-        match head {
-            Ok(Some(result)) => refs.extend(result.source_policies),
-            Ok(None)
-            | Err(
-                HeadObjectError::NoSuchKey
-                | HeadObjectError::NoSuchVersion
-                | HeadObjectError::DeleteMarker,
-            ) => {}
-            Err(error) => {
-                return Err(JobError::retryable(format!(
-                    "input policy lookup failed: {error}"
+        match record
+            .input_facts
+            .iter()
+            .find(|fact| fact.destination_key == input.dest_key)
+        {
+            Some(fact) => refs.extend(fact.policies.iter().copied()),
+            // A device seals no facts and may never read governed content, so
+            // its inputs carry none; a realm node must not guess them.
+            None if local_is_user(context, record.created_by.realm_id).await => {}
+            None => {
+                return Err(JobError::permanent(format!(
+                    "input `{}` has no sealed facts to inherit refs from",
+                    input.dest_key
                 )));
             }
         }
@@ -2123,12 +2100,13 @@ mod tests {
         assert!(pinned_inputs(&spec));
     }
 
-    #[test]
-    fn reads_pinned_source() {
-        // No run owns a copy, so its outputs inherit the refs of the exact
-        // source version the launch pinned.
+    #[tokio::test]
+    async fn inherits_sealed_refs() {
+        // A node that holds no copy of the input must still inherit its refs,
+        // so they come from the sealed facts and a missing fact fails closed.
         let version = Ulid::from_bytes([7; 16]);
-        let input = InputSelection {
+        let mut spec = spec(Vec::new());
+        spec.inputs.push(InputSelection {
             source: InputSource::S3 {
                 bucket: "input".to_string(),
                 key: "data.csv".to_string(),
@@ -2140,12 +2118,48 @@ mod tests {
             container_path: Some("/in/data.csv".to_string()),
             name: None,
             description: None,
+        });
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let realm_id = RealmId([1; 32]);
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
         };
+        let mut record = JobRecord::new(
+            JobId::from_bytes([4; 16]),
+            JobPayload::Execution(spec.clone()),
+            UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+            node_id,
+            1,
+            1,
+            None,
+        );
 
-        let pinned = policy_source(&input).unwrap();
-        assert_eq!(pinned.bucket, "input");
-        assert_eq!(pinned.key, "data.csv");
-        assert_eq!(pinned.version_id, Some(version));
+        let error = input_policies(&context, &spec, &record).await.unwrap_err();
+        assert_eq!(error.kind, JobErrorKind::Permanent);
+
+        let policy = PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([5; 16]),
+            digest: [6; 32],
+        };
+        record.input_facts.push(JobInputFact {
+            destination_key: "in/data.csv".to_string(),
+            source_node_id: node_id,
+            version_id: version,
+            blake3: [0; 32],
+            bytes: 4,
+            policies: vec![policy],
+        });
+
+        assert_eq!(
+            input_policies(&context, &spec, &record).await.unwrap(),
+            vec![policy]
+        );
     }
 
     #[test]
