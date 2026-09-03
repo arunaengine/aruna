@@ -5,9 +5,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
-    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, Permission, RealmId,
-    RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode,
-    pid_dedup_key, shard_for_subject, user_dedup_key,
+    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, OutputDestination,
+    Permission, RealmId, RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec,
+    WorkspaceMode, pid_dedup_key, shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -15,6 +15,7 @@ use aruna_core::types::{NodeId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -178,6 +179,24 @@ pub(crate) fn validate_execution(
         return Err(SubmitJobError::InvalidWorkspace(
             "none mode requires explicit output destinations".to_string(),
         ));
+    }
+    // An explicit destination and a workspace output resolve into one bucket
+    // and key namespace, so a key both name would share one reserved version.
+    let mut destinations = HashSet::new();
+    let workspace = spec
+        .workspace_outputs
+        .iter()
+        .filter_map(|output| workspace_bucket.map(|bucket| (bucket, output.dest_key.as_str())));
+    let explicit = spec.file_outputs.iter().map(|output| {
+        let OutputDestination::S3 { bucket, key } = &output.destination;
+        (bucket.as_str(), key.as_str())
+    });
+    for (bucket, key) in explicit.chain(workspace) {
+        if !destinations.insert((bucket, key)) {
+            return Err(SubmitJobError::InvalidWorkspace(format!(
+                "output {bucket}/{key} is declared twice"
+            )));
+        }
     }
     Ok(())
 }
@@ -1405,6 +1424,52 @@ mod tests {
         );
         spec.inputs[0].container_path = Some("/in.txt".to_string());
         assert!(validate_execution(&mut spec, WorkspaceMode::None, None).is_ok());
+    }
+
+    #[test]
+    fn refuses_shared_destination() {
+        // An explicit output inside the workspace bucket and a workspace output
+        // naming the same key would reserve one version twice.
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: vec![aruna_core::structs::OutputSelection {
+                container_path: "/out/result.txt".to_string(),
+                path_prefix: None,
+                destination: OutputDestination::S3 {
+                    bucket: "shared".to_string(),
+                    key: "result.txt".to_string(),
+                },
+                destination_node_id: None,
+                name: None,
+                description: None,
+            }],
+            workspace_outputs: vec![aruna_core::structs::WorkspaceOutput {
+                container_path: "/result.txt".to_string(),
+                dest_key: "result.txt".to_string(),
+            }],
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+
+        let error =
+            validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")).unwrap_err();
+
+        assert!(
+            matches!(error, SubmitJobError::InvalidWorkspace(message) if message.contains("shared/result.txt"))
+        );
+        spec.workspace_outputs[0].dest_key = "other.txt".to_string();
+        assert!(validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")).is_ok());
     }
 
     #[test]
