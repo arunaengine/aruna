@@ -98,8 +98,7 @@ impl BucketUsageOperation {
             key_marker: None,
             upload_id_marker: None,
             max_uploads: self.input.limit,
-        })
-        .complete_scan();
+        });
         self.state = BucketUsageState::ScanUploads;
         let effects = uploads.start();
         self.uploads = Some(uploads);
@@ -168,6 +167,12 @@ impl BucketUsageOperation {
             result.unwrap_or(Err(ListMultipartUploadsError::ListMultipartUploadsFailed))
         }) {
             Ok(result) => result,
+            // The scan keeps its row budget, so a reader cannot walk every
+            // multipart row on the node; an exhausted budget is a lower bound.
+            Err(ListMultipartUploadsError::ScanBudgetExceeded) => {
+                self.truncated = true;
+                return self.finish();
+            }
             Err(error) => return self.fail(error.into()),
         };
         self.truncated |= result.is_truncated;
@@ -220,5 +225,41 @@ impl Operation for BucketUsageOperation {
             (None, Some(uploads)) => uploads.abort(),
             (None, None) => smallvec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::events::StorageEvent;
+    use ulid::Ulid;
+
+    #[test]
+    fn budget_bounds_uploads() {
+        // A bucket reader must not be able to scan every multipart row on the
+        // node, so an exhausted budget reports a partial result instead.
+        let mut operation = BucketUsageOperation::new(BucketUsageInput {
+            bucket: "data".to_string(),
+            limit: 10,
+        });
+        let mut uploads = ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+            bucket: "data".to_string(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: 10,
+        })
+        .with_scan_budget(0);
+        uploads.start();
+        operation.state = BucketUsageState::ScanUploads;
+        operation.uploads = Some(uploads);
+
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+
+        let usage = operation.finalize().expect("the inventory settles");
+        assert!(!usage.complete);
     }
 }

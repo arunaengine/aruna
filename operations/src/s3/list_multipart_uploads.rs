@@ -120,7 +120,7 @@ impl ListMultipartUploadsOperation {
     }
 
     #[cfg(test)]
-    fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
+    pub(crate) fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
         self.max_scan_rows = max_scan_rows;
         self
     }
