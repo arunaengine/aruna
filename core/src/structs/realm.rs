@@ -1256,7 +1256,7 @@ mod test {
 
     #[test]
     fn derives_family_placement() {
-        // Two independently built configs sharing the sealed strategy must
+        // Two independently built configs sharing the stored strategy must
         // derive one identical placement for the same submission.
         let mut left = RealmConfigDocument::new(RealmId([10u8; 32]), Vec::new(), 3);
         left.seed_default_placement();

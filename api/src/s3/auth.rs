@@ -1,7 +1,7 @@
 use super::s3_server::S3OpLabel;
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
-use aruna_core::credential_seal::{CredentialSealKey, SealedS3Secret};
+use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, S3Session, UserAccess,
@@ -54,7 +54,7 @@ pub struct AuthProvider {
     pub(crate) driver_ctx: Arc<DriverContext>,
     pub(crate) realm_id: RealmId,
     pub(crate) node_id: NodeId,
-    pub(crate) seal_key: CredentialSealKey,
+    pub(crate) encryption_key: CredentialEncryptionKey,
     pub(crate) rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
 
@@ -69,7 +69,7 @@ impl S3Auth for AuthProvider {
                     "The Access Key Id you provided does not exist in our records."
                 ));
             }
-            let secret = session.open_secret(&self.seal_key).map_err(|_| {
+            let secret = session.open_secret(&self.encryption_key).map_err(|_| {
                 s3_error!(
                     InvalidAccessKeyId,
                     "The Access Key Id you provided does not exist in our records."
@@ -78,7 +78,7 @@ impl S3Auth for AuthProvider {
             return Ok(SecretKey::from(secret));
         }
         let user_access = self.query_user_access(access_key_id).await?;
-        // Secrets seal at rest with an issuer-local key, so only the issuing
+        // Secrets are encrypted at rest with an issuer-local key, so only the issuing
         // node can recover the plaintext s3s needs to verify a signature. A
         // record copied to another node, or with a rebound field, never opens.
         if user_access.issued_by != *self.node_id.as_bytes() {
@@ -87,7 +87,7 @@ impl S3Auth for AuthProvider {
                 "The Access Key Id you provided does not exist in our records."
             ));
         }
-        let secret = user_access.open_secret(&self.seal_key).map_err(|_| {
+        let secret = user_access.open_secret(&self.encryption_key).map_err(|_| {
             s3_error!(
                 InvalidAccessKeyId,
                 "The Access Key Id you provided does not exist in our records."
@@ -140,8 +140,8 @@ impl S3Access for AuthProvider {
         lease.replace(permit);
         cx.extensions_mut().insert(lease);
 
-        // Credentials are issuer-local and sealed at rest: s3s only had a secret
-        // to verify this signature because `get_secret_key` unsealed it on the
+        // Credentials are issuer-local and encrypted at rest: s3s only had a secret
+        // to verify this signature because `get_secret_key` decrypted it on the
         // issuing node. Confirm that node is still a member of this realm.
         if !self.issuer_in_realm(&user_access.issued_by).await? {
             return Err(s3_error!(
@@ -361,7 +361,7 @@ impl AuthProvider {
             access_key: String::new(),
             user_identity: UserId::nil(self.realm_id),
             group_id,
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             expiry: SystemTime::now(),
             path_restrictions: None,
             issued_by: *self.node_id.as_bytes(),
@@ -473,7 +473,7 @@ impl AuthProvider {
     }
 
     /// Whether `issued_by` is a node configured in this realm. Credentials are
-    /// issuer-local and sealed with an issuer-local key, so a verified signature
+    /// issuer-local and encrypted with an issuer-local key, so a verified signature
     /// already proves this serving node issued them; this only confirms the
     /// issuing node is still a realm member.
     async fn issuer_in_realm(&self, issued_by: &[u8; 32]) -> S3Result<bool> {
@@ -585,7 +585,7 @@ mod tests {
             driver_ctx,
             realm_id: RealmId([1u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-            seal_key: CredentialSealKey::derive(&[7u8; 32]),
+            encryption_key: CredentialEncryptionKey::derive(&[7u8; 32]),
             rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
         }
     }
@@ -620,25 +620,28 @@ mod tests {
             .await;
     }
 
-    fn sealed_access(provider: &AuthProvider, issued_by: [u8; 32]) -> UserAccess {
+    fn issued_access(provider: &AuthProvider, issued_by: [u8; 32]) -> UserAccess {
         use ulid::Ulid;
         let mut access = UserAccess {
             access_key: UserAccess::build_access_key(&Ulid::generate().to_string()).unwrap(),
             user_identity: UserId::local(Ulid::generate(), provider.realm_id),
             group_id: Ulid::generate(),
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             expiry: SystemTime::now() + std::time::Duration::from_secs(3600),
             path_restrictions: None,
             issued_by,
             revoked_at: None,
         };
         access
-            .seal_secret(&CredentialSealKey::derive(&[7u8; 32]), "unsealed-secret")
+            .encrypt_secret(
+                &CredentialEncryptionKey::derive(&[7u8; 32]),
+                "plaintext-secret",
+            )
             .unwrap();
         access
     }
 
-    fn sealed_session(
+    fn issued_session(
         provider: &AuthProvider,
         issued_by: [u8; 32],
         expiry: SystemTime,
@@ -648,7 +651,7 @@ mod tests {
             access_key: S3Session::build_access_key(&Ulid::generate().to_string()).unwrap(),
             user_identity: UserId::local(Ulid::generate(), provider.realm_id),
             group_id: Ulid::generate(),
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             token_hash: S3Session::hash_token("temporary-token"),
             expiry,
             path_restrictions: None,
@@ -656,7 +659,10 @@ mod tests {
             last_used_at: None,
         };
         session
-            .seal_secret(&CredentialSealKey::derive(&[7u8; 32]), "temporary-secret")
+            .encrypt_secret(
+                &CredentialEncryptionKey::derive(&[7u8; 32]),
+                "temporary-secret",
+            )
             .unwrap();
         session
     }
@@ -679,7 +685,7 @@ mod tests {
         let mut provider = provider(dir.path().to_str().unwrap());
         provider.rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::for_test(1));
 
-        let live = sealed_access(&provider, *provider.node_id.as_bytes());
+        let live = issued_access(&provider, *provider.node_id.as_bytes());
         let revoked = UserAccess {
             revoked_at: Some(SystemTime::now()),
             ..live.clone()
@@ -693,17 +699,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unseals_on_issuer() {
+    async fn decrypts_on_issuer() {
         let dir = tempfile::tempdir().unwrap();
         let provider = provider(dir.path().to_str().unwrap());
 
-        let local = sealed_access(&provider, *provider.node_id.as_bytes());
+        let local = issued_access(&provider, *provider.node_id.as_bytes());
         store_access(&provider, &local).await;
         let secret = provider.get_secret_key(&local.access_key).await.unwrap();
-        assert_eq!(secret.expose(), "unsealed-secret");
+        assert_eq!(secret.expose(), "plaintext-secret");
 
         // A record issued by another node (a copied DB) yields no usable secret.
-        let foreign = sealed_access(&provider, [9u8; 32]);
+        let foreign = issued_access(&provider, [9u8; 32]);
         store_access(&provider, &foreign).await;
         let error = provider
             .get_secret_key(&foreign.access_key)
@@ -717,7 +723,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = provider(dir.path().to_str().unwrap());
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
-        let session = sealed_session(
+        let session = issued_session(
             &provider,
             *provider.node_id.as_bytes(),
             now + std::time::Duration::from_secs(600),
@@ -751,12 +757,12 @@ mod tests {
     async fn session_never_degrades() {
         let dir = tempfile::tempdir().unwrap();
         let provider = provider(dir.path().to_str().unwrap());
-        let mut long_lived = sealed_access(&provider, *provider.node_id.as_bytes());
+        let mut long_lived = issued_access(&provider, *provider.node_id.as_bytes());
         long_lived.access_key =
             S3Session::build_access_key(&ulid::Ulid::generate().to_string()).unwrap();
-        long_lived.secret = SealedS3Secret::empty();
+        long_lived.secret = EncryptedS3Secret::empty();
         long_lived
-            .seal_secret(&provider.seal_key, "long-lived-secret")
+            .encrypt_secret(&provider.encryption_key, "long-lived-secret")
             .unwrap();
         store_access(&provider, &long_lived).await;
 
@@ -786,7 +792,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = provider(dir.path().to_str().unwrap());
         let expiry = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
-        let local = sealed_session(&provider, *provider.node_id.as_bytes(), expiry);
+        let local = issued_session(&provider, *provider.node_id.as_bytes(), expiry);
         store_session(&provider, &local).await;
         assert_eq!(
             provider
@@ -796,7 +802,7 @@ mod tests {
                 .expose(),
             "temporary-secret"
         );
-        let foreign = sealed_session(&provider, [9u8; 32], expiry);
+        let foreign = issued_session(&provider, [9u8; 32], expiry);
         store_session(&provider, &foreign).await;
 
         let error = provider

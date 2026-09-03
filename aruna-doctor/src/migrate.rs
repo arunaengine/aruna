@@ -6,7 +6,7 @@ use crate::error::CliError;
 use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::{JOB_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
 use aruna_core::structs::{
-    AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobInputFact, JobPayload,
+    AttemptIntent, CapturedInput, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
     JobProgress, JobRecord, JobResultPayload, JobState, MultipartUpload, WorkspaceMode,
 };
 use aruna_core::types::{NodeId, UserId};
@@ -137,7 +137,7 @@ struct LegacyJobRecord {
     attempt_intent: Option<AttemptIntent>,
     workspace_bucket: Option<String>,
     workspace_mode: LegacyWorkspaceMode,
-    input_facts: Vec<JobInputFact>,
+    captured_inputs: Vec<CapturedInput>,
     report_digest: Option<[u8; 32]>,
     retention_ms: u64,
     locally_exhausted: bool,
@@ -200,7 +200,7 @@ impl LegacyJobRecord {
             attempt_intent: self.attempt_intent,
             workspace_bucket: kept_bucket,
             workspace_mode,
-            input_facts: self.input_facts,
+            captured_inputs: self.captured_inputs,
             report_digest: self.report_digest,
             retention_ms: self.retention_ms,
             locally_exhausted: self.locally_exhausted,

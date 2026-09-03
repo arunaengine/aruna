@@ -10,7 +10,7 @@ use crate::rate_limit::{LocalKey, LocalLease};
 use crate::s3::util::bucket_name_reason;
 use crate::telemetry::{RequestCancelGuard, emit_request_completed, make_request_span};
 use aruna_core::NodeId;
-use aruna_core::credential_seal::CredentialSealKey;
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::{BucketCorsConfiguration, RealmId, RoCrateLimits};
 use aruna_operations::driver::{DriverContext, drive};
@@ -466,7 +466,7 @@ pub struct S3Server {
     driver_ctx: Arc<DriverContext>,
     metrics: Arc<NodeMetrics>,
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
-    seal_key: CredentialSealKey,
+    encryption_key: CredentialEncryptionKey,
     connection_limit: Arc<Semaphore>,
     control_limit: Arc<Semaphore>,
     bulk_limit: Arc<Semaphore>,
@@ -932,7 +932,7 @@ fn build_s3_service(
 impl S3Server {
     #[tracing::instrument(
         level = "trace",
-        skip(address, hostname, driver_ctx, seal_key, metrics)
+        skip(address, hostname, driver_ctx, encryption_key, metrics)
     )]
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -941,7 +941,7 @@ impl S3Server {
         driver_ctx: Arc<DriverContext>,
         realm_id: RealmId,
         node_id: NodeId,
-        seal_key: CredentialSealKey,
+        encryption_key: CredentialEncryptionKey,
         rocrate_limits: RoCrateLimits,
         cors: CorsConfig,
         metrics: Arc<NodeMetrics>,
@@ -959,7 +959,7 @@ impl S3Server {
                 driver_ctx: driver_ctx.clone(),
                 realm_id,
                 node_id,
-                seal_key: seal_key.clone(),
+                encryption_key: encryption_key.clone(),
                 rate_limits: rate_limits.clone(),
             },
         )?;
@@ -975,7 +975,7 @@ impl S3Server {
             driver_ctx,
             metrics,
             rate_limits,
-            seal_key,
+            encryption_key,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONNECTIONS)),
             control_limit: Arc::new(Semaphore::new(control_capacity(
                 DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
@@ -1034,7 +1034,7 @@ impl S3Server {
                 driver_ctx: self.driver_ctx.clone(),
                 realm_id: self.realm_id,
                 node_id: self.node_id,
-                seal_key: self.seal_key.clone(),
+                encryption_key: self.encryption_key.clone(),
                 rate_limits: rate_limits.clone(),
             },
         )?;
@@ -2617,7 +2617,7 @@ mod tests {
             driver_ctx,
             RealmId([5u8; 32]),
             iroh::SecretKey::generate().public(),
-            CredentialSealKey::random(),
+            CredentialEncryptionKey::random(),
             RoCrateLimits::default(),
             CorsConfig::default(),
             Arc::new(NodeMetrics::new()),
@@ -2723,7 +2723,7 @@ mod tests {
             driver_ctx,
             RealmId([9u8; 32]),
             node_id,
-            CredentialSealKey::random(),
+            CredentialEncryptionKey::random(),
             Default::default(),
             crate::cors::CorsConfig::default(),
             Arc::new(NodeMetrics::new()),

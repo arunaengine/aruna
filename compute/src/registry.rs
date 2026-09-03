@@ -110,8 +110,8 @@ impl ExecutorRegistry {
         &self,
         kind: &ExecutorKind,
         subject: &PlacementSubject,
-        sealed_generation: u64,
-        sealed_digest: &[u8; 32],
+        stored_generation: u64,
+        stored_digest: &[u8; 32],
     ) -> Result<&Arc<dyn ExecutorBackend>, BackendError> {
         let backend = self
             .get(kind)
@@ -119,8 +119,8 @@ impl ExecutorRegistry {
         let current =
             ExecutorCapability::new(kind.as_wire(), site(subject, &backend.capabilities()))
                 .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
-        match current.subject.generation == sealed_generation
-            && &current.subject_digest == sealed_digest
+        match current.subject.generation == stored_generation
+            && &current.subject_digest == stored_digest
         {
             true => Ok(backend),
             false => Err(BackendError::Fenced),
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn hides_unproven_site() {
-        // A backend that cannot prove worker placement advertises no site facts,
+        // A backend that cannot prove worker placement advertises no site details,
         // so no location or label rule can match it.
         let mut subject = subject();
         subject.location = "controller-site".to_string();
@@ -364,7 +364,7 @@ mod tests {
         let registry = ExecutorRegistry::new()
             .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
         let subject = subject();
-        let sealed = registry
+        let stored = registry
             .capabilities(&subject, false)
             .expect("subject is valid")
             .remove(0);
@@ -374,8 +374,8 @@ mod tests {
                 .fenced(
                     &ExecutorKind::Docker,
                     &subject,
-                    sealed.subject.generation,
-                    &sealed.subject_digest
+                    stored.subject.generation,
+                    &stored.subject_digest
                 )
                 .is_ok()
         );
@@ -387,8 +387,8 @@ mod tests {
                 .fenced(
                     &ExecutorKind::Docker,
                     &moved,
-                    sealed.subject.generation,
-                    &sealed.subject_digest
+                    stored.subject.generation,
+                    &stored.subject_digest
                 )
                 .err(),
             Some(BackendError::Fenced)
@@ -401,8 +401,8 @@ mod tests {
                 .fenced(
                     &ExecutorKind::Docker,
                     &aged,
-                    sealed.subject.generation,
-                    &sealed.subject_digest
+                    stored.subject.generation,
+                    &stored.subject_digest
                 )
                 .err(),
             Some(BackendError::Fenced)
@@ -412,8 +412,8 @@ mod tests {
                 .fenced(
                     &ExecutorKind::Slurm,
                     &subject,
-                    sealed.subject.generation,
-                    &sealed.subject_digest
+                    stored.subject.generation,
+                    &stored.subject_digest
                 )
                 .is_err()
         );
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn advertises_backend_site() {
-        // Each backend advertises its own kind, site locality, and sealed digest.
+        // Each backend advertises its own kind, site locality, and stored digest.
         let registry = ExecutorRegistry::new()
             .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
         let subject = subject();

@@ -106,7 +106,7 @@ pub struct PlacementPolicyRef {
 pub struct PlacementSubject {
     pub node_id: NodeId,
     /// Node-local counter incremented whenever any policy-relevant field below
-    /// changes. A receipt seals it so a later subject change cannot be replayed
+    /// changes. A receipt stores it so a later subject change cannot be replayed
     /// as a placement credential.
     pub generation: u64,
     pub location: String,
@@ -477,7 +477,7 @@ impl PlacementSubject {
         Ok(())
     }
 
-    /// `local_to_controller` is a transport fact rather than a residency
+    /// `local_to_controller` is a transport detail rather than a residency
     /// attribute, so it is deliberately absent from the matching view.
     pub fn normalized(&self) -> Result<NormalizedSubject, PlacementPolicyError> {
         self.validate()?;
@@ -495,7 +495,7 @@ impl PlacementSubject {
     }
 
     /// Binds the generation and the execution-site model to the matching
-    /// attributes, so a receipt's sealed digest detects a subject that changed
+    /// attributes, so a receipt's stored digest detects a subject that changed
     /// underneath it.
     pub fn digest(&self) -> Result<[u8; 32], PlacementPolicyError> {
         let normalized = self.normalized()?;
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn digest_binds_generation() {
-        // A sealed receipt must detect a subject that changed underneath it,
+        // A stored receipt must detect a subject that changed underneath it,
         // while matching itself must never depend on the generation.
         let base = subject();
         let advanced = PlacementSubject {

@@ -262,11 +262,11 @@ impl AdmitSubmissionOperation {
         }
         let spec = self.config.candidate.spec.envelope();
         let claim = self.config.candidate.claim.envelope();
-        let JobFamilyRecord::Spec(sealed) = &spec.record else {
+        let JobFamilyRecord::Spec(stored) = &spec.record else {
             return Err(LifecycleError::NotHolder);
         };
         authentic(spec.verify(&view.context(Evidence::default(), None))?)?;
-        authentic(claim.verify(&view.context(spec_evidence(sealed), None))?)?;
+        authentic(claim.verify(&view.context(spec_evidence(stored), None))?)?;
 
         let mut writes: Vec<(String, Key, Value)> = Vec::new();
         for envelope in [spec, claim] {
@@ -300,7 +300,7 @@ impl AdmitSubmissionOperation {
             family_prefix(&self.family()),
             Value::from(to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice()),
         ));
-        let record = logical_record(sealed);
+        let record = logical_record(stored);
         writes.push((
             JOB_KEYSPACE.to_string(),
             job_record_key(record.job_id),
@@ -313,7 +313,7 @@ impl AdmitSubmissionOperation {
         ));
         writes.push((
             JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
-            Key::from(sealed.group_id.to_bytes().as_slice()),
+            Key::from(stored.group_id.to_bytes().as_slice()),
             Value::from(to_bytes(&self.quota_revision.saturating_add(1))?.as_slice()),
         ));
         Ok(writes)

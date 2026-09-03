@@ -292,7 +292,7 @@ async fn setup_runtime() -> Result<Runtime, Box<dyn std::error::Error>> {
     });
 
     // One cancellation path for the whole node: background children register
-    // here so an ordered shutdown can drain them before storage is sealed.
+    // here so an ordered shutdown can drain them before storage is closed.
     let shutdown = Shutdown::new();
 
     // Start ops before realm bootstrap so readiness reports startup failure.
@@ -711,7 +711,7 @@ async fn bind_servers(
                 driver_ctx,
                 config.realm_id,
                 config.node_id,
-                aruna_core::credential_seal::CredentialSealKey::derive(
+                aruna_core::credential_encryption::CredentialEncryptionKey::derive(
                     &config.node_state.net_secret_key,
                 ),
                 config.rocrate_limits.clone(),

@@ -130,12 +130,12 @@ impl Family {
                 resources,
                 admitted_at_ms: 1_000,
             },
-            input_facts: Vec::new(),
+            captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             placement: self.placement,
         }
-        .seal()
-        .expect("spec seals")
+        .store_digest()
+        .expect("spec digest stored")
     }
 
     pub fn claim(&self, spec: &LogicalJobSpec) -> SubmissionClaim {

@@ -1,9 +1,9 @@
 //! Hard eligibility. Every rule here can only remove a target: stale telemetry
-//! and free capacity are ranking facts, and exact admission happens at the
+//! and free capacity are ranking inputs, and exact admission happens at the
 //! target itself.
 
 use crate::compute::NetworkAccess;
-use crate::scheduling::facts::{PlanRequest, TargetCandidate};
+use crate::scheduling::inputs::{PlanRequest, TargetCandidate};
 use crate::structs::{PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -56,7 +56,7 @@ impl PolicyVerdict {
 }
 
 impl RejectionVerdict {
-    /// Whether the rejection may resolve itself once missing facts arrive.
+    /// Whether the rejection may resolve itself once the missing values arrive.
     pub fn retryable(&self) -> bool {
         match self {
             RejectionVerdict::Policy { verdict, .. } => verdict.retryable(),

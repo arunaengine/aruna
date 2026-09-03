@@ -146,7 +146,7 @@ impl ControlGuard {
         })
     }
 
-    pub fn seal(&mut self, backend_ref: String) -> Result<TombstoneEvidence, BackendError> {
+    pub fn store(&mut self, backend_ref: String) -> Result<TombstoneEvidence, BackendError> {
         let record = self
             .record
             .as_mut()
@@ -247,7 +247,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let daemon = DaemonLock::acquire(directory.path()).unwrap();
         let mut control = daemon.control(&fence(1)).unwrap();
-        control.seal("control.json".to_string()).unwrap();
+        control.store("control.json".to_string()).unwrap();
         drop(control);
         assert!(daemon.control(&fence(2)).unwrap().tombstone().is_some());
     }

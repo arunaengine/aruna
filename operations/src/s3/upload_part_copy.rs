@@ -133,9 +133,9 @@ pub async fn upload_part_copy(
     )
     .await?;
 
-    // Sealed before the bytes land: a lost merge must not let the completed
+    // Stored before the bytes land: a lost merge must not let the completed
     // object drop the refs its source carried.
-    seal_source_policies(context, input.upload_id, &source.source_policies).await?;
+    store_source_policies(context, input.upload_id, &source.source_policies).await?;
 
     let content_length = source
         .resolved_range
@@ -192,7 +192,7 @@ async fn gate_part(
 
 /// Merges the source's refs into the destination upload record. An ungoverned
 /// copy writes nothing, so its behavior is exactly what it was before.
-async fn seal_source_policies(
+async fn store_source_policies(
     context: &DriverContext,
     upload_id: Ulid,
     policies: &[PlacementPolicyRef],
@@ -271,7 +271,7 @@ async fn merge_upload_policies(
 }
 
 /// Confirms the upload is this copy's open destination and reports the refs it
-/// already seals, which the gate unions with the source's.
+/// already stores, which the gate unions with the source's.
 async fn validate_destination_upload(
     context: &DriverContext,
     input: &UploadPartCopyInput,
@@ -545,8 +545,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn copy_seals_policies() {
-        // A part copied from a governed source seals its refs on the upload, so
+    async fn copy_stores_policies() {
+        // A part copied from a governed source stores its refs on the upload, so
         // the composed object cannot be less constrained than what it copied.
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([3u8; 32]);
@@ -631,7 +631,7 @@ mod test {
     #[tokio::test]
     async fn refuses_denied_part() {
         // A part may only land after the destination is admitted for every ref
-        // the finished object carries; the seal alone is not a gate.
+        // the finished object carries; the stored refs alone are not a gate.
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let group_id = Ulid::generate();

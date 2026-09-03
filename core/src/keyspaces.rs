@@ -134,7 +134,7 @@ pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_in
 
 /// Device-local registrations of the directories this node offers as read-only
 /// buckets, keyed by bucket name. Never replicated: the root path is the one
-/// fact about the owner's machine that must not leave it.
+/// detail about the owner's machine that must not leave it.
 pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
 
 /// Authoring intents the owner queued on the device while the realm was
@@ -228,7 +228,7 @@ pub const JOB_ADMISSION_QUOTA_KEYSPACE: &str = "job_admission_quota";
 pub const JOB_WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
 /// Current witness deadline by family; the due-time rows are the scan index.
 pub const JOB_WITNESS_DEADLINE_INDEX_KEYSPACE: &str = "job_witness_deadline_index";
-/// Bounded explain record of the plan a witness sealed before it launched.
+/// Bounded explain record of the plan a witness stored before it launched.
 pub const JOB_PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
 pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 /// The single row recording what this node could not resolve when it departed.

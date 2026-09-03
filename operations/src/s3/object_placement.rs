@@ -208,7 +208,7 @@ mod tests {
             None,
         )
         .with_policies(vec![policy_ref])
-        .expect("refs seal");
+        .expect("refs stored");
 
         let mut operation = operation();
         operation.start();

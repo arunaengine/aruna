@@ -195,13 +195,13 @@ pub struct PutObjectOperation {
     metadata: HashMap<String, String>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
-    /// Refs sealed on the version record, reused verbatim by its registration.
-    sealed_policies: Vec<PlacementPolicyRef>,
+    /// Refs stored on the version record, reused verbatim by its registration.
+    stored_policies: Vec<PlacementPolicyRef>,
     /// Destination default, read inside the version transaction so an edit
     /// observed after streaming cannot commit a stale ref set.
     bucket_policies: Vec<PlacementPolicyRef>,
     inherited_policies: Vec<PlacementPolicyRef>,
-    /// Destination facts of this node. Absent means no governed byte may be
+    /// Destination details of this node. Absent means no governed byte may be
     /// materialized here at all.
     gate_context: Option<GateContext>,
     gate: Option<PolicyGateOperation>,
@@ -240,7 +240,7 @@ impl PutObjectOperation {
             metadata: HashMap::new(),
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
-            sealed_policies: Vec::new(),
+            stored_policies: Vec::new(),
             bucket_policies: Vec::new(),
             inherited_policies: Vec::new(),
             gate_context: None,
@@ -281,7 +281,7 @@ impl PutObjectOperation {
 
     /// Subject generation the gate admitted this write under; zero for an
     /// ungoverned write, which no subject ever evaluated.
-    fn sealed_subject(&self) -> u64 {
+    fn stored_subject(&self) -> u64 {
         self.gated_bucket
             .as_ref()
             .and_then(|gated| gated.subject_generation)
@@ -459,7 +459,7 @@ impl PutObjectOperation {
         };
         self.gated_bucket = Some(
             GatedBucket::observe(bucket.as_ref())
-                .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
+                .stored_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
         let group_id = bucket
             .as_ref()
@@ -909,7 +909,7 @@ impl PutObjectOperation {
                 self.config.request.key.clone(),
                 version_id,
             );
-            self.sealed_policies = version.placement_policies.clone();
+            self.stored_policies = version.placement_policies.clone();
             let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -947,9 +947,9 @@ impl PutObjectOperation {
                 ),
                 node_id: self.config.node_id,
                 location: &location,
-                policies: &self.sealed_policies,
+                policies: &self.stored_policies,
                 origin: self.origin,
-                subject_generation: self.sealed_subject(),
+                subject_generation: self.stored_subject(),
                 registered_at_ms: version_id.timestamp_ms(),
             },
             self.txn_id,

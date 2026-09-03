@@ -6,7 +6,7 @@
 
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
-    EffectiveResources, ExecutionSpec, JobFamilyId, JobInputFact, LabelMatch, MAX_SELECTOR_LABELS,
+    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, LabelMatch, MAX_SELECTOR_LABELS,
     PlacementPolicyRef, SubmissionId, WorkspaceMode,
 };
 use aruna_core::types::NodeId;
@@ -18,7 +18,7 @@ use ulid::Ulid;
 /// Domain tag of the normalized request digest.
 pub const REQUEST_DIGEST_DOMAIN: &[u8] = b"aruna-job-request-v1";
 
-/// Reserved tag namespace of the scheduling directives an execution spec seals.
+/// Reserved tag namespace of the scheduling directives an execution spec stores.
 /// The spec is the complete request, so these travel inside it rather than
 /// beside it, in the tag namespace the engine already owns.
 pub const WORKSPACE_MODE_TAG: &str = "aruna-engine.org/workspace-mode";
@@ -65,7 +65,7 @@ pub struct SubmissionRequest {
     pub retention_ms: u64,
     /// The first node that resolved node-local object names for this request.
     pub ingress_node_id: NodeId,
-    pub input_facts: Vec<JobInputFact>,
+    pub captured_inputs: Vec<CapturedInput>,
     pub output_policies: Vec<PlacementPolicyRef>,
 }
 
@@ -99,7 +99,7 @@ impl SubmissionRequest {
                 self.created_by,
                 &self.spec,
                 self.ingress_node_id,
-                &self.input_facts,
+                &self.captured_inputs,
                 &self.output_policies,
             )?,
         })
@@ -110,7 +110,7 @@ fn request_digest(
     created_by: UserId,
     spec: &ExecutionSpec,
     ingress_node_id: NodeId,
-    input_facts: &[JobInputFact],
+    captured_inputs: &[CapturedInput],
     output_policies: &[PlacementPolicyRef],
 ) -> Result<[u8; 32], ConversionError> {
     let mut hasher = blake3::Hasher::new();
@@ -118,14 +118,14 @@ fn request_digest(
     hasher.update(&created_by.to_storage_key());
     hasher.update(&postcard::to_allocvec(spec)?);
     hasher.update(ingress_node_id.as_bytes());
-    hasher.update(&postcard::to_allocvec(input_facts)?);
+    hasher.update(&postcard::to_allocvec(captured_inputs)?);
     hasher.update(&postcard::to_allocvec(output_policies)?);
     Ok(*hasher.finalize().as_bytes())
 }
 
-/// Seals the workspace choice into the spec. A caller that already set a
+/// Stores the workspace choice in the spec. A caller that already set a
 /// reserved tag is refused rather than silently overridden.
-pub fn seal_workspace(
+pub fn store_workspace(
     spec: &mut ExecutionSpec,
     mode: WorkspaceMode,
     bucket: Option<String>,
@@ -145,7 +145,7 @@ pub fn seal_workspace(
     Ok(())
 }
 
-/// The workspace the sealed spec asks for. An unknown or absent mode owns no
+/// The workspace the stored spec asks for. An unknown or absent mode owns no
 /// bucket, which is what a run without a named bucket always meant.
 pub fn workspace_of(spec: &ExecutionSpec) -> (WorkspaceMode, Option<String>) {
     let mode = match spec.tags.get(WORKSPACE_MODE_TAG).map(String::as_str) {
@@ -155,7 +155,7 @@ pub fn workspace_of(spec: &ExecutionSpec) -> (WorkspaceMode, Option<String>) {
     (mode, spec.tags.get(WORKSPACE_BUCKET_TAG).cloned())
 }
 
-/// Required target labels the spec seals, in canonical order.
+/// Required target labels the spec stores, in canonical order.
 pub fn required_labels(spec: &ExecutionSpec) -> Result<Vec<LabelMatch>, RequestError> {
     let mut labels: Vec<LabelMatch> = Vec::new();
     for (key, value) in &spec.tags {

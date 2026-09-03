@@ -341,7 +341,7 @@ pub async fn publish_progress(
 }
 
 /// Publishes the terminal state of a receipted execution and releases its
-/// reservation. Success names the digest of the output record sealed before it,
+/// reservation. Success names the digest of the output record stored before it,
 /// so a success can never be projected without its exact outputs.
 pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bool {
     let Some(state) = terminal_state(record) else {

@@ -47,8 +47,8 @@ pub(crate) fn candidate_at(node_id: NodeId, kind: &str, location: &str) -> Targe
     }
 }
 
-/// Re-seals the advertised digest after a fixture changed the subject.
-pub(crate) fn reseal(candidate: &mut TargetCandidate) {
+/// Refreshes the advertised digest after a fixture changed the subject.
+pub(crate) fn refresh_digest(candidate: &mut TargetCandidate) {
     candidate.capability.subject_digest = candidate
         .capability
         .subject
@@ -227,7 +227,7 @@ fn policy_selects_site() {
         .subject
         .labels
         .insert("tier".to_string(), "gpu".to_string());
-    reseal(&mut labelled);
+    refresh_digest(&mut labelled);
 
     let cases = [
         PlacementSelector {
@@ -542,13 +542,13 @@ fn excludes_user_nodes() {
 #[test]
 fn drops_drifted_subject() {
     // An advertisement whose digest does not match its subject is drift: the
-    // sealed generation no longer describes the site policy was evaluated on.
+    // stored generation no longer describes the site policy was evaluated on.
     let target = node(2);
     let mut drifted = candidate(target, "docker");
     drifted.capability.subject.generation += 1;
     let mut foreign = candidate(node(3), "docker");
     foreign.capability.subject.node_id = node(9);
-    reseal(&mut foreign);
+    refresh_digest(&mut foreign);
     let plan_request = request(Vec::new());
 
     let outcome = plan(&plan_request, vec![drifted, foreign], &config(Vec::new()));
@@ -700,8 +700,8 @@ fn ties_break_by_node() {
 }
 
 #[test]
-fn shuffled_facts_agree() {
-    // Permuted inputs, holders, and candidates must seal the same digest.
+fn shuffled_inputs_agree() {
+    // Permuted inputs, holders, and candidates must produce the same digest.
     let mut first = resolved_input("a", 1);
     first.holders = vec![holder(node(5), "us"), holder(node(6), "ap")];
     let mut second = resolved_input("b", 2);
@@ -727,8 +727,8 @@ fn shuffled_facts_agree() {
 }
 
 #[test]
-fn digest_seals_facts() {
-    // Every sealed fact must move the digest: subject generation, input size,
+fn digest_covers_inputs() {
+    // Every stored value must move the digest: subject generation, input size,
     // chosen source, and the target itself.
     let target = node(2);
     let mut input = resolved_input("in", 1);
@@ -744,7 +744,7 @@ fn digest_seals_facts() {
 
     let mut regenerated = scan.clone();
     regenerated[0].capability.subject.generation += 1;
-    reseal(&mut regenerated[0]);
+    refresh_digest(&mut regenerated[0]);
     assert_ne!(
         selected(&plan_request, regenerated, &compute).plan_digest,
         base
@@ -819,7 +819,7 @@ fn best_beyond_bound() {
 
 #[test]
 fn shuffled_scan_agrees() {
-    // One scan in either order must seal the same selection, alternatives, and
+    // One scan in either order must produce the same selection, alternatives, and
     // digest, including which targets the ranking bound drops.
     let mut targets = scanned(130);
     for (index, target) in targets.iter_mut().enumerate() {
@@ -977,7 +977,7 @@ fn realm_backends_paged() {
 #[test]
 fn shuffled_pages_agree() {
     // The same advertisements in any discovery order must page identically and
-    // seal one plan, digest included.
+    // produce one plan, digest included.
     let mut targets = backends(129);
     for (index, target) in targets.iter_mut().enumerate() {
         target.load_permille = Some((index as u32 * 37) % 11);

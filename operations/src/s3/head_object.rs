@@ -97,7 +97,7 @@ pub struct HeadObjectResult {
     pub checksum_type: MultipartChecksumType,
     pub composite_hashes: HashMap<String, Vec<u8>>,
     pub part_count: Option<usize>,
-    /// Refs sealed on the version that was described. A derived write unions
+    /// Refs stored on the version that was described. A derived write unions
     /// them with its destination default and never drops one.
     pub source_policies: Vec<PlacementPolicyRef>,
 }

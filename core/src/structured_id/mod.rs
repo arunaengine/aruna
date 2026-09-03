@@ -138,7 +138,7 @@ fn decode_canonical(input: &str) -> Result<u128, ParseError> {
     Ok(value.0)
 }
 
-mod sealed {
+mod private {
     use ulid::Ulid;
 
     pub struct Token(());
@@ -149,7 +149,7 @@ mod sealed {
 
     /// The raw constructor lives here so no code outside this module can
     /// wrap an unvalidated ULID (e.g. one carrying the reserved handle 0).
-    pub trait Sealed {
+    pub trait Private {
         fn from_ulid(ulid: Ulid, _token: Token) -> Self;
     }
 }
@@ -157,7 +157,7 @@ mod sealed {
 /// Shared codec for the Aruna Structured ULID family (`MetaResourceId`,
 /// `JobId`). Every constructor guarantees a non-zero handle, so extracted
 /// fields are always valid.
-pub trait StructuredId: Sized + Copy + sealed::Sealed {
+pub trait StructuredId: Sized + Copy + private::Private {
     fn as_ulid(&self) -> Ulid;
 
     /// Builds an id from its four fields, rejecting an out-of-range timestamp or
@@ -181,7 +181,7 @@ pub trait StructuredId: Sized + Copy + sealed::Sealed {
                 bucket.get(),
                 nonce,
             )),
-            sealed::new(),
+            private::new(),
         ))
     }
 
@@ -192,7 +192,7 @@ pub trait StructuredId: Sized + Copy + sealed::Sealed {
         if layout::unpack(value).handle == layout::RESERVED_HANDLE {
             return Err(ParseError::ReservedHandle);
         }
-        Ok(Self::from_ulid(Ulid(value), sealed::new()))
+        Ok(Self::from_ulid(Ulid(value), private::new()))
     }
 
     fn timestamp_ms(&self) -> u64 {
@@ -231,8 +231,8 @@ macro_rules! structured_id_newtype {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(Ulid);
 
-        impl sealed::Sealed for $name {
-            fn from_ulid(ulid: Ulid, _token: sealed::Token) -> Self {
+        impl private::Private for $name {
+            fn from_ulid(ulid: Ulid, _token: private::Token) -> Self {
                 Self(ulid)
             }
         }

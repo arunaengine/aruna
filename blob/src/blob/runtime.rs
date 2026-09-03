@@ -85,7 +85,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
 }
 
 /// Effects that write bytes to a backend or remove them. Reads, serves, listings
-/// and connection control stay open after the seal.
+/// and connection control stay open after the close.
 fn blob_effect_mutates(effect: &BlobEffect) -> bool {
     matches!(
         effect,
@@ -186,21 +186,21 @@ impl BlobHandle {
         BlobHandle { handler }
     }
 
-    /// Closes the blob write path before storage is sealed. Mutations that
+    /// Closes the blob write path before storage is closed. Mutations that
     /// arrive afterwards are rejected and counted.
-    pub fn seal(&self) {
-        self.handler.seal();
+    pub fn close_writes(&self) {
+        self.handler.close_writes();
     }
 
-    pub fn is_sealed(&self) -> bool {
-        self.handler.is_sealed()
+    pub fn writes_closed(&self) -> bool {
+        self.handler.writes_closed()
     }
 
     pub fn rejected_writes(&self) -> u64 {
         self.handler.rejected_writes.load(Ordering::Relaxed)
     }
 
-    /// Waits until blob mutations registered before the seal complete, bounded
+    /// Waits until blob mutations registered before the close complete, bounded
     /// by `timeout`. Returns `true` when none remain.
     pub async fn drain_writes(&self, timeout: Duration) -> bool {
         self.handler.drain_writes(timeout).await
@@ -208,22 +208,22 @@ impl BlobHandle {
 
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
         let (class, kind) = classify_effect(&effect);
-        // Register a mutation before any await so a concurrent seal either
+        // Register a mutation before any await so a concurrent close either
         // rejects it or drains it; the guard lives for the whole effect.
         let _write = if blob_effect_mutates(&effect) {
-            let _seal_guard = self
+            let _close_guard = self
                 .handler
-                .seal_lock
+                .close_lock
                 .read()
-                .expect("blob seal lock poisoned");
-            if self.handler.is_sealed() {
+                .expect("blob close lock poisoned");
+            if self.handler.writes_closed() {
                 self.handler.rejected_writes.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    event = "blob.write.after_seal",
+                    event = "blob.write.after_close",
                     effect = kind,
-                    "Rejected a blob write issued after the shutdown seal"
+                    "Rejected a blob write issued after the shutdown close"
                 );
-                return Event::Blob(BlobEvent::Error(BlobError::Sealed));
+                return Event::Blob(BlobEvent::Error(BlobError::Closed));
             }
             Some(BlobWriteGuard::new(&self.handler))
         } else {
@@ -488,8 +488,8 @@ impl BlobHandler {
             inflight: Arc::new(AtomicUsize::new(0)),
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            sealed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            seal_lock: Arc::new(std::sync::RwLock::new(())),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            close_lock: Arc::new(std::sync::RwLock::new(())),
             rejected_writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes_in_flight: Arc::new(AtomicUsize::new(0)),
             writes_drained: Arc::new(tokio::sync::Notify::new()),
@@ -504,13 +504,13 @@ impl BlobHandler {
         Ok(BlobHandle::new(blob_handler))
     }
 
-    pub(super) fn seal(&self) {
-        let _guard = self.seal_lock.write().expect("blob seal lock poisoned");
-        self.sealed.store(true, Ordering::SeqCst);
+    pub(super) fn close_writes(&self) {
+        let _guard = self.close_lock.write().expect("blob close lock poisoned");
+        self.closed.store(true, Ordering::SeqCst);
     }
 
-    pub(super) fn is_sealed(&self) -> bool {
-        self.sealed.load(Ordering::SeqCst)
+    pub(super) fn writes_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     pub(super) async fn drain_writes(&self, timeout: Duration) -> bool {

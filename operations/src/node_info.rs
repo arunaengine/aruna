@@ -188,7 +188,7 @@ async fn read_reservations(ctx: &DriverContext) -> Result<Vec<JobReservationReco
 
 /// Bounded logical admission demand this node observes: every request family it
 /// holds records for that is admitted and not terminal, with the group and
-/// resources its immutable spec sealed. Replicas deduplicate by family, so a
+/// resources its immutable spec stored. Replicas deduplicate by family, so a
 /// family several holders observe still counts once.
 ///
 /// Truncation is per group: a group that overflows the shared family budget is
@@ -313,7 +313,7 @@ fn projection_family(key: &Key) -> Result<JobFamilyId, String> {
     })
 }
 
-/// The group and sealed ceilings of one family, read from its immutable spec.
+/// The group and stored ceilings of one family, read from its immutable spec.
 async fn read_family_spec(
     ctx: &DriverContext,
     family: &JobFamilyId,
@@ -1663,12 +1663,12 @@ mod tests {
                 resources,
                 admitted_at_ms: 1_000,
             },
-            input_facts: Vec::new(),
+            captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             placement: PlacementRef::NIL,
         }
-        .seal()
-        .expect("spec seals");
+        .store_digest()
+        .expect("spec digest stored");
         JobRecordEnvelope::sign(
             realm_id,
             JobFamilyRecord::Spec(Box::new(spec)),

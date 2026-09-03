@@ -1392,7 +1392,7 @@ async fn keeps_storage_cause() {
     // The storage reason must reach the blob error, not be flattened into a
     // fixed message that hides why the transaction never started.
     let context = setup_blob_handle(4).await;
-    context.storage_handle.seal();
+    context.storage_handle.close_writes();
     let handler = context.blob_handle.handler.clone();
 
     let error = handler
@@ -1403,7 +1403,7 @@ async fn keeps_storage_cause() {
     assert!(
         error
             .to_string()
-            .contains(&StorageError::Sealed.to_string()),
+            .contains(&StorageError::Closed.to_string()),
         "storage cause missing: {error}"
     );
 }
@@ -2430,13 +2430,13 @@ fn group_effect(backend_id: Ulid) -> BlobEffect {
     }
 }
 
-// The seal stops new blob mutations before storage is sealed, so a restart
+// Closing the write path stops new blob mutations before storage closes, so a restart
 // cannot find a backend write whose location never reached storage.
 #[tokio::test]
-async fn seal_blocks_writes() {
+async fn close_blocks_writes() {
     let context = setup_blob_handle(64).await;
-    context.blob_handle.seal();
-    assert!(context.blob_handle.is_sealed());
+    context.blob_handle.close_writes();
+    assert!(context.blob_handle.writes_closed());
 
     let rejected = context
         .blob_handle
@@ -2444,11 +2444,11 @@ async fn seal_blocks_writes() {
         .await;
     assert!(matches!(
         rejected,
-        Event::Blob(BlobEvent::Error(BlobError::Sealed))
+        Event::Blob(BlobEvent::Error(BlobError::Closed))
     ));
     assert_eq!(context.blob_handle.rejected_writes(), 1);
 
-    // A non-mutating effect still runs after the seal.
+    // A non-mutating effect still runs after the close.
     let listed = context
         .blob_handle
         .send_blob_effect(BlobEffect::ListHidden {
@@ -2458,7 +2458,7 @@ async fn seal_blocks_writes() {
         .await;
     assert!(!matches!(
         listed,
-        Event::Blob(BlobEvent::Error(BlobError::Sealed))
+        Event::Blob(BlobEvent::Error(BlobError::Closed))
     ));
 }
 

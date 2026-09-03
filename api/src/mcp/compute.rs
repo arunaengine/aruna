@@ -562,7 +562,7 @@ fn result_outputs(
     serde_json::from_value(outputs.clone()).map_err(internal_error)
 }
 
-/// Adds the facts a caller needs to render an object: the stored content type,
+/// Adds the details a caller needs to render an object: the stored content type,
 /// the filename, and when the version was written. A version owned by another
 /// node keeps the type its key implies, since only its owner can be asked.
 async fn artifact_output(

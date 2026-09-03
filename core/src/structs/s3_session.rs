@@ -1,5 +1,7 @@
 use crate::auth::credential_hash;
-use crate::credential_seal::{CredentialSealKey, SealError, SealedS3Secret, credential_aad};
+use crate::credential_encryption::{
+    CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
+};
 use crate::errors::ConversionError;
 use crate::structs::{PathRestriction, UserAccess};
 use crate::types::{GroupId, UserId};
@@ -16,7 +18,7 @@ pub struct S3Session {
     pub access_key: String,
     pub user_identity: UserId,
     pub group_id: GroupId,
-    pub secret: SealedS3Secret,
+    pub secret: EncryptedS3Secret,
     pub token_hash: String,
     pub expiry: SystemTime,
     pub path_restrictions: Option<Vec<PathRestriction>>,
@@ -75,16 +77,16 @@ impl S3Session {
         )
     }
 
-    pub fn seal_secret(
+    pub fn encrypt_secret(
         &mut self,
-        key: &CredentialSealKey,
+        key: &CredentialEncryptionKey,
         plaintext: &str,
-    ) -> Result<(), SealError> {
-        self.secret = SealedS3Secret::seal(key, plaintext, &self.credential_aad())?;
+    ) -> Result<(), EncryptionError> {
+        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad())?;
         Ok(())
     }
 
-    pub fn open_secret(&self, key: &CredentialSealKey) -> Result<String, SealError> {
+    pub fn open_secret(&self, key: &CredentialEncryptionKey) -> Result<String, EncryptionError> {
         self.secret.open(key, &self.credential_aad())
     }
 
@@ -119,7 +121,7 @@ mod tests {
                 RealmId::from_bytes([1u8; 32]),
             ),
             group_id: Ulid::from_bytes([3u8; 16]),
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             token_hash: S3Session::hash_token("token"),
             expiry,
             path_restrictions: None,

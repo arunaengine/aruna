@@ -1,10 +1,10 @@
 //! Bounded bulk application of a bucket default to current heads.
 //!
-//! A run seals one `(bucket identity, generation, target refs)` target in its
+//! A run captures one `(bucket identity, generation, target refs)` target in its
 //! own transaction. Each object is minted through the same per-version
-//! sub-operation the single-object mutation uses, which re-reads the sealed
+//! sub-operation the single-object mutation uses, which re-reads the captured
 //! default, the head and the intent inside its commit boundary. The application
-//! is additive: it unions the sealed refs with the head re-read inside the mint
+//! is additive: it unions the captured refs with the head re-read inside the mint
 //! transaction, so applying a default never removes an object's constraints.
 
 use crate::blob::blob_keyspace_helper::HeadAliasContext;
@@ -12,7 +12,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::placement_policy::foreign_owner;
 use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
-    MintPolicySuccessorOperation, SealedDefault, SuccessorError, SuccessorOutcome, SuccessorPlan,
+    CapturedDefault, MintPolicySuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -64,7 +64,7 @@ pub struct BulkReport {
     pub generation: u64,
     pub target_refs: Vec<PlacementPolicyRef>,
     pub observed: usize,
-    /// Heads this pass needed no successor for: already sealed, a delete
+    /// Heads this pass needed no successor for: already stored, a delete
     /// marker, or an intent an earlier pass completed.
     pub covered: usize,
     pub minted: usize,
@@ -91,7 +91,7 @@ pub enum BulkError {
     /// A group-owned rule governs only its owner's buckets.
     #[error("placement policy {policy_id} belongs to another group")]
     ForeignPolicy { policy_id: Ulid },
-    #[error("the run was sealed against a different bucket record")]
+    #[error("the run was captured against a different bucket record")]
     BucketChanged,
     #[error("unexpected event during the bulk pass")]
     InvalidEvent,
@@ -102,10 +102,10 @@ enum BulkState {
     Init,
     Authorize,
     AuthorizeGroup,
-    StartSeal,
-    ReadSeal,
+    StartCapture,
+    ReadCapture,
     WriteRun,
-    CommitSeal,
+    CommitCapture,
     Resolve,
     ScanHeads,
     ReadVersions,
@@ -125,7 +125,7 @@ enum BulkState {
 
 /// Only the resolutions one object's mint may evaluate. A pass accumulates every
 /// page's resolutions, while one evaluation is bounded to the refs of that
-/// object and the sealed target.
+/// object and the captured target.
 fn mint_resolutions(
     resolved: &BTreeMap<Ulid, PolicyResolution>,
     refs: &[PlacementPolicyRef],
@@ -226,8 +226,8 @@ impl PolicyBulkOperation {
         ))]
     }
 
-    fn start_seal(&mut self) -> Effects {
-        self.state = BulkState::StartSeal;
+    fn start_capture(&mut self) -> Effects {
+        self.state = BulkState::StartCapture;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
@@ -256,11 +256,11 @@ impl PolicyBulkOperation {
         effects
     }
 
-    /// The run's own transaction: sealing, superseding and completion are all
+    /// The run's own transaction: capturing, superseding and completion are all
     /// compare-and-set writes against the row this pass just read.
-    fn read_seal(&mut self, txn_id: TxnId) -> Result<Effects, BulkError> {
+    fn read_capture(&mut self, txn_id: TxnId) -> Result<Effects, BulkError> {
         self.txn_id = Some(txn_id);
-        self.state = BulkState::ReadSeal;
+        self.state = BulkState::ReadCapture;
         Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
                 (
@@ -276,7 +276,7 @@ impl PolicyBulkOperation {
         })])
     }
 
-    fn handle_seal(&mut self, event: Event) -> Effects {
+    fn handle_capture(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.fail(BulkError::InvalidEvent);
         };
@@ -338,7 +338,7 @@ impl PolicyBulkOperation {
         self.run = Some(run);
         match self.txn_id {
             Some(txn_id) => {
-                self.state = BulkState::CommitSeal;
+                self.state = BulkState::CommitCapture;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             None => self.fail(BulkError::InvalidEvent),
@@ -360,8 +360,8 @@ impl PolicyBulkOperation {
         })]
     }
 
-    /// After the seal commits, the pass either stops or resolves its target.
-    fn after_seal(&mut self) -> Effects {
+    /// After the capture commits, the pass either stops or resolves its target.
+    fn after_capture(&mut self) -> Effects {
         self.txn_id = None;
         let stopped = self
             .run
@@ -510,7 +510,7 @@ impl PolicyBulkOperation {
         self.resolve_union()
     }
 
-    /// The union a mint seals also contains the refs the head already carries,
+    /// The union a mint stores also contains the refs the head already carries,
     /// so they have to be authenticated too before any of them may be evaluated.
     fn resolve_union(&mut self) -> Effects {
         let mut refs = Vec::new();
@@ -642,7 +642,7 @@ impl PolicyBulkOperation {
             auth_context: self.config.auth_context.clone(),
             subject: self.config.subject.clone(),
             resolved: mint_resolutions(&self.resolved, &candidate.refs, &run.target_refs),
-            sealed_default: Some(SealedDefault {
+            captured_default: Some(CapturedDefault {
                 generation: run.generation,
                 refs: run.target_refs.clone(),
             }),
@@ -802,7 +802,7 @@ impl Operation for PolicyBulkOperation {
                     return self.fail(BulkError::InvalidEvent);
                 };
                 match allowed {
-                    Ok(true) => self.start_seal(),
+                    Ok(true) => self.start_capture(),
                     // A group administrator governs that group's own buckets.
                     Ok(false) => {
                         self.state = BulkState::AuthorizeGroup;
@@ -823,7 +823,7 @@ impl Operation for PolicyBulkOperation {
                     return self.fail(BulkError::InvalidEvent);
                 };
                 match allowed {
-                    Ok(true) => self.start_seal(),
+                    Ok(true) => self.start_capture(),
                     Ok(false) => self.fail(BulkError::Unauthorized),
                     Err(error) => {
                         warn!(error = %error, "Bulk policy authorization check failed");
@@ -831,33 +831,33 @@ impl Operation for PolicyBulkOperation {
                     }
                 }
             }
-            BulkState::StartSeal => {
+            BulkState::StartCapture => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self.fail(BulkError::InvalidEvent);
                 };
-                match self.read_seal(txn_id) {
+                match self.read_capture(txn_id) {
                     Ok(effects) => effects,
                     Err(error) => self.fail(error),
                 }
             }
-            BulkState::ReadSeal => self.handle_seal(event),
+            BulkState::ReadCapture => self.handle_capture(event),
             BulkState::WriteRun => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
                     return self.fail(BulkError::InvalidEvent);
                 };
                 match self.txn_id {
                     Some(txn_id) => {
-                        self.state = BulkState::CommitSeal;
+                        self.state = BulkState::CommitCapture;
                         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                     }
                     None => self.fail(BulkError::InvalidEvent),
                 }
             }
-            BulkState::CommitSeal => {
+            BulkState::CommitCapture => {
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return self.fail(BulkError::InvalidEvent);
                 };
-                self.after_seal()
+                self.after_capture()
             }
             BulkState::Resolve => {
                 let Some(resolver) = self.resolver.as_mut() else {
@@ -1406,7 +1406,7 @@ mod tests {
         // A bucket deleted and recreated for another group must not stay under
         // the authority of the group this run authorized.
         let mut operation = PolicyBulkOperation::new(bulk_config(Ulid::generate()));
-        operation.state = BulkState::ReadSeal;
+        operation.state = BulkState::ReadCapture;
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -1851,14 +1851,14 @@ mod tests {
         let sliced = super::mint_resolutions(&resolved, &object, &target);
 
         assert_eq!(sliced.len(), 3);
-        let mut sealed = object.clone();
-        sealed.extend(target);
+        let mut union = object.clone();
+        union.extend(target);
         assert!(!matches!(
-            evaluate_placement(&sealed, &sliced, &subject(node_id, "eu-west")),
+            evaluate_placement(&union, &sliced, &subject(node_id, "eu-west")),
             PlacementDecision::InvalidInput { .. }
         ));
         assert!(matches!(
-            evaluate_placement(&sealed, &resolved, &subject(node_id, "eu-west")),
+            evaluate_placement(&union, &resolved, &subject(node_id, "eu-west")),
             PlacementDecision::InvalidInput { .. }
         ));
     }

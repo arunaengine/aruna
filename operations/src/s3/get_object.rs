@@ -216,7 +216,7 @@ pub struct GetObjectResult {
     pub composite_hashes: HashMap<String, Vec<u8>>,
     pub part_count: Option<usize>,
     pub resolved_range: Option<ResolvedObjectRange>,
-    /// Refs sealed on the version that was read. A copy unions them with its
+    /// Refs stored on the version that was read. A copy unions them with its
     /// destination default, so a copy is never less constrained than its source.
     pub source_policies: Vec<PlacementPolicyRef>,
 }

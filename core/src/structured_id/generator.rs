@@ -150,7 +150,7 @@ impl<E: IdEnvironment> StructuredIdGenerator<E> {
         bucket: BucketId,
     ) -> Result<T, ClockHealthError> {
         let value = self.next_value(handle.get(), bucket.get())?;
-        Ok(T::from_ulid(Ulid(value), super::sealed::new()))
+        Ok(T::from_ulid(Ulid(value), super::private::new()))
     }
 
     fn validated_now_ms(&mut self) -> Result<u64, ClockHealthError> {

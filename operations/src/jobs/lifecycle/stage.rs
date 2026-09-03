@@ -1,10 +1,10 @@
-//! Cross-node staging of one sealed input version.
+//! Cross-node staging of one stored input version.
 //!
 //! The target may not hold the bytes an execution needs. It then reads them
 //! from a legal holder through the managed-copy handshake, which challenges a
 //! policy-unaware request, teaches the refs, and retries only once this node's
 //! own destination subject complies. The bytes land through the ordinary
-//! policy-gated workspace write, verified against the sealed hash.
+//! policy-gated workspace write, verified against the stored hash.
 
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
@@ -26,7 +26,7 @@ pub struct StagedInput {
 
 /// Reads one exact input version from a legal holder. Holders are tried in
 /// canonical order and a missing or corrupt source moves to the next one
-/// without ever changing the sealed input.
+/// without ever changing the stored input.
 pub async fn stage_remote_input(
     context: &DriverContext,
     record: &JobRecord,

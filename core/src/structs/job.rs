@@ -249,7 +249,7 @@ pub enum InputSource {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSelection {
     pub source: InputSource,
-    /// Node-local endpoint that owns the source object once the job is sealed.
+    /// Node-local endpoint that owns the source object once the job is stored.
     pub source_node_id: Option<crate::NodeId>,
     /// Input name, unique across the run; nothing copies it into a bucket.
     pub dest_key: String,
@@ -272,7 +272,7 @@ pub struct OutputSelection {
     /// Literal ancestor stripped from every matched path to build the
     /// destination key. Required with wildcards, absent otherwise.
     pub path_prefix: Option<String>,
-    /// Node-local endpoint that owns the destination once the job is sealed.
+    /// Node-local endpoint that owns the destination once the job is stored.
     pub destination_node_id: Option<crate::NodeId>,
     pub destination: OutputDestination,
     pub name: Option<String>,
@@ -326,10 +326,10 @@ pub struct ExecutionSpec {
     pub collision_policy: CollisionPolicy,
 }
 
-/// Exact source facts resolved at ingress and carried into the sealed job
+/// Exact source details resolved at ingress and carried into the stored job
 /// spec, so a forwarded planner never reinterprets a bucket on its own node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobInputFact {
+pub struct CapturedInput {
     pub destination_key: String,
     pub source_node_id: crate::NodeId,
     pub version_id: Ulid,
@@ -1335,8 +1335,8 @@ pub struct JobRecord {
     /// The caller's bucket an `Existing`-mode run works inside.
     pub workspace_bucket: Option<String>,
     pub workspace_mode: WorkspaceMode,
-    /// Resolved source facts copied from the sealed family for physical staging.
-    pub input_facts: Vec<JobInputFact>,
+    /// Resolved source details copied from the stored family for physical staging.
+    pub captured_inputs: Vec<CapturedInput>,
     pub report_digest: Option<[u8; 32]>,
     pub retention_ms: u64,
     /// Local attempts are spent without job-specific evidence: no further attempt
@@ -1383,7 +1383,7 @@ impl JobRecord {
             attempt_intent: None,
             workspace_bucket: None,
             workspace_mode: WorkspaceMode::default(),
-            input_facts: Vec::new(),
+            captured_inputs: Vec::new(),
             report_digest: None,
             retention_ms: DEFAULT_JOB_RETENTION_MS,
             locally_exhausted: false,
@@ -1785,9 +1785,9 @@ pub enum JobContractError {
     EmptyRetry,
     #[error("launch belongs to another witness budget")]
     BudgetMismatch,
-    #[error("launch sequence {sequence} is outside the sealed budget of {max_launches}")]
+    #[error("launch sequence {sequence} is outside the stored budget of {max_launches}")]
     BudgetExhausted { sequence: u32, max_launches: u32 },
-    #[error("launch spec digest does not match the sealed source spec digest")]
+    #[error("launch spec digest does not match the stored source spec digest")]
     SpecMismatch,
 }
 
@@ -1821,7 +1821,7 @@ pub enum JobRecordError {
     EvidenceMismatch(JobRecordKind),
     #[error("record's own embedded fields contradict each other")]
     Inconsistent,
-    #[error("caller is not authorized against the sealed job spec")]
+    #[error("caller is not authorized against the stored job spec")]
     Unauthorized,
     #[error("job record key must be {JOB_RECORD_KEY_BYTES} bytes naming a known kind")]
     MalformedKey,
@@ -1835,7 +1835,7 @@ pub enum JobRecordError {
     ChainConflict { sequence: u64 },
 }
 
-/// Per-witness launch bound sealed into the immutable spec.
+/// Per-witness launch bound stored in the immutable spec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRetryPolicy {
     /// Includes the initial launch and is at least one.
@@ -1898,7 +1898,7 @@ pub struct LogicalJobSpec {
     pub retention_ms: u64,
     pub retry: JobRetryPolicy,
     pub admission: JobAdmissionRecord,
-    pub input_facts: Vec<JobInputFact>,
+    pub captured_inputs: Vec<CapturedInput>,
     pub output_policies: Vec<PlacementPolicyRef>,
     /// Family placement derived from `submission_id`, never from the alias bucket.
     pub placement: PlacementRef,
@@ -1906,12 +1906,12 @@ pub struct LogicalJobSpec {
 
 impl LogicalJobSpec {
     /// Fills the self-referential `spec_digest` from the record's canonical bytes.
-    pub fn seal(mut self) -> Result<Self, JobRecordError> {
+    pub fn store_digest(mut self) -> Result<Self, JobRecordError> {
         self.spec_digest = self.digest()?;
         Ok(self)
     }
 
-    /// Fails when the sealed digest does not reproduce from the record itself.
+    /// Fails when the stored digest does not reproduce from the record itself.
     pub fn verify_digest(&self) -> Result<(), JobRecordError> {
         match self.spec_digest == self.digest()? {
             true => Ok(()),
@@ -1959,7 +1959,7 @@ impl SubmissionClaim {
     }
 }
 
-/// Lifetime launch bound one scheduler seals before it first plans a request.
+/// Lifetime launch bound one scheduler stores before it first plans a request.
 /// A later realm-config or alias change can never reset or widen it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessBudgetRecord {
@@ -1971,7 +1971,7 @@ pub struct WitnessBudgetRecord {
 }
 
 impl WitnessBudgetRecord {
-    /// A launch is actionable only inside the budget its own scheduler sealed.
+    /// A launch is actionable only inside the budget its own scheduler stored.
     pub fn admits(&self, launch: &LaunchIntent) -> Result<(), JobContractError> {
         if self.submission_id != launch.submission_id
             || self.request_digest != launch.request_digest
@@ -2159,7 +2159,7 @@ impl TryFrom<Vec<OutputObject>> for OutputSet {
     }
 }
 
-/// Terminal facts of one physical execution. Outputs are not embedded here: a
+/// Terminal result of one physical execution. Outputs are not embedded here: a
 /// success names the digest of its separately published output record, so that
 /// record must already be durable before success can be projected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2200,12 +2200,12 @@ pub struct ExecutionOutputRecord {
 }
 
 /// Token-free evidence of how the publishing node authorized the caller against
-/// the sealed spec. Bearer tokens never replicate.
+/// the stored spec. Bearer tokens never replicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancelAuthority {
-    /// The caller is the sealed submitter; every holder rechecks this alone.
+    /// The caller is the stored submitter; every holder rechecks this alone.
     Submitter,
-    /// The publishing node checked cancel permission on the sealed group when it
+    /// The publishing node checked cancel permission on the stored group when it
     /// published the record, and its envelope signature is that statement.
     GroupAdmin,
 }
@@ -2218,7 +2218,7 @@ pub struct JobCancelRecord {
     pub submission_id: SubmissionId,
     pub request_digest: [u8; 32],
     pub job_id: JobId,
-    /// Sealed spec the caller's authorization was evaluated against.
+    /// Stored spec the caller's authorization was evaluated against.
     pub spec_digest: [u8; 32],
     pub requested_by: UserId,
     pub authority: CancelAuthority,
@@ -2639,7 +2639,7 @@ pub struct LocalExecution {
     pub execution_id: Ulid,
     /// Local attempt fence digest standing in for the receipt digest.
     pub fence_digest: [u8; 32],
-    /// Local plan digest standing in for the sealed spec digest.
+    /// Local plan digest standing in for the stored spec digest.
     pub spec_digest: [u8; 32],
 }
 
@@ -2825,7 +2825,7 @@ impl JobRecordEnvelope {
         if spec.realm_id != context.realm_id {
             return Err(JobRecordError::RealmMismatch);
         }
-        // The sealed submitter is the authority every later round re-checks, so
+        // The stored submitter is the authority every later round re-checks, so
         // it must belong to the realm the record was published in.
         if spec.created_by.realm_id != spec.realm_id {
             return Err(JobRecordError::Unauthorized);
@@ -2984,7 +2984,7 @@ impl JobRecordEnvelope {
         let Some(receipt) = context.receipt else {
             return Ok(self.local_output(output, context));
         };
-        // The exact receipt digest seals the target's membership and subject
+        // The exact receipt digest covers the target's membership and subject
         // generations, so binding to it binds the epoch the work was accepted in.
         match output.execution_id == receipt.execution_id
             && output.executor_node_id == receipt.executor_node_id
@@ -3018,7 +3018,7 @@ impl JobRecordEnvelope {
         }
     }
 
-    /// Cancellation authority is defined against the sealed spec, so the spec is
+    /// Cancellation authority is defined against the stored spec, so the spec is
     /// required evidence, the publisher is the family holder that checked the
     /// caller's permission, and no bearer token ever replicates.
     fn verify_cancel(
@@ -3747,12 +3747,12 @@ mod tests {
                 max_launches_per_witness: 3,
             },
             admission: sample_admission(),
-            input_facts: Vec::new(),
+            captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             placement: placement(),
         }
-        .seal()
-        .expect("spec seals")
+        .store_digest()
+        .expect("spec digest stored")
     }
 
     fn spec_digest() -> [u8; 32] {
@@ -4007,7 +4007,7 @@ mod tests {
     }
 
     #[test]
-    fn admits_sealed_launch() {
+    fn admits_stored_launch() {
         let budget = sample_budget();
         assert_eq!(budget.admits(&sample_launch()), Ok(()));
 
@@ -4191,7 +4191,7 @@ mod tests {
         );
         let mut spec = sample_spec();
         spec.realm_id = RealmId([99u8; 32]);
-        let spec = spec.seal().unwrap();
+        let spec = spec.store_digest().unwrap();
         assert_eq!(
             envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&view.context()),
             Err(JobRecordError::RealmMismatch)
@@ -4203,7 +4203,7 @@ mod tests {
         let view = LocalView::new();
         let mut spec = sample_spec();
         spec.placement = PlacementRef::NIL;
-        let spec = spec.seal().unwrap();
+        let spec = spec.store_digest().unwrap();
         assert_eq!(
             envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&view.context()),
             Err(JobRecordError::PlacementMismatch)
@@ -4232,7 +4232,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_sealed_budget() {
+    fn bounds_stored_budget() {
         let view = LocalView::new();
         let budget = sample_budget();
         let spec = sample_spec();
@@ -4260,7 +4260,7 @@ mod tests {
 
     #[test]
     fn cancel_needs_spec() {
-        // Cancellation authority is defined only against the sealed spec.
+        // Cancellation authority is defined only against the stored spec.
         let view = LocalView::new();
         let signed = envelope(JobFamilyRecord::Cancel(sample_cancel()), 1);
         assert_eq!(

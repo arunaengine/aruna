@@ -1123,7 +1123,7 @@ async fn mint_books_bytes() {
             subject,
             resolved: BTreeMap::new(),
             intent: None,
-            sealed_default: None,
+            captured_default: None,
         }),
         &h.driver,
     )

@@ -1022,7 +1022,7 @@ async fn restart_preserves_outbox() -> TestResult<()> {
     Ok(())
 }
 
-/// SIGTERM must join the tracked core publisher before storage sealing.
+/// SIGTERM must join the tracked core publisher before storage closes.
 #[tokio::test]
 async fn sigterm_joins_core() -> TestResult<()> {
     use std::os::unix::process::ExitStatusExt;
@@ -1053,7 +1053,7 @@ async fn sigterm_joins_core() -> TestResult<()> {
         .find("Shutdown complete")
         .expect("shutdown completion missing");
     assert!(joined < background && background < complete, "{logs}");
-    assert!(!logs.contains("storage.write.after_seal"), "{logs}");
+    assert!(!logs.contains("storage.write.after_close"), "{logs}");
     assert!(!logs.contains("storage.write.after_fence"), "{logs}");
     assert!(logs.contains("rejected_writes=0"), "{logs}");
     Ok(())
@@ -1102,8 +1102,8 @@ fn assert_shutdown(logs: &str) {
     let background = logs
         .find("phase=\"background\"")
         .unwrap_or_else(|| panic!("background phase missing\n{logs}"));
-    // Completion is logged only after storage seal and final sync.
-    let sealed = logs
+    // Completion is logged only after the storage close and final sync.
+    let closed = logs
         .find("Shutdown complete")
         .expect("shutdown must finish after storage sync");
     assert!(
@@ -1111,16 +1111,16 @@ fn assert_shutdown(logs: &str) {
             && draining < recovery
             && outbox < tasks
             && recovery < background
-            && outbox < sealed
-            && recovery < sealed
-            && background < sealed,
+            && outbox < closed
+            && recovery < closed
+            && background < closed,
         "{logs}"
     );
     assert!(
         !logs.contains("Background children failed to drain before shutdown continued"),
         "{logs}"
     );
-    assert!(!logs.contains("storage.write.after_seal"), "{logs}");
+    assert!(!logs.contains("storage.write.after_close"), "{logs}");
     assert!(!logs.contains("storage.write.after_fence"), "{logs}");
     assert!(logs.contains("rejected_writes=0"), "{logs}");
 }

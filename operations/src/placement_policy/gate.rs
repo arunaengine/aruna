@@ -178,7 +178,7 @@ impl PolicyGateOperation {
 
 type ResolveResult = Result<super::resolve::ResolvedPolicy, ReadPolicyError>;
 
-/// The destination facts a governed write or serve is evaluated against.
+/// The destination details a governed write or serve is evaluated against.
 /// Absent means this node advertises no subject, so nothing governed may be
 /// materialized or served here.
 #[derive(Clone, Debug, PartialEq)]
@@ -275,7 +275,7 @@ pub fn gate_decision(outcome: PolicyGateOutcome) -> Result<(), PolicyGateError> 
     }
 }
 
-/// The destination facts the gate decided on. A change between the gate and the
+/// The destination details the gate decided on. A change between the gate and the
 /// exposing transaction means the copy would commit refs nothing evaluated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GatedBucket {
@@ -299,16 +299,16 @@ impl GatedBucket {
         }
     }
 
-    /// Seals the subject the gate decided under. Only a governed write has one.
-    pub fn sealed_under(mut self, context: Option<&GateContext>, governed: bool) -> Self {
+    /// Stores the subject the gate decided under. Only a governed write has one.
+    pub fn stored_under(mut self, context: Option<&GateContext>, governed: bool) -> Self {
         self.subject_generation = governed
             .then(|| context.map(|c| c.subject.generation))
             .flatten();
         self
     }
 
-    /// True when the destination facts the gate decided on still hold. The
-    /// sealed subject is checked separately, against the live subject row.
+    /// True when the destination details the gate decided on still hold. The
+    /// stored subject is checked separately, against the live subject row.
     pub fn matches(&self, observed: &Self) -> bool {
         self.identity == observed.identity
             && self.generation == observed.generation
@@ -322,12 +322,12 @@ impl GatedBucket {
         &self,
         observed: Option<&NodeSubjectRecord>,
     ) -> Result<(), PolicyGateError> {
-        let Some(sealed) = self.subject_generation else {
+        let Some(stored) = self.subject_generation else {
             return Ok(());
         };
         match observed {
             Some(record)
-                if record.subject.generation == sealed
+                if record.subject.generation == stored
                     && !record.serving_blocked
                     && !record.policy_draining =>
             {
@@ -339,7 +339,7 @@ impl GatedBucket {
 }
 
 /// Reads the destination bucket and the local subject in one round trip, so the
-/// exposing transaction re-checks every fact the gate decided on.
+/// exposing transaction re-checks every value the gate decided on.
 pub fn drift_reads(bucket: &str, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::BatchRead {
         reads: vec![
@@ -675,10 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn sealed_subject_must_hold() {
+    fn subject_must_hold() {
         // The subject that admitted the write must still be the one advertised
         // when the exposing transaction runs.
-        let gated = GatedBucket::observe(None).sealed_under(Some(&context("eu-west")), true);
+        let gated = GatedBucket::observe(None).stored_under(Some(&context("eu-west")), true);
         let record =
             aruna_core::structs::NodeSubjectRecord::seed(subject("eu-west")).expect("subject");
         assert_eq!(gated.check_subject(Some(&record)), Ok(()));
@@ -719,7 +719,7 @@ mod tests {
     fn ungoverned_ignores_subject() {
         // Nothing evaluated an ungoverned write, so no subject change can
         // invalidate it.
-        let gated = GatedBucket::observe(None).sealed_under(None, false);
+        let gated = GatedBucket::observe(None).stored_under(None, false);
         assert_eq!(gated.check_subject(None), Ok(()));
     }
 

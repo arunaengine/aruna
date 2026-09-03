@@ -16,10 +16,10 @@ use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    AuthContext, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobInputFact, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec,
-    LogicalJobState, OutputDestination, Permission, RealmConfigDocument, SubmissionClaim,
-    SubmissionId, WorkspaceMode, blob_group_permission_path,
+    AuthContext, CapturedInput, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
+    JobId, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+    OutputDestination, Permission, RealmConfigDocument, SubmissionClaim, SubmissionId,
+    WorkspaceMode, blob_group_permission_path,
 };
 use aruna_core::types::{NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -32,7 +32,7 @@ use super::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission,
 };
 use super::ids::{
-    RequestIdentity, SubmissionRequest, SubmissionScope, effective_resources, seal_workspace,
+    RequestIdentity, SubmissionRequest, SubmissionScope, effective_resources, store_workspace,
 };
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
@@ -53,7 +53,7 @@ use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
-/// sealed into the immutable spec, so a later config change cannot widen it.
+/// stored in the immutable spec, so a later config change cannot widen it.
 pub const MAX_LAUNCHES_PER_WITNESS: u32 = 3;
 
 /// What the caller learns about an accepted submission.
@@ -110,7 +110,7 @@ pub async fn submit_external_job(
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
-    seal_workspace(&mut spec, workspace_mode, workspace_bucket.clone())
+    store_workspace(&mut spec, workspace_mode, workspace_bucket.clone())
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     ids::required_labels(&spec)
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
@@ -126,20 +126,20 @@ pub async fn submit_external_job(
             scope,
             retention_ms,
             ingress_node_id: local,
-            input_facts: Vec::new(),
+            captured_inputs: Vec::new(),
             output_policies: Vec::new(),
         };
         return forward_device(context, request, &config, local, auth_token).await;
     }
     pin_outputs(&mut spec, local);
-    let (input_facts, output_policies) = resolve_facts(context, &spec, local).await?;
+    let (captured_inputs, output_policies) = resolve_inputs(context, &spec, local).await?;
     let request = SubmissionRequest {
         created_by,
         spec,
         scope,
         retention_ms,
         ingress_node_id: local,
-        input_facts,
+        captured_inputs,
         output_policies,
     };
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
@@ -223,20 +223,20 @@ fn input_reference(bucket: &str, key: &str, version_id: Option<&str>) -> String 
     }
 }
 
-/// Resolve node-local names once at ingress. The resulting facts are sealed in
+/// Resolve node-local names once at ingress. The resulting values are stored in
 /// the family spec and remain valid when admission or planning is forwarded.
-async fn resolve_facts(
+async fn resolve_inputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     local: NodeId,
 ) -> Result<
     (
-        Vec<JobInputFact>,
+        Vec<CapturedInput>,
         Vec<aruna_core::structs::PlacementPolicyRef>,
     ),
     SubmitJobError,
 > {
-    let mut input_facts = Vec::with_capacity(spec.inputs.len());
+    let mut captured_inputs = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
         let aruna_core::structs::InputSource::S3 {
             bucket,
@@ -309,7 +309,7 @@ async fn resolve_facts(
             &head.source_policies,
         )
         .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
-        input_facts.push(JobInputFact {
+        captured_inputs.push(CapturedInput {
             destination_key: input.dest_key.clone(),
             source_node_id: local,
             version_id: version,
@@ -355,7 +355,7 @@ async fn resolve_facts(
     }
     output_policies = aruna_core::structs::PlacementPolicyRef::canonical_set(&output_policies)
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-    Ok((input_facts, output_policies))
+    Ok((captured_inputs, output_policies))
 }
 
 /// The realm config this node synchronized plus its own identity.
@@ -434,11 +434,11 @@ async fn admit_here(
             resources: effective_resources(&request.spec),
             admitted_at_ms: now_ms,
         },
-        input_facts: request.input_facts.clone(),
+        captured_inputs: request.captured_inputs.clone(),
         output_policies: request.output_policies.clone(),
         placement,
     }
-    .seal()
+    .store_digest()
     .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     let claim = SubmissionClaim {
         submission_id: identity.submission_id,
@@ -759,19 +759,19 @@ async fn admit_forwarded(
         }
         false => peer,
     };
-    if request.input_facts.len() != request.spec.inputs.len()
-        || request.input_facts.iter().any(|fact| {
+    if request.captured_inputs.len() != request.spec.inputs.len()
+        || request.captured_inputs.iter().any(|captured| {
             !request
                 .spec
                 .inputs
                 .iter()
-                .any(|input| input.dest_key == fact.destination_key)
+                .any(|input| input.dest_key == captured.destination_key)
         })
         || request.ingress_node_id != ingress
         || request
-            .input_facts
+            .captured_inputs
             .iter()
-            .any(|fact| fact.source_node_id != request.ingress_node_id)
+            .any(|captured| captured.source_node_id != request.ingress_node_id)
         || request
             .spec
             .file_outputs
@@ -820,10 +820,10 @@ async fn pin_device_request(
     local: NodeId,
 ) -> Result<(), SubmissionRefusal> {
     pin_outputs(&mut request.spec, local);
-    let (input_facts, output_policies) = resolve_facts(context, &request.spec, local)
+    let (captured_inputs, output_policies) = resolve_inputs(context, &request.spec, local)
         .await
         .map_err(refusal_of)?;
-    request.input_facts = input_facts;
+    request.captured_inputs = captured_inputs;
     request.output_policies = output_policies;
     request.ingress_node_id = local;
     Ok(())
@@ -1042,12 +1042,12 @@ mod tests {
             container_path: "/out/extra.txt".to_string(),
             dest_key: "extra.txt".to_string(),
         });
-        seal_workspace(
+        store_workspace(
             &mut spec,
             WorkspaceMode::Existing,
             Some("results".to_string()),
         )
-        .expect("workspace seals");
+        .expect("workspace stored");
 
         pin_outputs(&mut spec, node(1));
 

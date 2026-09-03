@@ -10,8 +10,8 @@ use aruna_core::compute::{
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AttemptControl, AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputMode,
-    InputSelection, InputSource, JobError, JobInputFact, JobRecord, MAX_EXECUTION_OUTPUTS,
+    AttemptControl, AuthContext, BackendLocation, BucketInfo, CapturedInput, ExecutionSpec,
+    InputMode, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
     OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject, OutputSelection, PathRestriction,
     Permission, PlacementPolicyRef, UserAccess, VersionedObjectArn, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
@@ -218,12 +218,12 @@ async fn mint_credential(
     let access_key = UserAccess::build_access_key(&key_id).map_err(|error| {
         JobError::permanent(format!("workspace credential key failed: {error}"))
     })?;
-    // The credential is issued and consumed on this node, so its secret seals
-    // and unseals with this node's issuer-local key.
-    let seal_key = context
+    // The credential is issued and consumed on this node, so its secret is
+    // encrypted and decrypted with this node's issuer-local key.
+    let encryption_key = context
         .net_handle
         .as_ref()
-        .map(|net| net.credential_seal_key())
+        .map(|net| net.credential_encryption_key())
         .ok_or_else(|| JobError::permanent("workspace credential needs a net handle"))?;
     match Box::pin(drive(
         GetUserAccessOperation::new(access_key.clone()),
@@ -241,8 +241,8 @@ async fn mint_credential(
                 return Err(JobError::permanent("workspace credential is invalid"));
             }
             if !access.is_expired(SystemTime::now()) {
-                let secret = access.open_secret(&seal_key).map_err(|error| {
-                    JobError::permanent(format!("workspace credential unseal failed: {error}"))
+                let secret = access.open_secret(&encryption_key).map_err(|error| {
+                    JobError::permanent(format!("workspace credential decryption failed: {error}"))
                 })?;
                 return Ok(WorkspaceCredential {
                     access_key: access.access_key,
@@ -278,7 +278,7 @@ async fn mint_credential(
                 issued_by: *node_id.as_bytes(),
             },
             key_id,
-            seal_key,
+            encryption_key,
         ),
         context,
     ))
@@ -476,7 +476,7 @@ pub async fn load_direct_inputs(
 }
 
 /// The bytes of one input: the local copy when this node holds it, and the exact
-/// sealed version from a legal holder when it does not.
+/// stored version from a legal holder when it does not.
 async fn input_bytes(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -485,21 +485,21 @@ async fn input_bytes(
     input: &InputSelection,
     source: &SourceObject,
 ) -> Result<StagedSource, JobError> {
-    let fact = || {
+    let captured = || {
         record
-            .input_facts
+            .captured_inputs
             .iter()
-            .find(|fact| fact.destination_key == input.dest_key)
+            .find(|captured| captured.destination_key == input.dest_key)
     };
     // A forwarded plan validated the source at its ingress endpoint already; a
     // device plans nothing, so its own request is the only authority it has.
     if let Some(remote) = input.source_node_id.filter(|remote| *remote != node_id) {
-        return match fact() {
-            Some(fact) => Box::pin(remote_source(context, record, input, fact)).await,
+        return match captured() {
+            Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin)).await,
             None if local_is_user(context, record.created_by.realm_id).await => {
                 Box::pin(device_source(context, record, input, remote)).await
             }
-            None => Err(JobError::permanent("sealed input facts are missing")),
+            None => Err(JobError::permanent("captured inputs are missing")),
         };
     }
     Box::pin(authorize_source(context, spec, record, node_id, source)).await?;
@@ -519,15 +519,15 @@ async fn input_bytes(
     .and_then(|result| result.transpose());
     match local {
         Ok(Some(get)) => Ok(StagedSource::from_local(get)),
-        Ok(None) => match fact() {
-            Some(fact) => Box::pin(remote_source(context, record, input, fact)).await,
+        Ok(None) => match captured() {
+            Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin)).await,
             None => Err(JobError::permanent(format!(
                 "input {}/{} not found",
                 source.bucket, source.key
             ))),
         },
-        Err(error) => match fact() {
-            Some(fact) => Box::pin(remote_source(context, record, input, fact))
+        Err(error) => match captured() {
+            Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin))
                 .await
                 .map_err(|_| source_input_error(error)),
             None => Err(source_input_error(error)),
@@ -607,7 +607,7 @@ pub async fn capture_outputs(
 }
 
 /// Union of the refs every input carries, so an output can never be less
-/// constrained than what produced it. The refs come from the sealed facts, so a
+/// constrained than what produced it. The refs come from the captured inputs, so a
 /// node that holds no copy of an input still inherits its constraints.
 async fn input_policies(
     context: &DriverContext,
@@ -617,17 +617,17 @@ async fn input_policies(
     let mut refs = Vec::new();
     for input in &spec.inputs {
         match record
-            .input_facts
+            .captured_inputs
             .iter()
-            .find(|fact| fact.destination_key == input.dest_key)
+            .find(|captured| captured.destination_key == input.dest_key)
         {
-            Some(fact) => refs.extend(fact.policies.iter().copied()),
-            // A device seals no facts and may never read governed content, so
+            Some(captured) => refs.extend(captured.policies.iter().copied()),
+            // A device captures no inputs and may never read governed content, so
             // its inputs carry none; a realm node must not guess them.
             None if local_is_user(context, record.created_by.realm_id).await => {}
             None => {
                 return Err(JobError::permanent(format!(
-                    "input `{}` has no sealed facts to inherit refs from",
+                    "input `{}` has no captured inputs to inherit refs from",
                     input.dest_key
                 )));
             }
@@ -1088,13 +1088,13 @@ impl StagedSource {
     }
 }
 
-/// Stages one exact version from a legal holder. The sealed version and hash
+/// Stages one exact version from a legal holder. The stored version and hash
 /// are resolved first, so a remote read can never substitute other bytes.
 async fn remote_source(
     context: &DriverContext,
     record: &JobRecord,
     input: &InputSelection,
-    fact: &JobInputFact,
+    captured: &CapturedInput,
 ) -> Result<StagedSource, JobError> {
     let version = match &input.source {
         InputSource::S3 { version_id, .. } => version_id
@@ -1103,28 +1103,29 @@ async fn remote_source(
             .transpose()
             .map_err(|_| JobError::permanent("input version is invalid".to_string()))?,
     };
-    if version != Some(fact.version_id) || input.source_node_id != Some(fact.source_node_id) {
+    if version != Some(captured.version_id) || input.source_node_id != Some(captured.source_node_id)
+    {
         return Err(JobError::permanent(
-            "sealed remote input facts do not match the physical input".to_string(),
+            "captured remote input does not match the physical input".to_string(),
         ));
     }
     let staged = crate::jobs::lifecycle::stage::stage_remote_input(
         context,
         record,
         input,
-        fact.version_id,
-        fact.blake3,
+        captured.version_id,
+        captured.blake3,
     )
     .await?;
-    if staged.size != fact.bytes {
+    if staged.size != captured.bytes {
         return Err(JobError::permanent(
-            "staged input size differs from the sealed fact".to_string(),
+            "staged input size differs from the captured input".to_string(),
         ));
     }
     Ok(StagedSource {
         blob: staged.blob,
         location: None,
-        size: Some(fact.bytes),
+        size: Some(captured.bytes),
     })
 }
 
@@ -1965,8 +1966,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_foreign_seal() {
-        // A secret sealed by another node's key must refuse to be reused rather
+    async fn rejects_foreign_key() {
+        // A secret encrypted with another node's key must refuse to be reused rather
         // than hand the container an unusable or wrong secret.
         let CredentialFixture {
             context,
@@ -1990,8 +1991,8 @@ mod tests {
         .unwrap()
         .unwrap();
         access
-            .seal_secret(
-                &aruna_core::credential_seal::CredentialSealKey::random(),
+            .encrypt_secret(
+                &aruna_core::credential_encryption::CredentialEncryptionKey::random(),
                 "foreign",
             )
             .unwrap();
@@ -2008,14 +2009,14 @@ mod tests {
         let Err(error) =
             mint_workspace_credential(&context, &spec, &record, node_id, &bucket).await
         else {
-            panic!("a foreign seal must not yield a credential")
+            panic!("a foreign key must not yield a credential")
         };
 
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
         assert!(
             error
                 .message
-                .starts_with("workspace credential unseal failed")
+                .starts_with("workspace credential decryption failed")
         );
         net.shutdown().await;
     }
@@ -2056,7 +2057,7 @@ mod tests {
         let Err(within) =
             mint_input_credential(&context, &spec, &record, node_id, &buckets(25)).await
         else {
-            panic!("a credential cannot be sealed without a net handle")
+            panic!("a credential cannot be encrypted without a net handle")
         };
         assert_eq!(within.message, "workspace credential needs a net handle");
 
@@ -2074,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_sealed_versions() {
+    fn detects_pinned_versions() {
         // The pin is what routes a mounted job to staged delivery, so an
         // unpinned input must keep its mount and a pinned one must not.
         let mut spec = spec(Vec::new());
@@ -2101,9 +2102,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inherits_sealed_refs() {
+    async fn inherits_effective_refs() {
         // A node that holds no copy of the input must still inherit its refs,
-        // so they come from the sealed facts and a missing fact fails closed.
+        // so they come from the captured inputs and a missing one fails closed.
         let version = Ulid::from_bytes([7; 16]);
         let mut spec = spec(Vec::new());
         spec.inputs.push(InputSelection {
@@ -2147,7 +2148,7 @@ mod tests {
             policy_id: Ulid::from_bytes([5; 16]),
             digest: [6; 32],
         };
-        record.input_facts.push(JobInputFact {
+        record.captured_inputs.push(CapturedInput {
             destination_key: "in/data.csv".to_string(),
             source_node_id: node_id,
             version_id: version,

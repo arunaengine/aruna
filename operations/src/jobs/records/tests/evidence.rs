@@ -196,7 +196,7 @@ async fn admits_late_update() {
 
 #[tokio::test]
 async fn admits_late_output() {
-    // The receipt an output is sealed against sorts after the filler run.
+    // The receipt an output is stored against sorts after the filler run.
     let family = Family::new([24u8; 32]);
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;
     let spec = family.spec();
@@ -221,7 +221,7 @@ async fn admits_late_output() {
 #[tokio::test]
 async fn pages_receipt_kind() {
     // A launch whose scheduler this view no longer ranks as a holder is
-    // authentic only through the receipt that sealed it, and that receipt lies
+    // authentic only through the receipt that stored it, and that receipt lies
     // on a later page of its own kind.
     let mut family = Family::new([25u8; 32]);
     family.config.ensure_node(node(7), RealmNodeKind::Server);
@@ -233,7 +233,7 @@ async fn pages_receipt_kind() {
     let mut receipt = family.receipt(&launch, 1);
     receipt.execution_id = Ulid::from_bytes([0xffu8; 16]);
 
-    // The fillers seal a different launch, so only the receipt seeded later
+    // The fillers store a different launch, so only the receipt seeded later
     // can authenticate the offered one.
     let mut other = family.launch(&spec, scheduler.public(), 1);
     other.launch_id = Ulid::from_bytes([0x66u8; 16]);

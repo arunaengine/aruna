@@ -48,9 +48,9 @@ fn pends_then_admits() {
     assert!(plan.admitted.is_empty());
 
     let retained: Vec<(JobRecordKey, PendingRecord)> = plan.pending;
-    let sealed = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(spec)));
+    let signed = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(spec)));
     let (admission, plan) =
-        plan_append(&state(Some(&view), &empty), &retained, sealed.clone(), None);
+        plan_append(&state(Some(&view), &empty), &retained, signed.clone(), None);
     assert_eq!(admission, Admission::Authentic);
     assert_eq!(plan.admitted.len(), 2);
     assert_eq!(plan.cleared, vec![claim.key()]);

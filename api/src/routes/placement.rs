@@ -222,7 +222,7 @@ pub struct ObjectPlacementResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct BulkRunRequest {
-    /// Run identity; repeating it resumes the sealed run instead of starting a
+    /// Run identity; repeating it resumes the captured run instead of starting a
     /// new one.
     pub operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -971,7 +971,7 @@ ids.
 **Behavior**
 - This is a node-local read of the replicated bucket record: a default written on another node can
   be missing until it arrives here.
-- The `generation` is the counter every default change advances, and it is what a bulk run seals and
+- The `generation` is the counter every default change advances, and it is what a bulk run captures and
   what a compare-and-set update must present.
 - A bucket that has never been given a default returns an empty list at its current generation."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
@@ -1027,7 +1027,7 @@ operation.
   become a default, so one no holder can supply leaves the stored default untouched.
 - A real change advances `placement_policy_generation` exactly once inside the same transaction;
   submitting the set that is already stored commits nothing and returns the current generation, so a
-  replay cannot supersede a bulk run that sealed the same references.
+  replay cannot supersede a bulk run that captured the same references.
 - Sending `expected_generation` makes the change a compare-and-set.
 - The default governs versions minted after it: stored versions keep their own references until a
   successor is minted for them."#,
@@ -1323,12 +1323,12 @@ fn mutation_response(outcome: &SuccessorOutcome) -> ObjectPlacementResponse {
 operation.
 
 **Behavior**
-- Every sealed reference must be realm-wide or owned by the bucket's own group.
-- The first call under an `operation_id` seals the run against the bucket's exact identity,
-  generation and default reference set; repeating that id resumes the sealed run, and every later
-  pass is bound to what was sealed.
+- Every captured reference must be realm-wide or owned by the bucket's own group.
+- The first call under an `operation_id` captures the run against the bucket's exact identity,
+  generation and default reference set; repeating that id resumes the captured run, and every later
+  pass is bound to what was captured.
 - The application is additive: each object's successor carries the union of the references its head
-  already had and the sealed target, so applying a default never removes a constraint. Exact
+  already had and the captured target, so applying a default never removes a constraint. Exact
   replacement is the per-object route.
 - One pass walks a bounded page of this responder's own heads and returns a `cursor` to continue
   with; heads that already carry the target and delete markers count as covered, and a head that
@@ -1372,11 +1372,11 @@ operation.
             "cursor": "6b0d",
             "complete": false
         })),
-        (status = 400, description = "The operation id or cursor could not be parsed, or the sealed default references a rule owned by another group", body = ErrorResponse),
+        (status = 400, description = "The operation id or cursor could not be parsed, or the captured default references a rule owned by another group", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
-        (status = 409, description = "The run was sealed against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
+        (status = 409, description = "The run was captured against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
         (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -2067,7 +2067,7 @@ mod test_routes {
             None,
         )
         .with_policies(vec![policy.policy_ref()])
-        .expect("refs seal");
+        .expect("refs stored");
         write_fixture(
             &state,
             BLOB_HEAD_KEYSPACE,

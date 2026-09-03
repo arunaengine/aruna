@@ -550,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn stores_compute_config() {
         // The mutation must survive as the document a later read resolves, or
-        // the planner and the quota gate would keep deciding on stale facts.
+        // the planner and the quota gate would keep deciding on stale values.
         let dir = tempdir().unwrap();
         let ctx = context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);

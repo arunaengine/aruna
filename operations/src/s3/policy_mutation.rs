@@ -186,7 +186,7 @@ impl PolicyMutationOperation {
             subject: self.config.subject.clone(),
             resolved: self.resolved.clone(),
             intent: None,
-            sealed_default: None,
+            captured_default: None,
         };
         let mut mint = MintPolicySuccessorOperation::new(plan);
         let effects = mint.start();

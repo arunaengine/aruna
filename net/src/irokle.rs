@@ -1790,9 +1790,9 @@ impl DocumentSyncService {
         }
     }
 
-    /// Seal a topic before a departing holder scans its journal and outbox.
-    /// The result reports whether a journal entry still exists after sealing.
-    pub fn seal_topic(&self, topic_id: irokle_crate::TopicId) -> Result<bool> {
+    /// Closes a topic before a departing holder scans its journal and outbox.
+    /// The result reports whether a journal entry still exists afterwards.
+    pub fn close_topic(&self, topic_id: irokle_crate::TopicId) -> Result<bool> {
         self.node
             .seal_topic(topic_id)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -1805,7 +1805,7 @@ impl DocumentSyncService {
             .any(|eviction| eviction.topic_id == topic_id))
     }
 
-    pub fn unseal_topic(&self, topic_id: irokle_crate::TopicId) -> Result<()> {
+    pub fn reopen_topic(&self, topic_id: irokle_crate::TopicId) -> Result<()> {
         let removed = self
             .node
             .unseal_topic(topic_id)
@@ -3224,7 +3224,7 @@ impl DocumentSyncService {
                             )));
                             continue;
                         }
-                        // The sealed actor is the original publisher, so a relay
+                        // The stored actor is the original publisher, so a relay
                         // that restates the document is not its author.
                         let expected_actor = irokle_crate::actor_id_for(
                             topic_id,

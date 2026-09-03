@@ -628,7 +628,7 @@ impl ExecutorBackend for ApptainerBackend {
         )?;
         remove_tree(&directory)?;
         remove_cgroup(&self.cgroup_path(context))?;
-        guard.seal(reference)
+        guard.store(reference)
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
@@ -1238,7 +1238,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforces_cgroup_ceilings() {
-        // Every attempt runs inside a cgroup limit: the sealed ceiling when it
+        // Every attempt runs inside a cgroup limit: the stored ceiling when it
         // has one, the backend default otherwise, and never none at all.
         let root = tempdir().unwrap();
         let config = ApptainerConfig {
@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_delete_unsealed() {
+    async fn failed_delete_unrecorded() {
         let root = tempdir().unwrap();
         let backend = ApptainerBackend::with_config(ApptainerConfig {
             state_root: root.path().join("state"),

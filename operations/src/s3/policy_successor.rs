@@ -38,10 +38,10 @@ use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// The bucket default a bulk run sealed. A mint that observes another default
+/// The bucket default a bulk run captured. A mint that observes another default
 /// in its own transaction supersedes instead of committing an old target.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedDefault {
+pub struct CapturedDefault {
     pub generation: u64,
     pub refs: Vec<PlacementPolicyRef>,
 }
@@ -67,8 +67,8 @@ pub struct SuccessorPlan {
     /// successor or the blocked reason it records.
     pub intent: Option<PolicyBulkIntent>,
     /// Set by a bulk run, so the pass cannot commit against a default that
-    /// moved on between the run's seal and this transaction.
-    pub sealed_default: Option<SealedDefault>,
+    /// moved on between the run's capture and this transaction.
+    pub captured_default: Option<CapturedDefault>,
 }
 
 impl SuccessorPlan {
@@ -198,7 +198,7 @@ pub struct SuccessorMint {
     plan: SuccessorPlan,
     state: MintState,
     predecessor: Option<BlobVersion>,
-    sealed_refs: Vec<PlacementPolicyRef>,
+    effective_refs: Vec<PlacementPolicyRef>,
     outcome: Option<SuccessorOutcome>,
     /// Owner read from the bucket record inside this transaction.
     group_id: Option<GroupId>,
@@ -217,7 +217,7 @@ impl SuccessorMint {
             plan,
             state: MintState::ReadMutation,
             predecessor: None,
-            sealed_refs: Vec::new(),
+            effective_refs: Vec::new(),
             outcome: None,
             group_id: None,
             usage: None,
@@ -288,7 +288,7 @@ impl SuccessorMint {
             }
             self.outcome = Some(SuccessorOutcome::Replayed {
                 version_id: record.successor_version_id,
-                refs: record.sealed_refs,
+                refs: record.effective_refs,
                 materialized: record.materialized,
             });
             self.state = MintState::Done;
@@ -359,8 +359,8 @@ impl SuccessorMint {
         )]))
     }
 
-    /// Re-reads the destination facts inside the commit boundary: the bucket
-    /// the run sealed, and the subject the plan was evaluated against.
+    /// Re-reads the destination details inside the commit boundary: the bucket
+    /// the run captured, and the subject the plan was evaluated against.
     fn handle_bucket(
         &mut self,
         event: Event,
@@ -387,9 +387,9 @@ impl SuccessorMint {
         if !admitted {
             return Err(SuccessorError::SubjectDrift);
         }
-        if let Some(sealed) = self.plan.sealed_default.as_ref()
-            && (sealed.generation != bucket.placement_policy_generation
-                || sealed.refs != bucket.placement_policies)
+        if let Some(captured) = self.plan.captured_default.as_ref()
+            && (captured.generation != bucket.placement_policy_generation
+                || captured.refs != bucket.placement_policies)
         {
             return Err(SuccessorError::DefaultChanged {
                 current: bucket.placement_policy_generation,
@@ -416,7 +416,7 @@ impl SuccessorMint {
             return Err(SuccessorError::VersionMissing);
         };
         let predecessor = BlobVersion::from_bytes(value.as_ref())?;
-        self.sealed_refs = match self.plan.mode {
+        self.effective_refs = match self.plan.mode {
             PolicyRefMode::Replace => PlacementPolicyRef::canonical_set(&self.plan.target_refs)?,
             PolicyRefMode::Union => {
                 let mut refs = predecessor.placement_policies.clone();
@@ -477,7 +477,11 @@ impl SuccessorMint {
     /// The successor's refs must admit this node before any byte is claimed for
     /// it. An unresolvable or denying policy blocks instead of granting.
     fn blocked_placement(&self) -> Option<PolicyBlockedReason> {
-        match evaluate_placement(&self.sealed_refs, &self.plan.resolved, &self.plan.subject) {
+        match evaluate_placement(
+            &self.effective_refs,
+            &self.plan.resolved,
+            &self.plan.subject,
+        ) {
             PlacementDecision::Allowed => None,
             PlacementDecision::Denied { .. } => Some(PolicyBlockedReason::DestinationDenied),
             PlacementDecision::Required { .. }
@@ -557,7 +561,7 @@ impl SuccessorMint {
             self.plan.created_at,
             self.plan.auth_context.user_id,
         )
-        .with_policies(self.sealed_refs.clone())?;
+        .with_policies(self.effective_refs.clone())?;
         let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(6);
         writes.push((
             BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -581,7 +585,7 @@ impl SuccessorMint {
                 mutation_id: self.plan.mutation_id,
                 params: self.plan.params(),
                 successor_version_id: version_id,
-                sealed_refs: self.sealed_refs.clone(),
+                effective_refs: self.effective_refs.clone(),
                 materialized: location.is_some(),
             }
             .to_bytes()?
@@ -607,7 +611,7 @@ impl SuccessorMint {
                 version: self.plan.version_key(version_id),
                 node_id: self.plan.subject.node_id,
                 location,
-                policies: &self.sealed_refs,
+                policies: &self.effective_refs,
                 origin: source
                     .as_ref()
                     .map(|record| record.origin)
@@ -648,7 +652,7 @@ impl SuccessorMint {
         self.usage = Some(UsageCounterUpdate::for_group(group_id, delta));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
-            refs: self.sealed_refs.clone(),
+            refs: self.effective_refs.clone(),
             materialized: location.is_some(),
         });
         self.state = MintState::WriteRecords;
@@ -989,7 +993,7 @@ impl Operation for MintPolicySuccessorOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        MintPolicySuccessorOperation, MintState, SealedDefault, SuccessorError, SuccessorMint,
+        CapturedDefault, MintPolicySuccessorOperation, MintState, SuccessorError, SuccessorMint,
         SuccessorOutcome, SuccessorPlan, successor_version,
     };
     use crate::blob::blob_keyspace_helper::HeadAliasContext;
@@ -1108,7 +1112,7 @@ mod tests {
             subject: subject(),
             resolved: BTreeMap::new(),
             intent: None,
-            sealed_default: None,
+            captured_default: None,
         }
     }
 
@@ -1183,7 +1187,7 @@ mod tests {
             None,
         )
         .with_policies(refs)
-        .expect("refs seal")
+        .expect("refs stored")
     }
 
     /// One registered local copy of the predecessor, as the write path leaves it.
@@ -1326,7 +1330,7 @@ mod tests {
             mutation_id: Ulid::from_bytes([8u8; 16]),
             params: plan(Vec::new(), PolicyRefMode::Replace).params(),
             successor_version_id: Ulid::from_bytes([4u8; 16]),
-            sealed_refs: Vec::new(),
+            effective_refs: Vec::new(),
             materialized: true,
         };
         mint.start(None).expect("start builds");
@@ -1355,7 +1359,7 @@ mod tests {
             mutation_id: Ulid::from_bytes([8u8; 16]),
             params: plan(Vec::new(), PolicyRefMode::Replace).params(),
             successor_version_id: Ulid::from_bytes([4u8; 16]),
-            sealed_refs: Vec::new(),
+            effective_refs: Vec::new(),
             materialized: true,
         };
         mint.start(None).expect("start builds");
@@ -1422,7 +1426,7 @@ mod tests {
             ManagedCopyState::Registered,
         )
         .expect("record builds")
-        .sealed_under(subject().generation);
+        .stored_under(subject().generation);
 
         assert!(
             super::reusable_copy(&record.key(), &record, &version, &subject(), CONTENT, &refs)
@@ -1467,7 +1471,7 @@ mod tests {
         // A run's target is bound into its own transaction: a default that moved
         // on supersedes the run before any old target commits.
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Union));
-        mint.plan.sealed_default = Some(SealedDefault {
+        mint.plan.captured_default = Some(CapturedDefault {
             generation: 2,
             refs: Vec::new(),
         });
@@ -1588,8 +1592,8 @@ mod tests {
             panic!("expected the managed-copy scan");
         };
         assert_eq!(key_space, MANAGED_COPY_KEYSPACE);
-        assert!(mint.sealed_refs.contains(&existing.policy_ref()));
-        assert!(mint.sealed_refs.contains(&added.policy_ref()));
+        assert!(mint.effective_refs.contains(&existing.policy_ref()));
+        assert!(mint.effective_refs.contains(&added.policy_ref()));
     }
 
     #[test]
@@ -1599,7 +1603,7 @@ mod tests {
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Replace));
         drive_to_copy(&mut mint, &materialized(vec![existing.policy_ref()]));
 
-        assert!(mint.sealed_refs.is_empty());
+        assert!(mint.effective_refs.is_empty());
     }
 
     #[test]

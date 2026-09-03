@@ -37,7 +37,7 @@ pub struct CreatePolicyConfig {
 }
 
 /// Publishes one immutable policy document to the holders its policy id
-/// resolves to. The document's holders are a replication fact only: nothing
+/// resolves to. The document's holders are a replication detail only: nothing
 /// here consults the policy's own selectors, which govern data residency.
 #[derive(Debug, PartialEq)]
 pub struct CreatePolicyOperation {
@@ -224,7 +224,7 @@ impl CreatePolicyOperation {
 
     /// Binds the signed publication to the planned definition before it is
     /// written, so a signature that does not authenticate never leaves the node.
-    fn seal(
+    fn bind_publication(
         &mut self,
         pending: PendingPublication,
         publication: PolicyPublication,
@@ -389,7 +389,7 @@ impl Operation for CreatePolicyOperation {
             },
             CreatePolicyState::Sign { pending } => match event {
                 Event::Net(NetEvent::PolicySign(PolicySignEvent::Signed(publication))) => {
-                    match self.seal(*pending, *publication) {
+                    match self.bind_publication(*pending, *publication) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }

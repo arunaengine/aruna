@@ -65,7 +65,7 @@ pub struct WitnessDeadline {
     pub rank: u32,
 }
 
-/// The bounded plan this witness sealed before it launched, with the targets
+/// The bounded plan this witness stored before it launched, with the targets
 /// that already refused this request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessExplain {
@@ -74,7 +74,7 @@ pub struct WitnessExplain {
     pub declined: Vec<ExecutionTargetId>,
     /// The previous launch was never confirmed, so this one may overlap it.
     pub overlapping: bool,
-    pub sealed_at_ms: u64,
+    pub stored_at_ms: u64,
 }
 
 /// Kicks the witness queue without persisting a timer of its own.
@@ -380,7 +380,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     }
     // An incomplete family read is undecided evidence: a suppression, a
     // cancellation, or an earlier launch may be in the part that did not load,
-    // so this round seals no budget and offers no launch.
+    // so this round stores no budget and offers no launch.
     let records = match load_family_complete(context, family).await {
         Ok(records) => records,
         Err(error) => {
@@ -391,10 +391,10 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     if suppressed(family, &records) {
         return RoundOutcome::Done;
     }
-    let Some(spec) = sealed_spec(family, &records) else {
+    let Some(spec) = stored_spec(family, &records) else {
         return RoundOutcome::Retry { after_ms: base };
     };
-    let budget = match sealed_budget(context, &config, &spec, local, &records, now_ms).await {
+    let budget = match stored_budget(context, &config, &spec, local, &records, now_ms).await {
         Some(budget) => budget,
         None => return RoundOutcome::Retry { after_ms: base },
     };
@@ -417,7 +417,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         plan: empty_plan(),
         declined: Vec::new(),
         overlapping: false,
-        sealed_at_ms: now_ms,
+        stored_at_ms: now_ms,
     });
     if let Some(envelope) = mine.iter().max_by_key(|envelope| match &envelope.record {
         JobFamilyRecord::Launch(launch) => launch.scheduler_seq,
@@ -475,7 +475,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     explain.sequence = sequence;
     explain.overlapping = !mine.is_empty();
     explain.plan = plan;
-    explain.sealed_at_ms = now_ms;
+    explain.stored_at_ms = now_ms;
     // The explain record is durable before any launch exists, so every launch
     // has an auditable reason even if this node dies right after sending it.
     if write_row(
@@ -638,8 +638,8 @@ pub(crate) fn suppressed(family: JobFamilyId, records: &[JobRecordEnvelope]) -> 
         .any(|execution| execution.state != PhysicalExecutionState::Error)
 }
 
-/// The sealed spec of the family's canonical alias.
-fn sealed_spec(family: JobFamilyId, records: &[JobRecordEnvelope]) -> Option<LogicalJobSpec> {
+/// The stored spec of the family's canonical alias.
+fn stored_spec(family: JobFamilyId, records: &[JobRecordEnvelope]) -> Option<LogicalJobSpec> {
     let projection = reduce_family(family, records).ok()??;
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Spec(spec) if spec.job_id == projection.canonical_job_id => {
@@ -649,8 +649,8 @@ fn sealed_spec(family: JobFamilyId, records: &[JobRecordEnvelope]) -> Option<Log
     })
 }
 
-/// This node's immutable launch bound, sealed once before its first launch.
-async fn sealed_budget(
+/// This node's immutable launch bound, stored once before its first launch.
+async fn stored_budget(
     context: &DriverContext,
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,

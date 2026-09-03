@@ -94,7 +94,7 @@ fn both_wakeups() -> HashSet<TaskKey> {
     HashSet::from([TaskKey::DrainJobFamilyOutbox, TaskKey::DrainJobQueue])
 }
 
-/// A receipt for this launch id sealing different content. The row is written
+/// A receipt for this launch id storing different content. The row is written
 /// directly on purpose: admission would never sign this receipt.
 async fn seed_receipt(ctx: &DriverContext, family: &Family, launch: &LaunchIntent) {
     let mut receipt = family.receipt(launch, 9);
@@ -128,7 +128,7 @@ fn advertised(local: NodeId, draining: bool) -> NodeInfoDocument {
     NodeInfoDocument {
         node_id: local,
         executors: vec![
-            ExecutorCapability::new("docker".to_string(), subject).expect("capability seals"),
+            ExecutorCapability::new("docker".to_string(), subject).expect("capability is valid"),
         ],
         labels: BTreeMap::new(),
         urls: NodeUrls {
@@ -367,7 +367,7 @@ fn uncertain_never_drains() {
         (StorageError::QueueFull, CommitVerdict::Retry),
         (StorageError::Timeout, CommitVerdict::Uncertain),
         (StorageError::InvalidEffect, CommitVerdict::Uncertain),
-        (StorageError::Sealed, CommitVerdict::Uncertain),
+        (StorageError::Closed, CommitVerdict::Uncertain),
     ];
 
     for (error, expected) in outcomes {

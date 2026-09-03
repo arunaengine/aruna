@@ -681,7 +681,7 @@ mod tests {
             None,
         )
         .with_policies(refs)
-        .expect("refs seal")
+        .expect("refs stored")
     }
 
     fn copy_record(state: ManagedCopyState, version_id: Ulid) -> ManagedCopyRecord {

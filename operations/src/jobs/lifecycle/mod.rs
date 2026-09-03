@@ -9,9 +9,9 @@
 //!   either admits it here or forwards it one hop to an observed holder.
 //! * [`admit`] commits the claim and the immutable spec in one transaction.
 //! * [`outbox`] replicates locally published records to the other holders.
-//! * [`witness`] ranks holders, seals budgets, plans, and offers launches.
+//! * [`witness`] ranks holders, stores budgets, plans, and offers launches.
 //! * [`target`] reserves exact local capacity and signs the receipt.
-//! * [`stage`] moves the sealed input versions to the target.
+//! * [`stage`] moves the stored input versions to the target.
 //! * [`updates`] publishes the monotonic execution chain and its outputs.
 //! * [`cancel`] publishes the append-only cancellation intent.
 //! * [`routing`] answers external reads from the family projection.
@@ -74,8 +74,8 @@ pub enum LifecycleError {
     /// This node does not hold the submission family, so it may not admit it.
     #[error("this node does not hold the submission family placement")]
     NotHolder,
-    /// Exact local admission found no capacity for the sealed resources.
-    #[error("no local capacity for the sealed execution resources")]
+    /// Exact local admission found no capacity for the stored resources.
+    #[error("no local capacity for the stored execution resources")]
     Capacity,
     /// The same idempotency key is already bound to a different request.
     #[error("idempotency key already bound to job {existing_job_id}")]

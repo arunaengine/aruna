@@ -214,11 +214,11 @@ pub struct CompleteMultipartUploadOperation {
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
-    /// Refs sealed on the version record, reused verbatim by its registration.
-    sealed_policies: Vec<PlacementPolicyRef>,
+    /// Refs stored on the version record, reused verbatim by its registration.
+    stored_policies: Vec<PlacementPolicyRef>,
     /// Destination default, read inside the finalize transaction.
     bucket_policies: Vec<PlacementPolicyRef>,
-    /// Destination facts of this node. Absent means no governed object may be
+    /// Destination details of this node. Absent means no governed object may be
     /// composed or registered here.
     gate_context: Option<GateContext>,
     gate: Option<PolicyGateOperation>,
@@ -258,7 +258,7 @@ impl CompleteMultipartUploadOperation {
             output: None,
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
-            sealed_policies: Vec::new(),
+            stored_policies: Vec::new(),
             bucket_policies: Vec::new(),
             gate_context: None,
             gate: None,
@@ -289,7 +289,7 @@ impl CompleteMultipartUploadOperation {
 
     /// Subject generation the gate admitted this completion under; zero for an
     /// ungoverned object, which no subject ever evaluated.
-    fn sealed_subject(&self) -> u64 {
+    fn stored_subject(&self) -> u64 {
         self.gated_bucket
             .as_ref()
             .and_then(|gated| gated.subject_generation)
@@ -802,7 +802,7 @@ impl CompleteMultipartUploadOperation {
         };
         self.gated_bucket = Some(
             GatedBucket::observe(bucket.as_ref())
-                .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
+                .stored_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
         let group_id = bucket
             .as_ref()
@@ -1222,7 +1222,7 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
-        self.sealed_policies = version.placement_policies.clone();
+        self.stored_policies = version.placement_policies.clone();
         let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -1253,9 +1253,9 @@ impl CompleteMultipartUploadOperation {
                 version: VersionKey::new(&self.input.bucket, &self.input.key, version_id),
                 node_id: self.input.node_id,
                 location: &location,
-                policies: &self.sealed_policies,
+                policies: &self.stored_policies,
                 origin: CopyOrigin::Write,
-                subject_generation: self.sealed_subject(),
+                subject_generation: self.stored_subject(),
                 registered_at_ms: version_id.timestamp_ms(),
             },
             self.txn_id,

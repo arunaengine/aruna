@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::{
-    ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, InputMode, InputSelection,
-    InputSource, JobId, JobInputFact, JobPayload, JobRecord, JobState, OutputDestination,
+    CapturedInput, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, InputMode,
+    InputSelection, InputSource, JobId, JobPayload, JobRecord, JobState, OutputDestination,
     OutputSelection, RunCrateStatus, checksum::HASH_BLAKE3,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
@@ -180,7 +180,7 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
     let ctx = fixture.compute_ctx.as_ref();
     let node_id = ctx.net_handle.as_ref().unwrap().node_id();
     let job_id = job_id();
-    let input_facts = seal_facts(ctx, node_id, &spec).await;
+    let captured_inputs = capture_inputs(ctx, node_id, &spec).await;
     let mut record = JobRecord::new(
         job_id,
         JobPayload::Execution(spec),
@@ -190,7 +190,7 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         now_ms(),
         None,
     );
-    record.input_facts = input_facts;
+    record.captured_inputs = captured_inputs;
     insert_job(&ctx.storage_handle, &record).await.unwrap();
     let ClaimOutcome::Claimed(claimed) = claim_job(&ctx.storage_handle, job_id, node_id, now_ms())
         .await
@@ -205,14 +205,14 @@ fn now_ms() -> u64 {
     aruna_core::util::unix_timestamp_millis()
 }
 
-/// The sealed facts admission pins before a run is claimed. Outputs inherit
+/// The inputs admission captures before a run is claimed. Outputs inherit
 /// their refs from these, so a hand-built record must carry them too.
-async fn seal_facts(
+async fn capture_inputs(
     ctx: &DriverContext,
     node_id: NodeId,
     spec: &ExecutionSpec,
-) -> Vec<JobInputFact> {
-    let mut facts = Vec::with_capacity(spec.inputs.len());
+) -> Vec<CapturedInput> {
+    let mut captured = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
         let InputSource::S3 { bucket, key, .. } = &input.source;
         let head = drive(
@@ -229,7 +229,7 @@ async fn seal_facts(
         .expect("head decodes")
         .expect("input object exists");
         let location = head.location.as_ref().expect("input is materialized");
-        facts.push(JobInputFact {
+        captured.push(CapturedInput {
             destination_key: input.dest_key.clone(),
             source_node_id: node_id,
             version_id: head
@@ -248,7 +248,7 @@ async fn seal_facts(
             policies: head.source_policies.clone(),
         });
     }
-    facts
+    captured
 }
 
 /// Waits for `want` on a lost-progress window, not a wall-clock budget: the

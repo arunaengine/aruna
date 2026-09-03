@@ -129,7 +129,7 @@ pub fn job_manifest(
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
     // The credential Secret rides `envFrom`, which any inline entry of the same
-    // name would shadow, so the sealed secret always wins here too.
+    // name would shadow, so the stored secret always wins here too.
     let mut env = spec
         .env
         .iter()
@@ -568,7 +568,7 @@ fn container_security(read_only: bool) -> serde_json::Value {
 }
 
 /// Requests and limits of the task container. CPU and memory always carry a
-/// bound: an attempt the sealed spec and the backend both leave open would run
+/// bound: an attempt the stored spec and the backend both leave open would run
 /// against the whole node.
 fn resource_limits(
     spec: &TaskSpec,
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn bounds_task_resources() {
-        // The sealed envelope wins, the backend default fills a gap, and an
+        // The stored envelope wins, the backend default fills a gap, and an
         // attempt neither of them bounds never becomes a manifest.
         let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
         spec.resources.cpu_cores = Some(4);

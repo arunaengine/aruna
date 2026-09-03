@@ -1,5 +1,5 @@
-//! Pinned scheduling facts. Every value here is exact and already resolved:
-//! the planner performs no I/O and never invents a missing fact.
+//! Pinned scheduling inputs. Every value here is exact and already resolved:
+//! the planner performs no I/O and never invents a missing value.
 
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
@@ -63,8 +63,8 @@ pub struct InputHolder {
     pub subject: PlacementSubject,
 }
 
-/// One exact input of the physical execution. Snapshot facts stay fixed for the
-/// launch that seals them.
+/// One exact input of the physical execution. Snapshot values stay fixed for the
+/// launch that stores them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedInput {
     pub destination_key: String,
@@ -76,7 +76,7 @@ pub struct ResolvedInput {
     pub holders: Vec<InputHolder>,
 }
 
-/// One advertised execution target plus the membership facts the scheduling
+/// One advertised execution target plus the membership values the scheduling
 /// node authenticated for it. `node_kind` and `active` come from realm
 /// membership, never from the publisher's own document.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,7 +117,7 @@ pub struct PlanRequest {
 
 impl PlanRequest {
     /// Bounded, canonically ordered copy of the request. Sorting here is what
-    /// makes shuffled equivalent facts produce one identical plan.
+    /// makes shuffled equivalent values produce one identical plan.
     pub fn canonical(&self) -> Result<Self, PlanError> {
         if !self.admitted {
             return Err(PlanError::NotAdmitted);
@@ -225,7 +225,7 @@ mod tests {
     use crate::scheduling::tests::{node, request, resolved_input};
 
     #[test]
-    fn canonical_sorts_facts() {
+    fn canonical_sorts_inputs() {
         // Shuffled inputs and holders must reduce to one order.
         let plan = request(vec![resolved_input("b", 1), resolved_input("a", 2)]);
         let canonical = plan.canonical().expect("request is bounded");
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_facts() {
+    fn rejects_duplicate_inputs() {
         let plan = request(vec![resolved_input("a", 1), resolved_input("a", 2)]);
         assert!(matches!(
             plan.canonical(),

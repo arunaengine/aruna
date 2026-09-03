@@ -83,7 +83,7 @@ pub fn register_entry(
         registration.registered_at_ms,
         ManagedCopyState::Registered,
     )?
-    .sealed_under(registration.subject_generation)
+    .stored_under(registration.subject_generation)
     .from_origin(registration.origin);
     Ok((
         MANAGED_COPY_KEYSPACE.to_string(),
@@ -140,7 +140,7 @@ pub struct CopyRequest<'a> {
     pub node_id: Option<NodeId>,
     pub blake3: Option<[u8; 32]>,
     pub refs: &'a [PlacementPolicyRef],
-    /// Subject generation this node advertises now. A governed row sealed under
+    /// Subject generation this node advertises now. A governed row stored under
     /// an older one describes a subject that no longer exists here.
     pub subject_generation: Option<u64>,
 }
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn joins_caller_txn() {
-        // The registration also seals the provenance a reader later reports.
+        // The registration also stores the provenance a reader later reports.
         let txn_id = Ulid::from_bytes([8u8; 16]);
         let relationship_id = Ulid::from_bytes([3u8; 16]);
         let effect = register_effect(
@@ -1090,7 +1090,7 @@ mod driver_tests {
             .await;
     }
 
-    /// Seals refs on the stored version, the state step 6 mints directly.
+    /// Puts refs on the stored version, the state step 6 mints directly.
     async fn govern_version(context: &DriverContext, version_id: Ulid) {
         let version = read_version(context, version_id)
             .await
@@ -1099,7 +1099,7 @@ mod driver_tests {
                 policy_id: Ulid::from_bytes([3u8; 16]),
                 digest: [4u8; 32],
             }])
-            .expect("refs seal");
+            .expect("refs stored");
         let _ = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1112,7 +1112,7 @@ mod driver_tests {
                 txn_id: None,
             })
             .await;
-        // A gated write seals the same refs on the registration, so the
+        // A gated write stores the same refs on the registration, so the
         // fixture must too or the row describes a different copy.
         if let Some(mut record) = read_copy(context, version_id).await {
             record.policies = version.placement_policies.clone();

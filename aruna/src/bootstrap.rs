@@ -471,7 +471,7 @@ async fn sync_with_retry(
 
 /// Persisted onboarding secret, encrypted at rest under the node key.
 #[derive(Serialize, Deserialize)]
-struct SealedOnboardingSecret {
+struct EncryptedOnboardingSecret {
     nonce: [u8; 24],
     ciphertext: Vec<u8>,
 }
@@ -488,15 +488,15 @@ pub async fn ensure_initial_local_onboarding_secret(
     net_secret_key: &[u8; 32],
     realm_id: aruna_core::structs::RealmId,
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
-    if let Some(sealed) = load_persisted_state::<SealedOnboardingSecret>(
+    if let Some(encrypted) = load_persisted_state::<EncryptedOnboardingSecret>(
         driver_ctx,
         INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
     )
     .await
     {
-        let nonce = crypto_box::Nonce::from(sealed.nonce);
+        let nonce = crypto_box::Nonce::from(encrypted.nonce);
         let plaintext = onboarding_secret_box(net_secret_key)
-            .decrypt(&nonce, sealed.ciphertext.as_ref())
+            .decrypt(&nonce, encrypted.ciphertext.as_ref())
             .map_err(|_| "failed to decrypt persisted onboarding secret")?;
         return Ok(postcard::from_bytes(&plaintext)?);
     }
@@ -536,7 +536,7 @@ pub async fn ensure_initial_local_onboarding_secret(
     persist_state(
         driver_ctx,
         INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
-        &SealedOnboardingSecret {
+        &EncryptedOnboardingSecret {
             nonce: nonce_bytes,
             ciphertext,
         },

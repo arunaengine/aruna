@@ -1054,18 +1054,18 @@ async fn spawn_s3_server(
     let bind_addr = listener.local_addr()?;
     let address = bind_addr.to_string();
     let host = format!("localhost:{}", bind_addr.port());
-    let seal_key = context
+    let encryption_key = context
         .net_handle
         .as_ref()
-        .map(|net| net.credential_seal_key())
-        .unwrap_or_else(aruna_core::credential_seal::CredentialSealKey::random);
+        .map(|net| net.credential_encryption_key())
+        .unwrap_or_else(aruna_core::credential_encryption::CredentialEncryptionKey::random);
     let s3_server = S3Server::new(
         address.as_str(),
         host.clone(),
         context,
         realm_id,
         node_id,
-        seal_key,
+        encryption_key,
         Default::default(),
         test_cors_config(),
         metrics,

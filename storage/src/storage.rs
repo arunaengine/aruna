@@ -219,15 +219,15 @@ struct StorageMetrics {
     failed_total: AtomicU64,
     in_flight: AtomicU64,
     channel_closed: Arc<AtomicBool>,
-    sealed: AtomicBool,
+    closed: AtomicBool,
     /// Latched when the shutdown drain timed out. The worker reads it before it
     /// starts any mutation, so nothing already queued can commit behind the
     /// final `sync_all`.
     mutations_fenced: Arc<AtomicBool>,
-    /// Serializes sealing with mutating enqueues. Sealing takes the write lock;
+    /// Serializes closing with mutating enqueues. Closing takes the write lock;
     /// dispatch holds a read lock through its check and send, so writes are queued
-    /// before the final `SyncAll` or rejected after sealing.
-    seal_lock: RwLock<()>,
+    /// before the final `SyncAll` or rejected after the close.
+    close_lock: RwLock<()>,
     rejected_writes: AtomicU64,
     last_error: Mutex<Option<String>>,
     /// Woken when `in_flight` falls to zero, so the shutdown barrier does not poll.
@@ -269,7 +269,7 @@ pub struct StorageMetricsSnapshot {
     /// Errors that ended the request, excluding the conflicts callers retry.
     pub failed_total: u64,
     pub channel_closed: bool,
-    pub sealed: bool,
+    pub closed: bool,
     pub rejected_writes: u64,
     pub last_error: Option<String>,
 }
@@ -484,17 +484,17 @@ impl StorageHandle {
     /// Closes the write path before the final sync. Every mutating effect that
     /// arrives afterwards is rejected and counted, so a leaked child task can
     /// never commit behind a completed `sync_all`.
-    pub fn seal(&self) {
+    pub fn close_writes(&self) {
         let _guard = self
             .metrics
-            .seal_lock
+            .close_lock
             .write()
-            .expect("storage seal lock poisoned");
-        self.metrics.sealed.store(true, Ordering::SeqCst);
+            .expect("storage close lock poisoned");
+        self.metrics.closed.store(true, Ordering::SeqCst);
     }
 
-    pub fn is_sealed(&self) -> bool {
-        self.metrics.sealed.load(Ordering::SeqCst)
+    pub fn writes_closed(&self) -> bool {
+        self.metrics.closed.load(Ordering::SeqCst)
     }
 
     /// Stops the worker from starting any further mutation. Used when the
@@ -504,7 +504,7 @@ impl StorageHandle {
         self.metrics.mutations_fenced.store(true, Ordering::SeqCst);
     }
 
-    /// Mutating effects rejected because storage was already sealed.
+    /// Mutating effects rejected because storage was already closed.
     pub fn rejected_writes(&self) -> u64 {
         self.metrics.rejected_writes.load(Ordering::Relaxed)
     }
@@ -516,7 +516,7 @@ impl StorageHandle {
             conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
             failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
             channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
-            sealed: self.is_sealed(),
+            closed: self.writes_closed(),
             rejected_writes: self.rejected_writes(),
             last_error: self
                 .metrics
@@ -660,22 +660,22 @@ impl StorageHandle {
         }
         let mut deferred = None;
         let send_result: Result<(), StorageError> = {
-            // Guard held across the seal check and the queue send (never an
-            // await), so a concurrent `seal` cannot slip between them.
-            let _seal_guard = storage_effect_mutates(&effect).then(|| {
+            // Guard held across the close check and the queue send (never an
+            // await), so a concurrent `close_writes` cannot slip between them.
+            let _close_guard = storage_effect_mutates(&effect).then(|| {
                 self.metrics
-                    .seal_lock
+                    .close_lock
                     .read()
-                    .expect("storage seal lock poisoned")
+                    .expect("storage close lock poisoned")
             });
-            if _seal_guard.is_some() && self.is_sealed() {
+            if _close_guard.is_some() && self.writes_closed() {
                 self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    event = "storage.write.after_seal",
-                    operation, "Rejected a storage write issued after the shutdown seal"
+                    event = "storage.write.after_close",
+                    operation, "Rejected a storage write issued after the shutdown close"
                 );
                 return self.observe_storage_event(StorageEvent::Error {
-                    error: StorageError::Sealed,
+                    error: StorageError::Closed,
                 });
             }
             if let Some((txn_id, kind)) = cleanup {
@@ -727,8 +727,8 @@ impl StorageHandle {
                 match self.channel_for(&item.0).try_send(item) {
                     Ok(()) => Ok(()),
                     Err(TrySendError::Full(item)) if cleanup_write => {
-                        // Awaiting a slot needs the seal guard released first, so a
-                        // slot won after the seal enqueues; the worker mutation
+                        // Awaiting a slot needs the close guard released first, so a
+                        // slot won after the close enqueues; the worker mutation
                         // fence still rejects it before it can execute.
                         deferred = Some(item);
                         Ok(())
@@ -919,7 +919,7 @@ impl StorageHandle {
 }
 
 /// Effects that can commit durable state. Reads, iterations, transaction aborts
-/// and `SyncAll` stay open after the seal.
+/// and `SyncAll` stay open after the close.
 fn storage_effect_mutates(effect: &StorageEffect) -> bool {
     match effect {
         StorageEffect::Write { .. }
@@ -1452,7 +1452,7 @@ impl FjallStorage {
             "Rejected a storage mutation issued after the shutdown drain fence"
         );
         StorageEvent::Error {
-            error: StorageError::Sealed,
+            error: StorageError::Closed,
         }
     }
 
@@ -3743,17 +3743,17 @@ mod tests {
         assert!(metrics.channel_closed.load(Ordering::Relaxed));
     }
 
-    // The seal is the write-after-sync barrier: a leaked child that survives the
+    // The close is the write-after-sync barrier: a leaked child that survives the
     // drain gets an error instead of committing behind the final sync.
     #[tokio::test]
-    async fn seal_rejects_writes() {
+    async fn close_rejects_writes() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        handle.seal();
+        handle.close_writes();
 
         let event = handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: "sealed".to_string(),
+                key_space: "closed".to_string(),
                 key: b"key".to_vec().into(),
                 value: b"value".to_vec().into(),
                 txn_id: None,
@@ -3763,11 +3763,11 @@ mod tests {
         assert!(matches!(
             event,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
         assert_eq!(handle.rejected_writes(), 1);
-        assert!(handle.snapshot_metrics().sealed);
+        assert!(handle.snapshot_metrics().closed);
     }
 
     // Shutdown still has to read and fsync after the barrier is up.
@@ -3777,17 +3777,17 @@ mod tests {
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: "sealed".to_string(),
+                key_space: "closed".to_string(),
                 key: b"key".to_vec().into(),
                 value: b"value".to_vec().into(),
                 txn_id: None,
             })
             .await;
-        handle.seal();
+        handle.close_writes();
 
         let read = handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: "sealed".to_string(),
+                key_space: "closed".to_string(),
                 key: b"key".to_vec().into(),
                 txn_id: None,
             })
@@ -3801,7 +3801,7 @@ mod tests {
         assert_eq!(handle.rejected_writes(), 0);
     }
 
-    // The seal only blocks later dispatches, so a mutation already queued on the
+    // The close only blocks later dispatches, so a mutation already queued on the
     // bulk lane must be waited out before the final sync.
     #[tokio::test]
     async fn drain_waits_accepted() {
@@ -3816,7 +3816,7 @@ mod tests {
         let queued_state = poll_fn(|cx| Poll::Ready(queued.as_mut().poll(cx))).await;
         assert!(queued_state.is_pending());
         assert_eq!(handle.in_flight(), 1);
-        handle.seal();
+        handle.close_writes();
 
         let accepted = receivers.bulk.recv().expect("effect stays queued");
         let mut drain = Box::pin(handle.drain_accepted(Duration::from_secs(30)));
@@ -3833,7 +3833,7 @@ mod tests {
     async fn write_txn_rejected() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        handle.seal();
+        handle.close_writes();
 
         let write_txn = handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -3845,7 +3845,7 @@ mod tests {
         assert!(matches!(
             write_txn,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
         assert!(matches!(
@@ -3928,7 +3928,7 @@ mod tests {
         assert!(matches!(
             queued.await,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
         assert!(sync.await.is_ok());
@@ -3948,7 +3948,7 @@ mod tests {
         ));
     }
 
-    // The lane hole this fence closes: bulk work queued before the seal must not
+    // The lane hole this fence closes: bulk work queued before the close must not
     // commit once the drain gave up on it.
     #[tokio::test]
     async fn fence_blocks_bulk() {
@@ -3959,14 +3959,14 @@ mod tests {
         let mut queued = Box::pin(bulk.send_storage_effect(keyed_write("bulk")));
         poll_queued(&mut queued).await;
 
-        handle.seal();
+        handle.close_writes();
         handle.fence_mutations();
         serve_next(&mut storage, &receivers.bulk);
 
         assert!(matches!(
             queued.await,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
         assert_eq!(handle.rejected_writes(), 1);
@@ -4020,13 +4020,13 @@ mod tests {
         assert!(matches!(
             fenced_write.await,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
         assert!(matches!(
             fenced_commit.await,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
         assert!(storage.txns.is_empty());
@@ -4090,7 +4090,7 @@ mod tests {
         assert!(matches!(
             waiter.await.expect("cleanup sender"),
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
     }
@@ -5342,7 +5342,7 @@ mod tests {
                 conflicts_total: 0,
                 failed_total: 1,
                 channel_closed: false,
-                sealed: false,
+                closed: false,
                 rejected_writes: 0,
                 last_error: Some("Transaction not found".to_string()),
             }

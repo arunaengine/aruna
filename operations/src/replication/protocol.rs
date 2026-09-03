@@ -57,7 +57,7 @@ pub struct VersionReplicationManifest {
     /// Automatic advance count of the reference this manifest carries, so repair
     /// and snapshot replication preserve the cap instead of resetting it.
     pub reference_advance_count: Option<u16>,
-    /// Refs sealed on the replicated version. The target reconstructs the same
+    /// Refs stored on the replicated version. The target reconstructs the same
     /// governed version, so replication never relaxes an attachment.
     pub placement_policies: Vec<PlacementPolicyRef>,
 }
@@ -232,7 +232,7 @@ pub struct BaoReadRequest {
 }
 
 impl BaoReadRequest {
-    /// Bounds the destination facts before they are evaluated or stored.
+    /// Bounds the destination details before they are evaluated or stored.
     pub fn validate(&self) -> Result<(), ConversionError> {
         if self.known_refs.len() > MAX_POLICY_REF_INPUT {
             return Err(ConversionError::PlacementPolicyError(

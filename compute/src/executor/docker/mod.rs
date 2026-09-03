@@ -648,7 +648,7 @@ fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendEr
         ));
     }
     // The container is created with these two ceilings, so an attempt neither
-    // the sealed spec nor the backend bounds must never start.
+    // the stored spec nor the backend bounds must never start.
     enforced_limit(
         spec.resources.ram_bytes,
         config
@@ -1624,7 +1624,7 @@ impl ExecutorBackend for DockerBackend {
             Err(BackendError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        guard.seal(format!(
+        guard.store(format!(
             "{}/docker/attempts/{}/control.json",
             self.config.state_root.display(),
             context.attempt.external_name()
@@ -2073,7 +2073,7 @@ mod tests {
 
     #[test]
     fn refuses_unbounded_attempt() {
-        // With no sealed ceiling and no backend default, the container would run
+        // With no stored ceiling and no backend default, the container would run
         // against the whole host, so it must never be created.
         let unbounded = DockerConfig {
             default_mem_bytes: None,

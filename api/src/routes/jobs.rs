@@ -305,7 +305,7 @@ pub struct JobOutputResponse {
     pub endpoint_url: Option<String>,
 }
 
-/// The plan this responder sealed when it planned the request itself. Absent
+/// The plan this responder stored when it planned the request itself. Absent
 /// when another node planned it; node identities are never disclosed here.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobPlacementResponse {
@@ -317,7 +317,7 @@ pub struct JobPlacementResponse {
     pub rejected: u32,
     /// Rejections the bound dropped, so truncation never reads as agreement.
     pub omitted: u32,
-    pub sealed_at_ms: u64,
+    pub stored_at_ms: u64,
 }
 
 /// The replicated family behind one external job, as this responder reduces it.
@@ -566,7 +566,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
             alternatives: plan.alternatives,
             rejected: plan.rejected,
             omitted: plan.omitted,
-            sealed_at_ms: plan.sealed_at_ms,
+            stored_at_ms: plan.stored_at_ms,
         }),
     }
 }
@@ -774,8 +774,8 @@ fn native_input(
     if input.dest_key.is_empty() {
         return Err(ServerError::BadRequest);
     }
-    // A realm submission resolves its inputs through the planner, which seals
-    // the holder itself; naming one there would claim an unverified fact.
+    // A realm submission resolves its inputs through the planner, which stores
+    // the holder itself; naming one there would claim an unverified value.
     let source_node_id = match (&input.source_node_id, target) {
         (Some(node_id), ExecutionTarget::Local) => {
             Some(NodeId::from_str(node_id).map_err(|_| ServerError::BadRequest)?)
@@ -1511,7 +1511,7 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                         "alternatives": 2,
                         "rejected": 1,
                         "omitted": 0,
-                        "sealed_at_ms": 1755500000000u64
+                        "stored_at_ms": 1755500000000u64
                     }
                 }
             })
@@ -2287,7 +2287,7 @@ mod tests {
                     resources,
                     admitted_at_ms: 10,
                 },
-                input_facts: Vec::new(),
+                captured_inputs: Vec::new(),
                 output_policies: Vec::new(),
                 placement: PlacementRef::NIL,
             },
@@ -3220,7 +3220,7 @@ mod tests {
 
     #[test]
     fn local_names_holder() {
-        // Only a local run may name the holder: the planner seals it otherwise.
+        // Only a local run may name the holder: the planner stores it otherwise.
         let input = ExecutionInputRequest {
             bucket: "src".to_string(),
             key: "data.csv".to_string(),

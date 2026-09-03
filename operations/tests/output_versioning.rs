@@ -14,11 +14,11 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    Actor, AttemptControl, AttemptIntent, Backend, BackendConfig, BucketInfo, ExecutionSpec,
-    FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, InputMode, InputSelection,
-    InputSource, JobClaim, JobId, JobInputFact, JobPayload, JobRecord, JobState, OutputDestination,
-    OutputSelection, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RoutingSnapshot,
-    WorkspaceMode, checksum::HASH_BLAKE3,
+    Actor, AttemptControl, AttemptIntent, Backend, BackendConfig, BucketInfo, CapturedInput,
+    ExecutionSpec, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, InputMode,
+    InputSelection, InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState,
+    OutputDestination, OutputSelection, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RoutingSnapshot, WorkspaceMode, checksum::HASH_BLAKE3,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::{GroupId, NodeId};
@@ -159,7 +159,7 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
     )
     .unwrap();
     let token = Ulid::generate();
-    let input_facts = seal_facts(harness, &spec).await;
+    let captured_inputs = capture_inputs(harness, &spec).await;
     let mut record = JobRecord::new(
         job_id,
         JobPayload::Execution(spec),
@@ -169,7 +169,7 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
         1,
         None,
     );
-    record.input_facts = input_facts;
+    record.captured_inputs = captured_inputs;
     record.state = JobState::Running;
     record.claim = Some(JobClaim {
         holder_node_id: harness.node_id,
@@ -198,10 +198,10 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
     (commit.record, commit.control)
 }
 
-/// The facts admission seals for a run. A capture inherits its output refs
-/// from them, so a seeded record carries the same ones.
-async fn seal_facts(harness: &Harness, spec: &ExecutionSpec) -> Vec<JobInputFact> {
-    let mut facts = Vec::with_capacity(spec.inputs.len());
+/// The inputs admission captures for a run. An output inherits its refs from
+/// them, so a seeded record carries the same ones.
+async fn capture_inputs(harness: &Harness, spec: &ExecutionSpec) -> Vec<CapturedInput> {
+    let mut captured = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
         let InputSource::S3 { version_id, .. } = &input.source;
         let version = version_id
@@ -209,7 +209,7 @@ async fn seal_facts(harness: &Harness, spec: &ExecutionSpec) -> Vec<JobInputFact
             .map(|version| Ulid::from_string(version).unwrap());
         let head = head_object(harness, version).await;
         let location = head.location.as_ref().expect("input is materialized");
-        facts.push(JobInputFact {
+        captured.push(CapturedInput {
             destination_key: input.dest_key.clone(),
             source_node_id: harness.node_id,
             version_id: head
@@ -228,7 +228,7 @@ async fn seal_facts(harness: &Harness, spec: &ExecutionSpec) -> Vec<JobInputFact
             policies: head.source_policies.clone(),
         });
     }
-    facts
+    captured
 }
 
 fn body(bytes: &[u8]) -> BackendStream<Result<bytes::Bytes, StreamError>> {
@@ -367,7 +367,7 @@ async fn seed_auth(harness: &Harness) {
     }
 }
 
-/// One execution reading the object at exactly the version the launch sealed.
+/// One execution reading the object at exactly the version the launch stored.
 fn pinned_spec(harness: &Harness, version: Ulid, mode: InputMode) -> ExecutionSpec {
     let mut spec = execution_spec(harness.group_id);
     spec.inputs.push(InputSelection {
@@ -422,7 +422,7 @@ async fn staged_bytes(harness: &Harness, version: Ulid) -> Vec<u8> {
 
 #[tokio::test]
 async fn stages_pinned_version() {
-    // A later write to the same key must not reach a launch sealed on the first.
+    // A later write to the same key must not reach a launch stored on the first.
     let harness = setup().await;
     seed_auth(&harness).await;
     let first = put_version(&harness, b"first-version", None).await;

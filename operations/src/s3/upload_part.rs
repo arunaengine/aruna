@@ -213,7 +213,7 @@ impl UploadPartOperation {
         if let Err(err) = self.validate_upload_record(&record) {
             return self.emit_error(err);
         }
-        // Cheap re-check of the create-time seal: no ref is resolved again, but
+        // Cheap re-check of the create-time refs: no ref is resolved again, but
         // a subject that moved since then stops the part before any byte moves.
         if !record.admits_part(subject.as_ref()) {
             return self.emit_error(PolicyGateError::Drift.into());

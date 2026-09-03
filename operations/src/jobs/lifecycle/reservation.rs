@@ -129,7 +129,7 @@ pub struct ReserveExecutionConfig {
     pub logical_job_id: JobId,
     pub execution_id: Ulid,
     pub resources: EffectiveResources,
-    /// Execution site the receipt sealed, kept so the local attempt can fence
+    /// Execution site the receipt stored, kept so the local attempt can fence
     /// itself against a subject this node no longer advertises.
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],

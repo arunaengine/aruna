@@ -4,19 +4,19 @@
 //! membership, placement policy, and static capability, then ranks whatever
 //! survives by directed transfer cost and stale ranking hints and keeps the
 //! best of them. It performs no I/O, decides nothing about capacity the target
-//! owns, and seals every fact it used into a plan digest.
+//! owns, and covers every value it used with a plan digest.
 
 mod cost;
 mod digest;
 mod eligibility;
-mod facts;
+mod inputs;
 mod rank;
 mod scan;
 
 pub use cost::{InputRoute, UNKNOWN_PERMILLE};
 pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
 pub use eligibility::{PolicyVerdict, RejectionVerdict};
-pub use facts::{
+pub use inputs::{
     InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES, MAX_PLAN_INPUTS,
     MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
     TargetScore,
@@ -54,7 +54,7 @@ pub struct RejectedTarget {
     pub verdict: RejectionVerdict,
 }
 
-/// The target this plan launches on, with the facts sealed into `plan_digest`.
+/// The target this plan launches on, with the values covered by `plan_digest`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     pub target: ExecutionTargetId,
@@ -81,7 +81,7 @@ pub struct ExecutionPlan {
     pub omitted: u32,
 }
 
-/// Plans one execution over already resolved facts and one complete candidate
+/// Plans one execution over already resolved inputs and one complete candidate
 /// set, paging it for the caller. Returns an error only when the request itself
 /// is unusable; an empty or fully rejected scan is a plan without a selection,
 /// not a failure, and stays retryable while a rejection may still resolve
@@ -94,8 +94,9 @@ pub fn plan_execution(
 ) -> Result<ExecutionPlan, PlanError> {
     let mut planner = Planner::new(request, compute)?;
     let mut ordered = candidates.to_vec();
-    ordered
-        .sort_unstable_by(|left, right| facts::target_order(left).cmp(&facts::target_order(right)));
+    ordered.sort_unstable_by(|left, right| {
+        inputs::target_order(left).cmp(&inputs::target_order(right))
+    });
     for page in ordered.chunks(MAX_TARGET_SCAN) {
         planner.rank_page(page)?;
     }

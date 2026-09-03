@@ -230,14 +230,14 @@ pub struct IncomingVersionReplicationOperation {
     destination_full: Option<RoutingError>,
     manifest_policy: Option<String>,
     writer_policy: Option<String>,
-    /// Destination facts of this node. Absent means no governed replica may be
+    /// Destination details of this node. Absent means no governed replica may be
     /// materialized or registered here.
     gate_context: Option<GateContext>,
     gate: Option<PolicyGateOperation>,
     /// Refs the gate admitted: the manifest's set unioned with what the local
     /// version already carried, so a sender cannot drop an inherited ref.
     gated_refs: Vec<PlacementPolicyRef>,
-    /// Destination facts the gate decided on, re-read inside the apply
+    /// Destination details the gate decided on, re-read inside the apply
     /// transaction so a default or subject change cannot expose a stale replica.
     gated_bucket: Option<GatedBucket>,
     pending_negotiation: Option<ReplicationNegotiationResult>,
@@ -861,7 +861,7 @@ impl IncomingVersionReplicationOperation {
         self.gated_bucket = self
             .gated_bucket
             .take()
-            .map(|gated| gated.sealed_under(self.gate_context.as_ref(), !refs.is_empty()));
+            .map(|gated| gated.stored_under(self.gate_context.as_ref(), !refs.is_empty()));
         match write_gate(self.gate_context.as_ref(), &refs, self.destination_group_id) {
             Ok(None) => self.reply_negotiation(result),
             Ok(Some(mut gate)) => {
@@ -968,7 +968,7 @@ impl IncomingVersionReplicationOperation {
         })]
     }
 
-    /// Re-reads the facts the negotiation gate decided on, inside the very
+    /// Re-reads the details the negotiation gate decided on, inside the very
     /// transaction that exposes the replica.
     fn check_drift(&mut self) -> Effects {
         self.state = IncomingVersionReplicationState::CheckDrift;
@@ -992,7 +992,7 @@ impl IncomingVersionReplicationOperation {
 
     /// Subject generation the gate admitted this replica under; zero when the
     /// version is ungoverned.
-    fn sealed_subject(&self) -> u64 {
+    fn stored_subject(&self) -> u64 {
         self.gated_bucket
             .as_ref()
             .and_then(|gated| gated.subject_generation)
@@ -1397,7 +1397,7 @@ impl IncomingVersionReplicationOperation {
                     location: &location,
                     policies: &self.gated_refs,
                     origin: self.copy_origin(),
-                    subject_generation: self.sealed_subject(),
+                    subject_generation: self.stored_subject(),
                     registered_at_ms: self.manifest.version_id.timestamp_ms(),
                 },
                 self.txn_id,
@@ -3088,7 +3088,7 @@ mod tests {
         start_apply_with(op, None)
     }
 
-    /// `bucket` must echo what negotiation sealed, or None when no bucket was
+    /// `bucket` must echo what negotiation stored, or None when no bucket was
     /// read; the drift re-check compares the two.
     fn start_apply_with(
         op: &mut IncomingVersionReplicationOperation,

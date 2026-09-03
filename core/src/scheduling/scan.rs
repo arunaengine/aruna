@@ -3,7 +3,7 @@
 //! Discovery hands the planner one page of advertisements at a time. Each page
 //! is screened and ranked as it arrives and only the bounded best of everything
 //! seen so far is retained, so one planning operation reaches the end of the
-//! realm's advertisements and seals its plan after the last page instead of at
+//! realm's advertisements and stores its plan after the last page instead of at
 //! a scan bound.
 
 use std::cmp::Ordering;
@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use crate::compute::ExecutionTargetId;
 use crate::scheduling::cost::LinkIndex;
 use crate::scheduling::eligibility::RejectionVerdict;
-use crate::scheduling::facts::{
+use crate::scheduling::inputs::{
     MAX_PLAN_ALTERNATIVES, MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest,
     TargetCandidate, target_order,
 };
@@ -28,7 +28,7 @@ pub struct Planner<'a> {
     rejected: Vec<RejectedTarget>,
     /// Rejections the audit bound dropped.
     omitted: u32,
-    /// A rejection that later facts may resolve, kept for audit or not.
+    /// A rejection that later values may resolve, kept for audit or not.
     retryable_rejection: bool,
     cursor: Option<ExecutionTargetId>,
     scanned: u64,
@@ -36,7 +36,7 @@ pub struct Planner<'a> {
 }
 
 impl<'a> Planner<'a> {
-    /// Validates and canonicalizes the request facts once, before any
+    /// Validates and canonicalizes the request values once, before any
     /// advertisement is screened.
     pub fn new(request: &PlanRequest, compute: &'a RealmComputeConfig) -> Result<Self, PlanError> {
         compute.validate()?;
@@ -82,7 +82,7 @@ impl<'a> Planner<'a> {
     /// continuation rather than a conclusive refusal.
     pub fn finish(self, incomplete: bool) -> ExecutionPlan {
         // Nothing eligible yet may still become eligible: an advertisement this
-        // round could not read, or a rejection later facts resolve.
+        // round could not read, or a rejection later values resolve.
         let retryable = self.ranked.is_empty() && (incomplete || self.retryable_rejection);
         let alternatives = self
             .ranked
@@ -95,7 +95,7 @@ impl<'a> Planner<'a> {
             })
             .collect();
         // The kept order is total and a repeated entry is refused, so the same
-        // advertisement set seals the same plan whatever the page boundaries.
+        // advertisement set yields the same plan whatever the page boundaries.
         let selected = self.ranked.first().map(|scored| Selection {
             target: scored.target.clone(),
             subject_digest: scored.candidate.capability.subject_digest,

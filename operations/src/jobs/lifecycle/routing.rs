@@ -62,7 +62,7 @@ pub async fn family_of_alias(
     Ok(rows.iter().filter_map(|(key, _)| alias_family(key)).min())
 }
 
-/// The reduced family of one alias plus the sealed spec of its canonical claim.
+/// The reduced family of one alias plus the stored spec of its canonical claim.
 pub async fn family_projection(
     context: &DriverContext,
     job_id: JobId,

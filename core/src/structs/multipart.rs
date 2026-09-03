@@ -74,8 +74,8 @@ pub struct MultipartUpload {
 }
 
 impl MultipartUpload {
-    /// Whether a part may still land here. The create-time gate sealed the refs
-    /// and the subject; a part is only a cheap re-check of that same seal.
+    /// Whether a part may still land here. The create-time gate stored the refs
+    /// and the subject; a part is only a cheap re-check of the same values.
     pub fn admits_part(&self, subject: Option<&crate::structs::NodeSubjectRecord>) -> bool {
         if self.placement_policies.is_empty() {
             return true;
@@ -87,7 +87,7 @@ impl MultipartUpload {
         })
     }
 
-    /// Adds the refs a copied part brought along. Returns whether the sealed set
+    /// Adds the refs a copied part brought along. Returns whether the stored set
     /// changed, so an unchanged upload record is not rewritten.
     pub fn merge_policies(
         &mut self,

@@ -243,7 +243,7 @@ impl PutBucketPlacementOperation {
             Err(error) => return self.fail(error.into()),
         };
         // An unchanged default is not a change: replay must not inflate the
-        // generation and supersede runs that sealed the same refs.
+        // generation and supersede runs that stored the same refs.
         if updated.placement_policies == previous {
             return self.finish(BucketPlacementDefault {
                 policies: previous,
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn skips_unchanged_default() {
-        // Replay must not inflate the generation and supersede sealed runs.
+        // Replay must not inflate the generation and supersede stored runs.
         let policies = vec![policy(1)];
         let mut operation = operation(&policies, None);
         started(&mut operation, &policies);

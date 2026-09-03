@@ -138,7 +138,7 @@ impl EvidencePlan {
             JobFamilyRecord::Budget(_) => {
                 self.kinds.insert(JobRecordKind::Spec);
             }
-            // A receipt is keyed by its execution, so the one that seals this
+            // A receipt is keyed by its execution, so the one that stores this
             // launch is found only by reading every receipt of the family.
             JobFamilyRecord::Launch(launch) => {
                 self.kinds.insert(JobRecordKind::Spec);

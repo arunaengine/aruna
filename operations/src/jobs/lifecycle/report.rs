@@ -1,7 +1,7 @@
 //! What the external surfaces report about one request family.
 //!
 //! Everything here is derived from the immutable records this responder holds,
-//! plus two explicitly responder-local diagnostics: the plan this node sealed
+//! plus two explicitly responder-local diagnostics: the plan this node stored
 //! when it was a witness, and whether it still has a retry armed. Both are kept
 //! outside the replicated projection digest, so a client can tell a local view
 //! apart from realm-wide truth.
@@ -33,7 +33,7 @@ const MAX_SIBLING_SCAN: usize = 256;
 /// Explain rows one report reads; only this node ever writes them.
 const MAX_EXPLAIN_ROWS: usize = 4;
 
-/// The placement the responder's own witness round sealed. It explains one
+/// The placement the responder's own witness round stored. It explains one
 /// launch this node published and is never another node's decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanEstimate {
@@ -44,7 +44,7 @@ pub struct PlanEstimate {
     pub rejected: u32,
     /// Rejections the bound dropped, so truncation is never read as agreement.
     pub omitted: u32,
-    pub sealed_at_ms: u64,
+    pub stored_at_ms: u64,
 }
 
 /// One family as this responder currently reduces it.
@@ -206,7 +206,7 @@ fn terminal(state: PhysicalExecutionState) -> bool {
     state.is_terminal()
 }
 
-/// The plan this responder sealed for the family, when it planned one at all.
+/// The plan this responder stored for the family, when it planned one at all.
 async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
@@ -224,7 +224,7 @@ async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<P
     debug!(
         alternatives = explain.plan.alternatives.len(),
         rejected = explain.plan.rejected.len(),
-        "Reporting the responder's own sealed plan"
+        "Reporting the responder's own stored plan"
     );
     let selected = explain.plan.selected.as_ref();
     Some(PlanEstimate {
@@ -235,7 +235,7 @@ async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<P
         alternatives: explain.plan.alternatives.len() as u32,
         rejected: explain.plan.rejected.len() as u32,
         omitted: explain.plan.omitted,
-        sealed_at_ms: explain.sealed_at_ms,
+        stored_at_ms: explain.stored_at_ms,
     })
 }
 

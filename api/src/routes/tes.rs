@@ -381,7 +381,7 @@ impl TaskFilters {
                 })
     }
 
-    fn matches_facts(&self, record: &JobRecord, facts: &TaskFacts) -> bool {
+    fn matches_details(&self, record: &JobRecord, details: &TaskDetails) -> bool {
         if !self.matches_base(record) {
             return false;
         }
@@ -389,7 +389,7 @@ impl TaskFilters {
             return false;
         };
         let mut tags = project_tags(spec);
-        facts.stamp(&record.job_id.to_string(), &mut tags);
+        details.stamp(&record.job_id.to_string(), &mut tags);
         self.tags
             .iter()
             .filter(|(key, _)| DERIVED_TAG_KEYS.contains(&key.as_str()))
@@ -763,7 +763,7 @@ answer 404, so the existence of a task is never disclosed.
   stderr and the system logs.
 - `BASIC` and `FULL` also carry the derived read-only tags `aruna-engine.org/job-id` always,
   `aruna-engine.org/logical-state` once a family is known, and `aruna-engine.org/executor-kind` plus
-  `aruna-engine.org/estimated-transfer-bytes` once this responder sealed a placement.
+  `aruna-engine.org/estimated-transfer-bytes` once this responder stored a placement.
 - Output urls in the task log name the exact `versionId` the canonical execution wrote, which is not
   necessarily the object's current version: a duplicate execution admitted during a partition, or
   any later write, may have made another version current.
@@ -893,14 +893,14 @@ pub async fn get_task(
     // A distributed external job is projected from the replicated family, so
     // this surface reports the same logical view and the same exact output
     // VersionIds as the native REST status.
-    let (record, facts) = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
-        Some(Ok(report)) => (family_record(&report), TaskFacts::from_report(&report)),
+    let (record, details) = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
+        Some(Ok(report)) => (family_record(&report), TaskDetails::from_report(&report)),
         Some(Err(error)) => return TesError::from_job_route(error).into_response(),
         // The owner is the sole 404 authority; a non-owner routes or reports 503.
         None => {
             match read_record_routed(&state.get_ctx(), caller.auth.user_id, job_id, forwarded).await
             {
-                Ok(Some(record)) => (record, TaskFacts::default()),
+                Ok(Some(record)) => (record, TaskDetails::default()),
                 Ok(None) => return TesError::not_found("TES task not found").into_response(),
                 Err(error) => return TesError::from_job_route(error).into_response(),
             }
@@ -914,7 +914,7 @@ pub async fn get_task(
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     tes_json_response(
         StatusCode::OK,
-        project_task(&record, &facts, view, &base_url),
+        project_task(&record, &details, view, &base_url),
     )
 }
 
@@ -922,11 +922,11 @@ async fn task_record(
     state: &ServerState,
     auth: &AuthContext,
     record: JobRecord,
-) -> Result<(JobRecord, TaskFacts), TesError> {
+) -> Result<(JobRecord, TaskDetails), TesError> {
     match family_report(&state.get_ctx(), auth, record.job_id).await {
-        Some(Ok(report)) => Ok((family_record(&report), TaskFacts::from_report(&report))),
+        Some(Ok(report)) => Ok((family_record(&report), TaskDetails::from_report(&report))),
         Some(Err(error)) => Err(TesError::from_job_route(error)),
-        None => Ok((record, TaskFacts::default())),
+        None => Ok((record, TaskDetails::default())),
     }
 }
 
@@ -936,7 +936,7 @@ async fn list_derived(
     filters: &TaskFilters,
     mut cursor: Option<Vec<u8>>,
     limit: usize,
-) -> Result<(Vec<(JobRecord, TaskFacts)>, Option<Vec<u8>>), TesError> {
+) -> Result<(Vec<(JobRecord, TaskDetails)>, Option<Vec<u8>>), TesError> {
     let mut selected = Vec::with_capacity(limit);
     let mut page_cursor = None;
     loop {
@@ -950,7 +950,7 @@ async fn list_derived(
             return Ok((selected, None));
         };
         let task = task_record(state, &caller.auth, record).await?;
-        if filters.matches_facts(&task.0, &task.1) {
+        if filters.matches_details(&task.0, &task.1) {
             if selected.len() == limit {
                 return Ok((selected, page_cursor));
             }
@@ -1088,7 +1088,7 @@ pub async fn list_tasks(
     };
     let tasks = records
         .iter()
-        .map(|(record, facts)| project_task(record, facts, view, &base_url))
+        .map(|(record, details)| project_task(record, details, view, &base_url))
         .collect();
 
     tes_json_response(
@@ -1635,16 +1635,16 @@ fn family_record(report: &FamilyReport) -> JobRecord {
     record
 }
 
-/// Facts a TES tag exposes at read time. They come from the same family and
-/// sealed plan `GET /jobs/{id}` reports and are never stored on the task.
+/// Details a TES tag exposes at read time. They come from the same family and
+/// plan `GET /jobs/{id}` reports and are never kept on the task.
 #[derive(Debug, Default)]
-struct TaskFacts {
+struct TaskDetails {
     logical_state: Option<String>,
     executor_kind: Option<String>,
     transfer_bytes: Option<u64>,
 }
 
-impl TaskFacts {
+impl TaskDetails {
     fn from_report(report: &FamilyReport) -> Self {
         // Only a plan that selected a target is a placement; without one the
         // transfer estimate names nothing.
@@ -1672,7 +1672,12 @@ impl TaskFacts {
     }
 }
 
-fn project_task(record: &JobRecord, facts: &TaskFacts, view: TesView, base_url: &str) -> TesTask {
+fn project_task(
+    record: &JobRecord,
+    details: &TaskDetails,
+    view: TesView,
+    base_url: &str,
+) -> TesTask {
     let id = record.job_id.to_string();
     let state = tes_state(record);
     if view == TesView::Minimal {
@@ -1753,7 +1758,7 @@ fn project_task(record: &JobRecord, facts: &TaskFacts, view: TesView, base_url: 
     });
 
     let mut tags = project_tags(spec);
-    facts.stamp(&id, &mut tags);
+    details.stamp(&id, &mut tags);
 
     let mut log = build_task_log(record, base_url);
     if view == TesView::Basic {
@@ -1928,10 +1933,10 @@ async fn authenticate_tes(
         | Err(GetUserAccessError::NotFound) => return Err(TesError::unauthorized()),
         Ok(Some(Err(error))) | Err(error) => return Err(TesError::internal(error.to_string())),
     };
-    // The secret seals with this node's issuer-local key, so it opens only for a
+    // The secret is encrypted with this node's issuer-local key, so it opens only for a
     // credential this node issued; a foreign or tampered record never matches.
     let secret_matches = access
-        .open_secret(state.credential_seal_key())
+        .open_secret(state.credential_encryption_key())
         .is_ok_and(|plaintext| {
             blake3::hash(provided_secret.as_slice()) == blake3::hash(plaintext.as_bytes())
         });
@@ -2214,7 +2219,7 @@ mod tests {
             access_key: UserAccess::build_access_key("tes").unwrap(),
             user_identity,
             group_id,
-            secret: aruna_core::credential_seal::SealedS3Secret::empty(),
+            secret: aruna_core::credential_encryption::EncryptedS3Secret::empty(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: *node_id().as_bytes(),
@@ -2222,12 +2227,12 @@ mod tests {
         }
     }
 
-    /// A credential whose secret is sealed with the node's issuer-local key, as
-    /// the create-credential path would have produced.
-    fn sealed(state: &ServerState, group_id: Ulid) -> UserAccess {
+    /// A credential whose secret is encrypted with the node's issuer-local key,
+    /// as the create-credential path would have produced.
+    fn issued_access(state: &ServerState, group_id: Ulid) -> UserAccess {
         let mut access = credential(group_id);
         access
-            .seal_secret(state.credential_seal_key(), TES_SECRET)
+            .encrypt_secret(state.credential_encryption_key(), TES_SECRET)
             .unwrap();
         access
     }
@@ -2603,14 +2608,14 @@ mod tests {
             )),
         )
         .unwrap();
-        let facts = TaskFacts {
+        let details = TaskDetails {
             logical_state: Some("running".to_string()),
             executor_kind: Some("docker".to_string()),
             transfer_bytes: Some(4_096),
         };
         assert!(derived.has_derived());
         assert!(derived.matches(&record));
-        assert!(derived.matches_facts(&record, &facts));
+        assert!(derived.matches_details(&record, &details));
 
         let wrong_name = ListTasksQuery {
             name_prefix: Some("other".to_string()),
@@ -2970,7 +2975,7 @@ mod tests {
         )
         .unwrap();
         let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
-        let queued = project_task(&record, &TaskFacts::default(), TesView::Full, "http://x");
+        let queued = project_task(&record, &TaskDetails::default(), TesView::Full, "http://x");
         assert!(queued.logs[0].start_time.is_none());
         assert!(queued.logs[0].logs.is_empty());
         record.state = JobState::Succeeded;
@@ -3012,12 +3017,17 @@ mod tests {
             output_digest: None,
         });
 
-        let minimal = project_task(&record, &TaskFacts::default(), TesView::Minimal, "http://x");
+        let minimal = project_task(
+            &record,
+            &TaskDetails::default(),
+            TesView::Minimal,
+            "http://x",
+        );
         assert!(minimal.executors.is_empty());
         assert!(minimal.logs.is_empty());
         assert_eq!(minimal.state, Some(TesState::Complete));
 
-        let basic = project_task(&record, &TaskFacts::default(), TesView::Basic, "http://x");
+        let basic = project_task(&record, &TaskDetails::default(), TesView::Basic, "http://x");
         assert_eq!(basic.name.as_deref(), Some("align reads"));
         assert_eq!(basic.description.as_deref(), Some("sample task"));
         assert_eq!(basic.tags.get("project").map(String::as_str), Some("alpha"));
@@ -3040,7 +3050,7 @@ mod tests {
         assert_eq!(basic.resources.as_ref().unwrap().disk_gb, Some(8.0));
         assert_eq!(basic.resources.as_ref().unwrap().preemptible, Some(true));
 
-        let full = project_task(&record, &TaskFacts::default(), TesView::Full, "http://x");
+        let full = project_task(&record, &TaskDetails::default(), TesView::Full, "http://x");
         assert_eq!(full.logs.len(), 1);
         assert_eq!(full.logs[0].logs[0].exit_code, Some(0));
         assert_eq!(full.logs[0].logs[0].stdout.as_deref(), Some("hello"));
@@ -3124,7 +3134,7 @@ mod tests {
                 resources,
                 admitted_at_ms: 10,
             },
-            input_facts: Vec::new(),
+            captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             placement: PlacementRef::NIL,
         };
@@ -3196,7 +3206,7 @@ mod tests {
 
         let task = project_task(
             &family_record(&report),
-            &TaskFacts::from_report(&report),
+            &TaskDetails::from_report(&report),
             TesView::Full,
             "http://x",
         );
@@ -3212,7 +3222,7 @@ mod tests {
         running.state = LogicalJobState::Running;
         let pending = project_task(
             &family_record(&running),
-            &TaskFacts::from_report(&running),
+            &TaskDetails::from_report(&running),
             TesView::Full,
             "http://x",
         );
@@ -3222,7 +3232,7 @@ mod tests {
 
     #[test]
     fn derives_family_tags() {
-        // Placement facts are stamped at read time, so a task that was never
+        // Placement details are stamped at read time, so a task that was never
         // placed carries the job id and logical state and nothing more.
         use aruna_core::compute::ExecutionTargetId;
         use aruna_operations::jobs::lifecycle::PlanEstimate;
@@ -3230,7 +3240,7 @@ mod tests {
         let mut report = family_fixture();
         let unplaced = project_task(
             &family_record(&report),
-            &TaskFacts::from_report(&report),
+            &TaskDetails::from_report(&report),
             TesView::Basic,
             "http://x",
         );
@@ -3255,12 +3265,12 @@ mod tests {
             alternatives: 2,
             rejected: 1,
             omitted: 0,
-            sealed_at_ms: 15,
+            stored_at_ms: 15,
         });
-        let facts = TaskFacts::from_report(&report);
+        let details = TaskDetails::from_report(&report);
         let record = family_record(&report);
         for view in [TesView::Basic, TesView::Full] {
-            let task = project_task(&record, &facts, view, "http://x");
+            let task = project_task(&record, &details, view, "http://x");
             assert_eq!(
                 task.tags.get(EXECUTOR_KIND_TAG_KEY).map(String::as_str),
                 Some("docker")
@@ -3270,7 +3280,7 @@ mod tests {
                 Some("4096")
             );
         }
-        let minimal = project_task(&record, &facts, TesView::Minimal, "http://x");
+        let minimal = project_task(&record, &details, TesView::Minimal, "http://x");
         assert!(minimal.tags.is_empty());
     }
 
@@ -3442,12 +3452,12 @@ mod tests {
             collision_policy: Default::default(),
         };
         let record = execution_record(JobId::from_bytes([3u8; 16]), user(2), spec.clone());
-        let task = project_task(&record, &TaskFacts::default(), TesView::Basic, "http://x");
+        let task = project_task(&record, &TaskDetails::default(), TesView::Basic, "http://x");
         assert_eq!(task.executors[0].command, vec!["/bin/tool", "--flag", "x"]);
 
         spec.entrypoint = None;
         let record = execution_record(JobId::from_bytes([4u8; 16]), user(2), spec);
-        let task = project_task(&record, &TaskFacts::default(), TesView::Basic, "http://x");
+        let task = project_task(&record, &TaskDetails::default(), TesView::Basic, "http://x");
         assert_eq!(task.executors[0].command, vec!["--flag", "x"]);
     }
 
@@ -3455,7 +3465,7 @@ mod tests {
     async fn rejects_basic() {
         let (_dir, state) = build_state().await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = sealed(&state, group);
+        let access = issued_access(&state, group);
         let mut revoked = access.clone();
         revoked.revoked_at = Some(SystemTime::now());
         let mut expired = access.clone();
@@ -3480,7 +3490,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_restricted_basic() {
         let (_dir, state) = build_state().await;
-        let mut access = sealed(&state, Ulid::from_bytes([5u8; 16]));
+        let mut access = issued_access(&state, Ulid::from_bytes([5u8; 16]));
         access.path_restrictions = Some(Vec::new());
         write_credential(&state, &access).await;
 
@@ -3497,7 +3507,7 @@ mod tests {
         // honest single-node answer is the fixed-text 503, not an auth failure.
         let (_dir, state) = build_state().await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = sealed(&state, group);
+        let access = issued_access(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
         let mut task = sample_task(group);
@@ -3530,7 +3540,7 @@ mod tests {
         // run snapshots the same objects instead.
         let (_dir, state) = build_state().await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = sealed(&state, group);
+        let access = issued_access(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
 
@@ -3568,7 +3578,7 @@ mod tests {
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
         let sibling = Ulid::from_bytes([6u8; 16]);
-        let access = sealed(&state, group);
+        let access = issued_access(&state, group);
         write_credential(&state, &access).await;
         let headers = basic_headers(&access, TES_SECRET);
         let caller = authenticate_tes(&state, None, &headers).await.unwrap();
@@ -3654,7 +3664,7 @@ mod tests {
         let (_dir, state) = build_state().await;
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = sealed(&state, group);
+        let access = issued_access(&state, group);
         write_credential(&state, &access).await;
         let headers = basic_headers(&access, TES_SECRET);
         let (spec, _) =
@@ -3691,7 +3701,7 @@ mod tests {
         let (_dir, state) = build_state().await;
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = sealed(&state, group);
+        let access = issued_access(&state, group);
         write_credential(&state, &access).await;
         let headers = basic_headers(&access, TES_SECRET);
         let target = JobId::from_bytes([9u8; 16]);

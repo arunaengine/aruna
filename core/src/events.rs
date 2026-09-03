@@ -424,11 +424,11 @@ impl TryFrom<PlacementDecision> for DeclinedPolicy {
 pub enum LaunchDecline {
     /// The offering scheduler is not a holder in the target's current view.
     NotHolder,
-    /// Realm or group authorization denied the sealed submitter.
+    /// Realm or group authorization denied the stored submitter.
     Unauthorized,
     /// Placement evaluation blocked the execution subject; never `Allowed`.
     Policy(DeclinedPolicy),
-    /// Exact local admission found no capacity for the sealed resources.
+    /// Exact local admission found no capacity for the stored resources.
     Capacity,
     /// The target is draining or leaving and accepts no new work.
     Draining,

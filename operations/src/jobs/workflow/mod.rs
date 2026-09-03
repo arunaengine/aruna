@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::JOB_HEARTBEAT_MS;
-use super::output_record::seal_outputs;
+use super::output_record::store_outputs;
 use super::store::{
     ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
     complete_cancelled, complete_execution, fail_execution, mark_indeterminate,
@@ -350,7 +350,7 @@ pub async fn run_execution_job(
 /// Resolve the backend for a spec, or a permanent error when none is eligible.
 ///
 /// A receipted execution is fenced to the exact execution site its receipt
-/// sealed: subject drift refuses the start instead of running accepted work
+/// stored: subject drift refuses the start instead of running accepted work
 /// somewhere nobody authorized. A local job without a receipt keeps the
 /// unfenced selection.
 pub async fn resolve_backend(
@@ -370,7 +370,7 @@ pub async fn resolve_backend(
         .select(constraint.as_ref())
         .cloned()
         .ok_or_else(|| JobError::permanent("no eligible executor for job"))?;
-    let Some(sealed) = sealed_site(context, job_id)
+    let Some(stored) = stored_site(context, job_id)
         .await
         .map_err(JobError::retryable)?
     else {
@@ -386,18 +386,18 @@ pub async fn resolve_backend(
             "receipted execution cannot start without a local placement subject",
         ));
     };
-    match registry.fenced(&selected.kind(), &subject, sealed.0, &sealed.1) {
+    match registry.fenced(&selected.kind(), &subject, stored.0, &stored.1) {
         Ok(backend) => Ok(backend.clone()),
         Err(BackendError::Fenced) => {
             warn!(
                 job_id = %job_id,
-                sealed_generation = sealed.0,
+                stored_generation = stored.0,
                 current_generation = subject.generation,
                 "Receipted execution refused: the execution site drifted from its receipt"
             );
             Err(JobError::retryable(format!(
-                "execution site drifted from its receipt: sealed subject generation {}, current {}",
-                sealed.0, subject.generation
+                "execution site drifted from its receipt: stored subject generation {}, current {}",
+                stored.0, subject.generation
             )))
         }
         Err(error) => Err(JobError::permanent(format!(
@@ -408,7 +408,7 @@ pub async fn resolve_backend(
 
 /// Subject generation and digest one receipted execution was accepted under.
 /// `None` for a local job that never reserved capacity: the unfenced path.
-async fn sealed_site(
+async fn stored_site(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<(u64, [u8; 32])>, String> {
@@ -1158,7 +1158,7 @@ pub(crate) async fn finalize_attempt(
                 Box::pin(fail_bad_outputs(context, job_id, token, bucket, error)).await;
                 return;
             }
-            let Some(digest) = Box::pin(seal_or_fail(
+            let Some(digest) = Box::pin(store_or_fail(
                 context, job_id, token, bucket, &control, &result,
             ))
             .await
@@ -1316,7 +1316,7 @@ async fn finalize_cancel(
                         Box::pin(fail_bad_outputs(context, job_id, token, bucket, error)).await;
                         return;
                     }
-                    let Some(digest) = Box::pin(seal_or_fail(
+                    let Some(digest) = Box::pin(store_or_fail(
                         context, job_id, token, bucket, &control, &result,
                     ))
                     .await
@@ -1442,10 +1442,10 @@ fn name_output_record(result: &mut JobResultPayload, digest: [u8; 32]) {
     }
 }
 
-/// Seal this execution's exact output set before success is attempted. A
+/// Store this execution's exact output set before success is attempted. A
 /// permanent failure terminalizes the job: a success whose immutable output
 /// record is not durable must never be published.
-async fn seal_or_fail(
+async fn store_or_fail(
     context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
@@ -1469,10 +1469,10 @@ async fn seal_or_fail(
             return None;
         }
     };
-    match Box::pin(seal_outputs(context, &record, control, outputs)).await {
+    match Box::pin(store_outputs(context, &record, control, outputs)).await {
         Ok(digest) => Some(digest),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
-            warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output record seal failed; failing");
+            warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output record store failed; failing");
             Box::pin(fail_and_crate(context, job_id, token, &record, error)).await;
             None
         }
@@ -2504,7 +2504,7 @@ mod tests {
         task.await.unwrap();
     }
 
-    /// A context that can sign: terminal success seals an output record, which
+    /// A context that can sign: terminal success stores an output record, which
     /// needs this node's key.
     async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::NetHandle) {
         let net = aruna_net::NetHandle::new(
@@ -2845,7 +2845,7 @@ mod tests {
 
     /// Writes the receipted reservation and the node subject a fenced start
     /// compares against.
-    async fn seal_site(storage: &StorageHandle, job_id: JobId, generation: u64, digest: [u8; 32]) {
+    async fn store_site(storage: &StorageHandle, job_id: JobId, generation: u64, digest: [u8; 32]) {
         use aruna_core::compute_quota::JobReservationRecord;
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
@@ -2922,13 +2922,13 @@ mod tests {
 
     #[tokio::test]
     async fn drifted_site_refuses() {
-        // The receipt sealed one execution site; a node advertising another one
+        // The receipt stored one execution site; a node advertising another one
         // must refuse to start the accepted work, retryably.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = compute_context(storage.clone());
         let job_id = job_id();
-        seal_site(&storage, job_id, 99, [7u8; 32]).await;
+        store_site(&storage, job_id, 99, [7u8; 32]).await;
 
         let Err(error) = resolve_backend(&ctx, &execution_spec(), job_id).await else {
             panic!("a drifted subject must refuse the start");
@@ -2945,7 +2945,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = compute_context(storage.clone());
         let (record, token, _) = ready_with_intent(&storage).await;
-        seal_site(&storage, record.job_id, 99, [7u8; 32]).await;
+        store_site(&storage, record.job_id, 99, [7u8; 32]).await;
         let Err(error) = resolve_backend(&ctx, &execution_spec(), record.job_id).await else {
             panic!("a drifted subject must refuse the start");
         };
@@ -2966,8 +2966,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sealed_site_starts() {
-        // The exact sealed generation and digest still admit the start.
+    async fn stored_site_starts() {
+        // The exact stored generation and digest still admit the start.
         use aruna_compute::ExecutorRegistry;
         use aruna_core::compute::ExecutorCapability;
         use aruna_core::structs::{NodeSubjectRecord, PlacementSubject};
@@ -2994,7 +2994,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        seal_site(
+        store_site(
             &storage,
             job_id,
             capability.subject.generation,

@@ -163,7 +163,7 @@ pub async fn create_s3_session(
                 path_restrictions: restrictions,
                 issued_by: *state.get_node_id().as_bytes(),
             },
-            state.credential_seal_key().clone(),
+            state.credential_encryption_key().clone(),
         ),
         &state.get_ctx(),
     )
@@ -327,7 +327,7 @@ pub async fn refresh_s3_session(
                 path_restrictions: restrictions,
                 issued_by: *state.get_node_id().as_bytes(),
             },
-            state.credential_seal_key().clone(),
+            state.credential_encryption_key().clone(),
         ),
         &state.get_ctx(),
     )
@@ -602,7 +602,7 @@ mod tests {
                     path_restrictions: None,
                     issued_by,
                 },
-                state.credential_seal_key().clone(),
+                state.credential_encryption_key().clone(),
             ),
             &state.get_ctx(),
         )

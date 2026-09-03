@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn config_round_trips() {
-        // The transport form must preserve every planner and quota fact: a
+        // The transport form must preserve every planner and quota value: a
         // dropped link would silently change every transfer estimate.
         let stored = RealmComputeConfig {
             links: vec![LocationLink {

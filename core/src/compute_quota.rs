@@ -140,7 +140,7 @@ pub struct ComputeReservationSnapshot {
 }
 
 /// One durable local reservation of exact capacity, keyed by ExecutionId. This
-/// node writes it before starting work and releases it on a terminal fact.
+/// node writes it before starting work and releases it on a terminal state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobReservationRecord {
     pub execution_id: Ulid,
@@ -150,14 +150,14 @@ pub struct JobReservationRecord {
     pub logical_job_id: JobId,
     pub resources: EffectiveResources,
     pub created_at_ms: u64,
-    /// Execution site the receipt sealed. The local attempt refuses to start
+    /// Execution site the receipt stored. The local attempt refuses to start
     /// when this node no longer advertises exactly this subject.
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
 }
 
 /// What a departing node could not resolve before leaving. Recorded durably so
-/// removal never has to wait for it and audit keeps the last known facts.
+/// removal never has to wait for it and audit keeps the last known values.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComputeDepartureReport {
     pub departed_at_ms: u64,
@@ -236,7 +236,7 @@ fn fair_shares(counts: &[usize], budget: usize) -> Vec<usize> {
 }
 
 /// Ranking-only availability of one backend: its static ceilings minus what this
-/// node has reserved, observed now. Never a hard capacity fact: exact admission
+/// node has reserved, observed now. Never a hard capacity limit: exact admission
 /// is the target-side reservation.
 pub fn availability(
     limits: &ResourceEnvelope,
@@ -269,7 +269,7 @@ pub struct ComputeQuota {
     pub max_job_cpu_cores: Option<u32>,
     pub max_job_ram_bytes: Option<u64>,
     pub max_job_disk_bytes: Option<u64>,
-    /// Per-job walltime bound sealed into the request, not an assertion about
+    /// Per-job walltime bound stored in the request, not an assertion about
     /// any clock: nothing is cancelled because this quota later changed.
     pub max_job_walltime_ms: Option<u64>,
 }

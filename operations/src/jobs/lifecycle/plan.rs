@@ -1,8 +1,8 @@
-//! Assembling the pinned facts one planning round decides on.
+//! Assembling the pinned values one planning round decides on.
 //!
 //! Everything here is resolved before the pure planner runs: exact input
 //! versions and their known holders, the advertised targets, and the membership
-//! facts of the nodes that published them. Membership comes from the
+//! details of the nodes that published them. Membership comes from the
 //! authenticated realm config, never from an advertisement's own claims.
 
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use aruna_core::scheduling::{
     TargetCandidate,
 };
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, InputSource, JobInputFact, LogicalJobSpec,
+    AuthContext, BlobVersion, BlobVersionState, CapturedInput, InputSource, LogicalJobSpec,
     NodeInfoDocument, Permission, PlacementPolicyRef, PlacementSubject, PolicyResolution,
     RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn, WorkspaceMode,
     blob_group_permission_path, storage_subject,
@@ -42,7 +42,7 @@ pub(crate) const REALM_STAGING: StagingMode = StagingMode::Files;
 pub enum PlanBuildError {
     #[error("input {key} could not be pinned: {reason}")]
     Input { key: String, reason: String },
-    #[error("planning facts are unavailable: {0}")]
+    #[error("planning inputs are unavailable: {0}")]
     Unavailable(String),
     #[error(transparent)]
     Plan(#[from] aruna_core::scheduling::PlanError),
@@ -50,7 +50,7 @@ pub enum PlanBuildError {
     Request(#[from] ids::RequestError),
 }
 
-/// Builds and runs one planning round for the sealed spec. Targets already
+/// Builds and runs one planning round for the stored spec. Targets already
 /// declined for this request are excluded before ranking.
 pub async fn build_plan(
     context: &DriverContext,
@@ -86,7 +86,7 @@ pub async fn build_plan(
     Ok(planner.finish(unread))
 }
 
-/// The pinned facts one round screens every advertisement against.
+/// The pinned values one round screens every advertisement against.
 fn plan_request(
     spec: &LogicalJobSpec,
     inputs: Vec<ResolvedInput>,
@@ -243,14 +243,14 @@ fn node_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeK
         .map(|node| node.kind.clone())
 }
 
-/// Pins every declared input to one exact version at its sealed source.
+/// Pins every declared input to one exact version at its stored source.
 fn resolve_inputs(
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
 ) -> Result<Vec<ResolvedInput>, PlanBuildError> {
-    if spec.input_facts.len() != spec.payload.inputs.len() {
+    if spec.captured_inputs.len() != spec.payload.inputs.len() {
         return Err(PlanBuildError::Unavailable(
-            "sealed input facts are incomplete".to_string(),
+            "captured inputs are incomplete".to_string(),
         ));
     }
     let mut inputs = Vec::new();
@@ -260,18 +260,18 @@ fn resolve_inputs(
             key,
             version_id,
         } = &input.source;
-        let fact: &JobInputFact = spec
-            .input_facts
+        let captured: &CapturedInput = spec
+            .captured_inputs
             .iter()
-            .find(|fact| fact.destination_key == input.dest_key)
+            .find(|captured| captured.destination_key == input.dest_key)
             .ok_or_else(|| PlanBuildError::Input {
                 key: input.dest_key.clone(),
-                reason: "sealed input facts are unavailable".to_string(),
+                reason: "captured inputs are unavailable".to_string(),
             })?;
-        if fact.source_node_id != spec.ingress_node_id {
+        if captured.source_node_id != spec.ingress_node_id {
             return Err(PlanBuildError::Input {
                 key: input.dest_key.clone(),
-                reason: "sealed input endpoint changed".to_string(),
+                reason: "captured input endpoint changed".to_string(),
             });
         }
         if version_id
@@ -282,27 +282,27 @@ fn resolve_inputs(
                 key: input.dest_key.clone(),
                 reason: "version id is not a ulid".to_string(),
             })?
-            .is_some_and(|requested| requested != fact.version_id)
+            .is_some_and(|requested| requested != captured.version_id)
         {
             return Err(PlanBuildError::Input {
                 key: input.dest_key.clone(),
-                reason: "sealed input version changed".to_string(),
+                reason: "captured input version changed".to_string(),
             });
         }
-        let holders = input_holders(config, fact.source_node_id);
+        let holders = input_holders(config, captured.source_node_id);
         inputs.push(ResolvedInput {
             destination_key: input.dest_key.clone(),
             source: VersionedObjectArn {
                 realm_id: spec.realm_id,
-                node_id: fact.source_node_id,
+                node_id: captured.source_node_id,
                 bucket: bucket.clone(),
                 key: key.clone(),
-                version: fact.version_id,
+                version: captured.version_id,
             },
-            version_id: fact.version_id,
-            blake3: fact.blake3,
-            bytes: fact.bytes,
-            policies: fact.policies.clone(),
+            version_id: captured.version_id,
+            blake3: captured.blake3,
+            bytes: captured.bytes,
+            policies: captured.policies.clone(),
             holders,
         });
     }
@@ -339,7 +339,7 @@ pub async fn version_hash(
     }
 }
 
-/// The source endpoint owns the sealed bucket/key/version. A same-hash blob on
+/// The source endpoint owns the stored bucket/key/version. A same-hash blob on
 /// another node is not evidence that the node owns that S3 object identity.
 fn input_holders(config: &RealmConfigDocument, source_node: NodeId) -> Vec<InputHolder> {
     vec![InputHolder {
@@ -479,8 +479,8 @@ mod tests {
         }
     }
 
-    /// The pinned facts of one round, with the candidates left to the scan.
-    fn facts(spec: &LogicalJobSpec) -> PlanRequest {
+    /// The pinned values of one round, with the candidates left to the scan.
+    fn round_request(spec: &LogicalJobSpec) -> PlanRequest {
         plan_request(spec, Vec::new(), Vec::new(), BTreeMap::new(), 2_000)
             .expect("request is well formed")
     }
@@ -502,7 +502,7 @@ mod tests {
     }
 
     /// One planning walk over the advertisements in the order they were
-    /// published, with the cursor kept before the plan is sealed.
+    /// published, with the cursor kept before the plan is stored.
     async fn walk(
         config: &RealmConfigDocument,
         documents: &[NodeInfoDocument],
@@ -514,7 +514,7 @@ mod tests {
         }
         let spec = family.spec();
         let (read, _) = advertisements(&context, config).await;
-        let request = facts(&spec);
+        let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
         let scan = candidates(&context, config, &spec, &read, &[], &mut planner)
             .await
@@ -560,7 +560,7 @@ mod tests {
 
         let (read, unread) = advertisements(&context, &config).await;
         assert!(!unread && read.len() == 129);
-        let request = facts(&spec);
+        let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
         let scan = candidates(&context, &config, &spec, &read, &[], &mut planner)
             .await
@@ -591,7 +591,7 @@ mod tests {
         let excluded = vec![documents[0].executors[0].target(documents[0].node_id)];
 
         let (read, _) = advertisements(&context, &config).await;
-        let request = facts(&spec);
+        let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
         let scan = candidates(&context, &config, &spec, &read, &excluded, &mut planner)
             .await
@@ -639,7 +639,7 @@ mod tests {
         let family = Family::new([4u8; 32]);
         let mut spec = family.spec();
         mounted(&mut spec);
-        let request = facts(&spec);
+        let request = round_request(&spec);
         assert_eq!(request.staging, StagingMode::Files);
         let candidate = TargetCandidate {
             node_id: node(1),

@@ -99,10 +99,10 @@ async fn send_upstream(
         return Err(ServerError::NotFound);
     }
     let secret = provider
-        .open_secret(state.credential_seal_key())
+        .open_secret(state.credential_encryption_key())
         .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
     let custom_headers = provider
-        .open_headers(state.credential_seal_key())
+        .open_headers(state.credential_encryption_key())
         .map_err(|_| ServerError::InternalError("provider headers unavailable".to_string()))?;
     let body = if provider.kind == AssistantProviderKind::Chatgpt {
         force_chatgpt(&body)?
@@ -236,7 +236,7 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 - Only the kind's chat path is forwarded: `/v1/messages` for `anthropic`, `/v1/chat/completions` or
   `/v1/responses` for the OpenAI-shaped kinds, and `/responses` for `chatgpt`. Any other path is a
   404, so this is not a general proxy.
-- The sealed credentials are attached here; a caller sends none, and authentication and hop-by-hop
+- The encrypted credentials are attached here; a caller sends none, and authentication and hop-by-hop
   headers are stripped from the request and from the answer.
 - A ChatGPT body is rewritten with `store` set to false, so the conversation is not retained
   upstream.
@@ -284,7 +284,7 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 **Behavior**
 - Only the kind's model path is forwarded: `/models` for `chatgpt` and `/v1/models` for every other
   kind. Any other path is a 404, so this is not a general proxy.
-- The sealed credentials are attached here; a caller sends none, and authentication and hop-by-hop
+- The encrypted credentials are attached here; a caller sends none, and authentication and hop-by-hop
   headers are stripped from the request and from the answer.
 - A ChatGPT request whose access token expired refreshes the login once and retries; the retry's
   answer is the one returned.
@@ -427,7 +427,7 @@ mod tests {
     use super::*;
     use crate::server_state::ServerState;
     use aruna_core::compute::Secret;
-    use aruna_core::credential_seal::SealedS3Secret;
+    use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::structs::{AssistantHeaders, AssistantProviderSecret, AssistantProviderStatus};
     use aruna_operations::assistant_provider::CreateProviderOperation;
     use aruna_operations::driver::drive;
@@ -460,8 +460,8 @@ mod tests {
             kind,
             label: "Mock".to_string(),
             base_url,
-            headers: SealedS3Secret::empty(),
-            secret: SealedS3Secret::empty(),
+            headers: EncryptedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
             created_at: aruna_core::util::unix_timestamp_secs(),
@@ -471,8 +471,8 @@ mod tests {
             login_interval_seconds: None,
         };
         provider
-            .seal_secret(
-                state.credential_seal_key(),
+            .encrypt_secret(
+                state.credential_encryption_key(),
                 &AssistantProviderSecret {
                     api_key: api_key.map(Secret::new),
                     ..AssistantProviderSecret::empty()
@@ -480,8 +480,8 @@ mod tests {
             )
             .unwrap();
         provider
-            .seal_headers(
-                state.credential_seal_key(),
+            .encrypt_headers(
+                state.credential_encryption_key(),
                 &AssistantHeaders(BTreeMap::from([(
                     "x-custom".to_string(),
                     Secret::new("custom-value"),
@@ -733,12 +733,14 @@ mod tests {
             base_url,
             None,
         );
-        let mut secret = provider.open_secret(state.credential_seal_key()).unwrap();
+        let mut secret = provider
+            .open_secret(state.credential_encryption_key())
+            .unwrap();
         secret.access_token = Some(Secret::new("old-access"));
         secret.refresh_token = Some(Secret::new("refresh-token"));
         secret.account_id = Some(Secret::new("account-id"));
         provider
-            .seal_secret(state.credential_seal_key(), &secret)
+            .encrypt_secret(state.credential_encryption_key(), &secret)
             .unwrap();
         let provider_id = provider.provider_id.clone();
         drive(
@@ -746,7 +748,7 @@ mod tests {
                 provider,
                 secret,
                 AssistantHeaders(BTreeMap::new()),
-                state.credential_seal_key().clone(),
+                state.credential_encryption_key().clone(),
             ),
             &state.get_ctx(),
         )
@@ -820,7 +822,9 @@ mod tests {
             base_url,
             None,
         );
-        let mut secret = provider.open_secret(state.credential_seal_key()).unwrap();
+        let mut secret = provider
+            .open_secret(state.credential_encryption_key())
+            .unwrap();
         secret.access_token = Some(Secret::new("old-access"));
         secret.refresh_token = Some(Secret::new("refresh-token"));
         secret.account_id = Some(Secret::new("account-id"));
@@ -830,7 +834,7 @@ mod tests {
                 provider,
                 secret,
                 AssistantHeaders(BTreeMap::new()),
-                state.credential_seal_key().clone(),
+                state.credential_encryption_key().clone(),
             ),
             &state.get_ctx(),
         )

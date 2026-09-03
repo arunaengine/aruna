@@ -1,4 +1,4 @@
-//! Witness ranking, launch suppression, sealed budgets, and staging refusals.
+//! Witness ranking, launch suppression, stored budgets, and staging refusals.
 
 use aruna_core::structs::{JobErrorKind, JobFamilyRecord, PhysicalExecutionState};
 
@@ -70,7 +70,7 @@ fn cancel_suppresses_launch() {
 
 #[test]
 fn bounds_launch_sequence() {
-    // A launch outside the sealed budget is never admitted, whatever the
+    // A launch outside the stored budget is never admitted, whatever the
     // scheduler claims about its own sequence.
     let family = Family::new([1u8; 32]);
     let spec = family.spec();

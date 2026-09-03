@@ -33,7 +33,7 @@ pub struct BackendCaps {
     /// controller's execution subject.
     pub local_site: bool,
     /// Where a non-local backend's workers run. `None` means their placement is
-    /// unproven, so the advertisement carries no site facts at all.
+    /// unproven, so the advertisement carries no site details at all.
     pub worker_site: Option<WorkerSite>,
     /// Static ceilings; `None` is unmeasured and never filters.
     pub limits: ResourceEnvelope,
@@ -47,15 +47,15 @@ pub struct WorkerSite {
     pub labels: BTreeMap<String, String>,
 }
 
-/// The ceiling one attempt runs under: the sealed request's own, else the
+/// The ceiling one attempt runs under: the stored request's own, else the
 /// backend default. A dimension with neither is unbounded, which is never a
 /// legal execution envelope.
 pub fn enforced_limit(
-    sealed: Option<u64>,
+    stored: Option<u64>,
     default: Option<u64>,
     dimension: &str,
 ) -> Result<u64, BackendError> {
-    match sealed.or(default).filter(|limit| *limit > 0) {
+    match stored.or(default).filter(|limit| *limit > 0) {
         Some(limit) => Ok(limit),
         None => Err(BackendError::InvalidSpec(format!(
             "attempt has no {dimension} ceiling and the backend configures none"

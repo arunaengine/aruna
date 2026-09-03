@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn advance_needs_change() {
         // A reconfiguration that changes nothing digest-covered must not
-        // invalidate every registration and receipt sealed under the old one.
+        // invalidate every registration and receipt stored under the old one.
         let record = NodeSubjectRecord::seed(storage_subject(&entry("eu-west", None), 1))
             .expect("subject is valid");
         assert_eq!(

@@ -4,7 +4,7 @@ use crate::openapi::ApiDoc;
 use crate::routes::management_relay::ManagementUrlCache;
 use aruna_core::NodeId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
-use aruna_core::credential_seal::CredentialSealKey;
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -134,9 +134,9 @@ pub struct ServerState {
     realm_id: RealmId,
     // Realm membership
     node_id: NodeId,
-    // Issuer-local key that seals S3 credential secrets at rest, derived from
+    // Issuer-local key that encrypts S3 credential secrets at rest, derived from
     // this node's secret so it matches the S3 verifier on the same node.
-    credential_seal_key: CredentialSealKey,
+    credential_encryption_key: CredentialEncryptionKey,
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -251,11 +251,11 @@ impl ServerState {
             None
         };
         trusted_realms.insert(realm_id);
-        let credential_seal_key = driver_ctx
+        let credential_encryption_key = driver_ctx
             .net_handle
             .as_ref()
-            .map(|net| net.credential_seal_key())
-            .unwrap_or_else(CredentialSealKey::random);
+            .map(|net| net.credential_encryption_key())
+            .unwrap_or_else(CredentialEncryptionKey::random);
         let assistant_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none());
@@ -268,7 +268,7 @@ impl ServerState {
             driver_ctx,
             realm_id,
             node_id,
-            credential_seal_key,
+            credential_encryption_key,
             oidc_validator,
             jobs_runtime,
             node_capabilities,
@@ -394,8 +394,8 @@ impl ServerState {
         self.node_id
     }
 
-    pub fn credential_seal_key(&self) -> &CredentialSealKey {
-        &self.credential_seal_key
+    pub fn credential_encryption_key(&self) -> &CredentialEncryptionKey {
+        &self.credential_encryption_key
     }
 
     pub fn with_assistant_proxy(mut self, enabled: bool) -> Self {

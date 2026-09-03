@@ -452,7 +452,7 @@ mod tests {
             access_key: access_key.to_string(),
             user_identity: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
             group_id: Ulid::from_bytes([3; 16]),
-            secret: aruna_core::credential_seal::SealedS3Secret::empty(),
+            secret: aruna_core::credential_encryption::EncryptedS3Secret::empty(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: [4; 32],

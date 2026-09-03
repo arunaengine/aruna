@@ -84,8 +84,8 @@ pub enum BlobError {
     ReplicationRejected(String),
     #[error("Replication failed: {0}")]
     ReplicationFailed(String),
-    #[error("Blob storage is sealed for shutdown")]
-    Sealed,
+    #[error("Blob storage is closed for shutdown")]
+    Closed,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -170,8 +170,8 @@ pub enum StorageError {
     Timeout,
     #[error("Invalid effect type")]
     InvalidEffect,
-    #[error("Storage is sealed for shutdown")]
-    Sealed,
+    #[error("Storage is closed for shutdown")]
+    Closed,
 }
 
 impl StorageError {
