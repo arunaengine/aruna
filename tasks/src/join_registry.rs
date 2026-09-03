@@ -24,6 +24,8 @@ pub type JoinWatch<V> = watch::Receiver<Option<Joined<V>>>;
 #[derive(Debug)]
 pub struct JoinRegistry<K, V> {
     retention: Duration,
+    /// Decides which finished values stay joinable; `None` keeps every value.
+    retain_if: Option<fn(&V) -> bool>,
     entries: Mutex<HashMap<K, JoinWatch<V>>>,
 }
 
@@ -36,8 +38,17 @@ where
     pub fn new(retention: Duration) -> Self {
         Self {
             retention,
+            retain_if: None,
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Keeps a finished value joinable only while `keep` accepts it. Callers
+    /// already waiting still receive a rejected value; a later caller for the
+    /// same key starts fresh work instead of joining it.
+    pub fn retain_if(mut self, keep: fn(&V) -> bool) -> Self {
+        self.retain_if = Some(keep);
+        self
     }
 
     /// Joins the work already running for `key`, or spawns `work` for it. The
@@ -48,11 +59,12 @@ where
     {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let retention = self.retention;
+        let retain_if = self.retain_if;
         entries.retain(|_, watch| {
-            watch
-                .borrow()
-                .as_ref()
-                .is_none_or(|joined| joined.finished.elapsed() < retention)
+            watch.borrow().as_ref().is_none_or(|joined| {
+                joined.finished.elapsed() < retention
+                    && retain_if.is_none_or(|keep| keep(&joined.value))
+            })
         });
         if let Some(watch) = entries.get(&key) {
             return watch.clone();
@@ -142,5 +154,19 @@ mod tests {
             await_joined(registry.join("key", async { "second" })).await,
             Some("second")
         );
+    }
+
+    // A rejected value must not be served to a later caller, so a corrected
+    // retry runs again inside the retention window.
+    #[tokio::test(start_paused = true)]
+    async fn drops_failed_value() {
+        let registry: JoinRegistry<&str, Result<&str, &str>> =
+            JoinRegistry::new(RETENTION).retain_if(|value| value.is_ok());
+
+        let failed = registry.join("key", async { Err("failed") });
+        assert_eq!(await_joined(failed).await, Some(Err("failed")));
+
+        let retried = registry.join("key", async { Ok("retried") });
+        assert_eq!(await_joined(retried).await, Some(Ok("retried")));
     }
 }

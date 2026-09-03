@@ -18,12 +18,16 @@ use ulid::Ulid;
 /// was created, instead of a `NoSuchUpload` for an upload that is already gone.
 const COMPLETION_RETENTION: Duration = Duration::from_secs(600);
 
-pub type CompletionKey = (String, Ulid);
+/// Bucket, object key and upload id: an upload id alone would let a request
+/// for another key join this completion and skip its own target validation.
+pub type CompletionKey = (String, String, Ulid);
 pub type CompletionOutcome = Arc<Result<CompleteMultipartUploadResult, CompletionFailure>>;
 pub type CompletionRegistry = JoinRegistry<CompletionKey, CompletionOutcome>;
 
 pub fn completion_registry() -> CompletionRegistry {
-    JoinRegistry::new(COMPLETION_RETENTION)
+    // Only a successful completion is worth replaying; a corrected retry must
+    // not be served the earlier failure.
+    JoinRegistry::new(COMPLETION_RETENTION).retain_if(|outcome: &CompletionOutcome| outcome.is_ok())
 }
 
 /// An S3 error kept in a shareable form, so every joined request can be given

@@ -2258,7 +2258,7 @@ impl S3 for ArunaS3Service {
             Arc::new(outcome)
         };
         let joined = self.completions.join(
-            (req.input.bucket.clone(), upload_id),
+            (req.input.bucket.clone(), req.input.key.clone(), upload_id),
             work.instrument(tracing::Span::current()),
         );
 
