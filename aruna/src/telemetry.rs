@@ -17,6 +17,7 @@ const DEFAULT_LOG_FILTER: &str = concat!(
     "aruna=debug,",
     "aruna_api=debug,",
     "aruna_blob=debug,",
+    "aruna_compute=info,",
     "aruna_core=debug,",
     "aruna_net=info,",
     "aruna_operations=info,",
