@@ -14,12 +14,13 @@ use crate::blob::managed_copy::{
 use crate::placement_policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
@@ -27,8 +28,8 @@ use aruna_core::structs::{
     CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
     POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
     PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
-    PolicyMutationParams, PolicyMutationRecord, PolicyRefMode, PolicyResolution, UsageDelta,
-    VersionKey, evaluate_placement,
+    PolicyMutationParams, PolicyMutationRecord, PolicyRefMode, PolicyResolution,
+    RealmConfigDocument, UsageDelta, VersionKey, evaluate_placement,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -134,6 +135,12 @@ pub enum SuccessorError {
     Purge(#[from] PurgeFenceError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
+    #[error(transparent)]
+    QuotaGate(#[from] QuotaGateError),
+    /// The successor books its own bytes, so a mint that would push the owning
+    /// group past its hard ceiling is refused before the counters commit.
+    #[error("group quota ceiling {limit} exceeded by {usage} bytes")]
+    QuotaExceeded { limit: u64, usage: u64 },
     /// The successor's usage delta commits with its records, so a mint without
     /// a transaction would leave the counters short.
     #[error("the successor mint requires a transaction")]
@@ -178,6 +185,8 @@ enum MintState {
     ReadSuccessor,
     ScanCopies,
     WriteRecords,
+    ReadQuota,
+    EnforceQuota,
     UpdateUsage,
     Done,
 }
@@ -195,6 +204,9 @@ pub struct SuccessorMint {
     group_id: Option<GroupId>,
     /// The successor's counter change, committed with its records.
     usage: Option<UsageCounterUpdate>,
+    /// New logical bytes the successor books; only these need the quota gate.
+    quota_bytes: u64,
+    quota_gate: Option<QuotaGate>,
     /// Whether a batch write was emitted, so the caller knows to commit.
     wrote: bool,
 }
@@ -209,6 +221,8 @@ impl SuccessorMint {
             outcome: None,
             group_id: None,
             usage: None,
+            quota_bytes: 0,
+            quota_gate: None,
             wrote: false,
         }
     }
@@ -252,8 +266,10 @@ impl SuccessorMint {
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return Err(SuccessorError::InvalidEvent);
                 };
-                self.start_usage(txn_id)
+                self.start_quota(txn_id)
             }
+            MintState::ReadQuota => self.handle_quota_config(event, txn_id),
+            MintState::EnforceQuota => self.handle_quota(event, txn_id),
             MintState::UpdateUsage => self.handle_usage(event, txn_id),
             MintState::Done => Err(SuccessorError::InvalidEvent),
         }
@@ -627,10 +643,9 @@ impl SuccessorMint {
         let Some(group_id) = self.group_id else {
             return Err(SuccessorError::BucketChanged);
         };
-        self.usage = Some(UsageCounterUpdate::for_group(
-            group_id,
-            successor_usage(&successor, location.as_ref()),
-        ));
+        let delta = successor_usage(&successor, location.as_ref());
+        self.quota_bytes = u64::try_from(delta.logical_bytes).unwrap_or_default();
+        self.usage = Some(UsageCounterUpdate::for_group(group_id, delta));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
             refs: self.sealed_refs.clone(),
@@ -641,6 +656,75 @@ impl SuccessorMint {
         Ok(Some(smallvec![Effect::Storage(
             StorageEffect::BatchWrite { writes, txn_id }
         )]))
+    }
+
+    /// A materialized successor books new logical bytes, so the owning group's
+    /// hard ceiling is enforced inside the mint's transaction.
+    fn start_quota(&mut self, txn_id: Option<TxnId>) -> Result<Option<Effects>, SuccessorError> {
+        if self.quota_bytes == 0 {
+            return self.start_usage(txn_id);
+        }
+        let Some(txn_id) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        self.state = MintState::ReadQuota;
+        Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: DocumentSyncTarget::RealmConfig {
+                realm_id: self.plan.auth_context.realm_id,
+            }
+            .storage_key(),
+            txn_id: Some(txn_id),
+        })]))
+    }
+
+    fn handle_quota_config(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let Some(group_id) = self.group_id else {
+            return Err(SuccessorError::BucketChanged);
+        };
+        let ceiling = read_value(event)?
+            .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
+            .transpose()?
+            .and_then(|document| document.quota.effective_group_ceiling(&group_id));
+        let (Some(ceiling), Some(txn)) = (ceiling, txn_id) else {
+            return self.start_usage(txn_id);
+        };
+        let mut gate = QuotaGate::new_for_realm(
+            ceiling,
+            self.quota_bytes,
+            group_id,
+            self.plan.subject.node_id,
+            self.plan.auth_context.realm_id,
+        );
+        self.state = MintState::EnforceQuota;
+        let effects = gate.start(txn);
+        self.quota_gate = Some(gate);
+        Ok(Some(effects))
+    }
+
+    fn handle_quota(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let Some(txn) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        let Some(gate) = self.quota_gate.as_mut() else {
+            return Err(SuccessorError::InvalidEvent);
+        };
+        match gate.step(event, txn)? {
+            Some(effects) => Ok(Some(effects)),
+            None if gate.is_exceeded() => Err(SuccessorError::QuotaExceeded {
+                limit: gate.ceiling(),
+                usage: gate.projected_usage(),
+            }),
+            None => self.start_usage(txn_id),
+        }
     }
 
     /// The counters move inside the mint's transaction, so a committed
@@ -917,12 +1001,13 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        JobId, ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
-        PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationRecord,
-        PolicyRefMode, PolicyResolution, RealmId, StoragePurgeFence, StoragePurgeScope,
-        UsageCounters, VerifiedPolicy, VersionKey, checksum::HASH_BLAKE3, usage_group_key,
+        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
+        CurrentVersionPointer, JobId, ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord,
+        POLICY_BULK_INTENT_KEYSPACE, PlacementPolicy, PlacementPolicyRef, PlacementSelector,
+        PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
+        PolicyMutationRecord, PolicyRefMode, PolicyResolution, RealmConfigDocument, RealmId,
+        StoragePurgeFence, StoragePurgeScope, UsageCounters, VerifiedPolicy, VersionKey,
+        checksum::HASH_BLAKE3, usage_group_key,
     };
     use aruna_core::types::{Key, NodeId, TxnId, UserId, Value};
     use std::collections::{BTreeMap, HashMap};
@@ -1189,7 +1274,7 @@ mod tests {
     /// Runs the embedded counter update from the record batch to its own write
     /// and returns the counters the owning group would commit.
     fn group_counters(mint: &mut SuccessorMint, txn_id: TxnId) -> UsageCounters {
-        let effect = first_effect(
+        let mut effect = first_effect(
             mint.step(
                 Event::Storage(StorageEvent::BatchWriteResult {
                     entries: Vec::new(),
@@ -1198,6 +1283,14 @@ mod tests {
             )
             .expect("the usage update starts"),
         );
+        // A materialized mint reads the realm config first; without one the
+        // group is unlimited and the counter update starts right after.
+        if mint.state == MintState::ReadQuota {
+            effect = first_effect(
+                mint.step(read(None), Some(txn_id))
+                    .expect("no ceiling applies"),
+            );
+        }
         let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = effect else {
             panic!("expected the counter read");
         };
@@ -1678,6 +1771,58 @@ mod tests {
         assert_eq!(counters.objects, 0);
         assert_eq!(counters.stored_bytes, 0);
         assert_eq!(counters.referenced_bytes, 0);
+    }
+
+    #[test]
+    fn refuses_over_ceiling() {
+        // The successor books its own bytes, so a mint that would put the
+        // owning group past its hard ceiling must fail before the counters
+        // commit.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
+        mint.plan.resolved = resolution(&policy);
+        drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
+        let txn_id = Ulid::generate();
+        let row = copy_row(Vec::new(), ManagedCopyState::Registered);
+        mint.step(copies(vec![row]), Some(txn_id))
+            .expect("scan decides");
+        mint.step(
+            Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }),
+            Some(txn_id),
+        )
+        .expect("the quota read follows");
+
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        config.quota.default_group_quota_bytes = Some(1);
+        config.quota.grace_factor_percent = 100;
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: user_id(),
+            realm_id: realm_id(),
+        };
+        mint.step(
+            read(Some(config.to_bytes(&actor).expect("config encodes"))),
+            Some(txn_id),
+        )
+        .expect("the gate starts");
+        mint.step(read(None), Some(txn_id))
+            .expect("the gate reads its own realm config");
+        mint.step(read(None), Some(txn_id))
+            .expect("the group holds no counters yet");
+
+        let error = mint
+            .step(copies(Vec::new()), Some(txn_id))
+            .expect_err("the mint is refused");
+
+        assert_eq!(
+            error,
+            SuccessorError::QuotaExceeded {
+                limit: 1,
+                usage: location().blob_size,
+            }
+        );
     }
 
     #[test]
