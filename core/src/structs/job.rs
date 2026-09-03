@@ -3972,7 +3972,7 @@ mod tests {
                 "15a1c2404110cfc66720b7a7bb8f77f33d199665e2c028229efa3c708b66917a",
                 "6a2c88bab322eae973d142690b0a2fb0ba7a5bf5c417df9cc515de498b26635d",
                 "f69a68ef56b007a54533ebdb696b806e43b4cf04a75fdb453449d22190853310",
-                "f2f6b9fb023ed033aade2c1af131943e1243b82a3ca58469b5fad70a52c013f6",
+                "04f597da84b60c50ef81125d68373c978adc845af3fa4c2ff5b711cc243f0488",
             ]
         );
         assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);
