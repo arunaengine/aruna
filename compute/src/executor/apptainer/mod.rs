@@ -1018,6 +1018,7 @@ fn to_status(directory: &Path, record: StatusRecord) -> AttemptStatus {
         backend_ref: directory.display().to_string(),
         started_at_ms: record.started_at_ms,
         finished_at_ms: Some(record.finished_at_ms),
+        detail: None,
     }
 }
 
@@ -1027,6 +1028,7 @@ fn submitted_status(directory: &Path) -> AttemptStatus {
         backend_ref: directory.display().to_string(),
         started_at_ms: None,
         finished_at_ms: None,
+        detail: None,
     }
 }
 
@@ -1036,6 +1038,7 @@ fn running_status(directory: &Path, started_at_ms: Option<u64>) -> AttemptStatus
         backend_ref: directory.display().to_string(),
         started_at_ms,
         finished_at_ms: None,
+        detail: None,
     }
 }
 
@@ -1047,6 +1050,7 @@ fn lost_status(directory: &Path) -> AttemptStatus {
         backend_ref: directory.display().to_string(),
         started_at_ms: None,
         finished_at_ms: Some(now_ms()),
+        detail: None,
     }
 }
 

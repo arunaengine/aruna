@@ -777,6 +777,9 @@ pub struct AttemptStatus {
     pub backend_ref: String,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
+    /// Bounded human-readable termination evidence, such as a reason plus a
+    /// message, that a backend may attach to a terminal phase.
+    pub detail: Option<String>,
 }
 
 impl AttemptStatus {

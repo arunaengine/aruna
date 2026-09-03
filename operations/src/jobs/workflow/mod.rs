@@ -19,12 +19,12 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, ExecutionSpec, InputMode, JobError, JobId, JobPayload,
-    JobRecord, JobRecordError, JobResultPayload, OutputObject, PhysicalExecutionState,
-    WorkspaceMode,
+    JobRecord, JobRecordError, JobResultPayload, MAX_RESULT_MESSAGE_BYTES, OutputObject,
+    PhysicalExecutionState, WorkspaceMode,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::NodeId;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::util::{tail_str, unix_timestamp_millis};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -1196,12 +1196,22 @@ pub(crate) async fn finalize_attempt(
             else {
                 return;
             };
+            let detail = status.detail.as_deref();
+            warn!(
+                job_id = %job_id,
+                code,
+                detail_bytes = detail.map_or(0, str::len),
+                stdout_bytes = logs.stdout.len(),
+                stderr_bytes = logs.stderr.len(),
+                "Container exited non-zero"
+            );
+            let message = exit_message(code, detail);
             let result = execution_result_for(bucket, Some(code), outputs, logs);
             let record = Box::pin(terminal_fail(
                 storage,
                 job_id,
                 token,
-                JobError::permanent(format!("container exited with code {code}")),
+                JobError::permanent(message),
                 result,
             ))
             .await;
@@ -1335,12 +1345,13 @@ async fn finalize_cancel(
                     else {
                         return;
                     };
+                    let message = exit_message(code, status.detail.as_deref());
                     let result = execution_result_for(bucket, Some(code), outputs, logs);
                     let record = Box::pin(terminal_fail(
                         storage,
                         job_id,
                         token,
-                        JobError::permanent(format!("container exited with code {code}")),
+                        JobError::permanent(message),
                         result,
                     ))
                     .await;
@@ -1863,6 +1874,17 @@ fn execution_result_for(
     }
 }
 
+/// Failure message for a non-zero exit, keeping the exit code readable when the
+/// backend detail would not fit the stored message.
+fn exit_message(code: i32, detail: Option<&str>) -> String {
+    let head = format!("container exited with code {code}");
+    let Some(detail) = detail.map(str::trim).filter(|text| !text.is_empty()) else {
+        return head;
+    };
+    let room = MAX_RESULT_MESSAGE_BYTES.saturating_sub(head.len() + 2);
+    format!("{head}: {}", tail_str(detail, room))
+}
+
 async fn capture_or_park(
     context: &DriverContext,
     job_id: JobId,
@@ -2016,6 +2038,7 @@ mod tests {
                 backend_ref: "done".to_string(),
                 started_at_ms: Some(1),
                 finished_at_ms: Some(2),
+                detail: None,
             })
         }
         async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
@@ -2028,6 +2051,7 @@ mod tests {
                     backend_ref: "c1".to_string(),
                     started_at_ms: Some(1),
                     finished_at_ms: Some(2),
+                    detail: None,
                 }));
             }
             Ok(CancelEvidence::AlreadyGone)
@@ -2115,6 +2139,24 @@ mod tests {
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
         }
+    }
+
+    #[test]
+    fn exit_message_bounds() {
+        // An over-long detail must not push the message past the stored cap,
+        // because storage drops an over-cap message entirely.
+        assert_eq!(exit_message(2, None), "container exited with code 2");
+        assert_eq!(exit_message(2, Some("  ")), "container exited with code 2");
+        assert_eq!(
+            exit_message(2, Some(" Error: boom ")),
+            "container exited with code 2: Error: boom"
+        );
+
+        let detail = "a".repeat(MAX_RESULT_MESSAGE_BYTES) + "end";
+        let message = exit_message(2, Some(&detail));
+        assert!(message.len() <= MAX_RESULT_MESSAGE_BYTES);
+        assert!(message.starts_with("container exited with code 2: "));
+        assert!(message.ends_with("end"));
     }
 
     #[tokio::test]
@@ -2342,6 +2384,7 @@ mod tests {
                 backend_ref: "c1".to_string(),
                 started_at_ms: Some(1),
                 finished_at_ms: Some(2),
+                detail: None,
             }),
         ))
         .await;
@@ -2428,6 +2471,7 @@ mod tests {
                     backend_ref: "c1".to_string(),
                     started_at_ms: Some(1),
                     finished_at_ms: Some(2),
+                    detail: None,
                 }),
             ))
             .await;

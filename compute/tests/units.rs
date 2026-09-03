@@ -98,6 +98,7 @@ fn terminal_flags() {
         backend_ref: "abc".into(),
         started_at_ms: None,
         finished_at_ms: None,
+        detail: None,
     };
     assert!(st.is_terminal());
 }

@@ -170,6 +170,9 @@ pub fn job_manifest(
         "resources":resource_limits(spec, config)?,
         "securityContext":container_security(spec.security.read_only_rootfs),
         "startupProbe":startup_probe,
+        // When the container writes no termination log, Kubernetes reports its
+        // last log lines as the terminated message of a non-zero exit.
+        "terminationMessagePolicy":"FallbackToLogsOnError",
         "volumeMounts":mounts
     });
     let deadline = spec
@@ -721,6 +724,20 @@ mod tests {
     }
 
     #[test]
+    fn keeps_exit_evidence() {
+        // The task container must fall back to its logs, or a non-zero exit
+        // leaves no terminated message behind.
+        let spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.containers[0].termination_message_policy.as_deref(),
+            Some("FallbackToLogsOnError")
+        );
+    }
+
+    #[test]
     fn runs_without_workspace() {
         let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
         spec.staging_mode = StagingMode::S3Mount;
@@ -856,12 +873,18 @@ mod tests {
         let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
         spec.staging_mode = StagingMode::Files;
         spec.workdir = Some("/work".to_string());
-        spec.inputs.push(TaskInput::from_bytes("/work/quickruns/hello.py", "print(1)"));
+        spec.inputs.push(TaskInput::from_bytes(
+            "/work/quickruns/hello.py",
+            "print(1)",
+        ));
         let layout = StageLayout::from_spec(&spec).unwrap();
         let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
         let mounts = pod.containers[0].volume_mounts.clone().unwrap();
-        let scratch = mounts.iter().find(|mount| mount.mount_path == "/work").unwrap();
+        let scratch = mounts
+            .iter()
+            .find(|mount| mount.mount_path == "/work")
+            .unwrap();
         assert_eq!(scratch.name, "scratch");
         assert_ne!(scratch.read_only, Some(true));
         let script = mounts
