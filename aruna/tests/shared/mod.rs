@@ -17,6 +17,7 @@ use aruna_api::s3::s3_server::{S3Server, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
+use aruna_compute::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
@@ -24,8 +25,8 @@ use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
 use aruna_core::structs::{
-    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, NodeCapabilities, NodeUrls,
-    PathRestriction, RealmId, TokenClaims, UserAccess,
+    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, ManagedCopyQuarantine,
+    NodeCapabilities, NodeUrls, PathRestriction, RealmId, TokenClaims, UserAccess,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
@@ -41,6 +42,7 @@ use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::node_info::seed_node_info_document;
+use aruna_operations::placement_policy::{SubjectScanMode, sync_subject};
 use aruna_operations::s3::get_user_access::GetUserAccessOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -564,12 +566,20 @@ pub(crate) fn bucket_arn(realm_id: &RealmId, node_id: iroh::PublicKey, bucket: &
 
 #[allow(dead_code)]
 pub(crate) async fn spawn_seed_node() -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Minimal).await
+    spawn_seed_node_with_mode(NodeServiceMode::Minimal, None).await
 }
 
 #[allow(dead_code)]
 pub(crate) async fn spawn_full_seed_node() -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Full).await
+    spawn_seed_node_with_mode(NodeServiceMode::Full, None).await
+}
+
+/// A full node whose own runtime can launch and run executions: the registry is
+/// bound before the node info document is seeded, so the document advertises the
+/// backend a launch is admitted against.
+#[allow(dead_code)]
+pub(crate) async fn spawn_compute_seed(compute: Arc<ExecutorRegistry>) -> TestResult<SeedNode> {
+    spawn_seed_node_with_mode(NodeServiceMode::Full, Some(compute)).await
 }
 
 pub(crate) async fn create_onboarding_secret_via_http(
@@ -624,7 +634,10 @@ pub(crate) async fn spawn_full_joiner_node(
     spawn_joiner_node_with_mode(seed, onboarding_secret, NodeServiceMode::Full).await
 }
 
-async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode> {
+async fn spawn_seed_node_with_mode(
+    mode: NodeServiceMode,
+    compute: Option<Arc<ExecutorRegistry>>,
+) -> TestResult<SeedNode> {
     let temp_dir = tempfile::tempdir()?;
     let storage_path = temp_dir
         .path()
@@ -647,7 +660,9 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     .await?;
     let full_storage_config =
         (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::for_temp_dir(&temp_dir));
-    let context = initialize_context(storage, net.clone(), full_storage_config.as_ref()).await?;
+    let compute_enabled = compute.is_some();
+    let context =
+        initialize_context(storage, net.clone(), full_storage_config.as_ref(), compute).await?;
 
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
@@ -665,6 +680,19 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         context.as_ref(),
     )
     .await?;
+    // Advertised executors need this node's placement subject, which main.rs
+    // reconciles before it seeds the document.
+    if compute_enabled {
+        sync_subject(
+            context.as_ref(),
+            realm_id,
+            net.node_id(),
+            SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin),
+            aruna_operations::driver::now_ms(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+    }
     seed_node_info_document(
         context.as_ref(),
         net.node_id(),
@@ -770,6 +798,7 @@ async fn spawn_joiner_node_with_mode(
         storage_handle,
         joiner_net.clone(),
         full_storage_config.as_ref(),
+        None,
     )
     .await?;
     seed.net.add_peer_addr(joiner_net.endpoint_addr()).await;
@@ -876,6 +905,7 @@ async fn initialize_context(
     storage_handle: StorageHandle,
     net: NetHandle,
     full_storage_config: Option<&FullNodeStorageConfig>,
+    compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<Arc<DriverContext>> {
     let task_handle = TaskHandle::new();
     let metadata_handle = if let Some(config) = full_storage_config {
@@ -909,7 +939,7 @@ async fn initialize_context(
         blob_handle,
         metadata_handle,
         task_handle: Some(task_handle.clone()),
-        compute_handle: None,
+        compute_handle: compute,
     });
     initialize_net_incoming(context.clone());
     initialize_task_incoming(

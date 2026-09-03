@@ -13,12 +13,7 @@ use std::time::{Duration, Instant};
 
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
-use aruna_core::structs::{JobId, JobState};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, JobMutation, claim_job, mutate_job, read_job_record,
-};
-use aruna_operations::jobs::workflow::run_execution_job;
+use aruna_core::structs::JobId;
 use aws_sdk_s3::primitives::ByteStream;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, ProtocolVersion};
 use rmcp::service::RunningService;
@@ -29,9 +24,8 @@ use rmcp::{ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::{Value, json};
 use shared::{
     S3Credentials, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_full_seed_node, wait_for_group_via_http,
+    create_s3_credentials_via_http, s3_client, spawn_compute_seed, wait_for_group_via_http,
 };
-use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 const CHART_SCRIPT: &str = r#"import matplotlib
@@ -65,7 +59,6 @@ async fn docker_or_skip() -> Option<DockerBackend> {
 
 struct Fixture {
     seed: shared::SeedNode,
-    compute_ctx: Arc<DriverContext>,
     group_id: Ulid,
     bearer: String,
     s3: S3Credentials,
@@ -73,10 +66,11 @@ struct Fixture {
     bucket: String,
 }
 
-/// Full node + Docker-backed compute context + a group bucket holding a few
-/// dated objects the aggregation counts.
+/// Docker-backed node running its own jobs + a group bucket holding a few dated
+/// objects the aggregation counts.
 async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
-    let seed = spawn_full_seed_node().await?;
+    let registry = Arc::new(ExecutorRegistry::new().with_backend(Arc::new(backend)));
+    let seed = spawn_compute_seed(registry).await?;
     let endpoint = seed.s3.clone().expect("full node exposes S3");
     let bearer = create_bearer_token(
         &seed.context,
@@ -103,16 +97,8 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
             .await?;
     }
 
-    let container_endpoint = endpoint.endpoint_url.replace("localhost", "127.0.0.1");
-    let registry = ExecutorRegistry::new()
-        .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(Some(container_endpoint), "eu-central-1".to_string());
-    let mut ctx = (*seed.context).clone();
-    ctx.compute_handle = Some(Arc::new(registry));
-
     Ok(Fixture {
         seed,
-        compute_ctx: Arc::new(ctx),
         group_id,
         bearer,
         s3: creds,
@@ -157,68 +143,54 @@ fn is_error(result: &CallToolResult) -> bool {
     result.is_error == Some(true)
 }
 
-/// Takes the submitted job over from the node's own drain, which has no compute
-/// backend and can only fail it retryably. An expired lease is claimable, so a
-/// holder that already ran is displaced rather than waited out.
-async fn take_over(
-    ctx: &DriverContext,
+/// One `get_job` answer, or the refusal while the family cannot be served yet.
+async fn job_view(
+    client: &RunningService<RoleClient, ClientInfo>,
     job_id: JobId,
-    idle: Duration,
-) -> aruna_core::structs::JobRecord {
-    let node_id = ctx.net_handle.as_ref().expect("net handle").node_id();
-    let deadline = Instant::now() + idle;
-    loop {
-        if let Ok(ClaimOutcome::Claimed(record)) =
-            claim_job(&ctx.storage_handle, job_id, node_id, now_ms()).await
-        {
-            return record;
-        }
-        mutate_job(&ctx.storage_handle, job_id, |record| {
-            if let Some(claim) = record.claim.as_mut() {
-                claim.lease_expires_at_ms = 1;
-            }
-            Ok(JobMutation::Persist)
-        })
+) -> Result<Value, String> {
+    let request = CallToolRequestParams::new("get_job".to_string()).with_arguments(
+        json!({ "id": job_id.to_string() })
+            .as_object()
+            .expect("tool arguments object")
+            .clone(),
+    );
+    let result = client
+        .call_tool(request)
         .await
-        .ok();
-        if Instant::now() >= deadline {
-            panic!("the submitted job never became claimable");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        .map_err(|error| error.to_string())?;
+    match result.structured_content {
+        Some(content) if !is_error(&result) => Ok(content),
+        other => Err(format!("{other:?}")),
     }
 }
 
-fn now_ms() -> u64 {
-    aruna_core::util::unix_timestamp_millis()
-}
-
-/// Waits on a lost-progress window rather than a wall-clock budget.
-async fn wait_state(
-    ctx: &DriverContext,
+/// Waits on a lost-progress window rather than a wall-clock budget: an image
+/// pull outlasts any fixed budget while the view still moves. A family whose
+/// records are still landing answers unavailable, so a refusal is retried.
+async fn wait_view(
+    client: &RunningService<RoleClient, ClientInfo>,
     job_id: JobId,
-    want: JobState,
     idle: Duration,
-) -> JobState {
+) -> Value {
     let mut progress = None;
     let mut deadline = Instant::now() + idle;
+    let mut last = Err("get_job was never answered".to_string());
     loop {
-        let record = read_job_record(&ctx.storage_handle, job_id, None)
-            .await
+        last = job_view(client, job_id).await.or(last);
+        let state = last
+            .as_ref()
             .ok()
-            .flatten();
-        if let Some(record) = &record
-            && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
-        {
-            return record.state;
+            .and_then(|job| job["state"].as_str())
+            .map(str::to_string);
+        if matches!(state.as_deref(), Some("succeeded" | "failed" | "cancelled")) {
+            return last.expect("terminal view");
         }
-        let observed = record.map(|record| (record.state, record.updated_at_ms));
-        if observed != progress {
-            progress = observed;
+        if state.is_some() && state != progress {
+            progress = state;
             deadline = Instant::now() + idle;
         }
         if Instant::now() >= deadline {
-            let state = progress.map(|(state, _)| state);
-            panic!("timed out waiting for {want:?}, last state {state:?}");
+            return last.unwrap_or_else(|error| panic!("get_job stayed unavailable: {error}"));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -280,24 +252,8 @@ async fn artifact_round_trip() -> TestResult<()> {
         .expect("run_script returns a job id")
         .parse()?;
 
-    let record = take_over(&fixture.compute_ctx, job_id, Duration::from_secs(60)).await;
-    run_execution_job(
-        fixture.compute_ctx.clone(),
-        record,
-        CancellationToken::new(),
-    )
-    .await;
-    let state = wait_state(
-        &fixture.compute_ctx,
-        job_id,
-        JobState::Succeeded,
-        Duration::from_secs(300),
-    )
-    .await;
-    assert_eq!(state, JobState::Succeeded, "the chart run must succeed");
-
-    let job = call(&client, "get_job", json!({ "id": job_id.to_string() })).await;
-    assert_eq!(job["state"], "succeeded");
+    let job = wait_view(&client, job_id, Duration::from_secs(300)).await;
+    assert_eq!(job["state"], "succeeded", "the chart run must succeed");
 
     let outputs = call(
         &client,
