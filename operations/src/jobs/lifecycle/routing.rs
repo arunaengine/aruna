@@ -15,9 +15,10 @@ use aruna_core::structs::{
 use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
 
+use std::time::Duration;
+
 use super::ids::workspace_of;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::{alias_family, alias_prefix};
 use crate::jobs::records::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
@@ -25,6 +26,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::RoutedJobStatus;
 use crate::jobs::store::iter_prefix_page;
+use crate::jobs::{JOB_MUTATE_MAX_ATTEMPTS, JobRouteError};
 
 /// Families one alias may resolve to. Two families claiming one id is an
 /// anomaly that stays visible instead of rebinding the first one.
@@ -33,6 +35,10 @@ const MAX_ALIAS_FAMILIES: usize = 8;
 /// Why a partial projection answers nothing: it reduced only part of its
 /// family, so its state, executions, and outputs are unknown, never absent.
 const TRUNCATED: &str = "job family projection is truncated";
+
+/// A projection that lost its transaction every time is busy, not failed: the
+/// caller reads again rather than seeing a storage error.
+const BUSY: &str = "job status is busy, try again";
 
 /// Whether a projection may be decided on. An audit read may inspect a
 /// truncated one; a status answer or a routing choice may not.
@@ -62,24 +68,41 @@ pub async fn family_of_alias(
     Ok(rows.iter().filter_map(|(key, _)| alias_family(key)).min())
 }
 
+/// Drives one projection, retrying a lost optimistic transaction with the same
+/// bounded backoff a job mutation uses. `None` names no family here.
+async fn project_alias(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<ProjectedFamily>, JobRouteError> {
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        match drive(
+            ProjectFamilyOperation::new(ProjectFamilyConfig {
+                family: FamilyRef::Alias(job_id),
+                now_ms: unix_timestamp_millis(),
+                rebuild: false,
+            }),
+            context,
+        )
+        .await
+        {
+            Ok(projected) => return Ok(Some(projected)),
+            Err(RecordStoreError::UnknownAlias) => return Ok(None),
+            Err(error) if error.is_conflict() => {
+                tokio::time::sleep(Duration::from_millis(1 << attempt.min(6))).await;
+            }
+            Err(error) => return Err(JobRouteError::Unavailable(error.to_string())),
+        }
+    }
+    Err(JobRouteError::Unavailable(BUSY.to_string()))
+}
+
 /// The reduced family of one alias plus the stored spec of its canonical claim.
 pub async fn family_projection(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<(ProjectedFamily, LogicalJobSpec)>, JobRouteError> {
-    let projected = match drive(
-        ProjectFamilyOperation::new(ProjectFamilyConfig {
-            family: FamilyRef::Alias(job_id),
-            now_ms: unix_timestamp_millis(),
-            rebuild: false,
-        }),
-        context,
-    )
-    .await
-    {
-        Ok(projected) => projected,
-        Err(RecordStoreError::UnknownAlias) => return Ok(None),
-        Err(error) => return Err(JobRouteError::Unavailable(error.to_string())),
+    let Some(projected) = project_alias(context, job_id).await? else {
+        return Ok(None);
     };
     let canonical = projected
         .projection

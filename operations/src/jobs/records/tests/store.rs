@@ -265,3 +265,15 @@ async fn retains_conflict_row() {
     };
     assert_eq!(kept.accepted_at_ms, claim.accepted_at_ms);
 }
+
+#[test]
+fn names_transaction_conflict() {
+    // Only a lost optimistic transaction is retryable; a status read must not
+    // retry an unknown alias or a read failure.
+    use crate::jobs::records::RecordStoreError;
+    use aruna_core::errors::StorageError;
+
+    assert!(RecordStoreError::Storage(StorageError::TransactionConflict).is_conflict());
+    assert!(!RecordStoreError::Storage(StorageError::KeyNotFound).is_conflict());
+    assert!(!RecordStoreError::UnknownAlias.is_conflict());
+}

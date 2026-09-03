@@ -85,5 +85,13 @@ pub enum RecordStoreError {
     },
 }
 
+impl RecordStoreError {
+    /// Whether the work lost its optimistic transaction and may be retried
+    /// unchanged. Every other failure needs a different answer.
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Storage(StorageError::TransactionConflict))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
