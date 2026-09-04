@@ -74,6 +74,13 @@ pub struct RunScriptInput {
     /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Call `list_groups` for the ids the caller
     /// may use; the caller needs write permission on the group.
     pub group_id: String,
+    /// Short human name for the run, for example `GC content by sample`. Always
+    /// pass one so the run is recognizable in the run list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Longer note about what the run does and why. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Name of an existing bucket in that group, for example `project-data`.
     /// It is the run's workspace: the script is staged under
     /// `.aruna/scripts/<run id>/` and outputs are written back into it. Call
@@ -114,6 +121,11 @@ pub struct RunScriptInput {
     /// this machine and is served by a user device node only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<crate::routes::jobs::ExecutionTarget>,
+    /// Extra tags recorded on the run, for example who started it. A key under
+    /// `aruna-engine.org/label/` demands a matching target label. The runtime
+    /// sets its own network tag and keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -800,11 +812,10 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
         .iter()
         .map(|(key, value)| ((*key).to_string(), format!("{WORKDIR}/{value}")))
         .collect();
-    let tags = if dependencies.is_empty() {
-        BTreeMap::new()
-    } else {
-        BTreeMap::from([(NETWORK_TAG.to_string(), "open".to_string())])
-    };
+    let mut tags = input.tags.unwrap_or_default();
+    if !dependencies.is_empty() {
+        tags.insert(NETWORK_TAG.to_string(), "open".to_string());
+    }
     Ok(ScriptPlan {
         script_key,
         script_text,
@@ -812,6 +823,8 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
         dependency,
         request: crate::routes::jobs::SubmitExecutionRequest {
             group_id: input.group_id,
+            name: input.name,
+            description: input.description,
             image: runtime.image.to_string(),
             entrypoint: None,
             command,
@@ -858,6 +871,8 @@ mod tests {
         let plan = build_script(
             RunScriptInput {
                 group_id: "01J00000000000000000000000".to_string(),
+                name: None,
+                description: None,
                 bucket: "scripts".to_string(),
                 runtime: "deno".to_string(),
                 script: "console.log('ok');\n".to_string(),
@@ -868,6 +883,7 @@ mod tests {
                 ram_bytes: Some(1_000_000_000),
                 max_walltime_ms: Some(60_000),
                 target: None,
+                tags: None,
             },
             "01JTEST0000000000000000000",
         )
@@ -908,6 +924,8 @@ mod tests {
     fn script_input(runtime: &str, deps: Option<Vec<String>>) -> RunScriptInput {
         RunScriptInput {
             group_id: "01J00000000000000000000000".to_string(),
+            name: None,
+            description: None,
             bucket: "scripts".to_string(),
             runtime: runtime.to_string(),
             script: "print('hi')\n".to_string(),
@@ -918,6 +936,7 @@ mod tests {
             ram_bytes: None,
             max_walltime_ms: None,
             target: None,
+            tags: None,
         }
     }
 

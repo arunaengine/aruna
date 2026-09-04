@@ -190,6 +190,13 @@ pub struct SubmitExecutionRequest {
     /// Owning group's bare 26-character ULID, for example
     /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. The caller needs write permission on it.
     pub group_id: String,
+    /// Short human name for the run, for example `GC content by sample`. Shown
+    /// wherever the run is listed. Defaults to absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Longer note about what the run does and why. Defaults to absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// OCI image the task runs, for example `docker.io/library/python:3.13-slim`.
     /// Must not be blank.
     pub image: String,
@@ -1299,6 +1306,13 @@ pub async fn submit_job(
     Ok((status, Json(response)))
 }
 
+/// A blank label carries no more than an absent one, so it is stored as absent.
+fn trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
 pub(crate) async fn submit_execution(
     state: &ServerState,
     auth: Option<AuthContext>,
@@ -1356,8 +1370,8 @@ pub(crate) async fn submit_execution(
 
     let spec = ExecutionSpec {
         group_id,
-        name: None,
-        description: None,
+        name: trimmed(request.name),
+        description: trimmed(request.description),
         tags: request.tags,
         image: request.image,
         entrypoint: request.entrypoint,
@@ -3233,6 +3247,8 @@ mod tests {
     fn local_request() -> SubmitExecutionRequest {
         SubmitExecutionRequest {
             group_id: Ulid::from_bytes([5u8; 16]).to_string(),
+            name: None,
+            description: None,
             image: "alpine:3".to_string(),
             entrypoint: None,
             command: vec!["true".to_string()],
@@ -3398,6 +3414,8 @@ mod tests {
         for ram_bytes in [u64::MAX, i64::MAX as u64 + 1, 0] {
             let request = SubmitExecutionRequest {
                 group_id: Ulid::from_bytes([5u8; 16]).to_string(),
+                name: None,
+                description: None,
                 image: "alpine:3".to_string(),
                 entrypoint: None,
                 command: vec!["true".to_string()],
