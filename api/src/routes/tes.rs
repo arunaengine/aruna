@@ -3189,6 +3189,7 @@ mod tests {
                 stderr: ResultMessage::tail("err tail"),
             }),
             executions: 2,
+            execution_list: Vec::new(),
             duplicate_successes: 1,
             outputs: vec![OutputObject {
                 node_id,
@@ -3280,12 +3281,14 @@ mod tests {
                 node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
                 executor_kind: "docker".to_string(),
             }),
+            scheduler_node_id: None,
             estimated_transfer_bytes: 4_096,
             estimated_transfer_ms: 12,
             alternatives: 2,
             rejected: 1,
             omitted: 0,
             stored_at_ms: 15,
+            inputs: Vec::new(),
         });
         let details = TaskDetails::from_report(&report);
         let record = family_record(&report);

@@ -305,12 +305,31 @@ pub struct JobOutputResponse {
     pub endpoint_url: Option<String>,
 }
 
-/// The plan this responder stored when it planned the request itself. Absent
-/// when another node planned it; node identities are never disclosed here.
+/// One input the plan moves to the target, so a caller can show where the data
+/// comes from and what the move was expected to cost.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobPlacementInputResponse {
+    pub destination_key: String,
+    pub bytes: u64,
+    /// Null when the target already holds the compliant copy, so nothing moves.
+    pub source_node_id: Option<String>,
+    pub transfer_ms: u64,
+}
+
+/// Where the request was planned to run. It is the plan this responder stored
+/// when it planned the request itself, else the newest launch record any
+/// witness published. `alternatives`, `rejected` and `omitted` are counted only
+/// in the first case, because only a local planning round keeps them.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobPlacementResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
+    /// The node the execution was planned to run on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<String>,
+    /// The node that planned the launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler_node_id: Option<String>,
     pub estimated_transfer_bytes: u64,
     pub estimated_transfer_ms: u64,
     pub alternatives: u32,
@@ -318,6 +337,20 @@ pub struct JobPlacementResponse {
     /// Rejections the bound dropped, so truncation never reads as agreement.
     pub omitted: u32,
     pub stored_at_ms: u64,
+    pub inputs: Vec<JobPlacementInputResponse>,
+}
+
+/// One physical execution of the family, canonical or not.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobExecutionResponse {
+    pub execution_id: String,
+    pub executor_node_id: String,
+    pub state: String,
+    /// When this responder last saw an update of the execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    /// The execution the family's outcome is taken from.
+    pub canonical: bool,
 }
 
 /// The replicated family behind one external job, as this responder reduces it.
@@ -336,6 +369,8 @@ pub struct JobFamilyResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_execution_id: Option<String>,
     pub executions: u32,
+    /// Every known execution of the family, next to the count above.
+    pub execution_list: Vec<JobExecutionResponse>,
     pub duplicate_successes: u32,
     pub outputs: Vec<JobOutputResponse>,
     pub revision: u64,
@@ -527,7 +562,8 @@ pub(crate) fn output_response(
     }
 }
 
-/// Projects the reduced family without disclosing node identities.
+/// Projects the reduced family. Node ids of the executions and of the placement
+/// are disclosed, because a caller needs them to tell one run from another.
 pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
     // A missing endpoint only leaves that output unaddressable; the succeeded
     // family stays readable on any responder.
@@ -548,6 +584,17 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
             .canonical_execution_id
             .map(|execution| execution.to_string()),
         executions: report.executions,
+        execution_list: report
+            .execution_list
+            .iter()
+            .map(|execution| JobExecutionResponse {
+                execution_id: execution.execution_id.to_string(),
+                executor_node_id: execution.executor_node_id.to_string(),
+                state: execution.state.name().to_string(),
+                observed_at_ms: execution.observed_at_ms,
+                canonical: report.canonical_execution_id == Some(execution.execution_id),
+            })
+            .collect(),
         duplicate_successes: report.duplicate_successes,
         outputs,
         revision: report.revision,
@@ -561,12 +608,27 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
                 .target
                 .as_ref()
                 .map(|target| target.executor_kind.clone()),
+            target_node_id: plan
+                .target
+                .as_ref()
+                .map(|target| target.node_id.to_string()),
+            scheduler_node_id: plan.scheduler_node_id.map(|node| node.to_string()),
             estimated_transfer_bytes: plan.estimated_transfer_bytes,
             estimated_transfer_ms: plan.estimated_transfer_ms,
             alternatives: plan.alternatives,
             rejected: plan.rejected,
             omitted: plan.omitted,
             stored_at_ms: plan.stored_at_ms,
+            inputs: plan
+                .inputs
+                .iter()
+                .map(|input| JobPlacementInputResponse {
+                    destination_key: input.destination_key.clone(),
+                    bytes: input.bytes,
+                    source_node_id: input.source_node_id.map(|node| node.to_string()),
+                    transfer_ms: input.transfer_ms,
+                })
+                .collect(),
         }),
     }
 }
@@ -1426,9 +1488,10 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
 - `family.locally_exhausted` is a responder-local diagnostic outside the projection digest: every
   known execution ended without success and no retry is armed here. It is not evidence of a
   permanent failure, so poll again or ask another node.
-- Only the responder names itself; other node identities are never disclosed, and an output whose
-  owning node's S3 endpoint is unknown here carries `endpoint_url: null` rather than failing the
-  read.
+- `family.execution_list` names every known execution with the node that ran it, and
+  `family.placement` names the node that planned the launch, the node it was planned to run on, and
+  the inputs that had to move. An output whose owning node's S3 endpoint is unknown here carries
+  `endpoint_url: null` rather than failing the read.
 - A distributed execution job is answered from the replicated family projection, without routing.
   Every other kind is answered by the node that owns the job, derived from the id itself, and
   forwarded under the caller's own bearer token when that is another node.
@@ -1485,6 +1548,15 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                     "logical_state": "succeeded",
                     "canonical_execution_id": "01JJRSEXEC0123456789ABCDEF",
                     "executions": 2,
+                    "execution_list": [
+                        {
+                            "execution_id": "01JJRSEXEC0123456789ABCDEF",
+                            "executor_node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
+                            "state": "succeeded",
+                            "observed_at_ms": 1755500123000u64,
+                            "canonical": true
+                        }
+                    ],
                     "duplicate_successes": 1,
                     "outputs": [
                         {
@@ -1506,12 +1578,22 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                     "cancel_requested": false,
                     "placement": {
                         "executor_kind": "docker",
+                        "target_node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
+                        "scheduler_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
                         "estimated_transfer_bytes": 4194304,
                         "estimated_transfer_ms": 340,
                         "alternatives": 2,
                         "rejected": 1,
                         "omitted": 0,
-                        "stored_at_ms": 1755500000000u64
+                        "stored_at_ms": 1755500000000u64,
+                        "inputs": [
+                            {
+                                "destination_key": "reads.fastq",
+                                "bytes": 4194304,
+                                "source_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                                "transfer_ms": 340
+                            }
+                        ]
                     }
                 }
             })
@@ -2300,6 +2382,7 @@ mod tests {
             canonical_execution_id: None,
             canonical_result: None,
             executions: 2,
+            execution_list: Vec::new(),
             duplicate_successes: 1,
             outputs: vec![OutputObject {
                 node_id: node_id(),

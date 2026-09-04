@@ -80,6 +80,32 @@ async fn reports_exact_outputs() {
 }
 
 #[tokio::test]
+async fn reports_launch_nodes() {
+    // Without a stored plan of its own the responder reads the placement from
+    // the newest launch, so both node ids are still named.
+    let family = Family::new([1u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    seed(&ctx, &family, PhysicalExecutionState::Succeeded).await;
+
+    let report = family_report(&ctx, &auth(), family.job_id)
+        .await
+        .expect("alias names a family")
+        .expect("report is readable");
+
+    let plan = report.plan.expect("the launch is a placement");
+    assert_eq!(plan.scheduler_node_id, Some(family.holder.public()));
+    assert_eq!(
+        plan.target.map(|target| target.node_id),
+        Some(family.target.public())
+    );
+    assert_eq!(report.execution_list.len(), 1);
+    assert_eq!(
+        report.execution_list[0].executor_node_id,
+        family.target.public()
+    );
+}
+
+#[tokio::test]
 async fn marks_local_exhaustion() {
     // Every known execution terminal without success and no retry armed here is
     // a responder-local diagnostic, never a converged failure.

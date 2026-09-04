@@ -10,10 +10,11 @@ use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};
 use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE};
+use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::{
     AuthContext, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
-    JobRecordEnvelope, JobRecordKey, LogicalJobSpec, LogicalJobState, OutputObject,
-    PhysicalExecutionResult, PhysicalExecutionState, SubmissionId,
+    JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
+    PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
 use aruna_core::types::{Key, NodeId};
 use std::collections::BTreeMap;
@@ -25,7 +26,9 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::submission_prefix;
 use crate::jobs::records::rows::from_bytes;
-use crate::jobs::records::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
+use crate::jobs::records::{
+    AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation, load_kind_complete,
+};
 use crate::jobs::store::iter_prefix_page;
 
 /// Sibling families of one submission a conflict count may scan.
@@ -33,11 +36,15 @@ const MAX_SIBLING_SCAN: usize = 256;
 /// Explain rows one report reads; only this node ever writes them.
 const MAX_EXPLAIN_ROWS: usize = 4;
 
-/// The placement the responder's own witness round stored. It explains one
-/// launch this node published and is never another node's decision.
+/// The placement behind one family: the plan this responder's own witness round
+/// stored, or, when it never planned the request, the newest launch record any
+/// witness published. The counted alternatives and rejections exist only in the
+/// first case, because only a local round keeps them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanEstimate {
     pub target: Option<ExecutionTargetId>,
+    /// The node that planned the launch.
+    pub scheduler_node_id: Option<NodeId>,
     pub estimated_transfer_bytes: u64,
     pub estimated_transfer_ms: u64,
     pub alternatives: u32,
@@ -45,6 +52,9 @@ pub struct PlanEstimate {
     /// Rejections the bound dropped, so truncation is never read as agreement.
     pub omitted: u32,
     pub stored_at_ms: u64,
+    /// Inputs the plan moves to the target, so a caller can show where the data
+    /// comes from. Empty when nothing has to move.
+    pub inputs: Vec<PlannedInput>,
 }
 
 /// One family as this responder currently reduces it.
@@ -63,6 +73,8 @@ pub struct FamilyReport {
     pub canonical_execution_id: Option<ulid::Ulid>,
     pub canonical_result: Option<PhysicalExecutionResult>,
     pub executions: u32,
+    /// Every known execution of the family, canonical or not.
+    pub execution_list: Vec<ProjectedExecution>,
     pub duplicate_successes: u32,
     pub outputs: Vec<OutputObject>,
     /// Public storage endpoint for each output-owning node.
@@ -136,6 +148,7 @@ pub async fn family_report(
                 .and_then(|execution| execution.result.clone())
         }),
         executions: projection.executions.len() as u32,
+        execution_list: projection.executions.clone(),
         duplicate_successes: projection
             .executions
             .iter()
@@ -206,8 +219,17 @@ fn terminal(state: PhysicalExecutionState) -> bool {
     state.is_terminal()
 }
 
-/// The plan this responder stored for the family, when it planned one at all.
+/// The placement of the family: this responder's own stored plan, else the
+/// newest launch any witness published.
 async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
+    match stored_plan(context, family).await {
+        Some(plan) => Some(plan),
+        None => launched_plan(context, family).await,
+    }
+}
+
+/// The plan this responder stored for the family, when it planned one at all.
+async fn stored_plan(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
         JOB_PLAN_EXPLAIN_KEYSPACE,
@@ -229,6 +251,7 @@ async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<P
     let selected = explain.plan.selected.as_ref();
     Some(PlanEstimate {
         target: selected.map(|selection| selection.target.clone()),
+        scheduler_node_id: context.net_handle.as_ref().map(|net| net.node_id()),
         estimated_transfer_bytes: selected.map_or(0, |selection| selection.score.transfer_bytes),
         estimated_transfer_ms: selected
             .map_or(0, |selection| selection.score.estimated_transfer_ms),
@@ -236,6 +259,40 @@ async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<P
         rejected: explain.plan.rejected.len() as u32,
         omitted: explain.plan.omitted,
         stored_at_ms: explain.stored_at_ms,
+        inputs: selected
+            .map(|selection| selection.inputs.clone())
+            .unwrap_or_default(),
+    })
+}
+
+/// The newest launch of the family, read as its placement. It is replicated
+/// evidence, so any responder can answer it even when another node planned.
+async fn launched_plan(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
+    let records = load_kind_complete(context, family, JobRecordKind::Launch)
+        .await
+        .ok()?;
+    let launch = records
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Launch(launch) => Some(launch.as_ref()),
+            _ => None,
+        })
+        .max_by_key(|launch| (launch.created_at_ms, launch.scheduler_seq))?;
+    // Only inputs that have to move count toward the transfer estimate.
+    let moved = launch
+        .inputs
+        .iter()
+        .filter(|input| input.source_node_id.is_some());
+    Some(PlanEstimate {
+        target: Some(launch.target.clone()),
+        scheduler_node_id: Some(launch.scheduler_node_id),
+        estimated_transfer_bytes: moved.clone().map(|input| input.bytes).sum(),
+        estimated_transfer_ms: moved.map(|input| input.transfer_ms).sum(),
+        alternatives: 0,
+        rejected: 0,
+        omitted: 0,
+        stored_at_ms: launch.created_at_ms,
+        inputs: launch.inputs.clone(),
     })
 }
 
