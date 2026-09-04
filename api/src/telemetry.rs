@@ -52,6 +52,45 @@ impl Extractor for HeaderExtractor<'_> {
     }
 }
 
+/// Warns when a request future is dropped before it produced a response, which
+/// is otherwise invisible: a cancelled handler emits no completion record.
+pub struct RequestCancelGuard {
+    span: Span,
+    method: String,
+    path: String,
+    completed: bool,
+}
+
+impl RequestCancelGuard {
+    pub fn new(span: Span, method: &Method, path: &str) -> Self {
+        Self {
+            span,
+            method: method.to_string(),
+            path: path.to_string(),
+            completed: false,
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for RequestCancelGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let _guard = self.span.enter();
+        warn!(
+            event = "request.cancelled",
+            method = %self.method,
+            path = %self.path,
+            "Request cancelled before it produced a response"
+        );
+    }
+}
+
 pub async fn request_tracing_middleware(
     State(state): State<Arc<ServerState>>,
     request: Request,
@@ -85,10 +124,12 @@ pub async fn request_tracing_middleware(
     }
 
     let stages = RequestStages::default();
+    let mut cancel_guard = RequestCancelGuard::new(span.clone(), &method, &path);
     let response = stages
         .clone()
         .scope(next.run(request).instrument(span.clone()))
         .await;
+    cancel_guard.disarm();
     let elapsed = started.elapsed();
     let status_code = response.status().as_u16();
     emit_request_completed(&span, "http", status_code, started);

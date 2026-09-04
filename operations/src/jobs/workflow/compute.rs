@@ -45,6 +45,7 @@ mod tests {
             backend_ref: "attempt".to_string(),
             started_at_ms: None,
             finished_at_ms: None,
+            detail: None,
         };
         let exact = ArtifactEvidence {
             artifact_kind: "helper".to_string(),

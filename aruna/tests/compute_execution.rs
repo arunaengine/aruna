@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::{
-    ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, InputMode, InputSelection,
-    InputSource, JobId, JobPayload, JobRecord, JobState, OutputDestination, OutputSelection,
-    RunCrateStatus,
+    CapturedInput, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, InputMode,
+    InputSelection, InputSource, JobId, JobPayload, JobRecord, JobState, OutputDestination,
+    OutputSelection, RunCrateStatus, checksum::HASH_BLAKE3,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_operations::driver::DriverContext;
+use aruna_core::types::NodeId;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::reconcile::ExternalReconciler;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
@@ -28,6 +29,7 @@ use aruna_operations::jobs::store::{
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
 use aruna_operations::jobs::workflow::run_execution_job;
+use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
 use shared::{
     S3Credentials, TestResult, create_bearer_token, create_group_via_http,
@@ -160,7 +162,7 @@ fn execution_spec(
             source_node_id: None,
             dest_key: "inputs/data.txt".to_string(),
             mode: InputMode::Snapshot,
-            container_path: None,
+            container_path: Some("/inputs/data.txt".to_string()),
             name: None,
             description: None,
         }],
@@ -178,7 +180,8 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
     let ctx = fixture.compute_ctx.as_ref();
     let node_id = ctx.net_handle.as_ref().unwrap().node_id();
     let job_id = job_id();
-    let record = JobRecord::new(
+    let captured_inputs = capture_inputs(ctx, node_id, &spec).await;
+    let mut record = JobRecord::new(
         job_id,
         JobPayload::Execution(spec),
         fixture.seed.user_id,
@@ -187,6 +190,7 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         now_ms(),
         None,
     );
+    record.captured_inputs = captured_inputs;
     insert_job(&ctx.storage_handle, &record).await.unwrap();
     let ClaimOutcome::Claimed(claimed) = claim_job(&ctx.storage_handle, job_id, node_id, now_ms())
         .await
@@ -199,6 +203,52 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
 
 fn now_ms() -> u64 {
     aruna_core::util::unix_timestamp_millis()
+}
+
+/// The inputs admission captures before a run is claimed. Outputs inherit
+/// their refs from these, so a hand-built record must carry them too.
+async fn capture_inputs(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    spec: &ExecutionSpec,
+) -> Vec<CapturedInput> {
+    let mut captured = Vec::with_capacity(spec.inputs.len());
+    for input in &spec.inputs {
+        let InputSource::S3 { bucket, key, .. } = &input.source;
+        let head = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+            }),
+            ctx,
+        )
+        .await
+        .expect("head succeeds")
+        .transpose()
+        .expect("head decodes")
+        .expect("input object exists");
+        let location = head.location.as_ref().expect("input is materialized");
+        captured.push(CapturedInput {
+            destination_key: input.dest_key.clone(),
+            source_node_id: node_id,
+            version_id: head
+                .resolved_version_id
+                .or(head.version_id)
+                .expect("input has a version"),
+            blake3: <[u8; 32]>::try_from(
+                location
+                    .hashes
+                    .get(HASH_BLAKE3)
+                    .expect("blake3 is stored")
+                    .as_slice(),
+            )
+            .expect("blake3 is 32 bytes"),
+            bytes: location.blob_size,
+            policies: head.source_policies.clone(),
+        });
+    }
+    captured
 }
 
 /// Waits for `want` on a lost-progress window, not a wall-clock budget: the
@@ -275,9 +325,9 @@ async fn wait_run_crate(
     }
 }
 
-// Full happy path: workspace bucket, staged input, a container that reads the
-// input and writes an output via workspace S3 creds, terminal success, durable
-// output, and a run crate.
+// Full happy path: an input staged from the bucket it lives in, a container that
+// reads it and writes an output, terminal success, durable output, and a run
+// crate. The run creates no bucket of its own.
 #[tokio::test]
 async fn execution_end_to_end() -> TestResult<()> {
     let Some(backend) = docker_or_skip().await else {
@@ -342,7 +392,6 @@ async fn execution_end_to_end() -> TestResult<()> {
     assert_eq!(state, JobState::Succeeded, "container job must succeed");
 
     // The output copied from the container is durable at its declared URL.
-    let bucket = JobRecord::workspace_bucket_name(job_id);
     let client = s3_client(&fixture.endpoint, &fixture.s3);
     let output = client
         .get_object()
@@ -350,20 +399,11 @@ async fn execution_end_to_end() -> TestResult<()> {
         .key("outputs/result.txt")
         .send()
         .await
-        .expect("output object durable in workspace");
+        .expect("output object durable at its declared URL");
     let body = output.body.collect().await.unwrap().into_bytes();
     let expected = source_payload().to_ascii_uppercase();
     assert_eq!(body.len(), expected.len(), "output size must match");
     assert_eq!(&body[..], expected, "output bytes must match");
-
-    // The staged input is durable too.
-    client
-        .get_object()
-        .bucket(&bucket)
-        .key("inputs/data.txt")
-        .send()
-        .await
-        .expect("staged input durable in workspace");
 
     // The run crate obligation ran and wrote a crate at runs/{JobId}.
     let crate_status = wait_run_crate(&fixture.compute_ctx, job_id, Duration::from_secs(30)).await;

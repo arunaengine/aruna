@@ -8,7 +8,7 @@ use aruna_core::structs::{
     JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope, JobRetryPolicy,
     LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
     PhysicalExecutionState, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
-    SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+    ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::types::UserId;
 use ulid::Ulid;
@@ -130,12 +130,12 @@ impl Family {
                 resources,
                 admitted_at_ms: 1_000,
             },
-            input_facts: Vec::new(),
+            captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             placement: self.placement,
         }
-        .seal()
-        .expect("spec seals")
+        .store_digest()
+        .expect("spec digest stored")
     }
 
     pub fn claim(&self, spec: &LogicalJobSpec) -> SubmissionClaim {
@@ -224,6 +224,8 @@ impl Family {
                 exit_code: Some(0),
                 output_digest: Some(digest),
                 message: None,
+                stdout: ResultMessage::tail("out tail"),
+                stderr: ResultMessage::tail("err tail"),
             }),
         }
     }

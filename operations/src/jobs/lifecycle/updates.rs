@@ -341,7 +341,7 @@ pub async fn publish_progress(
 }
 
 /// Publishes the terminal state of a receipted execution and releases its
-/// reservation. Success names the digest of the output record sealed before it,
+/// reservation. Success names the digest of the output record stored before it,
 /// so a success can never be projected without its exact outputs.
 pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bool {
     let Some(state) = terminal_state(record) else {
@@ -374,6 +374,7 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
         );
         return false;
     };
+    let (stdout, stderr) = log_tails(record.result.as_ref());
     let result = PhysicalExecutionResult {
         exit_code: exit_code(record.result.as_ref()),
         output_digest: output_digest(record.result.as_ref()),
@@ -381,6 +382,8 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
             .last_error
             .as_ref()
             .and_then(|error| ResultMessage::new(error.message.clone()).ok()),
+        stdout,
+        stderr,
     };
     let observed_at_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
     if !publish_state(context, &chain, state, Some(result), observed_at_ms).await {
@@ -446,6 +449,17 @@ fn output_digest(result: Option<&JobResultPayload>) -> Option<[u8; 32]> {
     match result {
         Some(JobResultPayload::Execution { output_digest, .. }) => *output_digest,
         _ => None,
+    }
+}
+
+/// Bounded tails the replicated result carries, so every node answers a status
+/// read with the logs instead of only the node that ran the container.
+fn log_tails(result: Option<&JobResultPayload>) -> (Option<ResultMessage>, Option<ResultMessage>) {
+    match result {
+        Some(JobResultPayload::Execution { stdout, stderr, .. }) => {
+            (ResultMessage::tail(stdout), ResultMessage::tail(stderr))
+        }
+        _ => (None, None),
     }
 }
 

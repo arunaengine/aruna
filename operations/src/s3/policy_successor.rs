@@ -14,31 +14,34 @@ use crate::blob::managed_copy::{
 use crate::placement_policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
-    ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE,
-    PlacementDecision, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
-    PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationParams,
-    PolicyMutationRecord, PolicyRefMode, PolicyResolution, VersionKey, evaluate_placement,
+    AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketIdentity,
+    CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
+    POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
+    PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
+    PolicyMutationParams, PolicyMutationRecord, PolicyRefMode, PolicyResolution,
+    RealmConfigDocument, UsageDelta, VersionKey, evaluate_placement,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// The bucket default a bulk run sealed. A mint that observes another default
+/// The bucket default a bulk run captured. A mint that observes another default
 /// in its own transaction supersedes instead of committing an old target.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedDefault {
+pub struct CapturedDefault {
     pub generation: u64,
     pub refs: Vec<PlacementPolicyRef>,
 }
@@ -64,8 +67,8 @@ pub struct SuccessorPlan {
     /// successor or the blocked reason it records.
     pub intent: Option<PolicyBulkIntent>,
     /// Set by a bulk run, so the pass cannot commit against a default that
-    /// moved on between the run's seal and this transaction.
-    pub sealed_default: Option<SealedDefault>,
+    /// moved on between the run's capture and this transaction.
+    pub captured_default: Option<CapturedDefault>,
 }
 
 impl SuccessorPlan {
@@ -130,6 +133,18 @@ pub enum SuccessorError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Purge(#[from] PurgeFenceError),
+    #[error(transparent)]
+    Usage(#[from] UsageUpdateError),
+    #[error(transparent)]
+    QuotaGate(#[from] QuotaGateError),
+    /// The successor books its own bytes, so a mint that would push the owning
+    /// group past its hard ceiling is refused before the counters commit.
+    #[error("group quota ceiling {limit} exceeded by {usage} bytes")]
+    QuotaExceeded { limit: u64, usage: u64 },
+    /// The successor's usage delta commits with its records, so a mint without
+    /// a transaction would leave the counters short.
+    #[error("the successor mint requires a transaction")]
+    NoTransaction,
     #[error("mutation {0} is recorded with different parameters")]
     MutationConflict(Ulid),
     #[error("the object head is no longer the expected version")]
@@ -170,6 +185,9 @@ enum MintState {
     ReadSuccessor,
     ScanCopies,
     WriteRecords,
+    ReadQuota,
+    EnforceQuota,
+    UpdateUsage,
     Done,
 }
 
@@ -180,8 +198,15 @@ pub struct SuccessorMint {
     plan: SuccessorPlan,
     state: MintState,
     predecessor: Option<BlobVersion>,
-    sealed_refs: Vec<PlacementPolicyRef>,
+    effective_refs: Vec<PlacementPolicyRef>,
     outcome: Option<SuccessorOutcome>,
+    /// Owner read from the bucket record inside this transaction.
+    group_id: Option<GroupId>,
+    /// The successor's counter change, committed with its records.
+    usage: Option<UsageCounterUpdate>,
+    /// New logical bytes the successor books; only these need the quota gate.
+    quota_bytes: u64,
+    quota_gate: Option<QuotaGate>,
     /// Whether a batch write was emitted, so the caller knows to commit.
     wrote: bool,
 }
@@ -192,8 +217,12 @@ impl SuccessorMint {
             plan,
             state: MintState::ReadMutation,
             predecessor: None,
-            sealed_refs: Vec::new(),
+            effective_refs: Vec::new(),
             outcome: None,
+            group_id: None,
+            usage: None,
+            quota_bytes: 0,
+            quota_gate: None,
             wrote: false,
         }
     }
@@ -237,9 +266,11 @@ impl SuccessorMint {
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return Err(SuccessorError::InvalidEvent);
                 };
-                self.state = MintState::Done;
-                Ok(None)
+                self.start_quota(txn_id)
             }
+            MintState::ReadQuota => self.handle_quota_config(event, txn_id),
+            MintState::EnforceQuota => self.handle_quota(event, txn_id),
+            MintState::UpdateUsage => self.handle_usage(event, txn_id),
             MintState::Done => Err(SuccessorError::InvalidEvent),
         }
     }
@@ -257,7 +288,7 @@ impl SuccessorMint {
             }
             self.outcome = Some(SuccessorOutcome::Replayed {
                 version_id: record.successor_version_id,
-                refs: record.sealed_refs,
+                refs: record.effective_refs,
                 materialized: record.materialized,
             });
             self.state = MintState::Done;
@@ -328,8 +359,8 @@ impl SuccessorMint {
         )]))
     }
 
-    /// Re-reads the destination facts inside the commit boundary: the bucket
-    /// the run sealed, and the subject the plan was evaluated against.
+    /// Re-reads the destination details inside the commit boundary: the bucket
+    /// the run captured, and the subject the plan was evaluated against.
     fn handle_bucket(
         &mut self,
         event: Event,
@@ -347,6 +378,7 @@ impl SuccessorMint {
         if bucket.identity() != self.plan.bucket_identity {
             return Err(SuccessorError::BucketChanged);
         }
+        self.group_id = Some(bucket.group_id);
         let admitted = subject.is_some_and(|record| {
             record.subject.generation == self.plan.subject.generation
                 && !record.serving_blocked
@@ -355,9 +387,9 @@ impl SuccessorMint {
         if !admitted {
             return Err(SuccessorError::SubjectDrift);
         }
-        if let Some(sealed) = self.plan.sealed_default.as_ref()
-            && (sealed.generation != bucket.placement_policy_generation
-                || sealed.refs != bucket.placement_policies)
+        if let Some(captured) = self.plan.captured_default.as_ref()
+            && (captured.generation != bucket.placement_policy_generation
+                || captured.refs != bucket.placement_policies)
         {
             return Err(SuccessorError::DefaultChanged {
                 current: bucket.placement_policy_generation,
@@ -384,7 +416,7 @@ impl SuccessorMint {
             return Err(SuccessorError::VersionMissing);
         };
         let predecessor = BlobVersion::from_bytes(value.as_ref())?;
-        self.sealed_refs = match self.plan.mode {
+        self.effective_refs = match self.plan.mode {
             PolicyRefMode::Replace => PlacementPolicyRef::canonical_set(&self.plan.target_refs)?,
             PolicyRefMode::Union => {
                 let mut refs = predecessor.placement_policies.clone();
@@ -445,7 +477,11 @@ impl SuccessorMint {
     /// The successor's refs must admit this node before any byte is claimed for
     /// it. An unresolvable or denying policy blocks instead of granting.
     fn blocked_placement(&self) -> Option<PolicyBlockedReason> {
-        match evaluate_placement(&self.sealed_refs, &self.plan.resolved, &self.plan.subject) {
+        match evaluate_placement(
+            &self.effective_refs,
+            &self.plan.resolved,
+            &self.plan.subject,
+        ) {
             PlacementDecision::Allowed => None,
             PlacementDecision::Denied { .. } => Some(PolicyBlockedReason::DestinationDenied),
             PlacementDecision::Required { .. }
@@ -525,7 +561,7 @@ impl SuccessorMint {
             self.plan.created_at,
             self.plan.auth_context.user_id,
         )
-        .with_policies(self.sealed_refs.clone())?;
+        .with_policies(self.effective_refs.clone())?;
         let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(6);
         writes.push((
             BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -549,7 +585,7 @@ impl SuccessorMint {
                 mutation_id: self.plan.mutation_id,
                 params: self.plan.params(),
                 successor_version_id: version_id,
-                sealed_refs: self.sealed_refs.clone(),
+                effective_refs: self.effective_refs.clone(),
                 materialized: location.is_some(),
             }
             .to_bytes()?
@@ -575,7 +611,7 @@ impl SuccessorMint {
                 version: self.plan.version_key(version_id),
                 node_id: self.plan.subject.node_id,
                 location,
-                policies: &self.sealed_refs,
+                policies: &self.effective_refs,
                 origin: source
                     .as_ref()
                     .map(|record| record.origin)
@@ -608,9 +644,15 @@ impl SuccessorMint {
                 receipt.to_bytes()?.into(),
             ));
         }
+        let Some(group_id) = self.group_id else {
+            return Err(SuccessorError::BucketChanged);
+        };
+        let delta = successor_usage(&successor, location.as_ref());
+        self.quota_bytes = u64::try_from(delta.logical_bytes).unwrap_or_default();
+        self.usage = Some(UsageCounterUpdate::for_group(group_id, delta));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
-            refs: self.sealed_refs.clone(),
+            refs: self.effective_refs.clone(),
             materialized: location.is_some(),
         });
         self.state = MintState::WriteRecords;
@@ -618,6 +660,130 @@ impl SuccessorMint {
         Ok(Some(smallvec![Effect::Storage(
             StorageEffect::BatchWrite { writes, txn_id }
         )]))
+    }
+
+    /// A materialized successor books new logical bytes, so the owning group's
+    /// hard ceiling is enforced inside the mint's transaction.
+    fn start_quota(&mut self, txn_id: Option<TxnId>) -> Result<Option<Effects>, SuccessorError> {
+        if self.quota_bytes == 0 {
+            return self.start_usage(txn_id);
+        }
+        let Some(txn_id) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        self.state = MintState::ReadQuota;
+        Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: DocumentSyncTarget::RealmConfig {
+                realm_id: self.plan.auth_context.realm_id,
+            }
+            .storage_key(),
+            txn_id: Some(txn_id),
+        })]))
+    }
+
+    fn handle_quota_config(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let Some(group_id) = self.group_id else {
+            return Err(SuccessorError::BucketChanged);
+        };
+        let ceiling = read_value(event)?
+            .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
+            .transpose()?
+            .and_then(|document| document.quota.effective_group_ceiling(&group_id));
+        let (Some(ceiling), Some(txn)) = (ceiling, txn_id) else {
+            return self.start_usage(txn_id);
+        };
+        let mut gate = QuotaGate::new_for_realm(
+            ceiling,
+            self.quota_bytes,
+            group_id,
+            self.plan.subject.node_id,
+            self.plan.auth_context.realm_id,
+        );
+        self.state = MintState::EnforceQuota;
+        let effects = gate.start(txn);
+        self.quota_gate = Some(gate);
+        Ok(Some(effects))
+    }
+
+    fn handle_quota(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let Some(txn) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        let Some(gate) = self.quota_gate.as_mut() else {
+            return Err(SuccessorError::InvalidEvent);
+        };
+        match gate.step(event, txn)? {
+            Some(effects) => Ok(Some(effects)),
+            None if gate.is_exceeded() => Err(SuccessorError::QuotaExceeded {
+                limit: gate.ceiling(),
+                usage: gate.projected_usage(),
+            }),
+            None => self.start_usage(txn_id),
+        }
+    }
+
+    /// The counters move inside the mint's transaction, so a committed
+    /// successor can never leave the owning group's usage short.
+    fn start_usage(&mut self, txn_id: Option<TxnId>) -> Result<Option<Effects>, SuccessorError> {
+        let Some(mut update) = self.usage.take().filter(|update| !update.is_noop()) else {
+            self.state = MintState::Done;
+            return Ok(None);
+        };
+        let Some(txn_id) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        self.state = MintState::UpdateUsage;
+        let effects = update.start(txn_id);
+        self.usage = Some(update);
+        Ok(Some(effects))
+    }
+
+    fn handle_usage(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let Some(txn_id) = txn_id else {
+            return Err(SuccessorError::NoTransaction);
+        };
+        let Some(update) = self.usage.as_mut() else {
+            return Err(SuccessorError::InvalidEvent);
+        };
+        match update.step(event, txn_id)? {
+            Some(effects) => Ok(Some(effects)),
+            None => {
+                self.state = MintState::Done;
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// The successor is a second stored version of the same bytes: it books its own
+/// size, the head only moves between live versions so the object count holds,
+/// and nothing new is stored, so no `stored_*` counter and no quota gate apply.
+fn successor_usage(successor: &BlobVersion, location: Option<&BackendLocation>) -> UsageDelta {
+    match &successor.state {
+        BlobVersionState::Reference {
+            cached_metadata, ..
+        } => UsageDelta {
+            referenced_bytes: i128::from(cached_metadata.content_length),
+            ..Default::default()
+        },
+        BlobVersionState::Materialized { .. } => UsageDelta {
+            logical_bytes: location.map_or(0, |location| i128::from(location.blob_size)),
+            ..Default::default()
+        },
+        BlobVersionState::Deleted => UsageDelta::default(),
     }
 }
 
@@ -827,7 +993,7 @@ impl Operation for MintPolicySuccessorOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        MintPolicySuccessorOperation, MintState, SealedDefault, SuccessorError, SuccessorMint,
+        CapturedDefault, MintPolicySuccessorOperation, MintState, SuccessorError, SuccessorMint,
         SuccessorOutcome, SuccessorPlan, successor_version,
     };
     use crate::blob::blob_keyspace_helper::HeadAliasContext;
@@ -835,18 +1001,19 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        JobId, ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
-        PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationRecord,
-        PolicyRefMode, PolicyResolution, RealmId, StoragePurgeFence, StoragePurgeScope,
-        VerifiedPolicy, VersionKey, checksum::HASH_BLAKE3,
+        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
+        CurrentVersionPointer, JobId, ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord,
+        POLICY_BULK_INTENT_KEYSPACE, PlacementPolicy, PlacementPolicyRef, PlacementSelector,
+        PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
+        PolicyMutationRecord, PolicyRefMode, PolicyResolution, RealmConfigDocument, RealmId,
+        StoragePurgeFence, StoragePurgeScope, UsageCounters, VerifiedPolicy, VersionKey,
+        checksum::HASH_BLAKE3, usage_group_key,
     };
-    use aruna_core::types::{Key, NodeId, UserId, Value};
+    use aruna_core::types::{Key, NodeId, TxnId, UserId, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
     use ulid::Ulid;
@@ -945,7 +1112,7 @@ mod tests {
             subject: subject(),
             resolved: BTreeMap::new(),
             intent: None,
-            sealed_default: None,
+            captured_default: None,
         }
     }
 
@@ -1020,7 +1187,7 @@ mod tests {
             None,
         )
         .with_policies(refs)
-        .expect("refs seal")
+        .expect("refs stored")
     }
 
     /// One registered local copy of the predecessor, as the write path leaves it.
@@ -1108,6 +1275,45 @@ mod tests {
             .collect()
     }
 
+    /// Runs the embedded counter update from the record batch to its own write
+    /// and returns the counters the owning group would commit.
+    fn group_counters(mint: &mut SuccessorMint, txn_id: TxnId) -> UsageCounters {
+        let mut effect = first_effect(
+            mint.step(
+                Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }),
+                Some(txn_id),
+            )
+            .expect("the usage update starts"),
+        );
+        // A materialized mint reads the realm config first; without one the
+        // group is unlimited and the counter update starts right after.
+        if mint.state == MintState::ReadQuota {
+            effect = first_effect(
+                mint.step(read(None), Some(txn_id))
+                    .expect("no ceiling applies"),
+            );
+        }
+        let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = effect else {
+            panic!("expected the counter read");
+        };
+        let values = reads.into_iter().map(|(_, key)| (key, None)).collect();
+        let effect = first_effect(
+            mint.step(
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+                Some(txn_id),
+            )
+            .expect("the counters are written"),
+        );
+        let group_key = usage_group_key(bucket().group_id);
+        batch_writes(effect)
+            .into_iter()
+            .find(|(space, key, _)| space == USAGE_STATS_KEYSPACE && *key == group_key)
+            .map(|(_, _, value)| UsageCounters::from_bytes(&value).expect("counters decode"))
+            .expect("the group counter is written")
+    }
+
     fn first_effect(effects: Option<aruna_core::types::Effects>) -> Effect {
         effects
             .expect("effects follow")
@@ -1124,7 +1330,7 @@ mod tests {
             mutation_id: Ulid::from_bytes([8u8; 16]),
             params: plan(Vec::new(), PolicyRefMode::Replace).params(),
             successor_version_id: Ulid::from_bytes([4u8; 16]),
-            sealed_refs: Vec::new(),
+            effective_refs: Vec::new(),
             materialized: true,
         };
         mint.start(None).expect("start builds");
@@ -1153,7 +1359,7 @@ mod tests {
             mutation_id: Ulid::from_bytes([8u8; 16]),
             params: plan(Vec::new(), PolicyRefMode::Replace).params(),
             successor_version_id: Ulid::from_bytes([4u8; 16]),
-            sealed_refs: Vec::new(),
+            effective_refs: Vec::new(),
             materialized: true,
         };
         mint.start(None).expect("start builds");
@@ -1220,7 +1426,7 @@ mod tests {
             ManagedCopyState::Registered,
         )
         .expect("record builds")
-        .sealed_under(subject().generation);
+        .stored_under(subject().generation);
 
         assert!(
             super::reusable_copy(&record.key(), &record, &version, &subject(), CONTENT, &refs)
@@ -1265,7 +1471,7 @@ mod tests {
         // A run's target is bound into its own transaction: a default that moved
         // on supersedes the run before any old target commits.
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Union));
-        mint.plan.sealed_default = Some(SealedDefault {
+        mint.plan.captured_default = Some(CapturedDefault {
             generation: 2,
             refs: Vec::new(),
         });
@@ -1386,8 +1592,8 @@ mod tests {
             panic!("expected the managed-copy scan");
         };
         assert_eq!(key_space, MANAGED_COPY_KEYSPACE);
-        assert!(mint.sealed_refs.contains(&existing.policy_ref()));
-        assert!(mint.sealed_refs.contains(&added.policy_ref()));
+        assert!(mint.effective_refs.contains(&existing.policy_ref()));
+        assert!(mint.effective_refs.contains(&added.policy_ref()));
     }
 
     #[test]
@@ -1397,7 +1603,7 @@ mod tests {
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Replace));
         drive_to_copy(&mut mint, &materialized(vec![existing.policy_ref()]));
 
-        assert!(mint.sealed_refs.is_empty());
+        assert!(mint.effective_refs.is_empty());
     }
 
     #[test]
@@ -1552,12 +1758,105 @@ mod tests {
     }
 
     #[test]
-    fn reference_skips_registration() {
-        // A reference claims no managed copy, so it registers nothing.
+    fn books_successor_bytes() {
+        // The successor stores a second version of the same bytes, so its size
+        // is booked while the head only moves between two live versions.
         let policy = verified(1, Some(node_id()));
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);
-        let reference = BlobVersion::reference(
+        drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
+        let txn_id = Ulid::generate();
+        let row = copy_row(Vec::new(), ManagedCopyState::Registered);
+        mint.step(copies(vec![row]), Some(txn_id))
+            .expect("scan decides");
+
+        let counters = group_counters(&mut mint, txn_id);
+        assert_eq!(counters.logical_bytes, location().blob_size);
+        assert_eq!(counters.objects, 0);
+        assert_eq!(counters.stored_bytes, 0);
+        assert_eq!(counters.referenced_bytes, 0);
+    }
+
+    #[test]
+    fn refuses_over_ceiling() {
+        // The successor books its own bytes, so a mint that would put the
+        // owning group past its hard ceiling must fail before the counters
+        // commit.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
+        mint.plan.resolved = resolution(&policy);
+        drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
+        let txn_id = Ulid::generate();
+        let row = copy_row(Vec::new(), ManagedCopyState::Registered);
+        mint.step(copies(vec![row]), Some(txn_id))
+            .expect("scan decides");
+        mint.step(
+            Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }),
+            Some(txn_id),
+        )
+        .expect("the quota read follows");
+
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        config.quota.default_group_quota_bytes = Some(1);
+        config.quota.grace_factor_percent = 100;
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: user_id(),
+            realm_id: realm_id(),
+        };
+        mint.step(
+            read(Some(config.to_bytes(&actor).expect("config encodes"))),
+            Some(txn_id),
+        )
+        .expect("the gate starts");
+        mint.step(read(None), Some(txn_id))
+            .expect("the gate reads its own realm config");
+        mint.step(read(None), Some(txn_id))
+            .expect("the group holds no counters yet");
+
+        let error = mint
+            .step(copies(Vec::new()), Some(txn_id))
+            .expect_err("the mint is refused");
+
+        assert_eq!(
+            error,
+            SuccessorError::QuotaExceeded {
+                limit: 1,
+                usage: location().blob_size,
+            }
+        );
+    }
+
+    #[test]
+    fn blocked_skips_usage() {
+        // Nothing was minted, so the blocked receipt moves no counter.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Union));
+        mint.plan.resolved = resolution(&policy);
+        mint.plan.intent = Some(intent());
+        drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
+        let txn_id = Ulid::generate();
+        mint.step(copies(Vec::new()), Some(txn_id))
+            .expect("scan decides");
+
+        let effects = mint
+            .step(
+                Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }),
+                Some(txn_id),
+            )
+            .expect("the mint settles");
+        assert_eq!(effects, None);
+        assert_eq!(mint.state, MintState::Done);
+    }
+
+    const REFERENCE_BYTES: u64 = 1;
+
+    fn reference() -> BlobVersion {
+        BlobVersion::reference(
             aruna_core::structs::VersionSourceBinding {
                 strategy: aruna_core::structs::StagingStrategy::Reference,
                 descriptor: aruna_core::structs::PortableSourceDescriptor {
@@ -1571,7 +1870,7 @@ mod tests {
                 connector_id: None,
             },
             aruna_core::structs::SourceMetadata {
-                content_length: 1,
+                content_length: REFERENCE_BYTES,
                 content_type: None,
                 etag: None,
                 last_modified: None,
@@ -1580,8 +1879,31 @@ mod tests {
             UNIX_EPOCH,
             user_id(),
             UNIX_EPOCH,
-        );
-        let effect = drive_to_copy(&mut mint, &reference).expect("writes follow");
+        )
+    }
+
+    #[test]
+    fn books_reference_bytes() {
+        // A reference successor carries no local bytes, so it books the source
+        // size against the referenced counter instead of the logical one.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
+        mint.plan.resolved = resolution(&policy);
+        drive_to_copy(&mut mint, &reference()).expect("writes follow");
+
+        let counters = group_counters(&mut mint, Ulid::generate());
+        assert_eq!(counters.referenced_bytes, REFERENCE_BYTES);
+        assert_eq!(counters.logical_bytes, 0);
+        assert_eq!(counters.objects, 0);
+    }
+
+    #[test]
+    fn reference_skips_registration() {
+        // A reference claims no managed copy, so it registers nothing.
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
+        mint.plan.resolved = resolution(&policy);
+        let effect = drive_to_copy(&mut mint, &reference()).expect("writes follow");
         let writes = batch_writes(effect);
 
         assert!(

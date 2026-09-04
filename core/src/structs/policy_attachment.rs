@@ -1,5 +1,5 @@
 //! Durable records behind explicit policy attachment: the idempotency row one
-//! successor mint is keyed by, and the sealed bulk run plus its per-object
+//! successor mint is keyed by, and the captured bulk run plus its per-object
 //! intents. Attaching a policy never rewrites a stored version, so every record
 //! here describes a successor that is minted instead.
 
@@ -12,7 +12,7 @@ use ulid::Ulid;
 /// One row per `mutation_id`, carrying the successor VersionId this node
 /// durably assigned. A replay reads it instead of minting a second version.
 pub const POLICY_MUTATION_KEYSPACE: &str = "policy_mutations";
-/// One row per bulk run, sealing the bucket default every intent applies.
+/// One row per bulk run, capturing the bucket default every intent applies.
 pub const POLICY_BULK_RUN_KEYSPACE: &str = "policy_bulk_runs";
 /// One row per (run, object): observed head, preassigned successor, outcome.
 pub const POLICY_BULK_INTENT_KEYSPACE: &str = "policy_bulk_intents";
@@ -45,8 +45,8 @@ pub struct PolicyMutationRecord {
     pub mutation_id: Ulid,
     pub params: PolicyMutationParams,
     pub successor_version_id: Ulid,
-    /// Effective refs sealed on the successor, canonically sorted.
-    pub sealed_refs: Vec<PlacementPolicyRef>,
+    /// Effective refs stored on the successor, canonically sorted.
+    pub effective_refs: Vec<PlacementPolicyRef>,
     /// False for a reference-only successor, which registers no local copy.
     pub materialized: bool,
 }
@@ -57,14 +57,14 @@ impl PolicyMutationRecord {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        checked_refs(&self.sealed_refs)?;
+        checked_refs(&self.effective_refs)?;
         checked_refs(&self.params.target_refs)?;
         Ok(postcard::to_allocvec(&self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         let record: Self = postcard::from_bytes(bytes)?;
-        checked_refs(&record.sealed_refs)?;
+        checked_refs(&record.effective_refs)?;
         checked_refs(&record.params.target_refs)?;
         Ok(record)
     }
@@ -73,13 +73,13 @@ impl PolicyMutationRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PolicyBulkStatus {
     Active,
-    /// Every observed head carried the sealed refs at the end of a pass.
+    /// Every observed head carried the captured refs at the end of a pass.
     Completed,
     /// The bucket default moved on; the run stops instead of mixing policies.
     Superseded,
 }
 
-/// The sealed target of one bulk run. Nothing in a pass re-reads the bucket
+/// The captured target of one bulk run. Nothing in a pass re-reads the bucket
 /// default into the intents: a changed default supersedes the run instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PolicyBulkRun {
@@ -142,7 +142,7 @@ impl PolicyBulkIntentKey {
 pub enum PolicyBlockedReason {
     /// No serveable local copy to mint a materialized successor from.
     SourceUnavailable,
-    /// The sealed refs do not admit this node as a destination.
+    /// The captured refs do not admit this node as a destination.
     DestinationDenied,
     /// A referenced policy is not resolvable here right now.
     PolicyUnresolved,
@@ -221,7 +221,7 @@ mod tests {
             mutation_id: Ulid::from_bytes([3u8; 16]),
             params: params(refs.clone()),
             successor_version_id: Ulid::from_bytes([4u8; 16]),
-            sealed_refs: refs,
+            effective_refs: refs,
             materialized: true,
         }
     }

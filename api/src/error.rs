@@ -252,9 +252,7 @@ impl From<MetadataProfileValidationFinding> for ProfileValidationFindingResponse
             path: finding.path,
             rule: finding.rule,
             message: finding.message,
-            profile_revision: finding
-                .profile_revision
-                .map(|revision| revision.to_string()),
+            profile_revision: finding.profile_revision,
             completeness: format!("{:?}", finding.completeness).to_lowercase(),
         }
     }

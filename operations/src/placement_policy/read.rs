@@ -115,7 +115,7 @@ pub enum ReadPolicyError {
     /// Every reached holder answered without the document.
     #[error("policy {policy_id} is unknown to its holders")]
     NotFound { policy_id: ulid::Ulid },
-    /// No holder answered: an availability fact, never a denial.
+    /// No holder answered: an availability detail, never a denial.
     #[error("policy holders are unavailable: {0}")]
     Unavailable(String),
     /// The answering holder returned bytes that do not match the requested ref.

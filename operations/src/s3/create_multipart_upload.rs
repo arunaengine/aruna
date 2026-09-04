@@ -84,14 +84,14 @@ pub struct CreateMultipartUploadOperation {
     resolved: Option<ResolvedBackend>,
     record: Option<MultipartUpload>,
     metadata: HashMap<String, String>,
-    /// Destination facts of this node. Absent fails every governed upload
+    /// Destination details of this node. Absent fails every governed upload
     /// closed and leaves the ungoverned path untouched.
     gate_context: Option<GateContext>,
     gate: Option<PolicyGateOperation>,
-    /// Refs and subject the gate admitted, sealed on the upload record so every
+    /// Refs and subject the gate admitted, stored on the upload record so every
     /// part and the completion inherit exactly what was evaluated here.
-    sealed_policies: Vec<PlacementPolicyRef>,
-    sealed_subject: u64,
+    stored_policies: Vec<PlacementPolicyRef>,
+    stored_subject: u64,
     output: Option<Result<CreateMultipartUploadResult, CreateMultipartUploadError>>,
 }
 
@@ -106,8 +106,8 @@ impl CreateMultipartUploadOperation {
             metadata: HashMap::new(),
             gate_context: None,
             gate: None,
-            sealed_policies: Vec::new(),
-            sealed_subject: 0,
+            stored_policies: Vec::new(),
+            stored_subject: 0,
             output: None,
         }
     }
@@ -161,13 +161,13 @@ impl CreateMultipartUploadOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.emit_error(error.into()),
         };
-        self.sealed_policies = GatedBucket::observe(bucket.as_ref()).policies;
+        self.stored_policies = GatedBucket::observe(bucket.as_ref()).policies;
         let group_id = bucket
             .as_ref()
             .map_or(self.input.group_id, |bucket| bucket.group_id);
         match write_gate(
             self.gate_context.as_ref(),
-            &self.sealed_policies,
+            &self.stored_policies,
             Some(group_id),
         ) {
             Ok(None) => self.start_transaction(),
@@ -206,7 +206,7 @@ impl CreateMultipartUploadOperation {
         };
         match gate_decision(outcome) {
             Ok(()) => {
-                self.sealed_subject = self
+                self.stored_subject = self
                     .gate_context
                     .as_ref()
                     .map_or(0, |context| context.subject.generation);
@@ -276,8 +276,9 @@ impl CreateMultipartUploadOperation {
             status: MultipartUploadStatus::Open,
             checksum_hint: self.input.checksum_hint.clone(),
             metadata: self.metadata.clone(),
-            placement_policies: self.sealed_policies.clone(),
-            subject_generation: self.sealed_subject,
+            placement_policies: self.stored_policies.clone(),
+            subject_generation: self.stored_subject,
+            completing_since_ms: None,
         };
         let value = match record.to_bytes() {
             Ok(value) => value,

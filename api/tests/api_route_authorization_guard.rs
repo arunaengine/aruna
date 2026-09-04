@@ -73,7 +73,7 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "job_audit.rs",
         "get_job_audit",
         "self-scoped: family_report and family_audit answer NotFound unless the \
-         caller is the sealed submitter of the request",
+         caller is the stored submitter of the request",
     ),
     (
         "jobs.rs",

@@ -73,7 +73,7 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
 
 /// A binding set that is merely incomplete here still converges, so an unknown
 /// handle or strategy waits for replication. Divergent tuples and a bucket
-/// outside the strategy's range are settled facts of the immutable binding set:
+/// outside the strategy's range are settled values of the immutable binding set:
 /// no retry can resolve them, so burning a backoff schedule on them only hides
 /// the fault.
 fn binding_is_transient(error: &BindingError) -> bool {
@@ -237,7 +237,7 @@ mod tests {
                 expected: "e",
                 got: "g".to_string(),
             }),
-            // Settled facts of the immutable binding set; a retry replays them.
+            // Settled values of the immutable binding set; a retry replays them.
             create(CreateMetadataDocumentError::PlacementBinding(
                 BindingError::Conflicted(handle()),
             )),
@@ -276,7 +276,7 @@ mod tests {
                 StorageError::CommitFailed,
             )),
             create(CreateMetadataDocumentError::StorageError(
-                StorageError::Sealed,
+                StorageError::Closed,
             )),
             create(CreateMetadataDocumentError::TopicAnnouncement(
                 "no topic".to_string(),

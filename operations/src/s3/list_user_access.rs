@@ -240,7 +240,7 @@ impl Operation for ListUserAccessOperation {
 mod tests {
     use super::*;
     use crate::s3::access_index::{MAX_ACTIVE_CREDENTIALS, encode_index, owner_key};
-    use aruna_core::credential_seal::SealedS3Secret;
+    use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::structs::RealmId;
     use std::time::{Duration, SystemTime};
     use ulid::Ulid;
@@ -287,7 +287,7 @@ mod tests {
                     access_key: key.clone(),
                     user_identity,
                     group_id: Ulid::generate(),
-                    secret: SealedS3Secret::empty(),
+                    secret: EncryptedS3Secret::empty(),
                     expiry: SystemTime::now() + Duration::from_secs(60),
                     path_restrictions: None,
                     issued_by: [0; 32],

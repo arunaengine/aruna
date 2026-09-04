@@ -110,26 +110,26 @@ pub fn job_manifest(
                 }));
             }
         }
-        // Mounted jobs have no workspace PVC, so give the task a writable
-        // working directory that read-only inputs nest beneath.
-        if let Some(workdir) = spec.workdir.as_deref() {
-            let scratch = normalize_container_path(workdir).map_err(BackendError::InvalidSpec)?;
-            let taken = layout.mounts.iter().any(|input| input.path == scratch)
-                || layout.output_parents.contains(&scratch);
-            if !taken {
-                let empty_dir = match spec.resources.disk_bytes {
-                    Some(bytes) => json!({"sizeLimit":bytes.to_string()}),
-                    None => json!({}),
-                };
-                volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
-                mounts.push(json!({"name":"scratch","mountPath":scratch}));
-            }
-        }
     } else if spec.staging_mode == StagingMode::DirectS3 {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
+    // Tools write caches relative to the working directory, so the non-root
+    // task gets a writable one that read-only inputs nest beneath.
+    if let Some(workdir) = spec.workdir.as_deref() {
+        let scratch = normalize_container_path(workdir).map_err(BackendError::InvalidSpec)?;
+        let taken = layout.mounts.iter().any(|input| input.path == scratch)
+            || layout.output_parents.contains(&scratch);
+        if !taken {
+            let empty_dir = match spec.resources.disk_bytes {
+                Some(bytes) => json!({"sizeLimit":bytes.to_string()}),
+                None => json!({}),
+            };
+            volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
+            mounts.push(json!({"name":"scratch","mountPath":scratch}));
+        }
+    }
     // The credential Secret rides `envFrom`, which any inline entry of the same
-    // name would shadow, so the sealed secret always wins here too.
+    // name would shadow, so the stored secret always wins here too.
     let mut env = spec
         .env
         .iter()
@@ -170,6 +170,9 @@ pub fn job_manifest(
         "resources":resource_limits(spec, config)?,
         "securityContext":container_security(spec.security.read_only_rootfs),
         "startupProbe":startup_probe,
+        // When the container writes no termination log, Kubernetes reports its
+        // last log lines as the terminated message of a non-zero exit.
+        "terminationMessagePolicy":"FallbackToLogsOnError",
         "volumeMounts":mounts
     });
     let deadline = spec
@@ -568,7 +571,7 @@ fn container_security(read_only: bool) -> serde_json::Value {
 }
 
 /// Requests and limits of the task container. CPU and memory always carry a
-/// bound: an attempt the sealed spec and the backend both leave open would run
+/// bound: an attempt the stored spec and the backend both leave open would run
 /// against the whole node.
 fn resource_limits(
     spec: &TaskSpec,
@@ -666,7 +669,7 @@ mod tests {
 
     #[test]
     fn bounds_task_resources() {
-        // The sealed envelope wins, the backend default fills a gap, and an
+        // The stored envelope wins, the backend default fills a gap, and an
         // attempt neither of them bounds never becomes a manifest.
         let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
         spec.resources.cpu_cores = Some(4);
@@ -718,6 +721,20 @@ mod tests {
         let pod = job.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.init_containers.unwrap().len(), 1);
         assert!(pod.containers[0].startup_probe.is_some());
+    }
+
+    #[test]
+    fn keeps_exit_evidence() {
+        // The task container must fall back to its logs, or a non-zero exit
+        // leaves no terminated message behind.
+        let spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.containers[0].termination_message_policy.as_deref(),
+            Some("FallbackToLogsOnError")
+        );
     }
 
     #[test]
@@ -778,6 +795,40 @@ mod tests {
     }
 
     #[test]
+    fn stages_pinned_input() {
+        // A version-pinned input is delivered as a read-only copy in the
+        // per-attempt workspace; no CSI volume can serve a version.
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.inputs
+            .push(TaskInput::from_bytes("/in/data.csv", "a,b"));
+        spec.output_paths.push("/out/report.txt".to_string());
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.mount_path == "/in/data.csv")
+            .unwrap();
+        assert_eq!(mount.name, "workspace");
+        assert_eq!(mount.sub_path.as_deref(), Some("in/data.csv"));
+        assert_eq!(mount.read_only, Some(true));
+
+        let volumes: Vec<_> = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .map(|volume| volume.name)
+            .collect();
+        assert_eq!(volumes, ["workspace", "marker", "tools"]);
+        assert_eq!(pod.init_containers.unwrap().len(), 1);
+        assert!(pod.containers[0].startup_probe.is_some());
+    }
+
+    #[test]
     fn uses_configured_driver() {
         let mut config = config();
         config.s3_mount_driver = Some("s3.csi.example.org".to_string());
@@ -814,6 +865,33 @@ mod tests {
             .find(|volume| volume.name == "scratch")
             .unwrap();
         assert!(volume.empty_dir.is_some());
+    }
+
+    #[test]
+    fn files_workdir_writable() {
+        // Staged jobs mount inputs read-only, so the workdir needs its own scratch.
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::Files;
+        spec.workdir = Some("/work".to_string());
+        spec.inputs.push(TaskInput::from_bytes(
+            "/work/quickruns/hello.py",
+            "print(1)",
+        ));
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let mounts = pod.containers[0].volume_mounts.clone().unwrap();
+        let scratch = mounts
+            .iter()
+            .find(|mount| mount.mount_path == "/work")
+            .unwrap();
+        assert_eq!(scratch.name, "scratch");
+        assert_ne!(scratch.read_only, Some(true));
+        let script = mounts
+            .iter()
+            .find(|mount| mount.mount_path == "/work/quickruns/hello.py")
+            .unwrap();
+        assert_eq!(script.read_only, Some(true));
     }
 
     #[test]

@@ -1220,7 +1220,7 @@ mod test {
     fn config_bytes_canonical() {
         // Pins the canonical wire form. Postcard is positional, so the field
         // occupies a fixed slot that a shorter encoding cannot satisfy.
-        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000";
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712";
         let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
         config.job_family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
@@ -1256,7 +1256,7 @@ mod test {
 
     #[test]
     fn derives_family_placement() {
-        // Two independently built configs sharing the sealed strategy must
+        // Two independently built configs sharing the stored strategy must
         // derive one identical placement for the same submission.
         let mut left = RealmConfigDocument::new(RealmId([10u8; 32]), Vec::new(), 3);
         left.seed_default_placement();

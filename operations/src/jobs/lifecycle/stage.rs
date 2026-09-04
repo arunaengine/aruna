@@ -1,10 +1,10 @@
-//! Cross-node staging of one sealed input version.
+//! Cross-node staging of one stored input version.
 //!
 //! The target may not hold the bytes an execution needs. It then reads them
 //! from a legal holder through the managed-copy handshake, which challenges a
 //! policy-unaware request, teaches the refs, and retries only once this node's
 //! own destination subject complies. The bytes land through the ordinary
-//! policy-gated workspace write, verified against the sealed hash.
+//! policy-gated workspace write, verified against the stored hash.
 
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
@@ -26,7 +26,7 @@ pub struct StagedInput {
 
 /// Reads one exact input version from a legal holder. Holders are tried in
 /// canonical order and a missing or corrupt source moves to the next one
-/// without ever changing the sealed input.
+/// without ever changing the stored input.
 pub async fn stage_remote_input(
     context: &DriverContext,
     record: &JobRecord,
@@ -56,43 +56,68 @@ pub async fn stage_remote_input(
             "no known holder for input {bucket}/{key}"
         )));
     }
+    // Only the ingress endpoint owns the bucket/key/version identity. Any other
+    // holder keeps a registered copy of the same bytes, so it is asked by
+    // content hash once the exact version turns out not to be its own.
+    let ingress = record
+        .captured_inputs
+        .iter()
+        .find(|captured| captured.destination_key == input.dest_key)
+        .map(|captured| captured.source_node_id);
     let mut last: Option<BaoReadError> = None;
     for holder in holders {
-        let request = BaoReadRequest {
-            auth_context: AuthContext {
-                user_id: record.created_by,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
+        let source = VersionedObjectArn {
             realm_id,
-            target: BaoReadTarget::ExactVersion(VersionedObjectArn {
-                realm_id,
-                node_id: holder,
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version,
-            }),
-            expected_blake3: Some(blake3),
-            metadata_only: false,
-            // The managed read fills in this node's own destination subject, so the
-            // source evaluates placement against where the bytes would land.
-            destination: None,
-            known_refs: Vec::new(),
+            node_id: holder,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version,
         };
-        match managed_read(context, holder, request.clone()).await {
-            Ok(BaoReadOutput::Stream { blob, size, .. }) => {
-                debug!(peer = %holder, "Input staged from a remote holder");
-                return Ok(StagedInput { blob, size });
-            }
-            Ok(BaoReadOutput::Metadata { .. }) => continue,
-            Err(error) => {
-                warn!(peer = %holder, error = %error, "Remote input read failed");
-                last = Some(error);
+        for target in read_targets(source, Some(holder) == ingress, blake3) {
+            let request = BaoReadRequest {
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+                realm_id,
+                target,
+                expected_blake3: Some(blake3),
+                metadata_only: false,
+                // The managed read fills in this node's own destination subject, so the
+                // source evaluates placement against where the bytes would land.
+                destination: None,
+                known_refs: Vec::new(),
+            };
+            match managed_read(context, holder, request).await {
+                Ok(BaoReadOutput::Stream { blob, size, .. }) => {
+                    debug!(peer = %holder, "Input staged from a remote holder");
+                    return Ok(StagedInput { blob, size });
+                }
+                Ok(BaoReadOutput::Metadata { .. }) => continue,
+                Err(error) => {
+                    warn!(peer = %holder, error = %error, "Remote input read failed");
+                    last = Some(error);
+                }
             }
         }
     }
     Err(stage_error(bucket, key, last))
+}
+
+/// What one holder is asked for: its own stored version, and, when it is not
+/// the endpoint that owns that object identity, the same bytes by content hash.
+pub(crate) fn read_targets(
+    source: VersionedObjectArn,
+    is_ingress: bool,
+    blake3: [u8; 32],
+) -> Vec<BaoReadTarget> {
+    let mut targets = vec![BaoReadTarget::ExactVersion(source)];
+    if !is_ingress {
+        targets.push(BaoReadTarget::Blake3(blake3));
+    }
+    targets
 }
 
 /// A denied or policy-blocked read fails this attempt permanently; anything

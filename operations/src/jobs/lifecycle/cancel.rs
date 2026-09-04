@@ -1,7 +1,7 @@
 //! Append-only cancellation of one request family.
 //!
 //! Cancelling is a replicated intent, not a global stop: a holder that checked
-//! the caller's permission against the sealed spec signs a token-free record,
+//! the caller's permission against the stored spec signs a token-free record,
 //! every holder that observes it stops launching, and known active executions
 //! are asked to stop. A partitioned execution may still finish, and its late
 //! success is projected with `cancel_requested` set.
@@ -75,7 +75,7 @@ pub async fn cancel_family(
     Some(Ok(()))
 }
 
-/// How this node may state the caller's permission against the sealed spec. The
+/// How this node may state the caller's permission against the stored spec. The
 /// submitter is checked by every holder again; a group admin's permission is
 /// checked here and the signature is that statement.
 async fn cancel_authority(

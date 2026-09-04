@@ -16,7 +16,7 @@ use crate::driver::{DriverContext, drive};
 /// Build, sign, and make durable this execution's exact output record, then
 /// return the digest terminal success must name. Success is refused when this
 /// fails, so an unpublishable or unsigned output set never becomes a result.
-pub async fn seal_outputs(
+pub async fn store_outputs(
     context: &DriverContext,
     record: &JobRecord,
     control: &AttemptControl,
@@ -31,23 +31,23 @@ pub async fn seal_outputs(
         .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
     let outputs = OutputSet::canonical(outputs.to_vec())
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
-    // A replay re-appends the record it already sealed: the append is
+    // A replay re-appends the record it already stored: the append is
     // idempotent and a family view that was unavailable before may resolve now.
     // A receipted execution binds the real chain: the replicated identity, the
-    // sealed spec digest, and the target's own receipt. Without a receipt this
+    // stored spec digest, and the target's own receipt. Without a receipt this
     // is a purely local execution and the documented local stand-ins apply.
     let chain = chain_of_attempt(context, record.job_id, control.execution_id).await;
     let receipted = chain.is_some();
-    if let Some(sealed) = sealed_record(context, record.job_id, control, &outputs, net.node_id())
+    if let Some(frame) = stored_record(context, record.job_id, control, &outputs, net.node_id())
         .await?
         .map(JobRecordFrame::new)
         .transpose()
-        .map_err(|error| JobError::permanent(format!("sealed record is unpublishable: {error}")))?
+        .map_err(|error| JobError::permanent(format!("stored record is unpublishable: {error}")))?
     {
-        let digest = sealed.envelope().digest().map_err(|error| {
+        let digest = frame.envelope().digest().map_err(|error| {
             JobError::permanent(format!("output record digest failed: {error}"))
         })?;
-        append_output_record(context, record.job_id, control, sealed, receipted).await?;
+        append_output_record(context, record.job_id, control, frame, receipted).await?;
         return Ok(digest);
     }
     let output = ExecutionOutputRecord {
@@ -83,14 +83,14 @@ pub async fn seal_outputs(
     publish_output_record(context, record.job_id, control, frame, receipted).await
 }
 
-/// The record this execution already sealed for the same exact output set. A
+/// The record this execution already stored for the same exact output set. A
 /// replayed finalize reuses it instead of re-signing a second record that
 /// differs only by its commit timestamp.
 ///
 /// The stored row is re-verified on read-back: a row whose signature or
-/// publisher no longer proves this node sealed it is not evidence, so a correct
-/// record is sealed again instead of trusting it.
-async fn sealed_record(
+/// publisher no longer proves this node wrote it is not evidence, so a correct
+/// record is stored again instead of trusting it.
+async fn stored_record(
     context: &DriverContext,
     job_id: JobId,
     control: &AttemptControl,
@@ -110,14 +110,14 @@ async fn sealed_record(
         warn!(
             job_id = %job_id,
             attempt_epoch = control.attempt_epoch,
-            "Stored output record does not authenticate; sealing a new one"
+            "Stored output record does not authenticate; storing a new one"
         );
         return Ok(None);
     }
-    let JobFamilyRecord::Output(sealed) = &envelope.record else {
+    let JobFamilyRecord::Output(stored) = &envelope.record else {
         return Ok(None);
     };
-    let matches = sealed.outputs == *outputs && envelope.digest().ok() == Some(digest);
+    let matches = stored.outputs == *outputs && envelope.digest().ok() == Some(digest);
     Ok(matches.then_some(envelope))
 }
 
@@ -144,7 +144,7 @@ async fn publish_output_record(
         .await
         .map_err(|error| match error {
             JobMutationError::OutputRecordConflict => {
-                JobError::permanent("execution output record digest is already sealed")
+                JobError::permanent("execution output record digest is already stored")
             }
             error => JobError::retryable(format!("output record write failed: {error}")),
         })?;
@@ -152,7 +152,7 @@ async fn publish_output_record(
     Ok(digest)
 }
 
-/// Appends the sealed record to the append-only store. A realm that cannot
+/// Appends the stored record to the append-only store. A realm that cannot
 /// resolve the family view yet defers the record instead of failing the
 /// execution: the record is already durable and the append is idempotent.
 async fn append_output_record(
@@ -167,7 +167,7 @@ async fn append_output_record(
     };
     let envelope = frame.envelope();
     let JobFamilyRecord::Output(output) = &envelope.record else {
-        return Err(JobError::permanent("sealed record is not an output record"));
+        return Err(JobError::permanent("stored record is not an output record"));
     };
     let config = AppendRecordConfig {
         realm_id: envelope.realm_id,
@@ -200,7 +200,7 @@ async fn append_output_record(
                 "output record admission is awaiting family evidence",
             )),
             Admission::Conflict | Admission::Rejected(_) => Err(JobError::permanent(
-                "output record admission rejected the sealed record",
+                "output record admission rejected the stored record",
             )),
             admission => Err(JobError::permanent(format!(
                 "output record admission invalid for execution mode: {admission:?}"
@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seal_is_durable() {
+    async fn store_is_durable() {
         // The signed record must be readable back under the digest terminal
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
@@ -338,7 +338,7 @@ mod tests {
         let version_id = control.output_commits[0].version_id;
         let outputs = vec![output(control.execution_id, version_id)];
 
-        let digest = seal_outputs(&context, &record, &control, &outputs)
+        let digest = store_outputs(&context, &record, &control, &outputs)
             .await
             .unwrap();
 
@@ -363,13 +363,13 @@ mod tests {
         .unwrap();
         assert_eq!(envelope.digest().unwrap(), digest);
         assert!(envelope.verify_signature().is_ok());
-        let JobFamilyRecord::Output(sealed) = &envelope.record else {
-            panic!("the sealed record is an output record");
+        let JobFamilyRecord::Output(output_record) = &envelope.record else {
+            panic!("the stored record is an output record");
         };
-        assert_eq!(sealed.outputs.as_slice(), outputs.as_slice());
-        assert_eq!(sealed.execution_id, control.execution_id);
+        assert_eq!(output_record.outputs.as_slice(), outputs.as_slice());
+        assert_eq!(output_record.execution_id, control.execution_id);
 
-        let replayed = seal_outputs(&context, &record, &stored, &outputs)
+        let replayed = store_outputs(&context, &record, &stored, &outputs)
             .await
             .unwrap();
         assert_eq!(replayed, digest);

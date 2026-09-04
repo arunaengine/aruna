@@ -955,7 +955,7 @@ mod tests {
             state,
         )
         .expect("record builds")
-        .sealed_under(match governed {
+        .stored_under(match governed {
             true => 1,
             false => 0,
         })
@@ -1018,7 +1018,7 @@ mod tests {
     fn governed_version() -> BlobVersion {
         materialized()
             .with_policies(vec![policy_ref()])
-            .expect("refs seal")
+            .expect("refs stored")
     }
 
     #[test]

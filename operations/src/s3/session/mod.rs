@@ -16,7 +16,9 @@ pub use touch::{TouchS3SessionConfig, TouchS3SessionOperation};
 
 use crate::driver::{DriverContext, drive};
 use aruna_core::compute::Secret;
-use aruna_core::credential_seal::{CredentialSealKey, SealError, SealedS3Secret};
+use aruna_core::credential_encryption::{
+    CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
+};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
@@ -48,7 +50,7 @@ pub enum S3SessionError {
     #[error(transparent)]
     Restriction(#[from] RestrictionLimitError),
     #[error(transparent)]
-    Seal(#[from] SealError),
+    Encryption(#[from] EncryptionError),
     #[error("session access key is invalid")]
     InvalidAccessKey,
     #[error("session expiry is invalid")]
@@ -195,7 +197,7 @@ fn build_session(
     expiry: SystemTime,
     path_restrictions: Option<Vec<PathRestriction>>,
     issued_by: [u8; 32],
-    seal_key: &CredentialSealKey,
+    encryption_key: &CredentialEncryptionKey,
 ) -> Result<S3SessionCredentials, S3SessionError> {
     if let Some(restrictions) = path_restrictions.as_deref() {
         validate_restriction_limits(restrictions)?;
@@ -209,14 +211,14 @@ fn build_session(
         access_key: access_key.clone(),
         user_identity,
         group_id,
-        secret: SealedS3Secret::empty(),
+        secret: EncryptedS3Secret::empty(),
         token_hash: S3Session::hash_token(session_token.expose()),
         expiry,
         path_restrictions,
         issued_by,
         last_used_at: None,
     };
-    session.seal_secret(seal_key, secret_access_key.expose())?;
+    session.encrypt_secret(encryption_key, secret_access_key.expose())?;
     Ok(S3SessionCredentials {
         access_key_id: access_key,
         secret_access_key,
@@ -339,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_at_boundary() {
         let (_directory, context) = test_context();
-        let seal_key = CredentialSealKey::derive(&[7u8; 32]);
+        let encryption_key = CredentialEncryptionKey::derive(&[7u8; 32]);
         let user = UserId::local(Ulid::from_bytes([2u8; 16]), RealmId::from_bytes([1u8; 32]));
         let group = Ulid::from_bytes([3u8; 16]);
         let issuer = [4u8; 32];
@@ -347,7 +349,7 @@ mod tests {
         let issued = drive(
             CreateS3SessionOperation::new(
                 session_config(user, group, start, start + S3_SESSION_MAX_TTL, issuer),
-                seal_key.clone(),
+                encryption_key.clone(),
             ),
             &context,
         )
@@ -377,7 +379,7 @@ mod tests {
                     path_restrictions: None,
                     issued_by: issuer,
                 },
-                seal_key.clone(),
+                encryption_key.clone(),
             ),
             &context,
         )
@@ -397,7 +399,7 @@ mod tests {
                     path_restrictions: None,
                     issued_by: issuer,
                 },
-                seal_key,
+                encryption_key,
             ),
             &context,
         )
@@ -438,7 +440,7 @@ mod tests {
         let issued = drive(
             CreateS3SessionOperation::new(
                 session_config(user, group, now, now + Duration::from_secs(100), issuer),
-                CredentialSealKey::derive(&[7u8; 32]),
+                CredentialEncryptionKey::derive(&[7u8; 32]),
             ),
             &context,
         )
@@ -503,7 +505,7 @@ mod tests {
                         path_restrictions: None,
                         issued_by: [4u8; 32],
                     },
-                    CredentialSealKey::derive(&[7u8; 32]),
+                    CredentialEncryptionKey::derive(&[7u8; 32]),
                 ),
                 &context,
             )
@@ -515,7 +517,7 @@ mod tests {
         let session = drive(
             CreateS3SessionOperation::new(
                 session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
-                CredentialSealKey::derive(&[7u8; 32]),
+                CredentialEncryptionKey::derive(&[7u8; 32]),
             ),
             &context,
         )
@@ -542,7 +544,7 @@ mod tests {
                 drive(
                     CreateS3SessionOperation::new(
                         session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
-                        CredentialSealKey::derive(&[7u8; 32]),
+                        CredentialEncryptionKey::derive(&[7u8; 32]),
                     ),
                     &context,
                 )
@@ -554,7 +556,7 @@ mod tests {
         let extra = drive(
             CreateS3SessionOperation::new(
                 session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
-                CredentialSealKey::derive(&[7u8; 32]),
+                CredentialEncryptionKey::derive(&[7u8; 32]),
             ),
             &context,
         )
@@ -583,7 +585,7 @@ mod tests {
         let (_directory, context) = test_context();
         let user = UserId::local(Ulid::from_bytes([2u8; 16]), RealmId::from_bytes([1u8; 32]));
         let group = Ulid::from_bytes([3u8; 16]);
-        let seal_key = CredentialSealKey::derive(&[7u8; 32]);
+        let encryption_key = CredentialEncryptionKey::derive(&[7u8; 32]);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let mut issued = Vec::new();
         for step in 0..MAX_GROUP_SESSIONS as u64 {
@@ -593,7 +595,7 @@ mod tests {
                     CreateS3SessionOperation::with_key(
                         session_config(user, group, now, now + ttl, [4u8; 32]),
                         Ulid::from_parts(1_000 + step, u128::from(step)).to_string(),
-                        seal_key.clone(),
+                        encryption_key.clone(),
                     ),
                     &context,
                 )
@@ -607,7 +609,7 @@ mod tests {
             CreateS3SessionOperation::with_key(
                 session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
                 Ulid::from_parts(2_000, 9).to_string(),
-                seal_key,
+                encryption_key,
             ),
             &context,
         )

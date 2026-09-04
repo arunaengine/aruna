@@ -6,7 +6,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE};
 use aruna_core::structs::{
-    AuthContext, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId, JobInputFact,
+    AuthContext, CapturedInput, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId,
     JobState, LogicalJobSpec, RealmConfigDocument, RealmNodeKind, SubmissionClaim, WorkspaceMode,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -17,7 +17,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
-use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, seal_workspace};
+use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
 use crate::jobs::records::tests::fixture::{Family, REALM, context, node, payload, secret, user};
@@ -198,7 +198,7 @@ async fn refuses_undeliverable_submit() {
         payload(),
         user(),
         Some("idempotency".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         None,
@@ -259,16 +259,16 @@ async fn answers_by_alias() {
 #[test]
 fn identity_is_deterministic() {
     // The same normalized request yields one identity everywhere, and the
-    // sealed workspace choice is part of the digest it commits to.
+    // stored workspace choice is part of the digest it commits to.
     let mut spec = payload();
-    seal_workspace(&mut spec, WorkspaceMode::Kept, None).expect("workspace seals");
+    store_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace stored");
     let request = SubmissionRequest {
         created_by: user(),
         spec: spec.clone(),
         scope: SubmissionScope::Keyed("idempotency".to_string()),
         retention_ms: 60_000,
         ingress_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
-        input_facts: Vec::new(),
+        captured_inputs: Vec::new(),
         output_policies: Vec::new(),
     };
     let identity = request.identity().expect("identity derives");
@@ -292,7 +292,7 @@ fn identity_is_deterministic() {
     assert_ne!(moved.identity().expect("identity derives"), identity);
 
     let mut pinned = request;
-    pinned.input_facts.push(JobInputFact {
+    pinned.captured_inputs.push(CapturedInput {
         destination_key: "reads.fastq".to_string(),
         source_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         version_id: Ulid::from_bytes([1u8; 16]),
@@ -346,7 +346,7 @@ fn absent_input() -> InputSelection {
         source_node_id: None,
         dest_key: "input.fastq".to_string(),
         mode: InputMode::Snapshot,
-        container_path: None,
+        container_path: Some("/inputs/input.fastq".to_string()),
         name: None,
         description: None,
     }
@@ -366,7 +366,7 @@ async fn device_skips_materialization() {
         spec.clone(),
         user(),
         Some("device".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
@@ -393,7 +393,7 @@ async fn device_skips_materialization() {
         spec,
         user(),
         Some("server".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
@@ -424,7 +424,7 @@ async fn device_needs_bearer() {
         payload(),
         user(),
         Some("device".to_string()),
-        WorkspaceMode::Kept,
+        WorkspaceMode::None,
         None,
         60_000,
         None,
@@ -438,8 +438,8 @@ async fn device_needs_bearer() {
 #[test]
 fn refuses_reserved_tags() {
     // A caller may not preset the reserved scheduling tags and steer another
-    // workspace than the one the ingress sealed.
+    // workspace than the one the ingress stored.
     let mut spec = payload();
-    seal_workspace(&mut spec, WorkspaceMode::Kept, None).expect("workspace seals");
-    assert!(seal_workspace(&mut spec, WorkspaceMode::Kept, None).is_err());
+    store_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace stored");
+    assert!(store_workspace(&mut spec, WorkspaceMode::None, None).is_err());
 }

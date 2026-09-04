@@ -89,9 +89,9 @@ async fn ensure_held_shard_topics(
             });
             if (holders.contains(&local_node_id) || active_target)
                 && let Err(error) =
-                    net_handle.unseal_sync_topic(shard_topic_id(realm_id, &placement))
+                    net_handle.reopen_sync_topic(shard_topic_id(realm_id, &placement))
             {
-                debug!(error = %error, "Failed to unseal a current shard holder topic");
+                debug!(error = %error, "Failed to reopen a current shard holder topic");
                 outcome.pull_pending = true;
             }
             // Rank-0 is an activation role: a target that has not cut over yet

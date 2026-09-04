@@ -7,25 +7,36 @@ use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend,
-    MultipartUploadPart, MultipartUploadPartKey, RealmId, RoCrateLimits, WriteOwner,
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, COMPLETION_DEADLINE_MS,
+    GroupStorageBackend, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    MultipartUploadStatus, RealmId, RoCrateLimits, WriteOwner,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use tracing::{error, warn};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::group_backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
+use crate::s3::abort_multipart_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
 const CLEANUP_PAGE_SIZE: usize = 128;
 const MAX_CLEANUP_RETRIES: u8 = 3;
+/// An `Open` upload nobody added to or aborted is abandoned; S3 lifecycle rules
+/// use the same order of magnitude.
+const UPLOAD_OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// A `Completing` upload past the completion deadline lost the request that
+/// owned it; the margin keeps the sweep off a completion still running.
+const UPLOAD_COMPLETING_TTL_MS: u64 =
+    COMPLETION_DEADLINE_MS + BLOB_CLEANUP_AFTER.as_millis() as u64;
+/// Aborts are transactional, so one run reclaims a bounded slice of the backlog.
+const UPLOAD_SWEEP_BATCH: usize = 32;
 
 /// A cleanup row an operation has emitted but storage has not yet accepted.
 /// The row is the only durable record that the written object exists, so the
@@ -172,6 +183,94 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
         };
         start_after = Some(next);
     }
+}
+
+#[derive(Debug, Default)]
+pub struct UploadSweepOutcome {
+    pub aborted: usize,
+    pub failed: usize,
+}
+
+/// An upload no client will finish: an `Open` record past its TTL, or a
+/// `Completing` one whose lease lapsed long enough ago that its request is gone.
+fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
+    let age = record
+        .created_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| now_ms.saturating_sub(since.as_millis() as u64))
+        .unwrap_or_default();
+    match record.status {
+        MultipartUploadStatus::Open => age >= UPLOAD_OPEN_TTL_MS,
+        MultipartUploadStatus::Completing => record
+            .completing_since_ms
+            .map(|since| now_ms.saturating_sub(since) >= UPLOAD_COMPLETING_TTL_MS)
+            .unwrap_or(age >= UPLOAD_COMPLETING_TTL_MS),
+        MultipartUploadStatus::Aborting => false,
+    }
+}
+
+/// Reclaims stale multipart uploads, their part rows and their part blobs. The
+/// abort operation owns the transaction, so a refused record stays for the next
+/// run instead of leaving half-deleted state behind.
+pub async fn sweep_stale_uploads(
+    context: &DriverContext,
+    now_ms: u64,
+) -> Result<UploadSweepOutcome, String> {
+    let mut outcome = UploadSweepOutcome::default();
+    let mut start_after = None;
+    let mut stale: Vec<MultipartUpload> = Vec::new();
+
+    while stale.len() < UPLOAD_SWEEP_BATCH {
+        let (values, next) = iter_prefix_page(
+            &context.storage_handle,
+            S3_MULTIPART_UPLOAD_KEYSPACE,
+            None,
+            start_after,
+            CLEANUP_PAGE_SIZE,
+            None,
+        )
+        .await?;
+        for (_, value) in values {
+            match MultipartUpload::from_bytes(&value) {
+                Ok(record) if stale_upload(&record, now_ms) => stale.push(record),
+                Ok(_) => {}
+                Err(error) => warn!(error = %error, "Skipping an undecodable multipart upload"),
+            }
+            if stale.len() >= UPLOAD_SWEEP_BATCH {
+                break;
+            }
+        }
+        let Some(next) = next else {
+            break;
+        };
+        start_after = Some(next);
+    }
+
+    for record in stale {
+        let upload_id = record.upload_id;
+        match drive(
+            AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+                bucket: record.bucket,
+                key: record.key,
+                upload_id,
+                now_ms,
+            }),
+            context,
+        )
+        .await
+        {
+            Ok(_) => {
+                outcome.aborted = outcome.aborted.saturating_add(1);
+                warn!(%upload_id, status = ?record.status, "Reclaimed a stale multipart upload");
+            }
+            Err(error) => {
+                outcome.failed = outcome.failed.saturating_add(1);
+                warn!(%upload_id, error = %error, "Failed to reclaim a stale multipart upload");
+            }
+        }
+    }
+
+    Ok(outcome)
 }
 
 /// The backend a row needs credentials for, if it needs any.

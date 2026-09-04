@@ -74,7 +74,7 @@ pub enum AdvertisementError {
 }
 
 /// One backend a node offers as an execution target, with the execution-site
-/// facts a remote planner needs. Static fields hard-filter; `availability` is
+/// details a remote planner needs. Static fields hard-filter; `availability` is
 /// stale telemetry that may only rank.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorCapability {
@@ -99,7 +99,7 @@ pub struct ExecutorCapability {
 
 impl ExecutorCapability {
     /// Advertisement of one backend at `subject`. The subject's executor kind is
-    /// pinned to `kind` and its digest sealed, so later drift is detectable.
+    /// pinned to `kind` and its digest stored, so later drift is detectable.
     pub fn new(kind: String, subject: PlacementSubject) -> Result<Self, PlacementPolicyError> {
         let subject = PlacementSubject {
             executor_kind: Some(kind.clone()),
@@ -172,7 +172,7 @@ pub struct ExecutionTargetId {
     pub executor_kind: String,
 }
 
-/// Static ceilings of one backend. These are hard eligibility facts: a request
+/// Static ceilings of one backend. These are hard eligibility limits: a request
 /// that cannot fit is not schedulable here. `None` means unmeasured, so it never
 /// filters a backend out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,7 +201,7 @@ impl ResourceEnvelope {
 }
 
 /// Stale telemetry that may only rank targets. It carries no eligibility method
-/// on purpose: free capacity is never a hard planner fact, and exact admission
+/// on purpose: free capacity is never a hard planner limit, and exact admission
 /// happens at the target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorAvailability {
@@ -777,6 +777,9 @@ pub struct AttemptStatus {
     pub backend_ref: String,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
+    /// Bounded human-readable termination evidence, such as a reason plus a
+    /// message, that a backend may attach to a terminal phase.
+    pub detail: Option<String>,
 }
 
 impl AttemptStatus {
@@ -1008,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrips_target_facts() {
+    fn roundtrips_target_id() {
         let target = ExecutionTargetId {
             node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
             executor_kind: "docker".to_string(),

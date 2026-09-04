@@ -10,7 +10,7 @@ use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::compute::Secret;
-use aruna_core::credential_seal::SealedS3Secret;
+use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus, AuthContext,
@@ -372,7 +372,7 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 **Behavior**
 - Providers are stored per user on the node that registered them, so the listing is node-local and
   is not replicated to the realm's other nodes.
-- API keys, ChatGPT tokens and custom headers stay sealed: a summary carries only the label, the
+- API keys, ChatGPT tokens and custom headers stay encrypted: a summary carries only the label, the
   base URL, the known model ids and the status.
 - `status` is `ready` once the provider can serve a request, and `pending` while a ChatGPT device
   login is still open.
@@ -418,7 +418,7 @@ pub async fn list_providers(
     path = "/system/assistant/providers",
     tag = "system/assistant",
     summary = "Create an assistant provider",
-    description = r#"Registers an assistant provider for the calling user and seals its credentials.
+    description = r#"Registers an assistant provider for the calling user and encrypts its credentials.
 
 **Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
 refused. The provider is registered for the calling user alone.
@@ -428,7 +428,7 @@ refused. The provider is registered for the calling user alone.
   `chatgpt` is refused here because that kind is registered by the device login route.
 - `base_url` defaults to the kind's official origin and is required for `openai_compatible`; a
   trailing slash is trimmed off.
-- `api_key` and `headers` are stored sealed and are never returned by any route.
+- `api_key` and `headers` are stored encrypted and are never returned by any route.
 - `models` keeps only the ids the portal sends back; display names are dropped.
 - The record is written on the node serving the request and is not replicated to the realm.
 
@@ -440,7 +440,7 @@ refused. The provider is registered for the calling user alone.
   requires https and a public host, while a user node may name a loopback or private address."#,
     request_body(
         content = CreateProviderRequest,
-        description = "Provider kind and label, the credentials to seal, and the models the portal already fetched",
+        description = "Provider kind and label, the credentials to encrypt, and the models the portal already fetched",
         example = json!({
             "kind": "openai",
             "label": "OpenAI",
@@ -450,7 +450,7 @@ refused. The provider is registered for the calling user alone.
         })
     ),
     responses(
-        (status = 201, description = "Provider registered; the sealed credentials are not echoed back", body = ProviderSummary,
+        (status = 201, description = "Provider registered; the encrypted credentials are not echoed back", body = ProviderSummary,
             example = json!({
                 "provider_id": "01JCNCTR0123456789ABCDEFGH",
                 "kind": "openai",
@@ -489,8 +489,8 @@ pub async fn create_provider(
         kind,
         label: request.label,
         base_url,
-        headers: SealedS3Secret::empty(),
-        secret: SealedS3Secret::empty(),
+        headers: EncryptedS3Secret::empty(),
+        secret: EncryptedS3Secret::empty(),
         models: request.models.map(model_ids).unwrap_or_default(),
         default_model: request.default_model,
         created_at: unix_timestamp_secs(),
@@ -509,7 +509,7 @@ pub async fn create_provider(
             provider,
             secret,
             headers,
-            state.credential_seal_key().clone(),
+            state.credential_encryption_key().clone(),
         ),
         &state.get_ctx(),
     )
@@ -529,7 +529,7 @@ pub async fn create_provider(
 refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
-- An omitted field keeps its stored value; `api_key` replaces the sealed key and `headers` replaces
+- An omitted field keeps its stored value; `api_key` replaces the encrypted key and `headers` replaces
   the whole stored header set rather than merging into it.
 - A new `base_url` is validated exactly as it is at registration, so a server node keeps requiring a
   public https origin.
@@ -593,7 +593,7 @@ pub async fn patch_provider(
         provider.base_url = validate_base_url(&state, &base_url)?;
     }
     let mut secret = provider
-        .open_secret(state.credential_seal_key())
+        .open_secret(state.credential_encryption_key())
         .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
     if let Some(api_key) = request.api_key {
         secret.api_key = Some(Secret::new(api_key));
@@ -601,13 +601,13 @@ pub async fn patch_provider(
     let headers = match request.headers {
         Some(headers) => headers_from_input(headers)?,
         None => provider
-            .open_headers(state.credential_seal_key())
+            .open_headers(state.credential_encryption_key())
             .map_err(|_| ServerError::InternalError("provider headers unavailable".to_string()))?,
     };
     provider
-        .seal_secret(state.credential_seal_key(), &secret)
-        .and_then(|_| provider.seal_headers(state.credential_seal_key(), &headers))
-        .map_err(|_| ServerError::InternalError("provider seal failed".to_string()))?;
+        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .and_then(|_| provider.encrypt_headers(state.credential_encryption_key(), &headers))
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
     let provider = save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((StatusCode::OK, Json(provider_summary(&provider))))
 }
@@ -617,13 +617,13 @@ pub async fn patch_provider(
     path = "/system/assistant/providers/{id}",
     tag = "system/assistant",
     summary = "Delete an assistant provider",
-    description = r#"Deletes one assistant provider together with the credentials sealed for it.
+    description = r#"Deletes one assistant provider together with the credentials encrypted for it.
 
 **Authentication**: unrestricted realm bearer token of this realm; a path-restricted token is
 refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
-- The provider record, its sealed secret and its sealed headers are removed in one write.
+- The provider record, its encrypted secret and its encrypted headers are removed in one write.
 - The deletion is node-local, like the registration it removes; nothing is revoked upstream, so a
   ChatGPT login stays valid at the issuer until it expires there."#,
     params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
@@ -662,7 +662,7 @@ pub async fn delete_provider(
 refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
-- The node reads the provider's own model listing with the sealed credentials; the result is
+- The node reads the provider's own model listing with the encrypted credentials; the result is
   returned as it is read and is not stored on the provider record.
 - Embedding, audio, image, moderation and realtime model ids are filtered out, so only models a
   chat request can use remain.
@@ -763,7 +763,7 @@ pub async fn test_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::credential_seal::CredentialSealKey;
+    use aruna_core::credential_encryption::CredentialEncryptionKey;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
 
@@ -791,8 +791,8 @@ mod tests {
             kind: AssistantProviderKind::Openai,
             label: "OpenAI".to_string(),
             base_url: "https://api.openai.com".to_string(),
-            headers: SealedS3Secret::empty(),
-            secret: SealedS3Secret::empty(),
+            headers: EncryptedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
             created_at: 1,
@@ -801,9 +801,9 @@ mod tests {
             login_expires_at: None,
             login_interval_seconds: None,
         };
-        let key = CredentialSealKey::derive(&[7; 32]);
+        let key = CredentialEncryptionKey::derive(&[7; 32]);
         provider
-            .seal_secret(
+            .encrypt_secret(
                 &key,
                 &AssistantProviderSecret {
                     api_key: Some(Secret::new("secret-key")),

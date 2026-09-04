@@ -36,6 +36,16 @@ pub enum MultipartUploadStatus {
     Aborting,
 }
 
+/// How long one completion attempt owns an upload. A request whose connection
+/// died leaves the record `Completing`, so a later attempt takes it over once
+/// the lease lapses instead of failing forever with `NoSuchUpload`.
+pub const COMPLETION_LEASE_MS: u64 = 15 * 60 * 1000;
+
+/// Ceiling on one CompleteMultipartUpload. Composing a huge object is
+/// legitimately slow, so the bound only has to stop an operation that never
+/// finishes; nothing may reclaim the upload while a request still owns it.
+pub const COMPLETION_DEADLINE_MS: u64 = 2 * 60 * 60 * 1000;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub upload_id: Ulid,
@@ -58,11 +68,14 @@ pub struct MultipartUpload {
     /// Subject generation the CreateMultipartUpload gate admitted this upload
     /// under. Every part re-checks it before writing bytes; zero is ungoverned.
     pub subject_generation: u64,
+    /// When the current completion attempt claimed the record, in epoch ms.
+    /// Only meaningful while the status is `Completing`.
+    pub completing_since_ms: Option<u64>,
 }
 
 impl MultipartUpload {
-    /// Whether a part may still land here. The create-time gate sealed the refs
-    /// and the subject; a part is only a cheap re-check of that same seal.
+    /// Whether a part may still land here. The create-time gate stored the refs
+    /// and the subject; a part is only a cheap re-check of the same values.
     pub fn admits_part(&self, subject: Option<&crate::structs::NodeSubjectRecord>) -> bool {
         if self.placement_policies.is_empty() {
             return true;
@@ -74,7 +87,7 @@ impl MultipartUpload {
         })
     }
 
-    /// Adds the refs a copied part brought along. Returns whether the sealed set
+    /// Adds the refs a copied part brought along. Returns whether the stored set
     /// changed, so an unchanged upload record is not rewritten.
     pub fn merge_policies(
         &mut self,
@@ -86,6 +99,13 @@ impl MultipartUpload {
         let changed = merged != self.placement_policies;
         self.placement_policies = merged;
         Ok(changed)
+    }
+
+    /// Whether a `Completing` record may be taken over: an unstamped record is
+    /// stale by definition, so a crash before the stamp cannot strand it.
+    pub fn completion_stale(&self, now_ms: u64) -> bool {
+        self.completing_since_ms
+            .is_none_or(|since| now_ms.saturating_sub(since) >= COMPLETION_LEASE_MS)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {

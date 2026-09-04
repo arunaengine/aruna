@@ -621,6 +621,7 @@ mod tests {
                 metadata: HashMap::new(),
                 placement_policies: Vec::new(),
                 subject_generation: 0,
+                completing_since_ms: None,
             }
             .to_bytes()
             .unwrap(),

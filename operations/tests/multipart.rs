@@ -2,25 +2,27 @@
 #![recursion_limit = "256"]
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
     HASH_PATHS_INDEX_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
     Backend, BackendConfig, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    CurrentVersionPointer, HashPathIndexKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectPart, MultipartObjectSummary, MultipartUploadChecksumHint,
-    MultipartUploadPartKey, RealmId, RoutingSnapshot, VersionKey,
+    COMPLETION_LEASE_MS, CurrentVersionPointer, HashPathIndexKey, MultipartChecksumType,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+    MultipartUploadChecksumHint, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
+    RoutingSnapshot, VersionKey,
 };
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::blob::cleanup::process_cleanup_batch;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
+use aruna_operations::driver::{DriverContext, drive, now_ms};
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
@@ -35,7 +37,7 @@ use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperati
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation};
 use aruna_storage::storage;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};
 use std::path::Path;
 use tempfile::TempDir;
@@ -228,6 +230,7 @@ async fn complete_upload(
             object_size,
             created_by,
             quota_ceiling: None,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &context.driver,
     )
@@ -353,6 +356,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &context.driver,
     )
@@ -587,6 +591,7 @@ async fn rejects_missing_checksum() {
             object_size: Some(8),
             created_by,
             quota_ceiling: None,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &context.driver,
     )
@@ -790,6 +795,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &context.driver,
     )
@@ -1235,6 +1241,7 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
             bucket: "bucket-a".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &context.driver,
     )
@@ -1429,6 +1436,7 @@ async fn delete_object_removes_completed_multipart_metadata() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
+            now_ms: aruna_operations::driver::now_ms(),
         }),
         &context.driver,
     )
@@ -1487,4 +1495,308 @@ async fn delete_object_removes_completed_multipart_metadata() {
         .await
         .is_none()
     );
+}
+
+// Runs a completion up to the blob compose and abandons it there, the way a
+// dropped request future does: the record stays `Completing`.
+async fn stall_completion(
+    context: &TestContext,
+    input: CompleteMultipartUploadInput,
+) -> CompleteMultipartUploadOperation {
+    let mut operation = CompleteMultipartUploadOperation::new(input);
+    let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
+    while let Some(effect) = queue.pop_front() {
+        let Effect::Storage(effect) = effect else {
+            break;
+        };
+        let event = context
+            .driver
+            .storage_handle
+            .send_storage_effect(effect)
+            .await;
+        if operation.is_complete() {
+            break;
+        }
+        queue.extend(operation.step(event));
+    }
+    operation
+}
+
+// Runs the effects a deadline's abort emits, so the record is left as production
+// would leave it.
+async fn run_abort(context: &TestContext, operation: &mut CompleteMultipartUploadOperation) {
+    let mut queue: VecDeque<Effect> = operation.abort().into_iter().collect();
+    while let Some(effect) = queue.pop_front() {
+        let Effect::Storage(effect) = effect else {
+            continue;
+        };
+        let event = context
+            .driver
+            .storage_handle
+            .send_storage_effect(effect)
+            .await;
+        if operation.is_complete() {
+            break;
+        }
+        queue.extend(operation.step(event));
+    }
+}
+
+async fn read_upload(context: &TestContext, upload_id: Ulid) -> Option<MultipartUpload> {
+    read_value(
+        &context.driver,
+        S3_MULTIPART_UPLOAD_KEYSPACE,
+        upload_id.to_bytes().to_vec(),
+    )
+    .await
+    .map(|value| MultipartUpload::from_bytes(value.as_ref()).unwrap())
+}
+
+fn completion_input(
+    upload_id: Ulid,
+    part: &aruna_operations::s3::upload_part::UploadPartResult,
+    realm_id: RealmId,
+    node_id: aruna_core::types::NodeId,
+    created_by: UserId,
+    now: u64,
+) -> CompleteMultipartUploadInput {
+    CompleteMultipartUploadInput {
+        bucket: "bucket-a".to_string(),
+        key: "stalled.bin".to_string(),
+        upload_id,
+        realm_id,
+        node_id,
+        completed_parts: vec![CompleteMultipartPart {
+            part_number: 1,
+            etag: Some(hex::encode(part.location.hashes.get("md5").unwrap())),
+            expected_checksums: vec![],
+        }],
+        expected_checksums: vec![],
+        checksum_algorithm: None,
+        checksum_type: MultipartChecksumType::FullObject,
+        checksum_type_explicit: false,
+        object_size: Some(part.location.blob_size),
+        created_by,
+        quota_ceiling: None,
+        now_ms: now,
+    }
+}
+
+// A completion whose request future died must not strand the upload: the abort
+// path reopens the record it left `Completing`.
+#[tokio::test]
+async fn abort_reopens_upload() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
+    let upload = create_upload(&context, "bucket-a", "stalled.bin", group_id, created_by).await;
+    let part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "stalled.bin",
+        upload.upload_id,
+        1,
+        &vec![7u8; MIN_MULTIPART_PART_SIZE],
+        created_by,
+    )
+    .await;
+    let now = now_ms();
+
+    let mut operation = stall_completion(
+        &context,
+        completion_input(upload.upload_id, &part, realm_id, node_id, created_by, now),
+    )
+    .await;
+    let stalled = read_upload(&context, upload.upload_id).await.unwrap();
+    assert_eq!(stalled.status, MultipartUploadStatus::Completing);
+    assert_eq!(stalled.completing_since_ms, Some(now));
+
+    run_abort(&context, &mut operation).await;
+
+    let reopened = read_upload(&context, upload.upload_id).await.unwrap();
+    assert_eq!(reopened.status, MultipartUploadStatus::Open);
+    assert_eq!(reopened.completing_since_ms, None);
+}
+
+// The retry of a dropped completion takes the lapsed lease over instead of
+// failing with UploadNotOpen.
+#[tokio::test]
+async fn dropped_completion_retries() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
+    let upload = create_upload(&context, "bucket-a", "stalled.bin", group_id, created_by).await;
+    let part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "stalled.bin",
+        upload.upload_id,
+        1,
+        &vec![5u8; MIN_MULTIPART_PART_SIZE],
+        created_by,
+    )
+    .await;
+    let now = now_ms();
+
+    // The first attempt is abandoned mid-compose and never cleans up.
+    drop(
+        stall_completion(
+            &context,
+            completion_input(upload.upload_id, &part, realm_id, node_id, created_by, now),
+        )
+        .await,
+    );
+
+    let retried = drive(
+        CompleteMultipartUploadOperation::new(completion_input(
+            upload.upload_id,
+            &part,
+            realm_id,
+            node_id,
+            created_by,
+            now + COMPLETION_LEASE_MS,
+        )),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(retried.part_count, 1);
+    assert!(read_upload(&context, upload.upload_id).await.is_none());
+}
+
+// A live lease still owns the upload, so an abort is refused rather than
+// deleting the object a running completion is about to publish.
+#[tokio::test]
+async fn abort_refuses_lease() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
+    let upload = create_upload(&context, "bucket-a", "stalled.bin", group_id, created_by).await;
+    let part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "stalled.bin",
+        upload.upload_id,
+        1,
+        &vec![1u8; MIN_MULTIPART_PART_SIZE],
+        created_by,
+    )
+    .await;
+    let now = now_ms();
+    let _stalled = stall_completion(
+        &context,
+        completion_input(upload.upload_id, &part, realm_id, node_id, created_by, now),
+    )
+    .await;
+
+    let refused = drive(
+        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "stalled.bin".to_string(),
+            upload_id: upload.upload_id,
+            now_ms: now + 1,
+        }),
+        &context.driver,
+    )
+    .await;
+
+    assert!(matches!(
+        refused,
+        Err(aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError::CompletionInProgress)
+    ));
+
+    // Once the lease lapses the same abort reclaims the record and its part.
+    drive(
+        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "stalled.bin".to_string(),
+            upload_id: upload.upload_id,
+            now_ms: now + COMPLETION_LEASE_MS,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    assert!(read_upload(&context, upload.upload_id).await.is_none());
+    assert!(
+        read_value(
+            &context.driver,
+            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+            MultipartUploadPartKey::new(upload.upload_id, 1)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .is_none()
+    );
+    drain_cleanup(&context).await;
+    assert!(!exists(part.location.get_full_path().unwrap()).unwrap());
+}
+
+// Nothing else reclaims an upload whose client vanished, so the cleanup timer
+// sweeps it with its part rows and part blobs.
+#[tokio::test]
+async fn sweep_reclaims_upload() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
+    let baseline = count_blob_files(&context.blob_root);
+    let upload = create_upload(&context, "bucket-a", "stalled.bin", group_id, created_by).await;
+    let part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "stalled.bin",
+        upload.upload_id,
+        1,
+        &vec![3u8; MIN_MULTIPART_PART_SIZE],
+        created_by,
+    )
+    .await;
+    let now = now_ms();
+
+    let mut stale = read_upload(&context, upload.upload_id).await.unwrap();
+    stale.status = MultipartUploadStatus::Completing;
+    // Past the completion deadline plus the sweep margin, so no live request
+    // can still own the record.
+    stale.completing_since_ms = Some(now - 3 * 60 * 60 * 1000);
+    write_upload(&context, &stale).await;
+
+    let outcome = sweep_stale_uploads(&context.driver, now).await.unwrap();
+
+    assert_eq!(outcome.aborted, 1);
+    assert_eq!(outcome.failed, 0);
+    assert!(read_upload(&context, upload.upload_id).await.is_none());
+    drain_cleanup(&context).await;
+    assert!(!exists(part.location.get_full_path().unwrap()).unwrap());
+    assert_eq!(count_blob_files(&context.blob_root), baseline);
+}
+
+async fn write_upload(context: &TestContext, record: &MultipartUpload) {
+    let event = context
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key: record.upload_id.to_bytes().to_vec().into(),
+            value: record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
 }

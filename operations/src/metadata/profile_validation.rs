@@ -25,6 +25,7 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::metadata::MetadataHandle;
 use crate::metadata::api::ExportMetadataRoCrateResult;
+use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::forward::export_profile_routed;
 use crate::metadata::profile_shacl::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
@@ -112,9 +113,12 @@ pub const SUPPORTED_PROFILE_CONSTRAINTS: &[&str] = &[
 
 #[derive(Debug)]
 struct ResolvedProfile {
-    id: Ulid,
+    /// Absent for a built-in Profile, which no registry row defines.
+    id: Option<Ulid>,
     requested_iri: String,
-    revision: Ulid,
+    revision: String,
+    /// Graph the shapes are installed under, unique per Profile revision.
+    shapes_graph_iri: String,
     shapes: Vec<String>,
 }
 
@@ -173,14 +177,43 @@ pub async fn validate_submission(
     group_id: GroupId,
     jsonld: &str,
 ) -> Result<MetadataProfileValidationStatus, MetadataError> {
-    let status =
-        assess_submission(context, document_id, ProfileScope::Group(group_id), jsonld).await?;
-    if status.state == MetadataProfileValidationState::Invalid {
-        return Err(MetadataError::ProfileValidation(status.findings));
+    match assess_write(context, document_id, ProfileScope::Group(group_id), jsonld).await {
+        Ok(verdict) => write_verdict(verdict),
+        // An untagged crate never depended on the evaluator, so a node without
+        // one keeps accepting it instead of refusing every write.
+        Err(error) if untagged_without_evaluator(&error, jsonld) => {
+            Ok(not_profiled_status(document_id))
+        }
+        Err(error) => Err(error),
     }
-    Ok(status)
 }
 
+fn untagged_without_evaluator(error: &MetadataError, jsonld: &str) -> bool {
+    matches!(
+        error,
+        MetadataError::ProfileValidation(findings)
+            if findings
+                .iter()
+                .any(|finding| finding.code == "validator_unavailable")
+    ) && !submission_has_profile_tag(jsonld)
+}
+
+/// A write refuses exactly what the preview reports: structural violations
+/// first, since a malformed crate makes the Profile findings secondary.
+fn write_verdict(
+    verdict: MetadataProfilePreview,
+) -> Result<MetadataProfileValidationStatus, MetadataError> {
+    if !verdict.structural_violations.is_empty() {
+        return Err(MetadataError::Validation(verdict.structural_violations));
+    }
+    if verdict.status.state == MetadataProfileValidationState::Invalid {
+        return Err(MetadataError::ProfileValidation(verdict.status.findings));
+    }
+    Ok(verdict.status)
+}
+
+/// Profile verdict only. The write path uses `assess_write`, which also carries
+/// the structural findings; a render is never rejected and skips them.
 async fn assess_submission(
     context: &DriverContext,
     document_id: Ulid,
@@ -191,10 +224,51 @@ async fn assess_submission(
     let Some(requested_iri) = single_profile_tag(&data, &root)? else {
         return Ok(not_profiled_status(document_id));
     };
-    let profile = resolve_registered_profile(context, &requested_iri, scope).await?;
-    let metadata = evaluator_handle(context, Some(profile.revision))?;
+    Ok(
+        evaluate_tagged(context, document_id, scope, &requested_iri, jsonld)
+            .await?
+            .status,
+    )
+}
+
+/// The full verdict a create or replace enforces: Profile findings plus the
+/// structural findings, which an untagged crate only gets from a bare
+/// structural pass.
+async fn assess_write(
+    context: &DriverContext,
+    document_id: Ulid,
+    scope: ProfileScope,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let (data, root) = data_graph(jsonld)?;
+    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
+        let metadata = evaluator_handle(context, None)?;
+        let structural = metadata
+            .preview_crate_structure(jsonld.to_string())
+            .await
+            .map_err(|error| shacl_failure(error, None))?;
+        return Ok(MetadataProfilePreview {
+            status: not_profiled_status(document_id),
+            structural_violations: structural.into_iter().map(structural_violation).collect(),
+        });
+    };
+    evaluate_tagged(context, document_id, scope, &requested_iri, jsonld).await
+}
+
+async fn evaluate_tagged(
+    context: &DriverContext,
+    document_id: Ulid,
+    scope: ProfileScope,
+    requested_iri: &str,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let profile = resolve_profile(context, requested_iri, scope).await?;
+    let metadata = evaluator_handle(context, Some(&profile.revision))?;
     let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
-    Ok(profiled_status(document_id, &profile, assessment.findings))
+    Ok(MetadataProfilePreview {
+        status: profiled_status(document_id, &profile, assessment.findings),
+        structural_violations: assessment.structural,
+    })
 }
 
 /// Profile verdict for a merged render. A merge is never rejected, so an
@@ -252,25 +326,7 @@ pub async fn preview_submission(
     group_id: Option<GroupId>,
     jsonld: &str,
 ) -> Result<MetadataProfilePreview, MetadataError> {
-    let (data, root) = data_graph(jsonld)?;
-    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
-        let metadata = evaluator_handle(context, None)?;
-        let structural = metadata
-            .preview_crate_structure(jsonld.to_string())
-            .await
-            .map_err(|error| shacl_failure(error, None))?;
-        return Ok(MetadataProfilePreview {
-            status: not_profiled_status(Ulid::nil()),
-            structural_violations: structural.into_iter().map(structural_violation).collect(),
-        });
-    };
-    let profile = resolve_registered_profile(context, &requested_iri, group_id.into()).await?;
-    let metadata = evaluator_handle(context, Some(profile.revision))?;
-    let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
-    Ok(MetadataProfilePreview {
-        status: profiled_status(Ulid::nil(), &profile, assessment.findings),
-        structural_violations: assessment.structural,
-    })
+    assess_write(context, Ulid::nil(), group_id.into(), jsonld).await
 }
 
 struct ProfileAssessment {
@@ -284,29 +340,27 @@ async fn evaluate_profile(
     jsonld: &str,
 ) -> Result<ProfileAssessment, MetadataError> {
     let shapes = ProfileShapes {
-        profile_id: profile.id,
-        revision: profile.revision,
-        graph_iri: MetadataRegistryRecord::graph_iri_for(profile.id),
+        graph_iri: profile.shapes_graph_iri.clone(),
         sources: profile.shapes.clone(),
     };
     match metadata
         .evaluate_profile_shapes(shapes, jsonld.to_string())
         .await
     {
-        Ok(report) => Ok(shacl_assessment(report, profile.revision)),
+        Ok(report) => Ok(shacl_assessment(report, &profile.revision)),
         Err(ProfileShaclError::Unsupported { rule, message }) => Ok(ProfileAssessment {
-            findings: vec![unsupported_finding(&rule, message, profile.revision)],
+            findings: vec![unsupported_finding(&rule, message, Some(&profile.revision))],
             structural: Vec::new(),
         }),
         Err(ProfileShaclError::Limit { message }) => Ok(ProfileAssessment {
-            findings: vec![limit_finding(message, profile.revision)],
+            findings: vec![limit_finding(message, &profile.revision)],
             structural: Vec::new(),
         }),
-        Err(error) => Err(shacl_failure(error, Some(profile.revision))),
+        Err(error) => Err(shacl_failure(error, Some(&profile.revision))),
     }
 }
 
-fn shacl_assessment(report: ProfileShaclReport, profile_revision: Ulid) -> ProfileAssessment {
+fn shacl_assessment(report: ProfileShaclReport, profile_revision: &str) -> ProfileAssessment {
     ProfileAssessment {
         findings: report
             .results
@@ -323,7 +377,7 @@ fn shacl_assessment(report: ProfileShaclReport, profile_revision: Ulid) -> Profi
 
 fn constraint_finding(
     result: &ShaclValidationResult,
-    profile_revision: Ulid,
+    profile_revision: &str,
 ) -> MetadataProfileValidationFinding {
     let component = constraint_term(&result.source_constraint_component);
     MetadataProfileValidationFinding {
@@ -339,7 +393,7 @@ fn constraint_finding(
             || default_message(component.as_deref().unwrap_or_default()).to_string(),
             |message| message.text.clone(),
         ),
-        profile_revision: Some(profile_revision),
+        profile_revision: Some(profile_revision.to_string()),
         completeness: MetadataProfileValidationCompleteness::Complete,
     }
 }
@@ -402,15 +456,15 @@ fn single_profile_tag(
             "multiple_profile_tags",
             "multiple root conformsTo Profile tags are not supported by the revision-bound status contract"
                 .to_string(),
-            Ulid::nil(),
+            None,
         )])),
     }
 }
 
-fn evaluator_handle(
-    context: &DriverContext,
-    profile_revision: Option<Ulid>,
-) -> Result<&MetadataHandle, MetadataError> {
+fn evaluator_handle<'a>(
+    context: &'a DriverContext,
+    profile_revision: Option<&str>,
+) -> Result<&'a MetadataHandle, MetadataError> {
     match context.metadata_handle.as_ref() {
         Some(metadata) if metadata.profile_validation_available() => Ok(metadata),
         _ => Err(unavailable_error(
@@ -421,7 +475,7 @@ fn evaluator_handle(
     }
 }
 
-fn shacl_failure(error: ProfileShaclError, profile_revision: Option<Ulid>) -> MetadataError {
+fn shacl_failure(error: ProfileShaclError, profile_revision: Option<&str>) -> MetadataError {
     match error {
         ProfileShaclError::InvalidInput { message } => MetadataError::InvalidInput(message),
         other => unavailable_error(
@@ -456,9 +510,9 @@ fn profiled_status(
         } else {
             MetadataProfileValidationState::Valid
         },
-        profile_id: Some(profile.id),
+        profile_id: profile.id,
         profile_iri: Some(profile.requested_iri.clone()),
-        profile_revision: Some(profile.revision),
+        profile_revision: Some(profile.revision.clone()),
         evaluator: EVALUATOR_NAME.to_string(),
         validated_at_ms: Some(now_ms()),
         findings,
@@ -546,11 +600,11 @@ pub async fn current_validation_status(
         status.stale_reason = Some("dataset_revision_changed".to_string());
         return Ok(status);
     }
-    if let (Some(profile_id), Some(validated_revision)) =
-        (status.profile_id, status.profile_revision)
-    {
+    // A built-in Profile carries no id, so no registry row can age it out.
+    let pinned = status.profile_id.zip(status.profile_revision.clone());
+    if let Some((profile_id, validated_revision)) = pinned {
         match read_registry(context, profile_id).await {
-            Ok(Some(profile)) if profile.last_event_id == validated_revision => {}
+            Ok(Some(profile)) if profile.last_event_id.to_string() == validated_revision => {}
             Ok(Some(_)) => {
                 status.state = MetadataProfileValidationState::Stale;
                 status.completeness = MetadataProfileValidationCompleteness::Incomplete;
@@ -690,6 +744,25 @@ fn merged_jsonld(raw: &MetadataRawRevision) -> Option<&str> {
     raw.merged.as_ref().map(|merged| merged.jsonld.as_str())
 }
 
+/// A built-in Profile answers from the embedded shapes; everything else has to
+/// be registered in the realm.
+async fn resolve_profile(
+    context: &DriverContext,
+    requested_iri: &str,
+    scope: ProfileScope,
+) -> Result<ResolvedProfile, MetadataError> {
+    match builtin_shapes(requested_iri) {
+        Some(shapes) => Ok(ResolvedProfile {
+            id: None,
+            requested_iri: requested_iri.to_string(),
+            revision: BUILTIN_REVISION.to_string(),
+            shapes_graph_iri: format!("{requested_iri}#shapes/{BUILTIN_REVISION}"),
+            shapes: vec![shapes.to_string()],
+        }),
+        None => resolve_registered_profile(context, requested_iri, scope).await,
+    }
+}
+
 async fn resolve_registered_profile(
     context: &DriverContext,
     requested_iri: &str,
@@ -715,13 +788,16 @@ async fn resolve_registered_profile(
         return Err(profile_not_registered(requested_iri));
     }
     let revision = record.last_event_id;
+    let resolved = |shapes: Vec<String>| ResolvedProfile {
+        id: Some(profile_id),
+        requested_iri: requested_iri.to_string(),
+        revision: revision.to_string(),
+        shapes_graph_iri: format!("{}#shapes/{revision}", record.graph_iri),
+        shapes,
+    };
+    let pinned = revision.to_string();
     if let Some(shapes) = cached_shapes(context, profile_id, revision) {
-        return Ok(ResolvedProfile {
-            id: profile_id,
-            requested_iri: requested_iri.to_string(),
-            revision,
-            shapes: shapes.as_ref().clone(),
-        });
+        return Ok(resolved(shapes.as_ref().clone()));
     }
     let exported = export_profile_routed(&Arc::new(context.clone()), record.realm_id, profile_id, revision)
         .await
@@ -729,7 +805,7 @@ async fn resolve_registered_profile(
             unavailable_error(
                 "profile_unavailable",
                 "the registered Profile revision is temporarily unavailable; retry or remove the Profile tag",
-                Some(revision),
+                Some(&pinned),
             )
         })?;
     let ExportMetadataRoCrateResult::Raw {
@@ -741,7 +817,7 @@ async fn resolve_registered_profile(
         return Err(unavailable_error(
             "profile_unavailable",
             "the registered Profile revision cannot be read; retry or remove the Profile tag",
-            Some(revision),
+            Some(&pinned),
         ));
     };
     // Usability was decided from the registry row above, so the holder copy is
@@ -753,7 +829,7 @@ async fn resolve_registered_profile(
         return Err(unavailable_error(
             "profile_unavailable",
             "the registered Profile revision is changing; retry or remove the Profile tag",
-            Some(revision),
+            Some(&pinned),
         ));
     }
     let raw = raw.revision;
@@ -761,21 +837,16 @@ async fn resolve_registered_profile(
         unavailable_error(
             "profile_unavailable",
             "the registered Profile cannot be read; retry or remove the Profile tag",
-            Some(revision),
+            Some(&pinned),
         )
     })?;
     if !has_type(&profile_data, &profile_root, DX_PROFILE) {
         return Err(profile_not_registered(requested_iri));
     }
     let shapes = profile_shapes(&profile_data)
-        .map_err(|message| unavailable_error("profile_unavailable", &message, Some(revision)))?;
+        .map_err(|message| unavailable_error("profile_unavailable", &message, Some(&pinned)))?;
     cache_shapes(context, profile_id, revision, &shapes);
-    Ok(ResolvedProfile {
-        id: profile_id,
-        requested_iri: requested_iri.to_string(),
-        revision,
-        shapes,
-    })
+    Ok(resolved(shapes))
 }
 
 fn cached_shapes(
@@ -959,7 +1030,7 @@ fn default_message(component: &str) -> &'static str {
     }
 }
 
-fn limit_finding(message: String, profile_revision: Ulid) -> MetadataProfileValidationFinding {
+fn limit_finding(message: String, profile_revision: &str) -> MetadataProfileValidationFinding {
     MetadataProfileValidationFinding {
         code: "validation_limit".to_string(),
         severity: MetadataProfileValidationSeverity::Violation,
@@ -967,7 +1038,7 @@ fn limit_finding(message: String, profile_revision: Ulid) -> MetadataProfileVali
         path: None,
         rule: "validation_limit".to_string(),
         message,
-        profile_revision: Some(profile_revision),
+        profile_revision: Some(profile_revision.to_string()),
         completeness: MetadataProfileValidationCompleteness::Incomplete,
     }
 }
@@ -975,7 +1046,7 @@ fn limit_finding(message: String, profile_revision: Ulid) -> MetadataProfileVali
 fn unsupported_finding(
     rule: &str,
     message: String,
-    profile_revision: Ulid,
+    profile_revision: Option<&str>,
 ) -> MetadataProfileValidationFinding {
     MetadataProfileValidationFinding {
         code: "unsupported_constraint".to_string(),
@@ -984,7 +1055,7 @@ fn unsupported_finding(
         path: None,
         rule: rule.to_string(),
         message,
-        profile_revision: (profile_revision != Ulid::nil()).then_some(profile_revision),
+        profile_revision: profile_revision.map(str::to_string),
         completeness: MetadataProfileValidationCompleteness::Incomplete,
     }
 }
@@ -1002,7 +1073,7 @@ fn profile_not_registered(iri: &str) -> MetadataError {
     }])
 }
 
-fn unavailable_error(code: &str, message: &str, revision: Option<Ulid>) -> MetadataError {
+fn unavailable_error(code: &str, message: &str, revision: Option<&str>) -> MetadataError {
     MetadataError::ProfileValidation(vec![MetadataProfileValidationFinding {
         code: code.to_string(),
         severity: MetadataProfileValidationSeverity::Violation,
@@ -1010,7 +1081,7 @@ fn unavailable_error(code: &str, message: &str, revision: Option<Ulid>) -> Metad
         path: Some(DCTERMS_CONFORMS_TO.to_string()),
         rule: code.to_string(),
         message: message.to_string(),
-        profile_revision: revision,
+        profile_revision: revision.map(str::to_string),
         completeness: MetadataProfileValidationCompleteness::Incomplete,
     }])
 }
@@ -1018,6 +1089,7 @@ fn unavailable_error(code: &str, message: &str, revision: Option<Ulid>) -> Metad
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::metadata::PROCESS_RUN_CRATE_PROFILE_IRI;
     use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
     use craqle::{EncodedTerm, ShaclMessage};
 
@@ -1031,6 +1103,101 @@ mod tests {
             severity: EncodedTerm(format!("<{SH}{severity}>")),
             messages: Vec::new(),
         }
+    }
+
+    fn violation() -> MetadataValidationViolation {
+        MetadataValidationViolation {
+            code: "incomplete_root".to_string(),
+            message: "the root data entity needs a description".to_string(),
+            pointer: "/@graph/1".to_string(),
+            entity_id: Some("./".to_string()),
+        }
+    }
+
+    #[test]
+    fn refuses_untagged_structure() {
+        // The preview reports these for an untagged crate; the write must too.
+        let error = write_verdict(MetadataProfilePreview {
+            status: not_profiled_status(Ulid::nil()),
+            structural_violations: vec![violation()],
+        })
+        .expect_err("a structural violation must refuse the write");
+        let MetadataError::Validation(violations) = error else {
+            panic!("expected structural violations");
+        };
+        assert_eq!(violations, vec![violation()]);
+    }
+
+    #[test]
+    fn refuses_profiled_structure() {
+        // A Profile-scoped evaluation reports structure alongside its findings.
+        let mut status = not_profiled_status(Ulid::nil());
+        status.state = MetadataProfileValidationState::Valid;
+        let error = write_verdict(MetadataProfilePreview {
+            status,
+            structural_violations: vec![violation()],
+        })
+        .expect_err("a valid Profile verdict must not hide broken structure");
+        assert!(matches!(error, MetadataError::Validation(_)));
+    }
+
+    #[test]
+    fn refuses_invalid_profile() {
+        let mut status = not_profiled_status(Ulid::nil());
+        status.state = MetadataProfileValidationState::Invalid;
+        status.findings = vec![limit_finding("budget".to_string(), "01REV")];
+        let error = write_verdict(MetadataProfilePreview {
+            status,
+            structural_violations: Vec::new(),
+        })
+        .expect_err("an invalid Profile verdict must refuse the write");
+        assert!(matches!(error, MetadataError::ProfileValidation(_)));
+        let accepted = write_verdict(MetadataProfilePreview {
+            status: not_profiled_status(Ulid::nil()),
+            structural_violations: Vec::new(),
+        })
+        .expect("a clean verdict is accepted");
+        assert_eq!(accepted.state, MetadataProfileValidationState::NotProfiled);
+    }
+
+    fn crate_with_tag(tag: Option<&str>) -> String {
+        let mut root = serde_json::json!({
+            "@id": "https://example.test/dataset",
+            "@type": "Dataset",
+            "name": "Fixture"
+        });
+        if let Some(tag) = tag {
+            root["conformsTo"] = serde_json::json!({"@id": tag});
+        }
+        serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": "https://example.test/dataset"}
+                },
+                root
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn keeps_untagged_writable() {
+        // A node without an evaluator must still accept an untagged crate.
+        let untagged = crate_with_tag(None);
+        let tagged = crate_with_tag(Some(
+            "https://w3id.org/aruna/profile/01J00000000000000000000000",
+        ));
+        let unavailable = unavailable_error("validator_unavailable", "no evaluator", None);
+        assert!(untagged_without_evaluator(&unavailable, &untagged));
+        assert!(!untagged_without_evaluator(&unavailable, &tagged));
+        assert!(!untagged_without_evaluator(
+            &MetadataError::InvalidInput("broken".to_string()),
+            &untagged
+        ));
     }
 
     #[test]
@@ -1075,7 +1242,7 @@ mod tests {
 
     #[test]
     fn maps_shacl_severities() {
-        let revision = Ulid::from_parts(1, 1);
+        let revision = "01REV";
         let finding = constraint_finding(
             &result(&format!("{SH}MinCountConstraintComponent"), "Warning", None),
             revision,
@@ -1112,7 +1279,7 @@ mod tests {
             language: None,
             text: "name must be a string".to_string(),
         });
-        let finding = constraint_finding(&input, Ulid::from_parts(1, 1));
+        let finding = constraint_finding(&input, "01REV");
         assert_eq!(finding.message, "name must be a string");
         assert_eq!(finding.path.as_deref(), Some("http://schema.org/name"));
         assert_eq!(
@@ -1123,7 +1290,7 @@ mod tests {
 
     #[test]
     fn limits_are_incomplete() {
-        let finding = limit_finding("budget exhausted".to_string(), Ulid::from_parts(1, 1));
+        let finding = limit_finding("budget exhausted".to_string(), "01REV");
         assert_eq!(finding.code, "validation_limit");
         assert_eq!(
             finding.completeness,
@@ -1276,7 +1443,7 @@ mod tests {
                         "datePublished": "2026-08-19",
                         "conformsTo": [
                             {"@id": specification},
-                            {"@id": "https://w3id.org/ro/wfrun/process/0.5"}
+                            {"@id": "https://w3id.org/ro/wfrun/workflow/0.5"}
                         ]
                     }
                 ]
@@ -1285,5 +1452,17 @@ mod tests {
             let (data, root) = data_graph(&document).unwrap();
             assert!(profile_tags(&data, &root).is_empty());
         }
+    }
+
+    #[test]
+    fn builtin_tag_resolves() {
+        // The built-in Profile must survive the specification-marker filter.
+        let document = crate_with_tag(Some(PROCESS_RUN_CRATE_PROFILE_IRI));
+        let (data, root) = data_graph(&document).unwrap();
+        assert_eq!(
+            single_profile_tag(&data, &root).unwrap().as_deref(),
+            Some(PROCESS_RUN_CRATE_PROFILE_IRI)
+        );
+        assert!(builtin_shapes(PROCESS_RUN_CRATE_PROFILE_IRI).is_some());
     }
 }

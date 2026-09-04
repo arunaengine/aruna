@@ -1,11 +1,12 @@
 //! Leaderless witness scheduling.
 //!
 //! Every current holder of a submission family is a witness. Each computes the
-//! same rank from the immutable identity, so rank zero plans at once and later
-//! ranks only step in after their own persisted delay. No witness waits for
-//! another one, no witness holds a lease, and a partition may therefore produce
-//! one execution per participating witness.
+//! same rank from the immutable identity, so the admitting node plans at once
+//! and later ranks only step in after their own persisted delay. No witness
+//! holds a lease, and a partition may therefore produce one execution per
+//! participating witness.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::compute::ExecutionTargetId;
@@ -18,7 +19,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, PlacementDecision, RealmConfigDocument, WitnessBudgetRecord,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -36,9 +37,11 @@ use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
+    load_kind_complete,
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
+use crate::node_info::read_node_info_document;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
@@ -48,10 +51,6 @@ pub const WITNESS_DRAIN_BATCH: usize = 64;
 pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Wall-clock budget of one launch offer.
 pub const OFFER_DEADLINE: Duration = Duration::from_secs(30);
-/// Offers a target must leave unanswered before it is excluded from the next
-/// plan. One is never enough: a target that accepts slowly would be replaced by
-/// a second launch while it is already running the work.
-pub const LOST_TARGET_OFFERS: u32 = 2;
 /// Declined targets one explain row retains.
 pub const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
 
@@ -65,7 +64,7 @@ pub struct WitnessDeadline {
     pub rank: u32,
 }
 
-/// The bounded plan this witness sealed before it launched, with the targets
+/// The bounded plan this witness stored before it launched, with the targets
 /// that already refused this request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessExplain {
@@ -74,7 +73,7 @@ pub struct WitnessExplain {
     pub declined: Vec<ExecutionTargetId>,
     /// The previous launch was never confirmed, so this one may overlap it.
     pub overlapping: bool,
-    pub sealed_at_ms: u64,
+    pub stored_at_ms: u64,
 }
 
 /// Kicks the witness queue without persisting a timer of its own.
@@ -85,19 +84,28 @@ pub fn schedule_witness_drain(after: Duration) -> Effect {
     })
 }
 
-/// Position of `node` after sorting the witnesses by the domain-separated
-/// digest of the immutable identity. Identical on every node with the same
-/// holder set, and unbiasable by any publisher.
-pub fn witness_rank(holders: &[NodeId], family: &JobFamilyId, node: NodeId) -> Option<u32> {
+/// Position of `node` in the witness order. The admitting node ranks first,
+/// because it already holds the request and every input decision it made; the
+/// remaining witnesses follow the domain-separated digest of the immutable
+/// identity, which is identical on every node and unbiasable by any publisher.
+pub fn witness_rank(
+    holders: &[NodeId],
+    family: &JobFamilyId,
+    node: NodeId,
+    admitting: Option<NodeId>,
+) -> Option<u32> {
+    let admitting = admitting.filter(|first| holders.contains(first));
+    if admitting == Some(node) {
+        return Some(0);
+    }
     let mut ordered: Vec<([u8; 32], NodeId)> = holders
         .iter()
+        .filter(|holder| Some(**holder) != admitting)
         .map(|holder| (rank_key(family, *holder), *holder))
         .collect();
     ordered.sort_unstable();
-    ordered
-        .iter()
-        .position(|(_, holder)| *holder == node)
-        .map(|rank| rank as u32)
+    let rank = ordered.iter().position(|(_, holder)| *holder == node)? as u32;
+    Some(rank + u32::from(admitting.is_some()))
 }
 
 fn rank_key(family: &JobFamilyId, node: NodeId) -> [u8; 32] {
@@ -141,7 +149,8 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
         );
         return;
     };
-    let Some(rank) = witness_rank(view.holders(), &family, local) else {
+    let admitting = admitting_node(context, family).await;
+    let Some(rank) = witness_rank(view.holders(), &family, local, admitting) else {
         debug!(?family, "Node is not a witness for this family");
         return;
     };
@@ -171,6 +180,23 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
     if let Some(task) = context.task_handle.as_ref() {
         let _ = task.send_effect(schedule_witness_drain(after)).await;
     }
+}
+
+/// The node that admitted the family: the committing node of the claim with the
+/// lowest order key, which every holder reduces the same way. An unreadable
+/// claim set leaves the order to the digest alone.
+async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<NodeId> {
+    let records = load_kind_complete(context, family, JobRecordKind::Claim)
+        .await
+        .ok()?;
+    records
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Claim(claim) => Some(claim),
+            _ => None,
+        })
+        .min_by_key(|claim| claim.order_key())
+        .map(|claim| claim.committing_node_id)
 }
 
 /// One bounded pass over the persisted deadlines. Returns true while rows
@@ -241,7 +267,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, context};
+    use crate::jobs::records::tests::fixture::{Family, context, node};
 
     #[tokio::test]
     async fn keeps_later_deadlines() {
@@ -337,18 +363,64 @@ mod tests {
         assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
     }
 
+    /// One family with a launch by `holder` that no receipt answers.
+    fn foreign(fixture: &Family) -> (LaunchIntent, Vec<JobRecordEnvelope>) {
+        let spec = fixture.spec();
+        let launch = fixture.launch(&spec, fixture.holder.public(), 0);
+        let records = vec![fixture.sign(
+            &fixture.holder,
+            JobFamilyRecord::Launch(Box::new(launch.clone())),
+        )];
+        (launch, records)
+    }
+
+    #[test]
+    fn defers_to_launch() {
+        // Another witness's unreceipted launch holds the family until its
+        // window ends; this node's own launch never defers the round.
+        let fixture = Family::new([3u8; 32]);
+        let (launch, records) = foreign(&fixture);
+        let now = launch.created_at_ms + 10;
+
+        assert_eq!(
+            foreign_launch_wait(&records, node(2), now, 1_000),
+            Some(990)
+        );
+        assert_eq!(
+            foreign_launch_wait(&records, fixture.holder.public(), now, 1_000),
+            None
+        );
+    }
+
+    #[test]
+    fn plans_after_window() {
+        // Past the window, and once a receipt exists, the round plans again.
+        let fixture = Family::new([4u8; 32]);
+        let (launch, mut records) = foreign(&fixture);
+
+        assert_eq!(
+            foreign_launch_wait(&records, node(2), launch.created_at_ms + 1_000, 1_000),
+            None
+        );
+        records.push(fixture.sign(
+            &fixture.target,
+            JobFamilyRecord::Receipt(Box::new(fixture.receipt(&launch, 1))),
+        ));
+        assert_eq!(
+            foreign_launch_wait(&records, node(2), launch.created_at_ms + 10, 1_000),
+            None
+        );
+    }
+
     #[test]
     fn lost_target_expires() {
-        // One timed-out offer must never be enough to declare a target lost.
+        // A target keeps its launch for the whole configured catch-up window.
         let base = 5_000;
-        let offer = OFFER_DEADLINE.as_millis() as u64;
-        let window = lost_window_ms(base);
-        assert!(window >= offer + base);
-        assert!(!lost_target_expired(10, 10 + offer + base, base));
-        assert!(!lost_target_expired(10, 9 + window, base));
-        assert!(lost_target_expired(10, 10 + window, base));
-        assert_eq!(lost_retry_ms(10, 10, base), base);
-        assert_eq!(lost_retry_ms(10, 9 + window, base), 1);
+        let window = 300_000;
+        assert!(!lost_target_expired(10, 9 + window, window));
+        assert!(lost_target_expired(10, 10 + window, window));
+        assert_eq!(lost_retry_ms(10, 10, base, window), base);
+        assert_eq!(lost_retry_ms(10, 9 + window, base, window), 1);
     }
 }
 
@@ -372,6 +444,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         return RoundOutcome::Retry { after_ms: 1_000 };
     };
     let base = config.compute.witness_base_delay_ms;
+    let window = config.compute.catch_up_after_ms;
     let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
         return RoundOutcome::Retry { after_ms: base };
     };
@@ -380,7 +453,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     }
     // An incomplete family read is undecided evidence: a suppression, a
     // cancellation, or an earlier launch may be in the part that did not load,
-    // so this round seals no budget and offers no launch.
+    // so this round stores no budget and offers no launch.
     let records = match load_family_complete(context, family).await {
         Ok(records) => records,
         Err(error) => {
@@ -388,13 +461,14 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
             return RoundOutcome::Retry { after_ms: base };
         }
     };
-    if suppressed(family, &records) {
+    let silent = silent_nodes(context, family, &records, now_ms, window).await;
+    if suppressed(family, &records, &silent) {
         return RoundOutcome::Done;
     }
-    let Some(spec) = sealed_spec(family, &records) else {
+    let Some(spec) = stored_spec(family, &records) else {
         return RoundOutcome::Retry { after_ms: base };
     };
-    let budget = match sealed_budget(context, &config, &spec, local, &records, now_ms).await {
+    let budget = match stored_budget(context, &config, &spec, local, &records, now_ms).await {
         Some(budget) => budget,
         None => return RoundOutcome::Retry { after_ms: base },
     };
@@ -417,7 +491,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         plan: empty_plan(),
         declined: Vec::new(),
         overlapping: false,
-        sealed_at_ms: now_ms,
+        stored_at_ms: now_ms,
     });
     if let Some(envelope) = mine.iter().max_by_key(|envelope| match &envelope.record {
         JobFamilyRecord::Launch(launch) => launch.scheduler_seq,
@@ -425,11 +499,11 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     }) && let JobFamilyRecord::Launch(launch) = &envelope.record
         && !explain.declined.contains(&launch.target)
     {
-        if lost_target_expired(launch.created_at_ms, now_ms, base) {
+        if lost_target_expired(launch.created_at_ms, now_ms, window) {
             record_decline(context, &family, local, launch.target.clone()).await;
             return RoundOutcome::Retry { after_ms: 0 };
         }
-        let retry_after_ms = lost_retry_ms(launch.created_at_ms, now_ms, base);
+        let retry_after_ms = lost_retry_ms(launch.created_at_ms, now_ms, base, window);
         if launch.created_at_ms.saturating_add(base) > now_ms {
             return RoundOutcome::Retry {
                 after_ms: retry_after_ms,
@@ -451,6 +525,12 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
             },
         )
         .await;
+    }
+    // Another witness already launched and its window has not run out, so this
+    // round leaves the family to it instead of adding a second execution.
+    if let Some(after_ms) = foreign_launch_wait(&records, local, now_ms, window) {
+        debug!(after_ms, "Another witness holds a launch for this family");
+        return RoundOutcome::Retry { after_ms };
     }
     if sequence >= budget.max_launches {
         debug!(sequence, "Witness budget is exhausted for this request");
@@ -475,7 +555,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     explain.sequence = sequence;
     explain.overlapping = !mine.is_empty();
     explain.plan = plan;
-    explain.sealed_at_ms = now_ms;
+    explain.stored_at_ms = now_ms;
     // The explain record is durable before any launch exists, so every launch
     // has an auditable reason even if this node dies right after sending it.
     if write_row(
@@ -526,7 +606,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         frame,
         target: selection.target,
         now_ms,
-        retry_after_ms: lost_retry_ms(now_ms, now_ms, base),
+        retry_after_ms: lost_retry_ms(now_ms, now_ms, base, window),
     };
     offer(context, offered).await
 }
@@ -601,7 +681,8 @@ fn permanent_decline(reason: &LaunchDecline) -> bool {
         LaunchDecline::NotHolder
         | LaunchDecline::Capacity
         | LaunchDecline::Draining
-        | LaunchDecline::Cancelled => false,
+        | LaunchDecline::Cancelled
+        | LaunchDecline::AlreadyRunning => false,
     }
 }
 
@@ -624,22 +705,58 @@ async fn record_decline(
 }
 
 /// Whether a launch is suppressed by a success, cancellation, permanent
-/// failure, or an execution that may still finish.
-pub(crate) fn suppressed(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
+/// failure, or an execution that may still finish. An unfinished execution on a
+/// node in `silent` no longer suppresses: that node stopped reporting, so its
+/// execution is no longer evidence that the work is still under way.
+pub(crate) fn suppressed(
+    family: JobFamilyId,
+    records: &[JobRecordEnvelope],
+    silent: &BTreeSet<NodeId>,
+) -> bool {
     let Ok(Some(projection)) = reduce_family(family, records) else {
         return false;
     };
     if projection.cancel_requested || projection.canonical_execution_id.is_some() {
         return true;
     }
-    projection
-        .executions
-        .iter()
-        .any(|execution| execution.state != PhysicalExecutionState::Error)
+    projection.executions.iter().any(|execution| {
+        execution.state != PhysicalExecutionState::Error
+            && (execution.state.is_terminal() || !silent.contains(&execution.executor_node_id))
+    })
 }
 
-/// The sealed spec of the family's canonical alias.
-fn sealed_spec(family: JobFamilyId, records: &[JobRecordEnvelope]) -> Option<LogicalJobSpec> {
+/// Executor nodes of an unfinished execution whose replicated heartbeat is
+/// older than the catch-up window. A node this responder holds no heartbeat
+/// document for is never called silent: a missing local copy proves nothing.
+async fn silent_nodes(
+    context: &DriverContext,
+    family: JobFamilyId,
+    records: &[JobRecordEnvelope],
+    now_ms: u64,
+    window_ms: u64,
+) -> BTreeSet<NodeId> {
+    let mut silent = BTreeSet::new();
+    let Ok(Some(projection)) = reduce_family(family, records) else {
+        return silent;
+    };
+    let running: BTreeSet<NodeId> = projection
+        .executions
+        .iter()
+        .filter(|execution| !execution.state.is_terminal())
+        .map(|execution| execution.executor_node_id)
+        .collect();
+    for node in running {
+        if let Ok(Some(document)) = read_node_info_document(&context.storage_handle, node).await
+            && now_ms.saturating_sub(document.utilization.heartbeat_at_ms) > window_ms
+        {
+            silent.insert(node);
+        }
+    }
+    silent
+}
+
+/// The stored spec of the family's canonical alias.
+fn stored_spec(family: JobFamilyId, records: &[JobRecordEnvelope]) -> Option<LogicalJobSpec> {
     let projection = reduce_family(family, records).ok()??;
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Spec(spec) if spec.job_id == projection.canonical_job_id => {
@@ -649,8 +766,8 @@ fn sealed_spec(family: JobFamilyId, records: &[JobRecordEnvelope]) -> Option<Log
     })
 }
 
-/// This node's immutable launch bound, sealed once before its first launch.
-async fn sealed_budget(
+/// This node's immutable launch bound, stored once before its first launch.
+async fn stored_budget(
     context: &DriverContext,
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
@@ -913,22 +1030,45 @@ pub(super) async fn has_deadline(context: &DriverContext, family: JobFamilyId) -
     }
 }
 
-/// How long a target keeps its launch: every offer's own deadline plus the
-/// spacing of the rounds that make them.
-fn lost_window_ms(base_delay_ms: u64) -> u64 {
-    (OFFER_DEADLINE.as_millis() as u64)
-        .saturating_mul(u64::from(LOST_TARGET_OFFERS))
-        .saturating_add(base_delay_ms)
+fn lost_target_expired(created_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {
+    now_ms.saturating_sub(created_at_ms) >= window_ms
 }
 
-fn lost_target_expired(created_at_ms: u64, now_ms: u64, base_delay_ms: u64) -> bool {
-    now_ms.saturating_sub(created_at_ms) >= lost_window_ms(base_delay_ms)
-}
-
-fn lost_retry_ms(created_at_ms: u64, now_ms: u64, base_delay_ms: u64) -> u64 {
+fn lost_retry_ms(created_at_ms: u64, now_ms: u64, base_delay_ms: u64, window_ms: u64) -> u64 {
     let elapsed = now_ms.saturating_sub(created_at_ms);
-    let remaining = lost_window_ms(base_delay_ms).saturating_sub(elapsed);
+    let remaining = window_ms.saturating_sub(elapsed);
     base_delay_ms.min(remaining)
+}
+
+/// How long this round must still leave a launch by another witness alone. It
+/// is a soft lease: the launch keeps the family until the window ends without a
+/// receipt, and then any witness may plan again.
+fn foreign_launch_wait(
+    records: &[JobRecordEnvelope],
+    local: NodeId,
+    now_ms: u64,
+    window_ms: u64,
+) -> Option<u64> {
+    let receipted: std::collections::BTreeSet<Ulid> = records
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Receipt(receipt) => Some(receipt.launch_id),
+            _ => None,
+        })
+        .collect();
+    records
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Launch(launch)
+                if launch.scheduler_node_id != local && !receipted.contains(&launch.launch_id) =>
+            {
+                Some(launch.created_at_ms)
+            }
+            _ => None,
+        })
+        .max()
+        .map(|created_at_ms| window_ms.saturating_sub(now_ms.saturating_sub(created_at_ms)))
+        .filter(|remaining| *remaining > 0)
 }
 
 async fn read_deadline_index(

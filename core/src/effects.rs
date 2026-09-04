@@ -638,7 +638,7 @@ pub enum JobRecordEffect {
 }
 
 /// One scheduler's launch offer to an execution target. It carries no caller
-/// token: the target verifies the signed launch and fetches the sealed spec.
+/// token: the target verifies the signed launch and fetches the stored spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchOfferEffect {
     pub realm_id: RealmId,

@@ -3,8 +3,7 @@
 //! The device runs its owner's jobs against device-local data and nothing else.
 //! The realm never dispatches here and no record of a local run is forwarded or
 //! replicated. An input the device does not hold must name the realm version
-//! that holds it, which staging then materializes in the run's own workspace as
-//! an ordinary local object, never as a reference.
+//! that holds it, which staging then reads straight into the container.
 
 use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::structs::{
@@ -92,7 +91,7 @@ pub async fn submit_local_execution(
     }
     local_staging(&config.spec, config.workspace_mode)?;
     let limits = backend_limits(context, config.spec.executor_constraint.as_deref())?;
-    resolve_inputs(context, &config).await?;
+    resolve_inputs(context, &mut config).await?;
     pin_outputs(&mut config.spec, config.node_id);
     submit_execution_job(
         context,
@@ -110,8 +109,7 @@ pub async fn submit_local_execution(
 }
 
 /// Pins every declared output to this device, the only node that will ever
-/// write them. A workspace output is pinned by the run itself once its bucket
-/// exists.
+/// write them.
 fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
     for output in &mut spec.file_outputs {
         output.destination_node_id = Some(node_id);
@@ -183,21 +181,13 @@ struct LocalRuns {
     queued: u32,
 }
 
-/// Only file staging into the run's own workspace happens on a device: the
-/// other modes hand the container an S3 endpoint a device does not expose.
+/// A device stages every input as a file and forwards no bucket name: a mount
+/// needs an S3 endpoint it does not expose, and it names no workspace bucket.
 fn local_staging(spec: &ExecutionSpec, mode: WorkspaceMode) -> Result<(), LocalExecutionError> {
-    match mode {
-        WorkspaceMode::None => {
-            return Err(LocalExecutionError::Unsupported(
-                "workspace mode none needs an S3 endpoint a device does not expose",
-            ));
-        }
-        WorkspaceMode::Existing => {
-            return Err(LocalExecutionError::Unsupported(
-                "a local run keeps its outputs in its own workspace bucket",
-            ));
-        }
-        WorkspaceMode::Temporary | WorkspaceMode::Kept => {}
+    if mode == WorkspaceMode::Existing {
+        return Err(LocalExecutionError::Unsupported(
+            "a local run does not accept a workspace bucket",
+        ));
     }
     if spec
         .inputs
@@ -249,23 +239,26 @@ async fn count_runs(
 
 /// Refuses at submit time what staging could only discover mid-run: an input
 /// naming another node is fetched by exact version, anything else must already
-/// be readable here.
+/// be readable here. A local input the request left open is pinned to the
+/// version it resolves to now, because staging reads it by version.
 async fn resolve_inputs(
     context: &DriverContext,
-    config: &LocalExecutionConfig,
+    config: &mut LocalExecutionConfig,
 ) -> Result<(), LocalExecutionError> {
-    for input in &config.spec.inputs {
+    let node_id = config.node_id;
+    for input in &mut config.spec.inputs {
+        let remote = input.source_node_id.filter(|source| *source != node_id);
         let InputSource::S3 {
             bucket,
             key,
             version_id,
-        } = &input.source;
-        match input
-            .source_node_id
-            .filter(|source| *source != config.node_id)
-        {
+        } = &mut input.source;
+        match remote {
             Some(_) => remote_version(bucket, key, version_id.as_deref())?,
-            None => resolve_local(context, bucket, key, version_id.as_deref()).await?,
+            None => {
+                let pinned = resolve_local(context, bucket, key, version_id.as_deref()).await?;
+                *version_id = Some(pinned.to_string());
+            }
         }
     }
     Ok(())
@@ -290,12 +283,14 @@ fn remote_version(
     }
 }
 
+/// The exact local version the run will read, resolved from the head when the
+/// request named none.
 async fn resolve_local(
     context: &DriverContext,
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
-) -> Result<(), LocalExecutionError> {
+) -> Result<Ulid, LocalExecutionError> {
     let missing = || LocalExecutionError::InputNotLocal {
         bucket: bucket.to_string(),
         key: key.to_string(),
@@ -315,7 +310,11 @@ async fn resolve_local(
     .await
     .and_then(|result| result.transpose())
     {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(head)) => head
+            .resolved_version_id
+            .or(head.version_id)
+            .or(version_id)
+            .ok_or_else(missing),
         Ok(None)
         | Err(
             HeadObjectError::NoSuchKey
@@ -336,11 +335,14 @@ mod tests {
     use aruna_core::events::LaunchDecline;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, InputSelection, NodeUrls, OutputDestination, OutputSelection, RealmConfigDocument,
-        RealmId, RealmNodeKind,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, InputSelection, NodeUrls, OutputDestination, OutputSelection,
+        RealmConfigDocument, RealmId, RealmNodeKind, VersionKey, WorkspaceMode,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -402,7 +404,7 @@ mod tests {
             owner: caller,
             node_id: local,
             idempotency_key: None,
-            workspace_mode: WorkspaceMode::Kept,
+            workspace_mode: WorkspaceMode::None,
             retention_ms: 60_000,
         }
     }
@@ -417,7 +419,7 @@ mod tests {
             source_node_id: source,
             dest_key: "reads.fastq".to_string(),
             mode: InputMode::Snapshot,
-            container_path: None,
+            container_path: Some("/inputs/reads.fastq".to_string()),
             name: None,
             description: None,
         }
@@ -474,24 +476,22 @@ mod tests {
 
     #[test]
     fn refuses_foreign_staging() {
-        // Only file staging into the run's own workspace happens on a device.
+        // A device has no S3 endpoint to mount through and names no bucket.
         let mut spec = payload();
-        for mode in [WorkspaceMode::None, WorkspaceMode::Existing] {
-            assert!(matches!(
-                local_staging(&spec, mode),
-                Err(LocalExecutionError::Unsupported(_))
-            ));
-        }
+        assert!(matches!(
+            local_staging(&spec, WorkspaceMode::Existing),
+            Err(LocalExecutionError::Unsupported(_))
+        ));
 
         spec.inputs.push(input("project", None, None));
         spec.inputs[0].mode = InputMode::Mount;
         assert!(matches!(
-            local_staging(&spec, WorkspaceMode::Kept),
+            local_staging(&spec, WorkspaceMode::None),
             Err(LocalExecutionError::Unsupported(_))
         ));
 
         spec.inputs[0].mode = InputMode::Snapshot;
-        assert!(local_staging(&spec, WorkspaceMode::Kept).is_ok());
+        assert!(local_staging(&spec, WorkspaceMode::None).is_ok());
     }
 
     struct StubBackend;
@@ -701,6 +701,113 @@ mod tests {
         assert_eq!(spec.file_outputs[0].destination_node_id, Some(local));
     }
 
+    /// One readable local object, seeded straight into the keyspaces a head read
+    /// walks: bucket, current version pointer, version, and blob location.
+    async fn seed_object(ctx: &DriverContext, bucket: &str, key: &str, version: Ulid) {
+        let user = owner(2);
+        let hash = [17u8; 32];
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: bucket.to_string(),
+            backend_path: key.to_string(),
+            ulid: version,
+            compressed: false,
+            encrypted: false,
+            created_by: user,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 4,
+            hashes: std::collections::HashMap::new(),
+        };
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([6u8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        };
+        for (key_space, row_key, value) in [
+            (
+                S3_BUCKET_KEYSPACE,
+                bucket.as_bytes().to_vec(),
+                info.to_bytes().unwrap(),
+            ),
+            (
+                BLOB_HEAD_KEYSPACE,
+                BlobHeadKey::new(bucket, key).to_bytes().unwrap(),
+                CurrentVersionPointer::new(version).to_bytes().unwrap(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE,
+                VersionKey::new(bucket, key, version).to_bytes().unwrap(),
+                BlobVersion::materialized(
+                    hash,
+                    BackendRef::node_default(),
+                    std::time::SystemTime::UNIX_EPOCH,
+                    user,
+                    None,
+                )
+                .to_bytes()
+                .unwrap(),
+            ),
+            (
+                BLOB_LOCATIONS_KEYSPACE,
+                BlobLocationKey::new(hash, BackendRef::node_default()).to_bytes(),
+                location.to_bytes().unwrap(),
+            ),
+        ] {
+            let _ = ctx
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: row_key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_without_bucket() {
+        // A device run owns no bucket, and an input the request left open is
+        // pinned to the version it resolves to at accept time.
+        let dir = tempdir().unwrap();
+        let ctx = device_ctx(dir.path().to_str().unwrap());
+        let local = node(1);
+        let caller = owner(2);
+        write_config(
+            &ctx,
+            &realm_config(local, RealmNodeKind::User { owner: caller }),
+            local,
+        )
+        .await;
+        let version = Ulid::from_bytes([21u8; 16]);
+        seed_object(&ctx, "project", "reads.fastq", version).await;
+        let mut run = run_config(local, caller);
+        run.spec.inputs.push(input("project", None, None));
+
+        submit_local_execution(&ctx, run)
+            .await
+            .expect("the owner's run is accepted");
+
+        let (records, _) = list_owned_jobs(&ctx, caller, None, 8, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(records[0].workspace_mode, WorkspaceMode::None);
+        assert_eq!(records[0].workspace_bucket, None);
+        let JobPayload::Execution(spec) = &records[0].payload else {
+            panic!("expected an execution payload");
+        };
+        let InputSource::S3 { version_id, .. } = &spec.inputs[0].source;
+        assert_eq!(version_id.as_deref(), Some(version.to_string().as_str()));
+    }
+
     #[tokio::test]
     async fn refuses_missing_input() {
         let dir = tempdir().unwrap();
@@ -709,7 +816,7 @@ mod tests {
         let mut config = run_config(local, owner(2));
         config.spec.inputs.push(input("project", None, None));
 
-        let error = resolve_inputs(&ctx, &config)
+        let error = resolve_inputs(&ctx, &mut config)
             .await
             .expect_err("an input the device does not hold is refused");
 
@@ -731,7 +838,7 @@ mod tests {
             .inputs
             .push(input("project", Some(node(4)), None));
 
-        let error = resolve_inputs(&ctx, &config)
+        let error = resolve_inputs(&ctx, &mut config)
             .await
             .expect_err("a realm input without a version is refused");
 

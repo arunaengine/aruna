@@ -6,6 +6,7 @@ use crate::explorer::{
 };
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
+use crate::migrate::migrate;
 use crate::portal::update_portal;
 use crate::reclaim::{print_status as reclaim_status, seed_backend};
 use crate::storage::{import, snapshot};
@@ -19,6 +20,7 @@ mod error;
 mod explorer;
 mod info;
 mod iroh_check;
+mod migrate;
 mod portal;
 mod reclaim;
 mod storage;
@@ -96,6 +98,11 @@ pub enum Commands {
     Reclaim {
         #[command(subcommand)]
         command: ReclaimCommands,
+    },
+    /// Rewrite job family records stored before execution results carried
+    /// stdout and stderr tails. Run with the node stopped; safe to repeat.
+    Migrate {
+        database_path: String,
     },
 }
 
@@ -275,6 +282,7 @@ pub async fn main() -> Result<(), CliError> {
             } => seed_backend(database_path, backend).await?,
             ReclaimCommands::Status { database_path } => reclaim_status(database_path).await?,
         },
+        Commands::Migrate { database_path } => migrate(database_path).await?,
     };
 
     Ok(())

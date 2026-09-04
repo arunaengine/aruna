@@ -20,6 +20,7 @@ use crate::mutate_realm_placement::{
     RealmPlacementMutation,
 };
 use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
+use crate::queue_backoff::conflict_backoff;
 
 /// Publishes the realm's first candidate map and hands every strategy's
 /// activations to the reducer.
@@ -209,6 +210,8 @@ pub(crate) async fn mutate(
             Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
                 if attempts < MUTATION_CONFLICT_RETRIES =>
             {
+                // Retrying with no wait spends every attempt in one contention window.
+                tokio::time::sleep(conflict_backoff(attempts, actor.node_id.as_bytes())).await;
                 attempts += 1;
             }
             other => return other,

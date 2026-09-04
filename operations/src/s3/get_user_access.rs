@@ -155,7 +155,7 @@ mod test {
             access_key: access_key_id.clone(),
             user_identity,
             group_id: Ulid::generate(),
-            secret: aruna_core::credential_seal::SealedS3Secret::empty(),
+            secret: aruna_core::credential_encryption::EncryptedS3Secret::empty(),
             expiry: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
             path_restrictions: None,
             issued_by: [0u8; 32],

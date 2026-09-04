@@ -109,7 +109,7 @@ mod tests {
         assert!(stopped.load(Ordering::SeqCst));
     }
 
-    // A child admitted after the drain returned would write behind the seal.
+    // A child admitted after the drain returned would write behind the close.
     #[tokio::test]
     async fn rejects_late_spawn() {
         let shutdown = Shutdown::new();

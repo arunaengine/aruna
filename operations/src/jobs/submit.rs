@@ -163,9 +163,6 @@ impl SubmitJobOperation {
             record.workspace_mode = spec.workspace_mode;
             record.workspace_bucket = match spec.workspace_mode {
                 WorkspaceMode::Existing => spec.workspace_bucket,
-                WorkspaceMode::Temporary | WorkspaceMode::Kept => {
-                    Some(JobRecord::workspace_bucket_name(record.job_id))
-                }
                 WorkspaceMode::None => None,
             };
             record.plan_digest = Some(workspace_plan_digest(
@@ -302,22 +299,22 @@ impl SubmitJobOperation {
     }
 }
 
+/// The default workspace leaves the plan digest alone; only the bucket an
+/// `Existing`-mode run names changes what an idempotency key stands for.
 fn workspace_plan_digest(
     payload: &JobPayload,
     mode: WorkspaceMode,
     bucket: Option<&str>,
 ) -> [u8; 32] {
     let digest = payload.plan_digest();
-    if mode == WorkspaceMode::Kept {
+    if mode != WorkspaceMode::Existing {
         return digest;
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"aruna/job-workspace/v1");
     hasher.update(&digest);
     hasher.update(mode.name().as_bytes());
-    if mode == WorkspaceMode::Existing
-        && let Some(bucket) = bucket
-    {
+    if let Some(bucket) = bucket {
         hasher.update(bucket.as_bytes());
     }
     *hasher.finalize().as_bytes()
@@ -517,7 +514,7 @@ mod tests {
             dedup_key,
             now_ms: 1_000,
             retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
-            workspace_mode: WorkspaceMode::Kept,
+            workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
             active_cap: None,
         }
@@ -641,15 +638,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn temporary_dedup_stable() {
+    async fn existing_dedup_stable() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage);
         let submission = SubmitJobSpec {
             payload: execution_payload(),
-            dedup_key: Some(b"temporary".to_vec()),
-            workspace_mode: WorkspaceMode::Temporary,
-            workspace_bucket: None,
+            dedup_key: Some(b"existing".to_vec()),
+            workspace_mode: WorkspaceMode::Existing,
+            workspace_bucket: Some("shared-workspace".to_string()),
             ..spec(None)
         };
 

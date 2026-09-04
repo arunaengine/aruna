@@ -105,6 +105,8 @@ pub enum CompleteMultipartUploadError {
     UploadTargetMismatch,
     #[error("The multipart upload is no longer open.")]
     UploadNotOpen,
+    #[error("The upload is being completed, retry shortly.")]
+    CompletionInProgress,
     #[error("The requested multipart upload contains no parts.")]
     MissingParts,
     #[error("The specified multipart upload has missing part data.")]
@@ -168,6 +170,8 @@ pub struct CompleteMultipartUploadInput {
     /// resolved from the realm quota config at the request surface. `None` =
     /// unlimited, so no gate is enforced.
     pub quota_ceiling: Option<u64>,
+    /// Wall clock (epoch ms) the completion lease is stamped and judged against.
+    pub now_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,16 +214,19 @@ pub struct CompleteMultipartUploadOperation {
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
-    /// Refs sealed on the version record, reused verbatim by its registration.
-    sealed_policies: Vec<PlacementPolicyRef>,
+    /// Refs stored on the version record, reused verbatim by its registration.
+    stored_policies: Vec<PlacementPolicyRef>,
     /// Destination default, read inside the finalize transaction.
     bucket_policies: Vec<PlacementPolicyRef>,
-    /// Destination facts of this node. Absent means no governed object may be
+    /// Destination details of this node. Absent means no governed object may be
     /// composed or registered here.
     gate_context: Option<GateContext>,
     gate: Option<PolicyGateOperation>,
     /// What the gate decided on, re-read inside the finalize transaction.
     gated_bucket: Option<GatedBucket>,
+    /// The reset that returns the record to `Open` has already been taken, so
+    /// no later cleanup step may take it a second time.
+    reset_done: bool,
 }
 
 impl CompleteMultipartUploadOperation {
@@ -251,11 +258,12 @@ impl CompleteMultipartUploadOperation {
             output: None,
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
-            sealed_policies: Vec::new(),
+            stored_policies: Vec::new(),
             bucket_policies: Vec::new(),
             gate_context: None,
             gate: None,
             gated_bucket: None,
+            reset_done: false,
         }
     }
 
@@ -281,7 +289,7 @@ impl CompleteMultipartUploadOperation {
 
     /// Subject generation the gate admitted this completion under; zero for an
     /// ungoverned object, which no subject ever evaluated.
-    fn sealed_subject(&self) -> u64 {
+    fn stored_subject(&self) -> u64 {
         self.gated_bucket
             .as_ref()
             .and_then(|gated| gated.subject_generation)
@@ -310,8 +318,14 @@ impl CompleteMultipartUploadOperation {
         self.continue_error_cleanup()
     }
 
+    /// Whether the record may still be `Completing` in storage.
+    fn needs_reset(&self) -> bool {
+        self.upload_record.is_some() && !self.reset_done
+    }
+
     fn continue_error_cleanup(&mut self) -> Effects {
-        if self.upload_record.is_some() {
+        if self.needs_reset() {
+            self.reset_done = true;
             self.state = CompleteMultipartUploadState::ResetUploadTransaction;
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false,
@@ -477,6 +491,9 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn preserve_blob(&mut self) {
+        // An uncertain finalize commit may already have deleted the record, so
+        // resetting it to Open could resurrect an upload the object replaced.
+        self.reset_done = true;
         if self.reconcile_location.is_none() {
             let location = self
                 .composed_location
@@ -489,12 +506,15 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn emit_pending_error(&mut self) -> Effects {
-        let Some(error) = self.pending_error.take() else {
-            return self.emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        let error = match (self.pending_error.take(), self.output.take()) {
+            (Some(error), _) | (None, Some(Err(error))) => error,
+            _ => CompleteMultipartUploadError::CompleteMultipartUploadFailed,
         };
         self.emit_error(error)
     }
 
+    /// A `Completing` record whose lease lapsed is taken over: the previous
+    /// attempt lost its request future, so refusing it would strand the upload.
     fn validate_upload_target(
         &self,
         record: &MultipartUpload,
@@ -502,10 +522,16 @@ impl CompleteMultipartUploadOperation {
         if record.bucket != self.input.bucket || record.key != self.input.key {
             return Err(CompleteMultipartUploadError::UploadTargetMismatch);
         }
-        if record.status != MultipartUploadStatus::Open {
-            return Err(CompleteMultipartUploadError::UploadNotOpen);
+        match record.status {
+            MultipartUploadStatus::Open => Ok(()),
+            MultipartUploadStatus::Completing if record.completion_stale(self.input.now_ms) => {
+                Ok(())
+            }
+            MultipartUploadStatus::Completing => {
+                Err(CompleteMultipartUploadError::CompletionInProgress)
+            }
+            MultipartUploadStatus::Aborting => Err(CompleteMultipartUploadError::UploadNotOpen),
         }
-        Ok(())
     }
 
     fn validate_checksum_contract(
@@ -600,7 +626,14 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(err);
         }
 
+        if record.status == MultipartUploadStatus::Completing {
+            warn!(
+                upload_id = %self.input.upload_id,
+                "Taking over a multipart completion whose lease expired"
+            );
+        }
         record.status = MultipartUploadStatus::Completing;
+        record.completing_since_ms = Some(self.input.now_ms);
         let bytes = match record.to_bytes() {
             Ok(bytes) => bytes,
             Err(err) => return self.emit_error(err.into()),
@@ -769,7 +802,7 @@ impl CompleteMultipartUploadOperation {
         };
         self.gated_bucket = Some(
             GatedBucket::observe(bucket.as_ref())
-                .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
+                .stored_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
         let group_id = bucket
             .as_ref()
@@ -1189,7 +1222,7 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
-        self.sealed_policies = version.placement_policies.clone();
+        self.stored_policies = version.placement_policies.clone();
         let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -1220,9 +1253,9 @@ impl CompleteMultipartUploadOperation {
                 version: VersionKey::new(&self.input.bucket, &self.input.key, version_id),
                 node_id: self.input.node_id,
                 location: &location,
-                policies: &self.sealed_policies,
+                policies: &self.stored_policies,
                 origin: CopyOrigin::Write,
-                subject_generation: self.sealed_subject(),
+                subject_generation: self.stored_subject(),
                 registered_at_ms: version_id.timestamp_ms(),
             },
             self.txn_id,
@@ -1588,6 +1621,8 @@ impl CompleteMultipartUploadOperation {
             return self.handle_finalize_failure(event);
         };
         self.txn_id = None;
+        // The finalize transaction deleted the record, so nothing is left to reset.
+        self.reset_done = true;
         let release_id = self.composed_location.take().map(|location| location.ulid);
         let Some(location) = self.final_location.clone() else {
             return self.emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -1647,7 +1682,13 @@ impl CompleteMultipartUploadOperation {
                 Ok(record) => record,
                 Err(err) => return self.reset_failed(Some(err.into())),
             };
+            // Another attempt already took the lease over; its completion owns
+            // the record now and must not be reopened underneath it.
+            if record.completing_since_ms != Some(self.input.now_ms) {
+                return self.reset_failed(None);
+            }
             record.status = MultipartUploadStatus::Open;
+            record.completing_since_ms = None;
             self.upload_record = Some(record.clone());
             let bytes = match record.to_bytes() {
                 Ok(bytes) => bytes,
@@ -1719,7 +1760,7 @@ impl CompleteMultipartUploadOperation {
     fn handle_failed_compose_cleanup(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::TransactionAborted { .. }) => {
-                self.rollback_composed_blob()
+                self.continue_error_cleanup()
             }
             Event::Storage(StorageEvent::Error { error }) => self.abort_uncertain(&error),
             Event::Blob(BlobEvent::DeleteFinished) => {
@@ -1844,6 +1885,22 @@ impl Operation for CompleteMultipartUploadOperation {
         )
     }
 
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            CompleteMultipartUploadError::NoSuchUpload
+                | CompleteMultipartUploadError::UploadTargetMismatch
+                | CompleteMultipartUploadError::UploadNotOpen
+                | CompleteMultipartUploadError::CompletionInProgress
+        )
+    }
+
+    /// The mark transaction commits long before the finalize one, so a deadline
+    /// must still reopen the record it left `Completing`.
+    fn abort_after_commit(&self) -> bool {
+        self.needs_reset()
+    }
+
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         if self.state != CompleteMultipartUploadState::Finish {
             if let Some(Err(error)) = self.output {
@@ -1879,8 +1936,10 @@ impl Operation for CompleteMultipartUploadOperation {
             self.state = CompleteMultipartUploadState::QueueCleanupRow;
             return smallvec![effect];
         }
-        if self.has_cleanup() {
-            return self.rollback_composed_blob();
+        // A deadline that fires between the mark and the finalize leaves the
+        // record `Completing`; reopening it keeps the upload retryable.
+        if self.needs_reset() || self.has_cleanup() {
+            return self.continue_error_cleanup();
         }
         if let Some(id) = self.release_id {
             self.state = CompleteMultipartUploadState::ReleaseReservation;
@@ -1978,8 +2037,10 @@ fn composite_digest_for_algorithm(algorithm: ChecksumAlgorithm, bytes: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{BackendRef, MultipartUploadChecksumHint};
+    use aruna_core::structs::{BackendRef, COMPLETION_LEASE_MS, MultipartUploadChecksumHint};
     use aruna_core::task::{TaskEffect, TaskKey};
+
+    pub(super) const TEST_NOW_MS: u64 = 1_700_000_000_000;
 
     fn finalize_input() -> CompleteMultipartUploadInput {
         let realm_id = RealmId::from_bytes([3u8; 32]);
@@ -1997,6 +2058,7 @@ mod tests {
             object_size: Some(10),
             created_by: UserId::local(Ulid::generate(), realm_id),
             quota_ceiling: Some(30),
+            now_ms: TEST_NOW_MS,
         }
     }
 
@@ -2046,6 +2108,7 @@ mod tests {
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
+            completing_since_ms: None,
         }
     }
 
@@ -2622,6 +2685,129 @@ mod tests {
         .unwrap()
     }
 
+    // A fresh completion stamps the lease it will be judged by.
+    #[test]
+    fn marks_completion_lease() {
+        let input = finalize_input();
+        let mut record = open_upload_record(&input);
+        record.status = MultipartUploadStatus::Open;
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        op.txn_id = Some(TxnId::generate());
+        op.state = CompleteMultipartUploadState::ReadUploadForMark;
+
+        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(
+            op.state,
+            CompleteMultipartUploadState::WriteUploadCompleting
+        );
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected the marking write")
+        };
+        let written = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(written.status, MultipartUploadStatus::Completing);
+        assert_eq!(written.completing_since_ms, Some(TEST_NOW_MS));
+    }
+
+    // A completion whose request died left the record Completing; the next one
+    // takes it over once the lease lapsed, instead of failing forever.
+    #[test]
+    fn takes_stale_lease() {
+        let input = finalize_input();
+        let mut record = open_upload_record(&input);
+        record.completing_since_ms = Some(TEST_NOW_MS - COMPLETION_LEASE_MS);
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        op.txn_id = Some(TxnId::generate());
+        op.state = CompleteMultipartUploadState::ReadUploadForMark;
+
+        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected the take-over write")
+        };
+        let written = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(written.completing_since_ms, Some(TEST_NOW_MS));
+    }
+
+    // A live lease is a retryable refusal, never NoSuchUpload.
+    #[test]
+    fn refuses_live_lease() {
+        let input = finalize_input();
+        let mut record = open_upload_record(&input);
+        record.completing_since_ms = Some(TEST_NOW_MS - 1);
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        let txn_id = TxnId::generate();
+        op.txn_id = Some(txn_id);
+        op.state = CompleteMultipartUploadState::ReadUploadForMark;
+
+        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ));
+        assert_eq!(
+            op.pending_error,
+            Some(CompleteMultipartUploadError::CompletionInProgress)
+        );
+    }
+
+    // A deadline between the mark and the finalize must reopen the record.
+    #[test]
+    fn abort_reopens_record() {
+        let input = finalize_input();
+        let record = open_upload_record(&input);
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        op.upload_record = Some(record);
+        op.state = CompleteMultipartUploadState::ComposeBlob;
+
+        assert!(op.abort_after_commit());
+        let effects = op.abort();
+
+        assert_eq!(
+            op.state,
+            CompleteMultipartUploadState::ResetUploadTransaction
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+    }
+
+    // Only the attempt that owns the lease may reopen the record.
+    #[test]
+    fn reset_skips_foreign() {
+        let input = finalize_input();
+        let mut record = open_upload_record(&input);
+        record.completing_since_ms = Some(TEST_NOW_MS + 1);
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        op.txn_id = Some(TxnId::generate());
+        op.state = CompleteMultipartUploadState::ReadUploadForReset;
+
+        let effects = op.handle_upload_read_for_reset(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, CompleteMultipartUploadState::CleanupFailedCompose);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+    }
+
     #[test]
     fn checksum_contract_failure_aborts_mark_transaction() {
         let mut input = finalize_input();
@@ -3085,6 +3271,7 @@ mod tests {
 
 #[cfg(test)]
 mod gate_tests {
+    use super::tests::TEST_NOW_MS;
     use super::*;
     use crate::placement_policy::PolicyCacheEntry;
     use aruna_core::structs::{
@@ -3149,6 +3336,7 @@ mod gate_tests {
             object_size: Some(10),
             created_by: UserId::local(Ulid::generate(), realm_id),
             quota_ceiling: Some(30),
+            now_ms: TEST_NOW_MS,
         }
     }
 
@@ -3167,6 +3355,7 @@ mod gate_tests {
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
+            completing_since_ms: None,
         }
     }
 

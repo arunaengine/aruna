@@ -11,6 +11,7 @@ use aruna_core::compute::{
     NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
     TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
+use aruna_core::util::tail_str;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -18,8 +19,8 @@ use json_patch::Patch as JsonPatch;
 use k8s_openapi::api::authorization::v1::SelfSubjectAccessReview;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
-    ConfigMap, ContainerState, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
-    ServiceAccount,
+    ConfigMap, ContainerState, ContainerStateTerminated, Namespace, PersistentVolume,
+    PersistentVolumeClaim, Pod, Secret, ServiceAccount,
 };
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::storage::v1::{CSIDriver, StorageClass};
@@ -63,6 +64,8 @@ const EXEC_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// size. kube-rs otherwise defaults to 1 KiB, which throttles a transfer to a trickle
 /// and, on the read side, blocks the frame loop that drives its keepalive ping.
 const EXEC_STREAM_BUF_BYTES: usize = 512 * 1024;
+/// Bounds the termination evidence kept on a terminal status.
+const MAX_TERMINATION_DETAIL: usize = 2048;
 
 #[derive(Clone)]
 pub struct KubernetesBackend {
@@ -622,6 +625,7 @@ impl KubernetesBackend {
                 status.phase = AttemptPhase::Exited {
                     code: terminated.exit_code,
                 };
+                status.detail = termination_detail(terminated);
                 // A failed Job carries no completionTime, so the container is the
                 // only terminal timing evidence.
                 status.started_at_ms = status
@@ -1579,7 +1583,22 @@ fn job_status(job: &Job) -> AttemptStatus {
         backend_ref: job.metadata.uid.clone().unwrap_or_else(|| job.name_any()),
         started_at_ms: time_ms(times.and_then(|status| status.start_time.as_ref())),
         finished_at_ms: time_ms(times.and_then(|status| status.completion_time.as_ref())),
+        detail: None,
     }
+}
+
+/// Reason and message of a terminated container, bounded from the end because
+/// the fallback message holds the last log lines.
+fn termination_detail(state: &ContainerStateTerminated) -> Option<String> {
+    let reason = state.reason.as_deref().unwrap_or_default().trim();
+    let message = state.message.as_deref().unwrap_or_default().trim();
+    let detail = match (reason.is_empty(), message.is_empty()) {
+        (true, true) => return None,
+        (false, true) => reason.to_string(),
+        (true, false) => message.to_string(),
+        (false, false) => format!("{reason}: {message}"),
+    };
+    Some(tail_str(&detail, MAX_TERMINATION_DETAIL).to_string())
 }
 
 fn time_ms(time: Option<&Time>) -> Option<u64> {
@@ -2694,6 +2713,33 @@ mod tests {
             None
         );
         assert!(task_started(&pod));
+    }
+
+    #[test]
+    fn keeps_exit_detail() {
+        // Reason and message join plainly, and only the end of a long message
+        // survives because that is where the failure shows.
+        let terminated = |state: Value| -> Option<String> {
+            let pod = task_pod(json!({ "terminated": state }), POD_START);
+            let state = task_state(&pod).and_then(|state| state.terminated.clone());
+            termination_detail(&state.expect("terminated state"))
+        };
+
+        assert_eq!(
+            terminated(json!({"exitCode":2,"reason":"Error","message":" boom\n"})),
+            Some("Error: boom".to_string())
+        );
+        assert_eq!(
+            terminated(json!({"exitCode":2,"reason":"OOMKilled"})),
+            Some("OOMKilled".to_string())
+        );
+        assert_eq!(terminated(json!({"exitCode":2})), None);
+        assert_eq!(terminated(json!({"exitCode":2,"message":"  "})), None);
+
+        let long = terminated(json!({"exitCode":2,"message":"a".repeat(4096) + "end"}))
+            .expect("bounded detail");
+        assert_eq!(long.len(), MAX_TERMINATION_DETAIL);
+        assert!(long.ends_with("end"), "{long}");
     }
 
     #[test]

@@ -289,7 +289,7 @@ surface never confirms that somebody else's job exists.
                         "execution_id": "01JJRSEXEC0123456789ABCDEF",
                         "outputs": [
                             {
-                                "bucket": "ws-01jjrstvwxyz0123456789abcd",
+                                "bucket": "project-reports",
                                 "key": "reports/reads_fastqc.html",
                                 "version_id": "01JJRSVERSION0123456789ABC",
                                 "execution_id": "01JJRSEXEC0123456789ABCDEF",

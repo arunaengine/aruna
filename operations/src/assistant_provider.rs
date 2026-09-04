@@ -1,4 +1,4 @@
-use aruna_core::credential_seal::CredentialSealKey;
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -88,7 +88,7 @@ pub struct CreateProviderOperation {
     provider: AssistantProvider,
     pending_secret: AssistantProviderSecret,
     pending_headers: AssistantHeaders,
-    seal_key: CredentialSealKey,
+    encryption_key: CredentialEncryptionKey,
     txn_id: Option<TxnId>,
     state: CreateProviderState,
     output: Option<Result<AssistantProvider, String>>,
@@ -99,13 +99,13 @@ impl CreateProviderOperation {
         provider: AssistantProvider,
         secret: AssistantProviderSecret,
         headers: AssistantHeaders,
-        seal_key: CredentialSealKey,
+        encryption_key: CredentialEncryptionKey,
     ) -> Self {
         Self {
             provider,
             pending_secret: secret,
             pending_headers: headers,
-            seal_key,
+            encryption_key,
             txn_id: None,
             state: CreateProviderState::Init,
             output: None,
@@ -165,10 +165,10 @@ impl CreateProviderOperation {
         }
         if let Err(error) = self
             .provider
-            .seal_secret(&self.seal_key, &self.pending_secret)
+            .encrypt_secret(&self.encryption_key, &self.pending_secret)
             .and_then(|_| {
                 self.provider
-                    .seal_headers(&self.seal_key, &self.pending_headers)
+                    .encrypt_headers(&self.encryption_key, &self.pending_headers)
             })
         {
             return self.fail(error.into());
@@ -729,7 +729,7 @@ impl Operation for UpdateProviderOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::credential_seal::SealedS3Secret;
+    use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::structs::{AssistantProviderKind, AssistantProviderStatus, RealmId};
 
     #[test]
@@ -743,8 +743,8 @@ mod tests {
             kind: AssistantProviderKind::Openai,
             label: "Original".to_string(),
             base_url: "https://api.openai.com".to_string(),
-            headers: SealedS3Secret::empty(),
-            secret: SealedS3Secret::empty(),
+            headers: EncryptedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
             created_at: 1,

@@ -1,9 +1,9 @@
 //! Hard eligibility. Every rule here can only remove a target: stale telemetry
-//! and free capacity are ranking facts, and exact admission happens at the
+//! and free capacity are ranking inputs, and exact admission happens at the
 //! target itself.
 
 use crate::compute::NetworkAccess;
-use crate::scheduling::facts::{PlanRequest, TargetCandidate};
+use crate::scheduling::inputs::{PlanRequest, TargetCandidate};
 use crate::structs::{PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -56,12 +56,33 @@ impl PolicyVerdict {
 }
 
 impl RejectionVerdict {
-    /// Whether the rejection may resolve itself once missing facts arrive.
+    /// Whether the rejection may resolve itself once the missing values arrive.
     pub fn retryable(&self) -> bool {
         match self {
             RejectionVerdict::Policy { verdict, .. } => verdict.retryable(),
             RejectionVerdict::NoLegalSource { .. } => true,
             _ => false,
+        }
+    }
+
+    /// One short phrase a report reader understands without the audit fields.
+    pub fn reason(&self) -> String {
+        match self {
+            RejectionVerdict::NotAuthorized => "not a realm member".to_string(),
+            RejectionVerdict::NodeKind => "user nodes take no shared work".to_string(),
+            RejectionVerdict::Inactive => "node is not active".to_string(),
+            RejectionVerdict::ComputeDraining => "node stopped taking work".to_string(),
+            RejectionVerdict::PolicyDraining => "executor stopped taking work".to_string(),
+            RejectionVerdict::SubjectDrift => "advertisement does not match its digest".to_string(),
+            RejectionVerdict::ExecutorKind => "no executor of that kind".to_string(),
+            RejectionVerdict::Staging => "staging mode is not supported".to_string(),
+            RejectionVerdict::RequiredLabels => "a required label is missing".to_string(),
+            RejectionVerdict::Resources => "not enough resources".to_string(),
+            RejectionVerdict::OpenNetwork => "open network is not allowed here".to_string(),
+            RejectionVerdict::Policy { .. } => "placement policy refused".to_string(),
+            RejectionVerdict::NoLegalSource { destination_key } => {
+                format!("no legal source for input {destination_key}")
+            }
         }
     }
 }

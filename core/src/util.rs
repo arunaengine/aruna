@@ -44,9 +44,33 @@ pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Last `max_bytes` of `text`, cut on a char boundary so the result stays
+/// valid UTF-8. Used where the end of a message carries the evidence.
+pub fn tail_str(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_str_bounds() {
+        assert_eq!(tail_str("abcdef", 10), "abcdef");
+        assert_eq!(tail_str("abcdef", 2), "ef");
+        assert_eq!(tail_str("abcdef", 0), "");
+        // Cutting inside a multi-byte char must drop it, not split it.
+        let text = "aä";
+        assert_eq!(tail_str(text, 2), "ä");
+        assert_eq!(tail_str(text, 1), "");
+    }
 
     #[test]
     fn test_prefix_upper_bound() {

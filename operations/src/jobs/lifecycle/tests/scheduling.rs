@@ -1,6 +1,7 @@
-//! Witness ranking, launch suppression, sealed budgets, and staging refusals.
+//! Witness ranking, launch suppression, stored budgets, and staging refusals.
 
 use aruna_core::structs::{JobErrorKind, JobFamilyRecord, PhysicalExecutionState};
+use std::collections::BTreeSet;
 
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::lifecycle::witness::{suppressed, witness_rank};
@@ -18,11 +19,15 @@ fn ranks_witnesses() {
 
     let ranks: Vec<_> = holders
         .iter()
-        .map(|holder| witness_rank(&holders, &family.family(), *holder).expect("holder ranks"))
+        .map(|holder| {
+            witness_rank(&holders, &family.family(), *holder, None).expect("holder ranks")
+        })
         .collect();
     let reversed: Vec<_> = holders
         .iter()
-        .map(|holder| witness_rank(&shuffled, &family.family(), *holder).expect("holder ranks"))
+        .map(|holder| {
+            witness_rank(&shuffled, &family.family(), *holder, None).expect("holder ranks")
+        })
         .collect();
 
     assert_eq!(ranks, reversed);
@@ -30,7 +35,41 @@ fn ranks_witnesses() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), holders.len());
-    assert_eq!(witness_rank(&holders, &family.family(), node(9)), None);
+    assert_eq!(
+        witness_rank(&holders, &family.family(), node(9), None),
+        None
+    );
+}
+
+#[test]
+fn admitting_ranks_first() {
+    // The admitting node plans first and the remaining witnesses keep their
+    // digest order behind it; a non-holder never shifts anyone.
+    let family = Family::new([1u8; 32]);
+    let holders: Vec<_> = (1..=4u8).map(node).collect();
+    let admitting = Some(node(3));
+
+    let ranks: Vec<_> = holders
+        .iter()
+        .map(|holder| {
+            witness_rank(&holders, &family.family(), *holder, admitting).expect("holder ranks")
+        })
+        .collect();
+
+    assert_eq!(
+        witness_rank(&holders, &family.family(), node(3), admitting),
+        Some(0)
+    );
+    let mut sorted = ranks.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1, 2, 3]);
+    let outsider = Some(node(9));
+    for holder in &holders {
+        assert_eq!(
+            witness_rank(&holders, &family.family(), *holder, outsider),
+            witness_rank(&holders, &family.family(), *holder, None)
+        );
+    }
 }
 
 #[test]
@@ -41,11 +80,37 @@ fn suppresses_after_receipt() {
     let succeeded = family.run(1, 0, PhysicalExecutionState::Succeeded);
     let failed = family.run(1, 0, PhysicalExecutionState::Failed);
     let error = family.run(1, 0, PhysicalExecutionState::Error);
+    let live = BTreeSet::new();
 
-    assert!(suppressed(family.family(), &running));
-    assert!(suppressed(family.family(), &succeeded));
-    assert!(suppressed(family.family(), &failed));
-    assert!(!suppressed(family.family(), &error));
+    assert!(suppressed(family.family(), &running, &live));
+    assert!(suppressed(family.family(), &succeeded, &live));
+    assert!(suppressed(family.family(), &failed, &live));
+    assert!(!suppressed(family.family(), &error, &live));
+}
+
+#[test]
+fn silent_node_replans() {
+    // An unfinished execution on a node that stopped reporting stops
+    // suppressing, while its terminal outcomes still do.
+    let family = Family::new([1u8; 32]);
+    let running = family.run(1, 0, PhysicalExecutionState::Running);
+    let succeeded = family.run(1, 0, PhysicalExecutionState::Succeeded);
+    let failed = family.run(1, 0, PhysicalExecutionState::Failed);
+    let silent = BTreeSet::from([family.target.public()]);
+
+    assert!(!suppressed(family.family(), &running, &silent));
+    assert!(suppressed(family.family(), &succeeded, &silent));
+    assert!(suppressed(family.family(), &failed, &silent));
+}
+
+#[test]
+fn live_node_suppresses() {
+    // Another node going silent says nothing about the node that runs the work.
+    let family = Family::new([1u8; 32]);
+    let running = family.run(1, 0, PhysicalExecutionState::Running);
+    let elsewhere = BTreeSet::from([node(2)]);
+
+    assert!(suppressed(family.family(), &running, &elsewhere));
 }
 
 #[test]
@@ -60,7 +125,7 @@ fn cancel_suppresses_launch() {
         JobFamilyRecord::Cancel(family.cancel(&spec)),
     ));
 
-    assert!(suppressed(family.family(), &records));
+    assert!(suppressed(family.family(), &records, &BTreeSet::new()));
     assert!(
         records
             .iter()
@@ -70,7 +135,7 @@ fn cancel_suppresses_launch() {
 
 #[test]
 fn bounds_launch_sequence() {
-    // A launch outside the sealed budget is never admitted, whatever the
+    // A launch outside the stored budget is never admitted, whatever the
     // scheduler claims about its own sequence.
     let family = Family::new([1u8; 32]);
     let spec = family.spec();

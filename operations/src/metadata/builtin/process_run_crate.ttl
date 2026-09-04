@@ -1,0 +1,392 @@
+# SHACL shapes for the Process Run Crate 0.5 Profile, projected from the portal's
+# bundled definition (src/lib/profiles/builtinProfiles.ts, shapesFromEntityRules).
+# Presence and value constraints are split, so a missing MUST is a Violation, a
+# missing SHOULD a Warning, and an invalid value always a Violation.
+# Four value constraints deviate from that projection, which assumes plain JSON
+# strings: schema:license, schema:additionalType and schema:actionStatus reach RDF
+# as IRIs when a crate writes them as {"@id"}, and schema:datePublished may carry a
+# full RO-Crate timestamp rather than a bare date.
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix schema: <http://schema.org/> .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset> a sh:NodeShape ;
+  sh:property <https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-name-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-name>, <https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-description>, <https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-datePublished>, <https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-license>, <https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-mentions-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-mentions> .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-name-presence> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Name" ;
+  sh:description "Human readable title of the run." ;
+  sh:order 0 ;
+  sh:minCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-name> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Name" ;
+  sh:description "Human readable title of the run." ;
+  sh:order 0 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-description> a sh:PropertyShape ;
+  sh:path schema:description ;
+  sh:name "Description" ;
+  sh:description "Plain-language summary of what was run." ;
+  sh:order 1 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-datePublished> a sh:PropertyShape ;
+  sh:path schema:datePublished ;
+  sh:name "Date published" ;
+  sh:description "Publication date in ISO date format." ;
+  sh:order 2 ;
+  sh:datatype xsd:string ;
+  sh:pattern "^\\d{4}-\\d{2}-\\d{2}" ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-license> a sh:PropertyShape ;
+  sh:path schema:license ;
+  sh:name "License" ;
+  sh:description "License URL." ;
+  sh:order 3 ;
+  sh:or ( [ sh:nodeKind sh:IRI ] [ sh:datatype xsd:string ; sh:pattern "^[A-Za-z][A-Za-z0-9+.-]*:" ] ) ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-mentions-presence> a sh:PropertyShape ;
+  sh:path schema:mentions ;
+  sh:name "Process run" ;
+  sh:description "The action that carried out the run, the RO-Crate root mentions it." ;
+  sh:order 4 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Dataset-mentions> a sh:PropertyShape ;
+  sh:path schema:mentions ;
+  sh:name "Process run" ;
+  sh:description "The action that carried out the run, the RO-Crate root mentions it." ;
+  sh:order 4 ;
+  sh:nodeKind sh:IRI ;
+  sh:class schema:CreateAction ;
+  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction> .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction> a sh:NodeShape ;
+  sh:targetClass schema:CreateAction ;
+  sh:property <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-name-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-name>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-description-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-description>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-startTime>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-endTime-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-endTime>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-actionStatus>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-instrument-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-instrument>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-containerImage>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-agent-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-agent>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-object>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-result-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-result>, <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-error> .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-name-presence> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Name" ;
+  sh:description "What the run did." ;
+  sh:order 0 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-name> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Name" ;
+  sh:description "What the run did." ;
+  sh:order 0 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-description-presence> a sh:PropertyShape ;
+  sh:path schema:description ;
+  sh:name "Command" ;
+  sh:description "The complete command executed by the process." ;
+  sh:order 1 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-description> a sh:PropertyShape ;
+  sh:path schema:description ;
+  sh:name "Command" ;
+  sh:description "The complete command executed by the process." ;
+  sh:order 1 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-startTime> a sh:PropertyShape ;
+  sh:path schema:startTime ;
+  sh:name "Start time" ;
+  sh:description "When the run started." ;
+  sh:order 2 ;
+  sh:datatype xsd:string ;
+  sh:pattern "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}" ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-endTime-presence> a sh:PropertyShape ;
+  sh:path schema:endTime ;
+  sh:name "End time" ;
+  sh:description "When the run finished." ;
+  sh:order 3 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-endTime> a sh:PropertyShape ;
+  sh:path schema:endTime ;
+  sh:name "End time" ;
+  sh:description "When the run finished." ;
+  sh:order 3 ;
+  sh:datatype xsd:string ;
+  sh:pattern "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}" ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-actionStatus> a sh:PropertyShape ;
+  sh:path schema:actionStatus ;
+  sh:name "Status" ;
+  sh:description "Whether the run completed or failed." ;
+  sh:order 4 ;
+  sh:in ( <http://schema.org/CompletedActionStatus> <http://schema.org/FailedActionStatus> "http://schema.org/CompletedActionStatus" "http://schema.org/FailedActionStatus" ) ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-instrument-presence> a sh:PropertyShape ;
+  sh:path schema:instrument ;
+  sh:name "Instrument" ;
+  sh:description "The software application that performed the run." ;
+  sh:order 5 ;
+  sh:minCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-instrument> a sh:PropertyShape ;
+  sh:path schema:instrument ;
+  sh:name "Instrument" ;
+  sh:description "The software application that performed the run." ;
+  sh:order 5 ;
+  sh:nodeKind sh:IRI ;
+  sh:class schema:SoftwareApplication ;
+  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication> ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-containerImage> a sh:PropertyShape ;
+  sh:path <https://w3id.org/ro/terms/workflow-run#containerImage> ;
+  sh:name "Container image" ;
+  sh:description "The container image used by the run." ;
+  sh:order 6 ;
+  sh:nodeKind sh:IRI ;
+  sh:class <https://w3id.org/ro/terms/workflow-run#ContainerImage> ;
+  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage> ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-agent-presence> a sh:PropertyShape ;
+  sh:path schema:agent ;
+  sh:name "Agent" ;
+  sh:description "The person (or organization) that initiated the run." ;
+  sh:order 7 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-agent> a sh:PropertyShape ;
+  sh:path schema:agent ;
+  sh:name "Agent" ;
+  sh:description "The person (or organization) that initiated the run." ;
+  sh:order 7 ;
+  sh:nodeKind sh:IRI ;
+  sh:class schema:Person ;
+  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-Person> ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-object> a sh:PropertyShape ;
+  sh:path schema:object ;
+  sh:name "Inputs" ;
+  sh:description "Files consumed by the run." ;
+  sh:order 8 ;
+  sh:nodeKind sh:IRI ;
+  sh:class schema:MediaObject .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-result-presence> a sh:PropertyShape ;
+  sh:path schema:result ;
+  sh:name "Outputs" ;
+  sh:description "Files produced by the run." ;
+  sh:order 9 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-result> a sh:PropertyShape ;
+  sh:path schema:result ;
+  sh:name "Outputs" ;
+  sh:description "Files produced by the run." ;
+  sh:order 9 ;
+  sh:nodeKind sh:IRI ;
+  sh:class schema:MediaObject .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-error> a sh:PropertyShape ;
+  sh:path schema:error ;
+  sh:name "Error" ;
+  sh:description "Error output when the run failed." ;
+  sh:order 10 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Person> a sh:NodeShape ;
+  sh:targetClass schema:Person ;
+  sh:property <https://w3id.org/aruna/profiles/process-run-crate#shape-Person-name>, <https://w3id.org/aruna/profiles/process-run-crate#shape-Person-identifier> .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Person-name> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Name" ;
+  sh:description "Display name." ;
+  sh:order 0 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-Person-identifier> a sh:PropertyShape ;
+  sh:path schema:identifier ;
+  sh:name "Identifier" ;
+  sh:description "Persistent user identifier." ;
+  sh:order 1 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication> a sh:NodeShape ;
+  sh:targetClass schema:SoftwareApplication ;
+  sh:property <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-name-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-name>, <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-identifier>, <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-softwareVersion-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-softwareVersion>, <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-url-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-url> .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-name-presence> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Name" ;
+  sh:description "Application name." ;
+  sh:order 0 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-name> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Name" ;
+  sh:description "Application name." ;
+  sh:order 0 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-identifier> a sh:PropertyShape ;
+  sh:path schema:identifier ;
+  sh:name "Identifier" ;
+  sh:description "Application or image identifier." ;
+  sh:order 1 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-softwareVersion-presence> a sh:PropertyShape ;
+  sh:path schema:softwareVersion ;
+  sh:name "Version" ;
+  sh:description "Application version." ;
+  sh:order 2 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-softwareVersion> a sh:PropertyShape ;
+  sh:path schema:softwareVersion ;
+  sh:name "Version" ;
+  sh:description "Application version." ;
+  sh:order 2 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-url-presence> a sh:PropertyShape ;
+  sh:path schema:url ;
+  sh:name "Application link" ;
+  sh:description "Human-facing application URL." ;
+  sh:order 3 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication-url> a sh:PropertyShape ;
+  sh:path schema:url ;
+  sh:name "Application link" ;
+  sh:description "Human-facing application URL." ;
+  sh:order 3 ;
+  sh:datatype xsd:string ;
+  sh:pattern "^[A-Za-z][A-Za-z0-9+.-]*:" ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage> a sh:NodeShape ;
+  sh:targetClass <https://w3id.org/ro/terms/workflow-run#ContainerImage> ;
+  sh:property <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-additionalType-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-additionalType>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-identifier-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-identifier>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-registry-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-registry>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-name-presence>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-name>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-tag>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-sha256>, <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-url> .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-additionalType-presence> a sh:PropertyShape ;
+  sh:path schema:additionalType ;
+  sh:name "Image type" ;
+  sh:description "Container image format." ;
+  sh:order 0 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-additionalType> a sh:PropertyShape ;
+  sh:path schema:additionalType ;
+  sh:name "Image type" ;
+  sh:description "Container image format." ;
+  sh:order 0 ;
+  sh:or ( [ sh:nodeKind sh:IRI ] [ sh:datatype xsd:string ; sh:pattern "^[A-Za-z][A-Za-z0-9+.-]*:" ] ) ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-identifier-presence> a sh:PropertyShape ;
+  sh:path schema:identifier ;
+  sh:name "Pinned reference" ;
+  sh:description "Digest-pinned image reference." ;
+  sh:order 1 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-identifier> a sh:PropertyShape ;
+  sh:path schema:identifier ;
+  sh:name "Pinned reference" ;
+  sh:description "Digest-pinned image reference." ;
+  sh:order 1 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-registry-presence> a sh:PropertyShape ;
+  sh:path <https://w3id.org/ro/terms/workflow-run#registry> ;
+  sh:name "Registry" ;
+  sh:description "Container registry host." ;
+  sh:order 2 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-registry> a sh:PropertyShape ;
+  sh:path <https://w3id.org/ro/terms/workflow-run#registry> ;
+  sh:name "Registry" ;
+  sh:description "Container registry host." ;
+  sh:order 2 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-name-presence> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Image name" ;
+  sh:description "Repository name within the registry." ;
+  sh:order 3 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-name> a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Image name" ;
+  sh:description "Repository name within the registry." ;
+  sh:order 3 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-tag> a sh:PropertyShape ;
+  sh:path <https://w3id.org/ro/terms/workflow-run#tag> ;
+  sh:name "Tag" ;
+  sh:description "Submitted image tag." ;
+  sh:order 4 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-sha256> a sh:PropertyShape ;
+  sh:path <https://w3id.org/ro/terms/workflow-run#sha256> ;
+  sh:name "Digest" ;
+  sh:description "Pinned SHA-256 digest." ;
+  sh:order 5 ;
+  sh:datatype xsd:string ;
+  sh:maxCount 1 .
+
+<https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage-url> a sh:PropertyShape ;
+  sh:path schema:url ;
+  sh:name "Registry link" ;
+  sh:description "Human-facing image URL." ;
+  sh:order 6 ;
+  sh:datatype xsd:string ;
+  sh:pattern "^[A-Za-z][A-Za-z0-9+.-]*:" ;
+  sh:maxCount 1 .

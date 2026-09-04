@@ -306,7 +306,7 @@ pub struct ReplicateScopeOperation {
     writer_auth_context: Option<AuthContext>,
     reference_advance: Option<ReferenceAdvance>,
     routing: NodeRouting,
-    /// Destination facts of this node, passed to every version sub-operation
+    /// Destination details of this node, passed to every version sub-operation
     /// that may materialize reference bytes here.
     gate_context: Option<GateContext>,
     result: ReplicateScopeResult,
@@ -1041,7 +1041,7 @@ pub struct ReplicateObjectVersionOperation {
     /// Refs read from the stored version, carried onto the manifest unchanged.
     version_policies: Vec<PlacementPolicyRef>,
     pending_copy: Option<ManagedCopyKey>,
-    /// Destination facts of this node, evaluated before reference bytes are
+    /// Destination details of this node, evaluated before reference bytes are
     /// materialized locally.
     gate_context: Option<GateContext>,
     gate: Option<PolicyGateOperation>,

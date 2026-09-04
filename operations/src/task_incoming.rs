@@ -61,7 +61,9 @@ impl Drop for OutboxBarrier {
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
-use crate::blob::cleanup::{BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_cleanup_batch};
+use crate::blob::cleanup::{
+    BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_cleanup_batch, sweep_stale_uploads,
+};
 use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
@@ -2534,6 +2536,11 @@ impl OperationsTaskHandler {
                 BLOB_CLEANUP_RETRY
             }
         };
+        // The parts a reclaimed upload frees become cleanup rows, so the sweep
+        // rides the same timer that drains them.
+        if let Err(error) = sweep_stale_uploads(&self.context, unix_timestamp_millis()).await {
+            warn!(task_id = ?TaskKey::DrainBlobCleanupQueue, error = %error, "Failed to sweep stale multipart uploads");
+        }
         self.reschedule_timer(TaskKey::DrainBlobCleanupQueue, after)
             .await;
     }

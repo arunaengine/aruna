@@ -1,6 +1,8 @@
 use aruna_core::UserId;
 use aruna_core::compute::Secret;
-use aruna_core::credential_seal::{CredentialSealKey, SealError, SealedS3Secret};
+use aruna_core::credential_encryption::{
+    CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -47,7 +49,7 @@ pub enum CreateUserAccessError {
     #[error(transparent)]
     RestrictionLimit(#[from] RestrictionLimitError),
     #[error(transparent)]
-    Seal(#[from] SealError),
+    Encryption(#[from] EncryptionError),
     #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
     InvalidState {
         current: CreateUserAccessState,
@@ -86,7 +88,7 @@ pub struct CreateUserAccessConfig {
 pub struct CreateUserAccessOperation {
     config: CreateUserAccessConfig,
     key_id: String,
-    seal_key: CredentialSealKey,
+    encryption_key: CredentialEncryptionKey,
     pending_secret: Option<Secret>,
     access: Option<UserAccess>,
     txn_id: Option<ulid::Ulid>,
@@ -95,19 +97,19 @@ pub struct CreateUserAccessOperation {
 }
 
 impl CreateUserAccessOperation {
-    pub fn new(config: CreateUserAccessConfig, seal_key: CredentialSealKey) -> Self {
-        Self::new_with_key(config, Ulid::generate().to_string(), seal_key)
+    pub fn new(config: CreateUserAccessConfig, encryption_key: CredentialEncryptionKey) -> Self {
+        Self::new_with_key(config, Ulid::generate().to_string(), encryption_key)
     }
 
     pub fn new_with_key(
         config: CreateUserAccessConfig,
         key_id: String,
-        seal_key: CredentialSealKey,
+        encryption_key: CredentialEncryptionKey,
     ) -> Self {
         Self {
             config,
             key_id,
-            seal_key,
+            encryption_key,
             pending_secret: None,
             access: None,
             txn_id: None,
@@ -138,13 +140,13 @@ impl CreateUserAccessOperation {
             access_key,
             user_identity: self.config.user_identity,
             group_id: self.config.group_id,
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             expiry: self.config.expiry,
             path_restrictions: self.config.path_restrictions.clone(),
             issued_by: self.config.issued_by,
             revoked_at: None,
         };
-        if let Err(err) = access.seal_secret(&self.seal_key, &plaintext) {
+        if let Err(err) = access.encrypt_secret(&self.encryption_key, &plaintext) {
             return self.handle_error(err.into());
         }
 
@@ -450,8 +452,8 @@ mod tests {
         *iroh::SecretKey::from_bytes(&[9u8; 32]).public().as_bytes()
     }
 
-    fn test_seal_key() -> CredentialSealKey {
-        CredentialSealKey::derive(&[9u8; 32])
+    fn test_key() -> CredentialEncryptionKey {
+        CredentialEncryptionKey::derive(&[9u8; 32])
     }
 
     fn make_config(user_identity: UserId, group_id: GroupId) -> CreateUserAccessConfig {
@@ -473,7 +475,7 @@ mod tests {
         let user_identity = make_user_identity();
         let group_id = Ulid::generate();
         let mut op =
-            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_key());
 
         // Start opens the transaction before the owner index is checked.
         let effects = op.start();
@@ -502,7 +504,7 @@ mod tests {
         };
         assert_eq!(access.user_identity, user_identity);
         assert_eq!(access.group_id, group_id);
-        assert_eq!(access.open_secret(&test_seal_key()).unwrap().len(), 30);
+        assert_eq!(access.open_secret(&test_key()).unwrap().len(), 30);
         assert_eq!(access.path_restrictions, None);
         assert_eq!(access.issued_by, test_issuer());
         assert_eq!(access.revoked_at, None);
@@ -549,7 +551,7 @@ mod tests {
         assert_eq!(returned_access.access_key, access_key);
         // The one-time plaintext opens the stored ciphertext on the issuing key.
         assert_eq!(
-            returned_access.open_secret(&test_seal_key()).unwrap(),
+            returned_access.open_secret(&test_key()).unwrap(),
             plaintext.expose()
         );
     }
@@ -561,7 +563,7 @@ mod tests {
         let mut op = CreateUserAccessOperation::new_with_key(
             make_config(user_identity, Ulid::generate()),
             "newkey".to_string(),
-            test_seal_key(),
+            test_key(),
         );
         op.start();
         let txn_id = Ulid::generate();
@@ -576,7 +578,7 @@ mod tests {
             access_key: stale_key.clone(),
             user_identity,
             group_id: Ulid::generate(),
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             expiry: SystemTime::UNIX_EPOCH,
             path_restrictions: None,
             issued_by: test_issuer(),
@@ -609,7 +611,7 @@ mod tests {
         let mut op = CreateUserAccessOperation::new_with_key(
             make_config(user_identity, Ulid::generate()),
             "newkey".to_string(),
-            test_seal_key(),
+            test_key(),
         );
         op.start();
         let txn_id = Ulid::generate();
@@ -624,7 +626,7 @@ mod tests {
             access_key: "newkey".to_string(),
             user_identity,
             group_id: Ulid::generate(),
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: test_issuer(),
@@ -656,7 +658,7 @@ mod tests {
         let mut op = CreateUserAccessOperation::new_with_key(
             make_config(user_identity, Ulid::generate()),
             "newkey".to_string(),
-            test_seal_key(),
+            test_key(),
         );
         op.start();
         let txn_id = Ulid::generate();
@@ -672,7 +674,7 @@ mod tests {
                     access_key: key.clone(),
                     user_identity,
                     group_id: Ulid::generate(),
-                    secret: SealedS3Secret::empty(),
+                    secret: EncryptedS3Secret::empty(),
                     expiry: SystemTime::now() + Duration::from_secs(60),
                     path_restrictions: None,
                     issued_by: test_issuer(),
@@ -706,7 +708,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut config = make_config(make_user_identity(), Ulid::generate());
         config.path_restrictions = Some(restrictions);
-        let mut op = CreateUserAccessOperation::new(config, test_seal_key());
+        let mut op = CreateUserAccessOperation::new(config, test_key());
 
         let effects = op.start();
         assert!(effects.is_empty());
@@ -724,7 +726,7 @@ mod tests {
 
         // Starting twice does not bypass the transaction state.
         let mut op =
-            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_key());
         op.start();
         let effects = op.start();
         assert!(effects.is_empty());
@@ -732,7 +734,7 @@ mod tests {
 
         // A wrong event aborts the open transaction and fails closed.
         let mut op =
-            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_key());
         op.start();
         let key = Ulid::generate().to_bytes().into();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {

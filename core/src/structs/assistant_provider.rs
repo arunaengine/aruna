@@ -1,5 +1,5 @@
 use crate::compute::Secret;
-use crate::credential_seal::{CredentialSealKey, SealError, SealedS3Secret};
+use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret, EncryptionError};
 use crate::errors::ConversionError;
 use crate::types::UserId;
 use serde::{Deserialize, Serialize};
@@ -103,8 +103,8 @@ pub struct AssistantProvider {
     pub kind: AssistantProviderKind,
     pub label: String,
     pub base_url: String,
-    pub headers: SealedS3Secret,
-    pub secret: SealedS3Secret,
+    pub headers: EncryptedS3Secret,
+    pub secret: EncryptedS3Secret,
     pub models: Vec<String>,
     pub default_model: Option<String>,
     pub created_at: u64,
@@ -117,13 +117,13 @@ pub struct AssistantProvider {
 #[derive(Debug, Error)]
 pub enum AssistantSecretError {
     #[error(transparent)]
-    Seal(#[from] SealError),
+    Encryption(#[from] EncryptionError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
 
 impl AssistantProvider {
-    fn seal_aad(&self, field: u8) -> Vec<u8> {
+    fn field_aad(&self, field: u8) -> Vec<u8> {
         let mut aad = Vec::new();
         aad.extend_from_slice(self.provider_id.as_bytes());
         aad.push(0);
@@ -133,39 +133,39 @@ impl AssistantProvider {
         aad
     }
 
-    pub fn seal_secret(
+    pub fn encrypt_secret(
         &mut self,
-        key: &CredentialSealKey,
+        key: &CredentialEncryptionKey,
         secret: &AssistantProviderSecret,
     ) -> Result<(), AssistantSecretError> {
         let plaintext = serde_json::to_string(secret)?;
-        self.secret = SealedS3Secret::seal(key, &plaintext, &self.seal_aad(1))?;
+        self.secret = EncryptedS3Secret::encrypt(key, &plaintext, &self.field_aad(1))?;
         Ok(())
     }
 
     pub fn open_secret(
         &self,
-        key: &CredentialSealKey,
+        key: &CredentialEncryptionKey,
     ) -> Result<AssistantProviderSecret, AssistantSecretError> {
-        let plaintext = self.secret.open(key, &self.seal_aad(1))?;
+        let plaintext = self.secret.open(key, &self.field_aad(1))?;
         Ok(serde_json::from_str(&plaintext)?)
     }
 
-    pub fn seal_headers(
+    pub fn encrypt_headers(
         &mut self,
-        key: &CredentialSealKey,
+        key: &CredentialEncryptionKey,
         headers: &AssistantHeaders,
     ) -> Result<(), AssistantSecretError> {
         let plaintext = serde_json::to_string(headers)?;
-        self.headers = SealedS3Secret::seal(key, &plaintext, &self.seal_aad(2))?;
+        self.headers = EncryptedS3Secret::encrypt(key, &plaintext, &self.field_aad(2))?;
         Ok(())
     }
 
     pub fn open_headers(
         &self,
-        key: &CredentialSealKey,
+        key: &CredentialEncryptionKey,
     ) -> Result<AssistantHeaders, AssistantSecretError> {
-        let plaintext = self.headers.open(key, &self.seal_aad(2))?;
+        let plaintext = self.headers.open(key, &self.field_aad(2))?;
         Ok(serde_json::from_str(&plaintext)?)
     }
 

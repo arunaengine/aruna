@@ -370,7 +370,7 @@ impl EnsureRealmConfigOperation {
         }
         // A fresh document seeds its placement identity locally; without the
         // matching reducer events a later reducer-only rebuild loses them and
-        // the sealed family routing with them.
+        // the stored family routing with them.
         if fresh
             && reducer_state.materialized_family_strategy().is_none()
             && reducer_state

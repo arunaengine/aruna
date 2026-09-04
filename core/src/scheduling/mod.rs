@@ -4,19 +4,19 @@
 //! membership, placement policy, and static capability, then ranks whatever
 //! survives by directed transfer cost and stale ranking hints and keeps the
 //! best of them. It performs no I/O, decides nothing about capacity the target
-//! owns, and seals every fact it used into a plan digest.
+//! owns, and covers every value it used with a plan digest.
 
 mod cost;
 mod digest;
 mod eligibility;
-mod facts;
+mod inputs;
 mod rank;
 mod scan;
 
 pub use cost::{InputRoute, UNKNOWN_PERMILLE};
 pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
 pub use eligibility::{PolicyVerdict, RejectionVerdict};
-pub use facts::{
+pub use inputs::{
     InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES, MAX_PLAN_INPUTS,
     MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
     TargetScore,
@@ -54,7 +54,7 @@ pub struct RejectedTarget {
     pub verdict: RejectionVerdict,
 }
 
-/// The target this plan launches on, with the facts sealed into `plan_digest`.
+/// The target this plan launches on, with the values covered by `plan_digest`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     pub target: ExecutionTargetId,
@@ -81,7 +81,72 @@ pub struct ExecutionPlan {
     pub omitted: u32,
 }
 
-/// Plans one execution over already resolved facts and one complete candidate
+/// How one scanned target ended up in a planning round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateVerdict {
+    Selected,
+    Ranked,
+    Rejected,
+}
+
+impl CandidateVerdict {
+    /// Stable machine-readable name for API payloads.
+    pub fn name(&self) -> &'static str {
+        match self {
+            CandidateVerdict::Selected => "selected",
+            CandidateVerdict::Ranked => "ranked",
+            CandidateVerdict::Rejected => "rejected",
+        }
+    }
+}
+
+/// One target of a planning round as an external report shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanCandidate {
+    pub node_id: crate::NodeId,
+    pub executor_kind: Option<String>,
+    pub verdict: CandidateVerdict,
+    /// Place among the alternatives, counted from one. Absent for the selected
+    /// target and for a rejected one.
+    pub rank: Option<u32>,
+    /// Why the target was rejected, in plain words.
+    pub reason: Option<String>,
+}
+
+impl ExecutionPlan {
+    /// Every target of this round for a report: the selection first, then the
+    /// alternatives in rank order, then the rejections with their reason.
+    pub fn candidates(&self) -> Vec<PlanCandidate> {
+        let selected = self.selected.iter().map(|selection| PlanCandidate {
+            node_id: selection.target.node_id,
+            executor_kind: Some(selection.target.executor_kind.clone()),
+            verdict: CandidateVerdict::Selected,
+            rank: None,
+            reason: None,
+        });
+        let ranked = self
+            .alternatives
+            .iter()
+            .enumerate()
+            .map(|(index, ranked)| PlanCandidate {
+                node_id: ranked.target.node_id,
+                executor_kind: Some(ranked.target.executor_kind.clone()),
+                verdict: CandidateVerdict::Ranked,
+                rank: Some(index as u32 + 1),
+                reason: None,
+            });
+        let rejected = self.rejected.iter().map(|rejected| PlanCandidate {
+            node_id: rejected.target.node_id,
+            executor_kind: Some(rejected.target.executor_kind.clone()),
+            verdict: CandidateVerdict::Rejected,
+            rank: None,
+            reason: Some(rejected.verdict.reason()),
+        });
+        selected.chain(ranked).chain(rejected).collect()
+    }
+}
+
+/// Plans one execution over already resolved inputs and one complete candidate
 /// set, paging it for the caller. Returns an error only when the request itself
 /// is unusable; an empty or fully rejected scan is a plan without a selection,
 /// not a failure, and stays retryable while a rejection may still resolve
@@ -94,8 +159,9 @@ pub fn plan_execution(
 ) -> Result<ExecutionPlan, PlanError> {
     let mut planner = Planner::new(request, compute)?;
     let mut ordered = candidates.to_vec();
-    ordered
-        .sort_unstable_by(|left, right| facts::target_order(left).cmp(&facts::target_order(right)));
+    ordered.sort_unstable_by(|left, right| {
+        inputs::target_order(left).cmp(&inputs::target_order(right))
+    });
     for page in ordered.chunks(MAX_TARGET_SCAN) {
         planner.rank_page(page)?;
     }

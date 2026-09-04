@@ -45,9 +45,9 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
         path_restrictions: Some(restrictions.clone()),
         issued_by: *nodes[0].net.node_id().as_bytes(),
     };
-    let seal_key = aruna_core::credential_seal::CredentialSealKey::random();
+    let encryption_key = aruna_core::credential_encryption::CredentialEncryptionKey::random();
     let (access_key, _, _) = drive(
-        CreateUserAccessOperation::new(config, seal_key),
+        CreateUserAccessOperation::new(config, encryption_key),
         nodes[0].context.as_ref(),
     )
     .await??;

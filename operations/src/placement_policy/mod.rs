@@ -2,7 +2,7 @@
 //! fetch transport a non-holder resolves through.
 //!
 //! Placement of the document and placement allowed by the policy are separate
-//! facts. Nothing in this module derives one from the other: the document's
+//! details. Nothing in this module derives one from the other: the document's
 //! holders come from its policy id, while the subjects the policy admits come
 //! from its selectors and are evaluated only by `evaluate_placement`.
 

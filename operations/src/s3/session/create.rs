@@ -2,7 +2,7 @@ use super::{
     MAX_GROUP_SESSIONS, S3SessionCredentials, S3SessionError, build_session, decode_index,
     encode_index, expiry_key, owner_key, session_age,
 };
-use aruna_core::credential_seal::CredentialSealKey;
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -43,7 +43,7 @@ enum CreateSessionState {
 pub struct CreateS3SessionOperation {
     config: CreateS3SessionConfig,
     key_id: String,
-    seal_key: CredentialSealKey,
+    encryption_key: CredentialEncryptionKey,
     pending: Option<S3SessionCredentials>,
     txn_id: Option<Ulid>,
     state: CreateSessionState,
@@ -51,19 +51,19 @@ pub struct CreateS3SessionOperation {
 }
 
 impl CreateS3SessionOperation {
-    pub fn new(config: CreateS3SessionConfig, seal_key: CredentialSealKey) -> Self {
-        Self::with_key(config, Ulid::generate().to_string(), seal_key)
+    pub fn new(config: CreateS3SessionConfig, encryption_key: CredentialEncryptionKey) -> Self {
+        Self::with_key(config, Ulid::generate().to_string(), encryption_key)
     }
 
     pub fn with_key(
         config: CreateS3SessionConfig,
         key_id: String,
-        seal_key: CredentialSealKey,
+        encryption_key: CredentialEncryptionKey,
     ) -> Self {
         Self {
             config,
             key_id,
-            seal_key,
+            encryption_key,
             pending: None,
             txn_id: None,
             state: CreateSessionState::Init,
@@ -98,7 +98,7 @@ impl CreateS3SessionOperation {
             self.config.expiry,
             self.config.path_restrictions.clone(),
             self.config.issued_by,
-            &self.seal_key,
+            &self.encryption_key,
         ) {
             Ok(pending) => pending,
             Err(error) => return self.fail(error),

@@ -1,11 +1,12 @@
 //! Exact admission at the execution target.
 //!
-//! The target owns this decision alone. It re-fetches and verifies the sealed
+//! The target owns this decision alone. It re-fetches and verifies the stored
 //! spec, checks that the offering scheduler is a holder in its own current
-//! view, re-authorizes the sealed submitter, re-evaluates placement against its
+//! view, re-authorizes the stored submitter, re-evaluates placement against its
 //! own execution subject, reserves exact local capacity, and only then signs and
 //! persists the receipt that authorizes work. Replaying one launch returns the
-//! same receipt instead of admitting a second execution.
+//! same receipt instead of admitting a second execution, and a launch for a
+//! family this node already runs, or already ran successfully, is declined.
 
 use std::sync::Arc;
 
@@ -18,11 +19,13 @@ use aruna_core::effects::{
 use aruna_core::errors::StorageError;
 use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, NetEvent};
 use aruna_core::operation::Operation;
+use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::{
-    AuthContext, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
-    JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, Permission,
-    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument,
-    WorkspaceMode, blob_group_permission_path, evaluate_placement,
+    AuthContext, CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord,
+    JobPayload, JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
+    Permission, PhysicalExecutionState, PlacementDecision, PlacementPolicyRef, PlacementSubject,
+    PolicyResolution, RealmConfigDocument, WorkspaceMode, blob_group_permission_path,
+    evaluate_placement,
 };
 use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
@@ -35,9 +38,10 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::ids::{self, workspace_of};
-use super::plan::{network_access, staging_mode};
+use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::driver::{DriverContext, drive, gate_context, now_ms};
+use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
@@ -51,7 +55,7 @@ use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::request_authorization::authorize;
 use crate::request_policy::PolicyRequestExtras;
 
-/// Wall-clock budget of the record fetch that pulls a missing sealed spec.
+/// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 /// Reservation attempts one offer makes while no commit of its own became
 /// durable: a lost race or a write storage never accepted.
@@ -107,6 +111,9 @@ pub async fn admit_launch(
     if cancelled(family, &records) {
         return Some(Err(LaunchDecline::Cancelled));
     }
+    if already_running(family, &records, local) {
+        return Some(Err(LaunchDecline::AlreadyRunning));
+    }
     let capability = match local_capability(context.as_ref(), &config, local, &intent, &spec).await
     {
         Ok(capability) => capability,
@@ -154,7 +161,7 @@ pub async fn admit_launch(
 }
 
 /// Every record of one family, or nothing at all. An incomplete read leaves the
-/// offer undecided: a receipt, a cancellation, or the sealed spec may be in the
+/// offer undecided: a receipt, a cancellation, or the stored spec may be in the
 /// part that did not load, so nothing here may be reserved or minted.
 async fn family_records(
     context: &Arc<DriverContext>,
@@ -184,7 +191,7 @@ async fn reserve_and_run(
     context: &Arc<DriverContext>,
     round: ReceiptRound,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let config = match seal_receipt(context, &round).await {
+    let config = match store_receipt(context, &round).await {
         Ok(config) => config,
         Err(decline) => return Some(Err(decline)),
     };
@@ -200,14 +207,14 @@ async fn reserve_and_run(
         execution_id = %execution_id,
         executor_kind = %round.intent.target.executor_kind,
         subject_generation = round.capability.subject.generation,
-        "Target admitted a launch and sealed its receipt"
+        "Target admitted a launch and stored its receipt"
     );
     Some(Ok(frame))
 }
 
 /// Mints the local execution identity and signs the receipt that authorizes it,
 /// leaving the reservation transaction as the only thing still to commit.
-async fn seal_receipt(
+async fn store_receipt(
     context: &Arc<DriverContext>,
     round: &ReceiptRound,
 ) -> Result<ReserveExecutionConfig, LaunchDecline> {
@@ -253,7 +260,7 @@ async fn seal_receipt(
         subject_digest: round.capability.subject_digest,
         accepted_at_ms: now,
     };
-    let sealed_subject = (receipt.subject_generation, receipt.subject_digest);
+    let stored_subject = (receipt.subject_generation, receipt.subject_digest);
     let Some(net) = context.net_handle.as_ref() else {
         return Err(LaunchDecline::Draining);
     };
@@ -275,14 +282,14 @@ async fn seal_receipt(
         logical_job_id: round.spec.job_id,
         execution_id,
         resources: round.spec.resources,
-        subject_generation: sealed_subject.0,
-        subject_digest: sealed_subject.1,
+        subject_generation: stored_subject.0,
+        subject_digest: stored_subject.1,
         record: Box::new(record),
         now_ms: now,
     })
 }
 
-/// Commits one sealed receipt with its reservation. `None` is undecidable: the
+/// Commits one stored receipt with its reservation. `None` is undecidable: the
 /// offer was neither admitted nor refused and the scheduler may ask again.
 pub(crate) async fn commit_receipt(
     context: &Arc<DriverContext>,
@@ -335,7 +342,7 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
     }
 }
 
-/// Commits one sealed receipt through `reserve`, which is the reservation
+/// Commits one stored receipt through `reserve`, which is the reservation
 /// transaction in production and the injected outcome under test.
 pub(crate) async fn commit_with<F, Fut>(
     context: &Arc<DriverContext>,
@@ -351,9 +358,9 @@ where
     for attempt in 1..=RESERVE_ATTEMPTS {
         let error = match reserve(config.clone()).await {
             Ok(_) => {
-                let sealed = ReceiptFrame::new(config.receipt.envelope().clone())
+                let frame = ReceiptFrame::new(config.receipt.envelope().clone())
                     .map_err(|_| LaunchDecline::Unauthorized);
-                return Some(accepted(context.as_ref(), sealed).await);
+                return Some(accepted(context.as_ref(), frame).await);
             }
             Err(error) => error,
         };
@@ -438,17 +445,14 @@ fn materialize_local(
         };
         let InputSource::S3 { version_id, .. } = &mut input.source;
         *version_id = Some(pin.version_id.to_string());
-        input.source_node_id = spec
-            .input_facts
-            .iter()
-            .find(|fact| fact.destination_key == input.dest_key)
-            .map(|fact| fact.source_node_id)
-            .or(Some(spec.ingress_node_id));
+        // The plan picked which holder the bytes come from; no source means the
+        // target already holds the compliant copy.
+        input.source_node_id = pin.source_node_id.or(Some(local));
     }
     payload.resources.cpu_cores = Some(spec.resources.cpu_cores);
     payload.resources.ram_bytes = Some(spec.resources.ram_bytes);
-    // A sealed disk of zero is the absence of a request, not a zero-byte
-    // ceiling: sealing it as `Some(0)` is a spec every backend refuses.
+    // A stored disk of zero is the absence of a request, not a zero-byte
+    // ceiling: storing it as `Some(0)` is a spec every backend refuses.
     payload.resources.disk_bytes =
         (spec.resources.disk_bytes > 0).then_some(spec.resources.disk_bytes);
     payload.resources.max_walltime_ms = Some(spec.resources.max_walltime_ms);
@@ -460,9 +464,6 @@ fn materialize_local(
             return Err(LaunchDecline::Unauthorized);
         }
         WorkspaceMode::Existing => (mode, bucket),
-        WorkspaceMode::Temporary | WorkspaceMode::Kept => {
-            (mode, Some(JobRecord::workspace_bucket_name(spec.job_id)))
-        }
         WorkspaceMode::None => (mode, None),
     };
     let mut record = JobRecord::new(
@@ -477,7 +478,7 @@ fn materialize_local(
     record.retention_ms = spec.retention_ms;
     record.workspace_mode = physical_mode;
     record.workspace_bucket = physical_bucket;
-    record.input_facts = spec.input_facts.clone();
+    record.captured_inputs = spec.captured_inputs.clone();
     Ok(record)
 }
 
@@ -490,7 +491,7 @@ async fn schedule_local(context: &DriverContext) {
     }
 }
 
-/// The sealed spec the launch names, by its exact digest.
+/// The stored spec the launch names, by its exact digest.
 fn spec_of(records: &[JobRecordEnvelope], intent: &LaunchIntent) -> Option<LogicalJobSpec> {
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Spec(spec) if spec.spec_digest == intent.spec_digest => {
@@ -517,6 +518,29 @@ pub(crate) fn existing_receipt(
             }
         }
         _ => None,
+    })
+}
+
+/// An execution of the same family this node already accepted. A second launch
+/// is refused while that execution may still finish, after it succeeded, and
+/// after it failed permanently, because a permanent failure suppresses retry.
+/// So one family never runs twice here. The refusal is retryable: another
+/// target may still take the launch.
+pub(crate) fn already_running(
+    family: JobFamilyId,
+    records: &[JobRecordEnvelope],
+    local: NodeId,
+) -> bool {
+    let Ok(Some(projection)) = reduce_family(family, records) else {
+        return false;
+    };
+    projection.executions.iter().any(|execution| {
+        execution.executor_node_id == local
+            && (!execution.state.is_terminal()
+                || matches!(
+                    execution.state,
+                    PhysicalExecutionState::Succeeded | PhysicalExecutionState::Failed
+                ))
     })
 }
 
@@ -579,7 +603,7 @@ pub(crate) async fn local_capability(
             .executor_constraint
             .as_deref()
             .is_some_and(|kind| kind.trim() != capability.kind.trim())
-        || !capability.supports(staging_mode(spec))
+        || !capability.supports(REALM_STAGING)
         || !capability.limits.fits(&spec.resources)
     {
         return Err(LaunchDecline::Unauthorized);
@@ -609,7 +633,7 @@ fn backend_limits(context: &DriverContext, intent: &LaunchIntent) -> Option<Reso
     Some(backend.capabilities().limits)
 }
 
-/// The sealed submitter must still hold WRITE on the group here. No bearer
+/// The stored submitter must still hold WRITE on the group here. No bearer
 /// token replicates: the check runs against this node's replicated permissions.
 async fn authorize_submitter(
     context: &DriverContext,
@@ -634,6 +658,23 @@ async fn authorize_submitter(
     .map_err(|_| LaunchDecline::Unauthorized)
 }
 
+/// Whether one pinned input still describes the captured input it names. Any
+/// node may be the pinned source, because a registered copy of the same bytes
+/// serves the read; the captured version, hash and size still bind the content,
+/// and a source naming this target itself would not be a remote read at all.
+pub(crate) fn pin_matches(
+    captured: &CapturedInput,
+    pin: &PlannedInput,
+    ingress: NodeId,
+    local: NodeId,
+) -> bool {
+    captured.source_node_id == ingress
+        && captured.version_id == pin.version_id
+        && captured.blake3 == pin.blake3
+        && captured.bytes == pin.bytes
+        && pin.source_node_id != Some(local)
+}
+
 /// Re-evaluates the placement refs this target can resolve against its own
 /// execution subject. Refs of an input it cannot resolve yet are enforced again
 /// by the materialization gate when the bytes are staged.
@@ -646,7 +687,7 @@ async fn placement_verdict(
     if intent.inputs.len() != spec.payload.inputs.len() {
         return Err(LaunchDecline::Unauthorized);
     }
-    if spec.input_facts.len() != spec.payload.inputs.len() {
+    if spec.captured_inputs.len() != spec.payload.inputs.len() {
         return Err(LaunchDecline::Unauthorized);
     }
     let mut inputs: Vec<Vec<PlacementPolicyRef>> = Vec::new();
@@ -665,23 +706,17 @@ async fn placement_verdict(
         if requested.is_some_and(|requested| requested != pin.version_id) {
             return Err(LaunchDecline::Unauthorized);
         }
-        let fact = spec
-            .input_facts
+        let captured = spec
+            .captured_inputs
             .iter()
-            .find(|fact| fact.destination_key == input.dest_key)
+            .find(|captured| captured.destination_key == input.dest_key)
             .ok_or(LaunchDecline::Unauthorized)?;
-        if fact.source_node_id != spec.ingress_node_id
-            || fact.version_id != pin.version_id
-            || fact.blake3 != pin.blake3
-            || fact.bytes != pin.bytes
-            || pin.source_node_id
-                != (fact.source_node_id != subject.node_id).then_some(fact.source_node_id)
-        {
+        if !pin_matches(captured, pin, spec.ingress_node_id, subject.node_id) {
             return Err(LaunchDecline::Unauthorized);
         }
-        let version = Some(fact.version_id);
-        let hash = fact.blake3;
-        let mut policies = fact.policies.clone();
+        let version = Some(captured.version_id);
+        let hash = captured.blake3;
+        let mut policies = captured.policies.clone();
         policies.sort_unstable();
         policies.dedup();
         if version != Some(pin.version_id) || hash != pin.blake3 || policies != pin.policies {
@@ -881,8 +916,8 @@ mod tests {
     use crate::jobs::records::tests::fixture::Family;
 
     #[test]
-    fn materializes_sealed_facts() {
-        // The physical row must execute the exact input, resources, backend, and retention sealed.
+    fn materializes_captured_inputs() {
+        // The physical row must execute the exact input, resources, backend, and retention stored.
         let family = Family::new([8u8; 32]);
         let mut spec = family.spec();
         spec.payload.inputs.push(InputSelection {
@@ -939,7 +974,7 @@ mod tests {
 
     #[test]
     fn disk_stays_none() {
-        // A request without a disk ceiling seals zero, which no backend accepts
+        // A request without a disk ceiling stores zero, which no backend accepts
         // as a container limit.
         let family = Family::new([8u8; 32]);
         let mut spec = family.spec();
@@ -971,12 +1006,12 @@ mod tests {
             container_path: "/out/result.txt".to_string(),
             dest_key: "results/result.txt".to_string(),
         });
-        ids::seal_workspace(
+        ids::store_workspace(
             &mut spec.payload,
             WorkspaceMode::Existing,
             Some("existing".to_string()),
         )
-        .expect("workspace seals");
+        .expect("workspace stored");
         spec.payload.resolve_outputs("existing", ingress);
         let launch = family.launch(&spec, family.holder.public(), 0);
         let physical_id = JobId::from_bytes([10u8; 16]);

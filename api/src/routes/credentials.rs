@@ -287,7 +287,7 @@ can never widen them.
 
 **Behavior**
 - The credential is always issued to the calling user, so no caller can mint one for somebody else.
-- The secret access key is returned in this response only: it is stored sealed, later listings show
+- The secret access key is returned in this response only: it is stored encrypted, later listings show
   only the access key id, and a lost secret means creating a new credential.
 - The credential is stored on the node that served the request and is accepted by that node's S3
   endpoint.
@@ -374,7 +374,7 @@ pub async fn create_s3_credentials(
                 path_restrictions,
                 issued_by: *node_id.as_bytes(),
             },
-            state.credential_seal_key().clone(),
+            state.credential_encryption_key().clone(),
         ),
         &state.get_ctx(),
     )
@@ -898,7 +898,7 @@ mod tests {
                     path_restrictions: None,
                     issued_by: *node_id.as_bytes(),
                 },
-                state.credential_seal_key().clone(),
+                state.credential_encryption_key().clone(),
             ),
             &state.get_ctx(),
         )

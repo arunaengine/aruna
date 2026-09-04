@@ -198,11 +198,11 @@ async fn drain_step(
         return StepPlan::Pending;
     }
     if let Some(net_handle) = context.net_handle.as_ref() {
-        match net_handle.seal_sync_topic(shard_topic_id(realm_id, placement)) {
+        match net_handle.close_sync_topic(shard_topic_id(realm_id, placement)) {
             Ok(true) => return StepPlan::Pending,
             Ok(false) => {}
             Err(error) => {
-                debug!(error = %error, "Transition drain could not seal the shard topic");
+                debug!(error = %error, "Transition drain could not close the shard topic");
                 return StepPlan::Pending;
             }
         }

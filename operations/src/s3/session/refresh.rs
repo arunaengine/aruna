@@ -1,7 +1,7 @@
 use super::{
     S3SessionCredentials, S3SessionError, build_session, decode_index, expiry_key, owner_key,
 };
-use aruna_core::credential_seal::CredentialSealKey;
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -40,7 +40,7 @@ enum RefreshSessionState {
 #[derive(Debug, PartialEq)]
 pub struct RefreshS3SessionOperation {
     config: RefreshS3SessionConfig,
-    seal_key: CredentialSealKey,
+    encryption_key: CredentialEncryptionKey,
     pending: Option<S3SessionCredentials>,
     txn_id: Option<Ulid>,
     state: RefreshSessionState,
@@ -48,10 +48,10 @@ pub struct RefreshS3SessionOperation {
 }
 
 impl RefreshS3SessionOperation {
-    pub fn new(config: RefreshS3SessionConfig, seal_key: CredentialSealKey) -> Self {
+    pub fn new(config: RefreshS3SessionConfig, encryption_key: CredentialEncryptionKey) -> Self {
         Self {
             config,
-            seal_key,
+            encryption_key,
             pending: None,
             txn_id: None,
             state: RefreshSessionState::Init,
@@ -154,7 +154,7 @@ impl RefreshS3SessionOperation {
             self.config.expiry,
             self.config.path_restrictions.clone(),
             self.config.issued_by,
-            &self.seal_key,
+            &self.encryption_key,
         ) {
             Ok(pending) => pending,
             Err(error) => return self.fail(error),

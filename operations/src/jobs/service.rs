@@ -5,9 +5,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
-    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, Permission, RealmId,
-    RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode,
-    pid_dedup_key, shard_for_subject, user_dedup_key,
+    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, OutputDestination,
+    Permission, RealmId, RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec,
+    WorkspaceMode, pid_dedup_key, shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -15,6 +15,7 @@ use aruna_core::types::{NodeId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -131,6 +132,18 @@ pub(crate) fn validate_execution(
 ) -> Result<(), SubmitJobError> {
     spec.inputs =
         aruna_core::structs::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
+    // Nothing copies an input into a bucket any more, so one that names no
+    // container path would reach nobody.
+    if let Some(input) = spec
+        .inputs
+        .iter()
+        .find(|input| input.container_path.is_none())
+    {
+        return Err(SubmitJobError::InvalidWorkspace(format!(
+            "input {} needs a container path",
+            input.dest_key
+        )));
+    }
     // One bound governs declaration, expansion, the local result, and the
     // immutable output record, so a valid success is always publishable.
     if spec.file_outputs.len() + spec.workspace_outputs.len() > MAX_EXECUTION_OUTPUTS {
@@ -156,34 +169,34 @@ pub(crate) fn validate_execution(
                 "existing mode requires a bucket".to_string(),
             ));
         }
-        WorkspaceMode::Temporary | WorkspaceMode::Kept if workspace_bucket.is_some() => {
-            return Err(SubmitJobError::InvalidWorkspace(
-                "bucket is only valid for existing mode".to_string(),
-            ));
-        }
         _ => {}
     }
+    // Without a bucket of its own a run has nowhere to resolve a relative
+    // output key against, so every output must name its own destination.
     if workspace_mode == WorkspaceMode::None
-        && (spec
-            .inputs
-            .iter()
-            .any(|input| input.mode != aruna_core::structs::InputMode::Mount)
-            || !spec.workspace_outputs.is_empty()
-            || !spec.output_prefixes.is_empty())
+        && (!spec.workspace_outputs.is_empty() || !spec.output_prefixes.is_empty())
     {
         return Err(SubmitJobError::InvalidWorkspace(
-            "none mode requires mounted inputs and explicit output destinations".to_string(),
+            "none mode requires explicit output destinations".to_string(),
         ));
     }
-    if workspace_mode != WorkspaceMode::None
-        && spec
-            .inputs
-            .iter()
-            .any(|input| input.mode == aruna_core::structs::InputMode::Mount)
-    {
-        return Err(SubmitJobError::InvalidWorkspace(
-            "mounted inputs require none workspace mode".to_string(),
-        ));
+    // An explicit destination and a workspace output resolve into one bucket
+    // and key namespace, so a key both name would share one reserved version.
+    let mut destinations = HashSet::new();
+    let workspace = spec
+        .workspace_outputs
+        .iter()
+        .filter_map(|output| workspace_bucket.map(|bucket| (bucket, output.dest_key.as_str())));
+    let explicit = spec.file_outputs.iter().map(|output| {
+        let OutputDestination::S3 { bucket, key } = &output.destination;
+        (bucket.as_str(), key.as_str())
+    });
+    for (bucket, key) in explicit.chain(workspace) {
+        if !destinations.insert((bucket, key)) {
+            return Err(SubmitJobError::InvalidWorkspace(format!(
+                "output {bucket}/{key} is declared twice"
+            )));
+        }
     }
     Ok(())
 }
@@ -1332,8 +1345,8 @@ mod tests {
             UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
             node_id(),
             None,
-            WorkspaceMode::Kept,
-            None,
+            WorkspaceMode::Existing,
+            Some("shared".to_string()),
             1,
             None,
         )
@@ -1349,7 +1362,7 @@ mod tests {
         spec.workspace_outputs.pop();
         spec.output_prefixes.push("out/".to_string());
         assert!(matches!(
-            validate_execution(&mut spec, WorkspaceMode::Kept, None),
+            validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")),
             Err(SubmitJobError::InvalidWorkspace(_))
         ));
         spec.output_prefixes.clear();
@@ -1360,14 +1373,103 @@ mod tests {
                 UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
                 node_id(),
                 None,
-                WorkspaceMode::Kept,
-                None,
+                WorkspaceMode::Existing,
+                Some("shared".to_string()),
                 1,
                 None,
             )
             .await,
             Err(SubmitJobError::TooManyOutputs { .. })
         ));
+    }
+
+    #[test]
+    fn refuses_pathless_input() {
+        // Nothing copies an input into a bucket, so it must land in the container.
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: vec![aruna_core::structs::InputSelection {
+                source: aruna_core::structs::InputSource::S3 {
+                    bucket: "data".to_string(),
+                    key: "in.txt".to_string(),
+                    version_id: None,
+                },
+                source_node_id: None,
+                dest_key: "in.txt".to_string(),
+                mode: aruna_core::structs::InputMode::Snapshot,
+                container_path: None,
+                name: None,
+                description: None,
+            }],
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+
+        let error = validate_execution(&mut spec, WorkspaceMode::None, None).unwrap_err();
+
+        assert!(
+            matches!(error, SubmitJobError::InvalidWorkspace(message) if message.contains("in.txt"))
+        );
+        spec.inputs[0].container_path = Some("/in.txt".to_string());
+        assert!(validate_execution(&mut spec, WorkspaceMode::None, None).is_ok());
+    }
+
+    #[test]
+    fn refuses_shared_destination() {
+        // An explicit output inside the workspace bucket and a workspace output
+        // naming the same key would reserve one version twice.
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: vec![aruna_core::structs::OutputSelection {
+                container_path: "/out/result.txt".to_string(),
+                path_prefix: None,
+                destination: OutputDestination::S3 {
+                    bucket: "shared".to_string(),
+                    key: "result.txt".to_string(),
+                },
+                destination_node_id: None,
+                name: None,
+                description: None,
+            }],
+            workspace_outputs: vec![aruna_core::structs::WorkspaceOutput {
+                container_path: "/result.txt".to_string(),
+                dest_key: "result.txt".to_string(),
+            }],
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+
+        let error =
+            validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")).unwrap_err();
+
+        assert!(
+            matches!(error, SubmitJobError::InvalidWorkspace(message) if message.contains("shared/result.txt"))
+        );
+        spec.workspace_outputs[0].dest_key = "other.txt".to_string();
+        assert!(validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")).is_ok());
     }
 
     #[test]

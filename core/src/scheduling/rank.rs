@@ -8,7 +8,7 @@
 use crate::compute::ExecutionTargetId;
 use crate::scheduling::cost::{self, InputRoute, LinkIndex};
 use crate::scheduling::eligibility::{self, RejectionVerdict};
-use crate::scheduling::facts::{MAX_PLAN_CANDIDATES, PlanRequest, TargetCandidate, TargetScore};
+use crate::scheduling::inputs::{MAX_PLAN_CANDIDATES, PlanRequest, TargetCandidate, TargetScore};
 
 /// What one eligible advertisement costs: how each pinned input reaches it and
 /// the score that ranks it.
@@ -17,7 +17,7 @@ pub struct Evaluation {
     pub score: TargetScore,
 }
 
-/// One kept target with the routes and score the plan seals. It owns its
+/// One kept target with the routes and score the plan stores. It owns its
 /// candidate because the page the advertisement arrived on is dropped once the
 /// page is ranked.
 pub struct ScoredTarget {

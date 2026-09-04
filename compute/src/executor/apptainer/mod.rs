@@ -628,7 +628,7 @@ impl ExecutorBackend for ApptainerBackend {
         )?;
         remove_tree(&directory)?;
         remove_cgroup(&self.cgroup_path(context))?;
-        guard.seal(reference)
+        guard.store(reference)
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
@@ -1018,6 +1018,7 @@ fn to_status(directory: &Path, record: StatusRecord) -> AttemptStatus {
         backend_ref: directory.display().to_string(),
         started_at_ms: record.started_at_ms,
         finished_at_ms: Some(record.finished_at_ms),
+        detail: None,
     }
 }
 
@@ -1027,6 +1028,7 @@ fn submitted_status(directory: &Path) -> AttemptStatus {
         backend_ref: directory.display().to_string(),
         started_at_ms: None,
         finished_at_ms: None,
+        detail: None,
     }
 }
 
@@ -1036,6 +1038,7 @@ fn running_status(directory: &Path, started_at_ms: Option<u64>) -> AttemptStatus
         backend_ref: directory.display().to_string(),
         started_at_ms,
         finished_at_ms: None,
+        detail: None,
     }
 }
 
@@ -1047,6 +1050,7 @@ fn lost_status(directory: &Path) -> AttemptStatus {
         backend_ref: directory.display().to_string(),
         started_at_ms: None,
         finished_at_ms: Some(now_ms()),
+        detail: None,
     }
 }
 
@@ -1238,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforces_cgroup_ceilings() {
-        // Every attempt runs inside a cgroup limit: the sealed ceiling when it
+        // Every attempt runs inside a cgroup limit: the stored ceiling when it
         // has one, the backend default otherwise, and never none at all.
         let root = tempdir().unwrap();
         let config = ApptainerConfig {
@@ -1454,7 +1458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_delete_unsealed() {
+    async fn failed_delete_unrecorded() {
         let root = tempdir().unwrap();
         let backend = ApptainerBackend::with_config(ApptainerConfig {
             state_root: root.path().join("state"),

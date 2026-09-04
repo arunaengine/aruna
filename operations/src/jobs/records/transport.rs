@@ -204,10 +204,19 @@ pub async fn dispatch_offer(
     context: &DriverContext,
     effect: LaunchOfferEffect,
 ) -> LaunchOfferEvent {
+    let target = effect.target.node_id;
+    // No transport dials the node it starts from, so a launch this witness
+    // planned onto itself is admitted in process instead.
+    if context
+        .net_handle
+        .as_ref()
+        .is_some_and(|net| net.node_id() == target)
+    {
+        return admit_locally(context, target, *effect.launch).await;
+    }
     let Some(metadata) = context.metadata_handle.as_ref() else {
         return LaunchOfferEvent::Unavailable("metadata transport unavailable".to_string());
     };
-    let target = effect.target.node_id;
     let message = MetadataTransportMessage::ForwardLaunchOffer {
         launch: Box::new(effect.launch.as_ref().clone()),
     };
@@ -225,6 +234,24 @@ pub async fn dispatch_offer(
         )),
         Ok(Err(error)) => LaunchOfferEvent::Unavailable(error.to_string()),
         Err(_) => LaunchOfferEvent::Unavailable("launch offer deadline elapsed".to_string()),
+    }
+}
+
+/// Admits a self-targeted launch here. The decision is the same one an inbound
+/// offer gets; only the round trip is skipped.
+async fn admit_locally(
+    context: &DriverContext,
+    target: NodeId,
+    launch: LaunchFrame,
+) -> LaunchOfferEvent {
+    let context = Arc::new(context.clone());
+    match crate::jobs::lifecycle::target::admit_launch(&context, launch).await {
+        Some(Ok(receipt)) => LaunchOfferEvent::Accepted {
+            target,
+            receipt: Box::new(receipt),
+        },
+        Some(Err(reason)) => LaunchOfferEvent::Declined { target, reason },
+        None => LaunchOfferEvent::Unavailable("local launch admission undecided".to_string()),
     }
 }
 

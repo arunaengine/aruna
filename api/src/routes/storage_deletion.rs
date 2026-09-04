@@ -482,7 +482,7 @@ pub async fn submit_purge(
     ))
 }
 
-async fn bucket_info(
+pub(crate) async fn bucket_info(
     state: &ServerState,
     bucket: &str,
 ) -> ServerResult<aruna_core::structs::BucketInfo> {

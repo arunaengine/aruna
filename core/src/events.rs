@@ -424,11 +424,11 @@ impl TryFrom<PlacementDecision> for DeclinedPolicy {
 pub enum LaunchDecline {
     /// The offering scheduler is not a holder in the target's current view.
     NotHolder,
-    /// Realm or group authorization denied the sealed submitter.
+    /// Realm or group authorization denied the stored submitter.
     Unauthorized,
     /// Placement evaluation blocked the execution subject; never `Allowed`.
     Policy(DeclinedPolicy),
-    /// Exact local admission found no capacity for the sealed resources.
+    /// Exact local admission found no capacity for the stored resources.
     Capacity,
     /// The target is draining or leaving and accepts no new work.
     Draining,
@@ -436,6 +436,9 @@ pub enum LaunchDecline {
     LaunchConflict,
     /// The request family was cancelled before the offer arrived.
     Cancelled,
+    /// This node already runs, or already ran successfully, an execution of the
+    /// same family. Retryable: another target may still take the launch.
+    AlreadyRunning,
 }
 
 /// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an

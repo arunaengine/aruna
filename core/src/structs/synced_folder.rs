@@ -76,7 +76,7 @@ impl RemoteBinding {
 }
 
 /// One local directory bound to a realm bucket prefix. The record is
-/// device-local: the root path is the one fact about the owner's machine that
+/// device-local: the root path is the one detail about the owner's machine that
 /// must never leave it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncedFolder {
@@ -253,7 +253,7 @@ pub struct PendingMark {
 }
 
 impl SyncBase {
-    /// Whether the entry is still waiting on the same facts it was reported
+    /// Whether the entry is still waiting on the same values it was reported
     /// for. A changed file or a newer realm version reopens the decision.
     pub fn holds_pending(&self, local: Option<&Observed>, remote: Option<&RemoteHead>) -> bool {
         let Some(mark) = self.pending_at.as_ref() else {

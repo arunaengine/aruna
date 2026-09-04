@@ -188,7 +188,7 @@ impl ControlGuard {
         self.persist()
     }
 
-    pub fn seal(&mut self, reference: String) -> Result<TombstoneEvidence, BackendError> {
+    pub fn store(&mut self, reference: String) -> Result<TombstoneEvidence, BackendError> {
         let record = self
             .record
             .as_mut()

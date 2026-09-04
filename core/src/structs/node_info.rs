@@ -103,7 +103,7 @@ pub struct NodeInfoDocument {
 
 impl NodeInfoDocument {
     /// Bounds every advertised attribute and rejects a backend whose subject
-    /// does not belong to this publisher or does not match its sealed digest.
+    /// does not belong to this publisher or does not match its stored digest.
     pub fn validate(&self) -> Result<(), AdvertisementError> {
         if self.executors.len() > MAX_ADVERTISED_EXECUTORS {
             return Err(AdvertisementError::ExecutorCount);
@@ -128,7 +128,7 @@ impl NodeInfoDocument {
     }
 
     /// Whether this advertisement replaces `stored`. Equal epochs do not
-    /// supersede, so a replayed advertisement never rewrites observed facts.
+    /// supersede, so a replayed advertisement never rewrites observed values.
     pub fn supersedes(&self, stored: &Self) -> bool {
         self.node_id == stored.node_id && self.epoch.supersedes(&stored.epoch)
     }

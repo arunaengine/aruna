@@ -3,6 +3,7 @@ mod access_index;
 pub mod bucket_cors;
 pub mod bucket_placement;
 pub mod bucket_routing;
+pub mod bucket_usage;
 pub mod complete_multipart_upload;
 pub mod copy_object;
 pub mod create_bucket;

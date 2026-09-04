@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 /// One physical execution as its own records describe it.
 #[derive(Debug, Default)]
-struct ExecutionFacts {
+struct ExecutionRecords {
     receipt: Option<ExecutionReceipt>,
     updates: Vec<ExecutionUpdate>,
     output: Option<ExecutionOutputRecord>,
@@ -30,7 +30,7 @@ pub fn reduce_family(
     records: &[JobRecordEnvelope],
 ) -> Result<Option<JobProjection>, JobRecordError> {
     let mut claims: Vec<SubmissionClaim> = Vec::new();
-    let mut executions: BTreeMap<Ulid, ExecutionFacts> = BTreeMap::new();
+    let mut executions: BTreeMap<Ulid, ExecutionRecords> = BTreeMap::new();
     let mut cancelled = false;
 
     for envelope in records.iter().filter(|record| record.family() == family) {
@@ -65,21 +65,28 @@ pub fn reduce_family(
     let mut successes: Vec<(Ulid, [u8; 32])> = Vec::new();
     let mut failures: Vec<(Ulid, [u8; 32])> = Vec::new();
     let mut active = false;
-    for (execution_id, facts) in &executions {
-        let Some(receipt) = &facts.receipt else {
+    for (execution_id, collected) in &executions {
+        let Some(receipt) = &collected.receipt else {
             // A receipt is the only proof that an execution exists at all.
             continue;
         };
-        let output_digest = facts
+        let output_digest = collected
             .output
             .as_ref()
             .map(|output| output.digest())
             .transpose()?;
-        let chain = verify_update_chain(receipt.digest()?, output_digest, &facts.updates)?;
+        let chain = verify_update_chain(receipt.digest()?, output_digest, &collected.updates)?;
         let state = chain
             .last()
             .map_or(PhysicalExecutionState::Accepted, |update| update.state);
         let observed_at_ms = chain.last().map(|update| update.observed_at_ms);
+        // The work starts when the target first reports it running; without
+        // such an update the acceptance is the closest replicated moment.
+        let started_at_ms = chain
+            .iter()
+            .find(|update| update.state == PhysicalExecutionState::Running)
+            .map(|update| update.observed_at_ms)
+            .or(Some(receipt.accepted_at_ms));
         let result = chain.last().and_then(|update| update.result.clone());
         if !state.is_terminal() {
             active = true;
@@ -100,6 +107,7 @@ pub fn reduce_family(
             executor_node_id: receipt.executor_node_id,
             state,
             role: ExecutionRole::Redundant,
+            started_at_ms,
             observed_at_ms,
             result,
         });
@@ -120,7 +128,7 @@ pub fn reduce_family(
 
     let outputs = success
         .and_then(|execution_id| executions.get(&execution_id))
-        .and_then(|facts| facts.output.as_ref())
+        .and_then(|collected| collected.output.as_ref())
         .map(|output| output.outputs.clone())
         .map_or_else(|| OutputSet::new(Vec::new()), Ok)?;
 

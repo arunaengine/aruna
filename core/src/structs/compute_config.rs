@@ -23,6 +23,9 @@ pub const DEFAULT_AVAILABILITY_STALE_MS: u64 = 300_000;
 /// wait before any witness launches while higher ranks are down, so an operator
 /// tunes the leaderless failover latency here instead of in a hidden constant.
 pub const DEFAULT_WITNESS_BASE_DELAY_MS: u64 = 30_000;
+/// How long a witness waits for a launch to produce a receipt, and how long an
+/// executor node may stay silent, before the round plans again: 5 minutes.
+pub const DEFAULT_CATCH_UP_AFTER_MS: u64 = 300_000;
 /// Groups one realm gives an explicit compute quota.
 pub const MAX_GROUP_COMPUTE_QUOTAS: usize = 256;
 
@@ -38,6 +41,8 @@ pub enum ComputeConfigError {
     DuplicateLink { from: String, to: String },
     #[error("witness base delay must be greater than zero")]
     ZeroWitnessDelay,
+    #[error("catch-up wait must be greater than zero")]
+    ZeroCatchUpWait,
     #[error("a realm configures at most {MAX_GROUP_COMPUTE_QUOTAS} group compute quotas")]
     QuotaCount,
     #[error("group {group_id} has two compute quotas")]
@@ -73,6 +78,9 @@ pub struct RealmComputeConfig {
     /// Applies to every group without its own entry.
     pub default_group_quota: ComputeQuota,
     pub group_quotas: Vec<GroupComputeQuota>,
+    /// Wait window before a round plans again: how long a launch may stay
+    /// without a receipt, and how long an executor node may stay silent.
+    pub catch_up_after_ms: u64,
 }
 
 impl Default for RealmComputeConfig {
@@ -84,6 +92,7 @@ impl Default for RealmComputeConfig {
             witness_base_delay_ms: DEFAULT_WITNESS_BASE_DELAY_MS,
             default_group_quota: ComputeQuota::default(),
             group_quotas: Vec::new(),
+            catch_up_after_ms: DEFAULT_CATCH_UP_AFTER_MS,
         }
     }
 }
@@ -102,6 +111,10 @@ impl RealmComputeConfig {
         // ranked fallback exists to avoid.
         if self.witness_base_delay_ms == 0 {
             return Err(ComputeConfigError::ZeroWitnessDelay);
+        }
+        // Zero would make every launch look overdue at once.
+        if self.catch_up_after_ms == 0 {
+            return Err(ComputeConfigError::ZeroCatchUpWait);
         }
         let mut seen = BTreeSet::new();
         for link in &self.links {
@@ -205,6 +218,14 @@ mod tests {
             }
             .validate(),
             Err(ComputeConfigError::ZeroWitnessDelay)
+        );
+        assert_eq!(
+            RealmComputeConfig {
+                catch_up_after_ms: 0,
+                ..Default::default()
+            }
+            .validate(),
+            Err(ComputeConfigError::ZeroCatchUpWait)
         );
     }
 

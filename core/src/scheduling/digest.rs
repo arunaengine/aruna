@@ -1,14 +1,14 @@
-//! The sealed plan digest. It covers every fact the plan was made from, so a
+//! The stored plan digest. It covers every value the plan was made from, so a
 //! launch that replays it can be checked against the same evidence.
 
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::cost::InputRoute;
-use crate::scheduling::facts::{PlanRequest, TargetCandidate, TargetScore};
+use crate::scheduling::inputs::{PlanRequest, TargetCandidate, TargetScore};
 
 pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v1";
 
 /// Digest over the request identity, the pinned inputs and their chosen
-/// sources, the target's eligibility facts and sealed subject, and the score.
+/// sources, the target's eligibility values and stored subject, and the score.
 /// `routes` is parallel to `request.inputs`, which is canonically ordered.
 pub fn plan_digest(
     request: &PlanRequest,
@@ -72,7 +72,7 @@ pub fn plan_digest(
     field(&mut hasher, Some(candidate.node_kind.label()));
     hasher.update(&capability.subject_digest);
     hasher.update(&capability.subject.generation.to_le_bytes());
-    for fact in [
+    for value in [
         candidate.active,
         candidate.compute_draining,
         candidate.group_allowed,
@@ -82,7 +82,7 @@ pub fn plan_digest(
         capability.network_policy,
         capability.policy_draining,
     ] {
-        flag(&mut hasher, fact);
+        flag(&mut hasher, value);
     }
     let ResourceEnvelope {
         max_cpu_cores,

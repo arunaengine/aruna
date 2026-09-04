@@ -1311,7 +1311,7 @@ async fn process_blob_replication_job(
         Err(error) => return Err(error.to_string()),
     };
     // Reference materialization writes real bytes on this node, so the job
-    // carries this node's destination facts; a node mid-transition refuses.
+    // carries this node's destination details; a node mid-transition refuses.
     let gate = match gate_context(context, job.input.auth_context.realm_id, now_ms()).await {
         Ok(gate) => gate,
         Err(error) => return Err(error.to_string()),

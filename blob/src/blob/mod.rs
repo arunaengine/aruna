@@ -62,12 +62,12 @@ pub struct BlobHandler {
     /// operation still holds would leave that work unable to roll back.
     group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
     reservation_active: Arc<StdMutex<HashSet<Ulid>>>,
-    /// Shutdown seal for the blob write path, mirroring the storage seal so a
+    /// Shutdown close for the blob write path, mirroring the storage close so a
     /// mutation cannot land on a backend behind the final storage sync.
-    sealed: Arc<AtomicBool>,
-    /// Serializes sealing against the mutating dispatch: `seal` write-locks it,
-    /// each mutation read-locks across the seal check and registering itself.
-    seal_lock: Arc<StdRwLock<()>>,
+    closed: Arc<AtomicBool>,
+    /// Serializes closing against the mutating dispatch: `close_writes` locks it,
+    /// each mutation read-locks across the close check and registering itself.
+    close_lock: Arc<StdRwLock<()>>,
     rejected_writes: Arc<AtomicU64>,
     writes_in_flight: Arc<AtomicUsize>,
     writes_drained: Arc<Notify>,

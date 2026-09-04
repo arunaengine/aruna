@@ -3,6 +3,7 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     Actor, AuthContext, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
     JobResultPayload, JobState, MetadataRegistryRecord, Permission, RunCrateStatus,
+    key_content_type,
 };
 use serde_json::json;
 use ulid::Ulid;
@@ -290,7 +291,8 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
             "@id": id.clone(),
             "@type": "File",
             "name": output.key.clone(),
-            "contentSize": output.size.to_string()
+            "contentSize": output.size.to_string(),
+            "encodingFormat": key_content_type(&output.key)
         }));
         part_ids.push(id);
     }
@@ -712,6 +714,7 @@ mod tests {
         let output = by_id("s3://src/out.txt");
         assert_eq!(output["name"], "out.txt");
         assert_eq!(output["contentSize"], "7");
+        assert_eq!(output["encodingFormat"], "text/plain; charset=utf-8");
         let workspace = by_id("#workspace-bucket");
         assert_eq!(action["additionalProperty"][0]["@id"], "#workspace-bucket");
         assert_eq!(workspace["propertyID"], WORKSPACE_PROPERTY);
@@ -782,6 +785,35 @@ mod tests {
         assert!(graph.iter().any(|entity| {
             entity["propertyID"] == WORKSPACE_PROPERTY && entity["value"] == "workspace-sample-one"
         }));
+    }
+
+    #[test]
+    fn crate_meets_builtin_profile() {
+        // The built-in shapes must accept what this generator writes.
+        use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
+        use crate::metadata::profile_shacl::{ProfileShaclEngine, ProfileShapes};
+
+        let (record, spec) = execution_record();
+        let jsonld =
+            build_run_crate_jsonld(&record, &spec, Ulid::from_bytes(record.job_id.to_bytes()));
+        let directory = tempfile::tempdir().unwrap();
+        let engine = ProfileShaclEngine::open(directory.path()).unwrap();
+        let report = engine
+            .evaluate(
+                &ProfileShapes {
+                    graph_iri: format!("{PROCESS_PROFILE}#shapes/{BUILTIN_REVISION}"),
+                    sources: vec![builtin_shapes(PROCESS_PROFILE).unwrap().to_string()],
+                },
+                &jsonld,
+            )
+            .unwrap();
+        let blocking: Vec<_> = report
+            .results
+            .iter()
+            .filter(|result| !result.severity.0.contains("Warning"))
+            .collect();
+        assert!(blocking.is_empty(), "{blocking:#?}");
+        assert!(report.structural.is_empty(), "{:#?}", report.structural);
     }
 
     #[test]

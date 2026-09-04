@@ -648,7 +648,7 @@ fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendEr
         ));
     }
     // The container is created with these two ceilings, so an attempt neither
-    // the sealed spec nor the backend bounds must never start.
+    // the stored spec nor the backend bounds must never start.
     enforced_limit(
         spec.resources.ram_bytes,
         config
@@ -1624,7 +1624,7 @@ impl ExecutorBackend for DockerBackend {
             Err(BackendError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        guard.seal(format!(
+        guard.store(format!(
             "{}/docker/attempts/{}/control.json",
             self.config.state_root.display(),
             context.attempt.external_name()
@@ -1743,6 +1743,7 @@ fn lost_status(name: &str) -> AttemptStatus {
         backend_ref: name.to_string(),
         started_at_ms: None,
         finished_at_ms: Some(now_ms()),
+        detail: None,
     }
 }
 
@@ -1762,6 +1763,15 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
     // An absent exit code is NOT a zero exit code: defaulting it would report a container
     // that died without ever reporting status as a clean success.
     let exit_code = state.exit_code.map(|code| code as i32);
+    let detail = match state.oom_killed {
+        Some(true) => Some("OOMKilled".to_string()),
+        _ => state
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+            .map(str::to_string),
+    };
 
     let phase = match state.status.unwrap_or(ContainerStateStatusEnum::EMPTY) {
         ContainerStateStatusEnum::RUNNING
@@ -1804,6 +1814,7 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
         backend_ref,
         started_at_ms,
         finished_at_ms,
+        detail,
     }
 }
 
@@ -2073,7 +2084,7 @@ mod tests {
 
     #[test]
     fn refuses_unbounded_attempt() {
-        // With no sealed ceiling and no backend default, the container would run
+        // With no stored ceiling and no backend default, the container would run
         // against the whole host, so it must never be created.
         let unbounded = DockerConfig {
             default_mem_bytes: None,
@@ -2158,6 +2169,7 @@ mod tests {
             backend_ref: "id".to_string(),
             started_at_ms: None,
             finished_at_ms: None,
+            detail: None,
         };
         assert!(is_fresh_created(&fresh));
         // Anything that ever ran (or whose state is unreadable but timestamped)

@@ -1,15 +1,15 @@
-//! Directed network cost and ranking. An unknown fact makes a target rank
+//! Directed network cost and ranking. An unknown value makes a target rank
 //! worse; it never becomes capacity the target did not advertise.
 
 use crate::NodeId;
 use crate::compute::ExecutorCapability;
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::eligibility::allows;
-use crate::scheduling::facts::{PlanRequest, ResolvedInput, TargetCandidate, TargetScore};
+use crate::scheduling::inputs::{PlanRequest, ResolvedInput, TargetCandidate, TargetScore};
 use crate::structs::{DEFAULT_LOCATION, PlacementSubject, RealmComputeConfig};
 use std::collections::BTreeMap;
 
-/// Rank value of an unknown or stale ranking fact: as bad as a fully loaded
+/// Rank value of an unknown or stale ranking hint: as bad as a fully loaded
 /// site, and still only a rank.
 pub const UNKNOWN_PERMILLE: u32 = 1_000;
 

@@ -39,7 +39,7 @@ impl OfferedDirectory {
 /// fingerprint carrying one is incomplete and can never stand in for a hash.
 const UNKNOWN_FIELD: &str = "?";
 
-/// The stat facts one weak fingerprint is built from. Size and mtime alone are
+/// The stat values one weak fingerprint is built from. Size and mtime alone are
 /// forgeable: a rewrite can restore both. The change time and the inode cannot
 /// be set by a user tool, so a rewritten file always moves one of them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ pub struct FileStat {
 }
 
 impl FileStat {
-    /// Every stat fact of one local file. The inode and change time are read
+    /// Every stat value of one local file. The inode and change time are read
     /// where the platform has them and are absent otherwise, which makes the
     /// fingerprint incomplete rather than wrong.
     pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
@@ -123,7 +123,7 @@ fn field(value: Option<u128>) -> String {
     }
 }
 
-/// Whether a fingerprint carries every stat fact. Only a complete one may stand
+/// Whether a fingerprint carries every stat value. Only a complete one may stand
 /// in for reading the file: an unknown field says the filesystem did not answer,
 /// which is exactly when the bytes have to be hashed instead.
 pub fn fingerprint_complete(fingerprint: &str) -> bool {
@@ -168,7 +168,7 @@ mod tests {
         }
     }
 
-    // Every stat fact has to move the fingerprint. Size and mtime alone are not
+    // Every stat value has to move the fingerprint. Size and mtime alone are not
     // enough: a rewrite can restore both, and the change time cannot be, so a
     // file that changed under a preserved mtime must still look different.
     #[test]

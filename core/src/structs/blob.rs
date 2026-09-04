@@ -1,4 +1,6 @@
-use crate::credential_seal::{CredentialSealKey, SealError, SealedS3Secret, credential_aad};
+use crate::credential_encryption::{
+    CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
+};
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
@@ -22,6 +24,48 @@ pub const HIDDEN_BLOB_PREFIX: &str = "_jobs";
 /// share a namespace with tenant-written keys.
 pub const MULTIPART_PART_PREFIX: &str = "_parts";
 pub const OBJECT_CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
+
+/// MIME type implied by a key's extension, for writers that have no declared
+/// type. A captured `chart.png` must serve as an image rather than a download.
+pub fn key_content_type(key: &str) -> &'static str {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    let extension = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => extension.to_ascii_lowercase(),
+        _ => return "application/octet-stream",
+    };
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "jsonld" => "application/ld+json",
+        "yaml" | "yml" => "application/yaml",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "txt" | "log" => "text/plain; charset=utf-8",
+        "md" => "text/markdown; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "ts" => "text/x.typescript; charset=utf-8",
+        "py" => "text/x-python; charset=utf-8",
+        "sh" => "application/x-sh",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "zst" => "application/zstd",
+        "parquet" => "application/vnd.apache.parquet",
+        "arrow" => "application/vnd.apache.arrow.file",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
 
 pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {
     for component in path.components() {
@@ -814,7 +858,7 @@ pub struct ManagedCopyRecord {
     pub version: VersionKey,
     pub node_id: NodeId,
     pub location: BackendLocation,
-    /// Refs sealed with the copy, canonically sorted. Empty means unrestricted.
+    /// Refs stored with the copy, canonically sorted. Empty means unrestricted.
     pub policies: Vec<PlacementPolicyRef>,
     /// Subject generation the gate admitted this copy under. A later advance
     /// makes the row evidence about a subject this node no longer advertises.
@@ -845,9 +889,9 @@ impl ManagedCopyRecord {
         })
     }
 
-    /// Seals the admitting subject generation. Zero means no gate ever ran, so
+    /// Stores the admitting subject generation. Zero means no gate ever ran, so
     /// the row can never match a node that advertises a subject.
-    pub fn sealed_under(mut self, subject_generation: u64) -> Self {
+    pub fn stored_under(mut self, subject_generation: u64) -> Self {
         self.subject_generation = subject_generation;
         self
     }
@@ -967,7 +1011,7 @@ pub struct BlobVersion {
     /// versions so the record is accountable to the asserting node rather than
     /// only to the manifest's self-asserted `created_by`.
     pub published_by: Option<NodeId>,
-    /// Effective refs sealed when this version was minted, canonically sorted.
+    /// Effective refs stored when this version was minted, canonically sorted.
     /// Empty means unrestricted; a later attachment mints a successor instead.
     pub placement_policies: Vec<PlacementPolicyRef>,
 }
@@ -1032,7 +1076,7 @@ impl BlobVersion {
         self
     }
 
-    /// Seals the effective ref set in its one canonical, bounded form.
+    /// Stores the effective ref set in its one canonical, bounded form.
     pub fn with_policies(
         mut self,
         policies: Vec<PlacementPolicyRef>,
@@ -1168,9 +1212,9 @@ pub struct UserAccess {
     pub access_key: String,
     pub user_identity: UserId,
     pub group_id: Ulid,
-    /// Authenticated ciphertext of the S3 secret, sealed with an issuer-local
+    /// Authenticated ciphertext of the S3 secret, encrypted with an issuer-local
     /// key and bound to this record's identity. The plaintext never rests here.
-    pub secret: SealedS3Secret,
+    pub secret: EncryptedS3Secret,
     pub expiry: SystemTime,
     pub path_restrictions: Option<Vec<PathRestriction>>,
     pub issued_by: [u8; 32],
@@ -1210,7 +1254,7 @@ impl UserAccess {
         self.revoked_at.is_some()
     }
 
-    /// AAD binding the sealed secret to this record's identity fields.
+    /// AAD binding the encrypted secret to this record's identity fields.
     pub fn credential_aad(&self) -> Vec<u8> {
         credential_aad(
             &self.access_key,
@@ -1221,18 +1265,18 @@ impl UserAccess {
         )
     }
 
-    /// Seals `plaintext` into `self.secret`, bound to this record's identity.
-    pub fn seal_secret(
+    /// Encrypts `plaintext` into `self.secret`, bound to this record's identity.
+    pub fn encrypt_secret(
         &mut self,
-        key: &CredentialSealKey,
+        key: &CredentialEncryptionKey,
         plaintext: &str,
-    ) -> Result<(), SealError> {
-        self.secret = SealedS3Secret::seal(key, plaintext, &self.credential_aad())?;
+    ) -> Result<(), EncryptionError> {
+        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad())?;
         Ok(())
     }
 
     /// Recovers the plaintext secret; only the issuing node's key can succeed.
-    pub fn open_secret(&self, key: &CredentialSealKey) -> Result<String, SealError> {
+    pub fn open_secret(&self, key: &CredentialEncryptionKey) -> Result<String, EncryptionError> {
         self.secret.open(key, &self.credential_aad())
     }
 }
@@ -1244,7 +1288,7 @@ mod tests {
         BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
         HashPathIndexKey, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
         ManagedCopyState, VersionKey, blob_bucket_permission_path, blob_group_permission_path,
-        blob_object_permission_path,
+        blob_object_permission_path, key_content_type,
     };
     use crate::NodeId;
     use crate::errors::ConversionError;
@@ -1314,7 +1358,7 @@ mod tests {
             access_key: "access".into(),
             user_identity: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             group_id: Ulid::generate(),
-            secret: crate::credential_seal::SealedS3Secret::empty(),
+            secret: crate::credential_encryption::EncryptedS3Secret::empty(),
             expiry: now + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: [0u8; 32],
@@ -1332,29 +1376,29 @@ mod tests {
         assert!(revoked.is_revoked());
     }
 
-    // Sealed credentials open only on the issuing node and only while unmoved.
+    // Encrypted credentials open only on the issuing node and only while unmoved.
     #[test]
-    fn sealed_binds_record() {
+    fn secret_binds_record() {
         use super::UserAccess;
-        use crate::credential_seal::{CredentialSealKey, SealedS3Secret};
+        use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
         use std::time::Duration;
 
         let issuer = *iroh::SecretKey::from_bytes(&[9u8; 32]).public().as_bytes();
-        let key = CredentialSealKey::derive(&[9u8; 32]);
+        let key = CredentialEncryptionKey::derive(&[9u8; 32]);
         let mut access = UserAccess {
             access_key: "AKIA".into(),
             user_identity: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             group_id: Ulid::generate(),
-            secret: SealedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: issuer,
             revoked_at: None,
         };
-        access.seal_secret(&key, "the-secret").unwrap();
+        access.encrypt_secret(&key, "the-secret").unwrap();
         assert_eq!(access.open_secret(&key).unwrap(), "the-secret");
 
-        let other = CredentialSealKey::derive(&[1u8; 32]);
+        let other = CredentialEncryptionKey::derive(&[1u8; 32]);
         assert!(access.open_secret(&other).is_err());
 
         let mut moved = access.clone();
@@ -1919,5 +1963,17 @@ mod tests {
         let restored = BucketCorsConfiguration::from_bytes(&config.to_bytes().unwrap()).unwrap();
 
         assert_eq!(config, restored);
+    }
+
+    #[test]
+    fn maps_key_extension() {
+        assert_eq!(key_content_type("results/run/chart.PNG"), "image/png");
+        assert_eq!(key_content_type("summary.json"), "application/json");
+        assert_eq!(key_content_type("notes.md"), "text/markdown; charset=utf-8");
+        // No extension, a dotfile, and an unknown suffix all stay opaque.
+        assert_eq!(key_content_type("data/blob"), "application/octet-stream");
+        assert_eq!(key_content_type(".bashrc"), "application/octet-stream");
+        assert_eq!(key_content_type("a.unknown"), "application/octet-stream");
+        assert_eq!(key_content_type("dir.png/file"), "application/octet-stream");
     }
 }

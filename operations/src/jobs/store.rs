@@ -62,7 +62,7 @@ pub enum JobMutationError {
     ReportFrozen,
     #[error("attempt control epoch mismatch")]
     EpochMismatch,
-    #[error("execution output record digest conflicts with the sealed digest")]
+    #[error("execution output record digest conflicts with the stored digest")]
     OutputRecordConflict,
     #[error(transparent)]
     IllegalTransition(#[from] JobTransitionError),
@@ -207,7 +207,7 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
         ));
     }
     // Epochs are handed out from 1; every used epoch left a control row and, on
-    // a terminal success, the output record sealed under the same key.
+    // a terminal success, the output record stored under the same key.
     for epoch in 1..record.next_attempt_epoch {
         deletes.push((
             JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
@@ -1160,7 +1160,7 @@ where
     .await
 }
 
-/// The signed output record the attempt already sealed, if any. It shares the
+/// The signed output record the attempt already stored, if any. It shares the
 /// attempt-control key, so pruning the job removes both.
 pub async fn read_output_record(
     storage: &StorageHandle,
@@ -1814,25 +1814,7 @@ pub async fn transition_to_preparing(
     .await
 }
 
-/// Record the durable workspace bucket name on a claimed execution job; no state
-/// change so `Preparing` can persist the bucket before flipping it `Active`.
-pub async fn set_workspace_bucket(
-    storage: &StorageHandle,
-    job_id: JobId,
-    token: Ulid,
-    bucket: String,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
-        guard_token(record, token)?;
-        record.workspace_bucket = Some(bucket.clone());
-        record.updated_at_ms = now_ms;
-        Ok(JobMutation::Persist)
-    })
-    .await
-}
-
-/// `Preparing -> Ready`: workspace prepared and credentials minted.
+/// `Preparing -> Ready`: inputs staged and credentials minted.
 pub async fn transition_to_ready(
     storage: &StorageHandle,
     job_id: JobId,
@@ -4284,7 +4266,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_record_cas() {
-        // A replay may confirm the same digest, but a later seal cannot replace it.
+        // A replay may confirm the same digest, but a later write cannot replace it.
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA8; 16]);
         let token = Ulid::generate();

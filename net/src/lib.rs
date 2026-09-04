@@ -930,10 +930,12 @@ impl NetHandle {
         self.inner.endpoint.secret_key().sign(message)
     }
 
-    /// Issuer-local key that seals S3 credential secrets at rest. Derived from
-    /// this node's long-term secret, so only this node can unseal what it sealed.
-    pub fn credential_seal_key(&self) -> aruna_core::credential_seal::CredentialSealKey {
-        aruna_core::credential_seal::CredentialSealKey::derive(
+    /// Issuer-local key that encrypts S3 credential secrets at rest. Derived
+    /// from this node's secret, so only this node can decrypt what it wrote.
+    pub fn credential_encryption_key(
+        &self,
+    ) -> aruna_core::credential_encryption::CredentialEncryptionKey {
+        aruna_core::credential_encryption::CredentialEncryptionKey::derive(
             &self.inner.endpoint.secret_key().to_bytes(),
         )
     }
@@ -957,14 +959,14 @@ impl NetHandle {
         self.inner.document_sync.eviction_pending(placement)
     }
 
-    /// Seal a shard topic before a departing holder checks its eviction journal
-    /// and outbox, ordering those checks after any reset transaction.
-    pub fn seal_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<bool> {
-        self.inner.document_sync.seal_topic(topic_id)
+    /// Closes a shard topic before a departing holder checks its eviction
+    /// journal and outbox, ordering those checks after any reset transaction.
+    pub fn close_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<bool> {
+        self.inner.document_sync.close_topic(topic_id)
     }
 
-    pub fn unseal_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<()> {
-        self.inner.document_sync.unseal_topic(topic_id)
+    pub fn reopen_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<()> {
+        self.inner.document_sync.reopen_topic(topic_id)
     }
 
     /// Takes one genesis tie-break eviction into the re-emission hand-off. The
@@ -1593,7 +1595,7 @@ impl NetHandle {
         drop(tasks);
 
         // The endpoint is closed, so surviving handlers now fail their stream IO
-        // instead of blocking; join them before the caller seals storage.
+        // instead of blocking; join them before the caller closes storage.
         let inbound_drained =
             tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.inbound_tasks.wait())
                 .await

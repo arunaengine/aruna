@@ -505,7 +505,7 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         config.default_strategy_id = reducer_state.materialized_realm_config_default_strategy();
     }
 
-    // The sealed family strategy is immutable, so a materialized value always
+    // The stored family strategy is immutable, so a materialized value always
     // wins and an absent one never clears what the document already carries.
     if let Some(strategy_id) = reducer_state.materialized_family_strategy() {
         config.job_family_strategy_id = strategy_id;
@@ -1892,7 +1892,7 @@ impl AdminDocumentReducerState {
             .and_then(|value| Ulid::from_string(value).ok())
     }
 
-    /// The sealed submission-family strategy. A conflicted or nil value
+    /// The stored submission-family strategy. A conflicted or nil value
     /// materializes as `None`, which every derivation refuses.
     pub fn materialized_family_strategy(&self) -> Option<Ulid> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
@@ -6393,7 +6393,7 @@ mod tests {
 
     #[test]
     fn family_survives_rebuild() {
-        // A reducer-only rebuild must reproduce the sealed family strategy
+        // A reducer-only rebuild must reproduce the stored family strategy
         // instead of resetting it to the nil placeholder.
         let mut state = realm_config_state();
         let strategy_id = Ulid::from_bytes([4; 16]);
@@ -6441,7 +6441,7 @@ mod tests {
                 AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
             ))
             .unwrap();
-        let sealed = state.clone();
+        let stored = state.clone();
 
         assert_eq!(
             state.apply(&realm_config_event(
@@ -6465,7 +6465,7 @@ mod tests {
             )),
             Err(AdminDocumentReducerError::JobFamilyRemoved)
         );
-        assert_eq!(state, sealed);
+        assert_eq!(state, stored);
     }
 
     #[test]

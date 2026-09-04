@@ -3,7 +3,7 @@ use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::compute::Secret;
-use aruna_core::credential_seal::SealedS3Secret;
+use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus, AuthContext,
@@ -192,7 +192,7 @@ refused. The provider is registered for the calling user alone.
   URL to enter it at; the browser step happens outside Aruna.
 - The provider record is created right away with status `pending`, the fixed model set this node
   knows and `gpt-5.6-sol` as its default model.
-- The device code and its identifier are sealed with the provider and never reach the response.
+- The device code and its identifier are encrypted with the provider and never reach the response.
 - The login is completed by polling
   `POST /system/assistant/providers/{id}/login/poll`; nothing here waits for the user.
 - `label` falls back to `ChatGPT` when it is omitted or blank.
@@ -265,8 +265,8 @@ pub async fn start_login(
         kind: AssistantProviderKind::Chatgpt,
         label,
         base_url,
-        headers: SealedS3Secret::empty(),
-        secret: SealedS3Secret::empty(),
+        headers: EncryptedS3Secret::empty(),
+        secret: EncryptedS3Secret::empty(),
         models: static_models().into_iter().map(|model| model.id).collect(),
         default_model: Some("gpt-5.6-sol".to_string()),
         created_at: now,
@@ -285,7 +285,7 @@ pub async fn start_login(
             provider,
             secret,
             AssistantHeaders(BTreeMap::new()),
-            state.credential_seal_key().clone(),
+            state.credential_encryption_key().clone(),
         ),
         &state.get_ctx(),
     )
@@ -315,8 +315,8 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 
 **Behavior**
 - `status` is `pending` while the user has not confirmed the code, `ready` once the tokens are
-  sealed into the provider, `denied` when the user declined, and `expired` after the window closed.
-- On the first `ready` the tokens and the account id are sealed, the device code is dropped and the
+  encrypted into the provider, `denied` when the user declined, and `expired` after the window closed.
+- On the first `ready` the tokens and the account id are encrypted, the device code is dropped and the
   provider becomes usable; a provider that is already ready answers without asking the issuer.
 - Each call performs at most one upstream poll and never retries on its own: the caller polls until
   it sees a terminal status.
@@ -368,7 +368,7 @@ pub async fn poll_login(
         ));
     }
     let mut secret = provider
-        .open_secret(state.credential_seal_key())
+        .open_secret(state.credential_encryption_key())
         .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
     let device_auth_id = secret.device_auth_id.as_ref().ok_or_else(|| {
         ServerError::InternalError("ChatGPT pending login is incomplete".to_string())
@@ -441,8 +441,8 @@ pub async fn poll_login(
     provider.login_expires_at = None;
     provider.login_interval_seconds = None;
     provider
-        .seal_secret(state.credential_seal_key(), &secret)
-        .map_err(|_| ServerError::InternalError("provider seal failed".to_string()))?;
+        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
     save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((
         StatusCode::OK,
@@ -458,13 +458,13 @@ pub(super) async fn refresh_provider(
 ) -> ServerResult<AssistantProvider> {
     let prior_obtained = provider.token_obtained_at;
     let prior_secret = provider
-        .open_secret(state.credential_seal_key())
+        .open_secret(state.credential_encryption_key())
         .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
     let refresh_lock = state.chatgpt_lock(&provider.provider_id).await;
     let _guard = refresh_lock.lock().await;
     let mut provider = load_provider(state, provider.user_id, provider.provider_id).await?;
     let mut secret = provider
-        .open_secret(state.credential_seal_key())
+        .open_secret(state.credential_encryption_key())
         .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
     if provider.token_obtained_at != prior_obtained
         || secret.access_token != prior_secret.access_token
@@ -510,8 +510,8 @@ pub(super) async fn refresh_provider(
     }
     provider.token_obtained_at = Some(unix_timestamp_secs());
     provider
-        .seal_secret(state.credential_seal_key(), &secret)
-        .map_err(|_| ServerError::InternalError("provider seal failed".to_string()))?;
+        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
     save_provider(state, provider.user_id, expected, provider).await
 }
 
@@ -564,8 +564,8 @@ mod tests {
             kind: AssistantProviderKind::Chatgpt,
             label: "ChatGPT".to_string(),
             base_url,
-            headers: SealedS3Secret::empty(),
-            secret: SealedS3Secret::empty(),
+            headers: EncryptedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
             created_at: unix_timestamp_secs(),
@@ -584,7 +584,7 @@ mod tests {
                 provider.clone(),
                 secret,
                 AssistantHeaders(BTreeMap::new()),
-                state.credential_seal_key().clone(),
+                state.credential_encryption_key().clone(),
             ),
             &state.get_ctx(),
         )
@@ -605,8 +605,8 @@ mod tests {
             kind: AssistantProviderKind::Chatgpt,
             label: "ChatGPT".to_string(),
             base_url,
-            headers: SealedS3Secret::empty(),
-            secret: SealedS3Secret::empty(),
+            headers: EncryptedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
             created_at: unix_timestamp_secs(),
@@ -626,7 +626,7 @@ mod tests {
                 provider,
                 secret,
                 AssistantHeaders(BTreeMap::new()),
-                state.credential_seal_key().clone(),
+                state.credential_encryption_key().clone(),
             ),
             &state.get_ctx(),
         )
@@ -668,7 +668,9 @@ mod tests {
             .unwrap();
         assert_eq!(provider.status, AssistantProviderStatus::PendingLogin);
         assert_eq!(provider.label, "Work");
-        let secret = provider.open_secret(state.credential_seal_key()).unwrap();
+        let secret = provider
+            .open_secret(state.credential_encryption_key())
+            .unwrap();
         assert_eq!(secret.device_auth_id.as_ref().unwrap().expose(), "dev-1");
         handle.abort();
     }
@@ -750,7 +752,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(provider.status, AssistantProviderStatus::Ready);
-        let secret = provider.open_secret(state.credential_seal_key()).unwrap();
+        let secret = provider
+            .open_secret(state.credential_encryption_key())
+            .unwrap();
         assert_eq!(secret.access_token.as_ref().unwrap().expose(), "access-1");
         assert_eq!(secret.account_id.as_ref().unwrap().expose(), "acct_1");
         assert!(secret.device_auth_id.is_none());
@@ -897,7 +901,9 @@ mod tests {
         let state = Arc::new(state.with_chatgpt_urls(base_url.clone(), base_url.clone()));
         let provider = seed_ready(&state, &auth, base_url, 0).await;
         let refreshed = refresh_provider(&state, provider).await.unwrap();
-        let secret = refreshed.open_secret(state.credential_seal_key()).unwrap();
+        let secret = refreshed
+            .open_secret(state.credential_encryption_key())
+            .unwrap();
         assert_eq!(secret.access_token.as_ref().unwrap().expose(), "access-2");
         assert_eq!(secret.refresh_token.as_ref().unwrap().expose(), "refresh-2");
         assert_eq!(secret.account_id.as_ref().unwrap().expose(), "acct_1");
@@ -914,8 +920,8 @@ mod tests {
             kind: AssistantProviderKind::Chatgpt,
             label: "ChatGPT".to_string(),
             base_url: "http://127.0.0.1:1".to_string(),
-            headers: SealedS3Secret::empty(),
-            secret: SealedS3Secret::empty(),
+            headers: EncryptedS3Secret::empty(),
+            secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
             created_at: unix_timestamp_secs(),

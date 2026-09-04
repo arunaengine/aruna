@@ -1,4 +1,4 @@
-//! The terminal publication a receipted execution owes its family: the sealed
+//! The terminal publication a receipted execution owes its family: the stored
 //! output record, the update that names its digest, and the projection both
 //! must reduce to.
 
@@ -17,7 +17,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::jobs::lifecycle::updates::publish_terminal;
-use crate::jobs::output_record::seal_outputs;
+use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::tests::fixture::{Family, REALM, context};
 use crate::jobs::records::{
@@ -192,9 +192,9 @@ async fn publishes_terminal_success() {
         digest: None,
     }];
 
-    let output_digest = seal_outputs(&ctx, &commit.record, &control, &outputs)
+    let output_digest = store_outputs(&ctx, &commit.record, &control, &outputs)
         .await
-        .expect("outputs seal");
+        .expect("outputs stored");
     let mut terminal = record;
     terminal.state = JobState::Succeeded;
     terminal.finished_at_ms = Some(5_000);

@@ -1,6 +1,6 @@
 //! Ordered, bounded node shutdown.
 //!
-//! Ingress and writers stop before blob and storage are sealed, drained, and synced.
+//! Ingress and writers stop before blob and storage are closed, drained, and synced.
 
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -198,7 +198,7 @@ impl NodeShutdown {
             );
         }
 
-        // 5. Job workers write storage: drain them before the seal.
+        // 5. Job workers write storage: drain them before the close.
         let job_budget = writer_budget(budget.remaining());
         let job_grace = JOB_SHUTDOWN_GRACE.min(job_budget);
         let mut job_report = None;
@@ -270,10 +270,10 @@ impl NodeShutdown {
             .await;
         }
 
-        // 9. Seal blob writes, then drain the ones registered before the seal so
+        // 9. Close blob writes, then drain the ones registered before the close so
         //    their storage locations land before storage closes.
         let blob_rejected = if let Some(blob_handle) = self.blob_handle.as_ref() {
-            blob_handle.seal();
+            blob_handle.close_writes();
             let blob_drain = phase_slice(budget.remaining(), STORAGE_SLICE, BLOB_SLICE);
             if !blob_handle.drain_writes(blob_drain).await {
                 warn!("Blob writes outlived the shutdown drain");
@@ -283,9 +283,9 @@ impl NodeShutdown {
             0
         };
 
-        // 10. Seal the write path, then drain the mutations accepted before the
-        //     seal so they commit ahead of the fsync.
-        self.storage_handle.seal();
+        // 10. Close the write path, then drain the mutations accepted before the
+        //     close so they commit ahead of the fsync.
+        self.storage_handle.close_writes();
         let storage_drain = phase_slice(budget.remaining(), Duration::ZERO, STORAGE_SLICE);
         if !self.storage_handle.drain_accepted(storage_drain).await {
             // Undrained work must not commit behind the final fsync.
@@ -299,7 +299,7 @@ impl NodeShutdown {
         if rejected > 0 || blob_rejected > 0 {
             warn!(
                 storage_rejected = rejected,
-                blob_rejected, "Rejected writes issued after the shutdown seal"
+                blob_rejected, "Rejected writes issued after the shutdown close"
             );
         }
 
@@ -608,7 +608,7 @@ mod tests {
 
     // The whole point of the sequence: after it returns, no write lands.
     #[tokio::test]
-    async fn shutdown_seals_storage() {
+    async fn shutdown_closes_storage() {
         let dir = tempdir().expect("temp dir");
         let storage_handle = open_storage(&dir);
         let sequence = node_shutdown(Shutdown::new(), storage_handle.clone());
@@ -630,13 +630,13 @@ mod tests {
         assert!(matches!(
             event,
             Event::Storage(StorageEvent::Error {
-                error: StorageError::Sealed
+                error: StorageError::Closed
             })
         ));
         assert_eq!(storage_handle.rejected_writes(), 1);
     }
 
-    // Registered children are cancelled and joined before the seal.
+    // Registered children are cancelled and joined before the close.
     #[tokio::test]
     async fn shutdown_joins_children() {
         let dir = tempdir().expect("temp dir");
@@ -650,7 +650,7 @@ mod tests {
         shutdown.spawn(async move {
             child_shutdown.cancelled().await;
             // A child still writing here is inside the drain, so it commits
-            // before the seal rather than behind it.
+            // before the close rather than behind it.
             child_storage
                 .send_storage_effect(StorageEffect::Write {
                     key_space: "child".to_string(),
@@ -686,11 +686,11 @@ mod tests {
 
         sequence.run().await;
 
-        assert!(storage_handle.is_sealed());
+        assert!(storage_handle.writes_closed());
     }
 
     // With no budget left for any soft drain, every writer must still have
-    // stopped admitting work before storage is sealed.
+    // stopped admitting work before storage is closed.
     #[tokio::test]
     async fn zero_budget_closes() {
         let dir = tempdir().expect("temp dir");
@@ -715,7 +715,7 @@ mod tests {
         assert_eq!(shutdown.tracked_children(), 0);
         tokio::task::yield_now().await;
         assert!(!started.load(Ordering::SeqCst));
-        assert!(storage_handle.is_sealed());
+        assert!(storage_handle.writes_closed());
     }
 
     // A child that ignores cancellation must not hold up the sequence.
@@ -731,6 +731,6 @@ mod tests {
         sequence.run().await;
 
         assert!(shutdown.is_triggered());
-        assert!(storage_handle.is_sealed());
+        assert!(storage_handle.writes_closed());
     }
 }

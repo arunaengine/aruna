@@ -17,7 +17,7 @@ use super::super::store::{
 };
 use super::{
     DEFAULT_WALLTIME, build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel,
-    job_bucket, park_attempt, reload_task, requeue_after_tombstone, supervise_and_finalize,
+    job_bucket, park_attempt, prepare_inputs, requeue_after_tombstone, supervise_and_finalize,
     with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
@@ -416,7 +416,7 @@ pub(super) async fn resume_attempt(
                     return false;
                 };
                 let prepared =
-                    match Box::pin(reload_task(&context, &spec, &record, node_id, &bucket)).await {
+                    match Box::pin(prepare_inputs(&context, &spec, &record, node_id)).await {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;

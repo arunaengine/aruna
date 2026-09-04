@@ -12,25 +12,37 @@ use crate::types::{GroupId, UserId};
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 
-/// Supported RO-Crate specification IRIs and the RO-Crate community profiles
-/// (workflow run crates, Workflow RO-Crate) are version markers, not Profiles.
+/// The community Profile the node carries shapes for, so a crate tagged with it
+/// is validated without a realm document registering it.
+pub const PROCESS_RUN_CRATE_PROFILE_IRI: &str = "https://w3id.org/ro/wfrun/process/0.5";
+
+/// Whether the node validates this IRI from its own embedded shapes.
+pub fn is_builtin_profile(iri: &str) -> bool {
+    iri == PROCESS_RUN_CRATE_PROFILE_IRI
+}
+
+/// Supported RO-Crate specification IRIs and the remaining RO-Crate community
+/// profiles (workflow run crates, Workflow RO-Crate) are version markers, not
+/// Profiles. A built-in Profile is deliberately not a marker: it has to reach
+/// validation as a Profile tag for its embedded shapes to run.
 pub fn is_rocrate_specification(iri: &str) -> bool {
-    matches!(
-        iri,
-        "https://w3id.org/ro/crate/1.2" | "https://w3id.org/ro/crate/1.3"
-    ) || iri.starts_with("https://w3id.org/ro/wfrun/")
-        || iri.starts_with("https://w3id.org/workflowhub/workflow-ro-crate/")
+    !is_builtin_profile(iri)
+        && (matches!(
+            iri,
+            "https://w3id.org/ro/crate/1.2" | "https://w3id.org/ro/crate/1.3"
+        ) || iri.starts_with("https://w3id.org/ro/wfrun/")
+            || iri.starts_with("https://w3id.org/workflowhub/workflow-ro-crate/"))
 }
 
 #[cfg(test)]
 mod specification_tests {
-    use super::is_rocrate_specification;
+    use super::{PROCESS_RUN_CRATE_PROFILE_IRI, is_builtin_profile, is_rocrate_specification};
 
     #[test]
     fn community_profiles_are_markers() {
         assert!(is_rocrate_specification("https://w3id.org/ro/crate/1.3"));
         assert!(is_rocrate_specification(
-            "https://w3id.org/ro/wfrun/process/0.5"
+            "https://w3id.org/ro/wfrun/workflow/0.5"
         ));
         assert!(is_rocrate_specification(
             "https://w3id.org/workflowhub/workflow-ro-crate/1.0"
@@ -39,6 +51,14 @@ mod specification_tests {
             "https://w3id.org/aruna/profile/01J"
         ));
         assert!(!is_rocrate_specification("https://example.org/profile"));
+    }
+
+    #[test]
+    fn builtin_profile_tags() {
+        // The built-in Profile must tag, so it is never a bare version marker.
+        assert!(is_builtin_profile(PROCESS_RUN_CRATE_PROFILE_IRI));
+        assert!(!is_rocrate_specification(PROCESS_RUN_CRATE_PROFILE_IRI));
+        assert!(!is_builtin_profile("https://w3id.org/ro/wfrun/process/0.4"));
     }
 }
 
@@ -1194,7 +1214,8 @@ pub struct MetadataProfileValidationFinding {
     pub path: Option<String>,
     pub rule: String,
     pub message: String,
-    pub profile_revision: Option<Ulid>,
+    /// Registry event id of the evaluated Profile revision, or `builtin`.
+    pub profile_revision: Option<String>,
     pub completeness: MetadataProfileValidationCompleteness,
 }
 
@@ -1213,9 +1234,10 @@ pub struct MetadataProfileValidationStatus {
     /// The last event merged into the validated render; display only.
     pub dataset_revision: Ulid,
     pub state: MetadataProfileValidationState,
+    /// Absent for a built-in Profile, which no registry row defines.
     pub profile_id: Option<Ulid>,
     pub profile_iri: Option<String>,
-    pub profile_revision: Option<Ulid>,
+    pub profile_revision: Option<String>,
     pub evaluator: String,
     pub validated_at_ms: Option<u64>,
     pub findings: Vec<MetadataProfileValidationFinding>,
@@ -1232,7 +1254,9 @@ mod tests {
         METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataBearerToken,
         MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-        MetadataGraphLifecycleRecord, MetadataQueryResults, apply_raw_upsert,
+        MetadataGraphLifecycleRecord, MetadataProfileValidationCompleteness,
+        MetadataProfileValidationSeverity, MetadataProfileValidationState,
+        MetadataProfileValidationStatus, MetadataQueryResults, apply_raw_upsert,
         compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
@@ -1662,5 +1686,72 @@ mod tests {
         let rendered = format!("{token:?}");
         assert!(!rendered.contains("super-secret-value"));
         assert!(format!("{:?}", Some(token)).contains("redacted"));
+    }
+
+    #[test]
+    fn legacy_revision_decodes() {
+        // A Ulid postcard-encodes as its 26 character text, so rows written
+        // while the revision was a Ulid decode into the current String field.
+        #[derive(serde::Serialize)]
+        struct LegacyFinding {
+            code: String,
+            severity: MetadataProfileValidationSeverity,
+            focus_node: Option<String>,
+            path: Option<String>,
+            rule: String,
+            message: String,
+            profile_revision: Option<Ulid>,
+            completeness: MetadataProfileValidationCompleteness,
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacyStatus {
+            document_id: Ulid,
+            dataset_revision: Ulid,
+            state: MetadataProfileValidationState,
+            profile_id: Option<Ulid>,
+            profile_iri: Option<String>,
+            profile_revision: Option<Ulid>,
+            evaluator: String,
+            validated_at_ms: Option<u64>,
+            findings: Vec<LegacyFinding>,
+            completeness: MetadataProfileValidationCompleteness,
+            stale_reason: Option<String>,
+            dataset_digest: Option<[u8; 32]>,
+        }
+
+        let revision = Ulid::generate();
+        let legacy = LegacyStatus {
+            document_id: Ulid::generate(),
+            dataset_revision: Ulid::generate(),
+            state: MetadataProfileValidationState::Invalid,
+            profile_id: Some(Ulid::generate()),
+            profile_iri: Some("https://example.org/profile".to_string()),
+            profile_revision: Some(revision),
+            evaluator: "shacl".to_string(),
+            validated_at_ms: Some(7),
+            findings: vec![LegacyFinding {
+                code: "missing".to_string(),
+                severity: MetadataProfileValidationSeverity::Violation,
+                focus_node: None,
+                path: None,
+                rule: "rule".to_string(),
+                message: "message".to_string(),
+                profile_revision: Some(revision),
+                completeness: MetadataProfileValidationCompleteness::Complete,
+            }],
+            completeness: MetadataProfileValidationCompleteness::Complete,
+            stale_reason: None,
+            dataset_digest: Some([3u8; 32]),
+        };
+
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded: MetadataProfileValidationStatus = postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.profile_revision, Some(revision.to_string()));
+        assert_eq!(
+            decoded.findings[0].profile_revision,
+            Some(revision.to_string())
+        );
     }
 }

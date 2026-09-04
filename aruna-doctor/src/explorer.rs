@@ -279,7 +279,7 @@ enum DecodedValue {
         alternatives: usize,
         rejected: usize,
         overlapping: bool,
-        sealed_at_ms: u64,
+        stored_at_ms: u64,
     },
     ComputeDepartureReport {
         data: ComputeDepartureReport,
@@ -637,7 +637,7 @@ impl Serialize for JsonJobReservation {
         state.serialize_field("ram_bytes", &self.0.resources.ram_bytes)?;
         state.serialize_field("disk_bytes", &self.0.resources.disk_bytes)?;
         state.serialize_field("created_at_ms", &self.0.created_at_ms)?;
-        // The sealed site fence: a refusal to start is diagnosed from these two.
+        // The stored site fence: a refusal to start is diagnosed from these two.
         state.serialize_field("subject_generation", &self.0.subject_generation)?;
         state.serialize_field("subject_digest", &hex::encode(self.0.subject_digest))?;
         state.end()
@@ -1641,7 +1641,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 alternatives: data.plan.alternatives.len(),
                 rejected: data.plan.rejected.len(),
                 overlapping: data.overlapping,
-                sealed_at_ms: data.sealed_at_ms,
+                stored_at_ms: data.stored_at_ms,
             },
         ),
         COMPUTE_DEPARTURE_KEYSPACE => decode_value_with(
@@ -2446,7 +2446,7 @@ mod tests {
             },
             declined: Vec::new(),
             overlapping: false,
-            sealed_at_ms: 23,
+            stored_at_ms: 23,
         };
         let mut explain_key = test_family().to_bytes().to_vec();
         explain_key.extend_from_slice(test_node().as_bytes());
@@ -2464,7 +2464,7 @@ mod tests {
                 alternatives: 0,
                 rejected: 0,
                 overlapping: false,
-                sealed_at_ms: 23,
+                stored_at_ms: 23,
             }
         );
 
@@ -2618,7 +2618,7 @@ mod tests {
                 mode: PolicyRefMode::Union,
             },
             successor_version_id: Ulid::from_bytes([21_u8; 16]),
-            sealed_refs: Vec::new(),
+            effective_refs: Vec::new(),
             materialized: true,
         };
 
@@ -2962,6 +2962,7 @@ mod tests {
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
+            completing_since_ms: None,
         };
 
         let decoded = decode_entry(

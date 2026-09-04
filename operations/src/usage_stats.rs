@@ -226,7 +226,14 @@ impl UsageCounterUpdate {
                         Some(value) => UsageCounters::from_bytes(value.as_ref())?,
                         None => UsageCounters::default(),
                     };
-                    counters.apply(delta)?;
+                    for shortfall in counters.apply(delta)? {
+                        warn!(
+                            field = shortfall.field,
+                            key = hex::encode(key),
+                            shortfall = shortfall.missing,
+                            "usage counter decrement clamped at zero"
+                        );
+                    }
                     writes.push((
                         USAGE_STATS_KEYSPACE.to_string(),
                         key.clone().into(),
@@ -647,6 +654,9 @@ pub struct RebuildUsageStatsOperation {
     groups: HashMap<GroupId, UsageCounters>,
     existing_counter_keys: Vec<Vec<u8>>,
     stale_counter_deletes: Vec<(String, Key)>,
+    /// Materialized versions whose blob location row is gone; their bytes
+    /// cannot be recounted, so the rebuilt totals are low by that much.
+    orphan_versions: u64,
     output: Option<Result<UsageCounters, RebuildUsageStatsError>>,
 }
 
@@ -672,6 +682,7 @@ impl RebuildUsageStatsOperation {
             groups: HashMap::new(),
             existing_counter_keys: Vec::new(),
             stale_counter_deletes: Vec::new(),
+            orphan_versions: 0,
             output: None,
         }
     }
@@ -790,11 +801,13 @@ impl RebuildUsageStatsOperation {
                     }
 
                     let Some((logical_bytes, referenced_bytes)) = (match version.state {
-                        BlobVersionState::Materialized { blob_hash, .. } => self
-                            .blob_sizes
-                            .get(blob_hash.as_slice())
-                            .copied()
-                            .map(|size| (size, 0)),
+                        BlobVersionState::Materialized { blob_hash, .. } => {
+                            let size = self.blob_sizes.get(blob_hash.as_slice()).copied();
+                            if size.is_none() {
+                                self.orphan_versions += 1;
+                            }
+                            size.map(|size| (size, 0))
+                        }
                         BlobVersionState::Reference {
                             cached_metadata, ..
                         } => Some((0, cached_metadata.content_length)),
@@ -830,7 +843,15 @@ impl RebuildUsageStatsOperation {
             RebuildUsageStatsState::ScanBuckets => RebuildUsageStatsState::ScanBlobs,
             RebuildUsageStatsState::ScanBlobs => RebuildUsageStatsState::ScanHeads,
             RebuildUsageStatsState::ScanHeads => RebuildUsageStatsState::ScanVersions,
-            RebuildUsageStatsState::ScanVersions => RebuildUsageStatsState::ScanCounters,
+            RebuildUsageStatsState::ScanVersions => {
+                if self.orphan_versions > 0 {
+                    warn!(
+                        versions = self.orphan_versions,
+                        "rebuilt usage omits versions without a blob location row"
+                    );
+                }
+                RebuildUsageStatsState::ScanCounters
+            }
             RebuildUsageStatsState::ScanCounters => {
                 self.state = RebuildUsageStatsState::StartWriteTransaction;
                 return smallvec![Effect::Storage(StorageEffect::StartTransaction {

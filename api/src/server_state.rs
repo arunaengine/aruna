@@ -4,7 +4,7 @@ use crate::openapi::ApiDoc;
 use crate::routes::management_relay::ManagementUrlCache;
 use aruna_core::NodeId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
-use aruna_core::credential_seal::CredentialSealKey;
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -134,9 +134,9 @@ pub struct ServerState {
     realm_id: RealmId,
     // Realm membership
     node_id: NodeId,
-    // Issuer-local key that seals S3 credential secrets at rest, derived from
+    // Issuer-local key that encrypts S3 credential secrets at rest, derived from
     // this node's secret so it matches the S3 verifier on the same node.
-    credential_seal_key: CredentialSealKey,
+    credential_encryption_key: CredentialEncryptionKey,
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -144,8 +144,6 @@ pub struct ServerState {
     portal: Arc<RwLock<PortalRuntimeState>>,
     // Per-node Prometheus registry shared with the S3 server and ops listener.
     metrics: Arc<NodeMetrics>,
-    // True when this node can mount S3 inputs (Kubernetes with a CSI driver).
-    s3_mounts_available: bool,
     rocrate_limits: RoCrateLimits,
     // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
     trusted_proxies: Vec<ipnet::IpNet>,
@@ -253,11 +251,11 @@ impl ServerState {
             None
         };
         trusted_realms.insert(realm_id);
-        let credential_seal_key = driver_ctx
+        let credential_encryption_key = driver_ctx
             .net_handle
             .as_ref()
-            .map(|net| net.credential_seal_key())
-            .unwrap_or_else(CredentialSealKey::random);
+            .map(|net| net.credential_encryption_key())
+            .unwrap_or_else(CredentialEncryptionKey::random);
         let assistant_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none());
@@ -270,7 +268,7 @@ impl ServerState {
             driver_ctx,
             realm_id,
             node_id,
-            credential_seal_key,
+            credential_encryption_key,
             oidc_validator,
             jobs_runtime,
             node_capabilities,
@@ -280,7 +278,6 @@ impl ServerState {
             interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
             portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
             metrics: Arc::new(NodeMetrics::new()),
-            s3_mounts_available: false,
             rocrate_limits: RoCrateLimits::default(),
             trusted_proxies: Vec::new(),
             rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
@@ -332,17 +329,6 @@ impl ServerState {
     pub fn with_metrics(mut self, metrics: Arc<NodeMetrics>) -> Self {
         self.metrics = metrics;
         self
-    }
-
-    /// Records whether this node can mount S3 inputs, gating TES between mounted
-    /// and snapshot staging. Call before serving.
-    pub fn with_s3_mounts(mut self, available: bool) -> Self {
-        self.s3_mounts_available = available;
-        self
-    }
-
-    pub fn s3_mounts_available(&self) -> bool {
-        self.s3_mounts_available
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -408,8 +394,8 @@ impl ServerState {
         self.node_id
     }
 
-    pub fn credential_seal_key(&self) -> &CredentialSealKey {
-        &self.credential_seal_key
+    pub fn credential_encryption_key(&self) -> &CredentialEncryptionKey {
+        &self.credential_encryption_key
     }
 
     pub fn with_assistant_proxy(mut self, enabled: bool) -> Self {

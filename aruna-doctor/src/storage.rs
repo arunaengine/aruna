@@ -705,7 +705,7 @@ mod tests {
                         path_restrictions: None,
                         issued_by: *config.node_id.as_bytes(),
                     },
-                    aruna_core::credential_seal::CredentialSealKey::random(),
+                    aruna_core::credential_encryption::CredentialEncryptionKey::random(),
                 ),
                 context.as_ref(),
             )

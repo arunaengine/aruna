@@ -7,22 +7,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zeroize::Zeroize;
 
-const SEAL_CONTEXT: &str = "aruna s3 credential seal v1";
+const KEY_CONTEXT: &str = "aruna s3 credential seal v1";
 
-/// Node-held symmetric key that seals S3 credential secrets at rest. It is
+/// Node-held symmetric key that encrypts S3 credential secrets at rest. It is
 /// derived from the node's long-term secret, so only the issuing node can
-/// unseal, and it is reproduced identically across restarts.
+/// decrypt, and it is reproduced identically across restarts.
 #[derive(Clone, PartialEq, Eq)]
-pub struct CredentialSealKey([u8; 32]);
+pub struct CredentialEncryptionKey([u8; 32]);
 
-impl CredentialSealKey {
+impl CredentialEncryptionKey {
     /// Deterministic domain-separated derivation from the node's secret bytes.
     pub fn derive(node_secret: &[u8; 32]) -> Self {
-        Self(blake3::derive_key(SEAL_CONTEXT, node_secret))
+        Self(blake3::derive_key(KEY_CONTEXT, node_secret))
     }
 
-    /// Independent key with no issuing node; sealing stays self-consistent but
-    /// nothing derived from a real node secret can unseal it.
+    /// Independent key with no issuing node; encryption stays self-consistent but
+    /// nothing derived from a real node secret can decrypt it.
     pub fn random() -> Self {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).expect("operating system random number generator failed");
@@ -34,43 +34,43 @@ impl CredentialSealKey {
     }
 }
 
-impl fmt::Debug for CredentialSealKey {
+impl fmt::Debug for CredentialEncryptionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("CredentialSealKey(***)")
+        f.write_str("CredentialEncryptionKey(***)")
     }
 }
 
-impl Drop for CredentialSealKey {
+impl Drop for CredentialEncryptionKey {
     fn drop(&mut self) {
         self.0.zeroize();
     }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum SealError {
-    #[error("credential seal failed")]
-    Seal,
-    #[error("credential unseal failed")]
+pub enum EncryptionError {
+    #[error("credential encryption failed")]
+    Encrypt,
+    #[error("credential decryption failed")]
     Open,
-    #[error("sealed secret is not valid utf-8")]
+    #[error("encrypted secret is not valid utf-8")]
     Utf8,
 }
 
 /// Authenticated ciphertext of an S3 secret. The plaintext is never stored: it
 /// is returned once at issuance and re-derived only on the issuing node.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SealedS3Secret {
+pub struct EncryptedS3Secret {
     nonce: [u8; 24],
     ciphertext: Vec<u8>,
 }
 
-impl fmt::Debug for SealedS3Secret {
+impl fmt::Debug for EncryptedS3Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SealedS3Secret(***)")
+        f.write_str("EncryptedS3Secret(***)")
     }
 }
 
-impl SealedS3Secret {
+impl EncryptedS3Secret {
     /// Placeholder for records that never sign, such as the anonymous
     /// principal. Opening it always fails, so it can never authenticate.
     pub fn empty() -> Self {
@@ -80,9 +80,13 @@ impl SealedS3Secret {
         }
     }
 
-    pub fn seal(key: &CredentialSealKey, plaintext: &str, aad: &[u8]) -> Result<Self, SealError> {
+    pub fn encrypt(
+        key: &CredentialEncryptionKey,
+        plaintext: &str,
+        aad: &[u8],
+    ) -> Result<Self, EncryptionError> {
         let mut nonce = [0u8; 24];
-        getrandom::fill(&mut nonce).map_err(|_| SealError::Seal)?;
+        getrandom::fill(&mut nonce).map_err(|_| EncryptionError::Encrypt)?;
         let ciphertext = key
             .cipher()
             .encrypt(
@@ -92,11 +96,15 @@ impl SealedS3Secret {
                     aad,
                 },
             )
-            .map_err(|_| SealError::Seal)?;
+            .map_err(|_| EncryptionError::Encrypt)?;
         Ok(Self { nonce, ciphertext })
     }
 
-    pub fn open(&self, key: &CredentialSealKey, aad: &[u8]) -> Result<String, SealError> {
+    pub fn open(
+        &self,
+        key: &CredentialEncryptionKey,
+        aad: &[u8],
+    ) -> Result<String, EncryptionError> {
         let plaintext = key
             .cipher()
             .decrypt(
@@ -106,12 +114,12 @@ impl SealedS3Secret {
                     aad,
                 },
             )
-            .map_err(|_| SealError::Open)?;
-        String::from_utf8(plaintext).map_err(|_| SealError::Utf8)
+            .map_err(|_| EncryptionError::Open)?;
+        String::from_utf8(plaintext).map_err(|_| EncryptionError::Utf8)
     }
 }
 
-/// Additional authenticated data binding a sealed secret to the fields that
+/// Additional authenticated data binding an encrypted secret to the fields that
 /// must not change: access key id, user, group, issuing node, and expiry. A
 /// record moved to another key, user, group, node, or expiry no longer opens.
 pub fn credential_aad(
@@ -152,28 +160,29 @@ mod tests {
     }
 
     #[test]
-    fn seal_open_roundtrip() {
-        let key = CredentialSealKey::derive(&[7u8; 32]);
+    fn encrypt_open_roundtrip() {
+        let key = CredentialEncryptionKey::derive(&[7u8; 32]);
         let aad = sample_aad();
-        let sealed = SealedS3Secret::seal(&key, "top-secret", &aad).unwrap();
-        assert_eq!(sealed.open(&key, &aad).unwrap(), "top-secret");
+        let encrypted = EncryptedS3Secret::encrypt(&key, "top-secret", &aad).unwrap();
+        assert_eq!(encrypted.open(&key, &aad).unwrap(), "top-secret");
     }
 
     #[test]
     fn wrong_key_fails() {
         // A copied record on a node with a different secret never yields plaintext.
         let aad = sample_aad();
-        let sealed =
-            SealedS3Secret::seal(&CredentialSealKey::derive(&[7u8; 32]), "s", &aad).unwrap();
-        let other = CredentialSealKey::derive(&[8u8; 32]);
-        assert_eq!(sealed.open(&other, &aad), Err(SealError::Open));
+        let encrypted =
+            EncryptedS3Secret::encrypt(&CredentialEncryptionKey::derive(&[7u8; 32]), "s", &aad)
+                .unwrap();
+        let other = CredentialEncryptionKey::derive(&[8u8; 32]);
+        assert_eq!(encrypted.open(&other, &aad), Err(EncryptionError::Open));
     }
 
     #[test]
     fn tampered_aad_fails() {
         // Rebinding any AAD field (here the group) fails the authentication tag.
-        let key = CredentialSealKey::derive(&[7u8; 32]);
-        let sealed = SealedS3Secret::seal(&key, "s", &sample_aad()).unwrap();
+        let key = CredentialEncryptionKey::derive(&[7u8; 32]);
+        let encrypted = EncryptedS3Secret::encrypt(&key, "s", &sample_aad()).unwrap();
         let moved = credential_aad(
             "AKIA",
             UserId::local(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
@@ -181,17 +190,18 @@ mod tests {
             [4u8; 32],
             SystemTime::UNIX_EPOCH,
         );
-        assert_eq!(sealed.open(&key, &moved), Err(SealError::Open));
+        assert_eq!(encrypted.open(&key, &moved), Err(EncryptionError::Open));
     }
 
     #[test]
     fn restart_reproduces_key() {
         // Restart re-derives the identical key from the same node secret.
-        let sealed =
-            SealedS3Secret::seal(&CredentialSealKey::derive(&[5u8; 32]), "s", &[]).unwrap();
+        let encrypted =
+            EncryptedS3Secret::encrypt(&CredentialEncryptionKey::derive(&[5u8; 32]), "s", &[])
+                .unwrap();
         assert_eq!(
-            sealed
-                .open(&CredentialSealKey::derive(&[5u8; 32]), &[])
+            encrypted
+                .open(&CredentialEncryptionKey::derive(&[5u8; 32]), &[])
                 .unwrap(),
             "s"
         );
@@ -200,8 +210,8 @@ mod tests {
     #[test]
     fn empty_never_opens() {
         assert!(
-            SealedS3Secret::empty()
-                .open(&CredentialSealKey::derive(&[1u8; 32]), &[])
+            EncryptedS3Secret::empty()
+                .open(&CredentialEncryptionKey::derive(&[1u8; 32]), &[])
                 .is_err()
         );
     }

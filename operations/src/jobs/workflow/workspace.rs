@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -10,12 +10,13 @@ use aruna_core::compute::{
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
-    InputMode, InputSelection, InputSource, JobError, JobInputFact, JobRecord,
-    MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection, PathRestriction,
-    Permission, PlacementPolicyRef, UserAccess, VersionedObjectArn, WorkspaceMode,
-    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
-    ensure_confined_relative_path, workspace_credential_id,
+    AttemptControl, AuthContext, BackendLocation, BucketInfo, CapturedInput, ExecutionSpec,
+    HashPathIndexKey, InputMode, InputSelection, InputSource, JobError, JobRecord,
+    MAX_EXECUTION_OUTPUTS, OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject,
+    OutputSelection, PathRestriction, Permission, PlacementPolicyRef, RealmId, UserAccess,
+    VersionedObjectArn, blob_bucket_permission_path, blob_group_permission_path,
+    blob_object_permission_path, ensure_confined_relative_path, key_content_type,
+    workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
+use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
@@ -97,75 +99,52 @@ pub async fn ensure_group_write(
     }
 }
 
-/// Create the durable run bucket `ws-{jobid}` under the job's group. Idempotent
-/// across attempts: an already-existing bucket is accepted.
-pub async fn ensure_workspace_bucket(
+/// Check that the bucket an `Existing`-mode run names belongs to the execution
+/// group and is writable by the caller. A run never creates a bucket.
+pub async fn check_workspace_bucket(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
     bucket: &str,
 ) -> Result<(), JobError> {
-    if record.workspace_mode == WorkspaceMode::Existing {
-        let info = Box::pin(drive(
-            GetBucketInfoOperation::new(bucket.to_string()),
-            context,
-        ))
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| bucket_lookup_error("workspace", error))?
-        .ok_or_else(|| JobError::permanent("existing workspace bucket not found"))?;
-        if info.group_id != spec.group_id {
-            return Err(JobError::permanent(
-                "existing workspace bucket is outside the execution group",
-            ));
-        }
-        let allowed = Box::pin(drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: record.created_by,
-                    realm_id: record.created_by.realm_id,
-                    path_restrictions: None,
-                    session: None,
-                },
-                path: blob_bucket_permission_path(
-                    record.created_by.realm_id,
-                    spec.group_id,
-                    node_id,
-                    bucket,
-                ),
-                required_permission: Permission::WRITE,
-            }),
-            context,
-        ))
-        .await
-        .map_err(|error| authorization_error("workspace", error))?;
-        return if allowed {
-            Ok(())
-        } else {
-            Err(JobError::permanent("workspace write access denied"))
-        };
-    }
-    let bucket_info = BucketInfo {
-        group_id: spec.group_id,
-        created_at: SystemTime::now(),
-        created_by: record.created_by,
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-    };
-    match Box::pin(drive(
-        CreateBucketOperation::new(bucket.to_string(), bucket_info),
+    let info = Box::pin(drive(
+        GetBucketInfoOperation::new(bucket.to_string()),
         context,
     ))
     .await
-    {
-        Ok(_) => Ok(()),
-        Err(CreateBucketError::BucketAlreadyExists) => Ok(()),
-        Err(error) => Err(JobError::retryable(format!(
-            "workspace bucket create failed: {error}"
-        ))),
+    .and_then(|result| result.transpose())
+    .map_err(|error| bucket_lookup_error("workspace", error))?
+    .ok_or_else(|| JobError::permanent("existing workspace bucket not found"))?;
+    if info.group_id != spec.group_id {
+        return Err(JobError::permanent(
+            "existing workspace bucket is outside the execution group",
+        ));
+    }
+    let allowed = Box::pin(drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: record.created_by,
+                realm_id: record.created_by.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            path: blob_bucket_permission_path(
+                record.created_by.realm_id,
+                spec.group_id,
+                node_id,
+                bucket,
+            ),
+            required_permission: Permission::WRITE,
+        }),
+        context,
+    ))
+    .await
+    .map_err(|error| authorization_error("workspace", error))?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(JobError::permanent("workspace write access denied"))
     }
 }
 
@@ -241,12 +220,12 @@ async fn mint_credential(
     let access_key = UserAccess::build_access_key(&key_id).map_err(|error| {
         JobError::permanent(format!("workspace credential key failed: {error}"))
     })?;
-    // The credential is issued and consumed on this node, so its secret seals
-    // and unseals with this node's issuer-local key.
-    let seal_key = context
+    // The credential is issued and consumed on this node, so its secret is
+    // encrypted and decrypted with this node's issuer-local key.
+    let encryption_key = context
         .net_handle
         .as_ref()
-        .map(|net| net.credential_seal_key())
+        .map(|net| net.credential_encryption_key())
         .ok_or_else(|| JobError::permanent("workspace credential needs a net handle"))?;
     match Box::pin(drive(
         GetUserAccessOperation::new(access_key.clone()),
@@ -264,8 +243,8 @@ async fn mint_credential(
                 return Err(JobError::permanent("workspace credential is invalid"));
             }
             if !access.is_expired(SystemTime::now()) {
-                let secret = access.open_secret(&seal_key).map_err(|error| {
-                    JobError::permanent(format!("workspace credential unseal failed: {error}"))
+                let secret = access.open_secret(&encryption_key).map_err(|error| {
+                    JobError::permanent(format!("workspace credential decryption failed: {error}"))
                 })?;
                 return Ok(WorkspaceCredential {
                     access_key: access.access_key,
@@ -301,7 +280,7 @@ async fn mint_credential(
                 issued_by: *node_id.as_bytes(),
             },
             key_id,
-            seal_key,
+            encryption_key,
         ),
         context,
     ))
@@ -312,6 +291,103 @@ async fn mint_credential(
         access_key: access.access_key,
         secret: secret.expose().to_string(),
     })
+}
+
+/// True when the launch bound an input to an exact source version. A mount
+/// serves the current head only, so such a job is staged instead of mounted.
+pub fn pinned_inputs(spec: &ExecutionSpec) -> bool {
+    spec.inputs.iter().any(|input| {
+        let InputSource::S3 { version_id, .. } = &input.source;
+        version_id.is_some()
+    })
+}
+
+/// One declared input resolved to the object it names.
+struct SourceObject {
+    path: String,
+    bucket: String,
+    key: String,
+    version: Option<Ulid>,
+}
+
+/// The object one input names, with no storage read: a source this node does
+/// not hold is read from its holder, which authorizes the read itself.
+fn source_object(input: &InputSelection) -> Result<SourceObject, JobError> {
+    let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    ensure_confined_relative_path(Path::new(key))
+        .map_err(|error| JobError::permanent(format!("invalid input key: {error}")))?;
+    let path = input
+        .container_path
+        .clone()
+        .ok_or_else(|| JobError::permanent("input has no container path"))?;
+    let version = version_id
+        .as_deref()
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| JobError::permanent(format!("invalid input version_id for {bucket}/{key}")))?;
+    Ok(SourceObject {
+        path,
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version,
+    })
+}
+
+/// Authorize the caller against one input this node holds. The bucket must
+/// belong to the execution group and grant the caller READ on the object.
+async fn authorize_source(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    source: &SourceObject,
+) -> Result<(), JobError> {
+    let bucket_info = Box::pin(drive(
+        GetBucketInfoOperation::new(source.bucket.clone()),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    .map_err(|error| bucket_lookup_error("input", error))?
+    .ok_or_else(|| JobError::permanent(format!("input bucket {} not found", source.bucket)))?;
+    if bucket_info.group_id != spec.group_id {
+        return Err(JobError::permanent(
+            "input bucket is outside the execution group",
+        ));
+    }
+    let allowed = Box::pin(drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: record.created_by,
+                realm_id: record.created_by.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            path: blob_object_permission_path(
+                record.created_by.realm_id,
+                spec.group_id,
+                node_id,
+                &source.bucket,
+                &source.key,
+            ),
+            required_permission: Permission::READ,
+        }),
+        context,
+    ))
+    .await
+    .map_err(|error| authorization_error("input", error))?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(JobError::permanent(format!(
+            "input {}/{} access denied",
+            source.bucket, source.key
+        )))
+    }
 }
 
 /// Validate mounted inputs and resolve the exact S3 objects exposed to the task.
@@ -326,62 +402,12 @@ pub async fn prepare_mounts(
         if input.mode != InputMode::Mount {
             return Err(JobError::permanent("mounted job contains a snapshot input"));
         }
-        let InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &input.source;
-        if version_id.is_some() {
-            return Err(JobError::permanent(
-                "mounted input versions are not supported",
-            ));
-        }
-        ensure_confined_relative_path(Path::new(key))
-            .map_err(|error| JobError::permanent(format!("invalid mounted input key: {error}")))?;
-        let path = input
-            .container_path
-            .clone()
-            .ok_or_else(|| JobError::permanent("mounted input has no container path"))?;
-        let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(|error| bucket_lookup_error("input", error))?
-            .ok_or_else(|| JobError::permanent(format!("input bucket {bucket} not found")))?;
-        if bucket_info.group_id != spec.group_id {
-            return Err(JobError::permanent(
-                "input bucket is outside the execution group",
-            ));
-        }
-        let allowed = Box::pin(drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: record.created_by,
-                    realm_id: record.created_by.realm_id,
-                    path_restrictions: None,
-                    session: None,
-                },
-                path: blob_object_permission_path(
-                    record.created_by.realm_id,
-                    spec.group_id,
-                    node_id,
-                    bucket,
-                    key,
-                ),
-                required_permission: Permission::READ,
-            }),
-            context,
-        ))
-        .await
-        .map_err(|error| authorization_error("input", error))?;
-        if !allowed {
-            return Err(JobError::permanent(format!(
-                "input {bucket}/{key} access denied"
-            )));
-        }
+        let source = source_object(input)?;
+        Box::pin(authorize_source(context, spec, record, node_id, &source)).await?;
         match Box::pin(drive(
             HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
+                bucket: source.bucket.clone(),
+                key: source.key.clone(),
                 version_id: None,
             }),
             context,
@@ -397,7 +423,8 @@ pub async fn prepare_mounts(
                 | HeadObjectError::DeleteMarker,
             ) => {
                 return Err(JobError::permanent(format!(
-                    "input {bucket}/{key} not found"
+                    "input {}/{} not found",
+                    source.bucket, source.key
                 )));
             }
             Err(error) => {
@@ -405,52 +432,180 @@ pub async fn prepare_mounts(
             }
         }
         mounts.push(S3Mount {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            path,
+            bucket: source.bucket,
+            key: source.key,
+            path: source.path,
         });
     }
     Ok(mounts)
 }
 
-/// Snapshot each declared input into the workspace bucket by copying resolved
-/// bytes (internal GetObject -> PutObject). v1 supports internal S3 sources only.
-pub async fn stage_inputs(
+/// Open one un-consumed stream per declared input, read straight from the object
+/// it names at the version the launch pinned, so peak memory stays bounded by a
+/// chunk. A target holding no copy reads that version from a legal holder.
+pub async fn load_direct_inputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
-    bucket: &str,
-    node_id: NodeId,
-) -> Result<(), JobError> {
-    for input in &spec.inputs {
-        Box::pin(stage_one_input(
-            context, spec, record, bucket, node_id, input,
-        ))
-        .await?;
-    }
-    Ok(())
-}
-
-/// Open one un-consumed stream per staged input; bytes flow only when the
-/// backend uploads them, so peak memory stays bounded by a chunk.
-pub async fn load_inputs(
-    context: &DriverContext,
-    spec: &ExecutionSpec,
-    record: &JobRecord,
-    bucket: &str,
     node_id: NodeId,
 ) -> Result<Vec<TaskInput>, JobError> {
-    let mut files = Vec::new();
+    let mut files = Vec::with_capacity(spec.inputs.len());
     let mut total_bytes = 0u64;
     for input in &spec.inputs {
-        let Some(path) = input.container_path.clone() else {
-            continue;
+        let source = source_object(input)?;
+        let staged = Box::pin(input_bytes(context, spec, record, node_id, input, &source)).await?;
+        let size = staged
+            .location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .or(staged.size)
+            .ok_or_else(|| {
+                JobError::retryable(format!(
+                    "input {}/{} has no size",
+                    source.bucket, source.key
+                ))
+            })?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAX_TRANSFER_BYTES)
+            .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
+        let stream = staged
+            .blob
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        files.push(TaskInput::from_stream(source.path, size, Box::pin(stream)));
+    }
+    Ok(files)
+}
+
+/// The bytes of one input: the local copy when this node holds it, and the exact
+/// stored version from a legal holder when it does not.
+async fn input_bytes(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    input: &InputSelection,
+    source: &SourceObject,
+) -> Result<StagedSource, JobError> {
+    let captured = || {
+        record
+            .captured_inputs
+            .iter()
+            .find(|captured| captured.destination_key == input.dest_key)
+    };
+    // A forwarded plan validated the source at its ingress endpoint already; a
+    // device plans nothing, so its own request is the only authority it has.
+    if let Some(remote) = input.source_node_id.filter(|remote| *remote != node_id) {
+        return match captured() {
+            Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin)).await,
+            None if local_is_user(context, record.created_by.realm_id).await => {
+                Box::pin(device_source(context, record, input, remote)).await
+            }
+            None => Err(JobError::permanent("captured inputs are missing")),
         };
+    }
+    Box::pin(authorize_source(context, spec, record, node_id, source)).await?;
+    let local = Box::pin(drive(
+        GetObjectOperation::new(GetObjectInput {
+            bucket: source.bucket.clone(),
+            key: source.key.clone(),
+            version_id: source.version,
+            range: None,
+            group_id: spec.group_id,
+            user_identity: record.created_by,
+            node_id,
+        }),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose());
+    let failure = match local {
+        Ok(Some(get)) => return Ok(StagedSource::from_local(get)),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    let Some(input_pin) = captured() else {
+        return Err(match failure {
+            Some(error) => source_input_error(error),
+            None => {
+                JobError::permanent(format!("input {}/{} not found", source.bucket, source.key))
+            }
+        });
+    };
+    // The planner credits a node that holds a registered copy of the bytes, so
+    // the same content under another key is read here instead of fetched again.
+    if let Some(staged) = Box::pin(local_copy_source(
+        context, spec, record, node_id, source, input_pin,
+    ))
+    .await
+    {
+        return Ok(staged);
+    }
+    let remote = Box::pin(remote_source(context, record, input, input_pin)).await;
+    match failure {
+        Some(error) => remote.map_err(|_| source_input_error(error)),
+        None => remote,
+    }
+}
+
+/// Registered copies of the same bytes this node holds itself, deduplicated by
+/// the object they name. Only copies of this realm on this node can be read
+/// locally, so everything else is dropped.
+fn local_copies(
+    candidates: Vec<HashPathIndexKey>,
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> Vec<HashPathIndexKey> {
+    let mut unique = BTreeMap::new();
+    for candidate in candidates {
+        if candidate.realm_id != realm_id || candidate.node_id != node_id {
+            continue;
+        }
+        let key = (
+            candidate.bucket.clone(),
+            candidate.key.clone(),
+            candidate.version_id,
+        );
+        unique.entry(key).or_insert(candidate);
+    }
+    unique.into_values().collect()
+}
+
+/// The captured bytes read from a local copy under another key. Every copy is
+/// authorized like the named input, and the first one that serves wins. `None`
+/// means no local copy is readable, so the caller falls back to a remote read.
+async fn local_copy_source(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    source: &SourceObject,
+    captured: &CapturedInput,
+) -> Option<StagedSource> {
+    let candidates = Box::pin(drive(
+        ResolveBlobPermissionPathsOperation::new(captured.blake3),
+        context,
+    ))
+    .await
+    .ok()?;
+    for candidate in local_copies(candidates, record.created_by.realm_id, node_id) {
+        let copy = SourceObject {
+            path: source.path.clone(),
+            bucket: candidate.bucket,
+            key: candidate.key,
+            version: Some(candidate.version_id),
+        };
+        if Box::pin(authorize_source(context, spec, record, node_id, &copy))
+            .await
+            .is_err()
+        {
+            continue;
+        }
         let get = Box::pin(drive(
             GetObjectOperation::new(GetObjectInput {
-                bucket: bucket.to_string(),
-                key: input.dest_key.clone(),
-                version_id: None,
+                bucket: copy.bucket,
+                key: copy.key,
+                version_id: copy.version,
                 range: None,
                 group_id: spec.group_id,
                 user_identity: record.created_by,
@@ -459,34 +614,12 @@ pub async fn load_inputs(
             context,
         ))
         .await
-        .and_then(|result| result.transpose())
-        .map_err(staged_input_error)?
-        .ok_or_else(|| JobError::permanent(format!("staged input {} missing", input.dest_key)))?;
-        let size = get
-            .location
-            .as_ref()
-            .map(|location| location.blob_size)
-            .or_else(|| {
-                get.source_metadata
-                    .as_ref()
-                    .map(|metadata| metadata.content_length)
-            })
-            .ok_or_else(|| {
-                JobError::retryable(format!("staged input {} has no size", input.dest_key))
-            })?;
-        total_bytes = total_bytes
-            .checked_add(size)
-            .filter(|total| *total <= MAX_TRANSFER_BYTES)
-            .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
-        let stream = get.blob.map(|chunk| chunk.map_err(std::io::Error::other));
-        files.push(TaskInput::from_workspace(
-            path,
-            input.dest_key.clone(),
-            size,
-            Box::pin(stream),
-        ));
+        .and_then(|result| result.transpose());
+        if let Ok(Some(get)) = get {
+            return Some(StagedSource::from_local(get));
+        }
     }
-    Ok(files)
+    None
 }
 
 /// Export every declared file output under one write-ahead commit reservation, so
@@ -532,10 +665,7 @@ pub async fn capture_outputs(
             )
         })
         .collect();
-    // Plan section 10: an output inherits the union of its inputs' refs and the
-    // destination default, so a result can never be less constrained than what
-    // produced it.
-    let inherited = Box::pin(staged_input_policies(context, spec, record)).await?;
+    let inherited = Box::pin(input_policies(context, spec, record)).await?;
     let mut outputs = Vec::with_capacity(selections.len());
     for (selection, (destination_node_id, bucket, key)) in selections.iter().zip(&destinations) {
         let Some(version_id) = reserved
@@ -563,40 +693,29 @@ pub async fn capture_outputs(
     Ok(outputs)
 }
 
-/// Union of the refs every staged input carries. Read from the workspace copies
-/// themselves, so a restarted capture inherits exactly what staging sealed.
-async fn staged_input_policies(
+/// Union of the refs every input carries, so an output can never be less
+/// constrained than what produced it. The refs come from the captured inputs, so a
+/// node that holds no copy of an input still inherits its constraints.
+async fn input_policies(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
 ) -> Result<Vec<PlacementPolicyRef>, JobError> {
-    let bucket = super::job_bucket(record);
-    if bucket.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut refs = Vec::new();
     for input in &spec.inputs {
-        let head = Box::pin(drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.clone(),
-                key: input.dest_key.clone(),
-                version_id: None,
-            }),
-            context,
-        ))
-        .await
-        .and_then(|result| result.transpose());
-        match head {
-            Ok(Some(result)) => refs.extend(result.source_policies),
-            Ok(None)
-            | Err(
-                HeadObjectError::NoSuchKey
-                | HeadObjectError::NoSuchVersion
-                | HeadObjectError::DeleteMarker,
-            ) => {}
-            Err(error) => {
-                return Err(JobError::retryable(format!(
-                    "input policy lookup failed: {error}"
+        match record
+            .captured_inputs
+            .iter()
+            .find(|captured| captured.destination_key == input.dest_key)
+        {
+            Some(captured) => refs.extend(captured.policies.iter().copied()),
+            // A device captures no inputs and may never read governed content, so
+            // its inputs carry none; a realm node must not guess them.
+            None if local_is_user(context, record.created_by.realm_id).await => {}
+            None => {
+                return Err(JobError::permanent(format!(
+                    "input `{}` has no captured inputs to inherit refs from",
+                    input.dest_key
                 )));
             }
         }
@@ -794,7 +913,8 @@ async fn put_file_output(
         quota_ceiling,
         routing,
     })
-    .with_inherited_policies(inherited.to_vec());
+    .with_inherited_policies(inherited.to_vec())
+    .with_metadata(output_metadata(key));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -1004,6 +1124,15 @@ fn output_read_error(error: &BackendError) -> JobError {
     }
 }
 
+/// A captured output carries the type its destination key implies, so a chart
+/// or a JSON result is served as itself instead of an opaque download.
+fn output_metadata(key: &str) -> HashMap<String, String> {
+    HashMap::from([(
+        OBJECT_CONTENT_TYPE_KEY.to_string(),
+        key_content_type(key).to_string(),
+    )])
+}
+
 /// Exact identity of one written output: the version this write created and the
 /// physical execution that produced it, both read back from the stored version.
 fn output_object(
@@ -1026,13 +1155,11 @@ fn output_object(
     }
 }
 
-/// One input's bytes plus the facts the workspace write needs, from the local
-/// copy or from a remote holder.
+/// One input's bytes and its size, from the local copy or from a remote holder.
 struct StagedSource {
     blob: BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>,
     location: Option<BackendLocation>,
     size: Option<u64>,
-    source_policies: Vec<PlacementPolicyRef>,
 }
 
 impl StagedSource {
@@ -1044,18 +1171,17 @@ impl StagedSource {
                 .source_metadata
                 .as_ref()
                 .map(|metadata| metadata.content_length),
-            source_policies: get.source_policies,
         }
     }
 }
 
-/// Stages one exact version from a legal holder. The sealed version and hash
+/// Stages one exact version from a legal holder. The stored version and hash
 /// are resolved first, so a remote read can never substitute other bytes.
 async fn remote_source(
     context: &DriverContext,
     record: &JobRecord,
     input: &InputSelection,
-    fact: &JobInputFact,
+    captured: &CapturedInput,
 ) -> Result<StagedSource, JobError> {
     let version = match &input.source {
         InputSource::S3 { version_id, .. } => version_id
@@ -1064,29 +1190,31 @@ async fn remote_source(
             .transpose()
             .map_err(|_| JobError::permanent("input version is invalid".to_string()))?,
     };
-    if version != Some(fact.version_id) || input.source_node_id != Some(fact.source_node_id) {
+    // The record's own source is the holder the plan picked. It may be any node
+    // with a registered copy, so only the pinned version has to match here; the
+    // hash and size below bind the bytes.
+    if version != Some(captured.version_id) {
         return Err(JobError::permanent(
-            "sealed remote input facts do not match the physical input".to_string(),
+            "captured remote input does not match the physical input".to_string(),
         ));
     }
     let staged = crate::jobs::lifecycle::stage::stage_remote_input(
         context,
         record,
         input,
-        fact.version_id,
-        fact.blake3,
+        captured.version_id,
+        captured.blake3,
     )
     .await?;
-    if staged.size != fact.bytes {
+    if staged.size != captured.bytes {
         return Err(JobError::permanent(
-            "staged input size differs from the sealed fact".to_string(),
+            "staged input size differs from the captured input".to_string(),
         ));
     }
     Ok(StagedSource {
         blob: staged.blob,
         location: None,
-        size: Some(fact.bytes),
-        source_policies: fact.policies.clone(),
+        size: Some(captured.bytes),
     })
 }
 
@@ -1140,7 +1268,6 @@ async fn device_source(
             blob,
             location: None,
             size: Some(size),
-            source_policies: Vec::new(),
         }),
         Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
             "staging {bucket}/{key} received no bytes"
@@ -1165,223 +1292,6 @@ fn device_read_error(bucket: &str, key: &str, error: BaoReadError) -> JobError {
     }
 }
 
-async fn stage_one_input(
-    context: &DriverContext,
-    spec: &ExecutionSpec,
-    record: &JobRecord,
-    bucket: &str,
-    node_id: NodeId,
-    input: &InputSelection,
-) -> Result<(), JobError> {
-    let InputSource::S3 {
-        bucket: src_bucket,
-        key: src_key,
-        version_id,
-    } = &input.source;
-    let version = version_id
-        .as_deref()
-        .map(Ulid::from_string)
-        .transpose()
-        .map_err(|_| {
-            JobError::permanent(format!(
-                "invalid input version_id for {src_bucket}/{src_key}"
-            ))
-        })?;
-    let staged = if let Some(source) = input.source_node_id.filter(|source| *source != node_id) {
-        // A forwarded plan has already validated the source at its ingress
-        // endpoint; only the explicit exact-version staging path is local here.
-        match record
-            .input_facts
-            .iter()
-            .find(|fact| fact.destination_key == input.dest_key)
-        {
-            Some(fact) => Box::pin(remote_source(context, record, input, fact)).await?,
-            None => {
-                if !local_is_user(context, record.created_by.realm_id).await {
-                    return Err(JobError::permanent(
-                        "sealed input facts are missing".to_string(),
-                    ));
-                }
-                Box::pin(device_source(context, record, input, source)).await?
-            }
-        }
-    } else {
-        let bucket_info = Box::pin(drive(
-            GetBucketInfoOperation::new(src_bucket.clone()),
-            context,
-        ))
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| bucket_lookup_error("input", error))?
-        .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
-        let allowed = Box::pin(drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: record.created_by,
-                    realm_id: record.created_by.realm_id,
-                    path_restrictions: None,
-                    session: None,
-                },
-                path: blob_object_permission_path(
-                    record.created_by.realm_id,
-                    bucket_info.group_id,
-                    node_id,
-                    src_bucket,
-                    src_key,
-                ),
-                required_permission: Permission::READ,
-            }),
-            context,
-        ))
-        .await
-        .map_err(|error| authorization_error("input", error))?;
-        if !allowed {
-            return Err(JobError::permanent(format!(
-                "input {src_bucket}/{src_key} access denied"
-            )));
-        }
-        let local = Box::pin(drive(
-            GetObjectOperation::new(GetObjectInput {
-                bucket: src_bucket.clone(),
-                key: src_key.clone(),
-                version_id: version,
-                range: None,
-                group_id: bucket_info.group_id,
-                user_identity: record.created_by,
-                node_id,
-            }),
-            context,
-        ))
-        .await
-        .and_then(|result| result.transpose());
-        // A target that holds no copy stages the exact sealed version from a legal
-        // holder through the managed-copy handshake instead of failing the launch.
-        match local {
-            Ok(Some(get)) => StagedSource::from_local(get),
-            Ok(None) => {
-                let fact = record
-                    .input_facts
-                    .iter()
-                    .find(|fact| fact.destination_key == input.dest_key)
-                    .ok_or_else(|| {
-                        JobError::permanent("sealed input facts are missing".to_string())
-                    })?;
-                Box::pin(remote_source(context, record, input, fact)).await?
-            }
-            Err(error) => {
-                let Some(fact) = record
-                    .input_facts
-                    .iter()
-                    .find(|fact| fact.destination_key == input.dest_key)
-                else {
-                    return Err(source_input_error(error));
-                };
-                match Box::pin(remote_source(context, record, input, fact)).await {
-                    Ok(staged) => staged,
-                    Err(_) => return Err(source_input_error(error)),
-                }
-            }
-        }
-    };
-    let get = staged;
-
-    let destination = match Box::pin(drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: bucket.to_string(),
-            key: input.dest_key.clone(),
-            version_id: None,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    {
-        Ok(Some(result)) => result.location,
-        Ok(None)
-        | Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        ) => None,
-        Err(error) => {
-            return Err(JobError::retryable(format!(
-                "input destination lookup failed: {error}"
-            )));
-        }
-    };
-    if staged_content_matches(
-        get.location.as_ref().map(blob_identity),
-        destination.as_ref().map(blob_identity),
-    ) {
-        return Ok(());
-    }
-    if destination.is_some() {
-        match spec.collision_policy {
-            CollisionPolicy::Reject => {
-                return Err(JobError::permanent(format!(
-                    "composition key conflict on {}",
-                    input.dest_key
-                )));
-            }
-            CollisionPolicy::KeepExisting => return Ok(()),
-            CollisionPolicy::Replace => {}
-        }
-    }
-
-    let content_length = get
-        .location
-        .as_ref()
-        .map(|location| location.blob_size)
-        .or(get.size);
-    let realm_config = Box::pin(drive(
-        GetRealmConfigOperation::new(record.created_by.realm_id),
-        context,
-    ))
-    .await
-    .map_err(|error| JobError::retryable(format!("quota lookup failed: {error}")))?;
-    let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
-    let routing = routing_snapshot(context, spec.group_id, bucket)
-        .await
-        .map_err(|error| routing_error("input stage", error))?;
-    let gate = gate_context(context, record.created_by.realm_id, now_ms())
-        .await
-        .map_err(|error| gate_error("input stage", error))?;
-    if gate.as_ref().is_some_and(|gate| !gate.admitting) {
-        return Err(gate_stopped("input stage"));
-    }
-    // The staged copy carries the source version's refs: staging can only
-    // tighten what the workspace bucket already requires.
-    let mut operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: record.created_by,
-        group_id: spec.group_id,
-        realm_id: record.created_by.realm_id,
-        node_id,
-        request: PutObjectInput {
-            bucket: bucket.to_string(),
-            key: input.dest_key.clone(),
-            content_length,
-            body: Some(get.blob),
-        },
-        expected_checksums: Vec::new(),
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling,
-        routing,
-    })
-    .with_inherited_policies(get.source_policies.clone())
-    .with_origin(aruna_core::structs::CopyOrigin::Staging);
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
-    }
-    Box::pin(drive(operation, context))
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| put_object_error("input stage", error))?;
-    Ok(())
-}
-
 fn bucket_lookup_error(scope: &str, error: GetBucketInfoError) -> JobError {
     let message = format!("{scope} bucket lookup failed: {error}");
     if matches!(&error, GetBucketInfoError::StorageError(error) if storage_retryable(error)) {
@@ -1400,15 +1310,6 @@ fn get_input_retryable(error: &GetObjectError) -> bool {
         GetObjectError::HistoricalReferenceUnavailable
         | GetObjectError::ReferenceAdvanceExhausted => false,
         _ => false,
-    }
-}
-
-fn staged_input_error(error: GetObjectError) -> JobError {
-    let message = format!("staged input read failed: {error}");
-    if get_input_retryable(&error) {
-        JobError::retryable(message)
-    } else {
-        JobError::permanent(message)
     }
 }
 
@@ -1473,24 +1374,6 @@ fn storage_retryable(error: &StorageError) -> bool {
             | StorageError::QueueFull
             | StorageError::Timeout
     )
-}
-
-fn blob_identity(location: &BackendLocation) -> (u64, Option<&[u8]>) {
-    (location.blob_size, location.get_blake3())
-}
-
-fn staged_content_matches(
-    source: Option<(u64, Option<&[u8]>)>,
-    destination: Option<(u64, Option<&[u8]>)>,
-) -> bool {
-    let (Some(source), Some(destination)) = (source, destination) else {
-        return false;
-    };
-    source.0 == destination.0
-        && matches!(
-            (source.1, destination.1),
-            (Some(source), Some(destination)) if source == destination
-        )
 }
 
 /// Attribute this execution's outputs under the declared prefixes. A listed key
@@ -1705,9 +1588,6 @@ mod tests {
 
     use super::*;
 
-    const HASH_A: [u8; 32] = [1; 32];
-    const HASH_B: [u8; 32] = [2; 32];
-
     fn spec(output_prefixes: Vec<String>) -> ExecutionSpec {
         ExecutionSpec {
             group_id: Ulid::from_bytes([2; 16]),
@@ -1742,6 +1622,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capture_sets_type() {
+        // The captured put must name the type, or a chart serves as a download.
+        let metadata = output_metadata("results/run-1/chart.png");
+        assert_eq!(
+            metadata.get(OBJECT_CONTENT_TYPE_KEY).map(String::as_str),
+            Some("image/png")
+        );
+        assert_eq!(
+            output_metadata("out/blob")
+                .get(OBJECT_CONTENT_TYPE_KEY)
+                .map(String::as_str),
+            Some("application/octet-stream")
+        );
+    }
+
     // Both input mappings must retry only transient drift: a job that waits on a
     // rebind or a dropped observation would burn its whole attempt budget.
     #[test]
@@ -1770,21 +1666,47 @@ mod tests {
     }
 
     #[test]
+    fn picks_local_copies() {
+        // Only copies of this realm on this node may be read locally, and one
+        // object named twice stays one candidate.
+        let hash = [7u8; 32];
+        let realm = RealmId::from_bytes([1u8; 32]);
+        let other_realm = RealmId::from_bytes([2u8; 32]);
+        let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let other_node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let group = Ulid::from_bytes([5; 16]);
+        let version = Ulid::from_bytes([6; 16]);
+        let alias = |realm_id, node_id, bucket: &str, key: &str| {
+            HashPathIndexKey::new(hash, version, realm_id, group, node_id, bucket, key)
+        };
+        let candidates = vec![
+            alias(realm, node, "shared", "reads.fastq"),
+            alias(realm, node, "shared", "reads.fastq"),
+            alias(realm, node, "other", "copy.fastq"),
+            alias(realm, other_node, "shared", "reads.fastq"),
+            alias(other_realm, node, "shared", "reads.fastq"),
+        ];
+
+        let picked = local_copies(candidates, realm, node);
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().all(|copy| copy.node_id == node));
+        assert!(picked.iter().all(|copy| copy.realm_id == realm));
+    }
+
+    #[test]
     fn classifies_input_errors() {
-        for map in [staged_input_error, source_input_error] {
-            assert_eq!(
-                map(GetObjectError::ReferenceSourceChanged).kind,
-                JobErrorKind::Retryable
-            );
-            assert_eq!(
-                map(GetObjectError::HistoricalReferenceUnavailable).kind,
-                JobErrorKind::Permanent
-            );
-            assert_eq!(
-                map(GetObjectError::ReferenceAdvanceExhausted).kind,
-                JobErrorKind::Permanent
-            );
-        }
+        assert_eq!(
+            source_input_error(GetObjectError::ReferenceSourceChanged).kind,
+            JobErrorKind::Retryable
+        );
+        assert_eq!(
+            source_input_error(GetObjectError::HistoricalReferenceUnavailable).kind,
+            JobErrorKind::Permanent
+        );
+        assert_eq!(
+            source_input_error(GetObjectError::ReferenceAdvanceExhausted).kind,
+            JobErrorKind::Permanent
+        );
     }
 
     // Transient fjall faults now carry their source; classification must key on
@@ -1809,39 +1731,6 @@ mod tests {
         ] {
             assert!(!storage_retryable(&error));
         }
-    }
-
-    #[test]
-    fn matching_stage_skips() {
-        assert!(staged_content_matches(
-            Some((5, Some(&HASH_A))),
-            Some((5, Some(&HASH_A)))
-        ));
-    }
-
-    #[test]
-    fn changed_stage_writes() {
-        assert!(!staged_content_matches(
-            Some((5, Some(&HASH_A))),
-            Some((6, Some(&HASH_A)))
-        ));
-        assert!(!staged_content_matches(
-            Some((5, Some(&HASH_A))),
-            Some((5, Some(&HASH_B)))
-        ));
-    }
-
-    #[test]
-    fn unknown_stage_writes() {
-        assert!(!staged_content_matches(Some((5, Some(&HASH_A))), None));
-        assert!(!staged_content_matches(
-            Some((5, Some(&HASH_A))),
-            Some((5, None))
-        ));
-        assert!(!staged_content_matches(
-            Some((5, None)),
-            Some((5, Some(&HASH_A)))
-        ));
     }
 
     #[tokio::test]
@@ -2055,7 +1944,7 @@ mod tests {
             1,
             None,
         );
-        let bucket = JobRecord::workspace_bucket_name(job_id);
+        let bucket = format!("run-{}", job_id.to_string().to_lowercase());
         CredentialFixture {
             context,
             net,
@@ -2194,8 +2083,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_foreign_seal() {
-        // A secret sealed by another node's key must refuse to be reused rather
+    async fn rejects_foreign_key() {
+        // A secret encrypted with another node's key must refuse to be reused rather
         // than hand the container an unusable or wrong secret.
         let CredentialFixture {
             context,
@@ -2219,8 +2108,8 @@ mod tests {
         .unwrap()
         .unwrap();
         access
-            .seal_secret(
-                &aruna_core::credential_seal::CredentialSealKey::random(),
+            .encrypt_secret(
+                &aruna_core::credential_encryption::CredentialEncryptionKey::random(),
                 "foreign",
             )
             .unwrap();
@@ -2237,14 +2126,14 @@ mod tests {
         let Err(error) =
             mint_workspace_credential(&context, &spec, &record, node_id, &bucket).await
         else {
-            panic!("a foreign seal must not yield a credential")
+            panic!("a foreign key must not yield a credential")
         };
 
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
         assert!(
             error
                 .message
-                .starts_with("workspace credential unseal failed")
+                .starts_with("workspace credential decryption failed")
         );
         net.shutdown().await;
     }
@@ -2285,7 +2174,7 @@ mod tests {
         let Err(within) =
             mint_input_credential(&context, &spec, &record, node_id, &buckets(25)).await
         else {
-            panic!("a credential cannot be sealed without a net handle")
+            panic!("a credential cannot be encrypted without a net handle")
         };
         assert_eq!(within.message, "workspace credential needs a net handle");
 
@@ -2299,6 +2188,95 @@ mod tests {
         assert!(
             over.message
                 .starts_with("workspace credential restrictions invalid")
+        );
+    }
+
+    #[test]
+    fn detects_pinned_versions() {
+        // The pin is what routes a mounted job to staged delivery, so an
+        // unpinned input must keep its mount and a pinned one must not.
+        let mut spec = spec(Vec::new());
+        let mut input = InputSelection {
+            source: InputSource::S3 {
+                bucket: "input".to_string(),
+                key: "data.csv".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "data.csv".to_string(),
+            mode: InputMode::Mount,
+            container_path: Some("/data.csv".to_string()),
+            name: None,
+            description: None,
+        };
+        spec.inputs.push(input.clone());
+        assert!(!pinned_inputs(&spec));
+
+        let InputSource::S3 { version_id, .. } = &mut input.source;
+        *version_id = Some(Ulid::from_bytes([7; 16]).to_string());
+        spec.inputs.push(input);
+        assert!(pinned_inputs(&spec));
+    }
+
+    #[tokio::test]
+    async fn inherits_effective_refs() {
+        // A node that holds no copy of the input must still inherit its refs,
+        // so they come from the captured inputs and a missing one fails closed.
+        let version = Ulid::from_bytes([7; 16]);
+        let mut spec = spec(Vec::new());
+        spec.inputs.push(InputSelection {
+            source: InputSource::S3 {
+                bucket: "input".to_string(),
+                key: "data.csv".to_string(),
+                version_id: Some(version.to_string()),
+            },
+            source_node_id: None,
+            dest_key: "in/data.csv".to_string(),
+            mode: InputMode::Mount,
+            container_path: Some("/in/data.csv".to_string()),
+            name: None,
+            description: None,
+        });
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let realm_id = RealmId([1; 32]);
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let mut record = JobRecord::new(
+            JobId::from_bytes([4; 16]),
+            JobPayload::Execution(spec.clone()),
+            UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+            node_id,
+            1,
+            1,
+            None,
+        );
+
+        let error = input_policies(&context, &spec, &record).await.unwrap_err();
+        assert_eq!(error.kind, JobErrorKind::Permanent);
+
+        let policy = PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([5; 16]),
+            digest: [6; 32],
+        };
+        record.captured_inputs.push(CapturedInput {
+            destination_key: "in/data.csv".to_string(),
+            source_node_id: node_id,
+            version_id: version,
+            blake3: [0; 32],
+            bytes: 4,
+            policies: vec![policy],
+        });
+
+        assert_eq!(
+            input_policies(&context, &spec, &record).await.unwrap(),
+            vec![policy]
         );
     }
 
