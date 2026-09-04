@@ -3148,6 +3148,9 @@ pub struct ProjectedExecution {
     pub executor_node_id: NodeId,
     pub state: PhysicalExecutionState,
     pub role: ExecutionRole,
+    /// When the work itself started: the first `Running` update, else the
+    /// moment the target accepted the launch.
+    pub started_at_ms: Option<u64>,
     pub observed_at_ms: Option<u64>,
     pub result: Option<PhysicalExecutionResult>,
 }
@@ -3903,6 +3906,7 @@ mod tests {
                 executor_node_id: node_id(9),
                 state: PhysicalExecutionState::Succeeded,
                 role: ExecutionRole::Canonical,
+                started_at_ms: Some(1_700_000_000_500),
                 observed_at_ms: Some(1_700_000_001_000),
                 result: Some(PhysicalExecutionResult {
                     exit_code: Some(0),
@@ -3972,7 +3976,7 @@ mod tests {
                 "15a1c2404110cfc66720b7a7bb8f77f33d199665e2c028229efa3c708b66917a",
                 "6a2c88bab322eae973d142690b0a2fb0ba7a5bf5c417df9cc515de498b26635d",
                 "f69a68ef56b007a54533ebdb696b806e43b4cf04a75fdb453449d22190853310",
-                "04f597da84b60c50ef81125d68373c978adc845af3fa4c2ff5b711cc243f0488",
+                "bb342189b2c25f4c3c70813b14199b2e1c0fc2b54e8869e05fff02957ffc5d79",
             ]
         );
         assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);

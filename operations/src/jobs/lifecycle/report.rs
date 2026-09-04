@@ -75,6 +75,9 @@ pub struct FamilyReport {
     pub executions: u32,
     /// Every known execution of the family, canonical or not.
     pub execution_list: Vec<ProjectedExecution>,
+    /// When the work started, taken from the canonical execution and otherwise
+    /// from the newest one this responder knows.
+    pub started_at_ms: Option<u64>,
     pub duplicate_successes: u32,
     pub outputs: Vec<OutputObject>,
     /// Public storage endpoint for each output-owning node.
@@ -148,6 +151,7 @@ pub async fn family_report(
                 .and_then(|execution| execution.result.clone())
         }),
         executions: projection.executions.len() as u32,
+        started_at_ms: started_at(&projection),
         execution_list: projection.executions.clone(),
         duplicate_successes: projection
             .executions
@@ -217,6 +221,27 @@ async fn locally_exhausted(
 
 fn terminal(state: PhysicalExecutionState) -> bool {
     state.is_terminal()
+}
+
+/// When the family's work started: the canonical execution's start, else the
+/// newest start any execution reports.
+fn started_at(projection: &JobProjection) -> Option<u64> {
+    projection
+        .canonical_execution_id
+        .and_then(|execution_id| {
+            projection
+                .executions
+                .iter()
+                .find(|execution| execution.execution_id == execution_id)
+        })
+        .and_then(|execution| execution.started_at_ms)
+        .or_else(|| {
+            projection
+                .executions
+                .iter()
+                .filter_map(|execution| execution.started_at_ms)
+                .max()
+        })
 }
 
 /// The placement of the family: this responder's own stored plan, else the

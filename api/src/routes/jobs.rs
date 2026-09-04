@@ -346,6 +346,10 @@ pub struct JobExecutionResponse {
     pub execution_id: String,
     pub executor_node_id: String,
     pub state: String,
+    /// When the work itself started: the first running update, else the moment
+    /// the target accepted the launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
     /// When this responder last saw an update of the execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_at_ms: Option<u64>,
@@ -591,6 +595,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
                 execution_id: execution.execution_id.to_string(),
                 executor_node_id: execution.executor_node_id.to_string(),
                 state: execution.state.name().to_string(),
+                started_at_ms: execution.started_at_ms,
                 observed_at_ms: execution.observed_at_ms,
                 canonical: report.canonical_execution_id == Some(execution.execution_id),
             })
@@ -1553,6 +1558,7 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                             "execution_id": "01JJRSEXEC0123456789ABCDEF",
                             "executor_node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
                             "state": "succeeded",
+                            "started_at_ms": 1755500001000u64,
                             "observed_at_ms": 1755500123000u64,
                             "canonical": true
                         }
@@ -2383,6 +2389,7 @@ mod tests {
             canonical_result: None,
             executions: 2,
             execution_list: Vec::new(),
+            started_at_ms: Some(15),
             duplicate_successes: 1,
             outputs: vec![OutputObject {
                 node_id: node_id(),

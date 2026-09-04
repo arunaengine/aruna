@@ -1611,6 +1611,7 @@ fn family_record(report: &FamilyReport) -> JobRecord {
     record.workspace_mode = report.job.workspace_mode;
     record.workspace_bucket = report.job.workspace_bucket.clone();
     record.retention_ms = report.spec.retention_ms;
+    record.started_at_ms = report.started_at_ms;
     record.finished_at_ms = report.job.finished_at_ms;
     record.last_error = report.job.last_error.clone();
     record.result = matches!(report.job.state, JobState::Succeeded | JobState::Failed).then(|| {
@@ -3190,6 +3191,7 @@ mod tests {
             }),
             executions: 2,
             execution_list: Vec::new(),
+            started_at_ms: Some(15),
             duplicate_successes: 1,
             outputs: vec![OutputObject {
                 node_id,
