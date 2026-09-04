@@ -18,11 +18,15 @@ fn ranks_witnesses() {
 
     let ranks: Vec<_> = holders
         .iter()
-        .map(|holder| witness_rank(&holders, &family.family(), *holder).expect("holder ranks"))
+        .map(|holder| {
+            witness_rank(&holders, &family.family(), *holder, None).expect("holder ranks")
+        })
         .collect();
     let reversed: Vec<_> = holders
         .iter()
-        .map(|holder| witness_rank(&shuffled, &family.family(), *holder).expect("holder ranks"))
+        .map(|holder| {
+            witness_rank(&shuffled, &family.family(), *holder, None).expect("holder ranks")
+        })
         .collect();
 
     assert_eq!(ranks, reversed);
@@ -30,7 +34,41 @@ fn ranks_witnesses() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), holders.len());
-    assert_eq!(witness_rank(&holders, &family.family(), node(9)), None);
+    assert_eq!(
+        witness_rank(&holders, &family.family(), node(9), None),
+        None
+    );
+}
+
+#[test]
+fn admitting_ranks_first() {
+    // The admitting node plans first and the remaining witnesses keep their
+    // digest order behind it; a non-holder never shifts anyone.
+    let family = Family::new([1u8; 32]);
+    let holders: Vec<_> = (1..=4u8).map(node).collect();
+    let admitting = Some(node(3));
+
+    let ranks: Vec<_> = holders
+        .iter()
+        .map(|holder| {
+            witness_rank(&holders, &family.family(), *holder, admitting).expect("holder ranks")
+        })
+        .collect();
+
+    assert_eq!(
+        witness_rank(&holders, &family.family(), node(3), admitting),
+        Some(0)
+    );
+    let mut sorted = ranks.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1, 2, 3]);
+    let outsider = Some(node(9));
+    for holder in &holders {
+        assert_eq!(
+            witness_rank(&holders, &family.family(), *holder, outsider),
+            witness_rank(&holders, &family.family(), *holder, None)
+        );
+    }
 }
 
 #[test]

@@ -1,10 +1,10 @@
 //! Leaderless witness scheduling.
 //!
 //! Every current holder of a submission family is a witness. Each computes the
-//! same rank from the immutable identity, so rank zero plans at once and later
-//! ranks only step in after their own persisted delay. No witness waits for
-//! another one, no witness holds a lease, and a partition may therefore produce
-//! one execution per participating witness.
+//! same rank from the immutable identity, so the admitting node plans at once
+//! and later ranks only step in after their own persisted delay. No witness
+//! holds a lease, and a partition may therefore produce one execution per
+//! participating witness.
 
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, PlacementDecision, RealmConfigDocument, WitnessBudgetRecord,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -36,6 +36,7 @@ use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
+    load_kind_complete,
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
@@ -85,19 +86,28 @@ pub fn schedule_witness_drain(after: Duration) -> Effect {
     })
 }
 
-/// Position of `node` after sorting the witnesses by the domain-separated
-/// digest of the immutable identity. Identical on every node with the same
-/// holder set, and unbiasable by any publisher.
-pub fn witness_rank(holders: &[NodeId], family: &JobFamilyId, node: NodeId) -> Option<u32> {
+/// Position of `node` in the witness order. The admitting node ranks first,
+/// because it already holds the request and every input decision it made; the
+/// remaining witnesses follow the domain-separated digest of the immutable
+/// identity, which is identical on every node and unbiasable by any publisher.
+pub fn witness_rank(
+    holders: &[NodeId],
+    family: &JobFamilyId,
+    node: NodeId,
+    admitting: Option<NodeId>,
+) -> Option<u32> {
+    let admitting = admitting.filter(|first| holders.contains(first));
+    if admitting == Some(node) {
+        return Some(0);
+    }
     let mut ordered: Vec<([u8; 32], NodeId)> = holders
         .iter()
+        .filter(|holder| Some(**holder) != admitting)
         .map(|holder| (rank_key(family, *holder), *holder))
         .collect();
     ordered.sort_unstable();
-    ordered
-        .iter()
-        .position(|(_, holder)| *holder == node)
-        .map(|rank| rank as u32)
+    let rank = ordered.iter().position(|(_, holder)| *holder == node)? as u32;
+    Some(rank + u32::from(admitting.is_some()))
 }
 
 fn rank_key(family: &JobFamilyId, node: NodeId) -> [u8; 32] {
@@ -141,7 +151,8 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
         );
         return;
     };
-    let Some(rank) = witness_rank(view.holders(), &family, local) else {
+    let admitting = admitting_node(context, family).await;
+    let Some(rank) = witness_rank(view.holders(), &family, local, admitting) else {
         debug!(?family, "Node is not a witness for this family");
         return;
     };
@@ -171,6 +182,23 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
     if let Some(task) = context.task_handle.as_ref() {
         let _ = task.send_effect(schedule_witness_drain(after)).await;
     }
+}
+
+/// The node that admitted the family: the committing node of the claim with the
+/// lowest order key, which every holder reduces the same way. An unreadable
+/// claim set leaves the order to the digest alone.
+async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<NodeId> {
+    let records = load_kind_complete(context, family, JobRecordKind::Claim)
+        .await
+        .ok()?;
+    records
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Claim(claim) => Some(claim),
+            _ => None,
+        })
+        .min_by_key(|claim| claim.order_key())
+        .map(|claim| claim.committing_node_id)
 }
 
 /// One bounded pass over the persisted deadlines. Returns true while rows
