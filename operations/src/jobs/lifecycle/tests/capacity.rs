@@ -4,9 +4,10 @@
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::{
-    EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody, LaunchIntent,
-    LogicalJobSpec, PhysicalExecutionState,
+    CapturedInput, EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody,
+    LaunchIntent, LogicalJobSpec, PhysicalExecutionState, VersionedObjectArn,
 };
 use ulid::Ulid;
 
@@ -16,11 +17,13 @@ use crate::jobs::lifecycle::reservation::{
     ExecutionReservation, MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
     ReserveExecutionOperation, fits, held_reservations, job_reservation,
 };
-use crate::jobs::lifecycle::target::{already_running, existing_receipt};
+use crate::jobs::lifecycle::stage::read_targets;
+use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
 use crate::jobs::lifecycle::updates::chain_for;
 use crate::jobs::records::tests::fixture::{Family, REALM, context, node};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
+use crate::replication::protocol::BaoReadTarget;
 
 fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
@@ -312,6 +315,62 @@ fn declines_second_launch() {
     assert!(already_running(family.family(), &succeeded, target));
     assert!(!already_running(family.family(), &errored, target));
     assert!(!already_running(family.family(), &running, node(2)));
+}
+
+#[test]
+fn accepts_copy_pin() {
+    // A registered copy on any node may be the pinned source, but the captured
+    // version, hash and size still bind the bytes, and a pin naming this target
+    // itself is never a remote read.
+    let family = Family::new([3u8; 32]);
+    let ingress = family.holder.public();
+    let local = family.target.public();
+    let captured = CapturedInput {
+        destination_key: "in/reads.fastq".to_string(),
+        source_node_id: ingress,
+        version_id: Ulid::from_bytes([4u8; 16]),
+        blake3: [5u8; 32],
+        bytes: 128,
+        policies: Vec::new(),
+    };
+    let pin = PlannedInput {
+        destination_key: captured.destination_key.clone(),
+        version_id: captured.version_id,
+        blake3: captured.blake3,
+        bytes: captured.bytes,
+        policies: Vec::new(),
+        source_node_id: Some(node(2)),
+        transfer_ms: 7,
+        known_link: true,
+    };
+
+    assert!(pin_matches(&captured, &pin, ingress, local));
+    let mut here = pin.clone();
+    here.source_node_id = Some(local);
+    assert!(!pin_matches(&captured, &here, ingress, local));
+    let mut other_bytes = pin.clone();
+    other_bytes.blake3 = [6u8; 32];
+    assert!(!pin_matches(&captured, &other_bytes, ingress, local));
+}
+
+#[test]
+fn stages_by_hash() {
+    // The endpoint that owns the object identity is asked for its exact
+    // version; any other holder is also asked for the same bytes by hash.
+    let family = Family::new([4u8; 32]);
+    let source = VersionedObjectArn {
+        realm_id: REALM,
+        node_id: family.holder.public(),
+        bucket: "inputs".to_string(),
+        key: "reads.fastq".to_string(),
+        version: Ulid::from_bytes([4u8; 16]),
+    };
+
+    assert_eq!(read_targets(source.clone(), true, [5u8; 32]).len(), 1);
+    assert_eq!(
+        read_targets(source, false, [5u8; 32]).pop(),
+        Some(BaoReadTarget::Blake3([5u8; 32]))
+    );
 }
 
 #[test]

@@ -18,10 +18,11 @@ use aruna_core::effects::{
 use aruna_core::errors::StorageError;
 use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, NetEvent};
 use aruna_core::operation::Operation;
+use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::{
-    AuthContext, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
-    JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, Permission,
-    PhysicalExecutionState, PlacementDecision, PlacementPolicyRef, PlacementSubject,
+    AuthContext, CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord,
+    JobPayload, JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
+    Permission, PhysicalExecutionState, PlacementDecision, PlacementPolicyRef, PlacementSubject,
     PolicyResolution, RealmConfigDocument, WorkspaceMode, blob_group_permission_path,
     evaluate_placement,
 };
@@ -443,12 +444,9 @@ fn materialize_local(
         };
         let InputSource::S3 { version_id, .. } = &mut input.source;
         *version_id = Some(pin.version_id.to_string());
-        input.source_node_id = spec
-            .captured_inputs
-            .iter()
-            .find(|captured| captured.destination_key == input.dest_key)
-            .map(|captured| captured.source_node_id)
-            .or(Some(spec.ingress_node_id));
+        // The plan picked which holder the bytes come from; no source means the
+        // target already holds the compliant copy.
+        input.source_node_id = pin.source_node_id.or(Some(local));
     }
     payload.resources.cpu_cores = Some(spec.resources.cpu_cores);
     payload.resources.ram_bytes = Some(spec.resources.ram_bytes);
@@ -655,6 +653,23 @@ async fn authorize_submitter(
     .map_err(|_| LaunchDecline::Unauthorized)
 }
 
+/// Whether one pinned input still describes the captured input it names. Any
+/// node may be the pinned source, because a registered copy of the same bytes
+/// serves the read; the captured version, hash and size still bind the content,
+/// and a source naming this target itself would not be a remote read at all.
+pub(crate) fn pin_matches(
+    captured: &CapturedInput,
+    pin: &PlannedInput,
+    ingress: NodeId,
+    local: NodeId,
+) -> bool {
+    captured.source_node_id == ingress
+        && captured.version_id == pin.version_id
+        && captured.blake3 == pin.blake3
+        && captured.bytes == pin.bytes
+        && pin.source_node_id != Some(local)
+}
+
 /// Re-evaluates the placement refs this target can resolve against its own
 /// execution subject. Refs of an input it cannot resolve yet are enforced again
 /// by the materialization gate when the bytes are staged.
@@ -691,13 +706,7 @@ async fn placement_verdict(
             .iter()
             .find(|captured| captured.destination_key == input.dest_key)
             .ok_or(LaunchDecline::Unauthorized)?;
-        if captured.source_node_id != spec.ingress_node_id
-            || captured.version_id != pin.version_id
-            || captured.blake3 != pin.blake3
-            || captured.bytes != pin.bytes
-            || pin.source_node_id
-                != (captured.source_node_id != subject.node_id).then_some(captured.source_node_id)
-        {
+        if !pin_matches(captured, pin, spec.ingress_node_id, subject.node_id) {
             return Err(LaunchDecline::Unauthorized);
         }
         let version = Some(captured.version_id);

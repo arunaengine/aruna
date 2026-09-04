@@ -1103,8 +1103,10 @@ async fn remote_source(
             .transpose()
             .map_err(|_| JobError::permanent("input version is invalid".to_string()))?,
     };
-    if version != Some(captured.version_id) || input.source_node_id != Some(captured.source_node_id)
-    {
+    // The record's own source is the holder the plan picked. It may be any node
+    // with a registered copy, so only the pinned version has to match here; the
+    // hash and size below bind the bytes.
+    if version != Some(captured.version_id) {
         return Err(JobError::permanent(
             "captured remote input does not match the physical input".to_string(),
         ));

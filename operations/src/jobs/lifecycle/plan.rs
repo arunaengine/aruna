@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 
 use aruna_core::compute::{ExecutionTargetId, ExecutorCapability, NetworkAccess, StagingMode};
 use aruna_core::scheduling::{
-    ExecutionPlan, InputHolder, MAX_TARGET_SCAN, PlanRequest, Planner, ResolvedInput,
-    TargetCandidate,
+    ExecutionPlan, InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, Planner,
+    ResolvedInput, TargetCandidate,
 };
 use aruna_core::structs::{
     AuthContext, BlobVersion, BlobVersionState, CapturedInput, InputSource, LogicalJobSpec,
@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::ids;
+use crate::blob_holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::node_info::read_node_info_document;
 use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
@@ -65,7 +66,7 @@ pub async fn build_plan(
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
     let (documents, unread) = advertisements(context, config).await;
-    let inputs = resolve_inputs(config, spec)?;
+    let inputs = resolve_inputs(context, config, spec, local).await?;
     let mut output_policies = inputs
         .iter()
         .flat_map(|input| input.policies.clone())
@@ -244,9 +245,11 @@ fn node_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeK
 }
 
 /// Pins every declared input to one exact version at its stored source.
-fn resolve_inputs(
+async fn resolve_inputs(
+    context: &DriverContext,
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
+    local: NodeId,
 ) -> Result<Vec<ResolvedInput>, PlanBuildError> {
     if spec.captured_inputs.len() != spec.payload.inputs.len() {
         return Err(PlanBuildError::Unavailable(
@@ -289,7 +292,15 @@ fn resolve_inputs(
                 reason: "captured input version changed".to_string(),
             });
         }
-        let holders = input_holders(config, captured.source_node_id);
+        let holders = input_holders(
+            context,
+            config,
+            spec.realm_id,
+            local,
+            captured.source_node_id,
+            captured.blake3,
+        )
+        .await;
         inputs.push(ResolvedInput {
             destination_key: input.dest_key.clone(),
             source: VersionedObjectArn {
@@ -339,13 +350,53 @@ pub async fn version_hash(
     }
 }
 
-/// The source endpoint owns the stored bucket/key/version. A same-hash blob on
-/// another node is not evidence that the node owns that S3 object identity.
-fn input_holders(config: &RealmConfigDocument, source_node: NodeId) -> Vec<InputHolder> {
-    vec![InputHolder {
+/// The source endpoint owns the stored bucket/key/version, and every node the
+/// DHT lists for the same content hash holds a registered copy of the bytes, so
+/// running next to one of them saves the transfer. A failed lookup adds no
+/// holder, which leaves the source endpoint as the only route.
+async fn input_holders(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    realm_id: aruna_core::structs::RealmId,
+    local: NodeId,
+    source_node: NodeId,
+    blake3: [u8; 32],
+) -> Vec<InputHolder> {
+    let mut holders = vec![InputHolder {
         subject: holder_subject(config, source_node),
         node_id: source_node,
-    }]
+    }];
+    let registered = drive(
+        GetBlobHoldersOperation::new(blake3, realm_id, local),
+        context,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        debug!(error = %error, "Blob holder lookup found no registered copy");
+        Vec::new()
+    });
+    merge_holders(config, &mut holders, registered);
+    holders
+}
+
+/// Adds the registered copies to the holder list, keeping the source endpoint
+/// first, dropping repeats, and stopping at the bound the planner accepts.
+fn merge_holders(
+    config: &RealmConfigDocument,
+    holders: &mut Vec<InputHolder>,
+    registered: Vec<NodeId>,
+) {
+    for node_id in registered {
+        if holders.len() >= MAX_INPUT_HOLDERS {
+            return;
+        }
+        if holders.iter().all(|holder| holder.node_id != node_id) {
+            holders.push(InputHolder {
+                subject: holder_subject(config, node_id),
+                node_id,
+            });
+        }
+    }
 }
 
 /// A holder's storage subject comes from its realm placement entry, never an
@@ -630,6 +681,35 @@ mod tests {
             name: None,
             description: None,
         });
+    }
+
+    #[test]
+    fn credits_dht_holder() {
+        // A registered copy joins the source endpoint as a holder, repeats are
+        // dropped, and the list stops at the bound the planner accepts.
+        let (config, _) = realm(4);
+        let source = node(1);
+        let mut holders = vec![InputHolder {
+            subject: holder_subject(&config, source),
+            node_id: source,
+        }];
+
+        merge_holders(&config, &mut holders, vec![source, node(2), node(3)]);
+
+        assert_eq!(
+            holders
+                .iter()
+                .map(|holder| holder.node_id)
+                .collect::<Vec<_>>(),
+            vec![source, node(2), node(3)]
+        );
+        assert_eq!(holders[1].subject.node_id, node(2));
+        merge_holders(
+            &config,
+            &mut holders,
+            (10..=250u8).map(node).collect::<Vec<_>>(),
+        );
+        assert_eq!(holders.len(), MAX_INPUT_HOLDERS);
     }
 
     #[test]
