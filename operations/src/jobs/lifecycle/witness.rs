@@ -49,10 +49,6 @@ pub const WITNESS_DRAIN_BATCH: usize = 64;
 pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Wall-clock budget of one launch offer.
 pub const OFFER_DEADLINE: Duration = Duration::from_secs(30);
-/// Offers a target must leave unanswered before it is excluded from the next
-/// plan. One is never enough: a target that accepts slowly would be replaced by
-/// a second launch while it is already running the work.
-pub const LOST_TARGET_OFFERS: u32 = 2;
 /// Declined targets one explain row retains.
 pub const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
 
@@ -269,7 +265,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, context};
+    use crate::jobs::records::tests::fixture::{Family, context, node};
 
     #[tokio::test]
     async fn keeps_later_deadlines() {
@@ -365,18 +361,64 @@ mod tests {
         assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
     }
 
+    /// One family with a launch by `holder` that no receipt answers.
+    fn foreign(fixture: &Family) -> (LaunchIntent, Vec<JobRecordEnvelope>) {
+        let spec = fixture.spec();
+        let launch = fixture.launch(&spec, fixture.holder.public(), 0);
+        let records = vec![fixture.sign(
+            &fixture.holder,
+            JobFamilyRecord::Launch(Box::new(launch.clone())),
+        )];
+        (launch, records)
+    }
+
+    #[test]
+    fn defers_to_launch() {
+        // Another witness's unreceipted launch holds the family until its
+        // window ends; this node's own launch never defers the round.
+        let fixture = Family::new([3u8; 32]);
+        let (launch, records) = foreign(&fixture);
+        let now = launch.created_at_ms + 10;
+
+        assert_eq!(
+            foreign_launch_wait(&records, node(2), now, 1_000),
+            Some(990)
+        );
+        assert_eq!(
+            foreign_launch_wait(&records, fixture.holder.public(), now, 1_000),
+            None
+        );
+    }
+
+    #[test]
+    fn plans_after_window() {
+        // Past the window, and once a receipt exists, the round plans again.
+        let fixture = Family::new([4u8; 32]);
+        let (launch, mut records) = foreign(&fixture);
+
+        assert_eq!(
+            foreign_launch_wait(&records, node(2), launch.created_at_ms + 1_000, 1_000),
+            None
+        );
+        records.push(fixture.sign(
+            &fixture.target,
+            JobFamilyRecord::Receipt(Box::new(fixture.receipt(&launch, 1))),
+        ));
+        assert_eq!(
+            foreign_launch_wait(&records, node(2), launch.created_at_ms + 10, 1_000),
+            None
+        );
+    }
+
     #[test]
     fn lost_target_expires() {
-        // One timed-out offer must never be enough to declare a target lost.
+        // A target keeps its launch for the whole configured catch-up window.
         let base = 5_000;
-        let offer = OFFER_DEADLINE.as_millis() as u64;
-        let window = lost_window_ms(base);
-        assert!(window >= offer + base);
-        assert!(!lost_target_expired(10, 10 + offer + base, base));
-        assert!(!lost_target_expired(10, 9 + window, base));
-        assert!(lost_target_expired(10, 10 + window, base));
-        assert_eq!(lost_retry_ms(10, 10, base), base);
-        assert_eq!(lost_retry_ms(10, 9 + window, base), 1);
+        let window = 300_000;
+        assert!(!lost_target_expired(10, 9 + window, window));
+        assert!(lost_target_expired(10, 10 + window, window));
+        assert_eq!(lost_retry_ms(10, 10, base, window), base);
+        assert_eq!(lost_retry_ms(10, 9 + window, base, window), 1);
     }
 }
 
@@ -400,6 +442,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         return RoundOutcome::Retry { after_ms: 1_000 };
     };
     let base = config.compute.witness_base_delay_ms;
+    let window = config.compute.catch_up_after_ms;
     let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
         return RoundOutcome::Retry { after_ms: base };
     };
@@ -453,11 +496,11 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     }) && let JobFamilyRecord::Launch(launch) = &envelope.record
         && !explain.declined.contains(&launch.target)
     {
-        if lost_target_expired(launch.created_at_ms, now_ms, base) {
+        if lost_target_expired(launch.created_at_ms, now_ms, window) {
             record_decline(context, &family, local, launch.target.clone()).await;
             return RoundOutcome::Retry { after_ms: 0 };
         }
-        let retry_after_ms = lost_retry_ms(launch.created_at_ms, now_ms, base);
+        let retry_after_ms = lost_retry_ms(launch.created_at_ms, now_ms, base, window);
         if launch.created_at_ms.saturating_add(base) > now_ms {
             return RoundOutcome::Retry {
                 after_ms: retry_after_ms,
@@ -479,6 +522,12 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
             },
         )
         .await;
+    }
+    // Another witness already launched and its window has not run out, so this
+    // round leaves the family to it instead of adding a second execution.
+    if let Some(after_ms) = foreign_launch_wait(&records, local, now_ms, window) {
+        debug!(after_ms, "Another witness holds a launch for this family");
+        return RoundOutcome::Retry { after_ms };
     }
     if sequence >= budget.max_launches {
         debug!(sequence, "Witness budget is exhausted for this request");
@@ -554,7 +603,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         frame,
         target: selection.target,
         now_ms,
-        retry_after_ms: lost_retry_ms(now_ms, now_ms, base),
+        retry_after_ms: lost_retry_ms(now_ms, now_ms, base, window),
     };
     offer(context, offered).await
 }
@@ -941,22 +990,45 @@ pub(super) async fn has_deadline(context: &DriverContext, family: JobFamilyId) -
     }
 }
 
-/// How long a target keeps its launch: every offer's own deadline plus the
-/// spacing of the rounds that make them.
-fn lost_window_ms(base_delay_ms: u64) -> u64 {
-    (OFFER_DEADLINE.as_millis() as u64)
-        .saturating_mul(u64::from(LOST_TARGET_OFFERS))
-        .saturating_add(base_delay_ms)
+fn lost_target_expired(created_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {
+    now_ms.saturating_sub(created_at_ms) >= window_ms
 }
 
-fn lost_target_expired(created_at_ms: u64, now_ms: u64, base_delay_ms: u64) -> bool {
-    now_ms.saturating_sub(created_at_ms) >= lost_window_ms(base_delay_ms)
-}
-
-fn lost_retry_ms(created_at_ms: u64, now_ms: u64, base_delay_ms: u64) -> u64 {
+fn lost_retry_ms(created_at_ms: u64, now_ms: u64, base_delay_ms: u64, window_ms: u64) -> u64 {
     let elapsed = now_ms.saturating_sub(created_at_ms);
-    let remaining = lost_window_ms(base_delay_ms).saturating_sub(elapsed);
+    let remaining = window_ms.saturating_sub(elapsed);
     base_delay_ms.min(remaining)
+}
+
+/// How long this round must still leave a launch by another witness alone. It
+/// is a soft lease: the launch keeps the family until the window ends without a
+/// receipt, and then any witness may plan again.
+fn foreign_launch_wait(
+    records: &[JobRecordEnvelope],
+    local: NodeId,
+    now_ms: u64,
+    window_ms: u64,
+) -> Option<u64> {
+    let receipted: std::collections::BTreeSet<Ulid> = records
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Receipt(receipt) => Some(receipt.launch_id),
+            _ => None,
+        })
+        .collect();
+    records
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Launch(launch)
+                if launch.scheduler_node_id != local && !receipted.contains(&launch.launch_id) =>
+            {
+                Some(launch.created_at_ms)
+            }
+            _ => None,
+        })
+        .max()
+        .map(|created_at_ms| window_ms.saturating_sub(now_ms.saturating_sub(created_at_ms)))
+        .filter(|remaining| *remaining > 0)
 }
 
 async fn read_deadline_index(
