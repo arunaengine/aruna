@@ -5,7 +5,8 @@
 //! view, re-authorizes the stored submitter, re-evaluates placement against its
 //! own execution subject, reserves exact local capacity, and only then signs and
 //! persists the receipt that authorizes work. Replaying one launch returns the
-//! same receipt instead of admitting a second execution.
+//! same receipt instead of admitting a second execution, and a launch for a
+//! family this node already runs, or already ran successfully, is declined.
 
 use std::sync::Arc;
 

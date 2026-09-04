@@ -293,8 +293,9 @@ async fn require_config_admin(
 - Carries the operator knowledge no node can measure for itself: the directed bandwidth between
   placement locations the planner estimates transfers with, the bandwidth assumed for an
   unconfigured link, how long an availability sample counts for ranking, the per-rank delay of the
-  leaderless witness schedule, how long a launch may stay without a receipt before the round plans
-  again, and the standing compute quotas new admissions are decided against.
+  leaderless witness schedule, how long a launch may stay without a receipt or an executor node may
+  stay silent before the round plans again, and the standing compute quotas new admissions are
+  decided against.
 - A node-local read of the replicated realm configuration, so a change written on another node can
   be missing here until it arrives.
 - An unset quota dimension is unbounded, never zero, and a group entry replaces the realm default

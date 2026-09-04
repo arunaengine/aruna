@@ -1500,6 +1500,13 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
 - A distributed execution job is answered from the replicated family projection, without routing.
   Every other kind is answered by the node that owns the job, derived from the id itself, and
   forwarded under the caller's own bearer token when that is another node.
+- Scheduling is planner-first: the node that admitted the request plans it, and every other
+  holder of the family waits for its own turn. A launch without a receipt, and an executor node
+  whose heartbeat stopped, are both left alone for the realm's `catch_up_after_ms` before
+  another holder plans again, so a normal run has exactly one execution and a lost node is
+  still caught up on.
+- A target that already runs, or already ran successfully, an execution of the family declines a
+  second launch, so one node never runs the same request twice.
 - `run_crate` reports a side obligation of jobs that owe a run crate, not the job itself."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404")),
     responses(
