@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -11,11 +11,12 @@ use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CapturedInput, ExecutionSpec,
-    InputMode, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
-    OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject, OutputSelection, PathRestriction,
-    Permission, PlacementPolicyRef, UserAccess, VersionedObjectArn, blob_bucket_permission_path,
-    blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
-    key_content_type, workspace_credential_id,
+    HashPathIndexKey, InputMode, InputSelection, InputSource, JobError, JobRecord,
+    MAX_EXECUTION_OUTPUTS, OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject,
+    OutputSelection, PathRestriction, Permission, PlacementPolicyRef, RealmId, UserAccess,
+    VersionedObjectArn, blob_bucket_permission_path, blob_group_permission_path,
+    blob_object_permission_path, ensure_confined_relative_path, key_content_type,
+    workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
+use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
@@ -517,22 +519,107 @@ async fn input_bytes(
     ))
     .await
     .and_then(|result| result.transpose());
-    match local {
-        Ok(Some(get)) => Ok(StagedSource::from_local(get)),
-        Ok(None) => match captured() {
-            Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin)).await,
-            None => Err(JobError::permanent(format!(
-                "input {}/{} not found",
-                source.bucket, source.key
-            ))),
-        },
-        Err(error) => match captured() {
-            Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin))
-                .await
-                .map_err(|_| source_input_error(error)),
-            None => Err(source_input_error(error)),
-        },
+    let failure = match local {
+        Ok(Some(get)) => return Ok(StagedSource::from_local(get)),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    let Some(input_pin) = captured() else {
+        return Err(match failure {
+            Some(error) => source_input_error(error),
+            None => {
+                JobError::permanent(format!("input {}/{} not found", source.bucket, source.key))
+            }
+        });
+    };
+    // The planner credits a node that holds a registered copy of the bytes, so
+    // the same content under another key is read here instead of fetched again.
+    if let Some(staged) = Box::pin(local_copy_source(
+        context, spec, record, node_id, source, input_pin,
+    ))
+    .await
+    {
+        return Ok(staged);
     }
+    let remote = Box::pin(remote_source(context, record, input, input_pin)).await;
+    match failure {
+        Some(error) => remote.map_err(|_| source_input_error(error)),
+        None => remote,
+    }
+}
+
+/// Registered copies of the same bytes this node holds itself, deduplicated by
+/// the object they name. Only copies of this realm on this node can be read
+/// locally, so everything else is dropped.
+fn local_copies(
+    candidates: Vec<HashPathIndexKey>,
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> Vec<HashPathIndexKey> {
+    let mut unique = BTreeMap::new();
+    for candidate in candidates {
+        if candidate.realm_id != realm_id || candidate.node_id != node_id {
+            continue;
+        }
+        let key = (
+            candidate.bucket.clone(),
+            candidate.key.clone(),
+            candidate.version_id,
+        );
+        unique.entry(key).or_insert(candidate);
+    }
+    unique.into_values().collect()
+}
+
+/// The captured bytes read from a local copy under another key. Every copy is
+/// authorized like the named input, and the first one that serves wins. `None`
+/// means no local copy is readable, so the caller falls back to a remote read.
+async fn local_copy_source(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    source: &SourceObject,
+    captured: &CapturedInput,
+) -> Option<StagedSource> {
+    let candidates = Box::pin(drive(
+        ResolveBlobPermissionPathsOperation::new(captured.blake3),
+        context,
+    ))
+    .await
+    .ok()?;
+    for candidate in local_copies(candidates, record.created_by.realm_id, node_id) {
+        let copy = SourceObject {
+            path: source.path.clone(),
+            bucket: candidate.bucket,
+            key: candidate.key,
+            version: Some(candidate.version_id),
+        };
+        if Box::pin(authorize_source(context, spec, record, node_id, &copy))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let get = Box::pin(drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: copy.bucket,
+                key: copy.key,
+                version_id: copy.version,
+                range: None,
+                group_id: spec.group_id,
+                user_identity: record.created_by,
+                node_id,
+            }),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose());
+        if let Ok(Some(get)) = get {
+            return Some(StagedSource::from_local(get));
+        }
+    }
+    None
 }
 
 /// Export every declared file output under one write-ahead commit reservation, so
@@ -1576,6 +1663,34 @@ mod tests {
             .kind,
             JobErrorKind::Retryable
         );
+    }
+
+    #[test]
+    fn picks_local_copies() {
+        // Only copies of this realm on this node may be read locally, and one
+        // object named twice stays one candidate.
+        let hash = [7u8; 32];
+        let realm = RealmId::from_bytes([1u8; 32]);
+        let other_realm = RealmId::from_bytes([2u8; 32]);
+        let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let other_node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let group = Ulid::from_bytes([5; 16]);
+        let version = Ulid::from_bytes([6; 16]);
+        let alias = |realm_id, node_id, bucket: &str, key: &str| {
+            HashPathIndexKey::new(hash, version, realm_id, group, node_id, bucket, key)
+        };
+        let candidates = vec![
+            alias(realm, node, "shared", "reads.fastq"),
+            alias(realm, node, "shared", "reads.fastq"),
+            alias(realm, node, "other", "copy.fastq"),
+            alias(realm, other_node, "shared", "reads.fastq"),
+            alias(other_realm, node, "shared", "reads.fastq"),
+        ];
+
+        let picked = local_copies(candidates, realm, node);
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().all(|copy| copy.node_id == node));
+        assert!(picked.iter().all(|copy| copy.realm_id == realm));
     }
 
     #[test]
