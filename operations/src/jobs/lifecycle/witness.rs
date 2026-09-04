@@ -6,6 +6,7 @@
 //! holds a lease, and a partition may therefore produce one execution per
 //! participating witness.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::compute::ExecutionTargetId;
@@ -40,6 +41,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
+use crate::node_info::read_node_info_document;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
@@ -459,7 +461,8 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
             return RoundOutcome::Retry { after_ms: base };
         }
     };
-    if suppressed(family, &records) {
+    let silent = silent_nodes(context, family, &records, now_ms, window).await;
+    if suppressed(family, &records, &silent) {
         return RoundOutcome::Done;
     }
     let Some(spec) = stored_spec(family, &records) else {
@@ -702,18 +705,54 @@ async fn record_decline(
 }
 
 /// Whether a launch is suppressed by a success, cancellation, permanent
-/// failure, or an execution that may still finish.
-pub(crate) fn suppressed(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
+/// failure, or an execution that may still finish. An unfinished execution on a
+/// node in `silent` no longer suppresses: that node stopped reporting, so its
+/// execution is no longer evidence that the work is still under way.
+pub(crate) fn suppressed(
+    family: JobFamilyId,
+    records: &[JobRecordEnvelope],
+    silent: &BTreeSet<NodeId>,
+) -> bool {
     let Ok(Some(projection)) = reduce_family(family, records) else {
         return false;
     };
     if projection.cancel_requested || projection.canonical_execution_id.is_some() {
         return true;
     }
-    projection
+    projection.executions.iter().any(|execution| {
+        execution.state != PhysicalExecutionState::Error
+            && (execution.state.is_terminal() || !silent.contains(&execution.executor_node_id))
+    })
+}
+
+/// Executor nodes of an unfinished execution whose replicated heartbeat is
+/// older than the catch-up window. A node this responder holds no heartbeat
+/// document for is never called silent: a missing local copy proves nothing.
+async fn silent_nodes(
+    context: &DriverContext,
+    family: JobFamilyId,
+    records: &[JobRecordEnvelope],
+    now_ms: u64,
+    window_ms: u64,
+) -> BTreeSet<NodeId> {
+    let mut silent = BTreeSet::new();
+    let Ok(Some(projection)) = reduce_family(family, records) else {
+        return silent;
+    };
+    let running: BTreeSet<NodeId> = projection
         .executions
         .iter()
-        .any(|execution| execution.state != PhysicalExecutionState::Error)
+        .filter(|execution| !execution.state.is_terminal())
+        .map(|execution| execution.executor_node_id)
+        .collect();
+    for node in running {
+        if let Ok(Some(document)) = read_node_info_document(&context.storage_handle, node).await
+            && now_ms.saturating_sub(document.utilization.heartbeat_at_ms) > window_ms
+        {
+            silent.insert(node);
+        }
+    }
+    silent
 }
 
 /// The stored spec of the family's canonical alias.
