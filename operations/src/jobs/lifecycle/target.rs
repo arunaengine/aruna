@@ -21,8 +21,9 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
     JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, Permission,
-    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument,
-    WorkspaceMode, blob_group_permission_path, evaluate_placement,
+    PhysicalExecutionState, PlacementDecision, PlacementPolicyRef, PlacementSubject,
+    PolicyResolution, RealmConfigDocument, WorkspaceMode, blob_group_permission_path,
+    evaluate_placement,
 };
 use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
@@ -38,6 +39,7 @@ use super::ids::{self, workspace_of};
 use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::driver::{DriverContext, drive, gate_context, now_ms};
+use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
@@ -106,6 +108,9 @@ pub async fn admit_launch(
     }
     if cancelled(family, &records) {
         return Some(Err(LaunchDecline::Cancelled));
+    }
+    if already_running(family, &records, local) {
+        return Some(Err(LaunchDecline::AlreadyRunning));
     }
     let capability = match local_capability(context.as_ref(), &config, local, &intent, &spec).await
     {
@@ -514,6 +519,25 @@ pub(crate) fn existing_receipt(
             }
         }
         _ => None,
+    })
+}
+
+/// An execution of the same family this node already accepted. A second launch
+/// is refused while that execution may still finish, and after it succeeded, so
+/// one family never runs twice here. The refusal is retryable: another target
+/// may still take the launch.
+pub(crate) fn already_running(
+    family: JobFamilyId,
+    records: &[JobRecordEnvelope],
+    local: NodeId,
+) -> bool {
+    let Ok(Some(projection)) = reduce_family(family, records) else {
+        return false;
+    };
+    projection.executions.iter().any(|execution| {
+        execution.executor_node_id == local
+            && (!execution.state.is_terminal()
+                || execution.state == PhysicalExecutionState::Succeeded)
     })
 }
 

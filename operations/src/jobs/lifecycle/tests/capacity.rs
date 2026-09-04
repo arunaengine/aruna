@@ -6,7 +6,7 @@ use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::structs::{
     EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody, LaunchIntent,
-    LogicalJobSpec,
+    LogicalJobSpec, PhysicalExecutionState,
 };
 use ulid::Ulid;
 
@@ -16,9 +16,9 @@ use crate::jobs::lifecycle::reservation::{
     ExecutionReservation, MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
     ReserveExecutionOperation, fits, held_reservations, job_reservation,
 };
-use crate::jobs::lifecycle::target::existing_receipt;
+use crate::jobs::lifecycle::target::{already_running, existing_receipt};
 use crate::jobs::lifecycle::updates::chain_for;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
+use crate::jobs::records::tests::fixture::{Family, REALM, context, node};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
 
@@ -296,6 +296,22 @@ async fn output_binds_receipt() {
     assert_eq!(chain.family, family.family());
     assert_eq!(chain.spec_digest, spec.spec_digest);
     assert_eq!(chain.receipt_digest, receipt.digest().expect("digest"));
+}
+
+#[test]
+fn declines_second_launch() {
+    // A family this node still runs, or already ran successfully, refuses a
+    // second launch; a failed attempt leaves the node free to run it again.
+    let family = Family::new([2u8; 32]);
+    let target = family.target.public();
+    let running = family.run(1, 0, PhysicalExecutionState::Running);
+    let succeeded = family.run(1, 0, PhysicalExecutionState::Succeeded);
+    let errored = family.run(1, 0, PhysicalExecutionState::Error);
+
+    assert!(already_running(family.family(), &running, target));
+    assert!(already_running(family.family(), &succeeded, target));
+    assert!(!already_running(family.family(), &errored, target));
+    assert!(!already_running(family.family(), &running, node(2)));
 }
 
 #[test]

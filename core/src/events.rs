@@ -436,6 +436,9 @@ pub enum LaunchDecline {
     LaunchConflict,
     /// The request family was cancelled before the offer arrived.
     Cancelled,
+    /// This node already runs, or already ran successfully, an execution of the
+    /// same family. Retryable: another target may still take the launch.
+    AlreadyRunning,
 }
 
 /// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an
