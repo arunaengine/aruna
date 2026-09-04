@@ -34,6 +34,7 @@ async fn admin_job_flow() -> TestResult<()> {
         )
         .await?;
         config["witness_base_delay_ms"] = json!(1_000);
+        config["catch_up_after_ms"] = json!(5_000);
         config["default_group_quota"]["max_jobs"] = json!(4);
         config["group_quotas"] = json!([{
             "group_id": group.group_id,
@@ -50,6 +51,7 @@ async fn admin_job_flow() -> TestResult<()> {
         )
         .await?;
         assert_eq!(stored["witness_base_delay_ms"], 1_000);
+        assert_eq!(stored["catch_up_after_ms"], 5_000);
         assert_eq!(stored["default_group_quota"]["max_jobs"], 4);
 
         let snapshots_url = format!(
