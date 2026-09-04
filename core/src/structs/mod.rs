@@ -1,3 +1,4 @@
+mod assistant_chat;
 mod assistant_provider;
 mod backends;
 mod binding_directory;
@@ -42,6 +43,7 @@ mod synced_folder;
 mod usage;
 mod user_session;
 
+pub use assistant_chat::*;
 pub use assistant_provider::*;
 pub use backends::*;
 pub use binding_directory::*;

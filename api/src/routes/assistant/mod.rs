@@ -1,8 +1,10 @@
 mod chatgpt;
+mod chats;
 mod proxy;
 #[cfg(test)]
 mod test_support;
 
+use chats::{__path_get_chats, __path_put_chats, get_chats, put_chats};
 use chatgpt::{__path_poll_login, __path_start_login, poll_login, start_login};
 use proxy::{__path_proxy_get, __path_proxy_post, proxy_get, proxy_post};
 
@@ -48,7 +50,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_models))
         .routes(routes!(test_provider))
         .routes(routes!(start_login))
-        .routes(routes!(poll_login));
+        .routes(routes!(poll_login))
+        .routes(routes!(get_chats, put_chats));
     super::routes_at(
         router,
         "/system/assistant/providers/{id}/proxy/{*path}",
