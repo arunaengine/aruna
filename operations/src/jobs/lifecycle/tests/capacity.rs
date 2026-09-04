@@ -304,7 +304,7 @@ async fn output_binds_receipt() {
 #[test]
 fn declines_second_launch() {
     // A family this node still runs, or already ran successfully, refuses a
-    // second launch; a failed attempt leaves the node free to run it again.
+    // second launch; a retryable error leaves the node free to run it again.
     let family = Family::new([2u8; 32]);
     let target = family.target.public();
     let running = family.run(1, 0, PhysicalExecutionState::Running);
@@ -315,6 +315,21 @@ fn declines_second_launch() {
     assert!(already_running(family.family(), &succeeded, target));
     assert!(!already_running(family.family(), &errored, target));
     assert!(!already_running(family.family(), &running, node(2)));
+}
+
+#[test]
+fn declines_after_failure() {
+    // A permanent failure suppresses retry, so this node refuses the family
+    // again even though its execution is terminal.
+    let family = Family::new([2u8; 32]);
+    let failed = family.run(1, 0, PhysicalExecutionState::Failed);
+
+    assert!(already_running(
+        family.family(),
+        &failed,
+        family.target.public()
+    ));
+    assert!(!already_running(family.family(), &failed, node(2)));
 }
 
 #[test]

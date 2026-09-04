@@ -522,9 +522,10 @@ pub(crate) fn existing_receipt(
 }
 
 /// An execution of the same family this node already accepted. A second launch
-/// is refused while that execution may still finish, and after it succeeded, so
-/// one family never runs twice here. The refusal is retryable: another target
-/// may still take the launch.
+/// is refused while that execution may still finish, after it succeeded, and
+/// after it failed permanently, because a permanent failure suppresses retry.
+/// So one family never runs twice here. The refusal is retryable: another
+/// target may still take the launch.
 pub(crate) fn already_running(
     family: JobFamilyId,
     records: &[JobRecordEnvelope],
@@ -536,7 +537,10 @@ pub(crate) fn already_running(
     projection.executions.iter().any(|execution| {
         execution.executor_node_id == local
             && (!execution.state.is_terminal()
-                || execution.state == PhysicalExecutionState::Succeeded)
+                || matches!(
+                    execution.state,
+                    PhysicalExecutionState::Succeeded | PhysicalExecutionState::Failed
+                ))
     })
 }
 
