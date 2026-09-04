@@ -1,18 +1,19 @@
-//! Re-encodes the stored job-family rows that embed a physical execution result
-//! from the shape before it carried stdout and stderr tails. Safe to repeat: a
-//! row already in the current shape is left untouched.
+//! Re-encodes stored rows written before a field was added: job-family rows
+//! that embed a physical execution result without stdout and stderr tails, and
+//! realm configuration documents without the compute catch-up wait. Safe to
+//! repeat: a row already in the current shape is left untouched.
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::{
     JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-    JOB_FAMILY_RECORD_KEYSPACE,
+    JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
-    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
-    PhysicalExecutionState, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
-    WitnessBudgetRecord,
+    DEFAULT_CATCH_UP_AFTER_MS, ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate,
+    JobCancelRecord, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
+    PhysicalExecutionResult, PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage,
+    SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::types::NodeId;
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
@@ -33,6 +34,8 @@ pub struct MigrateOutput {
     /// Derived projection rows dropped. The reader rebuilds a missing one from
     /// the immutable records, so clearing them needs no re-encode.
     pub projections_cleared: usize,
+    pub realm_configs_scanned: usize,
+    pub realm_configs_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -57,6 +60,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         JOB_FAMILY_PROJECTION_KEYSPACE,
         KeyspaceCreateOptions::default,
     )?;
+    let config_rows = db.keyspace(REALM_CONFIG_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records = rewrites::<JobRecordEnvelope, LegacyEnvelope>(
         &db,
@@ -71,12 +75,14 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         JOB_FAMILY_CONFLICT_KEYSPACE,
     )?;
     let projections = keys(&db, &cache_rows)?;
+    let configs = realm_configs(&db, &config_rows)?;
 
     let mut txn = db.write_tx()?;
     for (keyspace, rows) in [
         (&record_rows, &records.rows),
         (&pending_rows, &pending.rows),
         (&conflict_rows, &conflicts.rows),
+        (&config_rows, &configs.rows),
     ] {
         for (key, value) in rows {
             txn.insert(keyspace.clone(), key.clone(), value.clone());
@@ -98,6 +104,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         conflicts_scanned: conflicts.scanned,
         conflicts_rewritten: conflicts.rows.len(),
         projections_cleared: projections.len(),
+        realm_configs_scanned: configs.scanned,
+        realm_configs_rewritten: configs.rows.len(),
     })
 }
 
@@ -126,6 +134,33 @@ where
             Ok(None) => {}
             Err(error) => return Err(decode_error(name, &key, error)),
         }
+    }
+    Ok(Rewrites { scanned, rows })
+}
+
+/// Realm configuration documents gained the compute catch-up wait as their last
+/// value. Postcard is positional, so an older row is the current row without
+/// that trailing value and appending its default re-encodes the row.
+fn realm_configs(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+) -> Result<Rewrites, ExplorerError> {
+    let mut scanned = 0;
+    let mut rows = Vec::new();
+    for entry in db.read_tx().iter(keyspace) {
+        let (key, value) = entry.into_inner()?;
+        scanned += 1;
+        if RealmConfigDocument::from_bytes(&value).is_ok() {
+            continue;
+        }
+        let mut bytes = value.to_vec();
+        bytes.extend_from_slice(
+            &postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS)
+                .map_err(|error| decode_error(REALM_CONFIG_KEYSPACE, &key, error))?,
+        );
+        RealmConfigDocument::from_bytes(&bytes)
+            .map_err(|error| decode_error(REALM_CONFIG_KEYSPACE, &key, error))?;
+        rows.push((key.to_vec(), bytes));
     }
     Ok(Rewrites { scanned, rows })
 }
@@ -308,11 +343,11 @@ mod tests {
     };
     use aruna_core::keyspaces::{
         JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::structs::{
-        ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, RealmId,
-        ResultMessage, SubmissionId,
+        DEFAULT_CATCH_UP_AFTER_MS, ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope,
+        PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage, SubmissionId,
     };
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -478,6 +513,40 @@ mod tests {
         assert!(read(&path, JOB_FAMILY_PROJECTION_KEYSPACE).is_empty());
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!(again.projections_cleared, 0);
+    }
+
+    #[test]
+    fn rewrites_realm_configs() {
+        // A document stored before the catch-up wait must decode again with the
+        // default, and a current document must stay byte-identical.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
+        let current = postcard::to_allocvec(&document).unwrap();
+        let trailer = postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS).unwrap();
+        let legacy = current[..current.len() - trailer.len()].to_vec();
+        write(
+            &path,
+            REALM_CONFIG_KEYSPACE,
+            vec![(b"old", legacy), (b"new", current.clone())],
+        );
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            (output.realm_configs_scanned, output.realm_configs_rewritten),
+            (2, 1)
+        );
+        let rows = read(&path, REALM_CONFIG_KEYSPACE);
+        assert_eq!(rows[b"new".as_slice()], current);
+        let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
+        assert_eq!(
+            migrated.compute.catch_up_after_ms,
+            DEFAULT_CATCH_UP_AFTER_MS
+        );
+
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(again.realm_configs_rewritten, 0);
     }
 
     #[test]

@@ -13447,6 +13447,7 @@ mod tests {
         let document_target = DocumentSyncTarget::RealmConfig { realm_id };
         let compute = aruna_core::structs::RealmComputeConfig {
             witness_base_delay_ms: 4_200,
+            catch_up_after_ms: 61_000,
             ..Default::default()
         };
 
