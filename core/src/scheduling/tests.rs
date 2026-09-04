@@ -1072,3 +1072,47 @@ fn retry_scans_pages() {
         targets[last].capability.target(targets[last].node_id)
     );
 }
+
+#[test]
+fn reports_candidates() {
+    // The report lists the selection first, then the alternatives in rank
+    // order, then every rejection with a plain reason.
+    let mut targets = scanned(3);
+    targets[2].compute_draining = true;
+    let drained = targets[2].node_id;
+    let plan_request = request(Vec::new());
+
+    let outcome = plan(&plan_request, targets, &config(Vec::new()));
+    let chosen = outcome
+        .selected
+        .as_ref()
+        .expect("a target is legal")
+        .target
+        .node_id;
+    let candidates = outcome.candidates();
+
+    assert_eq!(candidates.len(), 3);
+    assert_eq!(candidates[0].verdict, CandidateVerdict::Selected);
+    assert_eq!(candidates[0].node_id, chosen);
+    assert_eq!(candidates[0].rank, None);
+    assert_eq!(candidates[1].verdict, CandidateVerdict::Ranked);
+    assert_eq!(candidates[1].rank, Some(1));
+    assert_eq!(candidates[2].verdict, CandidateVerdict::Rejected);
+    assert_eq!(candidates[2].node_id, drained);
+    assert_eq!(
+        candidates[2].reason.as_deref(),
+        Some("node stopped taking work")
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.executor_kind.as_deref() == Some("docker"))
+    );
+    assert_eq!(
+        RejectionVerdict::NoLegalSource {
+            destination_key: "reads.fastq".to_string()
+        }
+        .reason(),
+        "no legal source for input reads.fastq"
+    );
+}

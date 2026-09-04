@@ -94,6 +94,8 @@ async fn reports_launch_nodes() {
 
     let plan = report.plan.expect("the launch is a placement");
     assert_eq!(plan.scheduler_node_id, Some(family.holder.public()));
+    // A launch record carries no planning round, so it names no candidates.
+    assert!(plan.candidates.is_empty());
     assert_eq!(
         plan.target.map(|target| target.node_id),
         Some(family.target.public())

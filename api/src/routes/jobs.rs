@@ -316,6 +316,24 @@ pub struct JobPlacementInputResponse {
     pub transfer_ms: u64,
 }
 
+/// One target a planning round looked at, in report order: the selected target
+/// first, then the alternatives by rank, then the rejected ones.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobPlacementCandidateResponse {
+    pub node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_kind: Option<String>,
+    /// `selected`, `ranked` or `rejected`.
+    pub verdict: String,
+    /// Place among the alternatives, counted from one. Absent for the selected
+    /// target and for a rejected one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
+    /// Why the target was rejected, in plain words. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Where the request was planned to run. It is the plan this responder stored
 /// when it planned the request itself, else the newest launch record any
 /// witness published. `alternatives`, `rejected` and `omitted` are counted only
@@ -338,6 +356,9 @@ pub struct JobPlacementResponse {
     pub omitted: u32,
     pub stored_at_ms: u64,
     pub inputs: Vec<JobPlacementInputResponse>,
+    /// Every target of the planning round. Filled only on the node that planned
+    /// the request; empty when the placement comes from a launch record.
+    pub candidates: Vec<JobPlacementCandidateResponse>,
 }
 
 /// One physical execution of the family, canonical or not.
@@ -632,6 +653,17 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
                     bytes: input.bytes,
                     source_node_id: input.source_node_id.map(|node| node.to_string()),
                     transfer_ms: input.transfer_ms,
+                })
+                .collect(),
+            candidates: plan
+                .candidates
+                .iter()
+                .map(|candidate| JobPlacementCandidateResponse {
+                    node_id: candidate.node_id.to_string(),
+                    executor_kind: candidate.executor_kind.clone(),
+                    verdict: candidate.verdict.name().to_string(),
+                    rank: candidate.rank,
+                    reason: candidate.reason.clone(),
                 })
                 .collect(),
         }),
@@ -1605,6 +1637,25 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
                                 "bytes": 4194304,
                                 "source_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
                                 "transfer_ms": 340
+                            }
+                        ],
+                        "candidates": [
+                            {
+                                "node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
+                                "executor_kind": "docker",
+                                "verdict": "selected"
+                            },
+                            {
+                                "node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                                "executor_kind": "docker",
+                                "verdict": "ranked",
+                                "rank": 1
+                            },
+                            {
+                                "node_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f8",
+                                "executor_kind": "apptainer",
+                                "verdict": "rejected",
+                                "reason": "no executor of that kind"
                             }
                         ]
                     }

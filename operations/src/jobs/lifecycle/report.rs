@@ -10,7 +10,7 @@ use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};
 use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE};
-use aruna_core::scheduling::PlannedInput;
+use aruna_core::scheduling::{PlanCandidate, PlannedInput};
 use aruna_core::structs::{
     AuthContext, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
     JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
@@ -55,6 +55,9 @@ pub struct PlanEstimate {
     /// Inputs the plan moves to the target, so a caller can show where the data
     /// comes from. Empty when nothing has to move.
     pub inputs: Vec<PlannedInput>,
+    /// Every target the planning round saw, with its verdict. Only a local
+    /// round keeps them, so a launch read leaves this empty.
+    pub candidates: Vec<PlanCandidate>,
 }
 
 /// One family as this responder currently reduces it.
@@ -287,6 +290,7 @@ async fn stored_plan(context: &DriverContext, family: JobFamilyId) -> Option<Pla
         inputs: selected
             .map(|selection| selection.inputs.clone())
             .unwrap_or_default(),
+        candidates: explain.plan.candidates(),
     })
 }
 
@@ -318,6 +322,7 @@ async fn launched_plan(context: &DriverContext, family: JobFamilyId) -> Option<P
         omitted: 0,
         stored_at_ms: launch.created_at_ms,
         inputs: launch.inputs.clone(),
+        candidates: Vec::new(),
     })
 }
 

@@ -64,6 +64,27 @@ impl RejectionVerdict {
             _ => false,
         }
     }
+
+    /// One short phrase a report reader understands without the audit fields.
+    pub fn reason(&self) -> String {
+        match self {
+            RejectionVerdict::NotAuthorized => "not a realm member".to_string(),
+            RejectionVerdict::NodeKind => "user nodes take no shared work".to_string(),
+            RejectionVerdict::Inactive => "node is not active".to_string(),
+            RejectionVerdict::ComputeDraining => "node stopped taking work".to_string(),
+            RejectionVerdict::PolicyDraining => "executor stopped taking work".to_string(),
+            RejectionVerdict::SubjectDrift => "advertisement does not match its digest".to_string(),
+            RejectionVerdict::ExecutorKind => "no executor of that kind".to_string(),
+            RejectionVerdict::Staging => "staging mode is not supported".to_string(),
+            RejectionVerdict::RequiredLabels => "a required label is missing".to_string(),
+            RejectionVerdict::Resources => "not enough resources".to_string(),
+            RejectionVerdict::OpenNetwork => "open network is not allowed here".to_string(),
+            RejectionVerdict::Policy { .. } => "placement policy refused".to_string(),
+            RejectionVerdict::NoLegalSource { destination_key } => {
+                format!("no legal source for input {destination_key}")
+            }
+        }
+    }
 }
 
 /// Every hard filter except data-source availability, which needs the routed

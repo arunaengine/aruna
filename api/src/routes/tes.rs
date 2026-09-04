@@ -3291,6 +3291,7 @@ mod tests {
             omitted: 0,
             stored_at_ms: 15,
             inputs: Vec::new(),
+            candidates: Vec::new(),
         });
         let details = TaskDetails::from_report(&report);
         let record = family_record(&report);

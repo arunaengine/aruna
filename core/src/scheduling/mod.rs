@@ -81,6 +81,71 @@ pub struct ExecutionPlan {
     pub omitted: u32,
 }
 
+/// How one scanned target ended up in a planning round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateVerdict {
+    Selected,
+    Ranked,
+    Rejected,
+}
+
+impl CandidateVerdict {
+    /// Stable machine-readable name for API payloads.
+    pub fn name(&self) -> &'static str {
+        match self {
+            CandidateVerdict::Selected => "selected",
+            CandidateVerdict::Ranked => "ranked",
+            CandidateVerdict::Rejected => "rejected",
+        }
+    }
+}
+
+/// One target of a planning round as an external report shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanCandidate {
+    pub node_id: crate::NodeId,
+    pub executor_kind: Option<String>,
+    pub verdict: CandidateVerdict,
+    /// Place among the alternatives, counted from one. Absent for the selected
+    /// target and for a rejected one.
+    pub rank: Option<u32>,
+    /// Why the target was rejected, in plain words.
+    pub reason: Option<String>,
+}
+
+impl ExecutionPlan {
+    /// Every target of this round for a report: the selection first, then the
+    /// alternatives in rank order, then the rejections with their reason.
+    pub fn candidates(&self) -> Vec<PlanCandidate> {
+        let selected = self.selected.iter().map(|selection| PlanCandidate {
+            node_id: selection.target.node_id,
+            executor_kind: Some(selection.target.executor_kind.clone()),
+            verdict: CandidateVerdict::Selected,
+            rank: None,
+            reason: None,
+        });
+        let ranked = self
+            .alternatives
+            .iter()
+            .enumerate()
+            .map(|(index, ranked)| PlanCandidate {
+                node_id: ranked.target.node_id,
+                executor_kind: Some(ranked.target.executor_kind.clone()),
+                verdict: CandidateVerdict::Ranked,
+                rank: Some(index as u32 + 1),
+                reason: None,
+            });
+        let rejected = self.rejected.iter().map(|rejected| PlanCandidate {
+            node_id: rejected.target.node_id,
+            executor_kind: Some(rejected.target.executor_kind.clone()),
+            verdict: CandidateVerdict::Rejected,
+            rank: None,
+            reason: Some(rejected.verdict.reason()),
+        });
+        selected.chain(ranked).chain(rejected).collect()
+    }
+}
+
 /// Plans one execution over already resolved inputs and one complete candidate
 /// set, paging it for the caller. Returns an error only when the request itself
 /// is unusable; an empty or fully rejected scan is a plan without a selection,
