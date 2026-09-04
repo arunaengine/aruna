@@ -336,7 +336,9 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::WriteResult {
             key: chat_key(user()),
         }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
 
         let saved = operation.finalize().unwrap();
         assert_eq!(saved.revision, 3);

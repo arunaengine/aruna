@@ -4,8 +4,8 @@ mod proxy;
 #[cfg(test)]
 mod test_support;
 
-use chats::{__path_get_chats, __path_put_chats, get_chats, put_chats};
 use chatgpt::{__path_poll_login, __path_start_login, poll_login, start_login};
+use chats::{__path_get_chats, __path_put_chats, get_chats, put_chats};
 use proxy::{__path_proxy_get, __path_proxy_post, proxy_get, proxy_post};
 
 use crate::auth::require_unrestricted_realm_auth;
