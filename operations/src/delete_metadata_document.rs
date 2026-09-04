@@ -21,7 +21,6 @@ use aruna_core::types::Effects;
 use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -42,6 +41,7 @@ use crate::persistent_id::{
     MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
+use crate::queue_backoff::conflict_backoff;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -375,14 +375,6 @@ fn delete_index_effect(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) ->
 
 const DELETE_CONFLICT_RETRIES: usize = 3;
 
-fn delete_retry_backoff(attempt: usize, document_id: Ulid) -> Duration {
-    let base = crate::queue_backoff::retry_after_ms(attempt as u32, 25, 250);
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&document_id.to_bytes()[..8]);
-    let jitter = u64::from_le_bytes(head) % base;
-    Duration::from_millis(base.saturating_add(jitter))
-}
-
 pub async fn delete_metadata_document(
     operation: DeleteMetadataDocumentOperation,
     context: &DriverContext,
@@ -395,7 +387,7 @@ pub async fn delete_metadata_document(
             Err(DeleteMetadataDocumentError::StorageError(StorageError::TransactionConflict))
                 if attempt < DELETE_CONFLICT_RETRIES =>
             {
-                tokio::time::sleep(delete_retry_backoff(attempt, document_id)).await;
+                tokio::time::sleep(conflict_backoff(attempt, &document_id.to_bytes())).await;
                 attempt += 1;
             }
             Err(error) => return Err(error),

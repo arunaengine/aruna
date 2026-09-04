@@ -45,6 +45,7 @@ use crate::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
+use crate::queue_backoff::conflict_backoff;
 use crate::sync_placement::sort_node_ids;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -732,16 +733,6 @@ pub fn resolve_metadata_id(
 
 const CREATE_CONFLICT_RETRIES: usize = 3;
 
-// Deterministic per-document jitter decorrelates overlapping create retries so a
-// genuine realm-config mutation does not make them all retry in lockstep.
-fn create_retry_backoff(attempt: usize, document_id: Ulid) -> std::time::Duration {
-    let base = crate::queue_backoff::retry_after_ms(attempt as u32, 25, 250);
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&document_id.to_bytes()[..8]);
-    let jitter = u64::from_le_bytes(head) % base;
-    std::time::Duration::from_millis(base.saturating_add(jitter))
-}
-
 pub async fn create_metadata_document(
     mut template: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
@@ -772,8 +763,11 @@ pub async fn create_metadata_document(
             Err(CreateMetadataDocumentError::StorageError(StorageError::TransactionConflict))
                 if attempt < CREATE_CONFLICT_RETRIES =>
             {
-                tokio::time::sleep(create_retry_backoff(attempt, template.config.document_id))
-                    .await;
+                tokio::time::sleep(conflict_backoff(
+                    attempt,
+                    &template.config.document_id.to_bytes(),
+                ))
+                .await;
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -1145,7 +1139,6 @@ mod tests {
     use super::{
         CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
         CreateMetadataDocumentPayload, accepted_create_matches, create_metadata_document,
-        create_retry_backoff,
     };
 
     use std::sync::Arc;
@@ -2015,17 +2008,6 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         })
-    }
-
-    #[test]
-    fn backoff_jitters() {
-        // Backoff is deterministic per document and stays within [base, 2*base).
-        let id = Ulid::from_bytes([7u8; 16]);
-        let base = crate::queue_backoff::retry_after_ms(0, 25, 250);
-        let first = create_retry_backoff(0, id);
-        assert_eq!(first, create_retry_backoff(0, id));
-        let ms = first.as_millis() as u64;
-        assert!(ms >= base && ms < base.saturating_mul(2));
     }
 
     // Real timers: the scripted storage runs on an OS thread, so a paused clock
