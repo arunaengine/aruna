@@ -69,7 +69,8 @@ pub const USER_SESSION_KEYSPACE: &str = "user_sessions";
 pub const USER_SESSION_OWNER_KEYSPACE: &str = "user_session_owner";
 pub const ASSISTANT_PROVIDER_KEYSPACE: &str = "assistant_providers";
 pub const ASSISTANT_PROVIDER_OWNER_KEYSPACE: &str = "assistant_provider_owner";
-pub const ASSISTANT_CHAT_KEYSPACE: &str = "assistant_chats";
+pub const ASSISTANT_CHAT_HEAD_KEYSPACE: &str = "assistant_chat_heads";
+pub const ASSISTANT_CHAT_TURN_KEYSPACE: &str = "assistant_chat_turns";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
