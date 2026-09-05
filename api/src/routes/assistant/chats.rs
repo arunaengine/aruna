@@ -156,3 +156,172 @@ pub async fn put_chats(
         }),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::keys::generate_signing_key;
+    use aruna_core::structs::{Actor, NodeCapabilities, RealmId};
+    use aruna_core::types::UserId;
+    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_storage::storage::FjallStorage;
+    use axum::response::IntoResponse;
+    use tempfile::TempDir;
+    use ulid::Ulid;
+
+    async fn setup_state() -> (TempDir, Arc<ServerState>, AuthContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let node_id = iroh::SecretKey::generate().public();
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
+                },
+                realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(
+            ServerState::new(
+                context,
+                realm_id,
+                node_id,
+                NodeCapabilities::management_node(signing_key).unwrap(),
+                false,
+                None,
+                JobsRuntime::new(),
+            )
+            .await,
+        );
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        (dir, state, auth)
+    }
+
+    fn save(payload: &str, revision: Option<u64>) -> Json<SaveAssistantChatsRequest> {
+        Json(SaveAssistantChatsRequest {
+            payload: payload.to_string(),
+            revision,
+        })
+    }
+
+    #[tokio::test]
+    async fn reads_empty_first() {
+        let (_dir, state, auth) = setup_state().await;
+        let (status, Json(body)) = get_chats(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.payload, None);
+        assert_eq!(body.revision, 0);
+        assert_eq!(body.updated_at, None);
+    }
+
+    #[tokio::test]
+    async fn saves_then_reads() {
+        // Every accepted save bumps the revision the next read reports.
+        let (_dir, state, auth) = setup_state().await;
+        let (status, Json(saved)) = put_chats(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            save("{\"chats\":[]}", None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved.revision, 1);
+        assert!(saved.updated_at.is_some());
+
+        let (_, Json(read)) = get_chats(State(state.clone()), Extension(Some(auth.clone())))
+            .await
+            .unwrap();
+        assert_eq!(read.payload.as_deref(), Some("{\"chats\":[]}"));
+        assert_eq!(read.revision, 1);
+
+        let (_, Json(again)) = put_chats(State(state), Extension(Some(auth)), save("{}", Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(again.revision, 2);
+        assert_eq!(again.payload.as_deref(), Some("{}"));
+    }
+
+    #[tokio::test]
+    async fn rejects_stale_save() {
+        let (_dir, state, auth) = setup_state().await;
+        let (_, Json(first)) = put_chats(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            save("{}", None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.revision, 1);
+        let error = put_chats(State(state), Extension(Some(auth)), save("{}", Some(5)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_payload() {
+        let (_dir, state, auth) = setup_state().await;
+        let payload = "x".repeat(MAX_ASSISTANT_CHAT_BYTES + 1);
+        let error = put_chats(State(state), Extension(Some(auth)), save(&payload, None))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn requires_unrestricted_token() {
+        let (_dir, state, mut auth) = setup_state().await;
+        let error = get_chats(State(state.clone()), Extension(None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        auth.path_restrictions = Some(Vec::new());
+        let error = put_chats(State(state), Extension(Some(auth)), save("{}", None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn maps_internal_faults() {
+        let error = map_chat_error(ChatStoreError::NotFinished);
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}

@@ -357,6 +357,149 @@ mod tests {
         assert_eq!(cleanup.len(), 1);
     }
 
+    fn started(operation: &mut WriteChatsOperation, txn_id: Ulid) {
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    }
+
+    fn written() -> Event {
+        Event::Storage(StorageEvent::WriteResult {
+            key: chat_key(user()),
+        })
+    }
+
+    #[test]
+    fn reads_stored_chats() {
+        let mut operation = ReadChatsOperation::new(user());
+        operation.start();
+        assert!(!operation.is_complete());
+        operation.step(read_result(Some(&stored(2))));
+
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize().unwrap(), Some(stored(2)));
+    }
+
+    #[test]
+    fn overwrites_without_expectation() {
+        let mut operation = WriteChatsOperation::new(user(), "{}".to_string(), None, 30);
+        let txn_id = Ulid::from_bytes([6; 16]);
+        started(&mut operation, txn_id);
+        assert_eq!(operation.step(read_result(Some(&stored(4)))).len(), 1);
+        operation.step(written());
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize().unwrap().revision, 5);
+    }
+
+    #[test]
+    fn rejects_unexpected_events() {
+        // Each state accepts one event kind; anything else fails and aborts the transaction.
+        let txn_id = Ulid::from_bytes([6; 16]);
+
+        let mut read = ReadChatsOperation::new(user());
+        read.start();
+        assert!(
+            read.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
+                .is_empty()
+        );
+        assert!(matches!(
+            read.finalize().unwrap_err(),
+            ChatStoreError::UnexpectedEvent { .. }
+        ));
+
+        let mut write = WriteChatsOperation::new(user(), "{}".to_string(), None, 30);
+        write.start();
+        assert!(write.step(read_result(None)).is_empty());
+        assert!(matches!(
+            write.finalize().unwrap_err(),
+            ChatStoreError::UnexpectedEvent { .. }
+        ));
+
+        let mut write = WriteChatsOperation::new(user(), "{}".to_string(), None, 30);
+        started(&mut write, txn_id);
+        assert_eq!(write.step(written()).len(), 1);
+        assert!(write.is_complete());
+
+        let mut write = WriteChatsOperation::new(user(), "{}".to_string(), None, 30);
+        started(&mut write, txn_id);
+        write.step(read_result(None));
+        assert_eq!(write.step(read_result(None)).len(), 1);
+
+        let mut write = WriteChatsOperation::new(user(), "{}".to_string(), None, 30);
+        started(&mut write, txn_id);
+        write.step(read_result(None));
+        write.step(written());
+        assert_eq!(write.step(read_result(None)).len(), 1);
+        assert!(matches!(
+            write.finalize().unwrap_err(),
+            ChatStoreError::UnexpectedEvent { .. }
+        ));
+    }
+
+    #[test]
+    fn aborts_on_storage_error() {
+        let mut operation = WriteChatsOperation::new(user(), "{}".to_string(), None, 30);
+        started(&mut operation, Ulid::from_bytes([6; 16]));
+        let cleanup = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert_eq!(cleanup.len(), 1);
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            ChatStoreError::Storage(StorageError::TransactionConflict)
+        );
+
+        let mut read = ReadChatsOperation::new(user());
+        read.start();
+        assert!(
+            read.step(Event::Storage(StorageEvent::Error {
+                error: StorageError::KeyNotFound,
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            read.finalize().unwrap_err(),
+            ChatStoreError::Storage(StorageError::KeyNotFound)
+        );
+    }
+
+    #[test]
+    fn rejects_corrupt_record() {
+        let mut read = ReadChatsOperation::new(user());
+        read.start();
+        read.step(Event::Storage(StorageEvent::ReadResult {
+            key: chat_key(user()),
+            value: Some(vec![0xff; 3].into()),
+        }));
+
+        assert!(matches!(
+            read.finalize().unwrap_err(),
+            ChatStoreError::Conversion(_)
+        ));
+    }
+
+    #[test]
+    fn finalize_needs_completion() {
+        let mut operation = WriteChatsOperation::new(user(), "{}".to_string(), None, 30);
+        assert!(!operation.is_complete());
+        // A step before start behaves like start.
+        assert_eq!(operation.step(read_result(None)).len(), 1);
+        assert!(operation.abort().is_empty());
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            ChatStoreError::NotFinished
+        );
+        assert_eq!(
+            ReadChatsOperation::new(user()).finalize().unwrap_err(),
+            ChatStoreError::NotFinished
+        );
+    }
+
     #[test]
     fn refuses_more_than_the_node_keeps() {
         let payload = "x".repeat(MAX_ASSISTANT_CHAT_BYTES + 1);
