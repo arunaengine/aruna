@@ -106,6 +106,7 @@ pub mod update_metadata_document;
 pub mod update_user;
 pub mod usage_stats;
 pub mod user_subject_index;
+pub mod user_vault;
 
 /// Deterministic member order for records that several nodes must byte-match.
 pub(crate) fn sorted_user_ids(
