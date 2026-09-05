@@ -564,7 +564,7 @@ mod tests {
         assert!(!operation.is_complete());
         assert!(operation.step(deleted()).is_empty());
         assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap(), ());
+        assert!(operation.finalize().is_ok());
     }
 
     fn expect_unexpected<O: Operation<Error = VaultStoreError>>(
