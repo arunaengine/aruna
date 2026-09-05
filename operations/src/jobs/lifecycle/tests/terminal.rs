@@ -16,7 +16,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
-use crate::jobs::lifecycle::updates::publish_terminal;
+use crate::jobs::lifecycle::updates::{execution_chain, publish_state, publish_terminal};
 use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::tests::fixture::{Family, REALM, context};
@@ -237,4 +237,30 @@ async fn publishes_terminal_success() {
     .await
     .expect("reservation scan");
     assert!(held.is_empty());
+}
+
+#[tokio::test]
+async fn bumps_dashboard_once() {
+    // A new state advances the dashboard revision; a replay of it does not.
+    let family = Family::new([22u8; 32]);
+    let (_dir, ctx) = target_context(&family).await;
+    let receipt = seed_family(&ctx, &family).await;
+    let mut terminal = reserve_execution(&ctx, &family, &receipt).await;
+    let chain = execution_chain(&ctx, physical())
+        .await
+        .expect("chain resolves");
+    let mut changes = ctx
+        .net_handle
+        .as_ref()
+        .expect("net handle")
+        .subscribe_dashboard_changes();
+    let before = *changes.borrow_and_update();
+
+    terminal.state = JobState::Cancelled;
+    terminal.finished_at_ms = Some(5_000);
+    assert!(publish_terminal(&ctx, &terminal).await);
+    assert_eq!(*changes.borrow_and_update(), before + 1);
+
+    assert!(publish_state(&ctx, &chain, PhysicalExecutionState::Cancelled, None, 5_000).await);
+    assert_eq!(*changes.borrow_and_update(), before + 1);
 }

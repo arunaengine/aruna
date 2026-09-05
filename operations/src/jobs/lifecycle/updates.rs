@@ -22,6 +22,7 @@ use ulid::Ulid;
 use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
 use super::routing::family_of_alias;
 use super::witness::arm_family;
+use crate::dashboard::notify_dashboard_change;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
@@ -298,6 +299,10 @@ pub async fn publish_state(
             ) =>
         {
             debug!(state = state.name(), "Execution update published");
+            // A duplicate is a retry of a stored state; only a new record is a change.
+            if matches!(outcome.admission, Admission::Authentic) {
+                notify_dashboard_change(context);
+            }
             // An infrastructure error ends this execution without deciding the
             // job, so the family must be planned again from here too.
             if state == PhysicalExecutionState::Error {
