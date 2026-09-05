@@ -15,6 +15,8 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// The vault of the caller; the payload is the portal's own ciphertext.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -61,6 +63,10 @@ fn vault_response(vault: Option<UserVault>) -> VaultResponse {
             updated_at: None,
         },
     }
+}
+
+pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::new().routes(routes!(get_vault, put_vault, delete_vault))
 }
 
 #[utoipa::path(

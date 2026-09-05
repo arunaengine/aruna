@@ -1,9 +1,5 @@
 mod vault;
 
-use vault::{
-    __path_delete_vault, __path_get_vault, __path_put_vault, delete_vault, get_vault, put_vault,
-};
-
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::authorize_onboarding_admin;
@@ -83,7 +79,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(list_user_devices))
         .routes(routes!(revoke_user_device))
         .routes(routes!(evict_device))
-        .routes(routes!(get_vault, put_vault, delete_vault))
+        .merge(vault::router())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
