@@ -29,6 +29,23 @@ fn decode_vault(value: Option<Value>) -> Result<Option<UserVault>, VaultStoreErr
         .transpose()?)
 }
 
+fn write_vault(vault: &UserVault, txn_id: TxnId) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space: USER_VAULT_KEYSPACE.to_string(),
+        key: vault_key(vault.user_id),
+        value: vault.to_bytes()?.into(),
+        txn_id: Some(txn_id),
+    }))
+}
+
+fn abort_effects(txn_id: &mut Option<TxnId>) -> Effects {
+    txn_id
+        .take()
+        .map_or_else(smallvec::SmallVec::new, |txn_id| {
+            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        })
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum VaultStoreError {
     #[error(transparent)]
@@ -210,18 +227,13 @@ impl WriteVaultOperation {
             revision: held.saturating_add(1),
             updated_at: self.now,
         };
-        let bytes = match vault.to_bytes() {
-            Ok(bytes) => bytes,
+        let effect = match write_vault(&vault, txn_id) {
+            Ok(effect) => effect,
             Err(error) => return self.fail(error.into()),
         };
         self.state = WriteVaultState::WriteVault;
         self.output = Some(Ok(vault));
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: USER_VAULT_KEYSPACE.to_string(),
-            key: vault_key(self.user_id),
-            value: bytes.into(),
-            txn_id: Some(txn_id),
-        })]
+        smallvec![effect]
     }
 
     fn handle_written(&mut self, event: Event) -> Effects {
@@ -282,43 +294,108 @@ impl Operation for WriteVaultOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        abort_effects(&mut self.txn_id)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DeleteVaultState {
     Init,
-    DeleteVault,
+    StartTransaction,
+    ReadVault,
+    WriteVault,
+    CommitTransaction,
     Finish,
     Error,
 }
 
-/// Removes the vault of one user. A vault that is not there is removed the
-/// same way, so a repeated delete succeeds.
+/// Empties the vault of one user but keeps its revision counting, so a browser
+/// that still holds the deleted vault cannot overwrite a re-created one. An
+/// absent or already emptied vault is left as it is.
 #[derive(Debug, PartialEq)]
 pub struct DeleteVaultOperation {
     user_id: UserId,
+    now: u64,
+    txn_id: Option<TxnId>,
     state: DeleteVaultState,
     output: Option<Result<(), VaultStoreError>>,
 }
 
 impl DeleteVaultOperation {
-    pub fn new(user_id: UserId) -> Self {
+    pub fn new(user_id: UserId, now: u64) -> Self {
         Self {
             user_id,
+            now,
+            txn_id: None,
             state: DeleteVaultState::Init,
             output: None,
         }
     }
 
     fn fail(&mut self, error: VaultStoreError) -> Effects {
+        let cleanup = self.abort();
         self.state = DeleteVaultState::Error;
         self.output = Some(Err(error));
+        cleanup
+    }
+
+    fn handle_started(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.fail(unexpected(&self.state, "transaction started", &event));
+        };
+        self.txn_id = Some(txn_id);
+        self.state = DeleteVaultState::ReadVault;
+        smallvec![read_vault(self.user_id, Some(txn_id))]
+    }
+
+    fn handle_current(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(unexpected(&self.state, "vault read", &event));
+        };
+        let current = match decode_vault(value) {
+            Ok(Some(vault)) if !vault.payload.is_empty() => vault,
+            Ok(_) => {
+                self.state = DeleteVaultState::Finish;
+                self.output = Some(Ok(()));
+                return self.abort();
+            }
+            Err(error) => return self.fail(error),
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(StorageError::TransactionNotFound.into());
+        };
+        let tombstone = UserVault {
+            user_id: self.user_id,
+            payload: String::new(),
+            revision: current.revision.saturating_add(1),
+            updated_at: self.now,
+        };
+        let effect = match write_vault(&tombstone, txn_id) {
+            Ok(effect) => effect,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = DeleteVaultState::WriteVault;
+        smallvec![effect]
+    }
+
+    fn handle_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.fail(unexpected(&self.state, "vault write", &event));
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(StorageError::TransactionNotFound.into());
+        };
+        self.state = DeleteVaultState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_committed(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.fail(unexpected(&self.state, "transaction committed", &event));
+        };
+        self.txn_id = None;
+        self.state = DeleteVaultState::Finish;
+        self.output = Some(Ok(()));
         smallvec![]
     }
 }
@@ -328,11 +405,9 @@ impl Operation for DeleteVaultOperation {
     type Error = VaultStoreError;
 
     fn start(&mut self) -> Effects {
-        self.state = DeleteVaultState::DeleteVault;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: USER_VAULT_KEYSPACE.to_string(),
-            key: vault_key(self.user_id),
-            txn_id: None,
+        self.state = DeleteVaultState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false,
         })]
     }
 
@@ -342,14 +417,10 @@ impl Operation for DeleteVaultOperation {
         }
         match self.state {
             DeleteVaultState::Init => self.start(),
-            DeleteVaultState::DeleteVault => {
-                let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
-                    return self.fail(unexpected(&self.state, "vault delete", &event));
-                };
-                self.state = DeleteVaultState::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
+            DeleteVaultState::StartTransaction => self.handle_started(event),
+            DeleteVaultState::ReadVault => self.handle_current(event),
+            DeleteVaultState::WriteVault => self.handle_written(event),
+            DeleteVaultState::CommitTransaction => self.handle_committed(event),
             DeleteVaultState::Finish | DeleteVaultState::Error => smallvec![],
         }
     }
@@ -366,7 +437,7 @@ impl Operation for DeleteVaultOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        abort_effects(&mut self.txn_id)
     }
 }
 
@@ -414,14 +485,21 @@ mod tests {
         })
     }
 
-    fn deleted() -> Event {
-        Event::Storage(StorageEvent::DeleteResult {
-            key: vault_key(user()),
-        })
+    fn tombstone(revision: u64) -> UserVault {
+        UserVault {
+            user_id: user(),
+            payload: String::new(),
+            revision,
+            updated_at: 70,
+        }
     }
 
     fn write_op(payload: &str, expected: Option<u64>) -> WriteVaultOperation {
         WriteVaultOperation::new(user(), payload.to_string(), expected, 50)
+    }
+
+    fn delete_op() -> DeleteVaultOperation {
+        DeleteVaultOperation::new(user(), 70)
     }
 
     fn is_read(effects: &Effects) -> bool {
@@ -460,6 +538,12 @@ mod tests {
         operation.start();
         operation.step(vault_read(Some(&vault(3))));
         assert_eq!(operation.finalize().unwrap(), Some(vault(3)));
+
+        // A deleted vault reads back as its tombstone, revision included.
+        let mut operation = ReadVaultOperation::new(user());
+        operation.start();
+        operation.step(vault_read(Some(&tombstone(4))));
+        assert_eq!(operation.finalize().unwrap(), Some(tombstone(4)));
     }
 
     #[test]
@@ -552,19 +636,55 @@ mod tests {
     }
 
     #[test]
-    fn deletes_any_vault() {
-        // One delete of the key, stored or not, so a repeat is harmless.
-        let mut operation = DeleteVaultOperation::new(user());
-        let effects = operation.start();
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::Delete { key_space, key, txn_id: None }))
-                if key_space == USER_VAULT_KEYSPACE && *key == vault_key(user())
-        ));
-        assert!(!operation.is_complete());
-        assert!(operation.step(deleted()).is_empty());
+    fn writes_over_tombstone() {
+        // A deleted vault keeps its revision for the check.
+        let mut operation = write_op("new", Some(1));
+        operation.start();
+        operation.step(started());
+        assert!(is_abort(&operation.step(vault_read(Some(&tombstone(2))))));
+        assert_eq!(operation.finalize().unwrap_err(), VaultStoreError::Stale);
+
+        for expected in [None, Some(2)] {
+            let mut operation = write_op("new", expected);
+            operation.start();
+            operation.step(started());
+            assert!(is_write(&operation.step(vault_read(Some(&tombstone(2))))));
+            operation.step(written());
+            operation.step(committed());
+            assert_eq!(operation.finalize().unwrap().revision, 3);
+        }
+    }
+
+    #[test]
+    fn deletes_a_vault() {
+        // The record stays as an empty tombstone with the next revision.
+        let mut operation = delete_op();
+        assert_eq!(operation.start().len(), 1);
+        assert!(is_read(&operation.step(started())));
+        let effects = operation.step(vault_read(Some(&vault(3))));
+        let Some(Effect::Storage(StorageEffect::Write { value, txn_id, .. })) = effects.first()
+        else {
+            panic!("expected the tombstone write, got {effects:?}");
+        };
+        assert_eq!(txn_id, &Some(txn()));
+        assert_eq!(UserVault::from_bytes(value.as_ref()).unwrap(), tombstone(4));
+        assert_eq!(operation.step(written()).len(), 1);
+        assert!(operation.step(committed()).is_empty());
         assert!(operation.is_complete());
         assert!(operation.finalize().is_ok());
+    }
+
+    #[test]
+    fn skips_missing_vault() {
+        // Nothing stored, or already emptied: the transaction is released without a write.
+        for stored in [None, Some(tombstone(4))] {
+            let mut operation = delete_op();
+            operation.start();
+            operation.step(started());
+            assert!(is_abort(&operation.step(vault_read(stored.as_ref()))));
+            assert!(operation.is_complete());
+            assert!(operation.finalize().is_ok());
+        }
     }
 
     fn expect_unexpected<O: Operation<Error = VaultStoreError>>(
@@ -592,7 +712,16 @@ mod tests {
         let live = || vault_read(Some(&stored));
 
         expect_unexpected(ReadVaultOperation::new(user()), vec![], started(), 0);
-        expect_unexpected(DeleteVaultOperation::new(user()), vec![], written(), 0);
+
+        expect_unexpected(delete_op(), vec![], vault_read(None), 0);
+        expect_unexpected(delete_op(), vec![started()], started(), 1);
+        expect_unexpected(delete_op(), vec![started(), live()], vault_read(None), 1);
+        expect_unexpected(
+            delete_op(),
+            vec![started(), live(), written()],
+            written(),
+            1,
+        );
 
         expect_unexpected(write_op("x", None), vec![], vault_read(None), 0);
         expect_unexpected(write_op("x", None), vec![started()], started(), 1);
@@ -635,9 +764,10 @@ mod tests {
             VaultStoreError::Storage(StorageError::TransactionConflict)
         );
 
-        let mut delete = DeleteVaultOperation::new(user());
+        let mut delete = delete_op();
         delete.start();
-        assert!(delete.step(error()).is_empty());
+        delete.step(started());
+        assert!(is_abort(&delete.step(error())));
         assert!(delete.is_complete());
         assert!(delete.finalize().is_err());
     }
@@ -666,6 +796,15 @@ mod tests {
             write.finalize().unwrap_err(),
             VaultStoreError::Conversion(_)
         ));
+
+        let mut delete = delete_op();
+        delete.start();
+        delete.step(started());
+        assert!(is_abort(&delete.step(corrupt())));
+        assert!(matches!(
+            delete.finalize().unwrap_err(),
+            VaultStoreError::Conversion(_)
+        ));
     }
 
     #[test]
@@ -681,7 +820,7 @@ mod tests {
         assert!(is_read(&read.step(started())));
         assert_eq!(read.finalize().unwrap_err(), VaultStoreError::NotFinished);
 
-        let mut delete = DeleteVaultOperation::new(user());
+        let mut delete = delete_op();
         assert_eq!(delete.step(started()).len(), 1);
         assert_eq!(delete.finalize().unwrap_err(), VaultStoreError::NotFinished);
     }

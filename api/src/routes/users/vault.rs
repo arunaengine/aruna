@@ -19,9 +19,9 @@ use utoipa::ToSchema;
 /// The vault of the caller; the payload is the portal's own ciphertext.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VaultResponse {
-    /// Null before the first save.
+    /// Null before the first save and after a delete.
     pub payload: Option<String>,
-    /// 0 before the first save, bumped by every accepted save; pass it back with the next save.
+    /// 0 before the first save, bumped by every save and delete; pass it back with the next save.
     pub revision: u64,
     /// Null before the first save.
     pub updated_at: Option<String>,
@@ -51,7 +51,7 @@ fn map_vault_error(error: VaultStoreError) -> ServerError {
 fn vault_response(vault: Option<UserVault>) -> VaultResponse {
     match vault {
         Some(vault) => VaultResponse {
-            payload: Some(vault.payload),
+            payload: Some(vault.payload).filter(|payload| !payload.is_empty()),
             revision: vault.revision,
             updated_at: Some(unix_rfc3339(vault.updated_at)),
         },
@@ -77,6 +77,8 @@ refused. The vault is self-scoped, so a caller reaches only their own.
 - The payload is the portal's own ciphertext, stored opaque and returned unchanged; the node holds
   no key that opens it.
 - Before the first save the payload and `updated_at` are null and the revision is 0.
+- After a delete the payload is null again, while the revision and `updated_at` keep counting
+  from the deleted vault.
 - The vault lives on the node that received it and is not replicated to the realm's other nodes."#,
     responses(
         (status = 200, description = "The caller's vault, or the empty state before the first save", body = VaultResponse,
@@ -116,6 +118,8 @@ refused. The vault is self-scoped, so a caller writes only their own.
 - Pass the `revision` last read, so a save from a second browser cannot silently drop what this
   one holds; a differing revision is refused with 409. Leaving it out overwrites. The first save
   may pass 0.
+- A delete bumps the revision too, so a browser that still holds the deleted vault cannot
+  overwrite a vault re-created elsewhere.
 - The vault after the save is returned; the first save answers revision 1.
 
 **Limits**
@@ -173,8 +177,9 @@ pub async fn put_vault(
 refused. The vault is self-scoped, so a caller deletes only their own.
 
 **Behavior**
-- The next read answers the empty state again: a null payload and revision 0.
-- Deleting a vault that is not there answers 204 as well."#,
+- The next read answers a null payload, while the revision and `updated_at` keep counting from
+  the deleted vault, so a browser that still holds it cannot overwrite a re-created one.
+- Deleting a vault that is not there, or one already deleted, answers 204 without a write."#,
     responses(
         (status = 204, description = "The vault is deleted or was never there"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -187,9 +192,12 @@ pub async fn delete_vault(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    drive(DeleteVaultOperation::new(auth.user_id), &state.get_ctx())
-        .await
-        .map_err(map_vault_error)?;
+    drive(
+        DeleteVaultOperation::new(auth.user_id, unix_timestamp_secs()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_vault_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -315,12 +323,9 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_twice() {
-        // A delete empties the vault; a repeat answers 204 too, and a new save starts over.
+        // A delete of nothing is a no-op; a delete keeps the revision and a repeat adds nothing.
         let (state, _dir) = setup_state().await;
         let auth = realm_auth(state.get_realm_id());
-        save(&state, Some(auth.clone()), "sealed", None)
-            .await
-            .unwrap();
         assert_eq!(
             delete(&state, Some(auth.clone())).await.unwrap(),
             StatusCode::NO_CONTENT
@@ -330,17 +335,48 @@ mod tests {
             (vault.payload, vault.revision, vault.updated_at),
             (None, 0, None)
         );
+
+        save(&state, Some(auth.clone()), "sealed", None)
+            .await
+            .unwrap();
         assert_eq!(
             delete(&state, Some(auth.clone())).await.unwrap(),
             StatusCode::NO_CONTENT
         );
+        let vault = read(&state, Some(auth.clone())).await.unwrap();
+        assert_eq!((vault.payload, vault.revision), (None, 2));
+        assert!(vault.updated_at.is_some());
         assert_eq!(
-            save(&state, Some(auth), "fresh", Some(0))
+            delete(&state, Some(auth.clone())).await.unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(read(&state, Some(auth)).await.unwrap().revision, 2);
+    }
+
+    #[tokio::test]
+    async fn refuses_stale_recreate() {
+        // A browser holding the deleted vault's revision cannot overwrite a re-created one.
+        let (state, _dir) = setup_state().await;
+        let auth = realm_auth(state.get_realm_id());
+        save(&state, Some(auth.clone()), "old", Some(0))
+            .await
+            .unwrap();
+        delete(&state, Some(auth.clone())).await.unwrap();
+        assert_eq!(
+            save(&state, Some(auth.clone()), "new", Some(2))
                 .await
                 .unwrap()
                 .revision,
-            1
+            3
         );
+        assert_eq!(
+            save(&state, Some(auth.clone()), "old again", Some(1))
+                .await
+                .unwrap_err(),
+            StatusCode::CONFLICT
+        );
+        let vault = read(&state, Some(auth)).await.unwrap();
+        assert_eq!((vault.payload.as_deref(), vault.revision), (Some("new"), 3));
     }
 
     #[tokio::test]
