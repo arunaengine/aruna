@@ -10,7 +10,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
