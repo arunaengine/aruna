@@ -5,7 +5,10 @@ mod proxy;
 mod test_support;
 
 use chatgpt::{__path_poll_login, __path_start_login, poll_login, start_login};
-use chats::{__path_get_chats, __path_put_chats, get_chats, put_chats};
+use chats::{
+    __path_delete_chat, __path_get_turns, __path_list_chats, __path_put_chat, __path_put_turn,
+    delete_chat, get_turns, list_chats, put_chat, put_turn,
+};
 use proxy::{__path_proxy_get, __path_proxy_post, proxy_get, proxy_post};
 
 use crate::auth::require_unrestricted_realm_auth;
@@ -51,7 +54,10 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(test_provider))
         .routes(routes!(start_login))
         .routes(routes!(poll_login))
-        .routes(routes!(get_chats, put_chats));
+        .routes(routes!(list_chats))
+        .routes(routes!(put_chat, delete_chat))
+        .routes(routes!(get_turns))
+        .routes(routes!(put_turn));
     super::routes_at(
         router,
         "/system/assistant/providers/{id}/proxy/{*path}",
