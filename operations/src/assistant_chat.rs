@@ -553,6 +553,7 @@ pub struct WriteChatTurnOperation {
     chat_id: String,
     seq: u32,
     payload: String,
+    expected_revision: Option<u64>,
     now: u64,
     txn_id: Option<TxnId>,
     /// Payload bytes of the turns this write replaces or drops.
@@ -564,12 +565,20 @@ pub struct WriteChatTurnOperation {
 }
 
 impl WriteChatTurnOperation {
-    pub fn new(user_id: UserId, chat_id: String, seq: u32, payload: String, now: u64) -> Self {
+    pub fn new(
+        user_id: UserId,
+        chat_id: String,
+        seq: u32,
+        payload: String,
+        expected_revision: Option<u64>,
+        now: u64,
+    ) -> Self {
         Self {
             user_id,
             chat_id,
             seq,
             payload,
+            expected_revision,
             now,
             txn_id: None,
             freed: 0,
@@ -606,6 +615,14 @@ impl WriteChatTurnOperation {
         let Some(txn_id) = self.txn_id else {
             return self.fail(StorageError::TransactionNotFound.into());
         };
+        // A revision from an older read means another browser wrote in between.
+        if let Some(expected) = self.expected_revision
+            && expected != head.revision
+        {
+            return self.fail(ChatStoreError::StaleTurn {
+                next_seq: head.next_seq,
+            });
+        }
         let read = if self.seq == head.next_seq {
             let over = head
                 .next_seq
@@ -1119,7 +1136,18 @@ mod tests {
     }
 
     fn turn_op(seq: u32, payload: &str) -> WriteChatTurnOperation {
-        WriteChatTurnOperation::new(user(), CHAT.to_string(), seq, payload.to_string(), 50)
+        WriteChatTurnOperation::new(user(), CHAT.to_string(), seq, payload.to_string(), None, 50)
+    }
+
+    fn turn_op_at(seq: u32, revision: u64) -> WriteChatTurnOperation {
+        WriteChatTurnOperation::new(
+            user(),
+            CHAT.to_string(),
+            seq,
+            "x".to_string(),
+            Some(revision),
+            50,
+        )
     }
 
     fn delete_op() -> DeleteChatOperation {
@@ -1458,9 +1486,30 @@ mod tests {
     }
 
     #[test]
+    fn refuses_stale_revision() {
+        // An append and a tail rewrite from an older read both stop; a matching one goes on.
+        for seq in [3, 4] {
+            let mut operation = turn_op_at(seq, 2);
+            operation.start();
+            operation.step(started());
+            assert_eq!(operation.step(head_read(Some(&head(CHAT, 4, 9)))).len(), 1);
+            assert_eq!(
+                operation.finalize().unwrap_err(),
+                ChatStoreError::StaleTurn { next_seq: 4 }
+            );
+        }
+        let mut operation = turn_op_at(4, 3);
+        operation.start();
+        operation.step(started());
+        let effects = operation.step(head_read(Some(&head(CHAT, 4, 9))));
+        assert!(is_iter(&effects, ASSISTANT_CHAT_HEAD_KEYSPACE));
+    }
+
+    #[test]
     fn refuses_large_turn() {
         let payload = "x".repeat(MAX_ASSISTANT_TURN_BYTES + 1);
-        let mut operation = WriteChatTurnOperation::new(user(), CHAT.to_string(), 0, payload, 50);
+        let mut operation =
+            WriteChatTurnOperation::new(user(), CHAT.to_string(), 0, payload, None, 50);
 
         assert!(operation.start().is_empty());
         assert_eq!(
