@@ -204,7 +204,7 @@ impl Operation for ListChatHeadsOperation {
                     Err(error) => return self.fail(error),
                 };
                 heads.retain(AssistantChatHead::is_live);
-                heads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                heads.sort_by_key(|head| std::cmp::Reverse(head.updated_at));
                 self.state = ListHeadsState::Finish;
                 self.output = Some(Ok(heads));
                 smallvec![]
