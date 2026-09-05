@@ -71,8 +71,7 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
                 stack.pop();
             }
             Ok(Event::Text(chunk)) => {
-                let raw = std::str::from_utf8(chunk.as_ref())
-                    .map_err(|error| OaiParseError::Xml(error.to_string()))?;
+                let raw: &str = chunk.as_ref();
                 text.push_str(
                     quick_xml::escape::unescape(raw)
                         .map_err(|error| OaiParseError::Xml(error.to_string()))?
@@ -81,15 +80,10 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
             }
             // CDATA is literal by definition: append it verbatim, no unescaping.
             Ok(Event::CData(chunk)) => {
-                text.push_str(
-                    std::str::from_utf8(chunk.as_ref())
-                        .map_err(|error| OaiParseError::Xml(error.to_string()))?,
-                );
+                text.push_str(chunk.as_ref());
             }
             Ok(Event::GeneralRef(reference)) => {
-                let name = std::str::from_utf8(reference.as_ref())
-                    .map_err(|error| OaiParseError::Xml(error.to_string()))?
-                    .trim_matches(|c| c == '&' || c == ';');
+                let name = reference.as_ref().trim_matches(|c| c == '&' || c == ';');
                 let resolved = quick_xml::escape::unescape(&format!("&{name};"))
                     .map_err(|error| OaiParseError::Xml(error.to_string()))?
                     .into_owned();
@@ -257,15 +251,15 @@ fn commit_text(
 }
 
 fn local_name(element: &BytesStart<'_>) -> Vec<u8> {
-    element.local_name().as_ref().to_vec()
+    element.local_name().as_ref().as_bytes().to_vec()
 }
 
 fn attribute(element: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, OaiParseError> {
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| OaiParseError::Xml(error.to_string()))?;
-        if attribute.key.local_name().as_ref() == key {
+        if attribute.key.local_name().as_ref().as_bytes() == key {
             let value = attribute
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|error| OaiParseError::Xml(error.to_string()))?
                 .into_owned();
             return Ok(Some(value));
@@ -290,7 +284,7 @@ pub fn parse_granularity(xml: &str) -> Option<HarvestGranularity> {
             // `OAI-PMH / Identify / granularity`, never a repeat of the name
             // inside a repository description block.
             Ok(Event::Text(chunk)) if is_granularity(&stack) => {
-                let raw = std::str::from_utf8(chunk.as_ref()).ok()?;
+                let raw: &str = chunk.as_ref();
                 return HarvestGranularity::parse(raw);
             }
             Ok(Event::Eof) | Err(_) => return None,

@@ -94,11 +94,19 @@ fn add_transport_responses(openapi: &mut utoipa::openapi::OpenApi) {
                     .or_insert_with(|| timeout_response().into());
             }
             if operation.request_body.is_some() {
-                operation
+                let limit = operation
                     .responses
                     .responses
                     .entry("413".to_string())
                     .or_insert_with(|| body_limit_response().into());
+                // A route with its own 413 still meets the transport body limit first.
+                if let RefOr::T(response) = limit
+                    && !response.content.contains_key("text/plain")
+                {
+                    response
+                        .content
+                        .insert("text/plain".to_string(), body_limit_content());
+                }
             }
             if needs_internal(path, method, operation) {
                 operation
@@ -166,12 +174,16 @@ fn timeout_response() -> Response {
 }
 
 fn body_limit_response() -> Response {
-    let mut response =
-        ResponseBuilder::new().description("The request body exceeded the configured limit");
+    ResponseBuilder::new()
+        .description("The request body exceeded the configured limit")
+        .content("text/plain", body_limit_content())
+        .build()
+}
+
+fn body_limit_content() -> Content {
     let mut text = Content::new(Some(Object::with_type(Type::String)));
     text.example = Some(json!("Failed to buffer the request body"));
-    response = response.content("text/plain", text);
-    response.build()
+    text
 }
 
 fn internal_response(path: &str) -> Response {

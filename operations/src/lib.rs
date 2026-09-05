@@ -10,6 +10,7 @@ pub mod add_user_to_realm_role;
 pub mod allocate_handle;
 pub mod announce;
 pub mod announce_realm_presence;
+pub mod assistant_chat;
 pub mod assistant_provider;
 pub mod auth;
 pub mod blob;

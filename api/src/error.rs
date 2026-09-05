@@ -46,6 +46,9 @@ pub enum ServerError {
     ComputeQuotaDenied(aruna_core::compute_quota::QuotaDenied),
     #[error("{0}")]
     PayloadTooLarge(String),
+    /// The record existed and was deleted; unlike a 404 it will not come back.
+    #[error("{0}")]
+    Gone(String),
     #[error("Bad request")]
     BadRequest,
     /// A write surface named a label the owning node derives for itself.
@@ -380,6 +383,7 @@ impl ServerError {
             | ServerError::ComputeQuotaDenied(_) => StatusCode::CONFLICT,
             ServerError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::Gone(_) => StatusCode::GONE,
             ServerError::BadRequest
             | ServerError::ReservedLabel(_)
             | ServerError::BadRequestReason(_)
@@ -414,6 +418,7 @@ impl ServerError {
             ServerError::ComputeQuotaDenied(_) => "compute_quota_denied".to_string(),
             ServerError::PreconditionFailed(_) => "Precondition failed".to_string(),
             ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
+            ServerError::Gone(_) => "Gone".to_string(),
             ServerError::ReservedLabel(_) => "reserved_label".to_string(),
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
@@ -547,6 +552,18 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body.code.as_deref(), Some("JobPlanConflict"));
+    }
+
+    #[tokio::test]
+    async fn gone_typed() {
+        let response = ServerError::Gone("the chat was deleted".to_string()).into_response();
+
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body: ErrorResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body.code.as_deref(), Some("Gone"));
+        assert_eq!(body.error, "the chat was deleted");
     }
 
     #[tokio::test]

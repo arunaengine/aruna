@@ -17,7 +17,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.73"
+version = "3.0.0-alpha.74"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -37,56 +37,56 @@ aruna-tasks = { path = "tasks" }
 
 # Third-party crates
 ahash = "0.8.12"
-async-compression = { version = "0.4.42", default-features = false, features = [
+async-compression = { version = "0.4.44", default-features = false, features = [
     "tokio",
     "deflate",
 ] }
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 async_zip = { package = "astral_async_zip", version = "0.0.20", features = [
     "tokio",
     "deflate",
 ] }
-aws-config = { version = "1.10.1", default-features = false, features = [
+aws-config = { version = "1.12.0", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-aws-sdk-s3 = { version = "1.140.0", default-features = false, features = [
+aws-sdk-s3 = { version = "1.145.0", default-features = false, features = [
     "default-https-client",
     "http-1x",
     "rt-tokio",
 ] }
 axum = "0.8.9"
-bao-tree = "0.16.0"
-base64 = "0.23.0"
+bao-tree = "0.16.1"
+base64 = "0.23.1"
 blake3 = { version = "=1.8.7", features = ["serde"] }
-bollard = "0.21.0"
-byteview = "0.10.1"
+bollard = "0.21.1"
+byteview = "0.10.2"
 bytes = "1.12.1"
 cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.10.1"
 chrono = { version = "0.4.45", features = ["serde"] }
-clap = { version = "4.6.4", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 craqle = { git = "https://github.com/arunaengine/craqle", branch = "main", features = [
     "iroh",
     "shacl-core",
 ] }
 crc-fast = "1.10.0"
-crossfire = "3.1.19"
+crossfire = "3.1.20"
 crypto_box = "0.9.1"
 dirs = "6.0.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
-fjall = "3.1.9"
-flate2 = "1.1.9"
-futures = "0.3.33"
-futures-core = "0.3.33"
-futures-util = { version = "0.3.33", features = ["io"] }
+fjall = "3.1.10"
+flate2 = "1.1.10"
+futures = "0.3.34"
+futures-core = "0.3.34"
+futures-util = { version = "0.3.34", features = ["io"] }
 getrandom = "0.4.3"
 governor = "0.10.4"
-globset = "0.4.19"
+globset = "0.4.20"
 hex = "0.4.3"
-http = "1.4.2"
-hyper = { version = "1.11.0", features = ["full"] }
+http = "1.5.0"
+hyper = { version = "1.11.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = [
     "server",
     "server-auto",
@@ -95,8 +95,8 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
-ipnet = "2.12.0"
-iroh = "1.0.3"
+ipnet = "2.12.1"
+iroh = "1.1.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
 irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f66816a16492c615525809f6c8b663", features = [
     "fjall",
@@ -105,7 +105,7 @@ irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f
 iroh-io = "0.6.2"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
-lru = "0.18.2"
+lru = "0.18.4"
 md5 = "0.8.1"
 nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
 opendal = { version = "0.57.0", features = [
@@ -129,27 +129,27 @@ opentelemetry_sdk = { version = "0.32.1", default-features = false, features = [
     "trace",
     "rt-tokio",
 ] }
-oxrdf = "0.3.3"
-oxttl = "0.2.3"
+oxrdf = "0.3.4"
+oxttl = "0.2.4"
 parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
 percent-encoding = "2.3.2"
 postcard = { version = "1.1.3", features = ["alloc"] }
 prometheus-client = "0.25"
 proptest = "1.11.0"
-quick-xml = "0.38.4"
+quick-xml = "0.42.0"
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = [
     "json",
     "rustls",
     "stream",
 ] }
-rmcp = { version = "3.1.4", default-features = false, features = [
+rmcp = { version = "3.2.0", default-features = false, features = [
     "server",
     "macros",
     "transport-streamable-http-server",
 ] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-rustls = { version = "0.23.42", features = ["ring"] }
+rustls = { version = "0.23.43", features = ["ring"] }
 kube = { version = "4.2.0", default-features = false, features = [
     "client",
     "jsonpatch",
@@ -164,19 +164,19 @@ serde_json = { version = "1.0.151", features = ["raw_value"] }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.2"
-spargebra = "0.4.6"
-spareval = "0.2.6"
+spargebra = "0.4.7"
+spareval = "0.2.7"
 sysinfo = { version = "0.39.6", default-features = false, features = [
     "system",
 ] }
 tar = "0.4.46"
 tempfile = "3.27.0"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full", "tracing"] }
-toml = "1.1.4"
+toml = "1.1.5"
 tokio-util = { version = "0.7.19", features = ["compat", "io-util", "rt"] }
 tower = { version = "0.5.3", features = ["limit"] }
-tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
+tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = [
@@ -189,7 +189,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 ulid = { version = "3.0.0", features = ["serde"] }
 unicode-normalization = "0.1.25"
 url = "2.5.8"
-uuid = { version = "1.24.1", features = ["v4"] }
+uuid = { version = "1.26.0", features = ["v4"] }
 utoipa = { version = "5.5.0", features = [
     "chrono",
     "axum_extras",
