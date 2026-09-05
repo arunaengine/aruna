@@ -10,6 +10,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
@@ -58,7 +59,12 @@ refused. Chats are self-scoped, so a caller reaches only their own.
 - `revision` counts accepted saves; pass it back to `PUT` so a save from a second browser cannot
   silently drop what this one holds."#,
     responses(
-        (status = 200, description = "The caller's stored chats", body = AssistantChatsResponse),
+        (status = 200, description = "The caller's stored chats", body = AssistantChatsResponse,
+            example = json!({
+                "payload": "{\"chats\":[]}",
+                "revision": 3,
+                "updated_at": "2026-04-09T12:00:00Z"
+            })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse)
     ),
@@ -103,9 +109,21 @@ refused. Chats are self-scoped, so a caller writes only their own.
   so the caller can read, merge and save again.
 - Leaving `revision` out overwrites whatever is stored.
 - A payload above the node's limit is refused with 413."#,
-    request_body = SaveAssistantChatsRequest,
+    request_body(
+        content = SaveAssistantChatsRequest,
+        description = "The portal's chat state and the revision it was read at",
+        example = json!({
+            "payload": "{\"chats\":[]}",
+            "revision": 3
+        })
+    ),
     responses(
-        (status = 200, description = "The stored chats after the save", body = AssistantChatsResponse),
+        (status = 200, description = "The stored chats after the save", body = AssistantChatsResponse,
+            example = json!({
+                "payload": "{\"chats\":[]}",
+                "revision": 4,
+                "updated_at": "2026-04-09T12:00:00Z"
+            })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 409, description = "The chats changed in another browser", body = ErrorResponse),
