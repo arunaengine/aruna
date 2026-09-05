@@ -37,7 +37,7 @@ pub struct ChatHeadResponse {
     pub next_seq: u32,
     /// Sum of the live turn payload lengths.
     pub bytes: u64,
-    /// Bumped by every accepted head or turn write; pass it back with a head save.
+    /// Bumped by every accepted head or turn write; pass it back with the next head or turn save.
     pub revision: u64,
 }
 
@@ -355,6 +355,8 @@ refused. Chats are self-scoped, so a caller writes only their own.
 - A `seq` equal to the head's `next_seq` appends; a `seq` one below it rewrites the tail turn
   while it still streams. Any other `seq` is refused with 409, and the message names the
   current `next_seq`.
+- A `seq` that is not a number is rejected by the path parser with a plain text 400 before the
+  route runs, so that answer carries no JSON error body.
 - Pass the head `revision` last read, so a write from an older read cannot replace a turn another
   browser appended in between; a differing revision is refused with 409 the same way.
 - The payload is the portal's own text and is stored opaque.
