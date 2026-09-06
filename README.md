@@ -178,6 +178,10 @@ subnet that does not overlap any network this host already uses.
 
 Kubernetes keeps its existing S3-only network policy, and Apptainer keeps the host network.
 
+The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
+the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
+`ghcr.io/arunaengine/aruna-session-python:0.1.0` and `ghcr.io/arunaengine/aruna-session-deno:0.1.0`.
+
 ## Durability Configuration
 
 `ARUNA_FJALL_PERSIST_MODE` controls the Fjall persist mode used by Aruna's local storage engine and document-sync metadata state.

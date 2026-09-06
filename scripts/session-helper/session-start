@@ -1,0 +1,40 @@
+#!/bin/sh
+# Start command of every Aruna session image. It installs the dependencies the
+# portal staged, points fsspec and the AWS SDK at the node's S3 endpoint, and
+# then becomes the session helper.
+set -eu
+
+workdir=$(pwd)
+
+# The node's workspace binding sets AWS_ENDPOINT_URL. Older botocore and s3fs
+# read their own names, so the same value is offered under all of them.
+if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+    export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-$AWS_ENDPOINT_URL}"
+    export FSSPEC_S3_ENDPOINT_URL="${FSSPEC_S3_ENDPOINT_URL:-$AWS_ENDPOINT_URL}"
+fi
+
+# The dependency file is staged as a job input. An input without a container
+# path lands in /inputs, so both places are checked.
+find_staged() {
+    for candidate in "$workdir/$1" "/inputs/$1"; do
+        if [ -f "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if requirements=$(find_staged requirements.txt); then
+    echo "aruna-session: installing $requirements" >&2
+    pip install --no-cache-dir --disable-pip-version-check -r "$requirements" >&2
+fi
+
+if deno_json=$(find_staged deno.json); then
+    echo "aruna-session: caching $deno_json" >&2
+    cp "$deno_json" "$workdir/deno.json"
+    deno cache --quiet "$workdir/deno.json" >&2 || true
+fi
+
+mkdir -p "$(dirname "${ARUNA_SESSION_SOCKET:-$workdir/.aruna/session.sock}")"
+exec /opt/aruna/session-helper serve
