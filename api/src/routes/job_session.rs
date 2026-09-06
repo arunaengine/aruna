@@ -229,18 +229,14 @@ fn ended_response(record: &JobRecord) -> Json<SessionResponse> {
     })
 }
 
-pub(crate) fn session_response(
-    state: &ServerState,
-    session: &Session,
-    with_cells: bool,
-) -> SessionResponse {
+pub(crate) fn session_response(session: &Session, with_cells: bool) -> SessionResponse {
     let snapshot = session.snapshot();
     SessionResponse {
         job_id: snapshot.job_id,
-        state: phase_name(snapshot.state).to_string(),
+        state: snapshot.state.as_str().to_string(),
         runtime: snapshot.runtime,
         workspace_bucket: snapshot.workspace_bucket,
-        executor_node_id: state.get_node_id().to_string(),
+        executor_node_id: snapshot.executor_node_id,
         started_at_ms: snapshot.started_at_ms,
         idle_after_ms: snapshot.idle_after_ms,
         idle_deadline_ms: snapshot.idle_deadline_ms,
@@ -262,16 +258,6 @@ pub(crate) fn session_response(
         ended: snapshot.ended.map(|reason| SessionEndedResponse {
             reason: reason.as_str().to_string(),
         }),
-    }
-}
-
-fn phase_name(phase: aruna_compute::session::SessionPhase) -> &'static str {
-    use aruna_compute::session::SessionPhase;
-    match phase {
-        SessionPhase::Starting => "starting",
-        SessionPhase::Ready => "ready",
-        SessionPhase::Busy => "busy",
-        SessionPhase::Ended => "ended",
     }
 }
 
@@ -342,7 +328,7 @@ pub async fn get_session(
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
     match live_session(&state, &record) {
-        Ok(session) => Ok(Json(session_response(&state, &session, true)).into_response()),
+        Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
         Err(response) => Ok(response),
     }
 }
@@ -392,7 +378,7 @@ pub async fn stream_session(
         Err(response) => return Ok(response),
     };
     let after = query.after.or_else(|| last_event_id(&headers)).unwrap_or(0);
-    let first = frame("session", 0, &session_response(&state, &session, false));
+    let first = frame("session", 0, &session_response(&session, false));
     let (backlog, receiver) = match session.subscribe(after) {
         Ok(resumed) => resumed,
         Err(from) => {

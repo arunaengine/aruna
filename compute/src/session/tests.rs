@@ -6,6 +6,7 @@ fn config(idle_after_ms: u64) -> SessionConfig {
         job_id: "01JJRSTVWXYZ0123456789ABCD".to_string(),
         runtime: "python-notebook".to_string(),
         workspace_bucket: "lab-data".to_string(),
+        executor_node_id: "node-1".to_string(),
         idle_after_ms,
         credential_expires_at_ms: 42,
     }
@@ -146,8 +147,8 @@ async fn stream_resumes_and_gaps() {
         state: "busy".to_string(),
     });
     let (backlog, _receiver) = session.subscribe(last).expect("resume");
-    assert_eq!(backlog.len(), 1);
     assert_eq!(backlog[0].kind, EventKind::Kernel);
+    assert_eq!(backlog[1].kind, EventKind::Session);
 
     for index in 0..events::MAX_RING_EVENTS {
         session.apply(HelperEvent::Kernel {

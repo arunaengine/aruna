@@ -60,6 +60,17 @@ pub enum SessionPhase {
     Ended,
 }
 
+impl SessionPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionPhase::Starting => "starting",
+            SessionPhase::Ready => "ready",
+            SessionPhase::Busy => "busy",
+            SessionPhase::Ended => "ended",
+        }
+    }
+}
+
 /// Why a session stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +154,7 @@ pub struct SessionSnapshot {
     pub state: SessionPhase,
     pub runtime: String,
     pub workspace_bucket: String,
+    pub executor_node_id: String,
     pub started_at_ms: u64,
     pub idle_after_ms: u64,
     pub idle_deadline_ms: u64,
@@ -180,6 +192,7 @@ pub struct SessionConfig {
     pub job_id: String,
     pub runtime: String,
     pub workspace_bucket: String,
+    pub executor_node_id: String,
     pub idle_after_ms: u64,
     pub credential_expires_at_ms: u64,
 }
@@ -254,6 +267,7 @@ impl Session {
             state: inner.phase,
             runtime: self.config.runtime.clone(),
             workspace_bucket: self.config.workspace_bucket.clone(),
+            executor_node_id: self.config.executor_node_id.clone(),
             started_at_ms: self.started_at_ms,
             idle_after_ms: self.config.idle_after_ms,
             idle_deadline_ms: deadline_ms(inner.idle_deadline),
@@ -282,6 +296,29 @@ impl Session {
         let receiver = self.events.subscribe();
         let backlog = inner.ring.since(inner.ring.first_id().saturating_sub(1));
         (backlog.unwrap_or_default(), receiver)
+    }
+
+    /// Re-sends the state object without its cells. The client's countdown and
+    /// state badge read it, so it follows every state or deadline change.
+    pub fn announce(&self) {
+        let mut inner = self.lock();
+        let frame = session_frame(&self.config, self.started_at_ms, &inner);
+        let event = inner.ring.push(EventKind::Session, &frame);
+        let _ = self.events.send(event);
+    }
+
+    /// Resets the idle wait and announces the new deadline. Reading scratch or
+    /// staging inputs counts as use, exactly like a cell submit.
+    pub fn touch(&self) {
+        {
+            let mut inner = self.lock();
+            if inner.phase == SessionPhase::Ended {
+                return;
+            }
+            inner.bump(self.config.idle_after_ms);
+        }
+        self.bumped.notify_waiters();
+        self.announce();
     }
 
     /// Outputs of one cell the ring still holds, after `after`, with the id to
@@ -362,6 +399,7 @@ impl Session {
             }
         };
         self.bumped.notify_waiters();
+        self.announce();
         let position = self.lock().queue.len();
         if self.requests.try_send(request).is_err() {
             return Err(SessionError::TooMany);
@@ -388,6 +426,7 @@ impl Session {
             let id = inner.next_id();
             HelperRequest::Interrupt { id }
         };
+        self.announce();
         self.requests
             .try_send(request)
             .map_err(|_| SessionError::TooMany)
@@ -403,6 +442,9 @@ impl Session {
             inner.phase = SessionPhase::Ended;
             inner.ended = Some(reason);
             inner.queue.clear();
+            let frame = session_frame(&self.config, self.started_at_ms, &inner);
+            let announced = inner.ring.push(EventKind::Session, &frame);
+            let _ = self.events.send(announced);
             let event = inner
                 .ring
                 .push(EventKind::Ended, &json!({ "reason": reason.as_str() }));
@@ -414,13 +456,16 @@ impl Session {
 
     /// Records a refreshed credential expiry and tells the client about it.
     pub fn credential_renewed(&self, expires_at_ms: u64) {
-        let mut inner = self.lock();
-        inner.credential_expires_at_ms = expires_at_ms;
-        let event = inner.ring.push(
-            EventKind::Credential,
-            &json!({ "expires_at_ms": expires_at_ms }),
-        );
-        let _ = self.events.send(event);
+        {
+            let mut inner = self.lock();
+            inner.credential_expires_at_ms = expires_at_ms;
+            let event = inner.ring.push(
+                EventKind::Credential,
+                &json!({ "expires_at_ms": expires_at_ms }),
+            );
+            let _ = self.events.send(event);
+        }
+        self.announce();
     }
 
     /// Lists one scratch directory through the helper.
@@ -546,6 +591,9 @@ impl Session {
                     .ring
                     .push(EventKind::Kernel, &json!({ "state": state }));
                 let _ = self.events.send(frame);
+                let announced = session_frame(&self.config, self.started_at_ms, &inner);
+                let event = inner.ring.push(EventKind::Session, &announced);
+                let _ = self.events.send(event);
                 if state == "dead" {
                     drop(inner);
                     self.end(EndReason::KernelExit);
@@ -750,6 +798,7 @@ async fn pump(
             inner.phase = SessionPhase::Ready;
         }
     }
+    session.announce();
     let writer = tokio::spawn(write_requests(
         channel.input,
         requests,
@@ -876,6 +925,24 @@ fn scratch_path(path: &str) -> Result<String, SessionError> {
         ".".to_string()
     } else {
         trimmed.to_string()
+    })
+}
+
+/// The state object the `session` frame carries: everything the snapshot has
+/// except its cells.
+fn session_frame(config: &SessionConfig, started_at_ms: u64, inner: &Inner) -> Value {
+    json!({
+        "job_id": config.job_id,
+        "state": inner.phase.as_str(),
+        "runtime": config.runtime,
+        "workspace_bucket": config.workspace_bucket,
+        "executor_node_id": config.executor_node_id,
+        "started_at_ms": started_at_ms,
+        "idle_after_ms": config.idle_after_ms,
+        "idle_deadline_ms": deadline_ms(inner.idle_deadline),
+        "credential_expires_at_ms": inner.credential_expires_at_ms,
+        "last_event_id": inner.ring.last_id(),
+        "ended": inner.ended.map(|reason| json!({ "reason": reason.as_str() })),
     })
 }
 

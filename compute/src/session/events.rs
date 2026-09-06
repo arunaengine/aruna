@@ -19,6 +19,9 @@ pub const TRUNCATED_NOTICE: &str = "[output truncated by the node]";
 /// kept in the ring, so it never moves a resume point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
+    /// The whole state object without its cells, re-sent whenever the state or
+    /// the idle deadline moved.
+    Session,
     Cell,
     Output,
     Kernel,
@@ -29,6 +32,7 @@ pub enum EventKind {
 impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            EventKind::Session => "session",
             EventKind::Cell => "cell",
             EventKind::Output => "output",
             EventKind::Kernel => "kernel",

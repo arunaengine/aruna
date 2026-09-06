@@ -1028,6 +1028,11 @@ async fn start_session(
 ) -> Option<Arc<Session>> {
     let requested = session_of(spec)?;
     let registry = context.compute_handle.as_ref()?.sessions().clone();
+    let executor_node_id = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id().to_string())
+        .unwrap_or_default();
     let realm_idle = realm_session_idle(context).await;
     let idle_after_ms = requested
         .idle_after_ms
@@ -1037,6 +1042,7 @@ async fn start_session(
             job_id: job_id.to_string(),
             runtime: requested.runtime,
             workspace_bucket: bucket.to_string(),
+            executor_node_id,
             idle_after_ms,
             credential_expires_at_ms: 0,
         },
