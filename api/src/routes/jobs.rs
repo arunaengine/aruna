@@ -4,6 +4,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aruna_core::compute::normalize_container_path;
+use aruna_core::compute::runtimes::{
+    SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    session_runtime,
+};
 use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
@@ -198,8 +202,20 @@ pub struct SubmitExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// OCI image the task runs, for example `docker.io/library/python:3.13-slim`.
-    /// Must not be blank.
+    /// Must not be blank unless `runtime` names a session runtime, which fills
+    /// the image, entrypoint and command instead.
+    #[serde(default)]
     pub image: String,
+    /// Session runtime catalog id, for example `python-notebook`. Required by a
+    /// submission carrying the tag `aruna-engine.org/session`, refused without
+    /// it. It fills `image`, `entrypoint` and `command`, which must be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Idle wait of a session job in milliseconds, for example `600000` for ten
+    /// minutes. The executing node clamps it to the realm's value, so a longer
+    /// request never extends the session. Refused outside a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_idle_after_ms: Option<u64>,
     /// Replaces the image ENTRYPOINT. Omit to keep the image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
@@ -812,6 +828,82 @@ pub(crate) fn map_submit_error(
     }
 }
 
+/// Resolves the session directives of a submission. A session names a catalog
+/// runtime instead of an image, and the node records the resolved runtime and
+/// the requested idle wait as engine tags the executing node reads back.
+fn session_request(request: &mut SubmitExecutionRequest) -> ServerResult<()> {
+    let Some(value) = request.tags.get(SESSION_TAG) else {
+        if request.runtime.is_some() || request.session_idle_after_ms.is_some() {
+            return Err(ServerError::BadRequestMessage(format!(
+                "runtime and session_idle_after_ms need the tag {SESSION_TAG}"
+            )));
+        }
+        return Ok(());
+    };
+    if value != SESSION_TAG_NOTEBOOK {
+        return Err(ServerError::BadRequestMessage(format!(
+            "tag {SESSION_TAG} accepts only the value {SESSION_TAG_NOTEBOOK}"
+        )));
+    }
+    if request.tags.contains_key(SESSION_RUNTIME_TAG) || request.tags.contains_key(SESSION_IDLE_TAG)
+    {
+        return Err(ServerError::BadRequestMessage(format!(
+            "tags {SESSION_RUNTIME_TAG} and {SESSION_IDLE_TAG} are set by the node"
+        )));
+    }
+    let existing = request
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| matches!(workspace.mode, WorkspaceModeRequest::Existing));
+    if !existing {
+        return Err(ServerError::BadRequestMessage(
+            "a session runs inside an existing workspace bucket".to_string(),
+        ));
+    }
+    if !request.image.trim().is_empty()
+        || request.entrypoint.is_some()
+        || !request.command.is_empty()
+    {
+        return Err(ServerError::BadRequestMessage(
+            "a session takes image, entrypoint and command from its runtime".to_string(),
+        ));
+    }
+    let id = request.runtime.as_deref().unwrap_or_default();
+    let runtime = session_runtime(id).ok_or_else(|| {
+        let known: Vec<&str> = SESSION_RUNTIMES.iter().map(|entry| entry.id).collect();
+        ServerError::BadRequestMessage(format!(
+            "unknown session runtime; known ids are {}",
+            known.join(", ")
+        ))
+    })?;
+    if let Some(idle) = request.session_idle_after_ms {
+        if idle == 0 {
+            return Err(ServerError::BadRequestMessage(
+                "session_idle_after_ms must be greater than zero".to_string(),
+            ));
+        }
+        request
+            .tags
+            .insert(SESSION_IDLE_TAG.to_string(), idle.to_string());
+    }
+    request.image = runtime.image.to_string();
+    request.command = runtime
+        .command
+        .iter()
+        .map(|part| (*part).to_string())
+        .collect();
+    for (key, value) in runtime.env {
+        request
+            .env
+            .entry((*key).to_string())
+            .or_insert_with(|| (*value).to_string());
+    }
+    request
+        .tags
+        .insert(SESSION_RUNTIME_TAG.to_string(), runtime.id.to_string());
+    Ok(())
+}
+
 /// An omitted workspace block runs without a bucket of the run's own.
 fn workspace_request(
     workspace: Option<WorkspaceRequest>,
@@ -1174,8 +1266,17 @@ additionally need WRITE on that bucket, which must belong to the same group.
   `workspace.mode` `existing` are both refused: a device stages files, exposes no S3 endpoint a
   container could reach, and names no workspace bucket.
 
+- A submission tagged `aruna-engine.org/session` with value `notebook` starts an interactive
+  session. It names a `runtime` from the session catalog instead of an image, runs inside an
+  existing workspace bucket, and stays running until the caller ends it, the idle wait passes, the
+  walltime is reached, or it is cancelled. `session_idle_after_ms` asks for a shorter idle wait
+  than the realm's; the executing node clamps it, so a longer request never extends the session.
+
 **Limits** (all refused with 400)
-- An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
+- An empty image without a `runtime`, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
+- A `runtime` or `session_idle_after_ms` without the session tag, an unknown runtime id, a session
+  without an existing workspace bucket, or a session that also names an image, entrypoint or
+  command.
 - More than 512 inputs, more than 1024 outputs, or more than 32 output prefixes.
 - An empty `dest_key`, or a container path that is not absolute and traversal-free.
 - An output without a `bucket` under `workspace.mode` `none`, named in the message.
@@ -1317,9 +1418,10 @@ pub(crate) async fn submit_execution(
     state: &ServerState,
     auth: Option<AuthContext>,
     bearer: Option<ValidatedArunaBearerTokenCarrier>,
-    request: SubmitExecutionRequest,
+    mut request: SubmitExecutionRequest,
     extras: PolicyRequestExtras,
 ) -> ServerResult<(StatusCode, SubmitJobResponse)> {
+    session_request(&mut request)?;
     let target = request.target.unwrap_or_default();
     let auth = match target {
         ExecutionTarget::Realm => require_unrestricted_realm_auth(state, auth)?,

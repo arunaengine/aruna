@@ -3,7 +3,9 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
-use aruna_core::compute::runtimes::{QUICK_RUNTIMES, QuickRuntime, quick_runtime};
+use aruna_core::compute::runtimes::{
+    QUICK_RUNTIMES, QuickRuntime, SESSION_RUNTIMES, SessionRuntime, quick_runtime,
+};
 use aruna_core::structs::{
     JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, blob_group_permission_path, key_content_type,
 };
@@ -66,6 +68,44 @@ impl From<&QuickRuntime> for RuntimeOutput {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct RuntimesOutput {
     pub runtimes: Vec<RuntimeOutput>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SessionRuntimeOutput {
+    pub id: String,
+    pub label: String,
+    pub hint: String,
+    pub image: String,
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub lang: String,
+}
+
+impl From<&SessionRuntime> for SessionRuntimeOutput {
+    fn from(runtime: &SessionRuntime) -> Self {
+        Self {
+            id: runtime.id.to_string(),
+            label: runtime.label.to_string(),
+            hint: runtime.hint.to_string(),
+            image: runtime.image.to_string(),
+            command: runtime
+                .command
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            env: runtime
+                .env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            lang: runtime.lang.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SessionRuntimesOutput {
+    pub runtimes: Vec<SessionRuntimeOutput>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -224,6 +264,31 @@ impl McpServer {
         compute_probe(self, &auth, Permission::READ, empty_extras("list_runtimes")).await?;
         Ok(Json(RuntimesOutput {
             runtimes: QUICK_RUNTIMES.iter().map(Into::into).collect(),
+        }))
+    }
+
+    #[tool(
+        description = "List the pinned session runtimes an interactive notebook session accepts. Each entry carries the runtime id, its container image, the language and the command the node runs. Call this before start_session to choose a runtime id. Takes no arguments.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn list_session_runtimes(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<Json<SessionRuntimesOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        compute_probe(
+            self,
+            &auth,
+            Permission::READ,
+            empty_extras("list_session_runtimes"),
+        )
+        .await?;
+        Ok(Json(SessionRuntimesOutput {
+            runtimes: SESSION_RUNTIMES.iter().map(Into::into).collect(),
         }))
     }
 
@@ -826,6 +891,8 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
             name: input.name,
             description: input.description,
             image: runtime.image.to_string(),
+            runtime: None,
+            session_idle_after_ms: None,
             entrypoint: None,
             command,
             env,

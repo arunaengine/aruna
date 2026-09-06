@@ -92,6 +92,9 @@ pub struct ComputeConfigBody {
     pub default_group_quota: ComputeQuotaBody,
     pub group_quotas: Vec<GroupQuotaBody>,
     pub catch_up_after_ms: u64,
+    /// How long an interactive session job may stay without a cell submit
+    /// before the executing node ends it.
+    pub session_idle_after_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -231,6 +234,7 @@ fn config_body(compute: &RealmComputeConfig) -> ComputeConfigBody {
             })
             .collect(),
         catch_up_after_ms: compute.catch_up_after_ms,
+        session_idle_after_ms: compute.session_idle_after_ms,
     }
 }
 
@@ -258,6 +262,7 @@ fn compute_config(body: ComputeConfigBody) -> ServerResult<RealmComputeConfig> {
         default_group_quota: body.default_group_quota.into(),
         group_quotas,
         catch_up_after_ms: body.catch_up_after_ms,
+        session_idle_after_ms: body.session_idle_after_ms,
     })
 }
 
@@ -294,8 +299,8 @@ async fn require_config_admin(
   placement locations the planner estimates transfers with, the bandwidth assumed for an
   unconfigured link, how long an availability sample counts for ranking, the per-rank delay of the
   leaderless witness schedule, how long a launch may stay without a receipt or an executor node may
-  stay silent before the round plans again, and the standing compute quotas new admissions are
-  decided against.
+  stay silent before the round plans again, how long an interactive session job may stay without a
+  cell submit, and the standing compute quotas new admissions are decided against.
 - A node-local read of the replicated realm configuration, so a change written on another node can
   be missing here until it arrives.
 - An unset quota dimension is unbounded, never zero, and a group entry replaces the realm default
@@ -325,7 +330,8 @@ async fn require_config_admin(
                     }
                 }
             ],
-            "catch_up_after_ms": 300000
+            "catch_up_after_ms": 300000,
+            "session_idle_after_ms": 1800000
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the realm configuration path, or a token of another realm", body = ErrorResponse),
@@ -376,7 +382,9 @@ node serves the call and every other node relays it to one.
   leaderless schedule, and zero would let every witness plan at once.
 - `catch_up_after_ms` must be greater than zero: it is how long a launch may stay without a
   receipt and how long an executor node may stay silent before the round plans again, and zero
-  would make every launch look overdue at once."#,
+  would make every launch look overdue at once.
+- `session_idle_after_ms` must be greater than zero: it is how long an interactive session job may
+  stay without a cell submit before the executing node ends it."#,
     request_body(
         content = ComputeConfigBody,
         description = "The complete compute configuration to store",
@@ -409,7 +417,8 @@ node serves the call and every other node relays it to one.
                     }
                 }
             ],
-            "catch_up_after_ms": 300000
+            "catch_up_after_ms": 300000,
+            "session_idle_after_ms": 1800000
         })
     ),
     responses(
@@ -442,9 +451,10 @@ node serves the call and every other node relays it to one.
                     }
                 }
             ],
-            "catch_up_after_ms": 300000
+            "catch_up_after_ms": 300000,
+            "session_idle_after_ms": 1800000
         })),
-        (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, a zero witness delay, or a zero catch-up wait", body = ErrorResponse),
+        (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, a zero witness delay, a zero catch-up wait, or a zero session idle timeout", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
