@@ -164,6 +164,20 @@ Onboarding only takes effect on a fresh data directory. Once a node has persiste
 
 For a ready-made multi-node onboarding flow, use `just local-cluster` instead of walking through the onboarding APIs manually.
 
+## Interactive Session Networking
+
+Interactive notebook sessions run in a container that must reach this node's S3 plane and nothing
+else. With the Docker executor the node creates an internal bridge network named `aruna-sessions`
+from `ARUNA_COMPUTE_DOCKER_SESSION_SUBNET` (default `172.30.255.0/24`). The network has no external
+route, and the node serves S3 on the bridge's gateway address, the first host address of that
+subnet, on the port from `S3_ADDRESS`.
+
+That address is only reachable from a session container. No other service on this host may listen on
+`0.0.0.0` on the same port, because it would answer session traffic instead of the node. Pick a
+subnet that does not overlap any network this host already uses.
+
+Kubernetes keeps its existing S3-only network policy, and Apptainer keeps the host network.
+
 ## Durability Configuration
 
 `ARUNA_FJALL_PERSIST_MODE` controls the Fjall persist mode used by Aruna's local storage engine and document-sync metadata state.

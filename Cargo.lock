@@ -403,6 +403,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "http 1.5.0",
+ "ipnet",
  "iroh",
  "json-patch",
  "k8s-openapi",

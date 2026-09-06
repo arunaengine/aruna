@@ -20,6 +20,7 @@ bytes = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
+ipnet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
