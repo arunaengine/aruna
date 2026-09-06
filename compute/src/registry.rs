@@ -5,6 +5,7 @@ use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
 use aruna_core::structs::{PlacementPolicyError, PlacementSubject};
 
 use crate::executor::{BackendCaps, ExecutorBackend};
+use crate::session::SessionRegistry;
 
 /// Container-facing S3 endpoint the workspace credential targets. Injected into
 /// the attempt env so unconfigured tooling reaches the node's S3 plane.
@@ -29,6 +30,7 @@ impl Default for WorkspaceEndpoint {
 pub struct ExecutorRegistry {
     backends: BTreeMap<String, Arc<dyn ExecutorBackend>>,
     workspace: WorkspaceEndpoint,
+    sessions: Arc<SessionRegistry>,
 }
 
 impl ExecutorRegistry {
@@ -36,6 +38,7 @@ impl ExecutorRegistry {
         Self {
             backends: BTreeMap::new(),
             workspace: WorkspaceEndpoint::default(),
+            sessions: Arc::new(SessionRegistry::new()),
         }
     }
 
@@ -54,6 +57,12 @@ impl ExecutorRegistry {
     /// because the operator configuration that fills it is documented.
     pub fn workspace_endpoint(&self) -> &WorkspaceEndpoint {
         &self.workspace
+    }
+
+    /// The interactive sessions this node runs. In memory only: a restart ends
+    /// every session and reconcile resolves the jobs behind them.
+    pub fn sessions(&self) -> &Arc<SessionRegistry> {
+        &self.sessions
     }
 
     pub fn register(&mut self, backend: Arc<dyn ExecutorBackend>) {

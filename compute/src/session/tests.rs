@@ -6,7 +6,6 @@ fn config(idle_after_ms: u64) -> SessionConfig {
         job_id: "01JJRSTVWXYZ0123456789ABCD".to_string(),
         runtime: "python-notebook".to_string(),
         workspace_bucket: "lab-data".to_string(),
-        executor_node_id: "node-1".to_string(),
         idle_after_ms,
         credential_expires_at_ms: 42,
     }

@@ -108,6 +108,16 @@ impl CellPhase {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CellPhase::Queued => "queued",
+            CellPhase::Running => "running",
+            CellPhase::Done => "done",
+            CellPhase::Error => "error",
+            CellPhase::Interrupted => "interrupted",
+        }
+    }
+
     fn is_open(self) -> bool {
         matches!(self, CellPhase::Queued | CellPhase::Running)
     }
@@ -133,7 +143,6 @@ pub struct SessionSnapshot {
     pub state: SessionPhase,
     pub runtime: String,
     pub workspace_bucket: String,
-    pub executor_node_id: String,
     pub started_at_ms: u64,
     pub idle_after_ms: u64,
     pub idle_deadline_ms: u64,
@@ -171,7 +180,6 @@ pub struct SessionConfig {
     pub job_id: String,
     pub runtime: String,
     pub workspace_bucket: String,
-    pub executor_node_id: String,
     pub idle_after_ms: u64,
     pub credential_expires_at_ms: u64,
 }
@@ -246,7 +254,6 @@ impl Session {
             state: inner.phase,
             runtime: self.config.runtime.clone(),
             workspace_bucket: self.config.workspace_bucket.clone(),
-            executor_node_id: self.config.executor_node_id.clone(),
             started_at_ms: self.started_at_ms,
             idle_after_ms: self.config.idle_after_ms,
             idle_deadline_ms: deadline_ms(inner.idle_deadline),
@@ -266,6 +273,37 @@ impl Session {
         let inner = self.lock();
         let receiver = self.events.subscribe();
         inner.ring.since(after).map(|backlog| (backlog, receiver))
+    }
+
+    /// Everything the ring still holds, plus a live receiver. Used after a gap,
+    /// when the client's resume point is already gone.
+    pub fn subscribe_all(&self) -> (Vec<SessionEvent>, broadcast::Receiver<SessionEvent>) {
+        let inner = self.lock();
+        let receiver = self.events.subscribe();
+        let backlog = inner.ring.since(inner.ring.first_id().saturating_sub(1));
+        (backlog.unwrap_or_default(), receiver)
+    }
+
+    /// Outputs of one cell the ring still holds, after `after`, with the id to
+    /// continue from. Older outputs are gone, which the caller reports as a gap.
+    pub fn cell_outputs(&self, cell_id: &str, after: u64) -> (u64, Vec<Value>) {
+        let inner = self.lock();
+        let mut outputs = Vec::new();
+        let backlog = inner.ring.since(after).unwrap_or_default();
+        for event in &backlog {
+            if event.kind != EventKind::Output {
+                continue;
+            }
+            let Ok(body) = serde_json::from_str::<Value>(&event.data) else {
+                continue;
+            };
+            if body.get("cell_id").and_then(Value::as_str) == Some(cell_id)
+                && let Some(output) = body.get("output")
+            {
+                outputs.push(output.clone());
+            }
+        }
+        (inner.ring.last_id(), outputs)
     }
 
     /// Accepts one cell and returns its place in the queue, counted from one.

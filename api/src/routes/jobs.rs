@@ -1817,7 +1817,7 @@ pub async fn get_job(
     Ok((StatusCode::OK, Json(response)))
 }
 
-fn coded_response(status: StatusCode, error: &str, code: &str) -> Response {
+pub(crate) fn coded_response(status: StatusCode, error: &str, code: &str) -> Response {
     (
         status,
         Json(ErrorResponse::new(error).with_code(code.to_string())),
@@ -3357,6 +3357,8 @@ mod tests {
             name: None,
             description: None,
             image: "alpine:3".to_string(),
+            runtime: None,
+            session_idle_after_ms: None,
             entrypoint: None,
             command: vec!["true".to_string()],
             env: BTreeMap::new(),
@@ -3524,6 +3526,8 @@ mod tests {
                 name: None,
                 description: None,
                 image: "alpine:3".to_string(),
+                runtime: None,
+                session_idle_after_ms: None,
                 entrypoint: None,
                 command: vec!["true".to_string()],
                 env: BTreeMap::new(),

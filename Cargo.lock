@@ -304,6 +304,7 @@ version = "3.0.0-alpha.76"
 dependencies = [
  "ahash 0.8.12",
  "aruna-blob",
+ "aruna-compute",
  "aruna-core",
  "aruna-net",
  "aruna-operations",
@@ -412,6 +413,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tower",

@@ -46,6 +46,8 @@ use crate::jobs::lifecycle::updates::{
     SETTLE_RETRY_AFTER, publish_progress, publish_terminal, schedule_terminal_settle,
 };
 use crate::placement_policy::subject::read_local_subject;
+use aruna_compute::session::{EndReason, Session, SessionConfig};
+use aruna_core::structs::DEFAULT_SESSION_IDLE_AFTER_MS;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, check_workspace_bucket, collect_outputs, ensure_group_write,
@@ -919,21 +921,52 @@ pub async fn supervise_and_finalize(
             .saturating_add(walltime_ms)
             .saturating_sub(unix_timestamp_millis()),
     );
+    let session = start_session(&context, &backend, &fence, job_id, &spec, &bucket).await;
     let wait_and_finalize = async {
-        let result = tokio::select! {
-            result = backend.wait(&fence, &cancel) => Some(result),
-            _ = tokio::time::sleep(walltime_left) => None,
+        // A session also stops when the client ends it or it goes idle; every
+        // other reason leaves the attempt wait in charge.
+        let stopped = async {
+            match &session {
+                Some(session) => {
+                    let reason = session.finished().await;
+                    match reason {
+                        EndReason::Ended | EndReason::Idle => reason,
+                        _ => std::future::pending().await,
+                    }
+                }
+                None => std::future::pending().await,
+            }
         };
-        if let Some(result) = result {
-            Box::pin(finalize_attempt(
-                &context, job_id, token, &backend, &fence, &spec, &bucket, result,
-            ))
-            .await;
-        } else {
-            Box::pin(finalize_walltime(
-                &context, job_id, token, &backend, &fence, &bucket,
-            ))
-            .await;
+        let outcome = tokio::select! {
+            result = backend.wait(&fence, &cancel) => SessionOutcome::Attempt(result),
+            _ = tokio::time::sleep(walltime_left) => SessionOutcome::Walltime,
+            reason = stopped => SessionOutcome::Stopped(reason),
+        };
+        match outcome {
+            SessionOutcome::Attempt(result) => {
+                if let Some(session) = &session {
+                    session.end(EndReason::KernelExit);
+                }
+                Box::pin(finalize_attempt(
+                    &context, job_id, token, &backend, &fence, &spec, &bucket, result,
+                ))
+                .await;
+            }
+            SessionOutcome::Walltime => {
+                if let Some(session) = &session {
+                    session.end(EndReason::Walltime);
+                }
+                Box::pin(finalize_walltime(
+                    &context, job_id, token, &backend, &fence, &bucket,
+                ))
+                .await;
+            }
+            SessionOutcome::Stopped(reason) => {
+                Box::pin(finalize_session(
+                    &context, job_id, token, &backend, &fence, &bucket, reason,
+                ))
+                .await;
+            }
         }
     };
     if with_execution_heartbeat(
@@ -974,6 +1007,94 @@ async fn walltime_anchor(
             anchor
         }
     }
+}
+
+/// Why the supervisor left its wait.
+enum SessionOutcome {
+    Attempt(Result<AttemptStatus, BackendError>),
+    Walltime,
+    Stopped(EndReason),
+}
+
+/// Registers the interactive session of a session job. `None` is an ordinary
+/// run, or a node with no compute plane.
+async fn start_session(
+    context: &Arc<DriverContext>,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    job_id: JobId,
+    spec: &ExecutionSpec,
+    bucket: &str,
+) -> Option<Arc<Session>> {
+    let requested = session_of(spec)?;
+    let registry = context.compute_handle.as_ref()?.sessions().clone();
+    let realm_idle = realm_session_idle(context).await;
+    let idle_after_ms = requested
+        .idle_after_ms
+        .map_or(realm_idle, |asked| asked.min(realm_idle));
+    Some(registry.open(
+        SessionConfig {
+            job_id: job_id.to_string(),
+            runtime: requested.runtime,
+            workspace_bucket: bucket.to_string(),
+            idle_after_ms,
+            credential_expires_at_ms: 0,
+        },
+        backend.clone(),
+        fence.clone(),
+    ))
+}
+
+/// The realm's idle wait, which the request may only shorten.
+async fn realm_session_idle(context: &DriverContext) -> u64 {
+    let Some(net) = context.net_handle.as_ref() else {
+        return DEFAULT_SESSION_IDLE_AFTER_MS;
+    };
+    crate::metadata::api::load_realm_config(context, *net.realm_id())
+        .await
+        .map(|config| config.compute.session_idle_after_ms)
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SESSION_IDLE_AFTER_MS)
+}
+
+/// A session the client ended, or that went idle, is a finished job: the work
+/// it did is already in the workspace bucket.
+async fn finalize_session(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    bucket: &str,
+    reason: EndReason,
+) {
+    let storage = &context.storage_handle;
+    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let logs = match backend.cancel(fence).await {
+        Ok(CancelEvidence::Stopped(_)) => {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
+                return;
+            };
+            logs
+        }
+        Ok(CancelEvidence::AlreadyGone) => LogTails::default(),
+        Ok(CancelEvidence::Requested) | Err(_) => {
+            Box::pin(park_attempt(
+                context,
+                job_id,
+                token,
+                JobError::retryable("session stop lacks evidence"),
+            ))
+            .await;
+            return;
+        }
+    };
+    info!(job_id = %job_id, reason = reason.as_str(), "Session finished");
+    let result = execution_result_for(bucket, Some(0), Vec::new(), logs);
+    let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
+    Box::pin(cleanup_and_crate(context, job_id, record)).await;
 }
 
 async fn finalize_walltime(
