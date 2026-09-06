@@ -936,3 +936,455 @@ pub async fn read_scratch(
     )
         .into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_compute::ExecutorRegistry;
+    use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
+    use aruna_compute::session::{SessionConfig, SessionPhase};
+    use aruna_core::compute::{
+        AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext,
+        LogLimits, LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, UserSpec,
+    };
+    use aruna_core::structs::{
+        CollisionPolicy, ComputeResources, ExecutionSpec, JobId, NodeCapabilities, RealmId,
+    };
+    use aruna_core::types::{NodeId, UserId};
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_operations::jobs::store::insert_job;
+    use aruna_storage::FjallStorage;
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio_util::sync::CancellationToken;
+
+    /// A backend whose channel is an in-memory pipe, so a route test needs no
+    /// container.
+    struct FakeBackend {
+        helper: AsyncMutex<Option<DuplexStream>>,
+    }
+
+    #[async_trait]
+    impl ExecutorBackend for FakeBackend {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Docker
+        }
+
+        fn capabilities(&self) -> BackendCaps {
+            BackendCaps {
+                session: true,
+                ..BackendCaps::default()
+            }
+        }
+
+        fn run_identity(&self) -> UserSpec {
+            NOBODY
+        }
+
+        async fn health(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn resolve_image(
+            &self,
+            image: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<String, BackendError> {
+            Ok(image.to_string())
+        }
+
+        async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn submit(
+            &self,
+            _context: &FenceContext,
+            _spec: &TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
+            Err(BackendError::InvalidSpec("not used".to_string()))
+        }
+
+        async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
+            Err(BackendError::InvalidSpec("not used".to_string()))
+        }
+
+        async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
+            Ok(CancelEvidence::AlreadyGone)
+        }
+
+        async fn fetch_logs(
+            &self,
+            _context: &FenceContext,
+            _limits: &LogLimits,
+        ) -> Result<LogTails, BackendError> {
+            Ok(LogTails::default())
+        }
+
+        async fn fetch_output(
+            &self,
+            _context: &FenceContext,
+            _path: &str,
+        ) -> Result<TaskOutput, BackendError> {
+            Err(BackendError::InvalidSpec("not used".to_string()))
+        }
+
+        async fn open_session(
+            &self,
+            _context: &FenceContext,
+        ) -> Result<SessionChannel, BackendError> {
+            let stream = self
+                .helper
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| BackendError::Conflict("channel already open".to_string()))?;
+            let (output, input) = tokio::io::split(stream);
+            Ok(SessionChannel {
+                input: Box::pin(input),
+                output: Box::pin(output),
+            })
+        }
+
+        async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
+            ReconcileEvidence::Absent
+        }
+
+        async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([1u8; 32])
+    }
+
+    fn node() -> NodeId {
+        NodeId::from_bytes(&[2u8; 32]).expect("a node id")
+    }
+
+    fn user(seed: u8) -> UserId {
+        UserId::new(ulid::Ulid::from_bytes([seed; 16]), realm())
+    }
+
+    fn auth_for(user_id: UserId) -> Option<AuthContext> {
+        Some(AuthContext {
+            user_id,
+            realm_id: realm(),
+            path_restrictions: None,
+            session: None,
+        })
+    }
+
+    fn session_spec() -> ExecutionSpec {
+        let mut tags = BTreeMap::new();
+        tags.insert(
+            aruna_core::compute::runtimes::SESSION_TAG.to_string(),
+            aruna_core::compute::runtimes::SESSION_TAG_NOTEBOOK.to_string(),
+        );
+        tags.insert(
+            aruna_core::compute::runtimes::SESSION_RUNTIME_TAG.to_string(),
+            "python-notebook".to_string(),
+        );
+        ExecutionSpec {
+            group_id: ulid::Ulid::from_bytes([6u8; 16]),
+            name: None,
+            description: None,
+            tags,
+            image: "img".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: Some("/work".to_string()),
+            env: BTreeMap::new(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: CollisionPolicy::default(),
+        }
+    }
+
+    /// A node holding one running session job of `owner`, plus the helper end
+    /// of its channel.
+    async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexStream) {
+        let dir = tempfile::tempdir().expect("a temporary store");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("a store path")).expect("a store");
+        let (node_side, helper) = tokio::io::duplex(64 * 1024);
+        let backend = Arc::new(FakeBackend {
+            helper: AsyncMutex::new(Some(node_side)),
+        });
+        let registry = Arc::new(ExecutorRegistry::new().with_backend(backend.clone()));
+        let ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: Some(registry.clone()),
+        });
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(session_spec()),
+            owner,
+            node(),
+            1_000,
+            1_000,
+            None,
+        );
+        record.state = JobState::Running;
+        record.workspace_bucket = Some("lab-data".to_string());
+        insert_job(&ctx.storage_handle, &record)
+            .await
+            .expect("the job is stored");
+        registry.sessions().open(
+            SessionConfig {
+                job_id: job_id.to_string(),
+                runtime: "python-notebook".to_string(),
+                workspace_bucket: "lab-data".to_string(),
+                executor_node_id: node().to_string(),
+                idle_after_ms: 600_000,
+                credential_expires_at_ms: 0,
+            },
+            backend,
+            FenceContext {
+                attempt: AttemptRef::new(job_id.to_string().to_lowercase(), 1),
+                attempt_epoch: 1,
+                controller_generation: 1,
+            },
+        );
+        let state = ServerState::new(
+            ctx,
+            realm(),
+            node(),
+            NodeCapabilities::user_node(realm()).expect("node capabilities"),
+            false,
+            None,
+            JobsRuntime::new(),
+        )
+        .await;
+        (dir, Arc::new(state), job_id, helper)
+    }
+
+    /// Reports the kernel ready and waits until the manager saw it.
+    async fn make_ready(state: &Arc<ServerState>, job_id: JobId, helper: &mut DuplexStream) {
+        helper
+            .write_all(b"{\"kind\":\"kernel\",\"state\":\"idle\"}\n")
+            .await
+            .expect("the helper announces readiness");
+        let session = state
+            .get_ctx()
+            .compute_handle
+            .as_ref()
+            .and_then(|registry| registry.sessions().get(&job_id.to_string()))
+            .expect("the session is registered");
+        let (_, mut receiver) = session.subscribe_all();
+        for _ in 0..64 {
+            if session.snapshot().state != SessionPhase::Starting {
+                return;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await;
+        }
+        panic!("the session never became ready");
+    }
+
+    #[tokio::test]
+    async fn foreign_job_is_not_found() {
+        // Absence and foreign ownership must be indistinguishable.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let response = get_session(
+            State(state),
+            Extension(auth_for(user(9))),
+            Path(job_id.to_string()),
+        )
+        .await;
+        assert!(matches!(response, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn unknown_job_is_not_found() {
+        let owner = user(2);
+        let (_dir, state, _job_id, _helper) = build_node(owner).await;
+        let response = get_session(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(JobId::from_bytes([8u8; 16]).to_string()),
+        )
+        .await;
+        assert!(matches!(response, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn restricted_token_is_refused() {
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let auth = Some(AuthContext {
+            user_id: owner,
+            realm_id: realm(),
+            path_restrictions: Some(Vec::new()),
+            session: None,
+        });
+        let response = get_session(State(state), Extension(auth), Path(job_id.to_string())).await;
+        assert!(matches!(response, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn starting_session_refuses_cells() {
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let response = submit_cell(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SubmitCellRequest {
+                cell_id: "c1".to_string(),
+                code: "1".to_string(),
+            }),
+        )
+        .await
+        .expect("the handler answers");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn burst_is_rate_limited() {
+        let owner = user(2);
+        let (_dir, state, job_id, mut helper) = build_node(owner).await;
+        make_ready(&state, job_id, &mut helper).await;
+        for index in 0..aruna_compute::session::MAX_SUBMITS {
+            let response = submit_cell(
+                State(state.clone()),
+                Extension(auth_for(owner)),
+                Path(job_id.to_string()),
+                Json(SubmitCellRequest {
+                    cell_id: format!("c{index}"),
+                    code: "1".to_string(),
+                }),
+            )
+            .await
+            .expect("the handler answers");
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+        let refused = submit_cell(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SubmitCellRequest {
+                cell_id: "late".to_string(),
+                code: "1".to_string(),
+            }),
+        )
+        .await
+        .expect("the handler answers");
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn busy_cell_conflicts() {
+        let owner = user(2);
+        let (_dir, state, job_id, mut helper) = build_node(owner).await;
+        make_ready(&state, job_id, &mut helper).await;
+        for expected in [StatusCode::ACCEPTED, StatusCode::CONFLICT] {
+            let response = submit_cell(
+                State(state.clone()),
+                Extension(auth_for(owner)),
+                Path(job_id.to_string()),
+                Json(SubmitCellRequest {
+                    cell_id: "c1".to_string(),
+                    code: "1".to_string(),
+                }),
+            )
+            .await
+            .expect("the handler answers");
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_resumes_from_after() {
+        // The portal sends the resume point as `after`, not as a header.
+        let owner = user(2);
+        let (_dir, state, job_id, mut helper) = build_node(owner).await;
+        make_ready(&state, job_id, &mut helper).await;
+        let response = stream_session(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Query(EventsQuery { after: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("the handler answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_reports_a_gap() {
+        let owner = user(2);
+        let (_dir, state, job_id, mut helper) = build_node(owner).await;
+        make_ready(&state, job_id, &mut helper).await;
+        let session = state
+            .get_ctx()
+            .compute_handle
+            .as_ref()
+            .and_then(|registry| registry.sessions().get(&job_id.to_string()))
+            .expect("the session is registered");
+        for _ in 0..(aruna_compute::session::events::MAX_RING_EVENTS + 4) {
+            session.announce();
+        }
+        assert!(session.subscribe(1).is_err(), "the ring rolled over");
+        let response = stream_session(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Query(EventsQuery { after: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("the handler answers");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn end_answers_the_job_status() {
+        let owner = user(2);
+        let (_dir, state, job_id, mut helper) = build_node(owner).await;
+        make_ready(&state, job_id, &mut helper).await;
+        let response = end_session(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+        )
+        .await
+        .expect("the handler answers");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let refused = submit_cell(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SubmitCellRequest {
+                cell_id: "c1".to_string(),
+                code: "1".to_string(),
+            }),
+        )
+        .await
+        .expect("the handler answers");
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+    }
+}

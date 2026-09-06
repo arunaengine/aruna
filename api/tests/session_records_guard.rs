@@ -45,6 +45,10 @@ fn cells_write_no_records() {
         let source = fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!("session source {} is readable: {error}", path.display())
         });
+        // Test fixtures may build records; only shipped code is scanned.
+        let source = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source.as_str(), |(shipped, _)| shipped);
         for (index, line) in source.lines().enumerate() {
             for writer in WRITERS {
                 if line.contains(writer) {

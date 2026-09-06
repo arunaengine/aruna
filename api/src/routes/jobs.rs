@@ -3794,4 +3794,121 @@ mod tests {
         .await;
         assert!(matches!(result, Err(ServerError::BadRequest)));
     }
+
+    /// The shape the portal posts for a session: no image, no command, an
+    /// existing workspace bucket.
+    fn session_body() -> SubmitExecutionRequest {
+        let mut tags = BTreeMap::new();
+        tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        SubmitExecutionRequest {
+            group_id: Ulid::from_bytes([5u8; 16]).to_string(),
+            name: None,
+            description: None,
+            image: String::new(),
+            runtime: Some("python-notebook".to_string()),
+            session_idle_after_ms: Some(600_000),
+            entrypoint: None,
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            tags,
+            workdir: None,
+            cpu_cores: None,
+            ram_bytes: None,
+            max_walltime_ms: None,
+            executor_constraint: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: CollisionPolicyRequest::default(),
+            idempotency_key: None,
+            workspace: Some(WorkspaceRequest {
+                mode: WorkspaceModeRequest::Existing,
+                bucket: Some("lab-data".to_string()),
+            }),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn session_takes_the_catalog() {
+        let mut request = session_body();
+        session_request(&mut request).expect("a session submit is accepted");
+        let runtime = session_runtime("python-notebook").expect("the catalog holds it");
+        assert_eq!(request.image, runtime.image);
+        assert_eq!(request.command, vec![runtime.command[0].to_string()]);
+        assert_eq!(request.workdir.as_deref(), Some(SESSION_WORKDIR));
+        assert_eq!(
+            request.tags.get(SESSION_RUNTIME_TAG).map(String::as_str),
+            Some("python-notebook")
+        );
+        assert_eq!(
+            request.tags.get(SESSION_IDLE_TAG).map(String::as_str),
+            Some("600000")
+        );
+    }
+
+    #[test]
+    fn session_refuses_an_image() {
+        for mutate in [
+            |request: &mut SubmitExecutionRequest| request.image = "alpine:3".to_string(),
+            |request: &mut SubmitExecutionRequest| {
+                request.entrypoint = Some(vec!["sh".to_string()])
+            },
+            |request: &mut SubmitExecutionRequest| request.command = vec!["sh".to_string()],
+        ] {
+            let mut request = session_body();
+            mutate(&mut request);
+            assert!(session_request(&mut request).is_err());
+        }
+    }
+
+    #[test]
+    fn session_needs_a_bucket() {
+        let mut request = session_body();
+        request.workspace = None;
+        assert!(session_request(&mut request).is_err());
+
+        let mut request = session_body();
+        request.workspace = Some(WorkspaceRequest {
+            mode: WorkspaceModeRequest::None,
+            bucket: None,
+        });
+        assert!(session_request(&mut request).is_err());
+    }
+
+    #[test]
+    fn session_needs_a_runtime() {
+        let mut request = session_body();
+        request.runtime = None;
+        assert!(session_request(&mut request).is_err());
+
+        let mut request = session_body();
+        request.runtime = Some("nope".to_string());
+        assert!(session_request(&mut request).is_err());
+    }
+
+    #[test]
+    fn runtime_needs_the_tag() {
+        // A catalog runtime outside a session would leave the image unpinned.
+        let mut request = session_body();
+        request.tags.clear();
+        assert!(session_request(&mut request).is_err());
+    }
+
+    #[test]
+    fn session_refuses_node_tags() {
+        for tag in [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG] {
+            let mut request = session_body();
+            request.tags.insert(tag.to_string(), "x".to_string());
+            assert!(session_request(&mut request).is_err());
+        }
+    }
+
+    #[test]
+    fn plain_run_keeps_its_image() {
+        let mut request = local_request();
+        session_request(&mut request).expect("a plain run is untouched");
+        assert_eq!(request.image, "alpine:3");
+        assert!(request.tags.get(SESSION_RUNTIME_TAG).is_none());
+    }
 }
