@@ -1013,7 +1013,12 @@ pub async fn supervise_and_finalize(
         match outcome {
             SessionOutcome::Attempt(result) => {
                 if let Some(session) = &session {
-                    session.end(EndReason::KernelExit);
+                    // A cancelled attempt ends its session for that reason; any
+                    // other return means the container stopped on its own.
+                    session.end(match cancel.is_cancelled() {
+                        true => EndReason::Cancelled,
+                        false => EndReason::KernelExit,
+                    });
                 }
                 Box::pin(finalize_attempt(
                     &context, job_id, token, &backend, &fence, &spec, &bucket, result,
