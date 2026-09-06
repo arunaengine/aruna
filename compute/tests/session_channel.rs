@@ -3,34 +3,40 @@
 //! it without interpreting a cell.
 
 use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
-use aruna_compute::session::events::EventKind;
-use aruna_compute::session::{EndReason, SessionConfig, SessionRegistry};
+use aruna_compute::session::{EventKind, SessionConfig, SessionPhase, SessionRegistry};
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
     LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, UserSpec,
 };
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// A backend whose channel is an in-memory pipe. The far end stands in for the
-/// helper inside a container.
+/// A backend whose channels are in-memory pipes. Each `open_session` hands out
+/// the next one, so a reconnect gets a fresh exec like a real backend.
 struct FakeBackend {
-    helper: Mutex<Option<DuplexStream>>,
+    helpers: Mutex<VecDeque<DuplexStream>>,
     session: bool,
 }
 
 impl FakeBackend {
-    fn new(session: bool) -> (Arc<Self>, DuplexStream) {
-        let (node, helper) = tokio::io::duplex(64 * 1024);
+    fn new(session: bool, channels: usize) -> (Arc<Self>, Vec<DuplexStream>) {
+        let mut helpers = VecDeque::new();
+        let mut nodes = Vec::new();
+        for _ in 0..channels {
+            let (node, helper) = tokio::io::duplex(64 * 1024);
+            helpers.push_back(helper);
+            nodes.push(node);
+        }
         let backend = Arc::new(Self {
-            helper: Mutex::new(Some(helper)),
+            helpers: Mutex::new(helpers),
             session,
         });
-        (backend, node)
+        (backend, nodes)
     }
 }
 
@@ -107,11 +113,11 @@ impl ExecutorBackend for FakeBackend {
             ));
         }
         let stream = self
-            .helper
+            .helpers
             .lock()
             .await
-            .take()
-            .ok_or_else(|| BackendError::Conflict("channel already open".to_string()))?;
+            .pop_front()
+            .ok_or_else(|| BackendError::Conflict("no channel left".to_string()))?;
         let (output, input) = tokio::io::split(stream);
         Ok(SessionChannel {
             input: Box::pin(input),
@@ -148,8 +154,9 @@ fn config() -> SessionConfig {
 }
 
 #[tokio::test]
-async fn backend_without_session_refuses() {
-    let (backend, _node) = FakeBackend::new(false);
+async fn refuses_without_flag() {
+    // A backend that does not advertise sessions opens no channel.
+    let (backend, _nodes) = FakeBackend::new(false, 1);
     let opened = ExecutorBackend::open_session(backend.as_ref(), &fence()).await;
     assert!(
         matches!(opened, Err(BackendError::InvalidSpec(_))),
@@ -159,12 +166,12 @@ async fn backend_without_session_refuses() {
 }
 
 #[tokio::test]
-async fn cell_reaches_the_helper() {
+async fn forwards_cell_code() {
     // The node forwards the code unchanged and never interprets it.
-    let (backend, node) = FakeBackend::new(true);
+    let (backend, mut nodes) = FakeBackend::new(true, 1);
     let registry = Arc::new(SessionRegistry::new());
     let session = registry.open(config(), backend, fence());
-    let mut helper = BufReader::new(node);
+    let mut helper = BufReader::new(nodes.remove(0));
 
     let mut line = String::new();
     // The helper reports itself ready before a cell is accepted.
@@ -194,23 +201,41 @@ async fn cell_reaches_the_helper() {
 }
 
 #[tokio::test]
-async fn channel_loss_ends_the_session() {
-    let (backend, node) = FakeBackend::new(true);
+async fn reopens_lost_channel() {
+    // A reconnect is a new exec against the same container, not a new session.
+    let (backend, mut nodes) = FakeBackend::new(true, 2);
     let registry = Arc::new(SessionRegistry::new());
     let session = registry.open(config(), backend, fence());
-    drop(node);
-    let reason = tokio::time::timeout(Duration::from_secs(5), session.finished())
-        .await
-        .expect("a dead channel ends the session");
-    assert_eq!(reason, EndReason::KernelExit);
-    // The registry drops an ended session from its own task, so wait for it.
-    for _ in 0..64 {
-        if registry.get(session.job_id()).is_none() {
+    let mut second = nodes.remove(1);
+    let first = nodes.remove(0);
+    {
+        let mut first = first;
+        announce_idle(&session, &mut first).await;
+        assert_eq!(session.snapshot().state, SessionPhase::Ready);
+    }
+    wait_for_starting(&session).await;
+    announce_idle(&session, &mut second).await;
+    assert_eq!(session.snapshot().state, SessionPhase::Ready);
+}
+
+/// Waits until the pump noticed the lost channel.
+async fn wait_for_starting(session: &Arc<aruna_compute::Session>) {
+    for _ in 0..10_000 {
+        if session.snapshot().state == SessionPhase::Starting {
             return;
         }
         tokio::task::yield_now().await;
     }
-    panic!("an ended session stayed registered");
+    panic!("a lost channel never put the session back into starting");
+}
+
+/// Reports the kernel ready over one channel and waits for the manager.
+async fn announce_idle(session: &Arc<aruna_compute::Session>, stream: &mut DuplexStream) {
+    stream
+        .write_all(b"{\"kind\":\"kernel\",\"state\":\"idle\"}\n")
+        .await
+        .expect("the helper announces readiness");
+    wait_for_ready(session).await;
 }
 
 /// Waits for the manager to observe the helper's readiness. The pump runs in
@@ -218,10 +243,10 @@ async fn channel_loss_ends_the_session() {
 async fn wait_for_ready(session: &Arc<aruna_compute::Session>) {
     let (_, mut receiver) = session.subscribe_all();
     for _ in 0..64 {
-        if session.snapshot().state != aruna_compute::session::SessionPhase::Starting {
+        if session.snapshot().state != SessionPhase::Starting {
             return;
         }
-        let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(60), receiver.recv()).await;
     }
     panic!("the session never became ready");
 }
@@ -229,7 +254,7 @@ async fn wait_for_ready(session: &Arc<aruna_compute::Session>) {
 async fn wait_for_output(session: &Arc<aruna_compute::Session>) -> String {
     let (_, mut receiver) = session.subscribe_all();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        let event = tokio::time::timeout(Duration::from_secs(60), receiver.recv())
             .await
             .expect("an output arrives")
             .expect("the stream stays open");

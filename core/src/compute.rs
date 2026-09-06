@@ -19,6 +19,7 @@ use crate::structs::{
 };
 
 pub mod runtimes;
+pub mod session;
 
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 

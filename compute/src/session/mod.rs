@@ -1,46 +1,31 @@
-//! Interactive sessions this node runs, held in memory only.
-//!
-//! One session owns the byte channel to the helper inside a running attempt,
-//! the bounded event log a reconnecting client resumes from, and the idle timer
-//! that ends the session. Cell traffic never becomes a job record.
+//! Interactive sessions this node runs, held in memory only. A session owns the
+//! channel to the helper inside a running attempt, the bounded event log a
+//! client resumes from, and the idle timer that ends it.
 
 pub mod events;
-pub mod protocol;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex};
 
 use aruna_core::compute::FenceContext;
+use aruna_core::compute::session::{MAX_TOUCHED_OBJECTS, MAX_TRACKED_INPUTS, TRUNCATED_NOTICE};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::ExecutorBackend;
-use events::{BudgetVerdict, CellBudget, EventKind, EventRing, SessionEvent, TRUNCATED_NOTICE};
-use protocol::{HelperEvent, HelperRequest};
+use events::{BudgetVerdict, CellBudget, EventRing, SessionEvent};
 
-/// Cells one session may hold queued before submits are refused.
-pub const MAX_QUEUED_CELLS: usize = 64;
-/// Submits one session accepts inside `SUBMIT_WINDOW`.
-pub const MAX_SUBMITS: usize = 30;
-/// Window the submit count is measured over.
-pub const SUBMIT_WINDOW: Duration = Duration::from_secs(10);
-/// Bytes of code one cell may carry.
-pub const MAX_CELL_CODE_BYTES: usize = 256 * 1024;
-/// Characters a cell id may have.
-pub const MAX_CELL_ID_LEN: usize = 64;
-/// Bytes one scratch read may return.
-pub const MAX_SCRATCH_READ_BYTES: u64 = 8 * 1024 * 1024;
-/// Cells one session reports in its state. Older ones are dropped from the
-/// listing; their events stay in the ring until it rolls over.
-pub const MAX_TRACKED_CELLS: usize = 512;
-/// Staged inputs one session records for its report.
-pub const MAX_TRACKED_INPUTS: usize = 1024;
+pub use aruna_core::compute::session::{
+    CellPhase, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_CODE_BYTES,
+    MAX_CELL_ID_LEN, MAX_QUEUED_CELLS, MAX_RING_EVENTS, MAX_SCRATCH_READ_BYTES, MAX_SUBMITS,
+    MAX_TRACKED_CELLS, SUBMIT_WINDOW, SessionError, SessionPhase,
+};
+
 /// Bytes one helper line may carry before the session is torn down.
 const MAX_HELPER_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// How long the node waits for a helper reply to a scratch or status request.
@@ -52,88 +37,59 @@ const OPEN_RETRY: Duration = Duration::from_secs(2);
 /// Frames one slow reader may fall behind before it is told about a gap.
 const BROADCAST_DEPTH: usize = 512;
 
-/// What the session is doing right now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionPhase {
-    Starting,
-    Ready,
-    Busy,
-    Ended,
+/// One `cell` frame. Absent optionals are omitted, never sent as null.
+#[derive(Serialize)]
+struct CellFrame<'a> {
+    cell_id: &'a str,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at_ms: Option<u64>,
 }
 
-impl SessionPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SessionPhase::Starting => "starting",
-            SessionPhase::Ready => "ready",
-            SessionPhase::Busy => "busy",
-            SessionPhase::Ended => "ended",
-        }
-    }
+/// One `session` frame: the state object without its cells.
+#[derive(Serialize)]
+struct SessionFrame<'a> {
+    job_id: &'a str,
+    state: &'static str,
+    runtime: &'a str,
+    workspace_bucket: &'a str,
+    executor_node_id: &'a str,
+    started_at_ms: u64,
+    idle_after_ms: u64,
+    idle_deadline_ms: u64,
+    credential_expires_at_ms: u64,
+    last_event_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended: Option<EndedFrame>,
 }
 
-/// Why a session stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EndReason {
-    Ended,
-    Idle,
-    Walltime,
-    Cancelled,
-    KernelExit,
-    NodeRestart,
+#[derive(Serialize)]
+struct EndedFrame {
+    reason: &'static str,
 }
 
-impl EndReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EndReason::Ended => "ended",
-            EndReason::Idle => "idle",
-            EndReason::Walltime => "walltime",
-            EndReason::Cancelled => "cancelled",
-            EndReason::KernelExit => "kernel_exit",
-            EndReason::NodeRestart => "node_restart",
-        }
-    }
+/// One object staged into the workspace bucket after the session started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StagedInput {
+    pub dest_key: String,
+    pub bytes: u64,
+    pub blake3: String,
+    pub source_node_id: String,
+    pub version_id: String,
 }
 
-/// Where one cell stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CellPhase {
-    Queued,
-    Running,
-    Done,
-    Error,
-    Interrupted,
-}
-
-impl CellPhase {
-    fn from_wire(value: &str) -> Option<Self> {
-        match value {
-            "queued" => Some(CellPhase::Queued),
-            "running" => Some(CellPhase::Running),
-            "done" => Some(CellPhase::Done),
-            "error" => Some(CellPhase::Error),
-            "interrupted" => Some(CellPhase::Interrupted),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CellPhase::Queued => "queued",
-            CellPhase::Running => "running",
-            CellPhase::Done => "done",
-            CellPhase::Error => "error",
-            CellPhase::Interrupted => "interrupted",
-        }
-    }
-
-    fn is_open(self) -> bool {
-        matches!(self, CellPhase::Queued | CellPhase::Running)
-    }
+/// One object the session's own credential read or wrote, as the S3 plane
+/// attributed it to this job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TouchedObject {
+    pub bucket: String,
+    pub key: String,
+    /// `read` or `write`.
+    pub operation: String,
 }
 
 /// One cell as the client sees it.
@@ -147,16 +103,6 @@ pub struct CellSnapshot {
     pub started_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
-}
-
-/// One object staged into the workspace bucket after the session started.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct StagedInput {
-    pub dest_key: String,
-    pub bytes: u64,
-    pub blake3: String,
-    pub source_node_id: String,
-    pub version_id: String,
 }
 
 /// The whole session as the client sees it.
@@ -174,28 +120,6 @@ pub struct SessionSnapshot {
     pub last_event_id: u64,
     pub cells: Vec<CellSnapshot>,
     pub ended: Option<EndReason>,
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum SessionError {
-    #[error("the session is still starting")]
-    Starting,
-    #[error("the session has ended")]
-    Ended,
-    #[error("cell {0} is already queued or running")]
-    CellBusy(String),
-    #[error("too many cells queued or submitted")]
-    TooMany,
-    #[error("a cell id is 1 to 64 characters of A-Z, a-z, 0-9, _ and -")]
-    CellId,
-    #[error("cell code is larger than {MAX_CELL_CODE_BYTES} bytes")]
-    CodeTooLarge,
-    #[error("a scratch path is relative to the working directory and carries no `..`")]
-    Path,
-    #[error("the session helper did not answer")]
-    NoReply,
-    #[error("the session helper refused: {0}")]
-    Helper(String),
 }
 
 /// What one session is opened with.
@@ -229,6 +153,7 @@ struct Inner {
     credential_expires_at_ms: u64,
     next_request: u64,
     inventory: Vec<StagedInput>,
+    touched: Vec<TouchedObject>,
 }
 
 /// One live session. Everything about it is node local and lost on restart.
@@ -325,6 +250,34 @@ impl Session {
         self.lock().inventory.clone()
     }
 
+    /// Marks the session as reconnecting after a lost channel, so the client
+    /// sees it starting again rather than a stale ready.
+    pub fn reopening(&self) {
+        {
+            let mut inner = self.lock();
+            if inner.phase == SessionPhase::Ended {
+                return;
+            }
+            inner.phase = SessionPhase::Starting;
+        }
+        self.announce();
+    }
+
+    /// Records one object the session's own credential touched. The job report
+    /// lists them at the end, so a run says what data it used.
+    pub fn record_touched(&self, object: TouchedObject) {
+        let mut inner = self.lock();
+        if inner.touched.len() >= MAX_TOUCHED_OBJECTS || inner.touched.contains(&object) {
+            return;
+        }
+        inner.touched.push(object);
+    }
+
+    /// Everything the session's credential read or wrote.
+    pub fn touched(&self) -> Vec<TouchedObject> {
+        self.lock().touched.clone()
+    }
+
     /// Re-sends the state object without its cells. The client's countdown and
     /// state badge read it, so it follows every state or deadline change.
     pub fn announce(&self) {
@@ -414,7 +367,13 @@ impl Session {
             inner.set_cell(cell_id, CellPhase::Queued, None, now_ms());
             let event = inner.ring.push(
                 EventKind::Cell,
-                &json!({ "cell_id": cell_id, "state": "queued" }),
+                &CellFrame {
+                    cell_id,
+                    state: CellPhase::Queued.as_str(),
+                    execution_count: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                },
             );
             let _ = self.events.send(event);
             inner.bump(self.config.idle_after_ms);
@@ -441,12 +400,29 @@ impl Session {
             if inner.phase == SessionPhase::Ended {
                 return Err(SessionError::Ended);
             }
-            let dropped: Vec<String> = inner.queue.drain(..).collect();
+            // The cell the kernel is running keeps its state: its reply
+            // decides whether it finished, errored or was interrupted.
+            let queued: Vec<String> = inner.queue.drain(..).collect();
+            let dropped: Vec<String> = queued
+                .into_iter()
+                .filter(|cell_id| {
+                    inner
+                        .cells
+                        .get(cell_id)
+                        .is_none_or(|record| record.state != CellPhase::Running)
+                })
+                .collect();
             for cell_id in dropped {
                 inner.set_cell(&cell_id, CellPhase::Interrupted, None, now_ms());
                 let event = inner.ring.push(
                     EventKind::Cell,
-                    &json!({ "cell_id": cell_id, "state": "interrupted" }),
+                    &CellFrame {
+                        cell_id: &cell_id,
+                        state: CellPhase::Interrupted.as_str(),
+                        execution_count: None,
+                        started_at_ms: None,
+                        finished_at_ms: None,
+                    },
                 );
                 let _ = self.events.send(event);
             }
@@ -524,16 +500,22 @@ impl Session {
         if self.lock().phase == SessionPhase::Ended {
             return Err(SessionError::Ended);
         }
+        let id = request.id();
         let (sender, receiver) = oneshot::channel();
         if let Ok(mut replies) = self.replies.lock() {
-            replies.insert(request.id(), sender);
+            replies.insert(id, sender);
         }
         self.requests
             .send(request)
             .await
             .map_err(|_| SessionError::Ended)?;
-        let body = timeout(REPLY_TIMEOUT, receiver)
-            .await
+        let answered = timeout(REPLY_TIMEOUT, receiver).await;
+        if answered.is_err()
+            && let Ok(mut replies) = self.replies.lock()
+        {
+            replies.remove(&id);
+        }
+        let body = answered
             .map_err(|_| SessionError::NoReply)?
             .map_err(|_| SessionError::NoReply)?;
         match body.get("error").and_then(Value::as_str) {
@@ -596,13 +578,13 @@ impl Session {
                     .and_then(|record| record.finished_at_ms);
                 let frame = inner.ring.push(
                     EventKind::Cell,
-                    &json!({
-                        "cell_id": cell_id,
-                        "state": state,
-                        "execution_count": execution_count,
-                        "started_at_ms": started_at_ms,
-                        "finished_at_ms": finished_at_ms,
-                    }),
+                    &CellFrame {
+                        cell_id: &cell_id,
+                        state: phase.as_str(),
+                        execution_count,
+                        started_at_ms,
+                        finished_at_ms,
+                    },
                 );
                 let _ = self.events.send(frame);
             }
@@ -772,6 +754,7 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
             credential_expires_at_ms,
             next_request: 0,
             inventory: Vec::new(),
+            touched: Vec::new(),
         }),
         events,
         requests: sender,
@@ -808,59 +791,74 @@ async fn idle_watch(session: Arc<Session>) {
     }
 }
 
-/// Opens the channel, then forwards requests and helper events until the
-/// session ends.
+/// Opens the channel, then forwards requests and helper events. A lost channel
+/// is reopened: a reconnect is a new exec against the same container.
 async fn pump(
     session: Arc<Session>,
     backend: Arc<dyn ExecutorBackend>,
     fence: FenceContext,
     requests: mpsc::Receiver<HelperRequest>,
 ) {
-    let Some(channel) = connect(&session, backend.as_ref(), &fence).await else {
-        session.end(EndReason::KernelExit);
-        return;
-    };
-    {
-        let mut inner = session.lock();
-        if inner.phase == SessionPhase::Starting {
-            inner.phase = SessionPhase::Ready;
+    let requests = Arc::new(tokio::sync::Mutex::new(requests));
+    loop {
+        let Some(channel) = connect(&session, backend.as_ref(), &fence).await else {
+            session.end(EndReason::KernelExit);
+            return;
+        };
+        // The helper reports the kernel's own state on attach, so the session
+        // stays starting until it says otherwise.
+        session.announce();
+        let writer = tokio::spawn(write_requests(
+            channel.input,
+            requests.clone(),
+            session.done.clone(),
+        ));
+        read_events(&session, channel.output).await;
+        writer.abort();
+        if session.done.is_cancelled() {
+            return;
         }
+        session.reopening();
     }
-    session.announce();
-    let writer = tokio::spawn(write_requests(
-        channel.input,
-        requests,
-        session.done.clone(),
-    ));
-    let mut reader = BufReader::new(channel.output);
+}
+
+/// Reads helper events until the channel ends or the session does.
+async fn read_events(
+    session: &Arc<Session>,
+    output: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+) {
+    let mut reader = BufReader::new(output);
     let mut line = Vec::new();
     loop {
         let read = tokio::select! {
             read = read_line(&mut reader, &mut line) => read,
-            _ = session.done.cancelled() => break,
+            _ = session.done.cancelled() => return,
         };
         match read {
-            Ok(0) => break,
-            Ok(_) => match serde_json::from_slice::<HelperEvent>(&line) {
-                Ok(event) => session.apply(event),
-                Err(error) => tracing::warn!(
-                    job_id = session.job_id(),
-                    error = %error,
-                    "session helper sent an unreadable event"
-                ),
-            },
+            Ok(0) => return,
+            Ok(_) => {
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                match serde_json::from_slice::<HelperEvent>(&line) {
+                    Ok(event) => session.apply(event),
+                    Err(error) => tracing::warn!(
+                        job_id = session.job_id(),
+                        error = %error,
+                        "session helper sent an unreadable event"
+                    ),
+                }
+            }
             Err(error) => {
                 tracing::warn!(
                     job_id = session.job_id(),
                     error = %error,
                     "session channel failed"
                 );
-                break;
+                return;
             }
         }
     }
-    writer.abort();
-    session.end(EndReason::KernelExit);
 }
 
 /// Retries until the attempt's helper answers, the session ends, or the node
@@ -894,9 +892,10 @@ async fn connect(
 
 async fn write_requests(
     mut input: std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
-    mut requests: mpsc::Receiver<HelperRequest>,
+    requests: Arc<tokio::sync::Mutex<mpsc::Receiver<HelperRequest>>>,
     done: CancellationToken,
 ) {
+    let mut requests = requests.lock().await;
     loop {
         let request = tokio::select! {
             request = requests.recv() => request,
@@ -958,20 +957,26 @@ fn scratch_path(path: &str) -> Result<String, SessionError> {
 
 /// The state object the `session` frame carries: everything the snapshot has
 /// except its cells.
-fn session_frame(config: &SessionConfig, started_at_ms: u64, inner: &Inner) -> Value {
-    json!({
-        "job_id": config.job_id,
-        "state": inner.phase.as_str(),
-        "runtime": config.runtime,
-        "workspace_bucket": config.workspace_bucket,
-        "executor_node_id": config.executor_node_id,
-        "started_at_ms": started_at_ms,
-        "idle_after_ms": config.idle_after_ms,
-        "idle_deadline_ms": deadline_ms(inner.idle_deadline),
-        "credential_expires_at_ms": inner.credential_expires_at_ms,
-        "last_event_id": inner.ring.last_id(),
-        "ended": inner.ended.map(|reason| json!({ "reason": reason.as_str() })),
-    })
+fn session_frame<'a>(
+    config: &'a SessionConfig,
+    started_at_ms: u64,
+    inner: &Inner,
+) -> SessionFrame<'a> {
+    SessionFrame {
+        job_id: &config.job_id,
+        state: inner.phase.as_str(),
+        runtime: &config.runtime,
+        workspace_bucket: &config.workspace_bucket,
+        executor_node_id: &config.executor_node_id,
+        started_at_ms,
+        idle_after_ms: config.idle_after_ms,
+        idle_deadline_ms: deadline_ms(inner.idle_deadline),
+        credential_expires_at_ms: inner.credential_expires_at_ms,
+        last_event_id: inner.ring.last_id(),
+        ended: inner.ended.map(|reason| EndedFrame {
+            reason: reason.as_str(),
+        }),
+    }
 }
 
 fn now_ms() -> u64 {

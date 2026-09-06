@@ -1,46 +1,12 @@
 //! The per-session event log: a bounded ring the stream resumes from, plus the
 //! caps that keep one runaway cell from filling it.
 
+pub use aruna_core::compute::session::{EventKind, TRUNCATED_NOTICE};
+use aruna_core::compute::session::{
+    MAX_CELL_OUTPUT_BYTES, MAX_CELL_OUTPUTS, MAX_RING_BYTES, MAX_RING_EVENTS,
+};
 use serde::Serialize;
 use std::collections::VecDeque;
-
-/// Events one session keeps for a reconnecting client.
-pub const MAX_RING_EVENTS: usize = 4096;
-/// Bytes one session keeps for a reconnecting client.
-pub const MAX_RING_BYTES: usize = 4 * 1024 * 1024;
-/// Outputs one cell may emit before the rest are dropped.
-pub const MAX_CELL_OUTPUTS: usize = 512;
-/// Output bytes one cell may emit before the rest are dropped.
-pub const MAX_CELL_OUTPUT_BYTES: usize = 1024 * 1024;
-/// What the client sees once a cell hit either output cap.
-pub const TRUNCATED_NOTICE: &str = "[output truncated by the node]";
-
-/// Event types the stream carries. `session` is built on connect and is not
-/// kept in the ring, so it never moves a resume point.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EventKind {
-    /// The whole state object without its cells, re-sent whenever the state or
-    /// the idle deadline moved.
-    Session,
-    Cell,
-    Output,
-    Kernel,
-    Credential,
-    Ended,
-}
-
-impl EventKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EventKind::Session => "session",
-            EventKind::Cell => "cell",
-            EventKind::Output => "output",
-            EventKind::Kernel => "kernel",
-            EventKind::Credential => "credential",
-            EventKind::Ended => "ended",
-        }
-    }
-}
 
 /// One stream frame. `data` is already serialized so the ring can measure it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,11 +57,11 @@ impl EventRing {
             .map_or_else(|| self.last_id.saturating_add(1), |event| event.id)
     }
 
-    /// Frames after `after`. `Err(from)` means the ring no longer holds that
-    /// point, so the client is told about the gap instead of losing it
-    /// silently.
+    /// Frames after `after`. `Err(from)` means the resume point lies outside
+    /// what the ring holds, older or newer, so the client is told about the gap
+    /// instead of losing it silently.
     pub fn since(&self, after: u64) -> Result<Vec<SessionEvent>, u64> {
-        if after < self.first_id().saturating_sub(1) {
+        if after < self.first_id().saturating_sub(1) || after > self.last_id {
             return Err(self.first_id());
         }
         Ok(self
@@ -164,7 +130,15 @@ mod tests {
     }
 
     #[test]
-    fn ring_resumes_from_zero() {
+    fn ring_refuses_future() {
+        // A resume point the ring never reached is a gap, not an empty tail.
+        let mut ring = EventRing::default();
+        ring.push(EventKind::Kernel, &json!({ "state": "idle" }));
+        assert!(ring.since(2).is_err());
+    }
+
+    #[test]
+    fn ring_resumes_zero() {
         let mut ring = EventRing::default();
         ring.push(EventKind::Kernel, &json!({ "state": "idle" }));
         let all = ring.since(0).expect("a fresh ring holds everything");
@@ -173,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_drops_by_bytes() {
+    fn ring_drops_bytes() {
         let mut ring = EventRing::default();
         let chunk = "x".repeat(MAX_RING_BYTES / 4);
         for _ in 0..8 {

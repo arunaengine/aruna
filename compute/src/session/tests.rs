@@ -1,4 +1,5 @@
 use super::*;
+use aruna_core::compute::session::{MAX_CELL_OUTPUTS, MAX_RING_EVENTS, TRUNCATED_NOTICE};
 use serde_json::json;
 
 fn config(idle_after_ms: u64) -> SessionConfig {
@@ -40,7 +41,8 @@ async fn refuses_after_end() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn refuses_bad_cell_id() {
+async fn refuses_bad_id() {
+    // A cell id is 1 to 64 characters of A-Z, a-z, 0-9, _ and -.
     let (session, _channel) = ready(600_000);
     assert_eq!(session.submit_cell("", "1"), Err(SessionError::CellId));
     assert_eq!(session.submit_cell("a b", "1"), Err(SessionError::CellId));
@@ -119,7 +121,7 @@ async fn truncates_cell_output() {
     // One runaway cell may fill its budget once and is then silent.
     let (session, _channel) = ready(600_000);
     session.submit_cell("c1", "1").expect("submit");
-    for _ in 0..(events::MAX_CELL_OUTPUTS + 4) {
+    for _ in 0..(MAX_CELL_OUTPUTS + 4) {
         session.apply(HelperEvent::Output {
             cell_id: "c1".to_string(),
             output: json!({"output_type": "stream", "name": "stdout", "text": "x"}),
@@ -128,18 +130,19 @@ async fn truncates_cell_output() {
     let (backlog, _receiver) = session.subscribe(0).expect("fresh ring resumes");
     let notices = backlog
         .iter()
-        .filter(|event| event.data.contains(events::TRUNCATED_NOTICE))
+        .filter(|event| event.data.contains(TRUNCATED_NOTICE))
         .count();
     let outputs = backlog
         .iter()
         .filter(|event| event.kind == EventKind::Output)
         .count();
     assert_eq!(notices, 1);
-    assert_eq!(outputs, events::MAX_CELL_OUTPUTS + 1);
+    assert_eq!(outputs, MAX_CELL_OUTPUTS + 1);
 }
 
 #[tokio::test(start_paused = true)]
-async fn stream_resumes_and_gaps() {
+async fn resumes_and_gaps() {
+    // A recent resume point replays; one the ring dropped reports a gap.
     let (session, _channel) = ready(600_000);
     session.submit_cell("c1", "1").expect("submit");
     let last = session.snapshot().last_event_id;
@@ -150,7 +153,7 @@ async fn stream_resumes_and_gaps() {
     assert_eq!(backlog[0].kind, EventKind::Kernel);
     assert_eq!(backlog[1].kind, EventKind::Session);
 
-    for index in 0..events::MAX_RING_EVENTS {
+    for index in 0..MAX_RING_EVENTS {
         session.apply(HelperEvent::Kernel {
             state: format!("busy{index}"),
         });
@@ -186,7 +189,8 @@ async fn submit_resets_idle() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn refuses_escaping_scratch_path() {
+async fn refuses_escaping_path() {
+    // A scratch path stays inside the working directory.
     assert_eq!(scratch_path("/etc/passwd"), Err(SessionError::Path));
     assert_eq!(scratch_path("a/../../b"), Err(SessionError::Path));
     assert_eq!(scratch_path(""), Ok(".".to_string()));
@@ -194,7 +198,8 @@ async fn refuses_escaping_scratch_path() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn credential_refresh_is_announced() {
+async fn announces_credential_refresh() {
+    // A refreshed credential expiry reaches the client as its own frame.
     let (session, _channel) = ready(600_000);
     session.credential_renewed(99);
     assert_eq!(session.snapshot().credential_expires_at_ms, 99);
@@ -204,4 +209,27 @@ async fn credential_refresh_is_announced() {
             .iter()
             .any(|event| event.kind == EventKind::Credential)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn records_touched_objects() {
+    // The report lists what the session's own credential used, once each.
+    let (session, _channel) = ready(600_000);
+    let object = TouchedObject {
+        bucket: "lab-data".to_string(),
+        key: "data/reads.fastq".to_string(),
+        operation: "read".to_string(),
+    };
+    session.record_touched(object.clone());
+    session.record_touched(object.clone());
+    assert_eq!(session.touched(), vec![object]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reopening_starts_again() {
+    // A lost channel puts the session back into starting, not a stale ready.
+    let (session, _channel) = ready(600_000);
+    assert_eq!(session.snapshot().state, SessionPhase::Ready);
+    session.reopening();
+    assert_eq!(session.snapshot().state, SessionPhase::Starting);
 }
