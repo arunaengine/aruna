@@ -269,7 +269,12 @@ async fn mint_credential(
         .max_walltime_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_WALLTIME);
-    let expiry = SystemTime::now() + walltime + CREDENTIAL_SLACK;
+    // A session's credential must not outlive the job it belongs to, so it gets
+    // the walltime and none of the slack a staged run needs for its capture.
+    let expiry = match crate::jobs::lifecycle::ids::session_of(spec) {
+        Some(_) => SystemTime::now() + walltime,
+        None => SystemTime::now() + walltime + CREDENTIAL_SLACK,
+    };
     let (_, secret, access) = Box::pin(drive(
         CreateUserAccessOperation::new_with_key(
             CreateUserAccessConfig {

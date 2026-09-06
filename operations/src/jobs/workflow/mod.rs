@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_compute::ExecutorBackend;
+use aruna_core::compute::WorkspaceBinding;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
@@ -33,7 +34,7 @@ use super::JOB_HEARTBEAT_MS;
 use super::output_record::store_outputs;
 use super::store::{
     ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
-    complete_cancelled, complete_execution, fail_execution, mark_indeterminate,
+    complete_cancelled, complete_execution, fail_execution, mark_indeterminate, put_job_entry,
     read_attempt_control, read_job_record, record_attempt_intent, record_attempt_started,
     record_attempt_tombstone, renew_lease, requeue_before_attempt, transition_external_to_running,
     transition_to_cancelling, transition_to_preparing, transition_to_ready,
@@ -45,9 +46,10 @@ use crate::jobs::lifecycle::reservation::job_reservation;
 use crate::jobs::lifecycle::updates::{
     SETTLE_RETRY_AFTER, publish_progress, publish_terminal, schedule_terminal_settle,
 };
+use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::placement_policy::subject::read_local_subject;
 use aruna_compute::session::{EndReason, Session, SessionConfig};
-use aruna_core::structs::DEFAULT_SESSION_IDLE_AFTER_MS;
+use aruna_core::structs::{DEFAULT_SESSION_IDLE_AFTER_MS, SessionReportDetail, SessionReportRow};
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, check_workspace_bucket, collect_outputs, ensure_group_write,
@@ -449,6 +451,8 @@ pub(super) struct PreparedTask {
     mounts: Vec<S3Mount>,
     secrets: BTreeMap<String, Secret>,
     staging: StagingMode,
+    /// Set for a session only: the bucket and endpoint its credential reaches.
+    workspace: Option<WorkspaceBinding>,
 }
 
 /// The bucket a run works inside, empty when it owns none.
@@ -482,6 +486,7 @@ pub(super) async fn prepare_inputs(
             mounts: Vec::new(),
             secrets: BTreeMap::new(),
             staging: StagingMode::Files,
+            workspace: None,
         });
     }
     let mounts = Box::pin(prepare_mounts(context, spec, record, node_id)).await?;
@@ -509,6 +514,7 @@ pub(super) async fn prepare_inputs(
         mounts,
         secrets,
         staging: StagingMode::S3Mount,
+        workspace: None,
     })
 }
 
@@ -520,7 +526,68 @@ async fn prepare_task(
     bucket: &str,
 ) -> Result<PreparedTask, JobError> {
     Box::pin(prepare_workspace(context, spec, record, node_id, bucket)).await?;
-    Box::pin(prepare_inputs(context, spec, record, node_id)).await
+    let mut prepared = Box::pin(prepare_inputs(context, spec, record, node_id)).await?;
+    if session_of(spec).is_some() {
+        Box::pin(add_session_credential(
+            context,
+            spec,
+            record,
+            node_id,
+            bucket,
+            &mut prepared,
+        ))
+        .await?;
+    }
+    Ok(prepared)
+}
+
+/// A session reads and writes its workspace bucket over S3 and nothing else.
+/// The credential is revoked with the job's terminal cleanup.
+async fn add_session_credential(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    bucket: &str,
+    prepared: &mut PreparedTask,
+) -> Result<(), JobError> {
+    if bucket.is_empty() {
+        return Err(JobError::permanent("a session needs a workspace bucket"));
+    }
+    let endpoint = context
+        .compute_handle
+        .as_ref()
+        .and_then(|registry| {
+            let workspace = registry.workspace_endpoint();
+            workspace
+                .session_endpoint
+                .clone()
+                .or_else(|| workspace.endpoint.clone())
+        })
+        .ok_or_else(|| JobError::permanent("a session needs a container-reachable S3 endpoint"))?;
+    let region = context
+        .compute_handle
+        .as_ref()
+        .map(|registry| registry.workspace_endpoint().region.clone())
+        .unwrap_or_default();
+    let credential = Box::pin(mint_workspace_credential(
+        context, spec, record, node_id, bucket,
+    ))
+    .await?;
+    prepared.secrets.insert(
+        "AWS_ACCESS_KEY_ID".to_string(),
+        Secret::new(credential.access_key),
+    );
+    prepared.secrets.insert(
+        "AWS_SECRET_ACCESS_KEY".to_string(),
+        Secret::new(credential.secret),
+    );
+    prepared.workspace = Some(WorkspaceBinding {
+        s3_endpoint: endpoint,
+        bucket_name: bucket.to_string(),
+        region,
+    });
+    Ok(())
 }
 
 pub(super) fn build_task_spec(
@@ -535,6 +602,7 @@ pub(super) fn build_task_spec(
         mounts,
         secrets,
         staging,
+        workspace,
     } = prepared;
     let resources = ResourceRequest {
         cpu_cores: spec.resources.cpu_cores,
@@ -565,7 +633,7 @@ pub(super) fn build_task_spec(
         env,
         secret_env: secrets,
         resources,
-        workspace: None,
+        workspace,
         security: SecurityContext {
             run_as,
             network: if spec
@@ -963,7 +1031,14 @@ pub async fn supervise_and_finalize(
             }
             SessionOutcome::Stopped(reason) => {
                 Box::pin(finalize_session(
-                    &context, job_id, token, &backend, &fence, &bucket, reason,
+                    &context,
+                    job_id,
+                    token,
+                    &backend,
+                    &fence,
+                    &bucket,
+                    session.as_ref(),
+                    reason,
                 ))
                 .await;
             }
@@ -1063,8 +1138,49 @@ async fn realm_session_idle(context: &DriverContext) -> u64 {
         .unwrap_or(DEFAULT_SESSION_IDLE_AFTER_MS)
 }
 
+/// Lists what the session brought into its workspace bucket and why it stopped.
+/// Cell traffic is never recorded: the family log is capped per family.
+async fn write_session_report(
+    storage: &aruna_storage::StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+    session: Option<&Arc<Session>>,
+    reason: EndReason,
+) {
+    let mut rows = Vec::new();
+    if let Some(session) = session {
+        for (index, input) in session.inventory().into_iter().enumerate() {
+            rows.push(SessionReportRow {
+                entry_key: format!("input/{index:04}"),
+                detail: SessionReportDetail::Input {
+                    dest_key: input.dest_key,
+                    bytes: input.bytes,
+                    blake3: input.blake3,
+                    source_node_id: input.source_node_id,
+                    version_id: input.version_id,
+                },
+            });
+        }
+    }
+    rows.push(SessionReportRow {
+        entry_key: "end".to_string(),
+        detail: SessionReportDetail::End {
+            reason: reason.as_str().to_string(),
+        },
+    });
+    for row in rows {
+        if let Err(error) =
+            put_job_entry(storage, job_id, token, row.entry_key.as_bytes(), &row).await
+        {
+            warn!(job_id = %job_id, error = %error, "Session report write failed");
+            return;
+        }
+    }
+}
+
 /// A session the client ended, or that went idle, is a finished job: the work
 /// it did is already in the workspace bucket.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_session(
     context: &DriverContext,
     job_id: JobId,
@@ -1072,6 +1188,7 @@ async fn finalize_session(
     backend: &Arc<dyn ExecutorBackend>,
     fence: &FenceContext,
     bucket: &str,
+    session: Option<&Arc<Session>>,
     reason: EndReason,
 ) {
     let storage = &context.storage_handle;
@@ -1098,6 +1215,10 @@ async fn finalize_session(
         }
     };
     info!(job_id = %job_id, reason = reason.as_str(), "Session finished");
+    Box::pin(write_session_report(
+        storage, job_id, token, session, reason,
+    ))
+    .await;
     let result = execution_result_for(bucket, Some(0), Vec::new(), logs);
     let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
     Box::pin(cleanup_and_crate(context, job_id, record)).await;
@@ -2970,6 +3091,7 @@ mod tests {
                 mounts: Vec::new(),
                 secrets: BTreeMap::new(),
                 staging: StagingMode::Files,
+                workspace: None,
             },
             NOBODY,
         );
@@ -2996,6 +3118,7 @@ mod tests {
                 mounts: Vec::new(),
                 secrets: BTreeMap::new(),
                 staging: StagingMode::Files,
+                workspace: None,
             },
             run_as,
         );
@@ -3018,6 +3141,7 @@ mod tests {
                 mounts: Vec::new(),
                 secrets: BTreeMap::new(),
                 staging: StagingMode::Files,
+                workspace: None,
             },
             NOBODY,
         );

@@ -13,6 +13,9 @@ use crate::session::SessionRegistry;
 pub struct WorkspaceEndpoint {
     pub endpoint: Option<String>,
     pub region: String,
+    /// Endpoint an interactive session reaches instead: the bridge gateway of
+    /// the session network, which has no external route.
+    pub session_endpoint: Option<String>,
 }
 
 impl Default for WorkspaceEndpoint {
@@ -20,6 +23,7 @@ impl Default for WorkspaceEndpoint {
         Self {
             endpoint: None,
             region: "eu-central-1".to_string(),
+            session_endpoint: None,
         }
     }
 }
@@ -48,7 +52,16 @@ impl ExecutorRegistry {
     }
 
     pub fn with_workspace_endpoint(mut self, endpoint: Option<String>, region: String) -> Self {
-        self.workspace = WorkspaceEndpoint { endpoint, region };
+        self.workspace = WorkspaceEndpoint {
+            endpoint,
+            region,
+            session_endpoint: self.workspace.session_endpoint,
+        };
+        self
+    }
+
+    pub fn with_session_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.workspace.session_endpoint = endpoint;
         self
     }
 

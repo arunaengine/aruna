@@ -102,6 +102,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "job_session.rs",
+        "stage_inputs",
+        "self-scoped: read_owned_job requires the caller to be the creator, and \
+         copy_object enforces the caller's own read permission on each source",
+    ),
+    (
+        "job_session.rs",
         "stream_session",
         "self-scoped: read_owned_job requires the caller to be the creator",
     ),

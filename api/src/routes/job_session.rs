@@ -6,10 +6,17 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use aruna_compute::session::events::SessionEvent;
-use aruna_compute::session::{EndReason, MAX_SCRATCH_READ_BYTES, Session, SessionError};
+use aruna_compute::session::{
+    EndReason, MAX_SCRATCH_READ_BYTES, Session, SessionError, StagedInput,
+};
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{AuthContext, JobPayload, JobRecord, JobState, key_content_type};
+use aruna_operations::driver::drive;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::service::read_owned_job;
+use aruna_operations::s3::copy_object::{CopyObjectInput, CopySourceConditions, copy_object};
+use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -20,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
+use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -31,6 +39,8 @@ use crate::server_state::ServerState;
 
 /// Envoy idles an upstream at 60 seconds, so the stream keeps itself alive.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// Objects one staging call brings into the workspace bucket.
+const MAX_STAGED_ITEMS: usize = 64;
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "compute/sessions", description = "Interactive notebook sessions")))]
@@ -43,6 +53,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(submit_cell))
         .routes(routes!(interrupt_session))
         .routes(routes!(end_session))
+        .routes(routes!(stage_inputs))
         .routes(routes!(list_scratch))
         .routes(routes!(read_scratch))
 }
@@ -134,6 +145,50 @@ pub struct ScratchEntryResponse {
 pub struct ScratchListResponse {
     pub path: String,
     pub entries: Vec<ScratchEntryResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SessionInputRequest {
+    /// Source bucket holding the object.
+    pub bucket: String,
+    /// Source object key inside `bucket`.
+    pub key: String,
+    /// Exact version to copy. Defaults to the current head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    /// Realm node holding the object. Defaults to this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
+    /// Full key inside the workspace bucket the object lands under.
+    pub dest_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SessionInputsRequest {
+    pub items: Vec<SessionInputRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StagedInputResponse {
+    pub dest_key: String,
+    pub bytes: u64,
+    pub blake3: String,
+    pub source_node_id: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct PendingInputResponse {
+    pub dest_key: String,
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SessionInputsResponse {
+    pub staged: Vec<StagedInputResponse>,
+    /// Sources that need a staging job of their own. Empty today: a source on
+    /// another node is refused instead, and the caller imports it first.
+    pub pending: Vec<PendingInputResponse>,
 }
 
 /// The caller's session job on this node. Absence and foreign ownership are
@@ -597,6 +652,172 @@ pub async fn end_session(
     };
     session.end(EndReason::Ended);
     Ok((StatusCode::ACCEPTED, Json(job_status_response(&record))).into_response())
+}
+
+#[utoipa::path(
+    post,
+    path = "/compute/jobs/{job_id}/session/inputs",
+    tag = "compute/sessions",
+    summary = "Stage objects into the session's workspace bucket",
+    description = r#"Copies objects into the workspace bucket the session works inside, so the kernel can open them over S3.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused. Self-scoped
+like cancel, and each source additionally needs the caller's read permission on its bucket.
+
+**Behavior**
+- A source on this node is copied server side, which deduplicates onto the stored blob instead of
+  moving bytes.
+- Nothing is copied into the container: the object lands in the bucket under `dest_key` and the
+  kernel reads it from there.
+- Every staged object is recorded in the session inventory and listed in the job report at the end,
+  with the node, version and hash it came from.
+- Staging resets the session's idle timer.
+
+**Limits** (refused with 400)
+- At most 64 items per call, and a `dest_key` that is relative and traversal-free.
+- A source on another node: import it into a bucket of this node first."#,
+    params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
+    request_body = SessionInputsRequest,
+    responses(
+        (status = 202, description = "The objects were staged", body = SessionInputsResponse),
+        (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, or the caller may not read a source", body = ErrorResponse),
+        (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
+        (status = 409, description = "The session has ended", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn stage_inputs(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(job_id): Path<String>,
+    Json(request): Json<SessionInputsRequest>,
+) -> ServerResult<Response> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let record = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record) {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    if request.items.is_empty() || request.items.len() > MAX_STAGED_ITEMS {
+        return Err(ServerError::BadRequestMessage(format!(
+            "a call stages 1 to {MAX_STAGED_ITEMS} objects"
+        )));
+    }
+    let bucket = record.workspace_bucket.clone().ok_or_else(|| {
+        ServerError::InternalError("a session has no workspace bucket".to_string())
+    })?;
+    let mut staged = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        staged.push(stage_one(&state, &auth, &bucket, item).await?);
+    }
+    for entry in &staged {
+        session.record_input(StagedInput {
+            dest_key: entry.dest_key.clone(),
+            bytes: entry.bytes,
+            blake3: entry.blake3.clone(),
+            source_node_id: entry.source_node_id.clone(),
+            version_id: entry.version_id.clone(),
+        });
+    }
+    session.touch();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SessionInputsResponse {
+            staged,
+            pending: Vec::new(),
+        }),
+    )
+        .into_response())
+}
+
+/// The bucket a name resolves to here. Absence reads as 404 like every other
+/// name the caller may not see.
+async fn bucket_info(
+    context: &aruna_operations::driver::DriverContext,
+    bucket: &str,
+) -> ServerResult<aruna_core::structs::BucketInfo> {
+    drive(GetBucketInfoOperation::new(bucket.to_string()), context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .ok_or(ServerError::NotFound)?
+        .map_err(|_| ServerError::NotFound)
+}
+
+/// Copies one object into the workspace bucket, deduplicating onto its blob.
+async fn stage_one(
+    state: &ServerState,
+    auth: &AuthContext,
+    bucket: &str,
+    item: SessionInputRequest,
+) -> ServerResult<StagedInputResponse> {
+    let dest_key = item.dest_key.trim();
+    if dest_key.is_empty()
+        || dest_key.starts_with('/')
+        || dest_key.split('/').any(|part| part == "..")
+    {
+        return Err(ServerError::BadRequestMessage(
+            "a destination key is relative and carries no `..`".to_string(),
+        ));
+    }
+    let node_id = state.get_node_id();
+    if let Some(source) = item.source_node_id.as_deref()
+        && source != node_id.to_string()
+    {
+        return Err(ServerError::BadRequestMessage(
+            "a source on another node must be imported into a bucket of this node first"
+                .to_string(),
+        ));
+    }
+    let context = state.get_ctx();
+    let source_info = bucket_info(&context, &item.bucket).await?;
+    let dest_info = bucket_info(&context, bucket).await?;
+    let realm_config = drive(GetRealmConfigOperation::new(state.get_realm_id()), &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let version_id = item
+        .version_id
+        .as_deref()
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| ServerError::BadRequestMessage("an unreadable version id".to_string()))?;
+    let result = copy_object(
+        &context,
+        CopyObjectInput {
+            source_bucket: item.bucket,
+            source_key: item.key,
+            source_version_id: version_id,
+            source_group_id: source_info.group_id,
+            source_auth_context: auth.clone(),
+            dest_bucket: bucket.to_string(),
+            dest_key: dest_key.to_string(),
+            user_id: auth.user_id,
+            group_id: dest_info.group_id,
+            realm_id: state.get_realm_id(),
+            node_id,
+            quota_ceiling: realm_config
+                .quota
+                .effective_group_ceiling(&dest_info.group_id),
+            conditions: CopySourceConditions::default(),
+            metadata: None,
+            restrictions: auth.path_restrictions.clone(),
+        },
+    )
+    .await
+    .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    Ok(StagedInputResponse {
+        dest_key: dest_key.to_string(),
+        bytes: result.location.blob_size,
+        blake3: result
+            .location
+            .hashes
+            .get(HASH_BLAKE3)
+            .map(hex::encode)
+            .unwrap_or_default(),
+        source_node_id: node_id.to_string(),
+        version_id: result.version_id.to_string(),
+    })
 }
 
 #[utoipa::path(

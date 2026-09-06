@@ -558,6 +558,30 @@ pub struct ExportReportDetail {
 pub type ImportReportRow = JobReportRow<ImportReportDetail>;
 pub type ExportReportRow = JobReportRow<ExportReportDetail>;
 
+/// What one line of a session job's report says.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionReportDetail {
+    /// One object staged into the workspace bucket while the session ran.
+    Input {
+        dest_key: String,
+        bytes: u64,
+        blake3: String,
+        source_node_id: String,
+        version_id: String,
+    },
+    /// Why the session stopped: `ended`, `idle`, `walltime`, `cancelled`,
+    /// `kernel_exit` or `node_restart`.
+    End { reason: String },
+}
+
+/// One line of a session job's report. It records what the session brought in
+/// and why it stopped; cell traffic is never recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReportRow {
+    pub entry_key: String,
+    pub detail: SessionReportDetail,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub location: BackendLocation,

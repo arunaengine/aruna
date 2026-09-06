@@ -1288,7 +1288,10 @@ async fn build_docker(
     );
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
+        .with_workspace_endpoint(workspace, "eu-central-1".to_string())
+        .with_session_endpoint(
+            session_s3_address(config).map(|address| format!("http://{address}")),
+        ))
 }
 
 #[cfg(not(feature = "docker"))]

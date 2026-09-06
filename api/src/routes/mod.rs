@@ -325,6 +325,7 @@ mod tests {
         ("POST", "/compute/jobs/{job_id}/cancel"),
         ("POST", "/compute/jobs/{job_id}/session/cells"),
         ("POST", "/compute/jobs/{job_id}/session/end"),
+        ("POST", "/compute/jobs/{job_id}/session/inputs"),
         ("POST", "/compute/jobs/{job_id}/session/interrupt"),
         ("POST", "/metadata"),
         ("POST", "/metadata/profile/validation/preview"),

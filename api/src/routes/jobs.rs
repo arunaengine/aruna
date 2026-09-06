@@ -13,8 +13,8 @@ use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
     ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
     JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
-    OutputDestination, OutputSelection, Permission, WorkspaceMode, WorkspaceOutput,
-    blob_bucket_permission_path, blob_group_permission_path,
+    OutputDestination, OutputSelection, Permission, SessionReportRow, WorkspaceMode,
+    WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
 };
 use aruna_core::types::NodeId;
 use aruna_operations::device::compute::{
@@ -1850,6 +1850,16 @@ fn decode_report_row(
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
                     "stored export report entry key does not match its row".to_string(),
+                ));
+            }
+            serde_json::to_value(row)
+        }
+        JobKind::Execution => {
+            let row: SessionReportRow = postcard::from_bytes(value)
+                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            if row.entry_key.as_bytes() != entry_key {
+                return Err(ServerError::InternalError(
+                    "stored session report entry key does not match its row".to_string(),
                 ));
             }
             serde_json::to_value(row)

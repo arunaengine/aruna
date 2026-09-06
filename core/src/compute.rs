@@ -558,7 +558,9 @@ impl TaskSpec {
     pub fn effective_env(&self) -> BTreeMap<String, String> {
         let mut env = self.env.clone();
         env.insert("ARUNA_JOB_ID".to_string(), self.attempt.job_id.clone());
-        if self.staging_mode == StagingMode::DirectS3 {
+        // A session always reaches its workspace bucket over S3, whatever the
+        // staging mode of its declared inputs is.
+        if self.staging_mode == StagingMode::DirectS3 || self.session {
             if let Some(workspace) = &self.workspace {
                 env.insert(
                     "AWS_ENDPOINT_URL".to_string(),

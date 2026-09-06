@@ -39,6 +39,8 @@ pub const MAX_SCRATCH_READ_BYTES: u64 = 8 * 1024 * 1024;
 /// Cells one session reports in its state. Older ones are dropped from the
 /// listing; their events stay in the ring until it rolls over.
 pub const MAX_TRACKED_CELLS: usize = 512;
+/// Staged inputs one session records for its report.
+pub const MAX_TRACKED_INPUTS: usize = 1024;
 /// Bytes one helper line may carry before the session is torn down.
 const MAX_HELPER_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// How long the node waits for a helper reply to a scratch or status request.
@@ -147,6 +149,16 @@ pub struct CellSnapshot {
     pub finished_at_ms: Option<u64>,
 }
 
+/// One object staged into the workspace bucket after the session started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StagedInput {
+    pub dest_key: String,
+    pub bytes: u64,
+    pub blake3: String,
+    pub source_node_id: String,
+    pub version_id: String,
+}
+
 /// The whole session as the client sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSnapshot {
@@ -216,6 +228,7 @@ struct Inner {
     idle_deadline: Instant,
     credential_expires_at_ms: u64,
     next_request: u64,
+    inventory: Vec<StagedInput>,
 }
 
 /// One live session. Everything about it is node local and lost on restart.
@@ -296,6 +309,20 @@ impl Session {
         let receiver = self.events.subscribe();
         let backlog = inner.ring.since(inner.ring.first_id().saturating_sub(1));
         (backlog.unwrap_or_default(), receiver)
+    }
+
+    /// Records one object staged into the workspace bucket. The job report
+    /// lists them at the end, so the run says where its data came from.
+    pub fn record_input(&self, input: StagedInput) {
+        let mut inner = self.lock();
+        if inner.inventory.len() < MAX_TRACKED_INPUTS {
+            inner.inventory.push(input);
+        }
+    }
+
+    /// Everything staged into the workspace bucket while the session ran.
+    pub fn inventory(&self) -> Vec<StagedInput> {
+        self.lock().inventory.clone()
     }
 
     /// Re-sends the state object without its cells. The client's countdown and
@@ -744,6 +771,7 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
             idle_deadline,
             credential_expires_at_ms,
             next_request: 0,
+            inventory: Vec::new(),
         }),
         events,
         requests: sender,
