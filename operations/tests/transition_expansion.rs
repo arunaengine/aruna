@@ -16,7 +16,7 @@ use aruna_core::StructuredId;
 use aruna_core::structs::{PlacementRef, RealmNodeKind};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    create_metadata_document, mint_local_document,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
@@ -192,7 +192,9 @@ async fn create_document(
     document_id: Ulid,
     document_path: &str,
 ) -> TestResult<PlacementRef> {
-    let created = drive(
+    // The realm's background writers can conflict with this create, so use
+    // the same retrying entry point the API uses.
+    let created = create_metadata_document(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: realm.actor(node),
             group_id,
@@ -206,7 +208,7 @@ async fn create_document(
                 license: None,
             },
         }),
-        node.context.as_ref(),
+        node.context.clone(),
     )
     .await?;
     replay_metadata_event_log(node.context.as_ref()).await?;
