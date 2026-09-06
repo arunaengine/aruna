@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_compute::ExecutorBackend;
+use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
     FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest, S3Mount,
@@ -39,6 +40,7 @@ use super::store::{
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
+use crate::jobs::lifecycle::ids::session_of;
 use crate::jobs::lifecycle::reservation::job_reservation;
 use crate::jobs::lifecycle::updates::{
     SETTLE_RETRY_AFTER, publish_progress, publish_terminal, schedule_terminal_settle,
@@ -544,13 +546,21 @@ pub(super) fn build_task_spec(
         preemptible: spec.resources.preemptible,
         backend_extensions: std::collections::BTreeMap::new(),
     };
+    let session = session_of(spec).is_some();
+    let mut env = spec.env.clone();
+    if let (true, Some(workdir)) = (session, spec.workdir.as_deref()) {
+        env.insert(
+            "ARUNA_SESSION_SOCKET".to_string(),
+            format!("{}/{SESSION_SOCKET_PATH}", workdir.trim_end_matches('/')),
+        );
+    }
     TaskSpec {
         attempt: attempt.clone(),
         image: pinned_image.to_string(),
         entrypoint: spec.entrypoint.clone(),
         command: spec.command.clone(),
         workdir: spec.workdir.clone(),
-        env: spec.env.clone(),
+        env,
         secret_env: secrets,
         resources,
         workspace: None,
@@ -568,6 +578,7 @@ pub(super) fn build_task_spec(
             ..Default::default()
         },
         log_limits: Default::default(),
+        session,
         inputs,
         s3_mounts: mounts,
         staging_mode: staging,

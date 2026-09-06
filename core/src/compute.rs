@@ -528,6 +528,9 @@ pub struct TaskSpec {
     pub workspace: Option<WorkspaceBinding>,
     pub security: SecurityContext,
     pub log_limits: LogLimits,
+    /// The task is an interactive session: it stays running until the node ends
+    /// it, and the node opens a byte channel to the helper inside it.
+    pub session: bool,
 }
 
 impl TaskSpec {
@@ -548,6 +551,7 @@ impl TaskSpec {
             workspace: None,
             security: SecurityContext::default(),
             log_limits: LogLimits::default(),
+            session: false,
         }
     }
 

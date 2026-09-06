@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
@@ -41,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::{KubernetesConfig, MAX_NODE_SELECTOR_ENTRIES};
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
-use super::{BackendCaps, ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 
 mod manifest;
 
@@ -849,6 +850,7 @@ impl ExecutorBackend for KubernetesBackend {
             local_site: false,
             worker_site,
             limits: self.config.envelope,
+            session: true,
         }
     }
 
@@ -1166,6 +1168,47 @@ impl ExecutorBackend for KubernetesBackend {
         self.save_logs(context).await?;
         self.delete_tasks(context).await?;
         Box::pin(self.list_archive(context, &prefix.to_string_lossy(), &glob)).await
+    }
+
+    /// Runs the helper in client mode inside the task container and hands the
+    /// exec's standard input and output to the caller.
+    async fn open_session(&self, context: &FenceContext) -> Result<SessionChannel, BackendError> {
+        let pods = self.task_pods(context).await?;
+        let pod = pods
+            .iter()
+            .find(|pod| task_state(pod).is_some_and(|state| state.running.is_some()))
+            .ok_or_else(|| {
+                BackendError::Conflict(format!(
+                    "attempt `{}` has no running task pod",
+                    context.attempt.external_name()
+                ))
+            })?;
+        let params = AttachParams::default()
+            .container("task")
+            .stdin(true)
+            .stdout(true)
+            .stderr(false)
+            .max_stdin_buf_size(EXEC_STREAM_BUF_BYTES)
+            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
+        let mut attached = self
+            .pods()
+            .exec(
+                &pod.name_any(),
+                [SESSION_HELPER_PATH, SESSION_CLIENT_MODE],
+                &params,
+            )
+            .await
+            .map_err(kube_error)?;
+        let input = attached.stdin().ok_or_else(|| {
+            BackendError::Api("session exec did not expose standard input".to_string())
+        })?;
+        let output = attached.stdout().ok_or_else(|| {
+            BackendError::Api("session exec did not expose standard output".to_string())
+        })?;
+        Ok(SessionChannel {
+            input: Box::pin(input),
+            output: Box::pin(output),
+        })
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {

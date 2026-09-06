@@ -72,6 +72,12 @@ pub const SESSION_IDLE_TAG: &str = "aruna-engine.org/session-idle-ms";
 /// directory. The node passes the absolute path in `ARUNA_SESSION_SOCKET`.
 pub const SESSION_SOCKET_PATH: &str = ".aruna/session.sock";
 
+/// Helper program every session image ships. Started by the image, and started
+/// again in `SESSION_CLIENT_MODE` by an exec that bridges standard input and
+/// output to the socket.
+pub const SESSION_HELPER_PATH: &str = "/opt/aruna/session-helper";
+pub const SESSION_CLIENT_MODE: &str = "session-client";
+
 /// One interactive runtime a session job may pick. The node fills image,
 /// entrypoint and command from this entry, so a caller never names an image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

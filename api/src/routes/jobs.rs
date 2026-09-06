@@ -60,6 +60,8 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 const DEFAULT_REPORT_LIMIT: usize = 200;
 const MAX_OUTPUT_PREFIXES: usize = 32;
+/// Working directory a session runs in when the caller names none.
+const SESSION_WORKDIR: &str = "/work";
 
 #[derive(OpenApi)]
 #[openapi(
@@ -885,6 +887,9 @@ fn session_request(request: &mut SubmitExecutionRequest) -> ServerResult<()> {
         request
             .tags
             .insert(SESSION_IDLE_TAG.to_string(), idle.to_string());
+    }
+    if request.workdir.is_none() {
+        request.workdir = Some(SESSION_WORKDIR.to_string());
     }
     request.image = runtime.image.to_string();
     request.command = runtime

@@ -4,6 +4,9 @@
 //! assigned locally enters a digest: no job id, no origin, no timestamp, no
 //! resolved server default and no current topology.
 
+use aruna_core::compute::runtimes::{
+    SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+};
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
     CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, LabelMatch, MAX_SELECTOR_LABELS,
@@ -153,6 +156,33 @@ pub fn workspace_of(spec: &ExecutionSpec) -> (WorkspaceMode, Option<String>) {
         _ => WorkspaceMode::None,
     };
     (mode, spec.tags.get(WORKSPACE_BUCKET_TAG).cloned())
+}
+
+/// What a session job carries next to its ordinary execution spec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSpec {
+    pub runtime: String,
+    /// The idle wait the submitter asked for. The executing node clamps it to
+    /// the realm value.
+    pub idle_after_ms: Option<u64>,
+}
+
+/// The interactive session the stored spec asks for. `None` is an ordinary run.
+pub fn session_of(spec: &ExecutionSpec) -> Option<SessionSpec> {
+    if spec.tags.get(SESSION_TAG).map(String::as_str) != Some(SESSION_TAG_NOTEBOOK) {
+        return None;
+    }
+    Some(SessionSpec {
+        runtime: spec
+            .tags
+            .get(SESSION_RUNTIME_TAG)
+            .cloned()
+            .unwrap_or_default(),
+        idle_after_ms: spec
+            .tags
+            .get(SESSION_IDLE_TAG)
+            .and_then(|value| value.parse().ok()),
+    })
 }
 
 /// Required target labels the spec stores, in canonical order.

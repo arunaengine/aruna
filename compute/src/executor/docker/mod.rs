@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
     CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogTails,
@@ -14,6 +15,7 @@ use aruna_core::compute::{
     TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
 };
 use async_trait::async_trait;
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
     ContainerCreateBody, ContainerInspectResponse, ContainerStateStatusEnum, HostConfig,
     HostConfigLogConfig, ImageInspect,
@@ -35,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::DockerConfig;
 use super::logs::BoundedTail;
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
+use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
@@ -1128,6 +1130,7 @@ impl ExecutorBackend for DockerBackend {
             file_staging: true,
             direct_s3: true,
             local_site: true,
+            session: true,
             limits: self.config.envelope,
             ..BackendCaps::default()
         }
@@ -1511,6 +1514,64 @@ impl ExecutorBackend for DockerBackend {
         }
     }
 
+    /// Bridges standard input and output of one exec to the helper socket. The
+    /// exec inherits the container's user and is never privileged.
+    async fn open_session(&self, context: &FenceContext) -> Result<SessionChannel, BackendError> {
+        let attempt = &context.attempt;
+        let inspect = self.inspect_matching_attempt(attempt).await?;
+        if !is_running(&inspect) {
+            return Err(BackendError::Conflict(format!(
+                "attempt `{}` is not running",
+                attempt.external_name()
+            )));
+        }
+        let user = inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.user.clone())
+            .unwrap_or_else(|| format!("{}:{}", NOBODY.uid, NOBODY.gid));
+        let created = self
+            .docker
+            .create_exec(
+                &attempt.external_name(),
+                CreateExecOptions {
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(false),
+                    tty: Some(false),
+                    privileged: Some(false),
+                    user: Some(user),
+                    cmd: Some(vec![
+                        SESSION_HELPER_PATH.to_string(),
+                        SESSION_CLIENT_MODE.to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| classify(&error))?;
+        let started = self
+            .docker
+            .start_exec(&created.id, Some(StartExecOptions::default()))
+            .await
+            .map_err(|error| classify(&error))?;
+        match started {
+            StartExecResults::Attached { output, input } => {
+                let bytes = output.map(|frame| match frame {
+                    Ok(frame) => Ok(frame.into_bytes()),
+                    Err(error) => Err(io::Error::other(error.to_string())),
+                });
+                Ok(SessionChannel {
+                    input,
+                    output: Box::pin(StreamReader::new(bytes)),
+                })
+            }
+            StartExecResults::Detached => {
+                Err(BackendError::Api("session exec did not attach".to_string()))
+            }
+        }
+    }
+
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
         let control = match self.daemon_lock.read(context) {
             Ok(control) => control,
@@ -1709,6 +1770,15 @@ fn validate_labels(
         ));
     }
     Ok(())
+}
+
+/// A session channel needs a container that is up right now.
+fn is_running(inspect: &ContainerInspectResponse) -> bool {
+    inspect
+        .state
+        .as_ref()
+        .and_then(|state| state.status)
+        .is_some_and(|status| status == ContainerStateStatusEnum::RUNNING)
 }
 
 fn validate_control(

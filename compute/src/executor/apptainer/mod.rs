@@ -7,6 +7,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
@@ -17,6 +18,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::ApptainerConfig;
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
-use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
+use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
 
 mod runtime;
 mod state;
@@ -94,7 +96,14 @@ impl ApptainerBackend {
         sif: PathBuf,
         metadata: OciMetadata,
     ) -> Result<PathBuf, BackendError> {
-        let plan = StagePlan::from_spec(spec)?;
+        let mut plan = StagePlan::from_spec(spec)?;
+        // The helper's socket lives in the working directory, so a session
+        // needs it bound as a host directory the node can reach.
+        if spec.session
+            && let Some(workdir) = &spec.workdir
+        {
+            plan.layout.output_parents.insert(PathBuf::from(workdir));
+        }
         let directory = self.state.attempt_dir(context);
         let temp = directory.with_extension(format!("{}.tmp", context.controller_generation));
         remove_staging_temps(&directory)?;
@@ -272,6 +281,7 @@ impl ExecutorBackend for ApptainerBackend {
             file_staging: true,
             direct_s3: true,
             local_site: true,
+            session: true,
             limits: self.config.envelope,
             ..BackendCaps::default()
         }
@@ -517,6 +527,26 @@ impl ExecutorBackend for ApptainerBackend {
             .canonicalize()
             .map_err(io_error)?;
         list_workspace(&root, &host_path(&root, &prefix), &glob)
+    }
+
+    /// Apptainer binds the working directory from the host, so the node reaches
+    /// the helper's socket directly instead of running a second process.
+    async fn open_session(&self, context: &FenceContext) -> Result<SessionChannel, BackendError> {
+        let directory = self.state.attempt_dir(context);
+        let launch: LaunchRecord = read_json(&directory.join("launch.json"))?;
+        let workdir = launch.workdir.ok_or_else(|| {
+            BackendError::InvalidSpec("a session needs a working directory".to_string())
+        })?;
+        let root = directory.join("workspace/root");
+        let socket = host_path(&root, Path::new(&workdir)).join(SESSION_SOCKET_PATH);
+        let stream = UnixStream::connect(&socket).await.map_err(|error| {
+            BackendError::Conflict(format!("session socket is not reachable: {error}"))
+        })?;
+        let (output, input) = stream.into_split();
+        Ok(SessionChannel {
+            input: Box::pin(input),
+            output: Box::pin(output),
+        })
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
