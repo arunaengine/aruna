@@ -1,3 +1,5 @@
+mod vault;
+
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::authorize_onboarding_admin;
@@ -77,6 +79,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(list_user_devices))
         .routes(routes!(revoke_user_device))
         .routes(routes!(evict_device))
+        .merge(vault::router())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2824,7 +2827,7 @@ mod resolve_tests {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    async fn setup_state() -> (Arc<ServerState>, TempDir) {
+    pub(super) async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();
         let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
@@ -2852,7 +2855,7 @@ mod resolve_tests {
         (state, tempdir)
     }
 
-    fn realm_auth(realm_id: RealmId) -> AuthContext {
+    pub(super) fn realm_auth(realm_id: RealmId) -> AuthContext {
         AuthContext {
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,

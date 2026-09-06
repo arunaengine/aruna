@@ -26,6 +26,7 @@ use super::admit::Admission;
 use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::rows::PendingNeed;
+use crate::dashboard::notify_dashboard_change;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{JobRecordPageReply, MetadataTransportMessage};
@@ -379,8 +380,11 @@ async fn accept_record(
         warn!(error = %error, "Job record append failed");
         ServeError::Unavailable
     })?;
-    if matches!(outcome.admission, Admission::Authentic) && rearms {
-        crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
+    if matches!(outcome.admission, Admission::Authentic) {
+        notify_dashboard_change(context.as_ref());
+        if rearms {
+            crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
+        }
     }
     match outcome.admission {
         Admission::Authentic | Admission::Duplicate => Ok(()),

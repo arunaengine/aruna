@@ -362,6 +362,21 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "self-scoped: RemoveDeviceNodeOperation re-checks that the node is a \
          User device owned by the caller",
     ),
+    (
+        "vault.rs",
+        "delete_vault",
+        "self-scoped: deletes only the caller's own vault record",
+    ),
+    (
+        "vault.rs",
+        "get_vault",
+        "self-scoped: reads only the caller's own vault record",
+    ),
+    (
+        "vault.rs",
+        "put_vault",
+        "self-scoped: writes only the caller's own vault record",
+    ),
 ];
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]

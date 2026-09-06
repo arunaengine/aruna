@@ -10,6 +10,7 @@ pub mod add_user_to_realm_role;
 pub mod allocate_handle;
 pub mod announce;
 pub mod announce_realm_presence;
+pub mod assistant_chat;
 pub mod assistant_provider;
 pub mod auth;
 pub mod blob;
@@ -105,6 +106,7 @@ pub mod update_metadata_document;
 pub mod update_user;
 pub mod usage_stats;
 pub mod user_subject_index;
+pub mod user_vault;
 
 /// Deterministic member order for records that several nodes must byte-match.
 pub(crate) fn sorted_user_ids(
