@@ -17,7 +17,7 @@ pub use heads::{DeleteChatOperation, ListChatHeadsOperation, WriteChatHeadOperat
 pub use turns::{ReadChatTurnsOperation, WriteChatTurnOperation};
 
 pub const CHAT_CAP: &str = "a user may keep at most 20 chats";
-pub const TURN_CAP: &str = "a turn payload may hold at most 64 KiB";
+pub const TURN_CAP: &str = "a turn payload may hold at most 256 KiB";
 pub const BUDGET_CAP: &str = "the chats of a user may hold at most 8 MiB together";
 
 fn head_prefix(user_id: UserId) -> Vec<u8> {

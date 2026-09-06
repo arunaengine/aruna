@@ -7,7 +7,7 @@ pub const MAX_ASSISTANT_CHATS: usize = 20;
 /// Live turns one chat keeps; an append past this drops the oldest turns.
 pub const MAX_ASSISTANT_CHAT_TURNS: u32 = 120;
 /// Bytes one turn payload may hold.
-pub const MAX_ASSISTANT_TURN_BYTES: usize = 64 * 1024;
+pub const MAX_ASSISTANT_TURN_BYTES: usize = 256 * 1024;
 /// Bytes all live turns of one user may hold together.
 pub const MAX_ASSISTANT_CHAT_BYTES: u64 = 8 * 1024 * 1024;
 

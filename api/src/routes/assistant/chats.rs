@@ -364,7 +364,7 @@ refused. Chats are self-scoped, so a caller writes only their own.
 - The head after the write is returned, so the caller learns `next_seq` and `revision`.
 
 **Limits**
-- A turn payload holds at most 64 KiB.
+- A turn payload holds at most 256 KiB.
 - A chat keeps its newest 120 turns.
 - All chats of a user hold at most 8 MiB together; a write past that is refused with 413."#,
     params(
@@ -860,9 +860,10 @@ mod tests {
     async fn refuses_over_budget() {
         // 64 KiB turns across two chats fill the 8 MiB budget exactly; one more is refused.
         let (_dir, state, auth) = setup_state().await;
-        let payload = "x".repeat(MAX_ASSISTANT_TURN_BYTES);
-        let fitting =
-            u32::try_from(MAX_ASSISTANT_CHAT_BYTES / MAX_ASSISTANT_TURN_BYTES as u64).unwrap();
+        let fill = 64 * 1024;
+        assert!(fill <= MAX_ASSISTANT_TURN_BYTES);
+        let payload = "x".repeat(fill);
+        let fitting = u32::try_from(MAX_ASSISTANT_CHAT_BYTES / fill as u64).unwrap();
         assert!(fitting > MAX_ASSISTANT_CHAT_TURNS);
         save_head(&state, &auth, "c-1", "Chat", None).await.unwrap();
         save_head(&state, &auth, "c-2", "Chat", None).await.unwrap();
@@ -900,7 +901,7 @@ mod tests {
         );
         assert_eq!(
             head.bytes,
-            (MAX_ASSISTANT_CHAT_TURNS as u64 - 1) * MAX_ASSISTANT_TURN_BYTES as u64 + 1
+            (MAX_ASSISTANT_CHAT_TURNS as u64 - 1) * fill as u64 + 1
         );
         let turns = read_turns(&state, &auth, "c-1", None).await.unwrap();
         assert_eq!(turns.len() as u32, MAX_ASSISTANT_CHAT_TURNS);
