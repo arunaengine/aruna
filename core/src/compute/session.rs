@@ -1,7 +1,6 @@
 //! Contracts of interactive sessions: the states a client sees, the caps the
-//! node enforces, and the protocol the node and the session helper speak.
-//!
-//! The runtime that drives them lives in the compute adapter.
+//! node enforces, and the protocol it speaks to the session helper. The runtime
+//! driving them lives in the compute adapter.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

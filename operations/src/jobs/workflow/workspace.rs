@@ -2167,7 +2167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_expiry_takes_min() {
+    async fn bounds_session_expiry() {
         // A session credential outlives neither its walltime nor its bearer.
         use aruna_core::compute::runtimes::{
             SESSION_EXPIRY_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,

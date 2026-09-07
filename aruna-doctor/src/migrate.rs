@@ -139,10 +139,9 @@ where
     Ok(Rewrites { scanned, rows })
 }
 
-/// Realm configuration documents gained the compute catch-up wait and then the
-/// session idle timeout as their last values. Postcard is positional, so an
-/// older row is the current row without them and appending their defaults
-/// re-encodes it.
+/// Realm configuration documents gained the catch-up wait and then the session
+/// idle timeout as their last values. Postcard is positional, so appending the
+/// defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
