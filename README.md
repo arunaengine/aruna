@@ -190,7 +190,7 @@ service account stays unprivileged, with its token unmounted.
 
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
-`ghcr.io/arunaengine/aruna-session-python:0.1.0` and `ghcr.io/arunaengine/aruna-session-deno:0.1.0`.
+`harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.1.0` and `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-deno:0.1.0`.
 
 ## Durability Configuration
 
