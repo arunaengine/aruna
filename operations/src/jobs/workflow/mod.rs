@@ -1260,6 +1260,21 @@ async fn finalize_session(
         storage, job_id, token, session, reason,
     ))
     .await;
+    // A kernel that died, or a helper that never answered, is a permanent
+    // execution failure, not a session the caller finished.
+    if reason == EndReason::KernelExit {
+        let result = execution_result_for(bucket, Some(1), Vec::new(), logs);
+        let terminal = Box::pin(terminal_fail(
+            storage,
+            job_id,
+            token,
+            JobError::permanent("session kernel exited"),
+            result,
+        ))
+        .await;
+        Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
+        return;
+    }
     // A terminal success needs a named output record, even with no outputs.
     let Some(control) = Box::pin(control_or_park(context, job_id, token, fence)).await else {
         return;
@@ -2999,6 +3014,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Succeeded);
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_kernel_fails() {
+        // A kernel that died is a permanent execution failure, not a clean end.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (ctx, net, registry) = session_context(storage.clone()).await;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+
+        let supervisor = tokio::spawn(supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            session_spec(None),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        ));
+        wait_for_session(&registry, job_id)
+            .await
+            .end(EndReason::KernelExit);
+        supervisor.await.unwrap();
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(stored.last_error.unwrap().message, "session kernel exited");
         net.shutdown().await;
     }
 
