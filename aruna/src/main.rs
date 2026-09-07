@@ -640,8 +640,7 @@ fn session_subnet() -> String {
 }
 
 /// The gateway address of the Docker session bridge, on the configured S3 port.
-/// Only a session container reaches it, and no other service on this host may
-/// bind 0.0.0.0 on that port.
+/// It is what a session container targets, whatever the node itself binds.
 fn session_s3_address(config: &Config, subnet: &str) -> Option<std::net::SocketAddr> {
     use aruna_compute::executor::docker::session_gateway;
 
@@ -652,16 +651,12 @@ fn session_s3_address(config: &Config, subnet: &str) -> Option<std::net::SocketA
     {
         return None;
     }
-    let main = config
+    let port = config
         .s3_address
         .as_deref()?
         .parse::<std::net::SocketAddr>()
-        .ok()?;
-    // A wildcard bind already answers on the gateway address.
-    if main.ip().is_unspecified() {
-        return None;
-    }
-    let port = main.port();
+        .ok()?
+        .port();
     match session_gateway(subnet) {
         Ok(gateway) => Some(std::net::SocketAddr::new(gateway.into(), port)),
         Err(error) => {
@@ -739,15 +734,24 @@ async fn bind_servers(
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let s3_timeouts = config.s3_timeouts();
-    let mut session_s3 = session_s3_address(&config, &session_subnet()).map(|address| SessionS3 {
-        address,
-        realm_id: config.realm_id,
-        node_id: config.node_id,
-        key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
-            &config.node_state.net_secret_key,
-        ),
-        rocrate_limits: config.rocrate_limits.clone(),
-    });
+    // A wildcard S3 bind already answers on the gateway, so it needs no second
+    // listener. Session containers still target the gateway address.
+    let wildcard_s3 = config
+        .s3_address
+        .as_deref()
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| address.ip().is_unspecified());
+    let mut session_s3 = session_s3_address(&config, &session_subnet())
+        .filter(|_| !wildcard_s3)
+        .map(|address| SessionS3 {
+            address,
+            realm_id: config.realm_id,
+            node_id: config.node_id,
+            key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                &config.node_state.net_secret_key,
+            ),
+            rocrate_limits: config.rocrate_limits.clone(),
+        });
     let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
         true => {
             let (roots, unsupported) = wipe_plan(&config);
