@@ -12,7 +12,7 @@ use aruna_core::compute::FenceContext;
 use aruna_core::compute::session::{MAX_TOUCHED_OBJECTS, MAX_TRACKED_INPUTS, TRUNCATED_NOTICE};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout};
 use tokio_util::sync::CancellationToken;
@@ -933,27 +933,18 @@ async fn read_line<R: AsyncBufRead + Unpin>(
     line: &mut Vec<u8>,
 ) -> io::Result<usize> {
     line.clear();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(line.len());
-        }
-        match available.iter().position(|byte| *byte == b'\n') {
-            Some(index) => {
-                line.extend_from_slice(&available[..index]);
-                reader.consume(index + 1);
-                return Ok(line.len().max(1));
-            }
-            None => {
-                let taken = available.len();
-                if line.len().saturating_add(taken) > MAX_HELPER_LINE_BYTES {
-                    return Err(io::Error::other("session helper line is too long"));
-                }
-                line.extend_from_slice(available);
-                reader.consume(taken);
-            }
-        }
+    let read = reader
+        .take((MAX_HELPER_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', line)
+        .await?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        return Ok(line.len().max(1));
     }
+    if line.len() > MAX_HELPER_LINE_BYTES {
+        return Err(io::Error::other("session helper line is too long"));
+    }
+    Ok(read)
 }
 
 /// A scratch path is relative to the working directory and carries no `..`.

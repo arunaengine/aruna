@@ -15,6 +15,40 @@ fn config(idle_after_ms: u64) -> SessionConfig {
 }
 
 #[tokio::test(start_paused = true)]
+async fn reads_helper_lines() {
+    let mut reader = BufReader::with_capacity(2, b"\nfirst\nlast".as_slice());
+    let mut line = vec![b'x'];
+    for (expected, count) in [
+        (b"".as_slice(), 1),
+        (b"first".as_slice(), 5),
+        (b"last".as_slice(), 4),
+        (b"".as_slice(), 0),
+    ] {
+        assert_eq!(read_line(&mut reader, &mut line).await.unwrap(), count);
+        assert_eq!(line, expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounds_helper_lines() {
+    for bytes in [MAX_HELPER_LINE_BYTES, MAX_HELPER_LINE_BYTES + 1] {
+        let mut input = vec![b'x'; bytes];
+        input.extend_from_slice(b"\nnext\n");
+        let mut reader = BufReader::with_capacity(input.len(), input.as_slice());
+        let mut line = Vec::new();
+        let result = read_line(&mut reader, &mut line).await;
+        if bytes > MAX_HELPER_LINE_BYTES {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), bytes);
+            assert_eq!(line.len(), bytes);
+            assert_eq!(read_line(&mut reader, &mut line).await.unwrap(), 4);
+            assert_eq!(line, b"next");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn exposes_public_id() {
     let registry = Arc::new(SessionRegistry::new());
     let config = config(600_000);
