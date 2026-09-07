@@ -2245,6 +2245,7 @@ mod tests {
     };
     use crate::jobs::workflow::workspace::mint_workspace_credential;
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+    use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
         ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination,
@@ -2884,6 +2885,121 @@ mod tests {
             compute_handle: None,
         });
         (context, net)
+    }
+
+    /// A session job's spec: the tags the node writes at submit, and a short
+    /// idle wait so the timer test does not depend on the realm default.
+    fn session_spec(idle_after_ms: Option<u64>) -> ExecutionSpec {
+        use aruna_core::compute::runtimes::{
+            SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+        };
+        let mut spec = execution_spec();
+        spec.tags
+            .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        spec.tags.insert(
+            SESSION_RUNTIME_TAG.to_string(),
+            "python-notebook".to_string(),
+        );
+        if let Some(idle) = idle_after_ms {
+            spec.tags
+                .insert(SESSION_IDLE_TAG.to_string(), idle.to_string());
+        }
+        spec
+    }
+
+    /// A context whose compute plane can register sessions.
+    async fn session_context(
+        storage: StorageHandle,
+    ) -> (
+        Arc<DriverContext>,
+        aruna_net::NetHandle,
+        Arc<ExecutorRegistry>,
+    ) {
+        let (context, net) = net_context(storage).await;
+        let registry = Arc::new(ExecutorRegistry::new());
+        let mut context = context;
+        Arc::get_mut(&mut context).unwrap().compute_handle = Some(registry.clone());
+        (context, net, registry)
+    }
+
+    /// Waits for the supervisor to register the session it is about to watch.
+    async fn wait_for_session(registry: &Arc<ExecutorRegistry>, job_id: JobId) -> Arc<Session> {
+        for _ in 0..10_000 {
+            if let Some(session) = registry.sessions().get(&job_id.to_string()) {
+                return session;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the supervisor never registered a session");
+    }
+
+    #[tokio::test]
+    async fn session_end_succeeds() {
+        // Ending a session finishes its job, so quota is released at once.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (ctx, net, registry) = session_context(storage.clone()).await;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+
+        let supervisor = tokio::spawn(supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            session_spec(None),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        ));
+        wait_for_session(&registry, job_id)
+            .await
+            .end(EndReason::Ended);
+        supervisor.await.unwrap();
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Succeeded);
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_idle_succeeds() {
+        // The idle timer finishes the job on its own, with reason `idle`.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (ctx, net, _registry) = session_context(storage.clone()).await;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+
+        supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            session_spec(Some(1)),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Succeeded);
+        net.shutdown().await;
     }
 
     #[tokio::test]

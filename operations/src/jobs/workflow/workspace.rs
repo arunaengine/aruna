@@ -2167,6 +2167,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_expiry_takes_min() {
+        // A session credential outlives neither its walltime nor its bearer.
+        use aruna_core::compute::runtimes::{
+            SESSION_EXPIRY_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+        };
+        let CredentialFixture {
+            _dir,
+            context,
+            net,
+            record,
+            node_id,
+            bucket,
+            mut spec,
+        } = credential_fixture().await;
+        let bearer_ms = aruna_core::util::unix_timestamp_millis() + 60_000;
+        spec.resources.max_walltime_ms = Some(24 * 60 * 60 * 1000);
+        spec.tags
+            .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        spec.tags.insert(
+            SESSION_RUNTIME_TAG.to_string(),
+            "python-notebook".to_string(),
+        );
+        spec.tags
+            .insert(SESSION_EXPIRY_TAG.to_string(), bearer_ms.to_string());
+
+        let credential = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+            .await
+            .unwrap();
+
+        assert_eq!(credential.expires_at_ms, bearer_ms);
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn rejects_oversized_mounts() {
         // Fifty patterns are the issuance cap, so twenty-five mounted buckets
         // still pass and the twenty-sixth must fail permanently.
