@@ -51,6 +51,7 @@ use aruna_operations::metadata::profile_validation::{
     MetadataProfilePreview, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
     preview_submission as run_preview_submission,
 };
+use aruna_operations::metadata::public_preview::restricted_files as run_restricted_files;
 use aruna_operations::notifications::watch::emit::emit_metadata_created;
 use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::update_metadata_document::{
@@ -156,6 +157,10 @@ pub struct ProfileValidationPreviewRequest {
     /// even while it is not public; without it only public Profiles do.
     #[serde(default)]
     pub group_id: Option<String>,
+    /// Whether the draft would be saved as a public dataset. Only then are
+    /// restricted files reported.
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -173,6 +178,24 @@ pub struct ProfileValidationPreviewResponse {
     pub findings: Vec<ProfileValidationFindingResponse>,
     pub completeness: String,
     pub structural_violations: Vec<ValidationViolationResponse>,
+    /// Data entities the anonymous principal may not read. Empty unless the
+    /// request set `public`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restricted_files: Vec<RestrictedFileResponse>,
+}
+
+/// A draft data entity that a public dataset would not expose. The location
+/// fields are omitted when the caller may not read the object either.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RestrictedFileResponse {
+    pub entity_id: String,
+    /// The object's permission path, ready to grant READ on exactly this object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl From<MetadataProfilePreview> for ProfileValidationPreviewResponse {
@@ -193,6 +216,7 @@ impl From<MetadataProfilePreview> for ProfileValidationPreviewResponse {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            restricted_files: Vec::new(),
         }
     }
 }
@@ -1270,10 +1294,18 @@ metadata path, because the group's own Profiles resolve for it.
   `profile_not_registered`.
 - A built-in Profile such as `https://w3id.org/ro/wfrun/process/0.5` resolves from shapes the node
   ships, in any group and with no registry row: `profile_id` is absent and `profile_revision` is
-  `builtin`."#,
+  `builtin`.
+- `public` marks a draft that would be saved as a public dataset. It then lists every File or
+  MediaObject entity that resolves to an Aruna object the realm's anonymous principal may not
+  read, as `restricted_files`. Each entry carries `permission_path`, the object's full
+  permission path, so READ can be granted on exactly that object. Resolution only follows paths
+  the caller may read, so an object the caller cannot read is reported by entity id alone,
+  without `permission_path`, `bucket` or `key`. The list is advisory: it never changes
+  `accepted`, and it stays empty when `public` is false."#,
     request_body(content = ProfileValidationPreviewRequest,
         example = json!({
             "group_id": "01JGROUP00000000000000000",
+            "public": true,
             "rocrate": {
                 "@context": "https://w3id.org/ro/crate/1.3/context",
                 "@graph": [
@@ -1318,7 +1350,15 @@ metadata path, because the group's own Profiles resolve for it.
                     }
                 ],
                 "completeness": "complete",
-                "structural_violations": []
+                "structural_violations": [],
+                "restricted_files": [
+                    {
+                        "entity_id": "https://w3id.org/aruna/data/0000000000000000000000000000000000000000000000000000000000000000",
+                        "permission_path": "/01JREALM00000000000000000/g/01JGROUP00000000000000000/data/01JNODE000000000000000000/reads/raw/one.csv",
+                        "bucket": "reads",
+                        "key": "raw/one.csv"
+                    }
+                ]
             })),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -1344,10 +1384,26 @@ pub async fn preview_profile_validation(
         ensure_metadata_scope(&state, &auth, group_id, Permission::READ).await?;
     }
     let jsonld = serialize_jsonld_object(&request.rocrate)?;
-    let preview = run_preview_submission(&state.get_ctx(), group_id, &jsonld)
+    let context = state.get_ctx();
+    let preview = run_preview_submission(&context, group_id, &jsonld)
         .await
         .map_err(map_metadata_error)?;
-    Ok((StatusCode::OK, Json(preview.into())))
+    let mut response = ProfileValidationPreviewResponse::from(preview);
+    if request.public {
+        response.restricted_files =
+            run_restricted_files(&context, state.get_realm_id(), &auth, &request.rocrate)
+                .await
+                .map_err(map_metadata_error)?
+                .into_iter()
+                .map(|file| RestrictedFileResponse {
+                    entity_id: file.entity_id,
+                    permission_path: file.permission_path,
+                    bucket: file.bucket,
+                    key: file.key,
+                })
+                .collect();
+    }
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -4650,6 +4706,7 @@ mod tests {
             Json(ProfileValidationPreviewRequest {
                 rocrate: draft_crate(),
                 group_id: Some(test.group_id.to_string()),
+                public: false,
             }),
         )
         .await;
@@ -4667,6 +4724,7 @@ mod tests {
             Json(ProfileValidationPreviewRequest {
                 rocrate: draft_crate(),
                 group_id: Some(test.group_id.to_string()),
+                public: false,
             }),
         )
         .await
@@ -4674,6 +4732,171 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(preview.state, "not_profiled");
+        assert!(preview.restricted_files.is_empty());
+    }
+
+    const PREVIEW_BUCKET: &str = "preview-reads";
+    const PREVIEW_KEY: &str = "raw/one.csv";
+
+    /// Seeds one stored object and returns the draft crate that references it
+    /// by content identity, the way the portal writes data entities.
+    async fn seed_preview_object(test: &TestState) -> Value {
+        let hash = [44u8; 32];
+        let version_id = Ulid::generate();
+        let ctx = test.state.get_ctx();
+        let bucket_info = BucketInfo {
+            group_id: test.group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test.auth.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        };
+        write_doc(
+            &ctx,
+            S3_BUCKET_KEYSPACE,
+            PREVIEW_BUCKET.as_bytes().into(),
+            bucket_info.to_bytes().unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                hash,
+                version_id,
+                test.state.get_realm_id(),
+                test.group_id,
+                test.state.get_node_id(),
+                PREVIEW_BUCKET,
+                PREVIEW_KEY,
+            )
+            .to_bytes()
+            .unwrap()
+            .into(),
+            Vec::<u8>::new().into(),
+        )
+        .await;
+        let mut crate_value = draft_crate();
+        crate_value["@graph"].as_array_mut().unwrap().push(json!({
+            "@id": format!(
+                "{}{}",
+                aruna_core::structs::ARUNA_DATA_PREFIX,
+                hex::encode(hash)
+            ),
+            "@type": "File",
+            "name": "one.csv",
+            "contentUrl": format!("s3://{PREVIEW_BUCKET}/{PREVIEW_KEY}")
+        }));
+        crate_value
+    }
+
+    async fn grant_anonymous_read(test: &TestState) {
+        let realm_id = test.state.get_realm_id();
+        let actor = Actor {
+            node_id: test.state.get_node_id(),
+            user_id: test.auth.user_id,
+            realm_id,
+        };
+        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let role_id = Ulid::generate();
+        realm_auth.roles.insert(
+            role_id,
+            aruna_core::structs::Role {
+                role_id,
+                name: "everyone".to_string(),
+                permissions: std::collections::HashMap::from([(
+                    format!("/{realm_id}/g/{}/**", test.group_id),
+                    Permission::READ,
+                )]),
+                assigned_users: HashSet::from([aruna_core::UserId::nil(realm_id)]),
+            },
+        );
+        write_doc(
+            &test.state.get_ctx(),
+            AUTH_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            realm_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn preview_lists_restricted() {
+        let test = setup_state().await;
+        let rocrate = seed_preview_object(&test).await;
+
+        let (_, Json(preview)) = preview_profile_validation(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(ProfileValidationPreviewRequest {
+                rocrate,
+                group_id: Some(test.group_id.to_string()),
+                public: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(preview.restricted_files.len(), 1);
+        let restricted = &preview.restricted_files[0];
+        assert_eq!(restricted.bucket.as_deref(), Some(PREVIEW_BUCKET));
+        assert_eq!(restricted.key.as_deref(), Some(PREVIEW_KEY));
+        assert_eq!(
+            restricted.permission_path.as_deref(),
+            Some(
+                aruna_core::structs::blob_object_permission_path(
+                    test.state.get_realm_id(),
+                    test.group_id,
+                    test.state.get_node_id(),
+                    PREVIEW_BUCKET,
+                    PREVIEW_KEY,
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_skips_readable() {
+        let test = setup_state().await;
+        let rocrate = seed_preview_object(&test).await;
+        grant_anonymous_read(&test).await;
+
+        let (_, Json(preview)) = preview_profile_validation(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(ProfileValidationPreviewRequest {
+                rocrate,
+                group_id: Some(test.group_id.to_string()),
+                public: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.restricted_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_skips_private_drafts() {
+        let test = setup_state().await;
+        let rocrate = seed_preview_object(&test).await;
+
+        let (_, Json(preview)) = preview_profile_validation(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(ProfileValidationPreviewRequest {
+                rocrate,
+                group_id: Some(test.group_id.to_string()),
+                public: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.restricted_files.is_empty());
     }
 
     #[tokio::test]

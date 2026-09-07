@@ -527,6 +527,7 @@ mod tests {
                     "@graph": []
                 }),
                 group_id: Some(Ulid::generate().to_string()),
+                public: false,
             }),
         )
         .await;
