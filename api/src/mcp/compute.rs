@@ -256,10 +256,10 @@ pub struct StartSessionInput {
     /// value caps it, so a longer request never extends the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_after_ms: Option<u64>,
-    /// Whole CPU cores reserved. Defaults to 1.
+    /// Whole CPU cores reserved. Defaults to 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_cores: Option<u32>,
-    /// RAM reserved in bytes, for example `2147483648` for 2 GiB.
+    /// RAM reserved in bytes. Defaults to 4 GB (4,000,000,000 bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_bytes: Option<u64>,
 }

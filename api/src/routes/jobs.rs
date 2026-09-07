@@ -896,6 +896,8 @@ fn session_request(
     if request.workdir.is_none() {
         request.workdir = Some(SESSION_WORKDIR.to_string());
     }
+    request.cpu_cores.get_or_insert(2);
+    request.ram_bytes.get_or_insert(4_000_000_000);
     request.image = runtime.image.to_string();
     request.command = runtime
         .command
@@ -1286,6 +1288,7 @@ additionally need WRITE on that bucket, which must belong to the same group.
   existing workspace bucket, and stays running until the caller ends it, the idle wait passes, the
   walltime is reached, or it is cancelled. `session_idle_after_ms` asks for a shorter idle wait
   than the realm's; the executing node clamps it, so a longer request never extends the session.
+  Omitted resource limits default to 2 CPU cores and 4 GB RAM (4,000,000,000 bytes).
 
 **Limits** (all refused with 400)
 - An empty image without a `runtime`, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
@@ -3897,6 +3900,8 @@ mod tests {
         let mut request = session_body();
         session_request(&mut request, None).expect("a session submit is accepted");
         let runtime = session_runtime("python-notebook").expect("the catalog holds it");
+        assert_eq!(request.cpu_cores, Some(2));
+        assert_eq!(request.ram_bytes, Some(4_000_000_000));
         assert_eq!(request.image, runtime.image);
         assert_eq!(request.command, vec![runtime.command[0].to_string()]);
         assert_eq!(request.workdir.as_deref(), Some(SESSION_WORKDIR));
@@ -3908,6 +3913,16 @@ mod tests {
             request.tags.get(SESSION_IDLE_TAG).map(String::as_str),
             Some("600000")
         );
+    }
+
+    #[test]
+    fn session_keeps_resources() {
+        let mut request = session_body();
+        request.cpu_cores = Some(8);
+        request.ram_bytes = Some(16_000_000_000);
+        session_request(&mut request, None).expect("explicit resources are accepted");
+        assert_eq!(request.cpu_cores, Some(8));
+        assert_eq!(request.ram_bytes, Some(16_000_000_000));
     }
 
     #[test]
