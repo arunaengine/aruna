@@ -39,6 +39,36 @@ fn ready(idle_after_ms: u64) -> (Arc<Session>, TestChannel) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn rejected_requests_preserve() {
+    for closed in [false, true] {
+        let (session, channel) = ready(600_000);
+        session.submit_cell("queued", "1").unwrap();
+        if closed {
+            drop(channel);
+        } else {
+            while session
+                .requests
+                .try_send(HelperRequest::Interrupt { id: 1 })
+                .is_ok()
+            {}
+        }
+        let before = session.snapshot();
+        assert_eq!(
+            session.submit_cell("refused", "2"),
+            Err(SessionError::TooMany)
+        );
+        assert_eq!(session.interrupt(), Err(SessionError::TooMany));
+        let after = session.snapshot();
+        assert_eq!(after.last_event_id, before.last_event_id);
+        assert_eq!(after.cells.len(), 1);
+        assert_eq!(after.cells[0].cell_id, "queued");
+        assert_eq!(after.cells[0].state, CellPhase::Queued);
+        assert_eq!(session.lock().queue.len(), 1);
+        assert_eq!(session.lock().submits.len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn refuses_while_starting() {
     let registry = Arc::new(SessionRegistry::new());
     let (session, _channel) = registry.open_detached(config(600_000));

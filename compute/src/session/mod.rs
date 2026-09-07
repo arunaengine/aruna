@@ -337,7 +337,7 @@ impl Session {
         if code.len() > MAX_CELL_CODE_BYTES {
             return Err(SessionError::CodeTooLarge);
         }
-        let request = {
+        let position = {
             let mut inner = self.lock();
             match inner.phase {
                 SessionPhase::Starting => return Err(SessionError::Starting),
@@ -362,6 +362,10 @@ impl Session {
             if inner.queue.len() >= MAX_QUEUED_CELLS || inner.submits.len() >= MAX_SUBMITS {
                 return Err(SessionError::TooMany);
             }
+            let permit = self
+                .requests
+                .try_reserve()
+                .map_err(|_| SessionError::TooMany)?;
             inner.submits.push_back(now);
             inner.queue.push_back(cell_id.to_string());
             inner.track(cell_id);
@@ -379,28 +383,29 @@ impl Session {
             let _ = self.events.send(event);
             inner.bump(self.config.idle_after_ms);
             let id = inner.next_id();
-            HelperRequest::Execute {
+            permit.send(HelperRequest::Execute {
                 id,
                 cell_id: cell_id.to_string(),
                 code: code.to_string(),
-            }
+            });
+            inner.queue.len()
         };
         self.bumped.notify_waiters();
         self.announce();
-        let position = self.lock().queue.len();
-        if self.requests.try_send(request).is_err() {
-            return Err(SessionError::TooMany);
-        }
         Ok(position)
     }
 
     /// Interrupts the running cell and drops the queue.
     pub fn interrupt(&self) -> Result<(), SessionError> {
-        let request = {
+        {
             let mut inner = self.lock();
             if inner.phase == SessionPhase::Ended {
                 return Err(SessionError::Ended);
             }
+            let permit = self
+                .requests
+                .try_reserve()
+                .map_err(|_| SessionError::TooMany)?;
             // The cell the kernel is running keeps its state: its reply
             // decides whether it finished, errored or was interrupted.
             let queued: Vec<String> = inner.queue.drain(..).collect();
@@ -428,12 +433,10 @@ impl Session {
                 let _ = self.events.send(event);
             }
             let id = inner.next_id();
-            HelperRequest::Interrupt { id }
+            permit.send(HelperRequest::Interrupt { id });
         };
         self.announce();
-        self.requests
-            .try_send(request)
-            .map_err(|_| SessionError::TooMany)
+        Ok(())
     }
 
     /// Ends the session. Repeating it keeps the first reason.
