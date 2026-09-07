@@ -15,9 +15,9 @@ COPY scripts/session-helper/session-start /opt/aruna/session-start
 # drive it through jupyter_client. It goes to a shared path because the
 # container runs as an unprivileged uid that cannot read root's home.
 RUN chmod 0755 /opt/aruna/session-helper /opt/aruna/session-start \
-    && DENO_DIR=/opt/aruna/.deno-cache JUPYTER_DATA_DIR=/usr/local/share/jupyter \
-       deno jupyter --install \
-    && chmod -R a+rX /usr/local/share/jupyter /opt/aruna/.deno-cache
+    && deno jupyter --install \
+    && jupyter kernelspec install /root/.local/share/jupyter/kernels/deno --prefix=/usr/local \
+    && chmod -R a+rX /usr/local/share/jupyter
 
 ENV ARUNA_SESSION_KERNEL=deno
 ENV DENO_DIR=.deno-cache
