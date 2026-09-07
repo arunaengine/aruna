@@ -124,10 +124,19 @@ impl Default for ExportCheckpoint {
     }
 }
 
+/// The bucket and key an entity was authored against, used to lay the archive
+/// out like the source prefix instead of by content hash.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StorageKey {
+    bucket: String,
+    key: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ExportEntity {
     entity_id: String,
     local_path: Option<String>,
+    storage_key: Option<StorageKey>,
     exact: Option<VersionedObjectArn>,
     hash: Option<[u8; 32]>,
     hash_realm: Option<RealmId>,
@@ -1711,21 +1720,36 @@ fn plan_export(
     checkpoint: &mut ExportCheckpoint,
     opened: &[ProbedEntry],
 ) -> Result<(), ExportFailure> {
+    let sources = opened
+        .iter()
+        .map(|entry| {
+            source_key(
+                &checkpoint.entities[entry.entity_index],
+                entry.candidate_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let layout = KeyLayout::new(&sources);
     let mut paths = HashSet::new();
-    for entry in opened {
+    for (entry, source) in opened.iter().zip(&sources) {
         let entity = &mut checkpoint.entities[entry.entity_index];
         entity.report_source = Some(entry.report_source);
         entity.resolved_version = entry.resolved_version;
+        let reserved = |path: &String| path == METADATA_PATH || path == REPORT_PATH;
         let explicit = entity
             .local_path
             .as_deref()
             .and_then(safe_zip_path)
-            .filter(|path| path != METADATA_PATH && path != REPORT_PATH);
+            .filter(|path| !reserved(path));
+        let derived = source
+            .as_ref()
+            .and_then(|source| layout.path(source))
+            .filter(|path| !reserved(path));
         let path = match explicit {
             Some(path) => path,
             None => {
                 entity.path_synthesized = true;
-                synthesized_path(entry.hash, &entity.entity_id)
+                derived.unwrap_or_else(|| synthesized_path(entry.hash, &entity.entity_id))
             }
         };
         if path.len() as u64 > spec.limits.key_bytes {
@@ -1851,10 +1875,21 @@ fn recognize_entities(
         if !files.remove(&subject) {
             continue;
         }
-        let identity = entity_identity(
-            &entity_id,
-            content_urls.get(&subject).map_or(&[], Vec::as_slice),
-        );
+        let urls = content_urls.get(&subject).map_or(&[][..], Vec::as_slice);
+        let identity = entity_identity(&entity_id, urls);
+        let storage_key = identity
+            .exact
+            .as_ref()
+            .filter(|exact| exact.realm_id == realm_id)
+            .map(|exact| StorageKey {
+                bucket: exact.bucket.clone(),
+                key: exact.key.clone(),
+            })
+            .or_else(|| {
+                std::iter::once(entity_id.as_str())
+                    .chain(urls.iter().map(String::as_str))
+                    .find_map(object_location)
+            });
         let external = identity.exact.is_none() && identity.hash.is_none();
         let hash_realm = identity.hash_realm;
         let supported_exact = identity
@@ -1871,6 +1906,7 @@ fn recognize_entities(
         entities.push(ExportEntity {
             entity_id,
             local_path,
+            storage_key,
             exact: identity.exact,
             hash: identity.hash,
             hash_realm,
@@ -2075,6 +2111,95 @@ fn jsonld_path(path: &str) -> String {
 fn synthesized_path(hash: [u8; 32], entity_id: &str) -> String {
     let suffix = blake3::hash(entity_id.as_bytes()).to_hex();
     format!("data/{}-{}", hex::encode(hash), &suffix[..12])
+}
+
+fn object_location(value: &str) -> Option<StorageKey> {
+    let (bucket, key) = value.strip_prefix("s3://")?.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then(|| StorageKey {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    })
+}
+
+/// The authored location wins over the resolved candidate: a content hash may
+/// be served from any alias, and only the authored key matches the crate.
+fn source_key(entity: &ExportEntity, candidate_index: usize) -> Option<StorageKey> {
+    if let Some(storage_key) = entity.storage_key.clone() {
+        return Some(storage_key);
+    }
+    match &entity.candidates.get(candidate_index)?.source {
+        CandidateSource::Local { bucket, key, .. } => Some(StorageKey {
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }),
+        CandidateSource::RemoteExact { target, .. } => Some(StorageKey {
+            bucket: target.bucket.clone(),
+            key: target.key.clone(),
+        }),
+        CandidateSource::RemoteHash { .. } => None,
+    }
+}
+
+/// How keys become archive paths: one bucket drops the directory prefix every
+/// payload shares, several buckets keep the whole key under the bucket name.
+struct KeyLayout {
+    dropped: usize,
+    with_bucket: bool,
+}
+
+impl KeyLayout {
+    fn new(sources: &[Option<StorageKey>]) -> Self {
+        let mut buckets = BTreeSet::new();
+        let mut shared: Option<Vec<&str>> = None;
+        for source in sources.iter().flatten() {
+            buckets.insert(source.bucket.as_str());
+            let parents = key_parents(&source.key);
+            shared = Some(match shared {
+                Some(shared) => common_prefix(shared, &parents),
+                None => parents,
+            });
+        }
+        let single = buckets.len() == 1;
+        Self {
+            dropped: if single {
+                shared.map_or(0, |shared| shared.len())
+            } else {
+                0
+            },
+            with_bucket: !single,
+        }
+    }
+
+    fn path(&self, source: &StorageKey) -> Option<String> {
+        let relative = source
+            .key
+            .split('/')
+            .skip(self.dropped)
+            .collect::<Vec<_>>()
+            .join("/");
+        let candidate = if self.with_bucket {
+            format!("{}/{relative}", source.bucket)
+        } else {
+            relative
+        };
+        safe_zip_path(&candidate)
+    }
+}
+
+fn key_parents(key: &str) -> Vec<&str> {
+    let mut parents = key.split('/').collect::<Vec<_>>();
+    parents.pop();
+    parents
+}
+
+fn common_prefix<'a>(mut shared: Vec<&'a str>, parents: &[&str]) -> Vec<&'a str> {
+    let common = shared
+        .iter()
+        .zip(parents)
+        .take_while(|(left, right)| left == right)
+        .count();
+    shared.truncate(common);
+    shared
 }
 
 fn scan_unrewritten(
@@ -4435,6 +4560,145 @@ mod tests {
         ));
     }
 
+    fn stored_file(hash: u8, location: &str) -> JsonValue {
+        json!({
+            "@id": format!(
+                "{}{}",
+                aruna_core::structs::ARUNA_DATA_PREFIX,
+                hex::encode([hash; 32])
+            ),
+            "@type": "File",
+            "name": "payload",
+            "contentUrl": location
+        })
+    }
+
+    fn crate_document(parts: &[JsonValue]) -> JsonValue {
+        let mut graph = vec![
+            json!({
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "test",
+                "description": "test crate",
+                "datePublished": "2026-07-23",
+                "hasPart": parts
+                    .iter()
+                    .map(|part| json!({"@id": part["@id"]}))
+                    .collect::<Vec<_>>()
+            }),
+            json!({
+                "@id": METADATA_PATH,
+                "@type": "CreativeWork",
+                "about": {"@id": "./"},
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+            }),
+        ];
+        graph.extend(parts.iter().cloned());
+        json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": graph})
+    }
+
+    fn planned_paths(
+        realm_id: RealmId,
+        document: &JsonValue,
+    ) -> Result<Vec<String>, ExportFailure> {
+        let spec = remote_spec(realm_id, UserId::nil(realm_id));
+        let entities = recognized_entities(document, realm_id).unwrap();
+        let opened = entities
+            .iter()
+            .enumerate()
+            .map(|(entity_index, entity)| ProbedEntry {
+                entity_index,
+                candidate_index: 0,
+                size: 1,
+                hash: entity.hash.unwrap_or([0; 32]),
+                report_source: ExportReportSource::Local,
+                resolved_version: None,
+            })
+            .collect::<Vec<_>>();
+        let mut checkpoint = ExportCheckpoint {
+            raw_jsonld: Some(document.to_string()),
+            entities,
+            ..ExportCheckpoint::default()
+        };
+        plan_export(&spec, &mut checkpoint, &opened)?;
+        Ok(checkpoint
+            .entities
+            .iter()
+            .filter_map(|entity| entity.zip_path.clone())
+            .collect())
+    }
+
+    #[test]
+    fn local_path_wins() {
+        let realm_id = RealmId::from_bytes([21; 32]);
+        let mut part = stored_file(1, "s3://reads/raw/one.csv");
+        part["localPath"] = json!("data/authored.csv");
+        let document = crate_document(&[part]);
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+        assert_eq!(entities[0].local_path.as_deref(), Some("data/authored.csv"));
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec!["data/authored.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn drops_shared_prefix() {
+        let realm_id = RealmId::from_bytes([22; 32]);
+        let document = crate_document(&[
+            stored_file(1, "s3://reads/raw/2024/one.csv"),
+            stored_file(2, "s3://reads/raw/2025/two.csv"),
+        ]);
+
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec!["2024/one.csv".to_string(), "2025/two.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn separates_buckets() {
+        let realm_id = RealmId::from_bytes([23; 32]);
+        let document = crate_document(&[
+            stored_file(1, "s3://reads/raw/one.csv"),
+            stored_file(2, "s3://results/two.csv"),
+        ]);
+
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec![
+                "reads/raw/one.csv".to_string(),
+                "results/two.csv".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_path_collision() {
+        let realm_id = RealmId::from_bytes([24; 32]);
+        let mut authored = stored_file(1, "s3://reads/one.csv");
+        authored["localPath"] = json!("two.csv");
+        let document = crate_document(&[authored, stored_file(2, "s3://reads/two.csv")]);
+
+        assert!(matches!(
+            planned_paths(realm_id, &document),
+            Err(ExportFailure::Permanent(message))
+                if message.contains("resolve to ZIP path `two.csv`")
+        ));
+    }
+
+    #[test]
+    fn keeps_reserved_names() {
+        let realm_id = RealmId::from_bytes([25; 32]);
+        let document = crate_document(&[stored_file(1, &format!("s3://reads/{METADATA_PATH}"))]);
+
+        let paths = planned_paths(realm_id, &document).unwrap();
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with("data/"));
+    }
+
     #[test]
     fn plans_ordered_paths() {
         assert_eq!(safe_zip_path("./a/b.txt").as_deref(), Some("a/b.txt"));
@@ -4455,6 +4719,7 @@ mod tests {
         let entities = [ExportEntity {
             entity_id: "payload".to_string(),
             local_path: Some("data/payload".to_string()),
+            storage_key: None,
             exact: None,
             hash: None,
             hash_realm: None,
@@ -4657,6 +4922,7 @@ mod tests {
             entities: vec![ExportEntity {
                 entity_id: "data/corrupt".to_string(),
                 local_path: None,
+                storage_key: None,
                 exact: None,
                 hash: Some(hash),
                 hash_realm: Some(realm_id),
