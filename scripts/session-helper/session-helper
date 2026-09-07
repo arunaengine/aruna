@@ -347,14 +347,10 @@ def serve(socket_path):
 
 
 def serve_one(kernel, connection, workdir, stream):
-    buffer = b""
-    while True:
-        chunk = stream.recv(65536)
-        if not chunk:
-            return
-        buffer += chunk
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
+    with stream.makefile("rb") as lines:
+        for line in lines:
+            if not line.endswith(b"\n"):
+                return
             if not line.strip():
                 continue
             try:

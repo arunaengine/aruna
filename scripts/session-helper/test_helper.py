@@ -1,3 +1,4 @@
+import io
 import pathlib
 import queue
 import runpy
@@ -11,6 +12,13 @@ HELPER = runpy.run_path(str(pathlib.Path(__file__).with_name("session-helper")))
 
 
 class KernelTest(unittest.TestCase):
+    def test_request_lines(self):
+        kernel = types.SimpleNamespace(execute=Mock())
+        request = b'{"op":"execute","cell_id":"cell","code":"1"}'
+        stream = types.SimpleNamespace(makefile=lambda _: io.BytesIO(b"\n" + request + b"\n" + request))
+        HELPER["serve_one"](kernel, None, "/work", stream)
+        kernel.execute.assert_called_once_with("cell", "1")
+
     def test_output_order(self):
         for status, ename, expected in [("ok", "", "done"), ("error", "KeyboardInterrupt", "interrupted")]:
             with self.subTest(status=status):
