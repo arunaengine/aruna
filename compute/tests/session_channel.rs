@@ -20,11 +20,10 @@ use tokio_util::sync::CancellationToken;
 /// the next one, so a reconnect gets a fresh exec like a real backend.
 struct FakeBackend {
     helpers: Mutex<VecDeque<DuplexStream>>,
-    session: bool,
 }
 
 impl FakeBackend {
-    fn new(session: bool, channels: usize) -> (Arc<Self>, Vec<DuplexStream>) {
+    fn new(channels: usize) -> (Arc<Self>, Vec<DuplexStream>) {
         let mut helpers = VecDeque::new();
         let mut nodes = Vec::new();
         for _ in 0..channels {
@@ -34,7 +33,6 @@ impl FakeBackend {
         }
         let backend = Arc::new(Self {
             helpers: Mutex::new(helpers),
-            session,
         });
         (backend, nodes)
     }
@@ -48,7 +46,7 @@ impl ExecutorBackend for FakeBackend {
 
     fn capabilities(&self) -> BackendCaps {
         BackendCaps {
-            session: self.session,
+            session: true,
             ..BackendCaps::default()
         }
     }
@@ -107,11 +105,6 @@ impl ExecutorBackend for FakeBackend {
     }
 
     async fn open_session(&self, _context: &FenceContext) -> Result<SessionChannel, BackendError> {
-        if !self.session {
-            return Err(BackendError::InvalidSpec(
-                "backend does not support session channels".to_string(),
-            ));
-        }
         let stream = self
             .helpers
             .lock()
@@ -155,21 +148,9 @@ fn config() -> SessionConfig {
 }
 
 #[tokio::test]
-async fn refuses_without_flag() {
-    // A backend that does not advertise sessions opens no channel.
-    let (backend, _nodes) = FakeBackend::new(false, 1);
-    let opened = ExecutorBackend::open_session(backend.as_ref(), &fence()).await;
-    assert!(
-        matches!(opened, Err(BackendError::InvalidSpec(_))),
-        "a backend without the flag opens no channel"
-    );
-    assert!(!backend.capabilities().session);
-}
-
-#[tokio::test]
 async fn forwards_cell_code() {
     // The node forwards the code unchanged and never interprets it.
-    let (backend, mut nodes) = FakeBackend::new(true, 1);
+    let (backend, mut nodes) = FakeBackend::new(1);
     let registry = Arc::new(SessionRegistry::new());
     let session = registry.open(config(), backend, fence());
     let mut helper = BufReader::new(nodes.remove(0));
@@ -204,7 +185,7 @@ async fn forwards_cell_code() {
 #[tokio::test]
 async fn reopens_lost_channel() {
     // A reconnect is a new exec against the same container, not a new session.
-    let (backend, mut nodes) = FakeBackend::new(true, 2);
+    let (backend, mut nodes) = FakeBackend::new(2);
     let registry = Arc::new(SessionRegistry::new());
     let session = registry.open(config(), backend, fence());
     let mut second = nodes.remove(1);

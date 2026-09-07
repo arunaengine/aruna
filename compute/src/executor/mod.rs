@@ -76,7 +76,6 @@ pub fn enforced_limit(
 }
 
 /// Wall-clock milliseconds every backend stamps its attempt evidence with.
-#[cfg(any(feature = "apptainer", feature = "docker"))]
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

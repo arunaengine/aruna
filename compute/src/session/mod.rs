@@ -17,7 +17,7 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::ExecutorBackend;
+use crate::executor::{ExecutorBackend, now_ms};
 use events::{BudgetVerdict, CellBudget, EventRing, SessionEvent};
 
 pub use aruna_core::compute::session::{
@@ -982,15 +982,6 @@ fn session_frame<'a>(
             reason: reason.as_str(),
         }),
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 /// Wall-clock milliseconds a monotonic deadline falls on.
