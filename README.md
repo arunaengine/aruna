@@ -190,7 +190,10 @@ service account stays unprivileged, with its token unmounted.
 
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
-`harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.1.0` and `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-deno:0.1.0`.
+`harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.2.0` and `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-deno:0.1.0`.
+Python notebooks accept `requirements.txt` for pip packages or `environment.yml` for one Conda
+environment shared by the Python kernel and Bash cells. Use **Dependencies** in the notebook
+to save the definition and restart the kernel to install changes.
 
 ## Durability Configuration
 

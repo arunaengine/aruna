@@ -98,8 +98,8 @@ pub const SESSION_RUNTIMES: [SessionRuntime; 2] = [
     SessionRuntime {
         id: "python-notebook",
         label: "Python notebook",
-        hint: "IPython kernel with s3fs preconfigured for the workspace bucket.",
-        image: "harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.1.0",
+        hint: "IPython and Bash with PyPI or a shared Conda environment and s3fs.",
+        image: "harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.2.0",
         command: &["/opt/aruna/session-start"],
         env: &[("PYTHONUNBUFFERED", "1")],
         lang: "python",
