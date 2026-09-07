@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{AuthorizationError, BlobError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -650,8 +650,19 @@ async fn extend_hash_candidates(
             .keys()
             .map(|(group_id, _)| *group_id)
             .collect::<BTreeSet<_>>();
-        load_rules(ctx, spec, permission_rules, groups.iter().copied()).await?;
-        load_policies(ctx, spec, policies, groups).await?;
+        load_rules(ctx, spec, permission_rules, groups).await?;
+        // Only a group whose rules already allow an alias needs its object
+        // policy; a foreign group is denied before its policy is consulted.
+        let allowed_groups = distinct
+            .keys()
+            .filter(|(group_id, path)| {
+                permission_rules
+                    .get(group_id)
+                    .is_some_and(|rules| rules.allows(path, &Permission::READ))
+            })
+            .map(|(group_id, _)| *group_id)
+            .collect::<BTreeSet<_>>();
+        load_policies(ctx, spec, policies, allowed_groups).await?;
         let mut resolved = Vec::new();
         let mut alias_denied = false;
         for key in distinct.keys() {
@@ -1032,7 +1043,7 @@ async fn check_read_txn(
     evaluator: &PolicyEvaluator,
     txn_id: TxnId,
 ) -> Result<bool, ExportFailure> {
-    let allowed = drive(
+    let allowed = match drive(
         CheckPermissionsOperation::new_with_txn(
             CheckPermissionsConfig {
                 auth_context: spec.auth_context.clone(),
@@ -1044,7 +1055,12 @@ async fn check_read_txn(
         ctx,
     )
     .await
-    .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    {
+        Ok(allowed) => allowed,
+        // Missing authorization state denies; it must not retry the job.
+        Err(AuthorizationError::AuthDocNotFound | AuthorizationError::GroupNotFound) => false,
+        Err(error) => return Err(ExportFailure::Retryable(error.to_string())),
+    };
     if !allowed {
         return Ok(false);
     }
@@ -1161,9 +1177,16 @@ async fn load_rules(
             auth_context: spec.auth_context.clone(),
             path: format!("/{}/g/{group_id}", spec.auth_context.realm_id),
         };
-        let loaded = drive(PermissionRulesOperation::new(config), &ctx.driver)
-            .await
-            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+        let loaded = match drive(PermissionRulesOperation::new(config), &ctx.driver).await {
+            Ok(loaded) => loaded,
+            // A group whose authorization state this node cannot read grants
+            // the caller nothing. That is a denial, not an outage, so the
+            // export omits its aliases instead of retrying forever.
+            Err(AuthorizationError::AuthDocNotFound | AuthorizationError::GroupNotFound) => {
+                PermissionRules::default()
+            }
+            Err(error) => return Err(ExportFailure::Retryable(error.to_string())),
+        };
         rules.insert(group_id, loaded);
     }
     Ok(())
@@ -4150,6 +4173,66 @@ mod tests {
         node.net.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn denies_foreign_alias() {
+        // A hash alias in a group whose authorization document this node cannot
+        // read must deny that alias, not fail the export with a retryable error.
+        let (node, owner, candidate) = local_candidate().await;
+        let realm_id = owner.realm_id;
+        let hash = candidate.expected_blake3.unwrap();
+        let foreign = Ulid::from_bytes([200; 16]);
+        let alias = HashPathIndexKey::new(
+            hash,
+            Ulid::from_bytes([201; 16]),
+            realm_id,
+            foreign,
+            node.net.node_id(),
+            "restricted",
+            "secret.csv",
+        );
+        assert!(matches!(
+            node.driver
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                    key: alias.to_bytes().unwrap().into(),
+                    value: Vec::new().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let spec = remote_spec(realm_id, owner);
+        let ctx = job_context(node.driver.clone(), node.net.node_id());
+        let mut candidates = Vec::new();
+        let mut denied = false;
+        extend_hash_candidates(
+            &ctx,
+            &spec,
+            hash,
+            None,
+            &mut candidates,
+            &mut denied,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        )
+        .await
+        .expect("a foreign group must deny instead of failing the export");
+
+        assert!(denied);
+        assert!(!candidates.iter().any(|candidate| matches!(
+            &candidate.source,
+            CandidateSource::Local { group_id, .. } if *group_id == foreign
+        )));
+        node.net.shutdown().await;
+    }
+
     #[test]
     fn learns_probe_hash() {
         let realm_id = RealmId::from_bytes([2; 32]);
@@ -4626,6 +4709,54 @@ mod tests {
             .iter()
             .filter_map(|entity| entity.zip_path.clone())
             .collect())
+    }
+
+    #[test]
+    fn keeps_subcrate_reference() {
+        let realm_id = RealmId::from_bytes([26; 32]);
+        let child = "https://w3id.org/aruna/01JCHILD0000000000000000A";
+        let descriptor = "https://api.example.test/metadata/01JCHILD0000000000000000A/rocrate";
+        let file = stored_file(1, "s3://reads/one.csv");
+        let document = json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "test",
+                    "description": "test crate",
+                    "datePublished": "2026-07-23",
+                    "hasPart": [{"@id": file["@id"]}, {"@id": child}]
+                },
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+                },
+                file,
+                {
+                    "@id": child,
+                    "@type": "Dataset",
+                    "name": "restricted child",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate"},
+                    "identifier": "01JCHILD0000000000000000A",
+                    "subjectOf": {"@id": descriptor}
+                },
+                {
+                    "@id": descriptor,
+                    "@type": "CreativeWork",
+                    "encodingFormat": "application/ld+json"
+                }
+            ]
+        });
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec!["one.csv".to_string()]
+        );
     }
 
     #[test]
