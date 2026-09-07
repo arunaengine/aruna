@@ -19,7 +19,16 @@ use crate::jobs::records::{
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {
-    let spec = family.spec();
+    let mut spec = family.spec();
+    spec.payload.tags.insert(
+        aruna_core::compute::runtimes::SESSION_TAG.to_string(),
+        aruna_core::compute::runtimes::SESSION_TAG_NOTEBOOK.to_string(),
+    );
+    spec.payload.tags.insert(
+        aruna_core::compute::runtimes::SESSION_RUNTIME_TAG.to_string(),
+        "python-notebook".to_string(),
+    );
+    let spec = spec.store_digest().expect("session spec digests");
     let launch = family.launch(&spec, family.holder.public(), 0);
     let receipt = family.receipt(&launch, 1);
     let published = [
@@ -102,6 +111,76 @@ async fn reads_kind_only() {
     assert!(matches!(
         &receipts[0].record,
         JobFamilyRecord::Receipt(stored) if stored.execution_id == receipt.execution_id
+    ));
+}
+
+#[tokio::test]
+async fn resolves_session_alias() {
+    use crate::jobs::JobRouteError;
+    use crate::jobs::lifecycle::routing::session_job;
+    use crate::jobs::service::read_owned_job;
+
+    let family = Family::new([7u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let (spec, receipt) = seed(&ctx, &family).await;
+    assert_ne!(spec.job_id, receipt.physical_job_id);
+    assert!(
+        read_owned_job(&ctx, spec.created_by, spec.job_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (record, physical) = session_job(&ctx, spec.created_by, spec.job_id)
+        .await
+        .unwrap();
+    assert_eq!(record.job_id, spec.job_id);
+    assert_eq!(record.owner_node_id, family.target.public());
+    assert_eq!(physical, Some(receipt.physical_job_id));
+    let now = aruna_core::util::unix_timestamp_millis();
+    let mut physical = aruna_core::structs::JobRecord::new(
+        receipt.physical_job_id,
+        aruna_core::structs::JobPayload::Execution(spec.payload.clone()),
+        spec.created_by,
+        family.target.public(),
+        now,
+        now,
+        None,
+    );
+    physical.state = aruna_core::structs::JobState::Succeeded;
+    physical.finished_at_ms = Some(now);
+    physical.report_digest = Some([4; 32]);
+    crate::jobs::store::insert_job(&ctx.storage_handle, &physical)
+        .await
+        .unwrap();
+    let report = crate::jobs::service::read_report_routed(
+        &ctx,
+        spec.created_by,
+        spec.job_id,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report, crate::jobs::service::JobReportLookup::Ready { job, .. }
+        if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32])
+    );
+    let stranger = aruna_core::types::UserId::new(ulid::Ulid(42), REALM);
+    assert!(matches!(
+        crate::jobs::service::read_report_routed(&ctx, stranger, spec.job_id, None, None, 1, None)
+            .await,
+        Ok(crate::jobs::service::JobReportLookup::NotFound)
+    ));
+    assert!(matches!(
+        session_job(&ctx, stranger, spec.job_id).await,
+        Err(JobRouteError::NotFound)
+    ));
+    poison(&ctx, &family).await;
+    assert!(matches!(
+        session_job(&ctx, spec.created_by, spec.job_id).await,
+        Err(JobRouteError::Unavailable(_))
     ));
 }
 

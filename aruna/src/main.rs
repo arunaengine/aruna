@@ -633,6 +633,103 @@ async fn device_wipe_armed(wipe: Option<&Arc<DeviceWipe>>) {
     }
 }
 
+/// The session subnet an operator configured, else the default.
+fn session_subnet() -> String {
+    dotenvy::var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
+        .unwrap_or_else(|_| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string())
+}
+
+/// The gateway address of the Docker session bridge, on the configured S3 port.
+/// It is what a session container targets, whatever the node itself binds.
+#[cfg(feature = "docker")]
+fn session_s3_address(config: &Config, subnet: &str) -> Option<std::net::SocketAddr> {
+    use aruna_compute::executor::docker::session_gateway;
+
+    if dotenvy::var("ARUNA_COMPUTE_EXECUTOR")
+        .unwrap_or_default()
+        .trim()
+        != "docker"
+    {
+        return None;
+    }
+    let port = config
+        .s3_address
+        .as_deref()?
+        .parse::<std::net::SocketAddr>()
+        .ok()?
+        .port();
+    match session_gateway(subnet) {
+        Ok(gateway) => Some(std::net::SocketAddr::new(gateway.into(), port)),
+        Err(error) => {
+            warn!(subnet = %subnet, error = %error, "Session subnet has no gateway; sessions reach no S3 endpoint");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "docker"))]
+fn session_s3_address(_config: &Config, _subnet: &str) -> Option<std::net::SocketAddr> {
+    None
+}
+
+/// What a second S3 listener on the session bridge needs, taken before the node
+/// configuration is consumed.
+struct SessionS3 {
+    address: std::net::SocketAddr,
+    realm_id: aruna_core::structs::RealmId,
+    node_id: iroh::PublicKey,
+    key: aruna_core::credential_encryption::CredentialEncryptionKey,
+    rocrate_limits: aruna_core::structs::RoCrateLimits,
+}
+
+/// Serves the node's S3 plane on the session bridge gateway too. A bind failure
+/// is not fatal: only sessions lose their endpoint, the node keeps serving.
+async fn bind_session_s3(
+    session: Option<SessionS3>,
+    s3_host: &str,
+    driver_ctx: Arc<DriverContext>,
+    cors: CorsConfig,
+    metrics: Arc<NodeMetrics>,
+    s3_timeouts: aruna_api::s3::s3_server::S3ServerTimeouts,
+    shutdown: &Shutdown,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let address = session.address;
+    let server = match S3Server::new(
+        &address.to_string(),
+        s3_host,
+        driver_ctx,
+        session.realm_id,
+        session.node_id,
+        session.key,
+        session.rocrate_limits,
+        cors,
+        metrics,
+    )
+    .await
+    {
+        Ok(server) => server.with_timeouts(s3_timeouts),
+        Err(error) => {
+            warn!(address = %address, error = %error, "Session S3 endpoint unavailable");
+            return;
+        }
+    };
+    let listener = match TcpListener::bind(address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            warn!(address = %address, error = %error, "Session S3 endpoint could not bind");
+            return;
+        }
+    };
+    // The shutdown token stops it, so the handle needs no separate join.
+    match server.run_with_listener(listener, shutdown.token()) {
+        Ok(_) => info!(address = %address, "Session S3 endpoint listening"),
+        Err(error) => warn!(address = %address, error = %error, "Session S3 endpoint failed"),
+    }
+}
+
 async fn bind_servers(
     config: Config,
     driver_ctx: Arc<DriverContext>,
@@ -643,6 +740,24 @@ async fn bind_servers(
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let s3_timeouts = config.s3_timeouts();
+    // A wildcard S3 bind already answers on the gateway, so it needs no second
+    // listener. Session containers still target the gateway address.
+    let wildcard_s3 = config
+        .s3_address
+        .as_deref()
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| address.ip().is_unspecified());
+    let mut session_s3 = session_s3_address(&config, &session_subnet())
+        .filter(|_| !wildcard_s3)
+        .map(|address| SessionS3 {
+            address,
+            realm_id: config.realm_id,
+            node_id: config.node_id,
+            key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                &config.node_state.net_secret_key,
+            ),
+            rocrate_limits: config.rocrate_limits.clone(),
+        });
     let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
         true => {
             let (roots, unsupported) = wipe_plan(&config);
@@ -703,6 +818,10 @@ async fn bind_servers(
 
     // A device serves S3 only where S3_HOST and S3_ADDRESS are configured; the
     // desktop shell sets both to loopback by default, and the pair stays whole.
+    let driver_ctx_for_sessions = driver_ctx.clone();
+    let cors_for_sessions = cors.clone();
+    let metrics_for_sessions = metrics.clone();
+    let session_s3 = session_s3.take();
     let s3_handle = match (config.s3_address.as_deref(), config.s3_host.as_deref()) {
         (Some(s3_address), Some(s3_host)) => {
             let s3_server = S3Server::new(
@@ -745,6 +864,16 @@ async fn bind_servers(
             let (_s3_addr, s3_handle) = s3_server
                 .run_with_listener(s3_listener, shutdown.token())
                 .unwrap();
+            bind_session_s3(
+                session_s3,
+                s3_host,
+                driver_ctx_for_sessions,
+                cors_for_sessions,
+                metrics_for_sessions,
+                s3_timeouts,
+                shutdown,
+            )
+            .await;
             Some(s3_handle)
         }
         _ => None,
@@ -1150,6 +1279,7 @@ async fn build_docker(
     )?;
     let mut docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
+        session_subnet: session_subnet(),
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
         envelope: compute_envelope()?,
         keep_failed: env_true("ARUNA_COMPUTE_KEEP_FAILED"),
@@ -1158,9 +1288,15 @@ async fn build_docker(
     if let Some(state_root) = env_path("ARUNA_COMPUTE_STATE_ROOT") {
         docker_config.state_root = state_root;
     }
+    let session_subnet = docker_config.session_subnet.clone();
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
         .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
+    // The bridge must exist before the S3 listener binds its gateway address.
+    backend
+        .ensure_session_network()
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!(
@@ -1169,7 +1305,10 @@ async fn build_docker(
     );
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
+        .with_workspace_endpoint(workspace, "eu-central-1".to_string())
+        .with_session_endpoint(
+            session_s3_address(config, &session_subnet).map(|address| format!("http://{address}")),
+        ))
 }
 
 #[cfg(not(feature = "docker"))]

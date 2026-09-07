@@ -9,7 +9,7 @@ const BOUNDARIES: &[&str] = &[
     "request_authorization::authorize",
     "submit_execution",
 ];
-const TOOL_COUNT: usize = 31;
+const TOOL_COUNT: usize = 37;
 
 #[test]
 fn tools_reach_authorize() {

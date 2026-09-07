@@ -1,5 +1,6 @@
 pub mod executor;
 pub mod registry;
+pub mod session;
 
 pub use executor::ExecutorBackend;
 pub use executor::config::{
@@ -7,3 +8,4 @@ pub use executor::config::{
 };
 pub use executor::dispatch_helper;
 pub use registry::ExecutorRegistry;
+pub use session::{Session, SessionRegistry};

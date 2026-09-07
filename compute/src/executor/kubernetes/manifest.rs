@@ -40,6 +40,7 @@ pub fn job_manifest(
     labels.insert(
         "aruna-engine.org/network".to_string(),
         match spec.security.network {
+            NetworkAccess::Isolated if spec.session => "s3",
             NetworkAccess::Isolated => "none",
             NetworkAccess::S3Only => "s3",
             NetworkAccess::Open => "task",
@@ -110,7 +111,8 @@ pub fn job_manifest(
                 }));
             }
         }
-    } else if spec.staging_mode == StagingMode::DirectS3 {
+    }
+    if spec.staging_mode == StagingMode::DirectS3 || spec.session {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
     // Tools write caches relative to the working directory, so the non-root
@@ -748,6 +750,58 @@ mod tests {
         assert!(pod.volumes.unwrap_or_default().is_empty());
         assert!(pod.init_containers.unwrap_or_default().is_empty());
         assert!(pod.containers[0].startup_probe.is_none());
+    }
+
+    #[test]
+    fn session_uses_s3() {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/session:latest");
+        spec.session = true;
+        spec.workdir = Some("/work".to_string());
+        spec.inputs.push(TaskInput::from_bytes(
+            "/inputs/requirements.txt",
+            b"numpy".to_vec(),
+        ));
+        spec.secret_env.insert(
+            "AWS_ACCESS_KEY_ID".to_string(),
+            Secret::new("session-access"),
+        );
+        spec.secret_env.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            Secret::new("session-secret"),
+        );
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        for (network, label) in [
+            (NetworkAccess::Isolated, "s3"),
+            (NetworkAccess::Open, "task"),
+        ] {
+            spec.security.network = network;
+            let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+            let template = job.spec.unwrap().template;
+            assert_eq!(
+                template.metadata.unwrap().labels.unwrap()["aruna-engine.org/network"],
+                label
+            );
+            let pod = template.spec.unwrap();
+            let task = &pod.containers[0];
+            assert_eq!(
+                task.env_from.as_ref().unwrap()[0]
+                    .secret_ref
+                    .as_ref()
+                    .unwrap()
+                    .name,
+                secret_name(&context().attempt.external_name())
+            );
+            assert!(
+                task.env
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.name != "AWS_SECRET_ACCESS_KEY")
+            );
+            assert!(task.volume_mounts.as_ref().unwrap().iter().any(|mount| {
+                mount.mount_path == "/inputs/requirements.txt" && mount.read_only == Some(true)
+            }));
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::structs::{
 };
 
 pub mod runtimes;
+pub mod session;
 
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -528,6 +529,9 @@ pub struct TaskSpec {
     pub workspace: Option<WorkspaceBinding>,
     pub security: SecurityContext,
     pub log_limits: LogLimits,
+    /// The task is an interactive session: it stays running until the node ends
+    /// it, and the node opens a byte channel to the helper inside it.
+    pub session: bool,
 }
 
 impl TaskSpec {
@@ -548,13 +552,16 @@ impl TaskSpec {
             workspace: None,
             security: SecurityContext::default(),
             log_limits: LogLimits::default(),
+            session: false,
         }
     }
 
     pub fn effective_env(&self) -> BTreeMap<String, String> {
         let mut env = self.env.clone();
         env.insert("ARUNA_JOB_ID".to_string(), self.attempt.job_id.clone());
-        if self.staging_mode == StagingMode::DirectS3 {
+        // A session always reaches its workspace bucket over S3, whatever the
+        // staging mode of its declared inputs is.
+        if self.staging_mode == StagingMode::DirectS3 || self.session {
             if let Some(workspace) = &self.workspace {
                 env.insert(
                     "AWS_ENDPOINT_URL".to_string(),

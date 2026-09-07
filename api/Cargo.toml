@@ -10,6 +10,7 @@ rust-version.workspace = true
 # Aruna modules
 aruna-core = { workspace = true }
 aruna-blob = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
 aruna-operations = { workspace = true }
 aruna-tasks = { workspace = true }
 

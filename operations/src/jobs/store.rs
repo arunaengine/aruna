@@ -27,6 +27,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS};
 use crate::queue_backoff::queue_retry_after_ms;
 
@@ -597,7 +598,11 @@ where
             if old.state != record.state {
                 validate_transition(old.execution_class, old.state, record.state)?;
             }
-            if !old.is_settled() && record.is_settled() && record.payload.is_rocrate() {
+            if !old.is_settled()
+                && record.is_settled()
+                && (record.payload.is_rocrate()
+                    || matches!(&record.payload, JobPayload::Execution(spec) if session_of(spec).is_some()))
+            {
                 let digest = report_digest(storage, txn_id, record.job_id).await?;
                 record.report_digest = Some(digest);
                 match record.result.as_mut() {

@@ -5,6 +5,8 @@ use aruna_core::compute::{
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +39,16 @@ pub struct BackendCaps {
     pub worker_site: Option<WorkerSite>,
     /// Static ceilings; `None` is unmeasured and never filters.
     pub limits: ResourceEnvelope,
+    /// The backend can open a byte channel to a running attempt, which an
+    /// interactive session needs.
+    pub session: bool,
+}
+
+/// One bidirectional byte channel to the helper inside a running attempt. The
+/// node forwards bytes over it and never interprets what a cell contains.
+pub struct SessionChannel {
+    pub input: Pin<Box<dyn AsyncWrite + Send>>,
+    pub output: Pin<Box<dyn AsyncRead + Send>>,
 }
 
 /// The operator-declared execution site of workers that do not run on the
@@ -64,7 +76,6 @@ pub fn enforced_limit(
 }
 
 /// Wall-clock milliseconds every backend stamps its attempt evidence with.
-#[cfg(any(feature = "apptainer", feature = "docker"))]
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -207,6 +218,15 @@ pub trait ExecutorBackend: Send + Sync {
     ) -> Result<Vec<String>, BackendError> {
         Err(BackendError::InvalidSpec(
             "backend does not support wildcard outputs".to_string(),
+        ))
+    }
+
+    /// Open a byte channel to the session helper of a running attempt. Only a
+    /// backend advertising `BackendCaps.session` implements it. A reconnect
+    /// opens a new channel; nothing is resumed inside the container.
+    async fn open_session(&self, _context: &FenceContext) -> Result<SessionChannel, BackendError> {
+        Err(BackendError::InvalidSpec(
+            "backend does not support session channels".to_string(),
         ))
     }
 

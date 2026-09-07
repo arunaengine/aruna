@@ -558,6 +558,36 @@ pub struct ExportReportDetail {
 pub type ImportReportRow = JobReportRow<ImportReportDetail>;
 pub type ExportReportRow = JobReportRow<ExportReportDetail>;
 
+/// What one line of a session job's report says.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionReportDetail {
+    /// One object staged into the workspace bucket while the session ran.
+    Input {
+        dest_key: String,
+        bytes: u64,
+        blake3: String,
+        source_node_id: String,
+        version_id: String,
+    },
+    /// One object the session's own credential read or wrote.
+    Touched {
+        bucket: String,
+        key: String,
+        operation: String,
+    },
+    /// Why the session stopped: `ended`, `idle`, `walltime`, `cancelled` or
+    /// `kernel_exit`.
+    End { reason: String },
+}
+
+/// One line of a session job's report. It records what the session brought in
+/// and why it stopped; cell traffic is never recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReportRow {
+    pub entry_key: String,
+    pub detail: SessionReportDetail,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub location: BackendLocation,
@@ -1555,6 +1585,14 @@ pub fn workspace_credential_id(job_id: JobId) -> String {
     format!("ws{job_id}")
 }
 
+/// The job a workspace credential's access key belongs to. `None` for every
+/// other credential, so an ordinary request is never attributed to a job.
+pub fn credential_job_id(access_key: &str) -> Option<JobId> {
+    access_key
+        .strip_prefix("ws")
+        .and_then(|id| JobId::from_str(id).ok())
+}
+
 /// Marker of a dedup key whose scope is the subject it names rather than the
 /// submitting user. `job_dedup_index_key` leaves these unprefixed, so two users
 /// asking for the same thing join one job identity. `user_dedup_key` always
@@ -2020,6 +2058,7 @@ pub struct LaunchIntent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
     pub execution_id: Ulid,
+    pub physical_job_id: JobId,
     pub launch_id: Ulid,
     pub launch_digest: [u8; 32],
     pub submission_id: SubmissionId,
@@ -3819,6 +3858,7 @@ mod tests {
     fn sample_receipt() -> ExecutionReceipt {
         ExecutionReceipt {
             execution_id: Ulid::from_bytes([13u8; 16]),
+            physical_job_id: JobId::from_bytes([14u8; 16]),
             launch_id: Ulid::from_bytes([10u8; 16]),
             launch_digest: sample_launch().digest().expect("launch digests"),
             submission_id: submission(),
@@ -3972,9 +4012,9 @@ mod tests {
                 "1ca48ad6fc1652c190e1808e565f7794fe08f32ac87b4d9e440447d87e2c3b93",
                 "db3657f9c0d342c3291b32f42bbadf757a7356030786a173cf8c569f38695c86",
                 "ded9dc94e1d65f2502e30dbcf8a5c4d2e588922d39790e451b6849f6f14ecd62",
-                "ec4c067595ea40647f1d6b293f7f9daf60fa8113be1885825360294271df4c6e",
-                "15a1c2404110cfc66720b7a7bb8f77f33d199665e2c028229efa3c708b66917a",
-                "6a2c88bab322eae973d142690b0a2fb0ba7a5bf5c417df9cc515de498b26635d",
+                "3c6a1f1bfa8d44ffb88a58a76e1d792f1aeaf5545a5c837a100ea0b4921f6fbe",
+                "d0797260ea757ae5d4ce2c06591444819295ea58780c29fe900e699212682f3c",
+                "0b94f899dc1e80849aa991ed99e554da52560b7b68984a276a3863643c92e57e",
                 "f69a68ef56b007a54533ebdb696b806e43b4cf04a75fdb453449d22190853310",
                 "bb342189b2c25f4c3c70813b14199b2e1c0fc2b54e8869e05fff02957ffc5d79",
             ]

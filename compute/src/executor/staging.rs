@@ -44,7 +44,9 @@ pub struct StageEntry {
 impl StageLayout {
     pub fn from_spec(spec: &TaskSpec) -> Result<Self, BackendError> {
         match spec.staging_mode {
-            StagingMode::Files if spec.workspace.is_some() || !spec.secret_env.is_empty() => {
+            StagingMode::Files
+                if !spec.session && (spec.workspace.is_some() || !spec.secret_env.is_empty()) =>
+            {
                 return Err(BackendError::InvalidSpec(
                     "Files staging must not include task credentials".to_string(),
                 ));
@@ -54,7 +56,9 @@ impl StageLayout {
                     "DirectS3 staging must not include container file inputs".to_string(),
                 ));
             }
-            StagingMode::S3Mount if !spec.inputs.is_empty() || spec.workspace.is_some() => {
+            StagingMode::S3Mount
+                if !spec.inputs.is_empty() || (!spec.session && spec.workspace.is_some()) =>
+            {
                 return Err(BackendError::InvalidSpec(
                     "S3Mount staging must not include copied inputs or a workspace binding"
                         .to_string(),
@@ -259,6 +263,25 @@ mod tests {
     use aruna_core::compute::{AttemptRef, S3Mount, Secret, TaskInput, TaskSpec};
 
     use super::*;
+
+    #[test]
+    fn session_keeps_credentials() {
+        let mut spec = TaskSpec::new(AttemptRef::new("session", 0), "session:latest");
+        spec.workspace = Some(aruna_core::compute::WorkspaceBinding {
+            s3_endpoint: "http://s3.example".to_string(),
+            bucket_name: "workspace".to_string(),
+            region: "us-east-1".to_string(),
+        });
+        spec.secret_env
+            .insert("AWS_ACCESS_KEY_ID".to_string(), Secret::new("access"));
+        for staging in [StagingMode::Files, StagingMode::S3Mount] {
+            spec.staging_mode = staging;
+            spec.session = false;
+            assert!(StageLayout::from_spec(&spec).is_err());
+            spec.session = true;
+            assert!(StageLayout::from_spec(&spec).is_ok());
+        }
+    }
 
     #[test]
     fn rejects_path_overlap() {

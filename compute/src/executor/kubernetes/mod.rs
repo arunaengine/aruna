@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
@@ -41,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::{KubernetesConfig, MAX_NODE_SELECTOR_ENTRIES};
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
-use super::{BackendCaps, ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 
 mod manifest;
 
@@ -849,6 +850,7 @@ impl ExecutorBackend for KubernetesBackend {
             local_site: false,
             worker_site,
             limits: self.config.envelope,
+            session: true,
         }
     }
 
@@ -939,6 +941,9 @@ impl ExecutorBackend for KubernetesBackend {
         }
         self.remove_helpers(context).await?;
         self.remove_marker(context).await?;
+        if spec.session {
+            self.ensure_secret(context, spec).await?;
+        }
         match spec.staging_mode {
             StagingMode::Files => {
                 self.ensure_pvc(
@@ -1166,6 +1171,50 @@ impl ExecutorBackend for KubernetesBackend {
         self.save_logs(context).await?;
         self.delete_tasks(context).await?;
         Box::pin(self.list_archive(context, &prefix.to_string_lossy(), &glob)).await
+    }
+
+    /// Runs the helper in client mode inside the task container and hands the
+    /// exec's standard input and output to the caller.
+    async fn open_session(&self, context: &FenceContext) -> Result<SessionChannel, BackendError> {
+        let pods = self.task_pods(context).await?;
+        let pod = pods
+            .iter()
+            .find(|pod| task_state(pod).is_some_and(|state| state.running.is_some()))
+            .ok_or_else(|| {
+                BackendError::Conflict(format!(
+                    "attempt `{}` has no running task pod",
+                    context.attempt.external_name()
+                ))
+            })?;
+        let params = AttachParams::default()
+            .container("task")
+            .stdin(true)
+            .stdout(true)
+            .stderr(false)
+            .max_stdin_buf_size(EXEC_STREAM_BUF_BYTES)
+            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
+        let mut attached = self
+            .pods()
+            .exec(
+                &pod.name_any(),
+                [SESSION_HELPER_PATH, SESSION_CLIENT_MODE],
+                &params,
+            )
+            .await
+            .map_err(kube_error)?;
+        let input = attached.stdin().ok_or_else(|| {
+            BackendError::Api("session exec did not expose standard input".to_string())
+        })?;
+        let output = attached.stdout().ok_or_else(|| {
+            BackendError::Api("session exec did not expose standard output".to_string())
+        })?;
+        Ok(SessionChannel {
+            input: Box::pin(input),
+            output: Box::pin(SessionReader {
+                inner: output,
+                _process: attached,
+            }),
+        })
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
@@ -1396,6 +1445,14 @@ fn validate_spec(
     if spec.staging_mode == StagingMode::S3Mount && config.s3_mount_driver.is_none() {
         return Err(BackendError::InvalidSpec(
             "S3 mounts are disabled on this backend".to_string(),
+        ));
+    }
+    if spec.session
+        && spec.security.network != aruna_core::compute::NetworkAccess::Open
+        && config.s3_cidrs.is_empty()
+    {
+        return Err(BackendError::InvalidSpec(
+            "sessions require configured S3 CIDRs for S3-only networking".to_string(),
         ));
     }
     match (spec.staging_mode, spec.security.network) {
@@ -1918,6 +1975,21 @@ fn build_archive(
         }
     }
     builder.finish().map_err(io_error)
+}
+
+struct SessionReader<R> {
+    inner: R,
+    _process: kube::api::AttachedProcess,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for SessionReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
 }
 
 struct ExactReader<R> {
@@ -2485,6 +2557,20 @@ mod tests {
         let value = serde_json::to_value(patch).unwrap();
         assert_eq!(value[0]["op"], "test");
         assert_eq!(value[0]["path"], "/metadata/uid");
+    }
+
+    #[test]
+    fn session_requires_egress() {
+        let mut spec = TaskSpec::new(context().attempt, "session:latest");
+        spec.session = true;
+        let mut config = test_config();
+        config.s3_cidrs.clear();
+        assert!(validate_spec(&context(), &spec, &config).is_err());
+        config.s3_cidrs.push("10.0.0.0/24".to_string());
+        assert!(validate_spec(&context(), &spec, &config).is_ok());
+        config.s3_cidrs.clear();
+        spec.security.network = aruna_core::compute::NetworkAccess::Open;
+        assert!(validate_spec(&context(), &spec, &config).is_ok());
     }
 
     #[test]

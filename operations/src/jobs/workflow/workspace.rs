@@ -61,6 +61,8 @@ const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
 pub struct WorkspaceCredential {
     pub access_key: String,
     pub secret: String,
+    /// Wall-clock milliseconds the credential stops working at.
+    pub expires_at_ms: u64,
 }
 
 pub async fn ensure_group_write(
@@ -246,9 +248,11 @@ async fn mint_credential(
                 let secret = access.open_secret(&encryption_key).map_err(|error| {
                     JobError::permanent(format!("workspace credential decryption failed: {error}"))
                 })?;
+                let expires_at_ms = expiry_ms(access.expiry);
                 return Ok(WorkspaceCredential {
                     access_key: access.access_key,
                     secret,
+                    expires_at_ms,
                 });
             }
             if record.attempt_intent.is_some() {
@@ -269,7 +273,18 @@ async fn mint_credential(
         .max_walltime_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_WALLTIME);
-    let expiry = SystemTime::now() + walltime + CREDENTIAL_SLACK;
+    // A session's credential must not outlive the job it belongs to, nor the
+    // bearer that asked for it; a staged run keeps the slack its capture needs.
+    let expiry = match crate::jobs::lifecycle::ids::session_of(spec) {
+        Some(session) => {
+            let walltime_end = SystemTime::now() + walltime;
+            match session.expires_at_ms {
+                Some(bearer) => walltime_end.min(from_ms(bearer)),
+                None => walltime_end,
+            }
+        }
+        None => SystemTime::now() + walltime + CREDENTIAL_SLACK,
+    };
     let (_, secret, access) = Box::pin(drive(
         CreateUserAccessOperation::new_with_key(
             CreateUserAccessConfig {
@@ -290,7 +305,20 @@ async fn mint_credential(
     Ok(WorkspaceCredential {
         access_key: access.access_key,
         secret: secret.expose().to_string(),
+        expires_at_ms: expiry_ms(access.expiry),
     })
+}
+
+/// Wall-clock milliseconds of a stored expiry.
+fn expiry_ms(expiry: SystemTime) -> u64 {
+    expiry
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn from_ms(millis: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(millis)
 }
 
 /// True when the launch bound an input to an exact source version. A mount
@@ -2135,6 +2163,40 @@ mod tests {
                 .message
                 .starts_with("workspace credential decryption failed")
         );
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounds_session_expiry() {
+        // A session credential outlives neither its walltime nor its bearer.
+        use aruna_core::compute::runtimes::{
+            SESSION_EXPIRY_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+        };
+        let CredentialFixture {
+            _dir,
+            context,
+            net,
+            record,
+            node_id,
+            bucket,
+            mut spec,
+        } = credential_fixture().await;
+        let bearer_ms = aruna_core::util::unix_timestamp_millis() + 60_000;
+        spec.resources.max_walltime_ms = Some(24 * 60 * 60 * 1000);
+        spec.tags
+            .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        spec.tags.insert(
+            SESSION_RUNTIME_TAG.to_string(),
+            "python-notebook".to_string(),
+        );
+        spec.tags
+            .insert(SESSION_EXPIRY_TAG.to_string(), bearer_ms.to_string());
+
+        let credential = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+            .await
+            .unwrap();
+
+        assert_eq!(credential.expires_at_ms, bearer_ms);
         net.shutdown().await;
     }
 

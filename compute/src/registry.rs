@@ -5,6 +5,7 @@ use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
 use aruna_core::structs::{PlacementPolicyError, PlacementSubject};
 
 use crate::executor::{BackendCaps, ExecutorBackend};
+use crate::session::SessionRegistry;
 
 /// Container-facing S3 endpoint the workspace credential targets. Injected into
 /// the attempt env so unconfigured tooling reaches the node's S3 plane.
@@ -12,6 +13,9 @@ use crate::executor::{BackendCaps, ExecutorBackend};
 pub struct WorkspaceEndpoint {
     pub endpoint: Option<String>,
     pub region: String,
+    /// Endpoint an interactive session reaches instead: the bridge gateway of
+    /// the session network, which has no external route.
+    pub session_endpoint: Option<String>,
 }
 
 impl Default for WorkspaceEndpoint {
@@ -19,6 +23,7 @@ impl Default for WorkspaceEndpoint {
         Self {
             endpoint: None,
             region: "eu-central-1".to_string(),
+            session_endpoint: None,
         }
     }
 }
@@ -29,6 +34,7 @@ impl Default for WorkspaceEndpoint {
 pub struct ExecutorRegistry {
     backends: BTreeMap<String, Arc<dyn ExecutorBackend>>,
     workspace: WorkspaceEndpoint,
+    sessions: Arc<SessionRegistry>,
 }
 
 impl ExecutorRegistry {
@@ -36,6 +42,7 @@ impl ExecutorRegistry {
         Self {
             backends: BTreeMap::new(),
             workspace: WorkspaceEndpoint::default(),
+            sessions: Arc::new(SessionRegistry::new()),
         }
     }
 
@@ -45,7 +52,16 @@ impl ExecutorRegistry {
     }
 
     pub fn with_workspace_endpoint(mut self, endpoint: Option<String>, region: String) -> Self {
-        self.workspace = WorkspaceEndpoint { endpoint, region };
+        self.workspace = WorkspaceEndpoint {
+            endpoint,
+            region,
+            session_endpoint: self.workspace.session_endpoint,
+        };
+        self
+    }
+
+    pub fn with_session_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.workspace.session_endpoint = endpoint;
         self
     }
 
@@ -54,6 +70,12 @@ impl ExecutorRegistry {
     /// because the operator configuration that fills it is documented.
     pub fn workspace_endpoint(&self) -> &WorkspaceEndpoint {
         &self.workspace
+    }
+
+    /// The interactive sessions this node runs. In memory only: a restart ends
+    /// every session and reconcile resolves the jobs behind them.
+    pub fn sessions(&self) -> &Arc<SessionRegistry> {
+        &self.sessions
     }
 
     pub fn register(&mut self, backend: Arc<dyn ExecutorBackend>) {

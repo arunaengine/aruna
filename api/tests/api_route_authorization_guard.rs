@@ -76,6 +76,47 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          caller is the stored submitter of the request",
     ),
     (
+        "job_session.rs",
+        "end_session",
+        "self-scoped: read_owned_job requires the caller to be the creator",
+    ),
+    (
+        "job_session.rs",
+        "get_session",
+        "self-scoped: read_owned_job requires the caller to be the creator",
+    ),
+    (
+        "job_session.rs",
+        "interrupt_session",
+        "self-scoped: read_owned_job requires the caller to be the creator",
+    ),
+    (
+        "job_session.rs",
+        "list_scratch",
+        "self-scoped: read_owned_job requires the caller to be the creator",
+    ),
+    (
+        "job_session.rs",
+        "read_scratch",
+        "self-scoped: read_owned_job requires the caller to be the creator",
+    ),
+    (
+        "job_session.rs",
+        "stage_inputs",
+        "self-scoped: read_owned_job requires the caller to be the creator, and \
+         copy_object enforces the caller's own read permission on each source",
+    ),
+    (
+        "job_session.rs",
+        "stream_session",
+        "self-scoped: read_owned_job requires the caller to be the creator",
+    ),
+    (
+        "job_session.rs",
+        "submit_cell",
+        "self-scoped: read_owned_job requires the caller to be the creator",
+    ),
+    (
         "jobs.rs",
         "cancel_job",
         "self-scoped: read_owned_job requires the caller to be the creator",

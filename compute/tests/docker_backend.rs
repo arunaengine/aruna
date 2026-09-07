@@ -98,6 +98,7 @@ impl DockerTestExt for DockerBackend {
             workspace: spec.workspace.clone(),
             security: spec.security.clone(),
             log_limits: spec.log_limits,
+            session: spec.session,
         };
         aruna_compute::ExecutorBackend::submit(self, &fence(&spec.attempt), &pinned, cancel).await
     }

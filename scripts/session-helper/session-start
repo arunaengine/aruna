@@ -1,0 +1,64 @@
+#!/bin/sh
+# Start command of every Aruna session image. It installs the dependencies the
+# portal staged, points fsspec and the AWS SDK at the node's S3 endpoint, and
+# then becomes the session helper.
+set -eu
+
+workdir=$(pwd)
+export MPLCONFIGDIR="$workdir/.aruna/matplotlib"
+
+# The node's workspace binding sets AWS_ENDPOINT_URL to the address this
+# container can reach. Older botocore and s3fs read their own names.
+if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+    export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-$AWS_ENDPOINT_URL}"
+    export FSSPEC_S3_ENDPOINT_URL="${FSSPEC_S3_ENDPOINT_URL:-$AWS_ENDPOINT_URL}"
+fi
+
+export HOME="${HOME:-$workdir}"
+
+# The dependency file is staged as a job input. An input without a container
+# path lands in /inputs, so both places are checked.
+find_staged() {
+    for candidate in "$workdir/$1" "/inputs/$1"; do
+        if [ -f "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if environment=$(find_staged environment.yml); then
+    export XDG_CACHE_HOME="$workdir/.aruna/cache"
+    export CONDA_PKGS_DIRS="$workdir/.aruna/conda-pkgs"
+    export CONDA_ENVS_PATH="$workdir/.aruna/envs"
+    environment_prefix="$workdir/.aruna/environment"
+    conda env create --yes --prefix "$environment_prefix" --file "$environment" >&2
+    conda install --yes --prefix "$environment_prefix" --channel conda-forge \
+        ipykernel=6.30.1 fsspec=2025.7.0 s3fs=2025.7.0 >&2
+    export PATH="$environment_prefix/bin:$PATH"
+    export CONDA_PREFIX="$environment_prefix"
+    python -m ipykernel install --name python3 --prefix "$workdir/.aruna/jupyter" >&2
+    export JUPYTER_PATH="$workdir/.aruna/jupyter/share/jupyter${JUPYTER_PATH:+:$JUPYTER_PATH}"
+fi
+
+# Package installs stay writable for the unprivileged kernel.
+export PYTHONUSERBASE="$workdir/.aruna/site"
+export PIP_USER=1
+python_version=$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+export PYTHONPATH="$PYTHONUSERBASE/lib/python$python_version/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p "$PYTHONUSERBASE"
+
+if requirements=$(find_staged requirements.txt); then
+    echo "aruna-session: installing $requirements" >&2
+    pip install --no-cache-dir --disable-pip-version-check -r "$requirements" >&2
+fi
+
+if deno_json=$(find_staged deno.json); then
+    echo "aruna-session: caching $deno_json" >&2
+    cp "$deno_json" "$workdir/deno.json"
+    deno cache --quiet "$workdir/deno.json" >&2 || true
+fi
+
+mkdir -p "$(dirname "${ARUNA_SESSION_SOCKET:-$workdir/.aruna/session.sock}")"
+exec /opt/aruna/session-helper serve

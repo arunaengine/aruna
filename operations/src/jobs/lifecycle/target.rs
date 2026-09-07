@@ -247,6 +247,7 @@ async fn store_receipt(
     };
     let receipt = ExecutionReceipt {
         execution_id,
+        physical_job_id,
         launch_id: round.intent.launch_id,
         launch_digest,
         submission_id: round.spec.submission_id,

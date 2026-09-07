@@ -8,23 +8,23 @@
 use aruna_core::jobs::{JobKind, JobStatusView};
 use aruna_core::keyspaces::JOB_FAMILY_ALIAS_KEYSPACE;
 use aruna_core::structs::{
-    AuthContext, ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobProgress,
-    JobProjection, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState,
-    PhysicalExecutionState, ResultMessage, WorkspaceMode,
+    AuthContext, ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
+    JobProgress, JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec,
+    LogicalJobState, PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
-use aruna_core::types::NodeId;
+use aruna_core::types::{NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
 
 use std::time::Duration;
 
-use super::ids::workspace_of;
+use super::ids::{session_of, workspace_of};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::keys::{alias_family, alias_prefix};
 use crate::jobs::records::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
     load_family_complete,
 };
-use crate::jobs::service::RoutedJobStatus;
+use crate::jobs::service::{RoutedJobStatus, read_owned_job};
 use crate::jobs::store::iter_prefix_page;
 use crate::jobs::{JOB_MUTATE_MAX_ATTEMPTS, JobRouteError};
 
@@ -146,6 +146,88 @@ pub async fn family_status(
         job: status_view(job_id, &projection, &spec),
         run_crate: None,
     }))
+}
+
+/// Resolves an owner's public session alias and its durable physical execution.
+pub async fn session_job(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<(JobRecord, Option<JobId>), JobRouteError> {
+    let Some((projected, spec)) = family_projection(context, job_id).await? else {
+        let record = read_owned_job(context, user_id, job_id)
+            .await
+            .map_err(JobRouteError::Internal)?
+            .ok_or(JobRouteError::NotFound)?;
+        match &record.payload {
+            JobPayload::Execution(spec) if session_of(spec).is_some() => {
+                return Ok((record, Some(job_id)));
+            }
+            _ => return Err(JobRouteError::NotFound),
+        }
+    };
+    if spec.created_by != user_id || session_of(&spec.payload).is_none() {
+        return Err(JobRouteError::NotFound);
+    }
+    decidable(&projected)?;
+    let projection = projected.projection.ok_or(JobRouteError::NotFound)?;
+    let status = status_view(job_id, &projection, &spec);
+    let execution = projection
+        .executions
+        .iter()
+        .find(|execution| Some(execution.execution_id) == projection.canonical_execution_id)
+        .or_else(|| {
+            projection.executions.iter().max_by_key(|execution| {
+                (
+                    !execution.state.is_terminal(),
+                    execution.started_at_ms,
+                    execution.execution_id,
+                )
+            })
+        });
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(spec.payload),
+        user_id,
+        execution.map_or(spec.origin_node_id, |execution| execution.executor_node_id),
+        spec.created_at_ms,
+        spec.created_at_ms,
+        None,
+    );
+    record.state = status.state;
+    record.updated_at_ms = status.updated_at_ms;
+    record.attempts = status.attempts;
+    record.cancel_requested = status.cancel_requested;
+    record.last_error = status.last_error;
+    record.progress = status.progress;
+    record.started_at_ms = execution.and_then(|execution| execution.started_at_ms);
+    record.workspace_bucket = status.workspace_bucket;
+    record.workspace_mode = status.workspace_mode;
+    record.finished_at_ms = status.finished_at_ms;
+    let physical = match execution {
+        Some(execution) => {
+            let records = load_family_complete(context, projected.family)
+                .await
+                .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
+            Some(
+                records
+                    .iter()
+                    .find_map(|envelope| match &envelope.record {
+                        JobFamilyRecord::Receipt(receipt)
+                            if receipt.execution_id == execution.execution_id =>
+                        {
+                            Some(receipt.physical_job_id)
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        JobRouteError::Unavailable("execution receipt unavailable".to_string())
+                    })?,
+            )
+        }
+        None => None,
+    };
+    Ok((record, physical))
 }
 
 /// The canonical execution's node, otherwise a successful execution's node,

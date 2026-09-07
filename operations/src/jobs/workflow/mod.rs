@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_compute::ExecutorBackend;
+use aruna_core::compute::WorkspaceBinding;
+use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
     FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest, S3Mount,
@@ -32,18 +34,22 @@ use super::JOB_HEARTBEAT_MS;
 use super::output_record::store_outputs;
 use super::store::{
     ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
-    complete_cancelled, complete_execution, fail_execution, mark_indeterminate,
+    complete_cancelled, complete_execution, fail_execution, mark_indeterminate, put_job_entry,
     read_attempt_control, read_job_record, record_attempt_intent, record_attempt_started,
     record_attempt_tombstone, renew_lease, requeue_before_attempt, transition_external_to_running,
     transition_to_cancelling, transition_to_preparing, transition_to_ready,
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
+use crate::jobs::lifecycle::ids::session_of;
 use crate::jobs::lifecycle::reservation::job_reservation;
 use crate::jobs::lifecycle::updates::{
     SETTLE_RETRY_AFTER, publish_progress, publish_terminal, schedule_terminal_settle,
 };
+use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::placement_policy::subject::read_local_subject;
+use aruna_compute::session::{EndReason, Session, SessionConfig};
+use aruna_core::structs::{DEFAULT_SESSION_IDLE_AFTER_MS, SessionReportDetail, SessionReportRow};
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, check_workspace_bucket, collect_outputs, ensure_group_write,
@@ -445,6 +451,8 @@ pub(super) struct PreparedTask {
     mounts: Vec<S3Mount>,
     secrets: BTreeMap<String, Secret>,
     staging: StagingMode,
+    /// Set for a session only: the bucket and endpoint its credential reaches.
+    workspace: Option<WorkspaceBinding>,
 }
 
 /// The bucket a run works inside, empty when it owns none.
@@ -478,6 +486,7 @@ pub(super) async fn prepare_inputs(
             mounts: Vec::new(),
             secrets: BTreeMap::new(),
             staging: StagingMode::Files,
+            workspace: None,
         });
     }
     let mounts = Box::pin(prepare_mounts(context, spec, record, node_id)).await?;
@@ -505,6 +514,7 @@ pub(super) async fn prepare_inputs(
         mounts,
         secrets,
         staging: StagingMode::S3Mount,
+        workspace: None,
     })
 }
 
@@ -516,7 +526,68 @@ async fn prepare_task(
     bucket: &str,
 ) -> Result<PreparedTask, JobError> {
     Box::pin(prepare_workspace(context, spec, record, node_id, bucket)).await?;
-    Box::pin(prepare_inputs(context, spec, record, node_id)).await
+    let mut prepared = Box::pin(prepare_inputs(context, spec, record, node_id)).await?;
+    if session_of(spec).is_some() {
+        Box::pin(add_session_credential(
+            context,
+            spec,
+            record,
+            node_id,
+            bucket,
+            &mut prepared,
+        ))
+        .await?;
+    }
+    Ok(prepared)
+}
+
+/// A session reads and writes its workspace bucket over S3 and nothing else.
+/// The credential is revoked with the job's terminal cleanup.
+async fn add_session_credential(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    bucket: &str,
+    prepared: &mut PreparedTask,
+) -> Result<(), JobError> {
+    if bucket.is_empty() {
+        return Err(JobError::permanent("a session needs a workspace bucket"));
+    }
+    let endpoint = context
+        .compute_handle
+        .as_ref()
+        .and_then(|registry| {
+            let workspace = registry.workspace_endpoint();
+            workspace
+                .session_endpoint
+                .clone()
+                .or_else(|| workspace.endpoint.clone())
+        })
+        .ok_or_else(|| JobError::permanent("a session needs a container-reachable S3 endpoint"))?;
+    let region = context
+        .compute_handle
+        .as_ref()
+        .map(|registry| registry.workspace_endpoint().region.clone())
+        .unwrap_or_default();
+    let credential = Box::pin(mint_workspace_credential(
+        context, spec, record, node_id, bucket,
+    ))
+    .await?;
+    prepared.secrets.insert(
+        "AWS_ACCESS_KEY_ID".to_string(),
+        Secret::new(credential.access_key),
+    );
+    prepared.secrets.insert(
+        "AWS_SECRET_ACCESS_KEY".to_string(),
+        Secret::new(credential.secret),
+    );
+    prepared.workspace = Some(WorkspaceBinding {
+        s3_endpoint: endpoint,
+        bucket_name: bucket.to_string(),
+        region,
+    });
+    Ok(())
 }
 
 pub(super) fn build_task_spec(
@@ -531,6 +602,7 @@ pub(super) fn build_task_spec(
         mounts,
         secrets,
         staging,
+        workspace,
     } = prepared;
     let resources = ResourceRequest {
         cpu_cores: spec.resources.cpu_cores,
@@ -544,16 +616,24 @@ pub(super) fn build_task_spec(
         preemptible: spec.resources.preemptible,
         backend_extensions: std::collections::BTreeMap::new(),
     };
+    let session = session_of(spec).is_some();
+    let mut env = spec.env.clone();
+    if let (true, Some(workdir)) = (session, spec.workdir.as_deref()) {
+        env.insert(
+            "ARUNA_SESSION_SOCKET".to_string(),
+            format!("{}/{SESSION_SOCKET_PATH}", workdir.trim_end_matches('/')),
+        );
+    }
     TaskSpec {
         attempt: attempt.clone(),
         image: pinned_image.to_string(),
         entrypoint: spec.entrypoint.clone(),
         command: spec.command.clone(),
         workdir: spec.workdir.clone(),
-        env: spec.env.clone(),
+        env,
         secret_env: secrets,
         resources,
-        workspace: None,
+        workspace,
         security: SecurityContext {
             run_as,
             network: if spec
@@ -568,6 +648,7 @@ pub(super) fn build_task_spec(
             ..Default::default()
         },
         log_limits: Default::default(),
+        session,
         inputs,
         s3_mounts: mounts,
         staging_mode: staging,
@@ -908,21 +989,81 @@ pub async fn supervise_and_finalize(
             .saturating_add(walltime_ms)
             .saturating_sub(unix_timestamp_millis()),
     );
+    let session = start_session(&context, &backend, &fence, job_id, &spec, &bucket).await;
     let wait_and_finalize = async {
-        let result = tokio::select! {
-            result = backend.wait(&fence, &cancel) => Some(result),
-            _ = tokio::time::sleep(walltime_left) => None,
+        // A session also stops when the client ends it or it goes idle; every
+        // other reason leaves the attempt wait in charge.
+        let stopped = async {
+            match &session {
+                Some(session) => {
+                    let reason = session.finished().await;
+                    match reason {
+                        EndReason::Ended | EndReason::Idle | EndReason::KernelExit => reason,
+                        _ => std::future::pending().await,
+                    }
+                }
+                None => std::future::pending().await,
+            }
         };
-        if let Some(result) = result {
-            Box::pin(finalize_attempt(
-                &context, job_id, token, &backend, &fence, &spec, &bucket, result,
-            ))
-            .await;
-        } else {
-            Box::pin(finalize_walltime(
-                &context, job_id, token, &backend, &fence, &bucket,
-            ))
-            .await;
+        let outcome = tokio::select! {
+            result = backend.wait(&fence, &cancel) => SessionOutcome::Attempt(result),
+            _ = tokio::time::sleep(walltime_left) => SessionOutcome::Walltime,
+            reason = stopped => SessionOutcome::Stopped(reason),
+        };
+        match outcome {
+            SessionOutcome::Attempt(result) => {
+                if let Some(session) = &session {
+                    // A cancelled attempt ends its session for that reason; any
+                    // other return means the container stopped on its own.
+                    let reason = match cancel.is_cancelled() {
+                        true => EndReason::Cancelled,
+                        false => EndReason::KernelExit,
+                    };
+                    session.end(reason);
+                    Box::pin(write_session_report(
+                        &context.storage_handle,
+                        job_id,
+                        token,
+                        Some(session),
+                        reason,
+                    ))
+                    .await;
+                }
+                Box::pin(finalize_attempt(
+                    &context, job_id, token, &backend, &fence, &spec, &bucket, result,
+                ))
+                .await;
+            }
+            SessionOutcome::Walltime => {
+                if let Some(session) = &session {
+                    session.end(EndReason::Walltime);
+                    Box::pin(write_session_report(
+                        &context.storage_handle,
+                        job_id,
+                        token,
+                        Some(session),
+                        EndReason::Walltime,
+                    ))
+                    .await;
+                }
+                Box::pin(finalize_walltime(
+                    &context, job_id, token, &backend, &fence, &bucket,
+                ))
+                .await;
+            }
+            SessionOutcome::Stopped(reason) => {
+                Box::pin(finalize_session(
+                    &context,
+                    job_id,
+                    token,
+                    &backend,
+                    &fence,
+                    &bucket,
+                    session.as_ref(),
+                    reason,
+                ))
+                .await;
+            }
         }
     };
     if with_execution_heartbeat(
@@ -963,6 +1104,197 @@ async fn walltime_anchor(
             anchor
         }
     }
+}
+
+/// Why the supervisor left its wait.
+enum SessionOutcome {
+    Attempt(Result<AttemptStatus, BackendError>),
+    Walltime,
+    Stopped(EndReason),
+}
+
+/// Registers the interactive session of a session job. `None` is an ordinary
+/// run, or a node with no compute plane.
+async fn start_session(
+    context: &Arc<DriverContext>,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    job_id: JobId,
+    spec: &ExecutionSpec,
+    bucket: &str,
+) -> Option<Arc<Session>> {
+    let requested = session_of(spec)?;
+    let public_job_id = job_reservation(context, job_id)
+        .await
+        .ok()?
+        .map_or(job_id, |reservation| reservation.logical_job_id);
+    let registry = context.compute_handle.as_ref()?.sessions().clone();
+    let net = context.net_handle.as_ref()?;
+    let node_id = net.node_id();
+    // The credential was minted while the task was prepared; this reads the
+    // same one back, so the client sees when it really expires.
+    let credential_expires_at_ms =
+        match read_job_record(&context.storage_handle, job_id, None).await {
+            Ok(Some(record)) => Box::pin(mint_workspace_credential(
+                context, spec, &record, node_id, bucket,
+            ))
+            .await
+            .map(|credential| credential.expires_at_ms)
+            .unwrap_or_default(),
+            _ => 0,
+        };
+    let realm_idle = realm_session_idle(context).await;
+    let idle_after_ms = requested
+        .idle_after_ms
+        .map_or(realm_idle, |asked| asked.min(realm_idle));
+    Some(registry.open(
+        SessionConfig {
+            job_id: job_id.to_string(),
+            public_job_id: public_job_id.to_string(),
+            runtime: requested.runtime,
+            workspace_bucket: bucket.to_string(),
+            executor_node_id: node_id.to_string(),
+            idle_after_ms,
+            credential_expires_at_ms,
+        },
+        backend.clone(),
+        fence.clone(),
+    ))
+}
+
+/// The realm's idle wait, which the request may only shorten.
+async fn realm_session_idle(context: &DriverContext) -> u64 {
+    let Some(net) = context.net_handle.as_ref() else {
+        return DEFAULT_SESSION_IDLE_AFTER_MS;
+    };
+    crate::metadata::api::load_realm_config(context, *net.realm_id())
+        .await
+        .map(|config| config.compute.session_idle_after_ms)
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SESSION_IDLE_AFTER_MS)
+}
+
+/// Lists what the session brought into its workspace bucket and why it stopped.
+/// Cell traffic is never recorded: the family log is capped per family.
+async fn write_session_report(
+    storage: &aruna_storage::StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+    session: Option<&Arc<Session>>,
+    reason: EndReason,
+) {
+    let mut rows = Vec::new();
+    if let Some(session) = session {
+        for (index, input) in session.inventory().into_iter().enumerate() {
+            rows.push(SessionReportRow {
+                entry_key: format!("input/{index:04}"),
+                detail: SessionReportDetail::Input {
+                    dest_key: input.dest_key,
+                    bytes: input.bytes,
+                    blake3: input.blake3,
+                    source_node_id: input.source_node_id,
+                    version_id: input.version_id,
+                },
+            });
+        }
+        for (index, object) in session.touched().into_iter().enumerate() {
+            rows.push(SessionReportRow {
+                entry_key: format!("touched/{index:04}"),
+                detail: SessionReportDetail::Touched {
+                    bucket: object.bucket,
+                    key: object.key,
+                    operation: object.operation,
+                },
+            });
+        }
+    }
+    rows.push(SessionReportRow {
+        entry_key: "end".to_string(),
+        detail: SessionReportDetail::End {
+            reason: reason.as_str().to_string(),
+        },
+    });
+    for row in rows {
+        if let Err(error) =
+            put_job_entry(storage, job_id, token, row.entry_key.as_bytes(), &row).await
+        {
+            warn!(job_id = %job_id, error = %error, "Session report write failed");
+            return;
+        }
+    }
+}
+
+/// A session the client ended, or that went idle, is a finished job: the work
+/// it did is already in the workspace bucket.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_session(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    bucket: &str,
+    session: Option<&Arc<Session>>,
+    reason: EndReason,
+) {
+    let storage = &context.storage_handle;
+    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let logs = match backend.cancel(fence).await {
+        Ok(CancelEvidence::Stopped(_)) => {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
+                return;
+            };
+            logs
+        }
+        Ok(CancelEvidence::AlreadyGone) => LogTails::default(),
+        Ok(CancelEvidence::Requested) | Err(_) => {
+            Box::pin(park_attempt(
+                context,
+                job_id,
+                token,
+                JobError::retryable("session stop lacks evidence"),
+            ))
+            .await;
+            return;
+        }
+    };
+    info!(job_id = %job_id, reason = reason.as_str(), "Session finished");
+    Box::pin(write_session_report(
+        storage, job_id, token, session, reason,
+    ))
+    .await;
+    // A kernel that died, or a helper that never answered, is a permanent
+    // execution failure, not a session the caller finished.
+    if reason == EndReason::KernelExit {
+        let result = execution_result_for(bucket, Some(1), Vec::new(), logs);
+        let terminal = Box::pin(terminal_fail(
+            storage,
+            job_id,
+            token,
+            JobError::permanent("session kernel exited"),
+            result,
+        ))
+        .await;
+        Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
+        return;
+    }
+    // A terminal success needs a named output record, even with no outputs.
+    let Some(control) = Box::pin(control_or_park(context, job_id, token, fence)).await else {
+        return;
+    };
+    let mut result = execution_result_for(bucket, Some(0), Vec::new(), logs);
+    let Some(digest) = Box::pin(store_or_fail(
+        context, job_id, token, bucket, &control, &result,
+    ))
+    .await
+    else {
+        return;
+    };
+    name_output_record(&mut result, digest);
+    let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
+    Box::pin(cleanup_and_crate(context, job_id, record)).await;
 }
 
 async fn finalize_walltime(
@@ -1933,6 +2265,7 @@ mod tests {
     };
     use crate::jobs::workflow::workspace::mint_workspace_credential;
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+    use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
         ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination,
@@ -1965,6 +2298,7 @@ mod tests {
     struct StubBackend {
         reconcile: StubReconcile,
         submits: Mutex<Vec<String>>,
+        wait_started: Notify,
         logs_started: Notify,
         logs_release: Notify,
         logs_fail: AtomicBool,
@@ -1977,6 +2311,7 @@ mod tests {
             Arc::new(Self {
                 reconcile,
                 submits: Mutex::new(Vec::new()),
+                wait_started: Notify::new(),
                 logs_started: Notify::new(),
                 logs_release: Notify::new(),
                 logs_fail: AtomicBool::new(false),
@@ -2031,6 +2366,7 @@ mod tests {
             _cancel: &CancellationToken,
         ) -> Result<AttemptStatus, BackendError> {
             if matches!(self.reconcile, StubReconcile::Waiting) {
+                self.wait_started.notify_one();
                 std::future::pending::<()>().await;
             }
             Ok(AttemptStatus {
@@ -2574,6 +2910,190 @@ mod tests {
         (context, net)
     }
 
+    /// A session job's spec: the tags the node writes at submit, and a short
+    /// idle wait so the timer test does not depend on the realm default.
+    fn session_spec(idle_after_ms: Option<u64>) -> ExecutionSpec {
+        use aruna_core::compute::runtimes::{
+            SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+        };
+        let mut spec = execution_spec();
+        spec.tags
+            .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        spec.tags.insert(
+            SESSION_RUNTIME_TAG.to_string(),
+            "python-notebook".to_string(),
+        );
+        if let Some(idle) = idle_after_ms {
+            spec.tags
+                .insert(SESSION_IDLE_TAG.to_string(), idle.to_string());
+        }
+        spec
+    }
+
+    /// A context whose compute plane can register sessions.
+    async fn session_context(
+        storage: StorageHandle,
+    ) -> (
+        Arc<DriverContext>,
+        aruna_net::NetHandle,
+        Arc<ExecutorRegistry>,
+    ) {
+        let (context, net) = net_context(storage).await;
+        let registry = Arc::new(ExecutorRegistry::new());
+        let mut context = context;
+        Arc::get_mut(&mut context).unwrap().compute_handle = Some(registry.clone());
+        (context, net, registry)
+    }
+
+    /// Waits for the supervisor to register the session it is about to watch.
+    async fn wait_for_session(
+        registry: &Arc<ExecutorRegistry>,
+        job_id: JobId,
+        backend: &StubBackend,
+    ) -> Arc<Session> {
+        tokio::time::timeout(Duration::from_secs(120), backend.wait_started.notified())
+            .await
+            .expect("the supervisor never started waiting");
+        registry
+            .sessions()
+            .get(&job_id.to_string())
+            .expect("the supervisor registers its session before waiting")
+    }
+
+    #[tokio::test]
+    async fn session_end_succeeds() {
+        // Ending a session finishes its job, so quota is released at once.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (ctx, net, registry) = session_context(storage.clone()).await;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        crate::jobs::store::mutate_job(&storage, job_id, |record| {
+            record.payload = JobPayload::Execution(session_spec(None));
+            Ok(crate::jobs::store::JobMutation::Persist)
+        })
+        .await
+        .unwrap();
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+
+        let supervisor = tokio::spawn(supervise_and_finalize(
+            ctx.clone(),
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            session_spec(None),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        ));
+        wait_for_session(&registry, job_id, &backend)
+            .await
+            .end(EndReason::Ended);
+        supervisor.await.unwrap();
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Succeeded);
+        assert!(stored.report_digest.is_some());
+        let report = crate::jobs::service::read_owned_report(
+            &ctx,
+            stored.created_by,
+            job_id,
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let crate::jobs::service::JobReportLookup::Ready { rows, .. } = report else {
+            panic!("ended session report must be readable");
+        };
+        assert_eq!(rows.len(), 1);
+        let row: SessionReportRow = postcard::from_bytes(&rows[0].1).unwrap();
+        assert_eq!(
+            row.detail,
+            SessionReportDetail::End {
+                reason: "ended".to_string()
+            }
+        );
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_idle_succeeds() {
+        // The idle timer finishes the job on its own, with reason `idle`.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (ctx, net, _registry) = session_context(storage.clone()).await;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+
+        supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            session_spec(Some(1)),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Succeeded);
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_kernel_fails() {
+        // A kernel that died is a permanent execution failure, not a clean end.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (ctx, net, registry) = session_context(storage.clone()).await;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+
+        let supervisor = tokio::spawn(supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            session_spec(None),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        ));
+        wait_for_session(&registry, job_id, &backend)
+            .await
+            .end(EndReason::KernelExit);
+        supervisor.await.unwrap();
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(stored.last_error.unwrap().message, "session kernel exited");
+        net.shutdown().await;
+    }
+
     #[tokio::test]
     async fn cancel_beats_success() {
         let dir = tempdir().unwrap();
@@ -2832,6 +3352,7 @@ mod tests {
                 mounts: Vec::new(),
                 secrets: BTreeMap::new(),
                 staging: StagingMode::Files,
+                workspace: None,
             },
             NOBODY,
         );
@@ -2858,6 +3379,7 @@ mod tests {
                 mounts: Vec::new(),
                 secrets: BTreeMap::new(),
                 staging: StagingMode::Files,
+                workspace: None,
             },
             run_as,
         );
@@ -2880,6 +3402,7 @@ mod tests {
                 mounts: Vec::new(),
                 secrets: BTreeMap::new(),
                 staging: StagingMode::Files,
+                workspace: None,
             },
             NOBODY,
         );

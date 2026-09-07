@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""Session helper for Aruna interactive notebook sessions.
+
+It is the main process of a session container. It starts one Jupyter kernel,
+listens on a unix socket, and translates the node's line-delimited JSON protocol
+to the Jupyter messaging protocol. Outputs are nbformat 4 output objects.
+
+Two modes:
+
+  session-helper                 serve on $ARUNA_SESSION_SOCKET (the default)
+  session-helper session-client  bridge stdin and stdout to that socket
+
+The node runs the second mode through an exec, so it never needs a port.
+"""
+
+import base64
+import json
+import os
+import queue
+import selectors
+import socket
+import sys
+import threading
+import time
+
+SOCKET_ENV = "ARUNA_SESSION_SOCKET"
+KERNEL_ENV = "ARUNA_SESSION_KERNEL"
+DEFAULT_SOCKET = "/work/.aruna/session.sock"
+# One reply may not carry more than the node returns anyway.
+MAX_READ_BYTES = 8 * 1024 * 1024
+MAX_LIST_ENTRIES = 4096
+
+
+def log(message):
+    print(f"aruna-session: {message}", file=sys.stderr, flush=True)
+
+
+class Connection:
+    """The one client the helper talks to, guarded so threads may write."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stream = None
+
+    def attach(self, stream):
+        with self._lock:
+            self._stream = stream
+
+    def detach(self):
+        with self._lock:
+            self._stream = None
+
+    def send(self, event):
+        line = (json.dumps(event) + "\n").encode("utf-8")
+        with self._lock:
+            if self._stream is None:
+                return
+            try:
+                self._stream.sendall(line)
+            except OSError:
+                self._stream = None
+
+
+class Kernel:
+    """One Jupyter kernel and the cell queue feeding it."""
+
+    state = "starting"
+
+    def __init__(self, connection, workdir):
+        from jupyter_client import KernelManager
+
+        self.connection = connection
+        self.workdir = workdir
+        self.cells = queue.Queue()
+        self.pending = {}
+        self.generation = 0
+        self.interrupted = set()
+        self.interrupt_pending = set()
+        self.lock = threading.Lock()
+        self.idle = set()
+        self.completed = threading.Condition(self.lock)
+        name = os.environ.get(KERNEL_ENV, "python3")
+        self.manager = KernelManager(kernel_name=name)
+        connection.send({"kind": "kernel", "state": "starting"})
+        self.manager.start_kernel(cwd=workdir)
+        self.client = self.manager.client()
+        self.client.start_channels()
+        self.client.wait_for_ready(timeout=120)
+        self.announce("idle")
+        threading.Thread(target=self._pump_outputs, daemon=True).start()
+        threading.Thread(target=self._run_cells, daemon=True).start()
+
+    def execute(self, cell_id, code):
+        with self.lock:
+            self.cells.put((self.generation, cell_id, code))
+
+    def interrupt(self):
+        with self.lock:
+            self.generation += 1
+            while True:
+                try:
+                    self.cells.get_nowait()
+                except queue.Empty:
+                    break
+            requested = set(self.pending) - self.interrupted
+            self.interrupted.update(requested)
+            interrupt = bool(requested) and self.state == "busy"
+            if not interrupt:
+                self.interrupt_pending.update(requested)
+        if interrupt:
+            self.manager.interrupt_kernel()
+
+    def status(self):
+        return {"alive": self.manager.is_alive(), "state": self.state}
+
+    def announce(self, state):
+        """Records the kernel state and tells the client about it."""
+        self.state = state
+        self.connection.send({"kind": "kernel", "state": state})
+
+    def die(self):
+        """A dead kernel ends the container: the node then finishes the job."""
+        self.announce("dead")
+        time.sleep(1)
+        os._exit(1)
+
+    def _run_cells(self):
+        while True:
+            generation, cell_id, code = self.cells.get()
+            with self.lock:
+                if generation != self.generation:
+                    continue
+                message_id = self.client.execute(code, store_history=True, allow_stdin=False)
+                self.pending[message_id] = cell_id
+                self.connection.send(
+                    {"kind": "cell", "cell_id": cell_id, "state": "running"}
+                )
+            self._await_reply(message_id, cell_id)
+
+    def _await_reply(self, message_id, cell_id):
+        while True:
+            try:
+                reply = self.client.get_shell_msg(timeout=1)
+            except queue.Empty:
+                if not self.manager.is_alive():
+                    self.die()
+                continue
+            if reply.get("parent_header", {}).get("msg_id") != message_id:
+                continue
+            content = reply.get("content", {})
+            state = "error" if content.get("status") == "error" else "done"
+            if content.get("ename") == "KeyboardInterrupt":
+                state = "interrupted"
+            with self.completed:
+                while message_id not in self.idle:
+                    self.completed.wait(timeout=1)
+                    if not self.manager.is_alive():
+                        self.die()
+                self.idle.remove(message_id)
+                self.pending.pop(message_id, None)
+                if state == "error" and message_id in self.interrupted:
+                    state = "interrupted"
+                self.interrupted.discard(message_id)
+                self.interrupt_pending.discard(message_id)
+            self.connection.send(
+                {
+                    "kind": "cell",
+                    "cell_id": cell_id,
+                    "state": state,
+                    "execution_count": content.get("execution_count"),
+                }
+            )
+            return
+
+    def _cell_of(self, message):
+        parent = message.get("parent_header", {}).get("msg_id")
+        with self.lock:
+            return self.pending.get(parent)
+
+    def _pump_outputs(self):
+        while True:
+            try:
+                message = self.client.get_iopub_msg(timeout=1)
+            except queue.Empty:
+                if not self.manager.is_alive():
+                    self.die()
+                continue
+            except Exception as error:  # the channel closed under us
+                log(f"iopub channel failed: {error}")
+                self.die()
+            self._forward(message)
+
+    def _forward(self, message):
+        kind = message.get("msg_type")
+        content = message.get("content", {})
+        if kind == "status":
+            state = content.get("execution_state", "idle")
+            self.announce(state)
+            parent = message.get("parent_header", {}).get("msg_id")
+            with self.completed:
+                interrupt = state == "busy" and parent in self.interrupt_pending
+                if interrupt:
+                    self.interrupt_pending.remove(parent)
+                if state == "idle" and parent in self.pending:
+                    self.idle.add(parent)
+                    self.completed.notify_all()
+            if interrupt:
+                self.manager.interrupt_kernel()
+            return
+        cell_id = self._cell_of(message)
+        if cell_id is None:
+            return
+        output = nbformat_output(kind, content)
+        if output is not None:
+            self.connection.send(
+                {"kind": "output", "cell_id": cell_id, "output": output}
+            )
+
+
+def nbformat_output(kind, content):
+    """One iopub message as an nbformat 4 output, or None when it carries none."""
+    if kind == "stream":
+        return {
+            "output_type": "stream",
+            "name": content.get("name", "stdout"),
+            "text": content.get("text", ""),
+        }
+    if kind == "display_data" or kind == "update_display_data":
+        return {
+            "output_type": "display_data",
+            "data": content.get("data", {}),
+            "metadata": content.get("metadata", {}),
+        }
+    if kind == "execute_result":
+        return {
+            "output_type": "execute_result",
+            "execution_count": content.get("execution_count"),
+            "data": content.get("data", {}),
+            "metadata": content.get("metadata", {}),
+        }
+    if kind == "error":
+        return {
+            "output_type": "error",
+            "ename": content.get("ename", ""),
+            "evalue": content.get("evalue", ""),
+            "traceback": content.get("traceback", []),
+        }
+    return None
+
+
+def safe_path(workdir, path):
+    """A scratch path stays inside the working directory."""
+    resolved = os.path.realpath(os.path.join(workdir, path or "."))
+    root = os.path.realpath(workdir)
+    if resolved != root and not resolved.startswith(root + os.sep):
+        raise ValueError("path leaves the working directory")
+    return resolved
+
+
+def list_reply(workdir, request):
+    path = request.get("path") or "."
+    target = safe_path(workdir, path)
+    entries = []
+    with os.scandir(target) as scan:
+        for entry in scan:
+            if len(entries) >= MAX_LIST_ENTRIES:
+                break
+            try:
+                info = entry.stat()
+            except OSError:
+                continue
+            entries.append(
+                {
+                    "name": entry.name,
+                    "kind": "dir" if entry.is_dir() else "file",
+                    "bytes": info.st_size,
+                    "modified_ms": int(info.st_mtime * 1000),
+                }
+            )
+    entries.sort(key=lambda item: (item["kind"] != "dir", item["name"]))
+    return {"path": path, "entries": entries}
+
+
+def read_reply(workdir, request):
+    target = safe_path(workdir, request.get("path") or "")
+    offset = int(request.get("offset") or 0)
+    limit = min(int(request.get("limit") or MAX_READ_BYTES), MAX_READ_BYTES)
+    with open(target, "rb") as handle:
+        handle.seek(offset)
+        data = handle.read(limit + 1)
+    truncated = len(data) > limit
+    data = data[:limit]
+    return {
+        "path": request.get("path"),
+        "base64": base64.b64encode(data).decode("ascii"),
+        "bytes": len(data),
+        "truncated": truncated,
+    }
+
+
+def handle(kernel, connection, workdir, request):
+    op = request.get("op")
+    request_id = request.get("id")
+    if op == "execute":
+        kernel.execute(request.get("cell_id", ""), request.get("code", ""))
+        return
+    if op == "interrupt":
+        kernel.interrupt()
+        return
+    if op == "status":
+        connection.send({"kind": "reply", "id": request_id, **kernel.status()})
+        return
+    try:
+        if op == "list":
+            body = list_reply(workdir, request)
+        elif op == "read":
+            body = read_reply(workdir, request)
+        else:
+            body = {"error": f"unknown op `{op}`"}
+    except (OSError, ValueError) as error:
+        body = {"error": str(error)}
+    connection.send({"kind": "reply", "id": request_id, **body})
+
+
+def serve(socket_path):
+    workdir = os.getcwd()
+    os.makedirs(os.path.dirname(socket_path) or ".", exist_ok=True)
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(socket_path)
+    os.chmod(socket_path, 0o600)
+    listener.listen(1)
+    connection = Connection()
+    kernel = Kernel(connection, workdir)
+    log(f"listening on {socket_path}")
+    while True:
+        stream, _ = listener.accept()
+        connection.attach(stream)
+        # A reconnect is a new exec, so the client learns the state it missed.
+        kernel.announce(kernel.state)
+        try:
+            serve_one(kernel, connection, workdir, stream)
+        finally:
+            connection.detach()
+            stream.close()
+
+
+def serve_one(kernel, connection, workdir, stream):
+    with stream.makefile("rb") as lines:
+        for line in lines:
+            if not line.endswith(b"\n"):
+                return
+            if not line.strip():
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as error:
+                log(f"unreadable request: {error}")
+                continue
+            handle(kernel, connection, workdir, request)
+
+
+def client(socket_path):
+    """Bridges standard input and output to the socket the helper listens on."""
+    stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            stream.connect(socket_path)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
+    selector = selectors.DefaultSelector()
+    selector.register(stream, selectors.EVENT_READ, "socket")
+    selector.register(sys.stdin.buffer.raw, selectors.EVENT_READ, "stdin")
+    while True:
+        for key, _ in selector.select():
+            if key.data == "socket":
+                data = stream.recv(65536)
+                if not data:
+                    return
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            else:
+                data = os.read(sys.stdin.fileno(), 65536)
+                if not data:
+                    return
+                stream.sendall(data)
+
+
+def main():
+    socket_path = os.environ.get(SOCKET_ENV, DEFAULT_SOCKET)
+    mode = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    if mode == "session-client":
+        client(socket_path)
+    elif mode == "serve":
+        serve(socket_path)
+    else:
+        log(f"unknown mode `{mode}`")
+        sys.exit(64)
+
+
+if __name__ == "__main__":
+    main()

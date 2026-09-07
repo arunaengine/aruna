@@ -3,7 +3,10 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
-use aruna_core::compute::runtimes::{QUICK_RUNTIMES, QuickRuntime, quick_runtime};
+use aruna_core::compute::runtimes::{
+    QUICK_RUNTIMES, QuickRuntime, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    SessionRuntime, quick_runtime,
+};
 use aruna_core::structs::{
     JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, blob_group_permission_path, key_content_type,
 };
@@ -18,6 +21,7 @@ use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
@@ -66,6 +70,44 @@ impl From<&QuickRuntime> for RuntimeOutput {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct RuntimesOutput {
     pub runtimes: Vec<RuntimeOutput>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SessionRuntimeOutput {
+    pub id: String,
+    pub label: String,
+    pub hint: String,
+    pub image: String,
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub lang: String,
+}
+
+impl From<&SessionRuntime> for SessionRuntimeOutput {
+    fn from(runtime: &SessionRuntime) -> Self {
+        Self {
+            id: runtime.id.to_string(),
+            label: runtime.label.to_string(),
+            hint: runtime.hint.to_string(),
+            image: runtime.image.to_string(),
+            command: runtime
+                .command
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            env: runtime
+                .env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            lang: runtime.lang.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SessionRuntimesOutput {
+    pub runtimes: Vec<SessionRuntimeOutput>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -194,6 +236,63 @@ pub struct ListJobsInput {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct StartSessionInput {
+    /// Owning group's bare 26-character ULID, for example
+    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Call `list_groups` for the ids the caller
+    /// may use.
+    pub group_id: String,
+    /// Name of an existing bucket in that group, for example `lab-data`. It is
+    /// the session's workspace: the notebook and its outputs live there.
+    pub bucket: String,
+    /// Session runtime id from `list_session_runtimes`, for example
+    /// `python-notebook`.
+    pub runtime: String,
+    /// Short human name for the session. Always pass one so it is
+    /// recognizable in the run list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Idle wait in milliseconds before the node ends the session. The realm
+    /// value caps it, so a longer request never extends the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_after_ms: Option<u64>,
+    /// Whole CPU cores reserved. Defaults to 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
+    /// RAM reserved in bytes. Defaults to 4 GB (4,000,000,000 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RunCellInput {
+    /// The session job's bare 26-character ULID, as returned by
+    /// `start_session`.
+    pub id: String,
+    /// Cell id, 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`.
+    pub cell_id: String,
+    /// The cell source. The node forwards it to the kernel unchanged.
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReadOutputsInput {
+    /// The session job's bare 26-character ULID.
+    pub id: String,
+    /// Cell id whose outputs to read.
+    pub cell_id: String,
+    /// Read only outputs after this event id. Pass the `last_event_id` of the
+    /// previous answer to page forward. Defaults to 0, the oldest kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SessionInput {
+    /// The session job's bare 26-character ULID.
+    pub id: String,
+}
+
 struct ScriptPlan {
     script_key: String,
     script_text: String,
@@ -225,6 +324,199 @@ impl McpServer {
         Ok(Json(RuntimesOutput {
             runtimes: QUICK_RUNTIMES.iter().map(Into::into).collect(),
         }))
+    }
+
+    #[tool(
+        description = "List the pinned session runtimes an interactive notebook session accepts. Each entry carries the runtime id, its container image, the language and the command the node runs. Call this before start_session to choose a runtime id. Takes no arguments.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn list_session_runtimes(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<Json<SessionRuntimesOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        compute_probe(
+            self,
+            &auth,
+            Permission::READ,
+            empty_extras("list_session_runtimes"),
+        )
+        .await?;
+        Ok(Json(SessionRuntimesOutput {
+            runtimes: SESSION_RUNTIMES.iter().map(Into::into).collect(),
+        }))
+    }
+
+    #[tool(
+        description = "Start an interactive notebook session as a job and return its job_id. The session stays running until end_session, the idle wait passes, the walltime is reached, or it is cancelled. It runs inside an existing bucket of the group, which is where the notebook and every result belong; the container's scratch directory is not kept. Call list_session_runtimes first for the runtime id. Then run_cell to execute code and read_cell_outputs for what it produced.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    pub async fn start_session(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<StartSessionInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let extras = tool_extras("start_session", &input)?;
+        let mut tags = BTreeMap::new();
+        tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        let request = crate::routes::jobs::SubmitExecutionRequest {
+            group_id: input.group_id,
+            name: input.name,
+            description: None,
+            image: String::new(),
+            runtime: Some(input.runtime),
+            session_idle_after_ms: input.idle_after_ms,
+            entrypoint: None,
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            tags,
+            workdir: None,
+            cpu_cores: input.cpu_cores,
+            ram_bytes: input.ram_bytes,
+            max_walltime_ms: None,
+            executor_constraint: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+            idempotency_key: None,
+            workspace: Some(crate::routes::jobs::WorkspaceRequest {
+                mode: crate::routes::jobs::WorkspaceModeRequest::Existing,
+                bucket: Some(input.bucket),
+            }),
+            target: None,
+        };
+        let (_, response) = crate::routes::jobs::submit_execution(
+            &self.state,
+            Some(auth),
+            request_bearer(&parts),
+            request,
+            extras,
+        )
+        .await
+        .map_err(job_error)?;
+        Ok(Json(JsonPayload(
+            serde_json::to_value(response).map_err(internal_error)?,
+        )))
+    }
+
+    #[tool(
+        description = "Queue one cell of code in a running notebook session and return its place in the queue. The cell runs asynchronously: call read_cell_outputs for what it produced. A submit resets the session's idle wait. Cell traffic creates no job records.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    pub async fn run_cell(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<RunCellInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        compute_probe(
+            self,
+            &auth,
+            Permission::WRITE,
+            tool_extras("run_cell", &input)?,
+        )
+        .await?;
+        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+            .await
+            .map_err(job_error)?;
+        let position = session
+            .submit_cell(&input.cell_id, &input.code)
+            .map_err(bad_request)?;
+        Ok(Json(JsonPayload(json!({
+            "cell_id": input.cell_id,
+            "position": position,
+        }))))
+    }
+
+    #[tool(
+        description = "Read the outputs one cell of a notebook session produced, as nbformat output objects. Pass the returned last_event_id back as `after` to read only what is new. Outputs older than the node keeps are gone; re-run the cell to produce them again.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn read_cell_outputs(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ReadOutputsInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        compute_probe(
+            self,
+            &auth,
+            Permission::READ,
+            tool_extras("read_cell_outputs", &input)?,
+        )
+        .await?;
+        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+            .await
+            .map_err(job_error)?;
+        let (last_event_id, outputs) =
+            session.cell_outputs(&input.cell_id, input.after.unwrap_or_default());
+        Ok(Json(JsonPayload(json!({
+            "cell_id": input.cell_id,
+            "last_event_id": last_event_id,
+            "outputs": outputs,
+        }))))
+    }
+
+    #[tool(
+        description = "Interrupt the cell a notebook session is running and drop everything still queued. Use it when a cell runs longer than intended; the session itself stays open.",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    pub async fn interrupt_session(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<SessionInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        compute_probe(
+            self,
+            &auth,
+            Permission::WRITE,
+            tool_extras("interrupt_session", &input)?,
+        )
+        .await?;
+        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+            .await
+            .map_err(job_error)?;
+        session.interrupt().map_err(bad_request)?;
+        Ok(Json(JsonPayload(json!({ "interrupted": true }))))
+    }
+
+    #[tool(
+        description = "End a notebook session. The job finishes succeeded; whatever the session wrote is already in its workspace bucket. Ending is asynchronous, so poll get_job for the settled state.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn end_session(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<SessionInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        compute_probe(
+            self,
+            &auth,
+            Permission::WRITE,
+            tool_extras("end_session", &input)?,
+        )
+        .await?;
+        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+            .await
+            .map_err(job_error)?;
+        session.end(aruna_compute::session::EndReason::Ended);
+        Ok(Json(JsonPayload(json!({ "ended": true }))))
     }
 
     #[tool(
@@ -826,6 +1118,8 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
             name: input.name,
             description: input.description,
             image: runtime.image.to_string(),
+            runtime: None,
+            session_idle_after_ms: None,
             entrypoint: None,
             command,
             env,

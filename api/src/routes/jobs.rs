@@ -4,6 +4,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aruna_core::compute::normalize_container_path;
+use aruna_core::compute::runtimes::{
+    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES, SESSION_TAG,
+    SESSION_TAG_NOTEBOOK, session_runtime,
+};
 use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
@@ -56,6 +60,8 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 const DEFAULT_REPORT_LIMIT: usize = 200;
 const MAX_OUTPUT_PREFIXES: usize = 32;
+/// Working directory a session runs in when the caller names none.
+const SESSION_WORKDIR: &str = "/work";
 
 #[derive(OpenApi)]
 #[openapi(
@@ -198,8 +204,20 @@ pub struct SubmitExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// OCI image the task runs, for example `docker.io/library/python:3.13-slim`.
-    /// Must not be blank.
+    /// Must not be blank unless `runtime` names a session runtime, which fills
+    /// the image, entrypoint and command instead.
+    #[serde(default)]
     pub image: String,
+    /// Session runtime catalog id, for example `python-notebook`. Required by a
+    /// submission carrying the tag `aruna-engine.org/session`, refused without
+    /// it. It fills `image`, `entrypoint` and `command`, which must be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Idle wait of a session job in milliseconds, for example `600000` for ten
+    /// minutes. The executing node clamps it to the realm's value, so a longer
+    /// request never extends the session. Refused outside a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_idle_after_ms: Option<u64>,
     /// Replaces the image ENTRYPOINT. Omit to keep the image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
@@ -812,6 +830,97 @@ pub(crate) fn map_submit_error(
     }
 }
 
+/// Resolves the session directives of a submission. A session names a catalog
+/// runtime instead of an image, and the node records the resolved runtime and
+/// the requested idle wait as engine tags the executing node reads back.
+fn session_request(
+    request: &mut SubmitExecutionRequest,
+    bearer_expires_at_ms: Option<u64>,
+) -> ServerResult<()> {
+    let Some(value) = request.tags.get(SESSION_TAG) else {
+        if request.runtime.is_some() || request.session_idle_after_ms.is_some() {
+            return Err(ServerError::BadRequestMessage(format!(
+                "runtime and session_idle_after_ms need the tag {SESSION_TAG}"
+            )));
+        }
+        return Ok(());
+    };
+    if value != SESSION_TAG_NOTEBOOK {
+        return Err(ServerError::BadRequestMessage(format!(
+            "tag {SESSION_TAG} accepts only the value {SESSION_TAG_NOTEBOOK}"
+        )));
+    }
+    if [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG, SESSION_EXPIRY_TAG]
+        .iter()
+        .any(|tag| request.tags.contains_key(*tag))
+    {
+        return Err(ServerError::BadRequestMessage(
+            "the session runtime, idle and expiry tags are set by the node".to_string(),
+        ));
+    }
+    let existing = request
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| matches!(workspace.mode, WorkspaceModeRequest::Existing));
+    if !existing {
+        return Err(ServerError::BadRequestMessage(
+            "a session runs inside an existing workspace bucket".to_string(),
+        ));
+    }
+    if !request.image.trim().is_empty()
+        || request.entrypoint.is_some()
+        || !request.command.is_empty()
+    {
+        return Err(ServerError::BadRequestMessage(
+            "a session takes image, entrypoint and command from its runtime".to_string(),
+        ));
+    }
+    let id = request.runtime.as_deref().unwrap_or_default();
+    let runtime = session_runtime(id).ok_or_else(|| {
+        let known: Vec<&str> = SESSION_RUNTIMES.iter().map(|entry| entry.id).collect();
+        ServerError::BadRequestMessage(format!(
+            "unknown session runtime; known ids are {}",
+            known.join(", ")
+        ))
+    })?;
+    if let Some(idle) = request.session_idle_after_ms {
+        if idle == 0 {
+            return Err(ServerError::BadRequestMessage(
+                "session_idle_after_ms must be greater than zero".to_string(),
+            ));
+        }
+        request
+            .tags
+            .insert(SESSION_IDLE_TAG.to_string(), idle.to_string());
+    }
+    if request.workdir.is_none() {
+        request.workdir = Some(SESSION_WORKDIR.to_string());
+    }
+    request.cpu_cores.get_or_insert(2);
+    request.ram_bytes.get_or_insert(4_000_000_000);
+    request.image = runtime.image.to_string();
+    request.command = runtime
+        .command
+        .iter()
+        .map(|part| (*part).to_string())
+        .collect();
+    for (key, value) in runtime.env {
+        request
+            .env
+            .entry((*key).to_string())
+            .or_insert_with(|| (*value).to_string());
+    }
+    request
+        .tags
+        .insert(SESSION_RUNTIME_TAG.to_string(), runtime.id.to_string());
+    if let Some(expires_at_ms) = bearer_expires_at_ms {
+        request
+            .tags
+            .insert(SESSION_EXPIRY_TAG.to_string(), expires_at_ms.to_string());
+    }
+    Ok(())
+}
+
 /// An omitted workspace block runs without a bucket of the run's own.
 fn workspace_request(
     workspace: Option<WorkspaceRequest>,
@@ -1174,8 +1283,18 @@ additionally need WRITE on that bucket, which must belong to the same group.
   `workspace.mode` `existing` are both refused: a device stages files, exposes no S3 endpoint a
   container could reach, and names no workspace bucket.
 
+- A submission tagged `aruna-engine.org/session` with value `notebook` starts an interactive
+  session. It names a `runtime` from the session catalog instead of an image, runs inside an
+  existing workspace bucket, and stays running until the caller ends it, the idle wait passes, the
+  walltime is reached, or it is cancelled. `session_idle_after_ms` asks for a shorter idle wait
+  than the realm's; the executing node clamps it, so a longer request never extends the session.
+  Omitted resource limits default to 2 CPU cores and 4 GB RAM (4,000,000,000 bytes).
+
 **Limits** (all refused with 400)
-- An empty image, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
+- An empty image without a `runtime`, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
+- A `runtime` or `session_idle_after_ms` without the session tag, an unknown runtime id, a session
+  without an existing workspace bucket, or a session that also names an image, entrypoint or
+  command.
 - More than 512 inputs, more than 1024 outputs, or more than 32 output prefixes.
 - An empty `dest_key`, or a container path that is not absolute and traversal-free.
 - An output without a `bucket` under `workspace.mode` `none`, named in the message.
@@ -1317,9 +1436,15 @@ pub(crate) async fn submit_execution(
     state: &ServerState,
     auth: Option<AuthContext>,
     bearer: Option<ValidatedArunaBearerTokenCarrier>,
-    request: SubmitExecutionRequest,
+    mut request: SubmitExecutionRequest,
     extras: PolicyRequestExtras,
 ) -> ServerResult<(StatusCode, SubmitJobResponse)> {
+    session_request(
+        &mut request,
+        bearer
+            .as_ref()
+            .map(|bearer| bearer.expires_at_secs().saturating_mul(1_000)),
+    )?;
     let target = request.target.unwrap_or_default();
     let auth = match target {
         ExecutionTarget::Realm => require_unrestricted_realm_auth(state, auth)?,
@@ -1710,7 +1835,7 @@ pub async fn get_job(
     Ok((StatusCode::OK, Json(response)))
 }
 
-fn coded_response(status: StatusCode, error: &str, code: &str) -> Response {
+pub(crate) fn coded_response(status: StatusCode, error: &str, code: &str) -> Response {
     (
         status,
         Json(ErrorResponse::new(error).with_code(code.to_string())),
@@ -1747,6 +1872,37 @@ fn decode_report_row(
             }
             serde_json::to_value(row)
         }
+        JobKind::Execution => {
+            use aruna_core::structs::{SessionReportDetail, SessionReportRow};
+
+            let row: SessionReportRow = postcard::from_bytes(value)
+                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            if row.entry_key.as_bytes() != entry_key {
+                return Err(ServerError::InternalError(
+                    "stored session report entry key does not match its row".to_string(),
+                ));
+            }
+            let (code, message) = match &row.detail {
+                SessionReportDetail::Input {
+                    dest_key,
+                    bytes,
+                    version_id,
+                    ..
+                } => (
+                    "input",
+                    format!("{dest_key} ({bytes} bytes, source version {version_id})"),
+                ),
+                SessionReportDetail::Touched {
+                    bucket,
+                    key,
+                    operation,
+                } => (operation.as_str(), format!("{bucket}/{key}")),
+                SessionReportDetail::End { reason } => ("ended", reason.clone()),
+            };
+            Ok(
+                serde_json::json!({ "entry_key": row.entry_key, "code": code, "message": message, "detail": row.detail }),
+            )
+        }
         _ => return Err(ServerError::NotFound),
     };
     row.map_err(|error| ServerError::InternalError(error.to_string()))
@@ -1756,14 +1912,14 @@ fn decode_report_row(
     get,
     path = "/compute/jobs/{job_id}/report",
     tag = "compute/jobs",
-    summary = "Page a finished RO-Crate job's report",
-    description = r#"Pages the frozen per-entry report of a finished RO-Crate import or export job.
+    summary = "Page a finished job's report",
+    description = r#"Pages the frozen per-entry report of a finished RO-Crate import, export or notebook session job.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
 Self-scoped like the status read: a job submitted by somebody else answers 404.
 
 **Behavior**
-- Only RO-Crate import and export jobs keep a per-entry report; every other kind answers 404.
+- RO-Crate imports, exports and notebook sessions keep per-entry reports; other jobs answer 404.
 - The report exists only once the job is terminal, so while it is still running the answer is a 404
   carrying a pending marker with the job's current state, and the caller should poll.
 - It is then frozen and immutable, and disappears again once the job's retention window passes.
@@ -2673,6 +2829,33 @@ mod tests {
     }
 
     #[test]
+    fn decodes_session_report() {
+        use aruna_core::structs::{SessionReportDetail, SessionReportRow};
+
+        let row = SessionReportRow {
+            entry_key: "input/0000".to_string(),
+            detail: SessionReportDetail::Input {
+                dest_key: "data/input.txt".to_string(),
+                bytes: 12,
+                blake3: "hash".to_string(),
+                source_node_id: "source".to_string(),
+                version_id: "source-version".to_string(),
+            },
+        };
+        let bytes = postcard::to_allocvec(&row).unwrap();
+        let decoded = decode_report_row(JobKind::Execution, b"input/0000", &bytes).unwrap();
+        assert_eq!(decoded["code"], "input");
+        assert!(
+            decoded["message"]
+                .as_str()
+                .unwrap()
+                .contains("source-version")
+        );
+        assert_eq!(decoded["detail"]["Input"]["version_id"], "source-version");
+        assert!(decode_report_row(JobKind::Execution, b"other", &bytes).is_err());
+    }
+
+    #[test]
     fn decodes_system_key() {
         let owner = user(2);
         let payload = import_job(JobId::from_bytes([9u8; 16]), owner).payload;
@@ -3250,6 +3433,8 @@ mod tests {
             name: None,
             description: None,
             image: "alpine:3".to_string(),
+            runtime: None,
+            session_idle_after_ms: None,
             entrypoint: None,
             command: vec!["true".to_string()],
             env: BTreeMap::new(),
@@ -3417,6 +3602,8 @@ mod tests {
                 name: None,
                 description: None,
                 image: "alpine:3".to_string(),
+                runtime: None,
+                session_idle_after_ms: None,
                 entrypoint: None,
                 command: vec!["true".to_string()],
                 env: BTreeMap::new(),
@@ -3672,5 +3859,136 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::BadRequest)));
+    }
+
+    /// The shape the portal posts for a session: no image, no command, an
+    /// existing workspace bucket.
+    fn session_body() -> SubmitExecutionRequest {
+        let mut tags = BTreeMap::new();
+        tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        SubmitExecutionRequest {
+            group_id: Ulid::from_bytes([5u8; 16]).to_string(),
+            name: None,
+            description: None,
+            image: String::new(),
+            runtime: Some("python-notebook".to_string()),
+            session_idle_after_ms: Some(600_000),
+            entrypoint: None,
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            tags,
+            workdir: None,
+            cpu_cores: None,
+            ram_bytes: None,
+            max_walltime_ms: None,
+            executor_constraint: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: CollisionPolicyRequest::default(),
+            idempotency_key: None,
+            workspace: Some(WorkspaceRequest {
+                mode: WorkspaceModeRequest::Existing,
+                bucket: Some("lab-data".to_string()),
+            }),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn session_takes_catalog() {
+        let mut request = session_body();
+        session_request(&mut request, None).expect("a session submit is accepted");
+        let runtime = session_runtime("python-notebook").expect("the catalog holds it");
+        assert_eq!(request.cpu_cores, Some(2));
+        assert_eq!(request.ram_bytes, Some(4_000_000_000));
+        assert_eq!(request.image, runtime.image);
+        assert_eq!(request.command, vec![runtime.command[0].to_string()]);
+        assert_eq!(request.workdir.as_deref(), Some(SESSION_WORKDIR));
+        assert_eq!(
+            request.tags.get(SESSION_RUNTIME_TAG).map(String::as_str),
+            Some("python-notebook")
+        );
+        assert_eq!(
+            request.tags.get(SESSION_IDLE_TAG).map(String::as_str),
+            Some("600000")
+        );
+    }
+
+    #[test]
+    fn session_keeps_resources() {
+        let mut request = session_body();
+        request.cpu_cores = Some(8);
+        request.ram_bytes = Some(16_000_000_000);
+        session_request(&mut request, None).expect("explicit resources are accepted");
+        assert_eq!(request.cpu_cores, Some(8));
+        assert_eq!(request.ram_bytes, Some(16_000_000_000));
+    }
+
+    #[test]
+    fn session_refuses_image() {
+        for mutate in [
+            |request: &mut SubmitExecutionRequest| request.image = "alpine:3".to_string(),
+            |request: &mut SubmitExecutionRequest| {
+                request.entrypoint = Some(vec!["sh".to_string()])
+            },
+            |request: &mut SubmitExecutionRequest| request.command = vec!["sh".to_string()],
+        ] {
+            let mut request = session_body();
+            mutate(&mut request);
+            assert!(session_request(&mut request, None).is_err());
+        }
+    }
+
+    #[test]
+    fn session_needs_bucket() {
+        let mut request = session_body();
+        request.workspace = None;
+        assert!(session_request(&mut request, None).is_err());
+
+        let mut request = session_body();
+        request.workspace = Some(WorkspaceRequest {
+            mode: WorkspaceModeRequest::None,
+            bucket: None,
+        });
+        assert!(session_request(&mut request, None).is_err());
+    }
+
+    #[test]
+    fn session_needs_runtime() {
+        let mut request = session_body();
+        request.runtime = None;
+        assert!(session_request(&mut request, None).is_err());
+
+        let mut request = session_body();
+        request.runtime = Some("nope".to_string());
+        assert!(session_request(&mut request, None).is_err());
+    }
+
+    #[test]
+    fn runtime_needs_tag() {
+        // A catalog runtime outside a session would leave the image unpinned.
+        let mut request = session_body();
+        request.tags.clear();
+        assert!(session_request(&mut request, None).is_err());
+    }
+
+    #[test]
+    fn session_refuses_reserved() {
+        // The runtime, idle and expiry tags are the node's to set.
+        for tag in [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG, SESSION_EXPIRY_TAG] {
+            let mut request = session_body();
+            request.tags.insert(tag.to_string(), "x".to_string());
+            assert!(session_request(&mut request, None).is_err());
+        }
+    }
+
+    #[test]
+    fn plain_run_untouched() {
+        // A run without the session tag keeps its own image and tags.
+        let mut request = local_request();
+        session_request(&mut request, None).expect("a plain run is untouched");
+        assert_eq!(request.image, "alpine:3");
+        assert!(!request.tags.contains_key(SESSION_RUNTIME_TAG));
     }
 }

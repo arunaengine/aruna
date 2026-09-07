@@ -21,6 +21,7 @@ pub mod group_backends;
 pub mod groups;
 pub mod info;
 pub mod job_audit;
+pub mod job_session;
 pub mod jobs;
 pub mod management_relay;
 pub mod metadata;
@@ -65,6 +66,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(device::router())
         .merge(device_compute::router())
         .merge(groups::router())
+        .merge(job_session::router())
         .merge(jobs::router())
         .merge(job_audit::router())
         .merge(metadata::router())
@@ -230,6 +232,10 @@ mod tests {
         ("GET", "/compute/jobs/{job_id}/artifacts/rocrate"),
         ("GET", "/compute/jobs/{job_id}/audit"),
         ("GET", "/compute/jobs/{job_id}/report"),
+        ("GET", "/compute/jobs/{job_id}/session"),
+        ("GET", "/compute/jobs/{job_id}/session/events"),
+        ("GET", "/compute/jobs/{job_id}/session/scratch"),
+        ("GET", "/compute/jobs/{job_id}/session/scratch/read"),
         ("GET", "/metadata"),
         ("GET", "/metadata/profile/validation/capabilities"),
         ("GET", "/metadata/references"),
@@ -317,6 +323,10 @@ mod tests {
         ("POST", "/access/groups/{id}/roles"),
         ("POST", "/compute/jobs"),
         ("POST", "/compute/jobs/{job_id}/cancel"),
+        ("POST", "/compute/jobs/{job_id}/session/cells"),
+        ("POST", "/compute/jobs/{job_id}/session/end"),
+        ("POST", "/compute/jobs/{job_id}/session/inputs"),
+        ("POST", "/compute/jobs/{job_id}/session/interrupt"),
         ("POST", "/metadata"),
         ("POST", "/metadata/profile/validation/preview"),
         ("POST", "/metadata/references/preflight"),

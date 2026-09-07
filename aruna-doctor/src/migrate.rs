@@ -10,10 +10,11 @@ use aruna_core::keyspaces::{
     JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    DEFAULT_CATCH_UP_AFTER_MS, ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate,
-    JobCancelRecord, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionResult, PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage,
-    SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+    DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionOutputRecord,
+    ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord, JobRecordEnvelope,
+    LaunchIntent, LogicalJobSpec, PhysicalExecutionResult, PhysicalExecutionState,
+    RealmConfigDocument, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
+    WitnessBudgetRecord,
 };
 use aruna_core::types::NodeId;
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
@@ -138,9 +139,9 @@ where
     Ok(Rewrites { scanned, rows })
 }
 
-/// Realm configuration documents gained the compute catch-up wait as their last
-/// value. Postcard is positional, so an older row is the current row without
-/// that trailing value and appending its default re-encodes the row.
+/// Realm configuration documents gained the catch-up wait and then the session
+/// idle timeout as their last values. Postcard is positional, so appending the
+/// defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -153,16 +154,28 @@ fn realm_configs(
         if RealmConfigDocument::from_bytes(&value).is_ok() {
             continue;
         }
-        let mut bytes = value.to_vec();
-        bytes.extend_from_slice(
-            &postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS)
-                .map_err(|error| decode_error(REALM_CONFIG_KEYSPACE, &key, error))?,
-        );
-        RealmConfigDocument::from_bytes(&bytes)
-            .map_err(|error| decode_error(REALM_CONFIG_KEYSPACE, &key, error))?;
+        let bytes = realm_config_suffix(&value)
+            .ok_or_else(|| decode_error(REALM_CONFIG_KEYSPACE, &key, "unknown shape"))?;
         rows.push((key.to_vec(), bytes));
     }
     Ok(Rewrites { scanned, rows })
+}
+
+/// Appends the trailing defaults an older row lacks, shortest suffix first, so
+/// a row missing only the newest value keeps the one it already has.
+fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
+    let idle = postcard::to_allocvec(&DEFAULT_SESSION_IDLE_AFTER_MS).ok()?;
+    let catch_up = postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS).ok()?;
+    let mut both = catch_up;
+    both.extend_from_slice(&idle);
+    for suffix in [idle, both] {
+        let mut bytes = value.to_vec();
+        bytes.extend_from_slice(&suffix);
+        if RealmConfigDocument::from_bytes(&bytes).is_ok() {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 fn keys(
@@ -346,8 +359,9 @@ mod tests {
         JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::structs::{
-        DEFAULT_CATCH_UP_AFTER_MS, ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope,
-        PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage, SubmissionId,
+        DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionUpdate, JobFamilyRecord,
+        JobRecordEnvelope, PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage,
+        SubmissionId,
     };
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -517,25 +531,32 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // A document stored before the catch-up wait must decode again with the
-        // default, and a current document must stay byte-identical.
+        // A document stored before the catch-up wait or before the session idle
+        // timeout must decode again with the defaults, and a current document
+        // must stay byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
         let current = postcard::to_allocvec(&document).unwrap();
-        let trailer = postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS).unwrap();
-        let legacy = current[..current.len() - trailer.len()].to_vec();
+        let idle = postcard::to_allocvec(&DEFAULT_SESSION_IDLE_AFTER_MS).unwrap();
+        let catch_up = postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS).unwrap();
+        let one_missing = current[..current.len() - idle.len()].to_vec();
+        let both_missing = current[..current.len() - idle.len() - catch_up.len()].to_vec();
         write(
             &path,
             REALM_CONFIG_KEYSPACE,
-            vec![(b"old", legacy), (b"new", current.clone())],
+            vec![
+                (b"old", both_missing),
+                (b"newer", one_missing),
+                (b"new", current.clone()),
+            ],
         );
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (2, 1)
+            (3, 2)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
@@ -543,6 +564,16 @@ mod tests {
         assert_eq!(
             migrated.compute.catch_up_after_ms,
             DEFAULT_CATCH_UP_AFTER_MS
+        );
+        assert_eq!(
+            migrated.compute.session_idle_after_ms,
+            DEFAULT_SESSION_IDLE_AFTER_MS
+        );
+        let newer = RealmConfigDocument::from_bytes(&rows[b"newer".as_slice()]).unwrap();
+        assert_eq!(newer.compute.catch_up_after_ms, DEFAULT_CATCH_UP_AFTER_MS);
+        assert_eq!(
+            newer.compute.session_idle_after_ms,
+            DEFAULT_SESSION_IDLE_AFTER_MS
         );
 
         let again = migrate_output(path.to_str().unwrap()).unwrap();

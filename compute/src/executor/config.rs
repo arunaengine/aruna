@@ -7,6 +7,10 @@ use super::WorkerSite;
 
 /// Node selector entries one backend stamps on every pod it creates.
 pub const MAX_NODE_SELECTOR_ENTRIES: usize = 16;
+/// Name of the internal bridge network interactive sessions join.
+pub const SESSION_NETWORK: &str = "aruna-sessions";
+/// Subnet of that network when the operator configures none.
+pub const DEFAULT_SESSION_SUBNET: &str = "172.30.255.0/24";
 
 #[derive(Clone, Debug)]
 pub enum ComputeConfig {
@@ -26,6 +30,9 @@ pub struct DockerConfig {
     pub default_disk_bytes: Option<u64>,
     pub default_max_walltime: Option<Duration>,
     pub pids_limit: i64,
+    /// Subnet of the internal bridge interactive sessions join. The node's S3
+    /// server listens on its gateway, the only endpoint a session reaches.
+    pub session_subnet: String,
     pub pull_deadline: Duration,
     /// Static ceilings this host offers. Hard eligibility plus the basis of the
     /// advertised ranking availability.
@@ -43,6 +50,7 @@ impl Default for DockerConfig {
             default_disk_bytes: None,
             default_max_walltime: Some(Duration::from_secs(24 * 60 * 60)),
             pids_limit: 2048,
+            session_subnet: DEFAULT_SESSION_SUBNET.to_string(),
             pull_deadline: Duration::from_secs(300),
             envelope: ResourceEnvelope::default(),
         }

@@ -1,11 +1,14 @@
+use ipnet::Ipv4Net;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
     CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogTails,
@@ -14,9 +17,10 @@ use aruna_core::compute::{
     TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
 };
 use async_trait::async_trait;
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
     ContainerCreateBody, ContainerInspectResponse, ContainerStateStatusEnum, HostConfig,
-    HostConfigLogConfig, ImageInspect,
+    HostConfigLogConfig, ImageInspect, Ipam, IpamConfig, NetworkCreateRequest,
 };
 use bollard::query_parameters::{
     ContainerArchiveInfoOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
@@ -32,10 +36,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
-use super::config::DockerConfig;
+use super::config::{DockerConfig, SESSION_NETWORK};
 use super::logs::BoundedTail;
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
+use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
@@ -169,6 +173,45 @@ impl DockerBackend {
         Ok(inspect_to_status(
             self.inspect_matching_attempt(attempt).await?,
         ))
+    }
+
+    /// Creates the internal bridge sessions join, once per daemon. It has no
+    /// external route: the node's S3 server on the gateway address is the only
+    /// endpoint a session container can reach.
+    pub async fn ensure_session_network(&self) -> Result<(), BackendError> {
+        let gateway = session_gateway(&self.config.session_subnet)?;
+        if let Ok(existing) = self.docker.inspect_network(SESSION_NETWORK, None).await {
+            return check_session_subnet(&existing, &self.config.session_subnet);
+        }
+        let request = NetworkCreateRequest {
+            name: SESSION_NETWORK.to_string(),
+            driver: Some("bridge".to_string()),
+            internal: Some(true),
+            ipam: Some(Ipam {
+                config: Some(vec![IpamConfig {
+                    subnet: Some(self.config.session_subnet.clone()),
+                    gateway: Some(gateway.to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match self.docker.create_network(request).await {
+            Ok(_) => Ok(()),
+            // Another attempt won the race, which is the same outcome.
+            Err(error)
+                if self
+                    .docker
+                    .inspect_network(SESSION_NETWORK, None)
+                    .await
+                    .is_ok() =>
+            {
+                tracing::debug!(error = %error, "session network already existed");
+                Ok(())
+            }
+            Err(error) => Err(classify(&error)),
+        }
     }
 
     async fn ensure_image(
@@ -1068,6 +1111,11 @@ fn build_config(
         cap_drop: Some(vec!["ALL".to_string()]),
         security_opt: Some(vec!["no-new-privileges".to_string()]),
         network_mode: match spec.security.network {
+            // A session reaches the node's S3 plane over the internal bridge and
+            // nothing else, so it is isolated from everything external.
+            _ if spec.session && spec.security.network != NetworkAccess::Open => {
+                Some(SESSION_NETWORK.to_string())
+            }
             NetworkAccess::Isolated => Some("none".to_string()),
             NetworkAccess::Open => None,
             // Docker enforces no S3-only egress, so the mode fails closed here
@@ -1128,6 +1176,7 @@ impl ExecutorBackend for DockerBackend {
             file_staging: true,
             direct_s3: true,
             local_site: true,
+            session: true,
             limits: self.config.envelope,
             ..BackendCaps::default()
         }
@@ -1206,7 +1255,7 @@ impl ExecutorBackend for DockerBackend {
                 "backend extension `{extension}` is not supported by the docker backend"
             )));
         }
-        let plan = (!spec.inputs.is_empty() || !spec.output_paths.is_empty())
+        let plan = (spec.session || !spec.inputs.is_empty() || !spec.output_paths.is_empty())
             .then(|| ArchivePlan::new(spec))
             .transpose()?;
         let name = spec.attempt.external_name();
@@ -1223,6 +1272,9 @@ impl ExecutorBackend for DockerBackend {
             };
         }
         self.ensure_image(&spec.image, cancel).await?;
+        if spec.session && spec.security.network != NetworkAccess::Open {
+            self.ensure_session_network().await?;
+        }
 
         let create_opts = CreateContainerOptionsBuilder::new().name(&name).build();
         let created = self
@@ -1511,6 +1563,64 @@ impl ExecutorBackend for DockerBackend {
         }
     }
 
+    /// Bridges standard input and output of one exec to the helper socket. The
+    /// exec inherits the container's user and is never privileged.
+    async fn open_session(&self, context: &FenceContext) -> Result<SessionChannel, BackendError> {
+        let attempt = &context.attempt;
+        let inspect = self.inspect_matching_attempt(attempt).await?;
+        if !is_running(&inspect) {
+            return Err(BackendError::Conflict(format!(
+                "attempt `{}` is not running",
+                attempt.external_name()
+            )));
+        }
+        let user = inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.user.clone())
+            .unwrap_or_else(|| format!("{}:{}", NOBODY.uid, NOBODY.gid));
+        let created = self
+            .docker
+            .create_exec(
+                &attempt.external_name(),
+                CreateExecOptions {
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(false),
+                    tty: Some(false),
+                    privileged: Some(false),
+                    user: Some(user),
+                    cmd: Some(vec![
+                        SESSION_HELPER_PATH.to_string(),
+                        SESSION_CLIENT_MODE.to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| classify(&error))?;
+        let started = self
+            .docker
+            .start_exec(&created.id, Some(StartExecOptions::default()))
+            .await
+            .map_err(|error| classify(&error))?;
+        match started {
+            StartExecResults::Attached { output, input } => {
+                let bytes = output.map(|frame| match frame {
+                    Ok(frame) => Ok(frame.into_bytes()),
+                    Err(error) => Err(io::Error::other(error.to_string())),
+                });
+                Ok(SessionChannel {
+                    input,
+                    output: Box::pin(StreamReader::new(bytes)),
+                })
+            }
+            StartExecResults::Detached => {
+                Err(BackendError::Api("session exec did not attach".to_string()))
+            }
+        }
+    }
+
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
         let control = match self.daemon_lock.read(context) {
             Ok(control) => control,
@@ -1709,6 +1819,54 @@ fn validate_labels(
         ));
     }
     Ok(())
+}
+
+/// An existing session network must carry the configured subnet: a different
+/// one would put containers on an address the node does not serve.
+fn check_session_subnet(
+    existing: &bollard::models::NetworkInspect,
+    subnet: &str,
+) -> Result<(), BackendError> {
+    let configured = existing
+        .ipam
+        .as_ref()
+        .and_then(|ipam| ipam.config.as_ref())
+        .and_then(|config| config.first())
+        .and_then(|entry| entry.subnet.clone())
+        .unwrap_or_default();
+    if configured == subnet {
+        return Ok(());
+    }
+    Err(BackendError::InvalidSpec(format!(
+        "network `{SESSION_NETWORK}` exists with subnet `{configured}`, not `{subnet}`"
+    )))
+}
+
+/// The first host address of the session subnet, which Docker gives the bridge
+/// and the node's S3 server binds.
+pub fn session_gateway(subnet: &str) -> Result<Ipv4Addr, BackendError> {
+    let network: Ipv4Net = subnet.parse().map_err(|_| {
+        BackendError::InvalidSpec(format!("session subnet `{subnet}` is not an IPv4 CIDR"))
+    })?;
+    let first = u32::from(network.network()).checked_add(1).ok_or_else(|| {
+        BackendError::InvalidSpec(format!("session subnet `{subnet}` has no host address"))
+    })?;
+    let gateway = Ipv4Addr::from(first);
+    if !network.contains(&gateway) {
+        return Err(BackendError::InvalidSpec(format!(
+            "session subnet `{subnet}` has no host address"
+        )));
+    }
+    Ok(gateway)
+}
+
+/// A session channel needs a container that is up right now.
+fn is_running(inspect: &ContainerInspectResponse) -> bool {
+    inspect
+        .state
+        .as_ref()
+        .and_then(|state| state.status)
+        .is_some_and(|status| status == ContainerStateStatusEnum::RUNNING)
 }
 
 fn validate_control(
@@ -2101,6 +2259,17 @@ mod tests {
     }
 
     #[test]
+    fn gateway_first_host() {
+        // Docker gives the bridge the first host address of the subnet.
+        assert_eq!(
+            session_gateway("172.30.255.0/24").expect("a /24 has host addresses"),
+            std::net::Ipv4Addr::new(172, 30, 255, 1)
+        );
+        assert!(session_gateway("not-a-cidr").is_err());
+        assert!(session_gateway("172.30.255.0/32").is_err());
+    }
+
+    #[test]
     fn network_fails_closed() {
         // Docker enforces no S3-only egress, so that mode must not open the
         // network even if it ever reached the container body.
@@ -2396,6 +2565,20 @@ mod tests {
         assert_eq!(plan.directories[Path::new("scratch")], 0o755);
         assert_eq!(plan.directories[Path::new("scratch/run")], 0o777);
         assert_eq!(plan.directories[Path::new("results")], 0o777);
+    }
+
+    #[tokio::test]
+    async fn session_workdir_archive() {
+        let mut spec = TaskSpec::new(AttemptRef::new("session", 0), "session:latest");
+        spec.session = true;
+        spec.workdir = Some("/work".to_string());
+        let plan = ArchivePlan::new(&spec).unwrap();
+        let bytes = collect_archive(&plan, &plan.directories, MAX_TRANSFER_BYTES)
+            .await
+            .unwrap();
+        let found = read_entries(bytes);
+        assert!(found[Path::new("work")].0.is_dir());
+        assert_eq!(found[Path::new("work")].1 & 0o777, 0o777);
     }
 
     #[tokio::test]

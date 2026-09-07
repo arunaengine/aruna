@@ -26,6 +26,9 @@ pub const DEFAULT_WITNESS_BASE_DELAY_MS: u64 = 30_000;
 /// How long a witness waits for a launch to produce a receipt, and how long an
 /// executor node may stay silent, before the round plans again: 5 minutes.
 pub const DEFAULT_CATCH_UP_AFTER_MS: u64 = 300_000;
+/// How long an interactive session may stay without a cell submit before the
+/// node ends it: 30 minutes.
+pub const DEFAULT_SESSION_IDLE_AFTER_MS: u64 = 1_800_000;
 /// Groups one realm gives an explicit compute quota.
 pub const MAX_GROUP_COMPUTE_QUOTAS: usize = 256;
 
@@ -43,6 +46,8 @@ pub enum ComputeConfigError {
     ZeroWitnessDelay,
     #[error("catch-up wait must be greater than zero")]
     ZeroCatchUpWait,
+    #[error("session idle timeout must be greater than zero")]
+    ZeroSessionIdle,
     #[error("a realm configures at most {MAX_GROUP_COMPUTE_QUOTAS} group compute quotas")]
     QuotaCount,
     #[error("group {group_id} has two compute quotas")]
@@ -81,6 +86,9 @@ pub struct RealmComputeConfig {
     /// Wait window before a round plans again: how long a launch may stay
     /// without a receipt, and how long an executor node may stay silent.
     pub catch_up_after_ms: u64,
+    /// How long an interactive session job may stay without a cell submit
+    /// before the executing node ends it. A submit resets the wait.
+    pub session_idle_after_ms: u64,
 }
 
 impl Default for RealmComputeConfig {
@@ -93,6 +101,7 @@ impl Default for RealmComputeConfig {
             default_group_quota: ComputeQuota::default(),
             group_quotas: Vec::new(),
             catch_up_after_ms: DEFAULT_CATCH_UP_AFTER_MS,
+            session_idle_after_ms: DEFAULT_SESSION_IDLE_AFTER_MS,
         }
     }
 }
@@ -115,6 +124,10 @@ impl RealmComputeConfig {
         // Zero would make every launch look overdue at once.
         if self.catch_up_after_ms == 0 {
             return Err(ComputeConfigError::ZeroCatchUpWait);
+        }
+        // Zero would end every session before its first cell.
+        if self.session_idle_after_ms == 0 {
+            return Err(ComputeConfigError::ZeroSessionIdle);
         }
         let mut seen = BTreeSet::new();
         for link in &self.links {
@@ -226,6 +239,14 @@ mod tests {
             }
             .validate(),
             Err(ComputeConfigError::ZeroCatchUpWait)
+        );
+        assert_eq!(
+            RealmComputeConfig {
+                session_idle_after_ms: 0,
+                ..Default::default()
+            }
+            .validate(),
+            Err(ComputeConfigError::ZeroSessionIdle)
         );
     }
 

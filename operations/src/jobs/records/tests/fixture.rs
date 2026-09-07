@@ -188,6 +188,7 @@ impl Family {
     pub fn receipt(&self, launch: &LaunchIntent, execution: u8) -> ExecutionReceipt {
         ExecutionReceipt {
             execution_id: Ulid::from_bytes([execution; 16]),
+            physical_job_id: JobId::from_bytes([execution + 30; 16]),
             launch_id: launch.launch_id,
             launch_digest: launch.digest().expect("launch digest"),
             submission_id: self.submission_id,
