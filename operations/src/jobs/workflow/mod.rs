@@ -1124,6 +1124,10 @@ async fn start_session(
     bucket: &str,
 ) -> Option<Arc<Session>> {
     let requested = session_of(spec)?;
+    let public_job_id = job_reservation(context, job_id)
+        .await
+        .ok()?
+        .map_or(job_id, |reservation| reservation.logical_job_id);
     let registry = context.compute_handle.as_ref()?.sessions().clone();
     let net = context.net_handle.as_ref()?;
     let node_id = net.node_id();
@@ -1146,6 +1150,7 @@ async fn start_session(
     Some(registry.open(
         SessionConfig {
             job_id: job_id.to_string(),
+            public_job_id: public_job_id.to_string(),
             runtime: requested.runtime,
             workspace_bucket: bucket.to_string(),
             executor_node_id: node_id.to_string(),

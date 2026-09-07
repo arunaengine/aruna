@@ -2058,6 +2058,7 @@ pub struct LaunchIntent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
     pub execution_id: Ulid,
+    pub physical_job_id: JobId,
     pub launch_id: Ulid,
     pub launch_digest: [u8; 32],
     pub submission_id: SubmissionId,
@@ -3857,6 +3858,7 @@ mod tests {
     fn sample_receipt() -> ExecutionReceipt {
         ExecutionReceipt {
             execution_id: Ulid::from_bytes([13u8; 16]),
+            physical_job_id: JobId::from_bytes([14u8; 16]),
             launch_id: Ulid::from_bytes([10u8; 16]),
             launch_digest: sample_launch().digest().expect("launch digests"),
             submission_id: submission(),

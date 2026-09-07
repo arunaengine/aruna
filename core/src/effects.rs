@@ -825,6 +825,7 @@ pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
     let secret = iroh::SecretKey::from_bytes(&[6u8; 32]);
     let record = JobFamilyRecord::Receipt(Box::new(ExecutionReceipt {
         execution_id: Ulid::from_bytes([8u8; 16]),
+        physical_job_id: JobId::from_bytes([14u8; 16]),
         launch_id: Ulid::from_bytes([9u8; 16]),
         launch_digest: [1u8; 32],
         submission_id: SubmissionId([1u8; 32]),

@@ -5,12 +5,26 @@ use serde_json::json;
 fn config(idle_after_ms: u64) -> SessionConfig {
     SessionConfig {
         job_id: "01JJRSTVWXYZ0123456789ABCD".to_string(),
+        public_job_id: "01JJRSTVWXYZ0123456789ABCE".to_string(),
         runtime: "python-notebook".to_string(),
         workspace_bucket: "lab-data".to_string(),
         executor_node_id: "node-1".to_string(),
         idle_after_ms,
         credential_expires_at_ms: 42,
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn exposes_public_id() {
+    let registry = Arc::new(SessionRegistry::new());
+    let config = config(600_000);
+    let (session, _channel) = registry.open_detached(config.clone());
+    assert!(registry.get(&config.job_id).is_some());
+    assert_eq!(session.snapshot().job_id, config.public_job_id);
+    session.announce();
+    let (events, _) = session.subscribe_all();
+    let data: serde_json::Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
+    assert_eq!(data["job_id"], config.public_job_id);
 }
 
 /// A session the kernel already reported ready for, with its request channel

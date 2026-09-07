@@ -11,13 +11,12 @@ use aruna_compute::session::{
     EndReason, MAX_SCRATCH_READ_BYTES, Session, SessionError, StagedInput,
 };
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{AuthContext, JobPayload, JobRecord, JobState, key_content_type};
-use aruna_core::types::NodeId;
+use aruna_core::structs::{AuthContext, JobId, JobPayload, JobRecord, JobState, key_content_type};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::jobs::lifecycle::ids::session_of;
-use aruna_operations::jobs::lifecycle::routing::family_projection;
-use aruna_operations::jobs::service::{read_owned_job, read_session_reason};
+use aruna_operations::jobs::lifecycle::routing::session_job;
+use aruna_operations::jobs::service::read_session_reason;
 use aruna_operations::s3::copy_object::{CopyObjectInput, CopySourceConditions, copy_object};
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use axum::extract::{Path, Query, State};
@@ -38,7 +37,9 @@ use utoipa_axum::routes;
 
 use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::jobs::{JobStatusResponse, coded_response, job_status_response, parse_job_id};
+use crate::routes::jobs::{
+    JobStatusResponse, coded_response, job_status_response, map_job_route, parse_job_id,
+};
 use crate::server_state::ServerState;
 
 /// Envoy idles an upstream at 60 seconds, so the stream keeps itself alive.
@@ -201,19 +202,10 @@ async fn owned_session_job(
     state: &ServerState,
     auth: &AuthContext,
     raw_job_id: &str,
-) -> ServerResult<JobRecord> {
-    let job_id = parse_job_id(raw_job_id)?;
-    let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
+) -> ServerResult<(JobRecord, Option<JobId>)> {
+    session_job(&state.get_ctx(), auth.user_id, parse_job_id(raw_job_id)?)
         .await
-        .map_err(ServerError::InternalError)?
-        .ok_or(ServerError::NotFound)?;
-    let JobPayload::Execution(spec) = &record.payload else {
-        return Err(ServerError::NotFound);
-    };
-    if session_of(spec).is_none() {
-        return Err(ServerError::NotFound);
-    }
-    Ok(record)
+        .map_err(map_job_route)
 }
 
 /// The caller's live session on this node, for callers that have no coded
@@ -223,64 +215,62 @@ pub(crate) async fn caller_session(
     auth: &AuthContext,
     raw_job_id: &str,
 ) -> ServerResult<Arc<Session>> {
-    let record = owned_session_job(state, auth, raw_job_id).await?;
+    let (record, physical_job_id) = owned_session_job(state, auth, raw_job_id).await?;
+    if record.owner_node_id != state.get_node_id() {
+        return Err(ServerError::NotFound);
+    }
+    let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
     state
         .get_ctx()
         .compute_handle
         .as_ref()
-        .and_then(|registry| registry.sessions().get(&record.job_id.to_string()))
+        .and_then(|registry| registry.sessions().get(&job_id.to_string()))
         .ok_or(ServerError::NotFound)
 }
 
 /// The live session, or the coded answer that says why there is none here.
 /// A node restart re-adopts the container and opens a new session, so a
 /// non-terminal job without one is starting, never ended.
-async fn live_session(state: &ServerState, record: &JobRecord) -> Result<Arc<Session>, Response> {
-    let job_id = record.job_id.to_string();
-    let session = state
-        .get_ctx()
-        .compute_handle
-        .as_ref()
-        .and_then(|registry| registry.sessions().get(&job_id));
-    if let Some(session) = session {
-        return Ok(session);
-    }
-    if let Some(executor) = executor_node(state, record).await
-        && executor != state.get_node_id()
-    {
+async fn live_session(
+    state: &ServerState,
+    record: &JobRecord,
+    physical_job_id: Option<JobId>,
+    state_read: bool,
+) -> Result<Arc<Session>, Response> {
+    if physical_job_id.is_some() && record.owner_node_id != state.get_node_id() {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "the session runs on another node",
                 "code": "session_not_here",
-                "executor_node_id": executor.to_string(),
+                "executor_node_id": record.owner_node_id.to_string(),
             })),
         )
             .into_response());
     }
+    let session = state
+        .get_ctx()
+        .compute_handle
+        .as_ref()
+        .and_then(|registry| {
+            physical_job_id.and_then(|id| registry.sessions().get(&id.to_string()))
+        });
+    if let Some(session) = session {
+        return Ok(session);
+    }
+    if !state_read {
+        return Err(session_error(if record.state.is_terminal() {
+            SessionError::Ended
+        } else {
+            SessionError::Starting
+        }));
+    }
     if !record.state.is_terminal() {
         return Err(starting_response(record).into_response());
     }
-    Err(ended_response(state, record).await.into_response())
-}
-
-/// The node the family says ran this job, canonical execution first. `None`
-/// when no execution is known yet, which is this node's own job to start.
-async fn executor_node(state: &ServerState, record: &JobRecord) -> Option<NodeId> {
-    let (projected, _) = family_projection(&state.get_ctx(), record.job_id)
+    Err(ended_response(state, record, physical_job_id)
         .await
-        .ok()??;
-    let projection = projected.projection?;
-    let execution = projection
-        .canonical_execution_id
-        .and_then(|id| {
-            projection
-                .executions
-                .iter()
-                .find(|execution| execution.execution_id == id)
-        })
-        .or_else(|| projection.executions.last())?;
-    Some(execution.executor_node_id)
+        .into_response())
 }
 
 /// A job whose session has not started here yet.
@@ -294,10 +284,18 @@ fn starting_response(record: &JobRecord) -> Json<SessionResponse> {
 
 /// A finished session job. The reason comes from the report the workflow wrote,
 /// so a failed session says why it stopped rather than reading as a clean end.
-async fn ended_response(state: &ServerState, record: &JobRecord) -> Json<SessionResponse> {
-    let reason = read_session_reason(&state.get_ctx(), record.created_by, record.job_id)
-        .await
-        .unwrap_or_else(|| default_reason(record).to_string());
+async fn ended_response(
+    state: &ServerState,
+    record: &JobRecord,
+    physical_job_id: Option<JobId>,
+) -> Json<SessionResponse> {
+    let reason = read_session_reason(
+        &state.get_ctx(),
+        record.created_by,
+        physical_job_id.unwrap_or(record.job_id),
+    )
+    .await
+    .unwrap_or_else(|| default_reason(record).to_string());
     Json(SessionResponse {
         state: "ended".to_string(),
         ended: Some(SessionEndedResponse { reason }),
@@ -434,8 +432,8 @@ pub async fn get_session(
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
         Err(response) => Ok(response),
     }
@@ -480,8 +478,8 @@ pub async fn stream_session(
     headers: HeaderMap,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -651,8 +649,8 @@ pub async fn submit_cell(
     Json(request): Json<SubmitCellRequest>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -698,8 +696,8 @@ pub async fn interrupt_session(
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -741,8 +739,8 @@ pub async fn end_session(
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -791,8 +789,8 @@ pub async fn stage_inputs(
     Json(request): Json<SessionInputsRequest>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -806,9 +804,7 @@ pub async fn stage_inputs(
     })?;
     let mut staged = Vec::with_capacity(request.items.len());
     for item in request.items {
-        staged.push(stage_one(&state, &auth, &bucket, item).await?);
-    }
-    for entry in &staged {
+        let entry = stage_one(&state, &auth, &bucket, item).await?;
         session.record_input(StagedInput {
             dest_key: entry.dest_key.clone(),
             bytes: entry.bytes,
@@ -816,8 +812,9 @@ pub async fn stage_inputs(
             source_node_id: entry.source_node_id.clone(),
             version_id: entry.version_id.clone(),
         });
+        staged.push(entry);
+        session.touch();
     }
-    session.touch();
     Ok((
         StatusCode::ACCEPTED,
         Json(SessionInputsResponse {
@@ -912,7 +909,10 @@ async fn stage_one(
             .map(hex::encode)
             .unwrap_or_default(),
         source_node_id: node_id.to_string(),
-        version_id: result.version_id.to_string(),
+        version_id: result
+            .source_version_id
+            .map(|version| version.to_string())
+            .unwrap_or_default(),
     })
 }
 
@@ -950,8 +950,8 @@ pub async fn list_scratch(
     Query(query): Query<ScratchQuery>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -1002,8 +1002,8 @@ pub async fn read_scratch(
     Query(query): Query<ScratchReadQuery>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record).await {
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -1249,6 +1249,7 @@ mod tests {
         registry.sessions().open(
             SessionConfig {
                 job_id: job_id.to_string(),
+                public_job_id: job_id.to_string(),
                 runtime: "python-notebook".to_string(),
                 workspace_bucket: "lab-data".to_string(),
                 executor_node_id: node().to_string(),
@@ -1343,6 +1344,25 @@ mod tests {
         // A session that has not reached its kernel yet accepts no cell.
         let owner = user(2);
         let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let response = submit_cell(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SubmitCellRequest {
+                cell_id: "c1".to_string(),
+                code: "1".to_string(),
+            }),
+        )
+        .await
+        .expect("the handler answers");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn refuses_unregistered_cell() {
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        drop_session(&state, job_id);
         let response = submit_cell(
             State(state),
             Extension(auth_for(owner)),

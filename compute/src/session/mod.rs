@@ -126,6 +126,7 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub job_id: String,
+    pub public_job_id: String,
     pub runtime: String,
     pub workspace_bucket: String,
     pub executor_node_id: String,
@@ -201,7 +202,7 @@ impl Session {
             })
             .collect();
         SessionSnapshot {
-            job_id: self.config.job_id.clone(),
+            job_id: self.config.public_job_id.clone(),
             state: inner.phase,
             runtime: self.config.runtime.clone(),
             workspace_bucket: self.config.workspace_bucket.clone(),
@@ -973,7 +974,7 @@ fn session_frame<'a>(
     inner: &Inner,
 ) -> SessionFrame<'a> {
     SessionFrame {
-        job_id: &config.job_id,
+        job_id: &config.public_job_id,
         state: inner.phase.as_str(),
         runtime: &config.runtime,
         workspace_bucket: &config.workspace_bucket,

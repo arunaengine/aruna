@@ -19,7 +19,16 @@ use crate::jobs::records::{
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {
-    let spec = family.spec();
+    let mut spec = family.spec();
+    spec.payload.tags.insert(
+        aruna_core::compute::runtimes::SESSION_TAG.to_string(),
+        aruna_core::compute::runtimes::SESSION_TAG_NOTEBOOK.to_string(),
+    );
+    spec.payload.tags.insert(
+        aruna_core::compute::runtimes::SESSION_RUNTIME_TAG.to_string(),
+        "python-notebook".to_string(),
+    );
+    let spec = spec.store_digest().expect("session spec digests");
     let launch = family.launch(&spec, family.holder.public(), 0);
     let receipt = family.receipt(&launch, 1);
     let published = [
@@ -102,6 +111,40 @@ async fn reads_kind_only() {
     assert!(matches!(
         &receipts[0].record,
         JobFamilyRecord::Receipt(stored) if stored.execution_id == receipt.execution_id
+    ));
+}
+
+#[tokio::test]
+async fn resolves_session_alias() {
+    use crate::jobs::JobRouteError;
+    use crate::jobs::lifecycle::routing::session_job;
+    use crate::jobs::service::read_owned_job;
+
+    let family = Family::new([7u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let (spec, receipt) = seed(&ctx, &family).await;
+    assert_ne!(spec.job_id, receipt.physical_job_id);
+    assert!(
+        read_owned_job(&ctx, spec.created_by, spec.job_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (record, physical) = session_job(&ctx, spec.created_by, spec.job_id)
+        .await
+        .unwrap();
+    assert_eq!(record.job_id, spec.job_id);
+    assert_eq!(record.owner_node_id, family.target.public());
+    assert_eq!(physical, Some(receipt.physical_job_id));
+    let stranger = aruna_core::types::UserId::new(ulid::Ulid(42), REALM);
+    assert!(matches!(
+        session_job(&ctx, stranger, spec.job_id).await,
+        Err(JobRouteError::NotFound)
+    ));
+    poison(&ctx, &family).await;
+    assert!(matches!(
+        session_job(&ctx, spec.created_by, spec.job_id).await,
+        Err(JobRouteError::Unavailable(_))
     ));
 }
 
