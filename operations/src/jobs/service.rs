@@ -6,8 +6,9 @@ use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
     JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, OutputDestination,
-    Permission, RealmId, RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec,
-    WorkspaceMode, pid_dedup_key, shard_for_subject, user_dedup_key,
+    Permission, RealmId, RunCrateStatus, SessionReportDetail, SessionReportRow,
+    StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode, pid_dedup_key,
+    shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -796,6 +797,35 @@ pub async fn read_owned_report(
         },
         rows,
         next_key,
+    })
+}
+
+/// Why a finished session stopped, from the report row its workflow wrote.
+/// Self-scoped like every other job read, and node local: session routes are
+/// served by the node that ran the job.
+pub async fn read_session_reason(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+) -> Option<String> {
+    let record = read_owned_job(context, user_id, job_id).await.ok()??;
+    if !record.state.is_terminal() {
+        return None;
+    }
+    let (rows, _) = list_job_entries(
+        &context.storage_handle,
+        job_id,
+        None,
+        crate::jobs::SESSION_REPORT_ROWS,
+    )
+    .await
+    .ok()?;
+    rows.iter().rev().find_map(|(_, value)| {
+        let row: SessionReportRow = postcard::from_bytes(value).ok()?;
+        match row.detail {
+            SessionReportDetail::End { reason } => Some(reason),
+            _ => None,
+        }
     })
 }
 

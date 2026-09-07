@@ -43,6 +43,8 @@ pub const JOB_PROGRESS_FLUSH_INTERVAL_MS: u64 = 500;
 /// Bounded OCC retries when a job mutation transaction conflicts.
 pub const JOB_MUTATE_MAX_ATTEMPTS: u32 = 8;
 pub const JOB_REPORT_MAX_ROWS: u16 = 1000;
+/// Report rows scanned to recover why a session stopped.
+pub const SESSION_REPORT_ROWS: usize = 64;
 /// How long a shutdown lets in-flight jobs wind down before handing their leases back.
 pub const JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 

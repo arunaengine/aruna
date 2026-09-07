@@ -13,8 +13,8 @@ use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
     ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
     JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
-    OutputDestination, OutputSelection, Permission, SessionReportRow, WorkspaceMode,
-    WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
+    OutputDestination, OutputSelection, Permission, WorkspaceMode, WorkspaceOutput,
+    blob_bucket_permission_path, blob_group_permission_path,
 };
 use aruna_core::types::NodeId;
 use aruna_operations::device::compute::{
@@ -1865,16 +1865,6 @@ fn decode_report_row(
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
                     "stored export report entry key does not match its row".to_string(),
-                ));
-            }
-            serde_json::to_value(row)
-        }
-        JobKind::Execution => {
-            let row: SessionReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
-            if row.entry_key.as_bytes() != entry_key {
-                return Err(ServerError::InternalError(
-                    "stored session report entry key does not match its row".to_string(),
                 ));
             }
             serde_json::to_value(row)
@@ -3913,7 +3903,7 @@ mod tests {
     #[test]
     fn session_refuses_reserved() {
         // The runtime, idle and expiry tags are the node's to set.
-        for tag in [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG] {
+        for tag in [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG, SESSION_EXPIRY_TAG] {
             let mut request = session_body();
             request.tags.insert(tag.to_string(), "x".to_string());
             assert!(session_request(&mut request, None).is_err());
@@ -3921,7 +3911,8 @@ mod tests {
     }
 
     #[test]
-    fn plain_run_keeps_image() {
+    fn plain_run_untouched() {
+        // A run without the session tag keeps its own image and tags.
         let mut request = local_request();
         session_request(&mut request, None).expect("a plain run is untouched");
         assert_eq!(request.image, "alpine:3");
