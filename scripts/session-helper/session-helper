@@ -73,6 +73,9 @@ class Kernel:
         self.workdir = workdir
         self.cells = queue.Queue()
         self.pending = {}
+        self.generation = 0
+        self.interrupted = set()
+        self.interrupt_pending = set()
         self.lock = threading.Lock()
         self.idle = set()
         self.completed = threading.Condition(self.lock)
@@ -88,15 +91,24 @@ class Kernel:
         threading.Thread(target=self._run_cells, daemon=True).start()
 
     def execute(self, cell_id, code):
-        self.cells.put((cell_id, code))
+        with self.lock:
+            self.cells.put((self.generation, cell_id, code))
 
     def interrupt(self):
-        while True:
-            try:
-                self.cells.get_nowait()
-            except queue.Empty:
-                break
-        self.manager.interrupt_kernel()
+        with self.lock:
+            self.generation += 1
+            while True:
+                try:
+                    self.cells.get_nowait()
+                except queue.Empty:
+                    break
+            requested = set(self.pending) - self.interrupted
+            self.interrupted.update(requested)
+            interrupt = bool(requested) and self.state == "busy"
+            if not interrupt:
+                self.interrupt_pending.update(requested)
+        if interrupt:
+            self.manager.interrupt_kernel()
 
     def status(self):
         return {"alive": self.manager.is_alive(), "state": self.state}
@@ -114,8 +126,10 @@ class Kernel:
 
     def _run_cells(self):
         while True:
-            cell_id, code = self.cells.get()
+            generation, cell_id, code = self.cells.get()
             with self.lock:
+                if generation != self.generation:
+                    continue
                 message_id = self.client.execute(code, store_history=True, allow_stdin=False)
                 self.pending[message_id] = cell_id
                 self.connection.send(
@@ -144,6 +158,10 @@ class Kernel:
                         self.die()
                 self.idle.remove(message_id)
                 self.pending.pop(message_id, None)
+                if state == "error" and message_id in self.interrupted:
+                    state = "interrupted"
+                self.interrupted.discard(message_id)
+                self.interrupt_pending.discard(message_id)
             self.connection.send(
                 {
                     "kind": "cell",
@@ -178,12 +196,16 @@ class Kernel:
         if kind == "status":
             state = content.get("execution_state", "idle")
             self.announce(state)
-            if state == "idle":
-                parent = message.get("parent_header", {}).get("msg_id")
-                with self.completed:
-                    if parent in self.pending:
-                        self.idle.add(parent)
-                        self.completed.notify_all()
+            parent = message.get("parent_header", {}).get("msg_id")
+            with self.completed:
+                interrupt = state == "busy" and parent in self.interrupt_pending
+                if interrupt:
+                    self.interrupt_pending.remove(parent)
+                if state == "idle" and parent in self.pending:
+                    self.idle.add(parent)
+                    self.completed.notify_all()
+            if interrupt:
+                self.manager.interrupt_kernel()
             return
         cell_id = self._cell_of(message)
         if cell_id is None:

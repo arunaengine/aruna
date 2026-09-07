@@ -1,8 +1,10 @@
 import pathlib
+import queue
 import runpy
 import threading
 import types
 import unittest
+from unittest.mock import Mock
 
 
 HELPER = runpy.run_path(str(pathlib.Path(__file__).with_name("session-helper")))
@@ -28,6 +30,8 @@ class KernelTest(unittest.TestCase):
                 kernel = HELPER["Kernel"].__new__(HELPER["Kernel"])
                 kernel.connection = types.SimpleNamespace(send=send)
                 kernel.pending = {"request": "cell"}
+                kernel.interrupted = set()
+                kernel.interrupt_pending = set()
                 kernel.lock = threading.Lock()
                 kernel.completed = Completion(kernel.lock)
                 kernel.idle = set()
@@ -53,6 +57,64 @@ class KernelTest(unittest.TestCase):
                 self.assertEqual(events[-1]["state"], expected)
                 self.assertEqual(kernel.pending, {})
                 self.assertEqual(kernel.idle, set())
+
+    def test_early_interrupt(self):
+        kernel = HELPER["Kernel"].__new__(HELPER["Kernel"])
+        kernel.connection = types.SimpleNamespace(send=Mock())
+        kernel.pending = {"request": "cell"}
+        kernel.generation = 0
+        kernel.interrupted = set()
+        kernel.interrupt_pending = set()
+        kernel.cells = queue.Queue()
+        kernel.lock = threading.Lock()
+        kernel.completed = threading.Condition(kernel.lock)
+        kernel.state = "idle"
+        kernel.idle = set()
+        kernel.manager = types.SimpleNamespace(interrupt_kernel=Mock(), is_alive=lambda: True)
+        kernel.client = types.SimpleNamespace(get_shell_msg=lambda **_: {
+            "parent_header": {"msg_id": "request"},
+            "content": {"status": "error", "ename": "Error", "execution_count": 1},
+        })
+        kernel.interrupt()
+        kernel.manager.interrupt_kernel.assert_not_called()
+        for state in ["busy", "busy", "idle"]:
+            kernel._forward({
+                "msg_type": "status", "parent_header": {"msg_id": "request"},
+                "content": {"execution_state": state},
+            })
+        kernel.manager.interrupt_kernel.assert_called_once()
+        kernel._await_reply("request", "cell")
+        self.assertEqual(kernel.connection.send.call_args.args[0]["state"], "interrupted")
+        self.assertFalse(kernel.interrupted)
+        self.assertFalse(kernel.interrupt_pending)
+
+    def test_dequeued_interrupt(self):
+        kernel = HELPER["Kernel"].__new__(HELPER["Kernel"])
+        kernel.pending = {}
+        kernel.generation = 0
+        kernel.interrupted = set()
+        kernel.interrupt_pending = set()
+        kernel.lock = threading.Lock()
+        kernel.state = "idle"
+        kernel.client = types.SimpleNamespace(execute=Mock())
+        kernel.manager = types.SimpleNamespace(interrupt_kernel=Mock())
+
+        class Cells(queue.Queue):
+            def get(self, block=True):
+                if not block:
+                    return super().get(block=False)
+                if self.empty():
+                    raise StopIteration
+                cell = super().get()
+                kernel.interrupt()
+                return cell
+
+        kernel.cells = Cells()
+        kernel.execute("cell", "must not execute")
+        with self.assertRaises(StopIteration):
+            kernel._run_cells()
+        kernel.client.execute.assert_not_called()
+        kernel.manager.interrupt_kernel.assert_not_called()
 
 
 if __name__ == "__main__":
