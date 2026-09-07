@@ -218,15 +218,16 @@ async fn reopens_lost_channel() {
     assert_eq!(session.snapshot().state, SessionPhase::Ready);
 }
 
-/// Waits until the pump noticed the lost channel.
+/// Waits until the pump noticed the lost channel. The reopen is paced, so the
+/// test waits for the announced state rather than spinning.
 async fn wait_for_starting(session: &Arc<aruna_compute::Session>) {
-    for _ in 0..10_000 {
-        if session.snapshot().state == SessionPhase::Starting {
-            return;
-        }
-        tokio::task::yield_now().await;
+    let (_, mut receiver) = session.subscribe_all();
+    while session.snapshot().state != SessionPhase::Starting {
+        tokio::time::timeout(Duration::from_secs(60), receiver.recv())
+            .await
+            .expect("a lost channel never put the session back into starting")
+            .expect("the stream stays open");
     }
-    panic!("a lost channel never put the session back into starting");
 }
 
 /// Reports the kernel ready over one channel and waits for the manager.

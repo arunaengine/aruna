@@ -2259,7 +2259,8 @@ mod tests {
     }
 
     #[test]
-    fn gateway_is_first_host() {
+    fn gateway_first_host() {
+        // Docker gives the bridge the first host address of the subnet.
         assert_eq!(
             session_gateway("172.30.255.0/24").expect("a /24 has host addresses"),
             std::net::Ipv4Addr::new(172, 30, 255, 1)

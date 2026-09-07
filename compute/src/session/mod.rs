@@ -818,6 +818,11 @@ async fn pump(
         if session.done.is_cancelled() {
             return;
         }
+        // An exec that exits at once must not become a reconnect storm.
+        tokio::select! {
+            _ = tokio::time::sleep(OPEN_RETRY) => {}
+            _ = session.done.cancelled() => return,
+        }
         session.reopening();
     }
 }
