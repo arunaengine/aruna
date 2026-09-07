@@ -74,6 +74,8 @@ class Kernel:
         self.cells = queue.Queue()
         self.pending = {}
         self.lock = threading.Lock()
+        self.idle = set()
+        self.completed = threading.Condition(self.lock)
         name = os.environ.get(KERNEL_ENV, "python3")
         self.manager = KernelManager(kernel_name=name)
         connection.send({"kind": "kernel", "state": "starting"})
@@ -113,12 +115,12 @@ class Kernel:
     def _run_cells(self):
         while True:
             cell_id, code = self.cells.get()
-            message_id = self.client.execute(code, store_history=True)
             with self.lock:
+                message_id = self.client.execute(code, store_history=True, allow_stdin=False)
                 self.pending[message_id] = cell_id
-            self.connection.send(
-                {"kind": "cell", "cell_id": cell_id, "state": "running"}
-            )
+                self.connection.send(
+                    {"kind": "cell", "cell_id": cell_id, "state": "running"}
+                )
             self._await_reply(message_id, cell_id)
 
     def _await_reply(self, message_id, cell_id):
@@ -133,6 +135,15 @@ class Kernel:
                 continue
             content = reply.get("content", {})
             state = "error" if content.get("status") == "error" else "done"
+            if content.get("ename") == "KeyboardInterrupt":
+                state = "interrupted"
+            with self.completed:
+                while message_id not in self.idle:
+                    self.completed.wait(timeout=1)
+                    if not self.manager.is_alive():
+                        self.die()
+                self.idle.remove(message_id)
+                self.pending.pop(message_id, None)
             self.connection.send(
                 {
                     "kind": "cell",
@@ -141,8 +152,6 @@ class Kernel:
                     "execution_count": content.get("execution_count"),
                 }
             )
-            with self.lock:
-                self.pending.pop(message_id, None)
             return
 
     def _cell_of(self, message):
@@ -167,7 +176,14 @@ class Kernel:
         kind = message.get("msg_type")
         content = message.get("content", {})
         if kind == "status":
-            self.announce(content.get("execution_state", "idle"))
+            state = content.get("execution_state", "idle")
+            self.announce(state)
+            if state == "idle":
+                parent = message.get("parent_header", {}).get("msg_id")
+                with self.completed:
+                    if parent in self.pending:
+                        self.idle.add(parent)
+                        self.completed.notify_all()
             return
         cell_id = self._cell_of(message)
         if cell_id is None:

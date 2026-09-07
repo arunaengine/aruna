@@ -641,6 +641,7 @@ fn session_subnet() -> String {
 
 /// The gateway address of the Docker session bridge, on the configured S3 port.
 /// It is what a session container targets, whatever the node itself binds.
+#[cfg(feature = "docker")]
 fn session_s3_address(config: &Config, subnet: &str) -> Option<std::net::SocketAddr> {
     use aruna_compute::executor::docker::session_gateway;
 
@@ -664,6 +665,11 @@ fn session_s3_address(config: &Config, subnet: &str) -> Option<std::net::SocketA
             None
         }
     }
+}
+
+#[cfg(not(feature = "docker"))]
+fn session_s3_address(_config: &Config, _subnet: &str) -> Option<std::net::SocketAddr> {
+    None
 }
 
 /// What a second S3 listener on the session bridge needs, taken before the node

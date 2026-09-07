@@ -1255,7 +1255,7 @@ impl ExecutorBackend for DockerBackend {
                 "backend extension `{extension}` is not supported by the docker backend"
             )));
         }
-        let plan = (!spec.inputs.is_empty() || !spec.output_paths.is_empty())
+        let plan = (spec.session || !spec.inputs.is_empty() || !spec.output_paths.is_empty())
             .then(|| ArchivePlan::new(spec))
             .transpose()?;
         let name = spec.attempt.external_name();
@@ -2565,6 +2565,20 @@ mod tests {
         assert_eq!(plan.directories[Path::new("scratch")], 0o755);
         assert_eq!(plan.directories[Path::new("scratch/run")], 0o777);
         assert_eq!(plan.directories[Path::new("results")], 0o777);
+    }
+
+    #[tokio::test]
+    async fn session_workdir_archive() {
+        let mut spec = TaskSpec::new(AttemptRef::new("session", 0), "session:latest");
+        spec.session = true;
+        spec.workdir = Some("/work".to_string());
+        let plan = ArchivePlan::new(&spec).unwrap();
+        let bytes = collect_archive(&plan, &plan.directories, MAX_TRANSFER_BYTES)
+            .await
+            .unwrap();
+        let found = read_entries(bytes);
+        assert!(found[Path::new("work")].0.is_dir());
+        assert_eq!(found[Path::new("work")].1 & 0o777, 0o777);
     }
 
     #[tokio::test]

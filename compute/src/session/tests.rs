@@ -141,6 +141,32 @@ async fn truncates_cell_output() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn rerun_resets_output() {
+    let (session, _channel) = ready(600_000);
+    session.submit_cell("c1", "first").unwrap();
+    session.apply(HelperEvent::Output {
+        cell_id: "c1".to_string(),
+        output: json!({"output_type": "stream", "name": "stdout", "text": "x".repeat(1024 * 1024)}),
+    });
+    session.apply(HelperEvent::Cell {
+        cell_id: "c1".to_string(),
+        state: "done".to_string(),
+        execution_count: Some(1),
+    });
+    let after = session.snapshot().last_event_id;
+    session.submit_cell("c1", "second").unwrap();
+    let cell = &session.snapshot().cells[0];
+    assert_eq!(cell.execution_count, None);
+    assert_eq!(cell.started_at_ms, None);
+    assert_eq!(cell.finished_at_ms, None);
+    session.apply(HelperEvent::Output {
+        cell_id: "c1".to_string(),
+        output: json!({"output_type": "stream", "name": "stdout", "text": "second"}),
+    });
+    assert_eq!(session.cell_outputs("c1", after).1[0]["text"], "second");
+}
+
+#[tokio::test(start_paused = true)]
 async fn resumes_and_gaps() {
     // A recent resume point replays; one the ring dropped reports a gap.
     let (session, _channel) = ready(600_000);

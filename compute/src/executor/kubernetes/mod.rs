@@ -941,6 +941,9 @@ impl ExecutorBackend for KubernetesBackend {
         }
         self.remove_helpers(context).await?;
         self.remove_marker(context).await?;
+        if spec.session {
+            self.ensure_secret(context, spec).await?;
+        }
         match spec.staging_mode {
             StagingMode::Files => {
                 self.ensure_pvc(
@@ -1207,7 +1210,10 @@ impl ExecutorBackend for KubernetesBackend {
         })?;
         Ok(SessionChannel {
             input: Box::pin(input),
-            output: Box::pin(output),
+            output: Box::pin(SessionReader {
+                inner: output,
+                _process: attached,
+            }),
         })
     }
 
@@ -1439,6 +1445,14 @@ fn validate_spec(
     if spec.staging_mode == StagingMode::S3Mount && config.s3_mount_driver.is_none() {
         return Err(BackendError::InvalidSpec(
             "S3 mounts are disabled on this backend".to_string(),
+        ));
+    }
+    if spec.session
+        && spec.security.network != aruna_core::compute::NetworkAccess::Open
+        && config.s3_cidrs.is_empty()
+    {
+        return Err(BackendError::InvalidSpec(
+            "sessions require configured S3 CIDRs for S3-only networking".to_string(),
         ));
     }
     match (spec.staging_mode, spec.security.network) {
@@ -1961,6 +1975,21 @@ fn build_archive(
         }
     }
     builder.finish().map_err(io_error)
+}
+
+struct SessionReader<R> {
+    inner: R,
+    _process: kube::api::AttachedProcess,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for SessionReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
 }
 
 struct ExactReader<R> {
@@ -2528,6 +2557,20 @@ mod tests {
         let value = serde_json::to_value(patch).unwrap();
         assert_eq!(value[0]["op"], "test");
         assert_eq!(value[0]["path"], "/metadata/uid");
+    }
+
+    #[test]
+    fn session_requires_egress() {
+        let mut spec = TaskSpec::new(context().attempt, "session:latest");
+        spec.session = true;
+        let mut config = test_config();
+        config.s3_cidrs.clear();
+        assert!(validate_spec(&context(), &spec, &config).is_err());
+        config.s3_cidrs.push("10.0.0.0/24".to_string());
+        assert!(validate_spec(&context(), &spec, &config).is_ok());
+        config.s3_cidrs.clear();
+        spec.security.network = aruna_core::compute::NetworkAccess::Open;
+        assert!(validate_spec(&context(), &spec, &config).is_ok());
     }
 
     #[test]

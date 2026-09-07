@@ -665,7 +665,12 @@ impl Inner {
             CellPhase::Done | CellPhase::Error | CellPhase::Interrupted => {
                 record.finished_at_ms = Some(now)
             }
-            CellPhase::Queued => {}
+            CellPhase::Queued => {
+                record.execution_count = None;
+                record.started_at_ms = None;
+                record.finished_at_ms = None;
+                record.budget = CellBudget::default();
+            }
         }
     }
 }
