@@ -32,7 +32,7 @@ Aruna is a federated peer-to-peer data orchestration engine that enables organiz
 - **Standardized metadata**: Metadata is stored as [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD enabling rich, interoperable descriptions of datasets, files, and processes.
 - **Powerful metadata manipulation**: RO-Crates can be created, edited and viewed through SPARQL queries and updates.
 - **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering.
-- **Built-in replication and synchronization**: Metadata and data are replicated across nodes with automatic conflict resolution.
+- **Built-in replication and synchronization**: Metadata edits converge across holders. Blob copies move through explicit copy or replication requests; each node owns its S3 keys, versions, and current heads.
 - **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting.
 - **AI assistant tools**: Authenticated [MCP](https://modelcontextprotocol.io/) access to Aruna context, data, metadata, and compute operations.
 - **Easy deployment**: Run a node as a single binary or deploy a multi-node cluster.
@@ -81,7 +81,7 @@ The quickest way to try Aruna is a local 3-node demo deployment.
 
 - `curl` (`ss` for cluster setup)
 - `docker`
-- `docker-compose`
+- Docker Compose v2 (`docker compose`)
 - `just` (optional, for convenience)
 
 ### Run a single node with an external identity provider
@@ -113,7 +113,7 @@ This demo deployment:
 
 - builds the workspace in release mode
 - launches 3 local Aruna nodes
-- waits for readiness at `http://127.0.0.1:<port>/swagger-ui`
+- waits for `/readyz` on each node's ops port
 - writes per-node logs, `summary.txt` and a private `credentials.txt` to `target/test-deploy/`
 - prints an `ADMIN_TOKEN=...` line for use in authenticated API calls during the session
 - prints a summary listing every node's API, portal, S3 and ops URLs next to the test logins
@@ -121,6 +121,13 @@ This demo deployment:
 `just preview` additionally serves the portal. The portal has its own listener,
 so each node exposes the SPA on a separate port from the REST API; the REST port
 redirects `/` to the Swagger UI.
+
+Docker images use the same website build: stage its `dist/` contents in the
+ignored `.portal-embed/` directory before building, or set the
+`PORTAL_EMBED_DIR` build argument to another staged directory in the build context.
+The Dockerfile copies those assets to `/run/portal`; without staged assets the
+image is headless. Portal source belongs in the separate website repository,
+not a second maintained bundle under `docker/`.
 
 Useful overrides:
 
@@ -156,7 +163,7 @@ The default example configuration exposes:
 
 ## State And Onboarding
 
-A node started without an `ONBOARDING_SECRET` initializes a new realm on first boot and persists its identity under `STORAGE_PATH`. When this happens, the first management node also logs an initial local onboarding secret for the new realm.
+A node started without an `ONBOARDING_SECRET` initializes a new realm on first boot and persists its identity under `STORAGE_PATH`. It does not log the initial administrator secret. The local deployment scripts stop the node and use `aruna-doctor recover-admin` against its database to mint a secret for the initial administrator claim.
 
 Additional nodes join an existing realm by setting `ONBOARDING_SECRET` on their first boot.
 
@@ -172,13 +179,14 @@ from `ARUNA_COMPUTE_DOCKER_SESSION_SUBNET` (default `172.30.255.0/24`). The netw
 route, and the node serves S3 on the bridge's gateway address, the first host address of that
 subnet, on the port from `S3_ADDRESS`.
 
-That address is only reachable from a session container. No other service on this host may listen on
-`0.0.0.0` on the same port, because it would answer session traffic instead of the node. Pick a
-subnet that does not overlap any network this host already uses.
+The bridge gives session containers a host-side S3 endpoint. It does not isolate other host services
+that bind that address or all interfaces. Restrict those listeners appropriately, and keep the S3
+port free on the bridge gateway. Pick a subnet that does not overlap an existing host network.
 
 Kubernetes keeps its existing S3-only network policy, and Apptainer keeps the host network. On
-Kubernetes the workload service account additionally needs the `create` verb on `pods/exec`: the
-node talks to a session's kernel through an exec into the running pod.
+Kubernetes the Aruna node's controller service account needs the `create` verb on `pods/exec`:
+the node talks to a session's kernel through an exec into the running pod. The task workload
+service account stays unprivileged, with its token unmounted.
 
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
