@@ -2,17 +2,18 @@ use std::collections::BTreeSet;
 
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{AuthContext, Permission, RealmId, blob_object_permission_path};
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, NodeId};
 use serde_json::Value as JsonValue;
 
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
+use crate::blob_holders::GetBlobHoldersOperation;
+use crate::driver::{DriverContext, drive, drive_until};
+use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::export::{EntityIdentity, entity_identity};
-use crate::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::replication::location_summary::LocationSummaryOperation;
+use crate::replication::protocol::LocationSummaryRequest;
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 
 const FILE_TYPES: [&str; 4] = [
     "File",
@@ -30,10 +31,17 @@ const MAX_ENTITY_PATHS: usize = 16;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestrictedFile {
     pub entity_id: String,
+    pub group_id: Option<GroupId>,
     /// The object's permission path, so a grant can name exactly this object.
     pub permission_path: Option<String>,
     pub bucket: Option<String>,
     pub key: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RestrictedFilesPreview {
+    pub files: Vec<RestrictedFile>,
+    pub complete: bool,
 }
 
 struct ObjectPath {
@@ -43,6 +51,11 @@ struct ObjectPath {
     path: String,
 }
 
+struct ResolvedPaths {
+    paths: Vec<ObjectPath>,
+    complete: bool,
+}
+
 /// Lists the draft's Aruna data entities that anonymous READ would not reach,
 /// so a dataset about to be published as public can warn about them. Resolution
 /// only follows paths the caller may read; nothing about a foreign object other
@@ -50,91 +63,184 @@ struct ObjectPath {
 pub async fn restricted_files(
     context: &DriverContext,
     realm_id: RealmId,
+    node_id: NodeId,
     auth: &AuthContext,
     rocrate: &JsonValue,
-) -> Result<Vec<RestrictedFile>, MetadataError> {
+) -> Result<RestrictedFilesPreview, MetadataError> {
     let anonymous = AuthContext::anonymous(realm_id);
+    let files = draft_files(rocrate);
+    let mut complete = files.len() <= MAX_DRAFT_FILES;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let remote_possible = drive(GetRealmConfigOperation::new(realm_id), context)
+        .await
+        .map_or(true, |config| {
+            !config.has_node(node_id)
+                || config
+                    .nodes
+                    .iter()
+                    .any(|node| node.node_id != node_id.to_string())
+        });
     let mut restricted = Vec::new();
-    for (entity_id, content_urls) in draft_files(rocrate) {
+    for (entity_id, content_urls) in files.into_iter().take(MAX_DRAFT_FILES) {
+        if tokio::time::Instant::now() >= deadline {
+            complete = false;
+            break;
+        }
         let identity = entity_identity(&entity_id, &content_urls);
-        let paths = entity_paths(context, realm_id, &identity).await?;
-        if paths.is_empty() {
+        if identity.exact.is_none()
+            && identity.hash.is_none()
+            && !std::iter::once(&entity_id)
+                .chain(&content_urls)
+                .any(|value| value.starts_with("s3://"))
+        {
             continue;
         }
+        let resolved =
+            match entity_paths(context, realm_id, node_id, auth, &identity, deadline).await {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+        if resolved.paths.is_empty() {
+            complete = false;
+            continue;
+        }
+        let mut checked = resolved.complete;
         let mut visible = None;
         let mut public = false;
-        for path in paths {
-            let evaluator = PolicyEvaluator::load(context, realm_id, Some(path.group_id))
-                .await
-                .map_err(policy_failure)?;
-            if !readable(context, &evaluator, auth, &path).await? {
-                continue;
+        for path in resolved.paths {
+            match readable(context, realm_id, &anonymous, &path).await {
+                Ok(true) => {
+                    public = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(_) => checked = false,
             }
-            if readable(context, &evaluator, &anonymous, &path).await? {
-                public = true;
-                break;
-            }
-            if visible.is_none() {
-                visible = Some(path);
+            match readable(context, realm_id, auth, &path).await {
+                Ok(true) if visible.is_none() => visible = Some(path),
+                Ok(_) => {}
+                Err(_) => checked = false,
             }
         }
         if public {
             continue;
         }
+        if remote_possible && let Some(hash) = identity.hash {
+            checked &= matches!(
+                drive_until(GetBlobHoldersOperation::new(hash, realm_id, node_id), context, deadline).await,
+                Ok(holders) if holders.is_empty()
+            );
+        }
+        if !checked {
+            complete = false;
+            continue;
+        }
         restricted.push(RestrictedFile {
             entity_id,
+            group_id: visible.as_ref().map(|path| path.group_id),
             permission_path: visible.as_ref().map(|path| path.path.clone()),
             bucket: visible.as_ref().map(|path| path.bucket.clone()),
             key: visible.as_ref().map(|path| path.key.clone()),
         });
     }
-    Ok(restricted)
+    Ok(RestrictedFilesPreview {
+        files: restricted,
+        complete,
+    })
 }
 
 async fn entity_paths(
     context: &DriverContext,
     realm_id: RealmId,
+    node_id: NodeId,
+    auth: &AuthContext,
     identity: &EntityIdentity,
-) -> Result<Vec<ObjectPath>, MetadataError> {
+    deadline: tokio::time::Instant,
+) -> Result<ResolvedPaths, MetadataError> {
     let mut paths = Vec::new();
+    let mut complete = true;
     let mut seen = BTreeSet::new();
     if let Some(exact) = identity
         .exact
         .as_ref()
         .filter(|exact| exact.realm_id == realm_id)
-        && let Some(group_id) = bucket_group(context, &exact.bucket).await?
+        .filter(|exact| exact.node_id == node_id)
     {
-        let path = blob_object_permission_path(
-            realm_id,
-            group_id,
-            exact.node_id,
-            &exact.bucket,
-            &exact.key,
-        );
-        seen.insert(path.clone());
-        paths.push(ObjectPath {
-            group_id,
-            bucket: exact.bucket.clone(),
-            key: exact.key.clone(),
-            path,
-        });
+        for principal in [&AuthContext::anonymous(realm_id), auth] {
+            let summary = drive_until(
+                LocationSummaryOperation::new_local(
+                    node_id,
+                    LocationSummaryRequest {
+                        realm_id,
+                        bucket: exact.bucket.clone(),
+                        key: exact.key.clone(),
+                        version_id: Some(exact.version),
+                        auth_context: principal.clone(),
+                    },
+                )
+                .with_policy(true),
+                context,
+                deadline,
+            )
+            .await;
+            if let Ok(summary) = summary
+                && summary.summary.version_id == Some(exact.version)
+                && summary.summary.materialized
+                && summary.summary.blob_size.is_some()
+                && let Some(group_id) = summary.summary.group_id
+            {
+                let path = blob_object_permission_path(
+                    realm_id,
+                    group_id,
+                    node_id,
+                    &exact.bucket,
+                    &exact.key,
+                );
+                seen.insert(path.clone());
+                paths.push(ObjectPath {
+                    group_id,
+                    bucket: exact.bucket.clone(),
+                    key: exact.key.clone(),
+                    path,
+                });
+                break;
+            }
+        }
+        if paths.is_empty() {
+            complete = false;
+        }
+    }
+    if identity
+        .exact
+        .as_ref()
+        .is_some_and(|exact| exact.node_id != node_id || exact.realm_id != realm_id)
+    {
+        complete = false;
     }
     let hash = identity
         .hash
         .filter(|_| identity.hash_realm.is_none_or(|realm| realm == realm_id));
     let Some(hash) = hash else {
-        return Ok(paths);
+        return Ok(ResolvedPaths { paths, complete });
     };
     let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), context)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     for alias in aliases.iter().filter(|alias| alias.realm_id == realm_id) {
-        if paths.len() >= MAX_ENTITY_PATHS {
-            break;
+        if alias.node_id != node_id {
+            complete = false;
+            continue;
         }
         let path = alias.permission_path();
         if !seen.insert(path.clone()) {
             continue;
+        }
+        if paths.len() >= MAX_ENTITY_PATHS {
+            complete = false;
+            break;
         }
         paths.push(ObjectPath {
             group_id: alias.group_id,
@@ -143,55 +249,32 @@ async fn entity_paths(
             path,
         });
     }
-    Ok(paths)
-}
-
-async fn bucket_group(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Option<GroupId>, MetadataError> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
-        Ok(Some(Ok(info))) => Ok(Some(info.group_id)),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => Ok(None),
-        Ok(Some(Err(error))) => Err(MetadataError::Backend(error.to_string())),
-        Err(error) => Err(MetadataError::Backend(error.to_string())),
-    }
+    Ok(ResolvedPaths { paths, complete })
 }
 
 async fn readable(
     context: &DriverContext,
-    evaluator: &PolicyEvaluator,
+    realm_id: RealmId,
     auth: &AuthContext,
     path: &ObjectPath,
-) -> Result<bool, MetadataError> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: path.path.clone(),
-            required_permission: Permission::READ,
-        }),
+) -> Result<bool, AuthorizeError> {
+    match authorize(
         context,
-    )
-    .await
-    .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    if !allowed {
-        return Ok(false);
-    }
-    let request = policy_request_with(
+        realm_id,
+        auth,
         &path.path,
         &Permission::READ,
-        Some(auth),
         PolicyRequestExtras::operation("s3.GetObject"),
-    );
-    match evaluator.evaluate(&request) {
+    )
+    .await
+    {
         Ok(()) => Ok(true),
-        Err(PolicyEnforcementError::Denied { .. }) => Ok(false),
-        Err(error) => Err(policy_failure(error)),
+        Err(
+            AuthorizeError::PermissionDenied
+            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+        ) => Ok(false),
+        Err(error) => Err(error),
     }
-}
-
-fn policy_failure(error: PolicyEnforcementError) -> MetadataError {
-    MetadataError::Backend(error.to_string())
 }
 
 fn draft_files(rocrate: &JsonValue) -> Vec<(String, Vec<String>)> {
@@ -213,7 +296,7 @@ fn draft_files(rocrate: &JsonValue) -> Vec<(String, Vec<String>)> {
                 )
             })
         })
-        .take(MAX_DRAFT_FILES)
+        .take(MAX_DRAFT_FILES + 1)
         .collect()
 }
 
@@ -264,6 +347,7 @@ mod tests {
     struct Fixture {
         context: DriverContext,
         realm_id: RealmId,
+        node_id: NodeId,
         owner: AuthContext,
         hash: [u8; 32],
         permission_path: String,
@@ -367,6 +451,7 @@ mod tests {
         Fixture {
             context,
             realm_id,
+            node_id,
             owner: AuthContext {
                 user_id: owner,
                 realm_id,
@@ -400,17 +485,18 @@ mod tests {
         let restricted = restricted_files(
             &fixture.context,
             fixture.realm_id,
+            fixture.node_id,
             &fixture.owner,
             &draft(fixture.hash),
         )
         .await
         .unwrap();
 
-        assert_eq!(restricted.len(), 1);
-        assert_eq!(restricted[0].bucket.as_deref(), Some(BUCKET));
-        assert_eq!(restricted[0].key.as_deref(), Some(KEY));
+        assert_eq!(restricted.files.len(), 1);
+        assert_eq!(restricted.files[0].bucket.as_deref(), Some(BUCKET));
+        assert_eq!(restricted.files[0].key.as_deref(), Some(KEY));
         assert_eq!(
-            restricted[0].permission_path.as_deref(),
+            restricted.files[0].permission_path.as_deref(),
             Some(fixture.permission_path.as_str())
         );
     }
@@ -422,13 +508,14 @@ mod tests {
         let restricted = restricted_files(
             &fixture.context,
             fixture.realm_id,
+            fixture.node_id,
             &fixture.owner,
             &draft(fixture.hash),
         )
         .await
         .unwrap();
 
-        assert!(restricted.is_empty());
+        assert!(restricted.files.is_empty());
     }
 
     #[tokio::test]
@@ -444,16 +531,17 @@ mod tests {
         let restricted = restricted_files(
             &fixture.context,
             fixture.realm_id,
+            fixture.node_id,
             &stranger,
             &draft(fixture.hash),
         )
         .await
         .unwrap();
 
-        assert_eq!(restricted.len(), 1);
-        assert!(restricted[0].permission_path.is_none());
-        assert!(restricted[0].bucket.is_none());
-        assert!(restricted[0].key.is_none());
+        assert_eq!(restricted.files.len(), 1);
+        assert!(restricted.files[0].permission_path.is_none());
+        assert!(restricted.files[0].bucket.is_none());
+        assert!(restricted.files[0].key.is_none());
     }
 
     #[tokio::test]
@@ -463,13 +551,15 @@ mod tests {
         let restricted = restricted_files(
             &fixture.context,
             fixture.realm_id,
+            fixture.node_id,
             &fixture.owner,
             &draft([99; 32]),
         )
         .await
         .unwrap();
 
-        assert!(restricted.is_empty());
+        assert!(restricted.files.is_empty());
+        assert!(!restricted.complete);
     }
 
     #[test]

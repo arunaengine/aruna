@@ -51,7 +51,9 @@ use aruna_operations::metadata::profile_validation::{
     MetadataProfilePreview, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
     preview_submission as run_preview_submission,
 };
-use aruna_operations::metadata::public_preview::restricted_files as run_restricted_files;
+use aruna_operations::metadata::public_preview::{
+    RestrictedFilesPreview, restricted_files as run_restricted_files,
+};
 use aruna_operations::notifications::watch::emit::emit_metadata_created;
 use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::update_metadata_document::{
@@ -182,6 +184,9 @@ pub struct ProfileValidationPreviewResponse {
     /// request set `public`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restricted_files: Vec<RestrictedFileResponse>,
+    /// Whether every relevant file could be checked. Present for public drafts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restricted_files_complete: Option<bool>,
 }
 
 /// A draft data entity that a public dataset would not expose. The location
@@ -189,6 +194,8 @@ pub struct ProfileValidationPreviewResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RestrictedFileResponse {
     pub entity_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     /// The object's permission path, ready to grant READ on exactly this object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_path: Option<String>,
@@ -217,7 +224,25 @@ impl From<MetadataProfilePreview> for ProfileValidationPreviewResponse {
                 .map(Into::into)
                 .collect(),
             restricted_files: Vec::new(),
+            restricted_files_complete: None,
         }
+    }
+}
+
+impl ProfileValidationPreviewResponse {
+    pub(crate) fn set_restricted(&mut self, preview: RestrictedFilesPreview) {
+        self.restricted_files_complete = Some(preview.complete);
+        self.restricted_files = preview
+            .files
+            .into_iter()
+            .map(|file| RestrictedFileResponse {
+                entity_id: file.entity_id,
+                group_id: file.group_id.map(|id| id.to_string()),
+                permission_path: file.permission_path,
+                bucket: file.bucket,
+                key: file.key,
+            })
+            .collect();
     }
 }
 
@@ -1301,7 +1326,10 @@ metadata path, because the group's own Profiles resolve for it.
   permission path, so READ can be granted on exactly that object. Resolution only follows paths
   the caller may read, so an object the caller cannot read is reported by entity id alone,
   without `permission_path`, `bucket` or `key`. The list is advisory: it never changes
-  `accepted`, and it stays empty when `public` is false."#,
+  `accepted`, and it stays empty when `public` is false. `restricted_files_complete` is false
+  when limits, remote-only objects or unavailable authorization prevent a complete check;
+  an empty list then does not establish public readability. `group_id` identifies the owning
+  group for each caller-readable permission path."#,
     request_body(content = ProfileValidationPreviewRequest,
         example = json!({
             "group_id": "01JGROUP00000000000000000",
@@ -1354,11 +1382,13 @@ metadata path, because the group's own Profiles resolve for it.
                 "restricted_files": [
                     {
                         "entity_id": "https://w3id.org/aruna/data/0000000000000000000000000000000000000000000000000000000000000000",
+                        "group_id": "01JGROUP00000000000000000",
                         "permission_path": "/01JREALM00000000000000000/g/01JGROUP00000000000000000/data/01JNODE000000000000000000/reads/raw/one.csv",
                         "bucket": "reads",
                         "key": "raw/one.csv"
                     }
-                ]
+                ],
+                "restricted_files_complete": true
             })),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -1390,18 +1420,17 @@ pub async fn preview_profile_validation(
         .map_err(map_metadata_error)?;
     let mut response = ProfileValidationPreviewResponse::from(preview);
     if request.public {
-        response.restricted_files =
-            run_restricted_files(&context, state.get_realm_id(), &auth, &request.rocrate)
-                .await
-                .map_err(map_metadata_error)?
-                .into_iter()
-                .map(|file| RestrictedFileResponse {
-                    entity_id: file.entity_id,
-                    permission_path: file.permission_path,
-                    bucket: file.bucket,
-                    key: file.key,
-                })
-                .collect();
+        response.set_restricted(
+            run_restricted_files(
+                &context,
+                state.get_realm_id(),
+                state.get_node_id(),
+                &auth,
+                &request.rocrate,
+            )
+            .await
+            .map_err(map_metadata_error)?,
+        );
     }
     Ok((StatusCode::OK, Json(response)))
 }
@@ -4840,7 +4869,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(preview.restricted_files.len(), 1);
+        assert_eq!(preview.restricted_files_complete, Some(true));
         let restricted = &preview.restricted_files[0];
+        assert_eq!(restricted.group_id, Some(test.group_id.to_string()));
         assert_eq!(restricted.bucket.as_deref(), Some(PREVIEW_BUCKET));
         assert_eq!(restricted.key.as_deref(), Some(PREVIEW_KEY));
         assert_eq!(
@@ -4877,6 +4908,7 @@ mod tests {
         .unwrap();
 
         assert!(preview.restricted_files.is_empty());
+        assert_eq!(preview.restricted_files_complete, Some(true));
     }
 
     #[tokio::test]
@@ -4897,6 +4929,7 @@ mod tests {
         .unwrap();
 
         assert!(preview.restricted_files.is_empty());
+        assert_eq!(preview.restricted_files_complete, None);
     }
 
     #[tokio::test]

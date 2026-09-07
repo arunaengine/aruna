@@ -29,6 +29,7 @@ use aruna_operations::device::list_drafts::ListDraftsOperation;
 use aruna_operations::device::repository::{IntakeEntry, IntakeState};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile_validation::preview_submission;
+use aruna_operations::metadata::public_preview::restricted_files;
 
 use super::require_owner;
 
@@ -387,7 +388,9 @@ for.
   against the copy this device already holds, so an unknown Profile reports as unevaluated rather
   than failing.
 - `group_id` names the group the draft would be saved in; the owner needs READ on that group's
-  metadata, and a Profile of that group then resolves. Without it only public Profiles resolve."#,
+  metadata, and a Profile of that group then resolves. Without it only public Profiles resolve.
+- `public` checks file readability for everyone. `restricted_files_complete` is false when
+  remote objects or unavailable state prevent a complete check; this never changes acceptance."#,
     request_body(
         content = ProfileValidationPreviewRequest,
         description = "The RO-Crate JSON-LD to evaluate",
@@ -431,7 +434,21 @@ async fn preview_draft(
     let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    Ok((StatusCode::OK, Json(preview.into())))
+    let mut response = ProfileValidationPreviewResponse::from(preview);
+    if request.public {
+        response.set_restricted(
+            restricted_files(
+                &state.get_ctx(),
+                state.get_realm_id(),
+                state.get_node_id(),
+                &auth,
+                &request.rocrate,
+            )
+            .await
+            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+        );
+    }
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[cfg(test)]
@@ -450,6 +467,7 @@ mod tests {
     use aruna_operations::device::repository::{IntakeEntry, IntakeState};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_operations::metadata::MetadataHandle;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::extract::State;
@@ -464,13 +482,22 @@ mod tests {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        let metadata = MetadataHandle::new(
+            &dir.path().join("metadata"),
+            node_id,
+            storage.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let state = Arc::new(
             ServerState::new(
                 Arc::new(DriverContext {
                     storage_handle: storage,
                     net_handle: None,
                     blob_handle: None,
-                    metadata_handle: None,
+                    metadata_handle: Some(metadata),
                     task_handle: Some(TaskHandle::new()),
                     compute_handle: None,
                 }),
@@ -533,6 +560,33 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn preview_marks_unchecked() {
+        let (_dir, state, auth) = user_node().await;
+        let file = format!("https://w3id.org/aruna/data/{}", "09".repeat(32));
+        let (_, Json(preview)) = preview_draft(
+            State(state), Extension(Some(auth)), Json(ProfileValidationPreviewRequest {
+                rocrate: serde_json::json!({
+                    "@context": "https://w3id.org/ro/crate/1.3/context",
+                    "@graph": [
+                        {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+                         "about": {"@id": "./"}, "conformsTo": {"@id": "https://w3id.org/ro/crate/1.3"}},
+                        {"@id": "./", "@type": "Dataset", "name": "Draft", "description": "Draft",
+                         "datePublished": "2026-09-08", "hasPart": {"@id": file}},
+                        {"@id": file, "@type": "File"}
+                    ]
+                }),
+                group_id: None, public: true,
+            }),
+        ).await.unwrap();
+        assert_eq!(preview.restricted_files_complete, Some(false));
+        assert!(preview.restricted_files.is_empty());
+        assert_eq!(
+            serde_json::to_value(preview).unwrap()["restricted_files_complete"],
+            false
+        );
     }
 
     fn entry() -> IntakeEntry {
