@@ -1869,6 +1869,37 @@ fn decode_report_row(
             }
             serde_json::to_value(row)
         }
+        JobKind::Execution => {
+            use aruna_core::structs::{SessionReportDetail, SessionReportRow};
+
+            let row: SessionReportRow = postcard::from_bytes(value)
+                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            if row.entry_key.as_bytes() != entry_key {
+                return Err(ServerError::InternalError(
+                    "stored session report entry key does not match its row".to_string(),
+                ));
+            }
+            let (code, message) = match &row.detail {
+                SessionReportDetail::Input {
+                    dest_key,
+                    bytes,
+                    version_id,
+                    ..
+                } => (
+                    "input",
+                    format!("{dest_key} ({bytes} bytes, source version {version_id})"),
+                ),
+                SessionReportDetail::Touched {
+                    bucket,
+                    key,
+                    operation,
+                } => (operation.as_str(), format!("{bucket}/{key}")),
+                SessionReportDetail::End { reason } => ("ended", reason.clone()),
+            };
+            Ok(
+                serde_json::json!({ "entry_key": row.entry_key, "code": code, "message": message, "detail": row.detail }),
+            )
+        }
         _ => return Err(ServerError::NotFound),
     };
     row.map_err(|error| ServerError::InternalError(error.to_string()))
@@ -1878,14 +1909,14 @@ fn decode_report_row(
     get,
     path = "/compute/jobs/{job_id}/report",
     tag = "compute/jobs",
-    summary = "Page a finished RO-Crate job's report",
-    description = r#"Pages the frozen per-entry report of a finished RO-Crate import or export job.
+    summary = "Page a finished job's report",
+    description = r#"Pages the frozen per-entry report of a finished RO-Crate import, export or notebook session job.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
 Self-scoped like the status read: a job submitted by somebody else answers 404.
 
 **Behavior**
-- Only RO-Crate import and export jobs keep a per-entry report; every other kind answers 404.
+- RO-Crate imports, exports and notebook sessions keep per-entry reports; other jobs answer 404.
 - The report exists only once the job is terminal, so while it is still running the answer is a 404
   carrying a pending marker with the job's current state, and the caller should poll.
 - It is then frozen and immutable, and disappears again once the job's retention window passes.
@@ -2792,6 +2823,33 @@ mod tests {
                 validation: None,
             },
         }
+    }
+
+    #[test]
+    fn decodes_session_report() {
+        use aruna_core::structs::{SessionReportDetail, SessionReportRow};
+
+        let row = SessionReportRow {
+            entry_key: "input/0000".to_string(),
+            detail: SessionReportDetail::Input {
+                dest_key: "data/input.txt".to_string(),
+                bytes: 12,
+                blake3: "hash".to_string(),
+                source_node_id: "source".to_string(),
+                version_id: "source-version".to_string(),
+            },
+        };
+        let bytes = postcard::to_allocvec(&row).unwrap();
+        let decoded = decode_report_row(JobKind::Execution, b"input/0000", &bytes).unwrap();
+        assert_eq!(decoded["code"], "input");
+        assert!(
+            decoded["message"]
+                .as_str()
+                .unwrap()
+                .contains("source-version")
+        );
+        assert_eq!(decoded["detail"]["Input"]["version_id"], "source-version");
+        assert!(decode_report_row(JobKind::Execution, b"other", &bytes).is_err());
     }
 
     #[test]

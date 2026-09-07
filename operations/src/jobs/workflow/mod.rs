@@ -2961,13 +2961,19 @@ mod tests {
         let (ctx, net, registry) = session_context(storage.clone()).await;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
+        crate::jobs::store::mutate_job(&storage, job_id, |record| {
+            record.payload = JobPayload::Execution(session_spec(None));
+            Ok(crate::jobs::store::JobMutation::Persist)
+        })
+        .await
+        .unwrap();
         transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::Waiting);
 
         let supervisor = tokio::spawn(supervise_and_finalize(
-            ctx,
+            ctx.clone(),
             job_id,
             token,
             backend.clone(),
@@ -2986,6 +2992,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Succeeded);
+        assert!(stored.report_digest.is_some());
+        let report = crate::jobs::service::read_owned_report(
+            &ctx,
+            stored.created_by,
+            job_id,
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let crate::jobs::service::JobReportLookup::Ready { rows, .. } = report else {
+            panic!("ended session report must be readable");
+        };
+        assert_eq!(rows.len(), 1);
+        let row: SessionReportRow = postcard::from_bytes(&rows[0].1).unwrap();
+        assert_eq!(
+            row.detail,
+            SessionReportDetail::End {
+                reason: "ended".to_string()
+            }
+        );
         net.shutdown().await;
     }
 

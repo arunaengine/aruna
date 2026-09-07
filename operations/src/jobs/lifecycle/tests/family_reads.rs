@@ -136,7 +136,43 @@ async fn resolves_session_alias() {
     assert_eq!(record.job_id, spec.job_id);
     assert_eq!(record.owner_node_id, family.target.public());
     assert_eq!(physical, Some(receipt.physical_job_id));
+    let now = aruna_core::util::unix_timestamp_millis();
+    let mut physical = aruna_core::structs::JobRecord::new(
+        receipt.physical_job_id,
+        aruna_core::structs::JobPayload::Execution(spec.payload.clone()),
+        spec.created_by,
+        family.target.public(),
+        now,
+        now,
+        None,
+    );
+    physical.state = aruna_core::structs::JobState::Succeeded;
+    physical.finished_at_ms = Some(now);
+    physical.report_digest = Some([4; 32]);
+    crate::jobs::store::insert_job(&ctx.storage_handle, &physical)
+        .await
+        .unwrap();
+    let report = crate::jobs::service::read_report_routed(
+        &ctx,
+        spec.created_by,
+        spec.job_id,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report, crate::jobs::service::JobReportLookup::Ready { job, .. }
+        if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32])
+    );
     let stranger = aruna_core::types::UserId::new(ulid::Ulid(42), REALM);
+    assert!(matches!(
+        crate::jobs::service::read_report_routed(&ctx, stranger, spec.job_id, None, None, 1, None)
+            .await,
+        Ok(crate::jobs::service::JobReportLookup::NotFound)
+    ));
     assert!(matches!(
         session_job(&ctx, stranger, spec.job_id).await,
         Err(JobRouteError::NotFound)

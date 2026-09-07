@@ -43,6 +43,7 @@ use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 
 use super::lifecycle::cancel::cancel_family;
+use super::lifecycle::ids::session_of;
 use super::lifecycle::routing::{family_of_alias, family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
@@ -764,6 +765,7 @@ pub async fn read_owned_report(
     let key_limit = match &record.payload {
         JobPayload::ImportRoCrate(spec) => spec.limits.key_bytes,
         JobPayload::ExportRoCrate(spec) => spec.limits.key_bytes,
+        JobPayload::Execution(spec) if session_of(spec).is_some() => 64,
         _ => return Ok(JobReportLookup::NotFound),
     };
     if last_key
@@ -781,7 +783,7 @@ pub async fn read_owned_report(
     }
     let report_digest = record
         .report_digest
-        .ok_or_else(|| "terminal RO-Crate job is missing its report digest".to_string())?;
+        .ok_or_else(|| "terminal job is missing its report digest".to_string())?;
     if expected_digest.is_some_and(|expected| expected != report_digest) {
         return Ok(JobReportLookup::CursorConflict);
     }
@@ -838,6 +840,16 @@ pub async fn read_report_routed(
     limit: usize,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
+    let job_id = if family_of_alias(context, job_id).await?.is_some() {
+        match super::lifecycle::routing::session_job(context, user_id, job_id).await {
+            Ok((_, Some(physical))) => physical,
+            Ok((record, None)) => return Ok(JobReportLookup::Pending(record.state)),
+            Err(JobRouteError::NotFound) => return Ok(JobReportLookup::NotFound),
+            Err(error) => return Err(error),
+        }
+    } else {
+        job_id
+    };
     let Some(net) = context.net_handle.as_ref() else {
         return read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
             .await
@@ -1297,7 +1309,7 @@ fn report_job_matches(
 ) -> bool {
     job.job_id == job_id
         && job.created_by == user_id
-        && job.kind.is_report()
+        && (job.kind.is_report() || job.kind == JobKind::Execution)
         && expected_digest.is_none_or(|digest| digest == job.report_digest)
 }
 
