@@ -331,9 +331,8 @@ impl ArunaS3Service {
     /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes`
     /// from the realm quota config, mirroring the create_group pattern of reading
     /// realm config at the request surface. `None` means the group is unlimited.
-    /// Attributes one request made with a session's own credential to its job,
-    /// so the job report says what data the session used. Every other
-    /// credential is ignored.
+    /// Attributes one authorized request made with a session's own credential
+    /// to its job. Every other credential is ignored.
     fn record_touch(&self, access_key: &str, bucket: &str, key: &str, operation: &str) {
         let Some(job_id) = credential_job_id(access_key) else {
             return;
@@ -1603,12 +1602,6 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         validate_object_key(&req.input.key)?;
-        self.record_touch(
-            &user_access.access_key,
-            &req.input.bucket,
-            &req.input.key,
-            "write",
-        );
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let trailer_algorithm = declared_trailer_algorithm(
             &req.headers,
@@ -1686,6 +1679,12 @@ impl S3 for ArunaS3Service {
             trailing_headers.as_ref(),
             &result.location.hashes,
         )?;
+        self.record_touch(
+            &user_access.access_key,
+            &replication_bucket,
+            &replication_key,
+            "write",
+        );
 
         self.put_object_response(
             &checksum_request,
@@ -2362,7 +2361,6 @@ impl S3 for ArunaS3Service {
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket;
         let key = req.input.key;
-        self.record_touch(&user_access.access_key, &bucket, &key, "read");
         let response_bucket = bucket.clone();
         let response_key = key.clone();
 
@@ -2388,6 +2386,12 @@ impl S3 for ArunaS3Service {
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to process GET request"))?;
+        self.record_touch(
+            &user_access.access_key,
+            &response_bucket,
+            &response_key,
+            "read",
+        );
 
         let version_id = result.version_id;
         let resolved_range = result.resolved_range.clone();
