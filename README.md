@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT)
 ![CI](https://github.com/arunaengine/aruna/actions/workflows/ci.yml/badge.svg)
 [![Codecov](https://codecov.io/github/arunaengine/aruna/coverage.svg?branch=main)](https://codecov.io/gh/arunaengine/aruna)
-[![dependency status](https://deps.rs/repo/github/arunaengine/aruna/status.svg)](https://deps.rs/repo/github/arunaengine/aruna)
+
 ___
 
 <p align="center">
