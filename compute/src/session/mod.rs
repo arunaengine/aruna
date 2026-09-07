@@ -1,6 +1,6 @@
-//! Interactive sessions this node runs, held in memory only. A session owns the
-//! channel to the helper inside a running attempt, the bounded event log a
-//! client resumes from, and the idle timer that ends it.
+//! Interactive sessions this node runs, in memory only. A session owns the
+//! channel to its helper, the event log a client resumes from, and its idle
+//! timer.
 
 pub mod events;
 

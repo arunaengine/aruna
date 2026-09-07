@@ -427,7 +427,7 @@ impl McpServer {
             .map_err(job_error)?;
         let position = session
             .submit_cell(&input.cell_id, &input.code)
-            .map_err(|error| bad_request(error))?;
+            .map_err(bad_request)?;
         Ok(Json(JsonPayload(json!({
             "cell_id": input.cell_id,
             "position": position,
@@ -487,7 +487,7 @@ impl McpServer {
         let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
             .await
             .map_err(job_error)?;
-        session.interrupt().map_err(|error| bad_request(error))?;
+        session.interrupt().map_err(bad_request)?;
         Ok(Json(JsonPayload(json!({ "interrupted": true }))))
     }
 

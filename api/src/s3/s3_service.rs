@@ -20,6 +20,7 @@ use crate::s3::util::{
     parse_upload_id, parse_version_id, reject_sse, s3_checksum_algorithm_from_core,
     s3_checksum_type_from_multipart, validate_object_key,
 };
+use aruna_compute::session::TouchedObject;
 use aruna_core::NodeId;
 use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -28,7 +29,7 @@ use aruna_core::structs::{
     ArunaArn, AuthContext, BlobHeadKey, BucketInfo, COMPLETION_DEADLINE_MS,
     OBJECT_CONTENT_TYPE_KEY, PathRestriction, Permission, RealmId, RoCrateLimits, SyncMode,
     SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, WatchEvent, WatchEventDetail,
-    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
+    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path, credential_job_id,
     data_watch_resource_path,
 };
 use aruna_core::types::UserId;
@@ -330,6 +331,28 @@ impl ArunaS3Service {
     /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes`
     /// from the realm quota config, mirroring the create_group pattern of reading
     /// realm config at the request surface. `None` means the group is unlimited.
+    /// Attributes one request made with a session's own credential to its job,
+    /// so the job report says what data the session used. Every other
+    /// credential is ignored.
+    fn record_touch(&self, access_key: &str, bucket: &str, key: &str, operation: &str) {
+        let Some(job_id) = credential_job_id(access_key) else {
+            return;
+        };
+        let Some(session) = self
+            .state
+            .compute_handle
+            .as_ref()
+            .and_then(|registry| registry.sessions().get(&job_id.to_string()))
+        else {
+            return;
+        };
+        session.record_touched(TouchedObject {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            operation: operation.to_string(),
+        });
+    }
+
     async fn resolve_quota_ceiling(
         &self,
         group_id: aruna_core::types::GroupId,
@@ -1580,6 +1603,12 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         validate_object_key(&req.input.key)?;
+        self.record_touch(
+            &user_access.access_key,
+            &req.input.bucket,
+            &req.input.key,
+            "write",
+        );
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let trailer_algorithm = declared_trailer_algorithm(
             &req.headers,
@@ -2333,6 +2362,7 @@ impl S3 for ArunaS3Service {
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket;
         let key = req.input.key;
+        self.record_touch(&user_access.access_key, &bucket, &key, "read");
         let response_bucket = bucket.clone();
         let response_key = key.clone();
 

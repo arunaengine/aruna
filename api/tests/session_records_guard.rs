@@ -38,7 +38,8 @@ fn sources(manifest_dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn cells_write_no_records() {
+fn cells_write_none() {
+    // Cell traffic must create no job record: the family log is capped.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut found = Vec::new();
     for path in sources(manifest_dir) {

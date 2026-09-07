@@ -10,10 +10,11 @@ use aruna_core::keyspaces::{
     JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    DEFAULT_CATCH_UP_AFTER_MS, ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate,
-    JobCancelRecord, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionResult, PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage,
-    SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+    DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionOutputRecord,
+    ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord, JobRecordEnvelope,
+    LaunchIntent, LogicalJobSpec, PhysicalExecutionResult, PhysicalExecutionState,
+    RealmConfigDocument, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
+    WitnessBudgetRecord,
 };
 use aruna_core::types::NodeId;
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
@@ -138,9 +139,10 @@ where
     Ok(Rewrites { scanned, rows })
 }
 
-/// Realm configuration documents gained the compute catch-up wait as their last
-/// value. Postcard is positional, so an older row is the current row without
-/// that trailing value and appending its default re-encodes the row.
+/// Realm configuration documents gained the compute catch-up wait and then the
+/// session idle timeout as their last values. Postcard is positional, so an
+/// older row is the current row without them and appending their defaults
+/// re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -154,10 +156,15 @@ fn realm_configs(
             continue;
         }
         let mut bytes = value.to_vec();
-        bytes.extend_from_slice(
-            &postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS)
-                .map_err(|error| decode_error(REALM_CONFIG_KEYSPACE, &key, error))?,
-        );
+        for default in [DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS] {
+            if RealmConfigDocument::from_bytes(&bytes).is_ok() {
+                break;
+            }
+            bytes.extend_from_slice(
+                &postcard::to_allocvec(&default)
+                    .map_err(|error| decode_error(REALM_CONFIG_KEYSPACE, &key, error))?,
+            );
+        }
         RealmConfigDocument::from_bytes(&bytes)
             .map_err(|error| decode_error(REALM_CONFIG_KEYSPACE, &key, error))?;
         rows.push((key.to_vec(), bytes));
@@ -346,8 +353,9 @@ mod tests {
         JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::structs::{
-        DEFAULT_CATCH_UP_AFTER_MS, ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope,
-        PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage, SubmissionId,
+        DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionUpdate, JobFamilyRecord,
+        JobRecordEnvelope, PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage,
+        SubmissionId,
     };
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -543,6 +551,10 @@ mod tests {
         assert_eq!(
             migrated.compute.catch_up_after_ms,
             DEFAULT_CATCH_UP_AFTER_MS
+        );
+        assert_eq!(
+            migrated.compute.session_idle_after_ms,
+            DEFAULT_SESSION_IDLE_AFTER_MS
         );
 
         let again = migrate_output(path.to_str().unwrap()).unwrap();

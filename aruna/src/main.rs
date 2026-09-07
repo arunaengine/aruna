@@ -633,14 +633,16 @@ async fn device_wipe_armed(wipe: Option<&Arc<DeviceWipe>>) {
     }
 }
 
-/// The address session containers reach the node's S3 plane on: the gateway of
-/// the Docker session bridge, on the configured S3 port. `None` unless this node
-/// runs the Docker executor.
-///
-/// The bridge has no external route, so this address is only reachable from a
-/// session container. No other service on this host may bind 0.0.0.0 on that
-/// port, or it would answer session traffic instead of the node.
-fn session_s3_address(config: &Config) -> Option<std::net::SocketAddr> {
+/// The session subnet an operator configured, else the default.
+fn session_subnet() -> String {
+    dotenvy::var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
+        .unwrap_or_else(|_| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string())
+}
+
+/// The gateway address of the Docker session bridge, on the configured S3 port.
+/// Only a session container reaches it, and no other service on this host may
+/// bind 0.0.0.0 on that port.
+fn session_s3_address(config: &Config, subnet: &str) -> Option<std::net::SocketAddr> {
     use aruna_compute::executor::docker::session_gateway;
 
     if dotenvy::var("ARUNA_COMPUTE_EXECUTOR")
@@ -650,15 +652,17 @@ fn session_s3_address(config: &Config) -> Option<std::net::SocketAddr> {
     {
         return None;
     }
-    let port = config
+    let main = config
         .s3_address
         .as_deref()?
         .parse::<std::net::SocketAddr>()
-        .ok()?
-        .port();
-    let subnet = dotenvy::var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
-        .unwrap_or_else(|_| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string());
-    match session_gateway(&subnet) {
+        .ok()?;
+    // A wildcard bind already answers on the gateway address.
+    if main.ip().is_unspecified() {
+        return None;
+    }
+    let port = main.port();
+    match session_gateway(subnet) {
         Ok(gateway) => Some(std::net::SocketAddr::new(gateway.into(), port)),
         Err(error) => {
             warn!(subnet = %subnet, error = %error, "Session subnet has no gateway; sessions reach no S3 endpoint");
@@ -679,7 +683,6 @@ struct SessionS3 {
 
 /// Serves the node's S3 plane on the session bridge gateway too. A bind failure
 /// is not fatal: only sessions lose their endpoint, the node keeps serving.
-#[allow(clippy::too_many_arguments)]
 async fn bind_session_s3(
     session: Option<SessionS3>,
     s3_host: &str,
@@ -736,7 +739,7 @@ async fn bind_servers(
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let s3_timeouts = config.s3_timeouts();
-    let mut session_s3 = session_s3_address(&config).map(|address| SessionS3 {
+    let mut session_s3 = session_s3_address(&config, &session_subnet()).map(|address| SessionS3 {
         address,
         realm_id: config.realm_id,
         node_id: config.node_id,
@@ -1266,9 +1269,7 @@ async fn build_docker(
     )?;
     let mut docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
-        session_subnet: dotenvy::var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET").unwrap_or_else(|_| {
-            aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string()
-        }),
+        session_subnet: session_subnet(),
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
         envelope: compute_envelope()?,
         keep_failed: env_true("ARUNA_COMPUTE_KEEP_FAILED"),
@@ -1277,9 +1278,15 @@ async fn build_docker(
     if let Some(state_root) = env_path("ARUNA_COMPUTE_STATE_ROOT") {
         docker_config.state_root = state_root;
     }
+    let session_subnet = docker_config.session_subnet.clone();
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
         .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
+    // The bridge must exist before the S3 listener binds its gateway address.
+    backend
+        .ensure_session_network()
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!(
@@ -1290,7 +1297,7 @@ async fn build_docker(
         .with_backend(Arc::new(backend))
         .with_workspace_endpoint(workspace, "eu-central-1".to_string())
         .with_session_endpoint(
-            session_s3_address(config).map(|address| format!("http://{address}")),
+            session_s3_address(config, &session_subnet).map(|address| format!("http://{address}")),
         ))
 }
 

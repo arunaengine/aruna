@@ -5,7 +5,7 @@
 //! resolved server default and no current topology.
 
 use aruna_core::compute::runtimes::{
-    SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
@@ -165,6 +165,8 @@ pub struct SessionSpec {
     /// The idle wait the submitter asked for. The executing node clamps it to
     /// the realm value.
     pub idle_after_ms: Option<u64>,
+    /// When the submitter's bearer expires. The credential never outlives it.
+    pub expires_at_ms: Option<u64>,
 }
 
 /// The interactive session the stored spec asks for. `None` is an ordinary run.
@@ -181,6 +183,10 @@ pub fn session_of(spec: &ExecutionSpec) -> Option<SessionSpec> {
         idle_after_ms: spec
             .tags
             .get(SESSION_IDLE_TAG)
+            .and_then(|value| value.parse().ok()),
+        expires_at_ms: spec
+            .tags
+            .get(SESSION_EXPIRY_TAG)
             .and_then(|value| value.parse().ok()),
     })
 }

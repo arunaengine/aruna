@@ -176,7 +176,9 @@ That address is only reachable from a session container. No other service on thi
 `0.0.0.0` on the same port, because it would answer session traffic instead of the node. Pick a
 subnet that does not overlap any network this host already uses.
 
-Kubernetes keeps its existing S3-only network policy, and Apptainer keeps the host network.
+Kubernetes keeps its existing S3-only network policy, and Apptainer keeps the host network. On
+Kubernetes the workload service account additionally needs the `create` verb on `pods/exec`: the
+node talks to a session's kernel through an exec into the running pod.
 
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names

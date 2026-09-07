@@ -6,12 +6,21 @@ set -eu
 
 workdir=$(pwd)
 
-# The node's workspace binding sets AWS_ENDPOINT_URL. Older botocore and s3fs
-# read their own names, so the same value is offered under all of them.
+# The node's workspace binding sets AWS_ENDPOINT_URL to the address this
+# container can reach. Older botocore and s3fs read their own names.
 if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
     export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-$AWS_ENDPOINT_URL}"
     export FSSPEC_S3_ENDPOINT_URL="${FSSPEC_S3_ENDPOINT_URL:-$AWS_ENDPOINT_URL}"
 fi
+
+# The container runs as an unprivileged uid with no writable home, so packages
+# install into the working directory.
+export HOME="${HOME:-$workdir}"
+export PYTHONUSERBASE="$workdir/.aruna/site"
+export PIP_USER=1
+python_version=$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+export PYTHONPATH="$PYTHONUSERBASE/lib/python$python_version/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p "$PYTHONUSERBASE"
 
 # The dependency file is staged as a job input. An input without a container
 # path lands in /inputs, so both places are checked.

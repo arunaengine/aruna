@@ -569,8 +569,14 @@ pub enum SessionReportDetail {
         source_node_id: String,
         version_id: String,
     },
-    /// Why the session stopped: `ended`, `idle`, `walltime`, `cancelled`,
-    /// `kernel_exit` or `node_restart`.
+    /// One object the session's own credential read or wrote.
+    Touched {
+        bucket: String,
+        key: String,
+        operation: String,
+    },
+    /// Why the session stopped: `ended`, `idle`, `walltime`, `cancelled` or
+    /// `kernel_exit`.
     End { reason: String },
 }
 
@@ -1577,6 +1583,14 @@ pub fn cleanup_job_id(job_id: JobId) -> JobId {
 
 pub fn workspace_credential_id(job_id: JobId) -> String {
     format!("ws{job_id}")
+}
+
+/// The job a workspace credential's access key belongs to. `None` for every
+/// other credential, so an ordinary request is never attributed to a job.
+pub fn credential_job_id(access_key: &str) -> Option<JobId> {
+    access_key
+        .strip_prefix("ws")
+        .and_then(|id| JobId::from_str(id).ok())
 }
 
 /// Marker of a dedup key whose scope is the subject it names rather than the

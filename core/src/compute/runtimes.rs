@@ -64,6 +64,9 @@ pub const SESSION_TAG_NOTEBOOK: &str = "notebook";
 /// Catalog runtime the node resolved the image from, stored on the spec so the
 /// executing node reports it back without matching images.
 pub const SESSION_RUNTIME_TAG: &str = "aruna-engine.org/session-runtime";
+/// Wall-clock milliseconds the submitter's bearer token expires at. The
+/// session credential never outlives it.
+pub const SESSION_EXPIRY_TAG: &str = "aruna-engine.org/session-expires-at-ms";
 /// Idle wait the submitter asked for. The executing node clamps it to the realm
 /// value, so a longer request never extends the session.
 pub const SESSION_IDLE_TAG: &str = "aruna-engine.org/session-idle-ms";

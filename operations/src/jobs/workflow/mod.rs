@@ -998,7 +998,7 @@ pub async fn supervise_and_finalize(
                 Some(session) => {
                     let reason = session.finished().await;
                     match reason {
-                        EndReason::Ended | EndReason::Idle => reason,
+                        EndReason::Ended | EndReason::Idle | EndReason::KernelExit => reason,
                         _ => std::future::pending().await,
                     }
                 }
@@ -1015,10 +1015,19 @@ pub async fn supervise_and_finalize(
                 if let Some(session) = &session {
                     // A cancelled attempt ends its session for that reason; any
                     // other return means the container stopped on its own.
-                    session.end(match cancel.is_cancelled() {
+                    let reason = match cancel.is_cancelled() {
                         true => EndReason::Cancelled,
                         false => EndReason::KernelExit,
-                    });
+                    };
+                    session.end(reason);
+                    Box::pin(write_session_report(
+                        &context.storage_handle,
+                        job_id,
+                        token,
+                        Some(session),
+                        reason,
+                    ))
+                    .await;
                 }
                 Box::pin(finalize_attempt(
                     &context, job_id, token, &backend, &fence, &spec, &bucket, result,
@@ -1028,6 +1037,14 @@ pub async fn supervise_and_finalize(
             SessionOutcome::Walltime => {
                 if let Some(session) = &session {
                     session.end(EndReason::Walltime);
+                    Box::pin(write_session_report(
+                        &context.storage_handle,
+                        job_id,
+                        token,
+                        Some(session),
+                        EndReason::Walltime,
+                    ))
+                    .await;
                 }
                 Box::pin(finalize_walltime(
                     &context, job_id, token, &backend, &fence, &bucket,
@@ -1108,11 +1125,20 @@ async fn start_session(
 ) -> Option<Arc<Session>> {
     let requested = session_of(spec)?;
     let registry = context.compute_handle.as_ref()?.sessions().clone();
-    let executor_node_id = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id().to_string())
-        .unwrap_or_default();
+    let net = context.net_handle.as_ref()?;
+    let node_id = net.node_id();
+    // The credential was minted while the task was prepared; this reads the
+    // same one back, so the client sees when it really expires.
+    let credential_expires_at_ms =
+        match read_job_record(&context.storage_handle, job_id, None).await {
+            Ok(Some(record)) => Box::pin(mint_workspace_credential(
+                context, spec, &record, node_id, bucket,
+            ))
+            .await
+            .map(|credential| credential.expires_at_ms)
+            .unwrap_or_default(),
+            _ => 0,
+        };
     let realm_idle = realm_session_idle(context).await;
     let idle_after_ms = requested
         .idle_after_ms
@@ -1122,9 +1148,9 @@ async fn start_session(
             job_id: job_id.to_string(),
             runtime: requested.runtime,
             workspace_bucket: bucket.to_string(),
-            executor_node_id,
+            executor_node_id: node_id.to_string(),
             idle_after_ms,
-            credential_expires_at_ms: 0,
+            credential_expires_at_ms,
         },
         backend.clone(),
         fence.clone(),
@@ -1163,6 +1189,16 @@ async fn write_session_report(
                     blake3: input.blake3,
                     source_node_id: input.source_node_id,
                     version_id: input.version_id,
+                },
+            });
+        }
+        for (index, object) in session.touched().into_iter().enumerate() {
+            rows.push(SessionReportRow {
+                entry_key: format!("touched/{index:04}"),
+                detail: SessionReportDetail::Touched {
+                    bucket: object.bucket,
+                    key: object.key,
+                    operation: object.operation,
                 },
             });
         }
@@ -1224,7 +1260,19 @@ async fn finalize_session(
         storage, job_id, token, session, reason,
     ))
     .await;
-    let result = execution_result_for(bucket, Some(0), Vec::new(), logs);
+    // A terminal success needs a named output record, even with no outputs.
+    let Some(control) = Box::pin(control_or_park(context, job_id, token, fence)).await else {
+        return;
+    };
+    let mut result = execution_result_for(bucket, Some(0), Vec::new(), logs);
+    let Some(digest) = Box::pin(store_or_fail(
+        context, job_id, token, bucket, &control, &result,
+    ))
+    .await
+    else {
+        return;
+    };
+    name_output_record(&mut result, digest);
     let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
     Box::pin(cleanup_and_crate(context, job_id, record)).await;
 }

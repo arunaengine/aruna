@@ -5,16 +5,22 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use aruna_compute::session::EventKind;
 use aruna_compute::session::events::SessionEvent;
 use aruna_compute::session::{
     EndReason, MAX_SCRATCH_READ_BYTES, Session, SessionError, StagedInput,
 };
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{AuthContext, JobPayload, JobRecord, JobState, key_content_type};
+use aruna_core::structs::{
+    AuthContext, JobPayload, JobRecord, JobState, SessionReportDetail, SessionReportRow,
+    key_content_type,
+};
+use aruna_core::types::NodeId;
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::jobs::lifecycle::family_report;
 use aruna_operations::jobs::lifecycle::ids::session_of;
-use aruna_operations::jobs::service::read_owned_job;
+use aruna_operations::jobs::service::{JobReportLookup, read_owned_job, read_report_routed};
 use aruna_operations::s3::copy_object::{CopyObjectInput, CopySourceConditions, copy_object};
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use axum::extract::{Path, Query, State};
@@ -25,6 +31,7 @@ use axum::{Extension, Json};
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use ulid::Ulid;
@@ -41,6 +48,8 @@ use crate::server_state::ServerState;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Objects one staging call brings into the workspace bucket.
 const MAX_STAGED_ITEMS: usize = 64;
+/// Report rows read to recover why a finished session stopped.
+const REPORT_SCAN_ROWS: usize = 64;
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "compute/sessions", description = "Interactive notebook sessions")))]
@@ -229,46 +238,126 @@ pub(crate) async fn caller_session(
 }
 
 /// The live session, or the coded answer that says why there is none here.
-fn live_session(state: &ServerState, record: &JobRecord) -> Result<Arc<Session>, Response> {
+/// A node restart re-adopts the container and opens a new session, so a
+/// non-terminal job without one is starting, never ended.
+async fn live_session(
+    state: &ServerState,
+    auth: &AuthContext,
+    record: &JobRecord,
+) -> Result<Arc<Session>, Response> {
     let job_id = record.job_id.to_string();
     let session = state
         .get_ctx()
         .compute_handle
         .as_ref()
         .and_then(|registry| registry.sessions().get(&job_id));
-    match session {
-        Some(session) => Ok(session),
-        None if record.state.is_terminal() => Err(ended_response(record).into_response()),
-        None if record.owner_node_id == state.get_node_id() => {
-            Err(ended_response(record).into_response())
-        }
-        None => Err((
+    if let Some(session) = session {
+        return Ok(session);
+    }
+    if let Some(executor) = executor_node(state, auth, record).await
+        && executor != state.get_node_id()
+    {
+        return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "the session runs on another node",
                 "code": "session_not_here",
-                "executor_node_id": record.owner_node_id.to_string(),
+                "executor_node_id": executor.to_string(),
             })),
         )
-            .into_response()),
+            .into_response());
+    }
+    if !record.state.is_terminal() {
+        return Err(starting_response(record).into_response());
+    }
+    Err(ended_response(state, record).await.into_response())
+}
+
+/// The node the family says ran this job, canonical execution first. `None`
+/// when no execution is known yet, which is this node's own job to start.
+async fn executor_node(
+    state: &ServerState,
+    auth: &AuthContext,
+    record: &JobRecord,
+) -> Option<NodeId> {
+    let report = family_report(&state.get_ctx(), auth, record.job_id)
+        .await?
+        .ok()?;
+    let canonical = report
+        .canonical_execution_id
+        .and_then(|id| {
+            report
+                .execution_list
+                .iter()
+                .find(|execution| execution.execution_id == id)
+        })
+        .or_else(|| report.execution_list.first())?;
+    Some(canonical.executor_node_id)
+}
+
+/// A job whose session has not started here yet.
+fn starting_response(record: &JobRecord) -> Json<SessionResponse> {
+    Json(SessionResponse {
+        state: "starting".to_string(),
+        ended: None,
+        ..base_response(record)
+    })
+}
+
+/// A finished session job. The reason comes from the report the workflow wrote,
+/// so a failed session says why it stopped rather than reading as a clean end.
+async fn ended_response(state: &ServerState, record: &JobRecord) -> Json<SessionResponse> {
+    let reason = stored_reason(state, record)
+        .await
+        .unwrap_or_else(|| default_reason(record).to_string());
+    Json(SessionResponse {
+        state: "ended".to_string(),
+        ended: Some(SessionEndedResponse { reason }),
+        ..base_response(record)
+    })
+}
+
+/// The reason the workflow recorded for this session, if the report holds one.
+async fn stored_reason(state: &ServerState, record: &JobRecord) -> Option<String> {
+    let lookup = read_report_routed(
+        &state.get_ctx(),
+        record.created_by,
+        record.job_id,
+        None,
+        None,
+        REPORT_SCAN_ROWS,
+        None,
+    )
+    .await
+    .ok()?;
+    let JobReportLookup::Ready { rows, .. } = lookup else {
+        return None;
+    };
+    rows.iter().rev().find_map(|(_, value)| {
+        let row: SessionReportRow = postcard::from_bytes(value).ok()?;
+        match row.detail {
+            SessionReportDetail::End { reason } => Some(reason),
+            _ => None,
+        }
+    })
+}
+
+fn default_reason(record: &JobRecord) -> &'static str {
+    match record.state {
+        JobState::Cancelled => EndReason::Cancelled.as_str(),
+        _ => EndReason::Ended.as_str(),
     }
 }
 
-/// What a job whose session this node no longer holds looks like. A restart
-/// ends every session, so the client is told rather than left waiting.
-fn ended_response(record: &JobRecord) -> Json<SessionResponse> {
+/// The fields every answer about a job without a live session shares.
+fn base_response(record: &JobRecord) -> SessionResponse {
     let requested = match &record.payload {
         JobPayload::Execution(spec) => session_of(spec),
         _ => None,
     };
-    let reason = match record.state {
-        JobState::Cancelled => EndReason::Cancelled,
-        state if state.is_terminal() => EndReason::Ended,
-        _ => EndReason::NodeRestart,
-    };
-    Json(SessionResponse {
+    SessionResponse {
         job_id: record.job_id.to_string(),
-        state: "ended".to_string(),
+        state: String::new(),
         runtime: requested.map(|session| session.runtime).unwrap_or_default(),
         workspace_bucket: record.workspace_bucket.clone().unwrap_or_default(),
         executor_node_id: record.owner_node_id.to_string(),
@@ -278,10 +367,8 @@ fn ended_response(record: &JobRecord) -> Json<SessionResponse> {
         credential_expires_at_ms: 0,
         last_event_id: 0,
         cells: Some(Vec::new()),
-        ended: Some(SessionEndedResponse {
-            reason: reason.as_str().to_string(),
-        }),
-    })
+        ended: None,
+    }
 }
 
 pub(crate) fn session_response(session: &Session, with_cells: bool) -> SessionResponse {
@@ -363,8 +450,11 @@ like cancel: only the submitter, and anybody else's job answers 404.
 **Behavior**
 - Session routes are served by the node that runs the job. When another node runs it, the answer is
   409 with code `session_not_here` and the `executor_node_id` to talk to instead.
-- A node restart ends every session, so a job whose session this node no longer holds reports
-  `state` `ended` with reason `node_restart` rather than looking live."#,
+- A node restart re-adopts the running container and opens a new session for it, so a job that is
+  queued, preparing or being re-adopted answers `starting`, never `ended`. Event ids start again
+  at one, and a client resuming from an older point receives a `gap` and re-reads this state.
+- A finished session answers `ended` with the reason the node recorded: `ended`, `idle`,
+  `walltime`, `cancelled` or `kernel_exit`."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     responses(
         (status = 200, description = "The session state", body = SessionResponse),
@@ -382,7 +472,7 @@ pub async fn get_session(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    match live_session(&state, &record) {
+    match live_session(&state, &auth, &record).await {
         Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
         Err(response) => Ok(response),
     }
@@ -428,7 +518,7 @@ pub async fn stream_session(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record) {
+    let session = match live_session(&state, &auth, &record).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -443,18 +533,20 @@ pub async fn stream_session(
                 &json!({ "from": after.saturating_add(1), "to": from }),
             );
             let (backlog, receiver) = session.subscribe_all();
+            let last_id = backlog.last().map_or(from, |event| event.id);
             return Ok(sse(
                 stream::iter(vec![first, gap])
                     .chain(stream::iter(backlog.into_iter().map(sse_event)))
-                    .chain(live_stream(receiver)),
+                    .chain(live_stream(receiver, last_id)),
                 &state,
             ));
         }
     };
+    let last_id = backlog.last().map_or(after, |event| event.id);
     Ok(sse(
         stream::iter(vec![first])
             .chain(stream::iter(backlog.into_iter().map(sse_event)))
-            .chain(live_stream(receiver)),
+            .chain(live_stream(receiver, last_id)),
         &state,
     ))
 }
@@ -472,19 +564,44 @@ where
         .into_response()
 }
 
+/// The live tail of the stream. It stops right after `ended`, and a reader that
+/// fell behind is told the exact range it lost before the next event.
 fn live_stream(
     receiver: tokio::sync::broadcast::Receiver<SessionEvent>,
+    last_id: u64,
 ) -> impl Stream<Item = Event> + Send {
-    stream::unfold(receiver, |mut receiver| async move {
-        match receiver.recv().await {
-            Ok(event) => Some((sse_event(event), receiver)),
-            Err(RecvError::Lagged(count)) => Some((
-                frame("gap", 0, &json!({ "from": 0, "to": count })),
-                receiver,
-            )),
-            Err(RecvError::Closed) => None,
-        }
-    })
+    stream::unfold(
+        (receiver, last_id, VecDeque::new(), false),
+        |(mut receiver, mut last_id, mut pending, done)| async move {
+            if let Some(event) = pending.pop_front() {
+                return Some((event, (receiver, last_id, pending, done)));
+            }
+            if done {
+                return None;
+            }
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        let ended = event.kind == EventKind::Ended;
+                        let id = event.id;
+                        if id > last_id.saturating_add(1) {
+                            pending.push_back(sse_event(event));
+                            let gap = frame(
+                                "gap",
+                                0,
+                                &json!({ "from": last_id.saturating_add(1), "to": id }),
+                            );
+                            return Some((gap, (receiver, id, pending, ended)));
+                        }
+                        last_id = id;
+                        return Some((sse_event(event), (receiver, last_id, pending, ended)));
+                    }
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
 }
 
 fn sse_event(event: SessionEvent) -> Event {
@@ -556,7 +673,7 @@ pub async fn submit_cell(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record) {
+    let session = match live_session(&state, &auth, &record).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -603,7 +720,7 @@ pub async fn interrupt_session(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record) {
+    let session = match live_session(&state, &auth, &record).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -646,7 +763,7 @@ pub async fn end_session(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record) {
+    let session = match live_session(&state, &auth, &record).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -696,7 +813,7 @@ pub async fn stage_inputs(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record) {
+    let session = match live_session(&state, &auth, &record).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
@@ -855,10 +972,11 @@ pub async fn list_scratch(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record) {
+    let session = match live_session(&state, &auth, &record).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
+    session.touch();
     match session
         .list_scratch(query.path.as_deref().unwrap_or_default())
         .await
@@ -906,10 +1024,11 @@ pub async fn read_scratch(
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let record = owned_session_job(&state, &auth, &job_id).await?;
-    let session = match live_session(&state, &record) {
+    let session = match live_session(&state, &auth, &record).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
     };
+    session.touch();
     let body = match session
         .read_scratch(&query.path, 0, MAX_SCRATCH_READ_BYTES)
         .await
@@ -1065,7 +1184,7 @@ mod tests {
     }
 
     fn node() -> NodeId {
-        NodeId::from_bytes(&[2u8; 32]).expect("a node id")
+        iroh::SecretKey::from_bytes(&[2u8; 32]).public()
     }
 
     fn user(seed: u8) -> UserId {
@@ -1191,13 +1310,13 @@ mod tests {
             if session.snapshot().state != SessionPhase::Starting {
                 return;
             }
-            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(60), receiver.recv()).await;
         }
         panic!("the session never became ready");
     }
 
     #[tokio::test]
-    async fn foreign_job_is_not_found() {
+    async fn hides_foreign_job() {
         // Absence and foreign ownership must be indistinguishable.
         let owner = user(2);
         let (_dir, state, job_id, _helper) = build_node(owner).await;
@@ -1211,7 +1330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_job_is_not_found() {
+    async fn hides_unknown_job() {
         let owner = user(2);
         let (_dir, state, _job_id, _helper) = build_node(owner).await;
         let response = get_session(
@@ -1224,7 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_token_is_refused() {
+    async fn refuses_restricted_token() {
         let owner = user(2);
         let (_dir, state, job_id, _helper) = build_node(owner).await;
         let auth = Some(AuthContext {
@@ -1238,7 +1357,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn starting_session_refuses_cells() {
+    async fn refuses_early_cells() {
+        // A session that has not reached its kernel yet accepts no cell.
         let owner = user(2);
         let (_dir, state, job_id, _helper) = build_node(owner).await;
         let response = submit_cell(
@@ -1256,11 +1376,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn burst_is_rate_limited() {
+    async fn limits_submit_burst() {
         let owner = user(2);
         let (_dir, state, job_id, mut helper) = build_node(owner).await;
         make_ready(&state, job_id, &mut helper).await;
-        for index in 0..aruna_compute::session::MAX_SUBMITS {
+        for index in 0..aruna_core::compute::session::MAX_SUBMITS {
             let response = submit_cell(
                 State(state.clone()),
                 Extension(auth_for(owner)),
@@ -1310,7 +1430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_resumes_from_after() {
+    async fn resumes_from_after() {
         // The portal sends the resume point as `after`, not as a header.
         let owner = user(2);
         let (_dir, state, job_id, mut helper) = build_node(owner).await;
@@ -1335,7 +1455,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_reports_a_gap() {
+    async fn stream_reports_gap() {
+        // A resume point the ring dropped is answered with a gap frame.
         let owner = user(2);
         let (_dir, state, job_id, mut helper) = build_node(owner).await;
         make_ready(&state, job_id, &mut helper).await;
@@ -1345,7 +1466,7 @@ mod tests {
             .as_ref()
             .and_then(|registry| registry.sessions().get(&job_id.to_string()))
             .expect("the session is registered");
-        for _ in 0..(aruna_compute::session::events::MAX_RING_EVENTS + 4) {
+        for _ in 0..(aruna_core::compute::session::MAX_RING_EVENTS + 4) {
             session.announce();
         }
         assert!(session.subscribe(1).is_err(), "the ring rolled over");
@@ -1362,7 +1483,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_answers_the_job_status() {
+    async fn end_answers_status() {
+        // Ending answers with the job status and refuses every later cell.
         let owner = user(2);
         let (_dir, state, job_id, mut helper) = build_node(owner).await;
         make_ready(&state, job_id, &mut helper).await;

@@ -64,6 +64,8 @@ class Connection:
 class Kernel:
     """One Jupyter kernel and the cell queue feeding it."""
 
+    state = "starting"
+
     def __init__(self, connection, workdir):
         from jupyter_client import KernelManager
 
@@ -79,7 +81,7 @@ class Kernel:
         self.client = self.manager.client()
         self.client.start_channels()
         self.client.wait_for_ready(timeout=120)
-        connection.send({"kind": "kernel", "state": "idle"})
+        self.announce("idle")
         threading.Thread(target=self._pump_outputs, daemon=True).start()
         threading.Thread(target=self._run_cells, daemon=True).start()
 
@@ -95,7 +97,18 @@ class Kernel:
         self.manager.interrupt_kernel()
 
     def status(self):
-        return {"alive": self.manager.is_alive()}
+        return {"alive": self.manager.is_alive(), "state": self.state}
+
+    def announce(self, state):
+        """Records the kernel state and tells the client about it."""
+        self.state = state
+        self.connection.send({"kind": "kernel", "state": state})
+
+    def die(self):
+        """A dead kernel ends the container: the node then finishes the job."""
+        self.announce("dead")
+        time.sleep(1)
+        os._exit(1)
 
     def _run_cells(self):
         while True:
@@ -114,8 +127,7 @@ class Kernel:
                 reply = self.client.get_shell_msg(timeout=1)
             except queue.Empty:
                 if not self.manager.is_alive():
-                    self.connection.send({"kind": "kernel", "state": "dead"})
-                    return
+                    self.die()
                 continue
             if reply.get("parent_header", {}).get("msg_id") != message_id:
                 continue
@@ -144,21 +156,18 @@ class Kernel:
                 message = self.client.get_iopub_msg(timeout=1)
             except queue.Empty:
                 if not self.manager.is_alive():
-                    self.connection.send({"kind": "kernel", "state": "dead"})
-                    return
+                    self.die()
                 continue
             except Exception as error:  # the channel closed under us
                 log(f"iopub channel failed: {error}")
-                self.connection.send({"kind": "kernel", "state": "dead"})
-                return
+                self.die()
             self._forward(message)
 
     def _forward(self, message):
         kind = message.get("msg_type")
         content = message.get("content", {})
         if kind == "status":
-            state = content.get("execution_state", "idle")
-            self.connection.send({"kind": "kernel", "state": state})
+            self.announce(content.get("execution_state", "idle"))
             return
         cell_id = self._cell_of(message)
         if cell_id is None:
@@ -290,6 +299,8 @@ def serve(socket_path):
     while True:
         stream, _ = listener.accept()
         connection.attach(stream)
+        # A reconnect is a new exec, so the client learns the state it missed.
+        kernel.announce(kernel.state)
         try:
             serve_one(kernel, connection, workdir, stream)
         finally:

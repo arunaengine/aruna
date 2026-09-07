@@ -30,10 +30,8 @@ pub struct DockerConfig {
     pub default_disk_bytes: Option<u64>,
     pub default_max_walltime: Option<Duration>,
     pub pids_limit: i64,
-    /// Subnet of the internal bridge network interactive sessions join. The
-    /// network has no external route; the node's S3 server listens on the
-    /// gateway address, which is the only endpoint a session can reach.
-    /// No other host service may bind 0.0.0.0 on that port.
+    /// Subnet of the internal bridge interactive sessions join. The node's S3
+    /// server listens on its gateway, the only endpoint a session reaches.
     pub session_subnet: String,
     pub pull_deadline: Duration,
     /// Static ceilings this host offers. Hard eligibility plus the basis of the

@@ -178,16 +178,11 @@ impl DockerBackend {
     /// Creates the internal bridge sessions join, once per daemon. It has no
     /// external route: the node's S3 server on the gateway address is the only
     /// endpoint a session container can reach.
-    async fn ensure_session_network(&self) -> Result<(), BackendError> {
-        if self
-            .docker
-            .inspect_network(SESSION_NETWORK, None)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
+    pub async fn ensure_session_network(&self) -> Result<(), BackendError> {
         let gateway = session_gateway(&self.config.session_subnet)?;
+        if let Ok(existing) = self.docker.inspect_network(SESSION_NETWORK, None).await {
+            return check_session_subnet(&existing, &self.config.session_subnet);
+        }
         let request = NetworkCreateRequest {
             name: SESSION_NETWORK.to_string(),
             driver: Some("bridge".to_string()),
@@ -1826,6 +1821,27 @@ fn validate_labels(
     Ok(())
 }
 
+/// An existing session network must carry the configured subnet: a different
+/// one would put containers on an address the node does not serve.
+fn check_session_subnet(
+    existing: &bollard::models::NetworkInspect,
+    subnet: &str,
+) -> Result<(), BackendError> {
+    let configured = existing
+        .ipam
+        .as_ref()
+        .and_then(|ipam| ipam.config.as_ref())
+        .and_then(|config| config.first())
+        .and_then(|entry| entry.subnet.clone())
+        .unwrap_or_default();
+    if configured == subnet {
+        return Ok(());
+    }
+    Err(BackendError::InvalidSpec(format!(
+        "network `{SESSION_NETWORK}` exists with subnet `{configured}`, not `{subnet}`"
+    )))
+}
+
 /// The first host address of the session subnet, which Docker gives the bridge
 /// and the node's S3 server binds.
 pub fn session_gateway(subnet: &str) -> Result<Ipv4Addr, BackendError> {
@@ -2243,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn session_gateway_is_first_host() {
+    fn gateway_is_first_host() {
         assert_eq!(
             session_gateway("172.30.255.0/24").expect("a /24 has host addresses"),
             std::net::Ipv4Addr::new(172, 30, 255, 1)

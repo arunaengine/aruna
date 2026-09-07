@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::{
-    SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
-    session_runtime,
+    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES, SESSION_TAG,
+    SESSION_TAG_NOTEBOOK, session_runtime,
 };
 use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
@@ -833,7 +833,10 @@ pub(crate) fn map_submit_error(
 /// Resolves the session directives of a submission. A session names a catalog
 /// runtime instead of an image, and the node records the resolved runtime and
 /// the requested idle wait as engine tags the executing node reads back.
-fn session_request(request: &mut SubmitExecutionRequest) -> ServerResult<()> {
+fn session_request(
+    request: &mut SubmitExecutionRequest,
+    bearer_expires_at_ms: Option<u64>,
+) -> ServerResult<()> {
     let Some(value) = request.tags.get(SESSION_TAG) else {
         if request.runtime.is_some() || request.session_idle_after_ms.is_some() {
             return Err(ServerError::BadRequestMessage(format!(
@@ -847,11 +850,13 @@ fn session_request(request: &mut SubmitExecutionRequest) -> ServerResult<()> {
             "tag {SESSION_TAG} accepts only the value {SESSION_TAG_NOTEBOOK}"
         )));
     }
-    if request.tags.contains_key(SESSION_RUNTIME_TAG) || request.tags.contains_key(SESSION_IDLE_TAG)
+    if [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG, SESSION_EXPIRY_TAG]
+        .iter()
+        .any(|tag| request.tags.contains_key(*tag))
     {
-        return Err(ServerError::BadRequestMessage(format!(
-            "tags {SESSION_RUNTIME_TAG} and {SESSION_IDLE_TAG} are set by the node"
-        )));
+        return Err(ServerError::BadRequestMessage(
+            "the session runtime, idle and expiry tags are set by the node".to_string(),
+        ));
     }
     let existing = request
         .workspace
@@ -906,6 +911,11 @@ fn session_request(request: &mut SubmitExecutionRequest) -> ServerResult<()> {
     request
         .tags
         .insert(SESSION_RUNTIME_TAG.to_string(), runtime.id.to_string());
+    if let Some(expires_at_ms) = bearer_expires_at_ms {
+        request
+            .tags
+            .insert(SESSION_EXPIRY_TAG.to_string(), expires_at_ms.to_string());
+    }
     Ok(())
 }
 
@@ -1426,7 +1436,12 @@ pub(crate) async fn submit_execution(
     mut request: SubmitExecutionRequest,
     extras: PolicyRequestExtras,
 ) -> ServerResult<(StatusCode, SubmitJobResponse)> {
-    session_request(&mut request)?;
+    session_request(
+        &mut request,
+        bearer
+            .as_ref()
+            .map(|bearer| bearer.expires_at_secs().saturating_mul(1_000)),
+    )?;
     let target = request.target.unwrap_or_default();
     let auth = match target {
         ExecutionTarget::Realm => require_unrestricted_realm_auth(state, auth)?,
@@ -3830,9 +3845,9 @@ mod tests {
     }
 
     #[test]
-    fn session_takes_the_catalog() {
+    fn session_takes_catalog() {
         let mut request = session_body();
-        session_request(&mut request).expect("a session submit is accepted");
+        session_request(&mut request, None).expect("a session submit is accepted");
         let runtime = session_runtime("python-notebook").expect("the catalog holds it");
         assert_eq!(request.image, runtime.image);
         assert_eq!(request.command, vec![runtime.command[0].to_string()]);
@@ -3848,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn session_refuses_an_image() {
+    fn session_refuses_image() {
         for mutate in [
             |request: &mut SubmitExecutionRequest| request.image = "alpine:3".to_string(),
             |request: &mut SubmitExecutionRequest| {
@@ -3858,56 +3873,57 @@ mod tests {
         ] {
             let mut request = session_body();
             mutate(&mut request);
-            assert!(session_request(&mut request).is_err());
+            assert!(session_request(&mut request, None).is_err());
         }
     }
 
     #[test]
-    fn session_needs_a_bucket() {
+    fn session_needs_bucket() {
         let mut request = session_body();
         request.workspace = None;
-        assert!(session_request(&mut request).is_err());
+        assert!(session_request(&mut request, None).is_err());
 
         let mut request = session_body();
         request.workspace = Some(WorkspaceRequest {
             mode: WorkspaceModeRequest::None,
             bucket: None,
         });
-        assert!(session_request(&mut request).is_err());
+        assert!(session_request(&mut request, None).is_err());
     }
 
     #[test]
-    fn session_needs_a_runtime() {
+    fn session_needs_runtime() {
         let mut request = session_body();
         request.runtime = None;
-        assert!(session_request(&mut request).is_err());
+        assert!(session_request(&mut request, None).is_err());
 
         let mut request = session_body();
         request.runtime = Some("nope".to_string());
-        assert!(session_request(&mut request).is_err());
+        assert!(session_request(&mut request, None).is_err());
     }
 
     #[test]
-    fn runtime_needs_the_tag() {
+    fn runtime_needs_tag() {
         // A catalog runtime outside a session would leave the image unpinned.
         let mut request = session_body();
         request.tags.clear();
-        assert!(session_request(&mut request).is_err());
+        assert!(session_request(&mut request, None).is_err());
     }
 
     #[test]
-    fn session_refuses_node_tags() {
+    fn session_refuses_reserved() {
+        // The runtime, idle and expiry tags are the node's to set.
         for tag in [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG] {
             let mut request = session_body();
             request.tags.insert(tag.to_string(), "x".to_string());
-            assert!(session_request(&mut request).is_err());
+            assert!(session_request(&mut request, None).is_err());
         }
     }
 
     #[test]
-    fn plain_run_keeps_its_image() {
+    fn plain_run_keeps_image() {
         let mut request = local_request();
-        session_request(&mut request).expect("a plain run is untouched");
+        session_request(&mut request, None).expect("a plain run is untouched");
         assert_eq!(request.image, "alpine:3");
         assert!(request.tags.get(SESSION_RUNTIME_TAG).is_none());
     }

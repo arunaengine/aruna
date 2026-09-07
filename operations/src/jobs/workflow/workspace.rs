@@ -61,6 +61,8 @@ const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
 pub struct WorkspaceCredential {
     pub access_key: String,
     pub secret: String,
+    /// Wall-clock milliseconds the credential stops working at.
+    pub expires_at_ms: u64,
 }
 
 pub async fn ensure_group_write(
@@ -246,9 +248,11 @@ async fn mint_credential(
                 let secret = access.open_secret(&encryption_key).map_err(|error| {
                     JobError::permanent(format!("workspace credential decryption failed: {error}"))
                 })?;
+                let expires_at_ms = expiry_ms(access.expiry);
                 return Ok(WorkspaceCredential {
                     access_key: access.access_key,
                     secret,
+                    expires_at_ms,
                 });
             }
             if record.attempt_intent.is_some() {
@@ -269,10 +273,16 @@ async fn mint_credential(
         .max_walltime_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_WALLTIME);
-    // A session's credential must not outlive the job it belongs to, so it gets
-    // the walltime and none of the slack a staged run needs for its capture.
+    // A session's credential must not outlive the job it belongs to, nor the
+    // bearer that asked for it; a staged run keeps the slack its capture needs.
     let expiry = match crate::jobs::lifecycle::ids::session_of(spec) {
-        Some(_) => SystemTime::now() + walltime,
+        Some(session) => {
+            let walltime_end = SystemTime::now() + walltime;
+            match session.expires_at_ms {
+                Some(bearer) => walltime_end.min(from_ms(bearer)),
+                None => walltime_end,
+            }
+        }
         None => SystemTime::now() + walltime + CREDENTIAL_SLACK,
     };
     let (_, secret, access) = Box::pin(drive(
@@ -295,7 +305,20 @@ async fn mint_credential(
     Ok(WorkspaceCredential {
         access_key: access.access_key,
         secret: secret.expose().to_string(),
+        expires_at_ms: expiry_ms(access.expiry),
     })
+}
+
+/// Wall-clock milliseconds of a stored expiry.
+fn expiry_ms(expiry: SystemTime) -> u64 {
+    expiry
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn from_ms(millis: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(millis)
 }
 
 /// True when the launch bound an input to an exact source version. A mount
