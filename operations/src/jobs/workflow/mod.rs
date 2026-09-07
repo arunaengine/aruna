@@ -2298,6 +2298,7 @@ mod tests {
     struct StubBackend {
         reconcile: StubReconcile,
         submits: Mutex<Vec<String>>,
+        wait_started: Notify,
         logs_started: Notify,
         logs_release: Notify,
         logs_fail: AtomicBool,
@@ -2310,6 +2311,7 @@ mod tests {
             Arc::new(Self {
                 reconcile,
                 submits: Mutex::new(Vec::new()),
+                wait_started: Notify::new(),
                 logs_started: Notify::new(),
                 logs_release: Notify::new(),
                 logs_fail: AtomicBool::new(false),
@@ -2364,6 +2366,7 @@ mod tests {
             _cancel: &CancellationToken,
         ) -> Result<AttemptStatus, BackendError> {
             if matches!(self.reconcile, StubReconcile::Waiting) {
+                self.wait_started.notify_one();
                 std::future::pending::<()>().await;
             }
             Ok(AttemptStatus {
@@ -2943,14 +2946,18 @@ mod tests {
     }
 
     /// Waits for the supervisor to register the session it is about to watch.
-    async fn wait_for_session(registry: &Arc<ExecutorRegistry>, job_id: JobId) -> Arc<Session> {
-        for _ in 0..10_000 {
-            if let Some(session) = registry.sessions().get(&job_id.to_string()) {
-                return session;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("the supervisor never registered a session");
+    async fn wait_for_session(
+        registry: &Arc<ExecutorRegistry>,
+        job_id: JobId,
+        backend: &StubBackend,
+    ) -> Arc<Session> {
+        tokio::time::timeout(Duration::from_secs(120), backend.wait_started.notified())
+            .await
+            .expect("the supervisor never started waiting");
+        registry
+            .sessions()
+            .get(&job_id.to_string())
+            .expect("the supervisor registers its session before waiting")
     }
 
     #[tokio::test]
@@ -2982,7 +2989,7 @@ mod tests {
             "ws-test".to_string(),
             CancellationToken::new(),
         ));
-        wait_for_session(&registry, job_id)
+        wait_for_session(&registry, job_id, &backend)
             .await
             .end(EndReason::Ended);
         supervisor.await.unwrap();
@@ -3073,7 +3080,7 @@ mod tests {
             "ws-test".to_string(),
             CancellationToken::new(),
         ));
-        wait_for_session(&registry, job_id)
+        wait_for_session(&registry, job_id, &backend)
             .await
             .end(EndReason::KernelExit);
         supervisor.await.unwrap();
