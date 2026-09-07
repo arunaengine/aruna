@@ -239,3 +239,270 @@ fn text_values(value: &JsonValue) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        ARUNA_DATA_PREFIX, Actor, BucketInfo, Group, GroupAuthorizationDocument, HashPathIndexKey,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, Role,
+    };
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+    use ulid::Ulid;
+
+    const BUCKET: &str = "reads";
+    const KEY: &str = "raw/one.csv";
+
+    struct Fixture {
+        context: DriverContext,
+        realm_id: RealmId,
+        owner: AuthContext,
+        hash: [u8; 32],
+        permission_path: String,
+        _tempdir: tempfile::TempDir,
+    }
+
+    async fn fixture(anonymous_read: bool) -> Fixture {
+        let staging = crate::staging::test_utils::setup_driver_context().await;
+        let context = staging.driver_context;
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let owner = UserId::local(Ulid::from_bytes([62; 16]), realm_id);
+        let group_id = Ulid::from_bytes([63; 16]);
+        let version_id = Ulid::from_bytes([64; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[65; 32]).public();
+        let hash = [66; 32];
+        let actor = Actor {
+            node_id,
+            user_id: owner,
+            realm_id,
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        if anonymous_read {
+            let role_id = Ulid::from_bytes([67; 16]);
+            realm_auth.roles.insert(
+                role_id,
+                Role {
+                    role_id,
+                    name: "everyone".to_string(),
+                    permissions: HashMap::from([(
+                        format!("/{realm_id}/g/{group_id}/**"),
+                        Permission::READ,
+                    )]),
+                    assigned_users: HashSet::from([UserId::nil(realm_id)]),
+                },
+            );
+        }
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "preview".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let bucket = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: owner,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        };
+        let alias =
+            HashPathIndexKey::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
+        let writes = vec![
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                realm_id.as_bytes().to_vec().into(),
+                config.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                realm_id.as_bytes().to_vec().into(),
+                realm_auth.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                group_id.to_bytes().to_vec().into(),
+                group_auth.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                GROUP_KEYSPACE.to_string(),
+                group_id.to_bytes().to_vec().into(),
+                group.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                BUCKET.as_bytes().to_vec().into(),
+                bucket.to_bytes().unwrap().into(),
+            ),
+            (
+                HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                alias.to_bytes().unwrap().into(),
+                Vec::new().into(),
+            ),
+        ];
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        Fixture {
+            context,
+            realm_id,
+            owner: AuthContext {
+                user_id: owner,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            hash,
+            permission_path: blob_object_permission_path(realm_id, group_id, node_id, BUCKET, KEY),
+            _tempdir: staging._tempdir,
+        }
+    }
+
+    fn draft(hash: [u8; 32]) -> JsonValue {
+        json!({
+            "@graph": [
+                {"@id": "./", "@type": "Dataset", "name": "draft"},
+                {
+                    "@id": format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash)),
+                    "@type": "File",
+                    "name": "one.csv",
+                    "contentUrl": format!("s3://{BUCKET}/{KEY}")
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn lists_private_object() {
+        let fixture = fixture(false).await;
+
+        let restricted = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            &fixture.owner,
+            &draft(fixture.hash),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restricted.len(), 1);
+        assert_eq!(restricted[0].bucket.as_deref(), Some(BUCKET));
+        assert_eq!(restricted[0].key.as_deref(), Some(KEY));
+        assert_eq!(
+            restricted[0].permission_path.as_deref(),
+            Some(fixture.permission_path.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_public_object() {
+        let fixture = fixture(true).await;
+
+        let restricted = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            &fixture.owner,
+            &draft(fixture.hash),
+        )
+        .await
+        .unwrap();
+
+        assert!(restricted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hides_foreign_object() {
+        let fixture = fixture(false).await;
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::from_bytes([68; 16]), fixture.realm_id),
+            realm_id: fixture.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+
+        let restricted = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            &stranger,
+            &draft(fixture.hash),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restricted.len(), 1);
+        assert!(restricted[0].permission_path.is_none());
+        assert!(restricted[0].bucket.is_none());
+        assert!(restricted[0].key.is_none());
+    }
+
+    #[tokio::test]
+    async fn ignores_unknown_object() {
+        let fixture = fixture(false).await;
+
+        let restricted = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            &fixture.owner,
+            &draft([99; 32]),
+        )
+        .await
+        .unwrap();
+
+        assert!(restricted.is_empty());
+    }
+
+    #[test]
+    fn selects_data_entities() {
+        let document = json!({
+            "@graph": [
+                {"@id": "./", "@type": "Dataset", "name": "draft"},
+                {"@id": "one", "@type": "File", "contentUrl": "s3://reads/one.csv"},
+                {"@id": "two", "@type": ["MediaObject", "Thing"],
+                 "contentUrl": ["s3://reads/two.csv", {"@id": "s3://reads/dup.csv"}]},
+                {"@id": "three", "@type": "CreativeWork"}
+            ]
+        });
+
+        let files = draft_files(&document);
+
+        assert_eq!(
+            files,
+            vec![
+                ("one".to_string(), vec!["s3://reads/one.csv".to_string()]),
+                (
+                    "two".to_string(),
+                    vec![
+                        "s3://reads/two.csv".to_string(),
+                        "s3://reads/dup.csv".to_string()
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_missing_graph() {
+        assert!(draft_files(&json!({"@id": "./"})).is_empty());
+    }
+}
