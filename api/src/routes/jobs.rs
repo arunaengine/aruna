@@ -3925,6 +3925,6 @@ mod tests {
         let mut request = local_request();
         session_request(&mut request, None).expect("a plain run is untouched");
         assert_eq!(request.image, "alpine:3");
-        assert!(request.tags.get(SESSION_RUNTIME_TAG).is_none());
+        assert!(!request.tags.contains_key(SESSION_RUNTIME_TAG));
     }
 }

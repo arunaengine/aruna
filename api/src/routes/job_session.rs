@@ -1484,7 +1484,7 @@ mod tests {
 
     #[tokio::test]
     async fn end_answers_status() {
-        // Ending answers with the job status and refuses every later cell.
+        // Ending answers with the job status and lets the session go.
         let owner = user(2);
         let (_dir, state, job_id, mut helper) = build_node(owner).await;
         make_ready(&state, job_id, &mut helper).await;
@@ -1496,17 +1496,87 @@ mod tests {
         .await
         .expect("the handler answers");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let refused = submit_cell(
-            State(state),
+        for _ in 0..10_000 {
+            if registry_session(&state, job_id).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("an ended session stayed registered");
+    }
+
+    #[tokio::test]
+    async fn live_job_reads_starting() {
+        // A re-adopted job has no session yet, which is starting, never ended.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        drop_session(&state, job_id);
+        let body = session_body(&state, owner, job_id).await;
+        assert_eq!(body.state, "starting");
+        assert!(body.ended.is_none());
+    }
+
+    #[tokio::test]
+    async fn finished_job_reads_ended() {
+        // A settled session reports why it stopped, not a live state.
+        let owner = user(2);
+        let (_dir, state, _job_id, _helper) = build_node(owner).await;
+        let settled = JobId::from_bytes([4u8; 16]);
+        let mut record = JobRecord::new(
+            settled,
+            JobPayload::Execution(session_spec()),
+            owner,
+            node(),
+            1_000,
+            1_000,
+            None,
+        );
+        record.state = JobState::Cancelled;
+        record.finished_at_ms = Some(2_000);
+        record.workspace_bucket = Some("lab-data".to_string());
+        insert_job(&state.get_ctx().storage_handle, &record)
+            .await
+            .expect("the settled job is stored");
+        let body = session_body(&state, owner, settled).await;
+        assert_eq!(body.state, "ended");
+        assert_eq!(
+            body.ended.map(|ended| ended.reason),
+            Some("cancelled".to_string())
+        );
+    }
+
+    fn registry_session(state: &Arc<ServerState>, job_id: JobId) -> Option<Arc<Session>> {
+        state
+            .get_ctx()
+            .compute_handle
+            .as_ref()
+            .and_then(|registry| registry.sessions().get(&job_id.to_string()))
+    }
+
+    /// Ends and forgets the session, standing in for a node restart.
+    fn drop_session(state: &Arc<ServerState>, job_id: JobId) {
+        if let Some(session) = registry_session(state, job_id) {
+            session.end(EndReason::Ended);
+        }
+    }
+
+    /// The parsed body of a session read.
+    async fn session_body(
+        state: &Arc<ServerState>,
+        owner: UserId,
+        job_id: JobId,
+    ) -> SessionResponse {
+        let response = get_session(
+            State(state.clone()),
             Extension(auth_for(owner)),
             Path(job_id.to_string()),
-            Json(SubmitCellRequest {
-                cell_id: "c1".to_string(),
-                code: "1".to_string(),
-            }),
         )
         .await
         .expect("the handler answers");
-        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body reads");
+        serde_json::from_slice(&bytes).expect("the body parses")
     }
 }
