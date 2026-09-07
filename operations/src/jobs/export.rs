@@ -19,10 +19,11 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{GroupId, Key, NodeId, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
-use async_zip::{Compression, ZipEntryBuilder};
+use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};
 #[cfg(test)]
 use bytes::Bytes;
 use byteview::ByteView;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use futures_util::StreamExt;
 use futures_util::io::AsyncWriteExt;
 use oxrdf::{NamedOrBlankNode, Term};
@@ -184,6 +185,7 @@ struct PlannedEntry {
     path: String,
     source: PlannedSource,
     expected_blake3: [u8; 32],
+    modified_ms: u64,
 }
 
 #[derive(Debug)]
@@ -2474,6 +2476,7 @@ async fn assemble_export(
         .ok_or_else(|| ExportFailure::Permanent("rewritten metadata is missing".to_string()))?;
     let mut entries = Vec::with_capacity(opened.len());
     let source_spec = std::sync::Arc::new(spec.clone());
+    let job_ms = unix_timestamp_millis();
     for entry in opened {
         let entity = &checkpoint.entities[entry.entity_index];
         let path = entity
@@ -2498,6 +2501,9 @@ async fn assemble_export(
                 candidate,
             },
             expected_blake3: entry.hash,
+            modified_ms: entry
+                .resolved_version
+                .map_or(job_ms, |version| version.timestamp_ms()),
         });
     }
     let report = checkpoint.report_json.clone();
@@ -2511,7 +2517,7 @@ async fn assemble_export(
     let cancel = ctx.cancel.clone();
     let shutdown = ctx.shutdown.clone();
     let writer_task = tokio::spawn(Box::pin(write_archive_checked(
-        writer, metadata, entries, report, policies, cancel, shutdown,
+        writer, metadata, entries, report, policies, cancel, shutdown, job_ms,
     )));
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
@@ -2566,6 +2572,7 @@ async fn assemble_export(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_archive_checked(
     writer: tokio::io::DuplexStream,
     metadata: Vec<u8>,
@@ -2574,11 +2581,12 @@ async fn write_archive_checked(
     policies: std::sync::Arc<BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>>,
     cancel: tokio_util::sync::CancellationToken,
     shutdown: tokio_util::sync::CancellationToken,
+    job_ms: u64,
 ) -> Result<(), ExportFailure> {
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
     archive
-        .write_entry_whole(zip_entry(METADATA_PATH), &metadata)
+        .write_entry_whole(zip_entry(METADATA_PATH, job_ms), &metadata)
         .await
         .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     for entry in entries {
@@ -2588,6 +2596,7 @@ async fn write_archive_checked(
             path,
             source,
             expected_blake3,
+            modified_ms,
         } = entry;
         let opened = match source {
             PlannedSource::Candidate {
@@ -2637,7 +2646,7 @@ async fn write_archive_checked(
             }
         };
         let mut writer = archive
-            .write_entry_stream(zip_entry(&path))
+            .write_entry_stream(zip_entry(&path, modified_ms))
             .await
             .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
         let mut hasher = blake3::Hasher::new();
@@ -2682,7 +2691,7 @@ async fn write_archive_checked(
     }
     if let Some(report) = report {
         archive
-            .write_entry_whole(zip_entry(REPORT_PATH), &report)
+            .write_entry_whole(zip_entry(REPORT_PATH, job_ms), &report)
             .await
             .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     }
@@ -2693,8 +2702,28 @@ async fn write_archive_checked(
     Ok(())
 }
 
-fn zip_entry(path: &str) -> ZipEntryBuilder {
+fn zip_entry(path: &str, modified_ms: u64) -> ZipEntryBuilder {
     ZipEntryBuilder::new(path.to_string().into(), Compression::Stored)
+        .last_modification_date(zip_date(modified_ms))
+}
+
+/// MS-DOS ZIP timestamps only cover 1980 through 2107, so a moment outside
+/// that window keeps its month and day but clamps to the nearest year.
+fn zip_date(modified_ms: u64) -> ZipDateTime {
+    let Some(moment) = i64::try_from(modified_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+    else {
+        return ZipDateTime::default();
+    };
+    ZipDateTimeBuilder::new()
+        .year(moment.year().clamp(1980, 2107))
+        .month(moment.month())
+        .day(moment.day())
+        .hour(moment.hour())
+        .minute(moment.minute())
+        .second(moment.second())
+        .build()
 }
 
 fn stream_status(error: &StreamError) -> OpenStatus {
@@ -2904,6 +2933,10 @@ fn permanent(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::permanent(message.into()))
 }
 
+/// 2026-02-03T04:05:06Z: a fixed moment keeps fixture archives byte-identical.
+#[cfg(test)]
+const FIXTURE_MOMENT_MS: u64 = 1_770_091_506_000;
+
 #[cfg(test)]
 async fn probe_sources(
     ctx: &JobContext,
@@ -2963,6 +2996,7 @@ async fn write_archive(
         std::sync::Arc::new(BTreeMap::new()),
         cancel,
         shutdown,
+        FIXTURE_MOMENT_MS,
     )
     .await
 }
@@ -3373,14 +3407,20 @@ mod tests {
             ("notes/unlisted.txt", b"unlisted payload".as_slice()),
         ] {
             writer
-                .write_entry_whole(zip_entry(&format!("{prefix}{path}")), bytes)
+                .write_entry_whole(
+                    zip_entry(&format!("{prefix}{path}"), FIXTURE_MOMENT_MS),
+                    bytes,
+                )
                 .await
                 .unwrap();
         }
         if eln {
             writer
                 .write_entry_whole(
-                    zip_entry(&format!("{prefix}ro-crate-metadata.json.minisig")),
+                    zip_entry(
+                        &format!("{prefix}ro-crate-metadata.json.minisig"),
+                        FIXTURE_MOMENT_MS,
+                    ),
                     b"untrusted fixture signature",
                 )
                 .await
@@ -3574,6 +3614,7 @@ mod tests {
                 path: entity.zip_path.clone().unwrap(),
                 source: PlannedSource::Ready(byte_stream(FIXTURE_BYTES)),
                 expected_blake3: payload_hash,
+                modified_ms: FIXTURE_MOMENT_MS,
             })
             .collect();
         let (writer, mut reader) = tokio::io::duplex(64 * 1024);
@@ -4180,6 +4221,7 @@ mod tests {
                     path: "data/b".to_string(),
                     source: PlannedSource::Ready(byte_stream(b"b")),
                     expected_blake3: *blake3::hash(b"b").as_bytes(),
+                    modified_ms: FIXTURE_MOMENT_MS,
                 },
                 PlannedEntry {
                     entity_index: 1,
@@ -4187,6 +4229,7 @@ mod tests {
                     path: "data/a".to_string(),
                     source: PlannedSource::Ready(byte_stream(b"a")),
                     expected_blake3: *blake3::hash(b"a").as_bytes(),
+                    modified_ms: FIXTURE_MOMENT_MS,
                 },
             ],
             Some(b"report".to_vec()),
@@ -4528,6 +4571,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clamps_zip_dates() {
+        assert_eq!(zip_date(FIXTURE_MOMENT_MS).year(), 2026);
+        assert_eq!(zip_date(0).year(), 1980);
+        assert_eq!(zip_date(u64::MAX).year(), 1980);
+        assert_eq!(
+            zip_date(Ulid::from_bytes([74; 16]).timestamp_ms()).year(),
+            2107
+        );
+    }
+
+    #[tokio::test]
+    async fn stamps_entry_dates() {
+        let bytes = sample_archive().await;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).unwrap();
+            let moment = entry
+                .last_modified()
+                .expect("entry carries a modification date");
+            assert_eq!(moment.year(), 2026);
+        }
+    }
+
+    #[tokio::test]
+    async fn dates_follow_versions() {
+        let version = Ulid::from_bytes([74; 16]);
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let task = tokio::spawn(write_archive(
+            writer,
+            b"metadata".to_vec(),
+            vec![PlannedEntry {
+                entity_index: 0,
+                candidate_index: 0,
+                path: "data/a".to_string(),
+                source: PlannedSource::Ready(byte_stream(b"a")),
+                expected_blake3: *blake3::hash(b"a").as_bytes(),
+                modified_ms: version.timestamp_ms(),
+            }],
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap().unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let metadata_year = archive
+            .by_name(METADATA_PATH)
+            .unwrap()
+            .last_modified()
+            .unwrap()
+            .year();
+        let payload_year = archive
+            .by_name("data/a")
+            .unwrap()
+            .last_modified()
+            .unwrap()
+            .year();
+
+        assert_eq!(metadata_year, 2026);
+        assert_eq!(payload_year, 2107);
+    }
+
     #[tokio::test]
     async fn archives_are_deterministic() {
         assert_eq!(sample_archive().await, sample_archive().await);
@@ -4590,6 +4698,7 @@ mod tests {
                 path: "data/corrupt".to_string(),
                 source: PlannedSource::Ready(byte_stream(b"wrong")),
                 expected_blake3: [0; 32],
+                modified_ms: FIXTURE_MOMENT_MS,
             }],
             None,
             tokio_util::sync::CancellationToken::new(),
@@ -4625,6 +4734,7 @@ mod tests {
                     Result<Bytes, std::io::Error>,
                 >())),
                 expected_blake3: [0; 32],
+                modified_ms: FIXTURE_MOMENT_MS,
             }],
             None,
             cancel,
@@ -4641,7 +4751,10 @@ mod tests {
         let mut writer = async_zip::base::write::ZipFileWriter::new(Vec::<u8>::new());
         for index in 0..70_000u32 {
             writer
-                .write_entry_whole(zip_entry(&format!("data/{index:08}")), &[])
+                .write_entry_whole(
+                    zip_entry(&format!("data/{index:08}"), FIXTURE_MOMENT_MS),
+                    &[],
+                )
                 .await
                 .unwrap();
         }
@@ -4681,7 +4794,7 @@ mod tests {
             enabled: Arc::clone(&sparse),
         });
         let mut entry = writer
-            .write_entry_stream(zip_entry("data/large"))
+            .write_entry_stream(zip_entry("data/large", FIXTURE_MOMENT_MS))
             .await
             .unwrap();
         let zeros = vec![0; CHUNK_SIZE];
