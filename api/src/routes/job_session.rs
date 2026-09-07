@@ -489,35 +489,27 @@ pub async fn stream_session(
         Err(response) => return Ok(response),
     };
     let after = query.after.or_else(|| last_event_id(&headers)).unwrap_or(0);
-    let first = frame("session", 0, &session_response(&session, false));
+    let mut initial = vec![frame("session", &session_response(&session, false))];
     let (backlog, receiver) = match session.subscribe(after) {
         Ok(resumed) => resumed,
         Err(_) => {
             let (backlog, receiver) = session.subscribe_all();
             // The lost range is what the ring no longer reaches, so the client
             // sees the window it still holds rather than an inverted one.
-            let gap = frame(
+            initial.push(frame(
                 "gap",
-                0,
                 &json!({
                     "from": backlog.first().map_or(after, |event| event.id),
                     "to": backlog.last().map_or(after, |event| event.id),
                 }),
-            );
-            let last_id = backlog.last().map_or(after, |event| event.id);
-            let ended = stream_ended(&backlog);
-            return Ok(sse(
-                stream::iter(vec![first, gap])
-                    .chain(stream::iter(backlog.into_iter().map(sse_event)))
-                    .chain(live_stream(receiver, last_id, ended)),
-                &state,
             ));
+            (backlog, receiver)
         }
     };
     let last_id = backlog.last().map_or(after, |event| event.id);
     let ended = stream_ended(&backlog);
     Ok(sse(
-        stream::iter(vec![first])
+        stream::iter(initial)
             .chain(stream::iter(backlog.into_iter().map(sse_event)))
             .chain(live_stream(receiver, last_id, ended)),
         &state,
@@ -570,7 +562,6 @@ fn live_stream(
                             pending.push_back(sse_event(event));
                             let gap = frame(
                                 "gap",
-                                0,
                                 &json!({ "from": last_id.saturating_add(1), "to": id }),
                             );
                             return Some((gap, (receiver, id, pending, ended)));
@@ -593,15 +584,10 @@ fn sse_event(event: SessionEvent) -> Event {
         .data(event.data)
 }
 
-fn frame<T: Serialize>(name: &str, id: u64, data: &T) -> Event {
-    let event = Event::default()
+fn frame<T: Serialize>(name: &str, data: &T) -> Event {
+    Event::default()
         .event(name)
-        .data(serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string()));
-    if id > 0 {
-        event.id(id.to_string())
-    } else {
-        event
-    }
+        .data(serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string()))
 }
 
 fn last_event_id(headers: &HeaderMap) -> Option<u64> {
