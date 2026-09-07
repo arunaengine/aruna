@@ -418,7 +418,12 @@ like cancel: only the submitter, and anybody else's job answers 404.
   `walltime`, `cancelled` or `kernel_exit`."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     responses(
-        (status = 200, description = "The session state", body = SessionResponse),
+        (status = 200, description = "The session state", body = SessionResponse, example = json!({
+            "job_id": "01JJRSTVWXYZ0123456789ABCD", "state": "ready", "runtime": "python-notebook",
+            "workspace_bucket": "lab-data", "executor_node_id": "node-1", "started_at_ms": 1755500000000_u64,
+            "idle_after_ms": 1800000, "idle_deadline_ms": 1755501800000_u64,
+            "credential_expires_at_ms": 1755503600000_u64, "last_event_id": 1, "cells": []
+        })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
@@ -630,15 +635,16 @@ like cancel.
   that cell id is already queued or running.
 - 429 when more than 64 cells are queued, or more than 30 submits arrived in 10 seconds."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
-    request_body = SubmitCellRequest,
+    request_body(content = SubmitCellRequest, example = json!({"cell_id": "cell-1", "code": "print('hello')"})),
     responses(
-        (status = 202, description = "The cell was queued", body = SubmitCellResponse),
+        (status = 202, description = "The cell was queued", body = SubmitCellResponse, example = json!({"cell_id": "cell-1", "position": 1})),
         (status = 400, description = "An invalid cell id or oversized code", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session is not ready, or that cell is busy", body = ErrorResponse),
-        (status = 429, description = "Too many cells queued or submitted", body = ErrorResponse)
+        (status = 429, description = "Too many cells queued or submitted", body = ErrorResponse,
+            headers(("Retry-After" = u32, description = "Seconds before retrying the cell submission")))
     ),
     security(("bearer_auth" = []))
 )]
@@ -725,7 +731,12 @@ like cancel.
 - The call is idempotent: ending an already ended session keeps the first reason."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     responses(
-        (status = 202, description = "The session was ended", body = JobStatusResponse),
+        (status = 202, description = "The session was ended", body = JobStatusResponse, example = json!({
+            "job_id": "01JJRSTVWXYZ0123456789ABCD", "kind": "execution", "state": "running",
+            "attempts": 1, "cancel_requested": false, "created_at": "2025-08-18T05:33:20Z",
+            "updated_at": "2025-08-18T05:33:20Z", "progress": {"current": 0, "total": null, "unit": "items"},
+            "workspace_bucket": "lab-data", "workspace_mode": "existing", "locally_exhausted": false
+        })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
@@ -771,9 +782,14 @@ like cancel, and each source additionally needs the caller's read permission on 
 - At most 64 items per call, and a `dest_key` that is relative and traversal-free.
 - A source on another node: import it into a bucket of this node first."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
-    request_body = SessionInputsRequest,
+    request_body(content = SessionInputsRequest, example = json!({
+        "items": [{"bucket": "source-data", "key": "input.txt", "dest_key": "data/input.txt"}]
+    })),
     responses(
-        (status = 202, description = "The objects were staged", body = SessionInputsResponse),
+        (status = 202, description = "The objects were staged", body = SessionInputsResponse, example = json!({
+            "staged": [{"dest_key": "data/input.txt", "bytes": 12, "blake3": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                "source_node_id": "node-1", "version_id": "01JJRSVERSION0123456789ABC"}], "pending": []
+        })),
         (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, or the caller may not read a source", body = ErrorResponse),
@@ -934,7 +950,9 @@ like cancel.
         ScratchQuery
     ),
     responses(
-        (status = 200, description = "The directory listing", body = ScratchListResponse),
+        (status = 200, description = "The directory listing", body = ScratchListResponse, example = json!({
+            "path": "", "entries": [{"name": "result.txt", "kind": "file", "bytes": 42, "modified_ms": 1755500000000_u64}]
+        })),
         (status = 400, description = "A path that leaves the working directory", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
