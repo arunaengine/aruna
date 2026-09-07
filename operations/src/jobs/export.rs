@@ -242,10 +242,10 @@ enum CandidateOpen {
     Status(OpenStatus),
 }
 
-struct EntityIdentity {
-    exact: Option<VersionedObjectArn>,
-    hash: Option<[u8; 32]>,
-    hash_realm: Option<RealmId>,
+pub(crate) struct EntityIdentity {
+    pub(crate) exact: Option<VersionedObjectArn>,
+    pub(crate) hash: Option<[u8; 32]>,
+    pub(crate) hash_realm: Option<RealmId>,
 }
 
 pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
@@ -2047,7 +2047,9 @@ fn term_value(term: &Term) -> Option<String> {
     }
 }
 
-fn entity_identity(entity_id: &str, content_urls: &[String]) -> EntityIdentity {
+/// Reads an Aruna object identity out of a data entity's `@id` and
+/// `contentUrl` values: a versioned ARN, or a content hash W3ID or ARN.
+pub(crate) fn entity_identity(entity_id: &str, content_urls: &[String]) -> EntityIdentity {
     let mut exact = None;
     let mut hash = None;
     let mut hash_realm = None;

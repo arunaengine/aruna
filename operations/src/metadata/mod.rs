@@ -12,6 +12,7 @@ pub mod profile_validation;
 pub mod projector;
 pub(crate) mod protocol;
 pub mod prune_queue;
+pub mod public_preview;
 mod query_cache;
 mod queue_storage;
 pub mod raw;
