@@ -562,6 +562,210 @@ mod tests {
         assert!(!restricted.complete);
     }
 
+    async fn add_alias(fixture: &Fixture, group_id: GroupId, key: &str) {
+        let alias = HashPathIndexKey::new(
+            fixture.hash,
+            Ulid::generate(),
+            fixture.realm_id,
+            group_id,
+            fixture.node_id,
+            BUCKET,
+            key,
+        );
+        let event = fixture
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                key: alias.to_bytes().unwrap().into(),
+                value: Vec::<u8>::new().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn skips_foreign_alias() {
+        let fixture = fixture(true).await;
+        add_alias(&fixture, Ulid::from_bytes([1; 16]), "foreign.csv").await;
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &fixture.owner,
+            &draft(fixture.hash),
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(preview.complete);
+    }
+
+    #[tokio::test]
+    async fn marks_unavailable_policy() {
+        let fixture = fixture(false).await;
+        let event = fixture
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: GROUP_KEYSPACE.to_string(),
+                key: Ulid::from_bytes([63; 16]).to_bytes().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::DeleteResult { .. })
+        ));
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &fixture.owner,
+            &draft(fixture.hash),
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(!preview.complete);
+    }
+
+    #[tokio::test]
+    async fn marks_alias_limit() {
+        let fixture = fixture(false).await;
+        for index in 0..MAX_ENTITY_PATHS {
+            add_alias(
+                &fixture,
+                Ulid::from_bytes([63; 16]),
+                &format!("alias-{index}.csv"),
+            )
+            .await;
+        }
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &fixture.owner,
+            &draft(fixture.hash),
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(!preview.complete);
+    }
+
+    #[tokio::test]
+    async fn marks_file_limit() {
+        let fixture = fixture(true).await;
+        let file = draft(fixture.hash)["@graph"][1].clone();
+        let document = json!({"@graph": vec![file; MAX_DRAFT_FILES + 1]});
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &fixture.owner,
+            &document,
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(!preview.complete);
+    }
+
+    #[tokio::test]
+    async fn marks_remote_exact() {
+        let fixture = fixture(true).await;
+        let remote = iroh::SecretKey::from_bytes(&[99; 32]).public();
+        let exact = aruna_core::structs::VersionedObjectArn::new(
+            fixture.realm_id,
+            remote,
+            BUCKET.to_string(),
+            KEY.to_string(),
+            Ulid::generate(),
+        )
+        .unwrap();
+        let document = json!({"@graph": [{"@id": exact.to_w3id(), "@type": "File"}]});
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &fixture.owner,
+            &document,
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(!preview.complete);
+    }
+
+    #[tokio::test]
+    async fn checks_anonymous_first() {
+        let fixture = fixture(true).await;
+        let mut caller = fixture.owner.clone();
+        caller.path_restrictions = Some(vec![aruna_core::structs::PathRestriction {
+            pattern: format!("/{}/g/*/meta/**", fixture.realm_id),
+            permission: Permission::READ,
+        }]);
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &caller,
+            &draft(fixture.hash),
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(preview.complete);
+    }
+
+    #[tokio::test]
+    async fn skips_external_files() {
+        let fixture = fixture(false).await;
+        let document =
+            json!({"@graph": [{"@id": "https://example.org/file.csv", "@type": "File"}]});
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &fixture.owner,
+            &document,
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(preview.complete);
+    }
+
+    #[tokio::test]
+    async fn marks_missing_version() {
+        let fixture = fixture(false).await;
+        let exact = aruna_core::structs::VersionedObjectArn::new(
+            fixture.realm_id,
+            fixture.node_id,
+            BUCKET,
+            KEY,
+            Ulid::generate(),
+        )
+        .unwrap();
+        let document = json!({"@graph": [{"@id": exact.to_w3id(), "@type": "File"}]});
+        let preview = restricted_files(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.node_id,
+            &fixture.owner,
+            &document,
+        )
+        .await
+        .unwrap();
+        assert!(preview.files.is_empty());
+        assert!(!preview.complete);
+    }
+
     #[test]
     fn selects_data_entities() {
         let document = json!({
