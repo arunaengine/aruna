@@ -7,7 +7,7 @@ use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
 use aruna_core::structs::RealmId;
 
 #[test]
-fn approval_is_atomic() {
+fn membership_is_atomic() {
     let realm_id = RealmId::from_bytes([7; 32]);
     let group_id = Ulid::from_bytes([3; 16]);
     let actor = Actor {
@@ -109,6 +109,78 @@ fn approval_is_atomic() {
             Some(config.to_bytes(&actor).unwrap().into()),
         ),
     ];
+    let requestor = Actor {
+        user_id: UserId::local(Ulid::from_bytes([8; 16]), realm_id),
+        ..actor.clone()
+    };
+    let input = GroupJoinInput {
+        actor: requestor.clone(),
+        auth: AuthContext {
+            user_id: requestor.user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        group_id,
+        action: JoinAction::Request { message: None },
+        now_ms: 3,
+    };
+    let mut request_operation = GroupJoinOperation::new(input.clone());
+    request_operation.start();
+    let request_txn = Ulid::from_bytes([9; 16]);
+    request_operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: request_txn,
+    }));
+    let request_effects = request_operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: values.clone(),
+    }));
+    let [
+        Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(notification_txn),
+        }),
+    ] = request_effects.as_slice()
+    else {
+        panic!("request must write one atomic batch");
+    };
+    assert_eq!(*notification_txn, request_txn);
+    let notifications: Vec<_> = writes
+        .iter()
+        .filter(|(space, _, _)| space == aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE)
+        .collect();
+    assert_eq!(notifications.len(), 1);
+    let notification = NotificationOutboxRecord::from_bytes(&notifications[0].2).unwrap();
+    assert_eq!(notification.record.recipient, actor.user_id);
+    assert!(
+        matches!(notification.record.kind, aruna_core::structs::NotificationKind::GroupJoinRequested { group_id: notified_group, actor_user_id, .. } if notified_group == group_id && actor_user_id == requestor.user_id)
+    );
+    let mut duplicate_values = values.clone();
+    duplicate_values[2].1 = Some(
+        writes
+            .iter()
+            .find(|(space, _, _)| space == ADMIN_DOCUMENT_STATE_KEYSPACE)
+            .unwrap()
+            .2
+            .clone(),
+    );
+    let mut duplicate = GroupJoinOperation::new(input);
+    duplicate.start();
+    duplicate.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: request_txn,
+    }));
+    let duplicate_effects = duplicate.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: duplicate_values,
+    }));
+    assert!(matches!(
+        duplicate_effects.as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+    ));
+    let aborted = request_operation.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    }));
+    assert!(
+        matches!(aborted.as_slice(), [Effect::Storage(StorageEffect::AbortTransaction { txn_id })] if *txn_id == request_txn)
+    );
     let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     let [
         Effect::Storage(StorageEffect::BatchWrite {

@@ -41,6 +41,29 @@ pub fn route_resource_event(
 ) -> Vec<NotificationRecord> {
     let mut records = Vec::new();
     match event {
+        ResourceEvent::GroupJoinRequested {
+            group_id,
+            request_id,
+            actor_user_id,
+        } => {
+            if let Some(group_auth) = ctx.group_auth {
+                for admin in group_admin_user_ids(group_auth) {
+                    if admin == *actor_user_id || admin.is_nil() {
+                        continue;
+                    }
+                    records.push(NotificationRecord::new(
+                        admin,
+                        NotificationClass::Direct,
+                        NotificationKind::GroupJoinRequested {
+                            group_id: *group_id,
+                            request_id: *request_id,
+                            actor_user_id: *actor_user_id,
+                        },
+                        now_ms,
+                    ));
+                }
+            }
+        }
         ResourceEvent::GroupMemberAdded {
             group_id,
             affected_user,
@@ -167,6 +190,44 @@ mod tests {
             .expect("default group admin role exists")
             .assigned_users = assigned;
         doc
+    }
+
+    #[test]
+    fn join_notifies_admins() {
+        let requester = user(3);
+        let admins = HashSet::from([user(1), user(2), requester, UserId::nil(REALM)]);
+        let doc = group_doc_with_admins(admins);
+        let request_id = Ulid::from_bytes([4; 16]);
+        let records = route_resource_event(
+            &ResourceEvent::GroupJoinRequested {
+                group_id: doc.group_id,
+                request_id,
+                actor_user_id: requester,
+            },
+            RoutingContext {
+                group_auth: Some(&doc),
+                realm_auth: None,
+            },
+            100,
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.recipient)
+                .collect::<Vec<_>>(),
+            vec![user(1), user(2)]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.class == NotificationClass::Direct
+                    && record.kind
+                        == NotificationKind::GroupJoinRequested {
+                            group_id: doc.group_id,
+                            request_id,
+                            actor_user_id: requester
+                        })
+        );
     }
 
     #[test]

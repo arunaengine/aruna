@@ -99,6 +99,8 @@ pub struct NotificationResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_user_id: Option<String>,
@@ -253,6 +255,7 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         created_at_ms: record.created_at_ms,
         read: record.read_at_ms.is_some(),
         group_id: None,
+        request_id: None,
         member_user_id: None,
         actor_user_id: None,
         node_id: None,
@@ -267,6 +270,15 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         error: None,
     };
     match &record.kind {
+        NotificationKind::GroupJoinRequested {
+            group_id,
+            request_id,
+            actor_user_id,
+        } => {
+            response.group_id = Some(group_id.to_string());
+            response.request_id = Some(request_id.to_string());
+            response.actor_user_id = Some(actor_user_id.to_string());
+        }
         NotificationKind::AddedToGroup {
             group_id,
             actor_user_id,
@@ -2074,6 +2086,22 @@ mod tests {
         let member = UserId::new(Ulid::generate(), realm_id);
         let onboarded_node = node(9);
 
+        let request_id = Ulid::generate();
+        let joined = notification_response(&NotificationRecord::new(
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::GroupJoinRequested {
+                group_id,
+                request_id,
+                actor_user_id: actor,
+            },
+            1,
+        ));
+        assert_eq!(joined.kind, "group_join_requested");
+        assert_eq!(joined.category, "group.membership");
+        assert_eq!(joined.request_id, Some(request_id.to_string()));
+        assert_eq!(joined.group_id, Some(group_id.to_string()));
+        assert_eq!(joined.actor_user_id, Some(actor.to_string()));
         let added = notification_response(&NotificationRecord::new(
             recipient,
             NotificationClass::Direct,

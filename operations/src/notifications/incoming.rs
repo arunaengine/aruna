@@ -472,6 +472,16 @@ fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) -> Result<(
 
 fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> Result<(), String> {
     match kind {
+        NotificationKind::GroupJoinRequested {
+            group_id,
+            request_id,
+            actor_user_id,
+        } => {
+            if group_id.is_nil() || request_id.is_nil() {
+                return Err("join notification has empty group or request id".into());
+            }
+            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+        }
         NotificationKind::AddedToGroup {
             group_id,
             actor_user_id,
@@ -1323,6 +1333,26 @@ mod tests {
             "unexpected reject reason: {error}"
         );
         assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[test]
+    fn join_payload_validates() {
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let actor_user_id = UserId::local(Ulid::from_bytes([1; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2; 16]);
+        let valid = NotificationKind::GroupJoinRequested {
+            group_id,
+            request_id: Ulid::from_bytes([3; 16]),
+            actor_user_id,
+        };
+        assert!(validate_inbound_kind(&valid, realm_id).is_ok());
+        assert!(validate_inbound_kind(&valid, RealmId::from_bytes([8; 32])).is_err());
+        let invalid = NotificationKind::GroupJoinRequested {
+            group_id,
+            request_id: Ulid::nil(),
+            actor_user_id,
+        };
+        assert!(validate_inbound_kind(&invalid, realm_id).is_err());
     }
 
     #[test]

@@ -2,6 +2,8 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::notifications::outbox::schedule_notification_outbox_drain_effect;
+use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::placement::placement_ref_for_target;
 use aruna_core::admin_document_reducer::{
     AdminDocumentReducerError, decode_admin_document_reducer_state,
@@ -20,10 +22,12 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    admin_document_reducer_state_write_entry, notification_outbox_write_entry,
+    stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmConfigDocument,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, NotificationOutboxRecord, Permission,
+    RealmConfigDocument, ResourceEvent,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -96,6 +100,7 @@ enum State {
     Fence,
     Commit,
     Schedule,
+    Notify,
     Done,
     Failed,
 }
@@ -108,6 +113,7 @@ pub struct GroupJoinOperation {
     fence: crate::placement::fence::WriteFence,
     deletes: Vec<(KeySpace, Key)>,
     changed: bool,
+    notifications: bool,
     output: Option<Result<JoinRequestState, GroupJoinError>>,
 }
 
@@ -120,6 +126,7 @@ impl GroupJoinOperation {
             fence: Default::default(),
             deletes: Vec::new(),
             changed: false,
+            notifications: false,
             output: None,
         }
     }
@@ -319,6 +326,22 @@ impl GroupJoinOperation {
             }
             _ => return Err(GroupJoinError::UnexpectedEvent),
         };
+        let notifications = if matches!(op, AdminDocumentOperation::GroupJoinRequested { .. }) {
+            route_resource_event(
+                &ResourceEvent::GroupJoinRequested {
+                    group_id: self.input.group_id,
+                    request_id,
+                    actor_user_id: self.input.actor.user_id,
+                },
+                RoutingContext {
+                    group_auth: Some(&auth),
+                    realm_auth: None,
+                },
+                self.input.now_ms,
+            )
+        } else {
+            Vec::new()
+        };
         let event = state.apply_operation(&self.input.actor, op)?;
         let config =
             RealmConfigDocument::from_bytes(config.as_deref().ok_or(GroupJoinError::NotFound)?)?;
@@ -357,6 +380,15 @@ impl GroupJoinOperation {
             outbox_write_entry(&record).map_err(ConversionError::from)?,
         ];
         writes.extend(admin_document_conflict_write_entries(&state)?);
+        self.notifications = !notifications.is_empty();
+        for record in notifications {
+            writes.push(notification_outbox_write_entry(
+                &NotificationOutboxRecord {
+                    outbox_id: record.notification_id,
+                    record,
+                },
+            )?);
+        }
         self.changed = true;
         self.state = State::Write;
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -478,6 +510,18 @@ impl Operation for GroupJoinOperation {
             }
             (
                 State::Schedule,
+                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
+            ) => {
+                if self.notifications {
+                    self.state = State::Notify;
+                    smallvec![schedule_notification_outbox_drain_effect()]
+                } else {
+                    self.state = State::Done;
+                    smallvec![]
+                }
+            }
+            (
+                State::Notify,
                 Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
             ) => {
                 self.state = State::Done;
