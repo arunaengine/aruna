@@ -16,6 +16,7 @@ pub mod events;
 pub mod handle;
 pub mod id;
 pub mod jobs;
+pub mod join_request;
 pub mod keys;
 pub mod keyspaces;
 pub mod metadata;
