@@ -294,6 +294,12 @@ pub enum AdminDocumentOperation {
     GroupDisplayNameSet {
         display_name: String,
     },
+    GroupJoinRequested {
+        request: crate::join_request::JoinRequest,
+    },
+    GroupJoinDecided {
+        decision: crate::join_request::JoinDecision,
+    },
 }
 
 #[cfg(test)]

@@ -109,3 +109,137 @@ impl AdminDocumentReducerState {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin_documents::{AdminDocumentOperation, AdminDocumentRoleDefinition};
+    use crate::structs::{Actor, RealmId};
+    use std::collections::BTreeMap;
+
+    fn actor(seed: u8) -> Actor {
+        let realm_id = RealmId::from_bytes([7; 32]);
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([seed; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn pending() -> (AdminDocumentReducerState, JoinRequest, Ulid) {
+        let admin = actor(1);
+        let member = actor(2);
+        let group_id = Ulid::from_bytes([3; 16]);
+        let role_id = Ulid::from_bytes([4; 16]);
+        let mut state = AdminDocumentReducerState::new(AdminDocumentTarget::Group { group_id });
+        state
+            .apply_operation(
+                &admin,
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: AdminDocumentRoleDefinition {
+                        role_id,
+                        name: "user".into(),
+                        permissions: BTreeMap::new(),
+                    },
+                },
+            )
+            .unwrap();
+        let request = JoinRequest {
+            request_id: Ulid::from_bytes([5; 16]),
+            group_id,
+            user_id: member.user_id,
+            message: Some("Please admit me".into()),
+            created_at: 1,
+        };
+        state
+            .apply_operation(
+                &member,
+                AdminDocumentOperation::GroupJoinRequested {
+                    request: request.clone(),
+                },
+            )
+            .unwrap();
+        (state, request, role_id)
+    }
+
+    #[test]
+    fn concurrent_decisions_converge() {
+        let (initial, request, role_id) = pending();
+        let mut approved = initial.clone();
+        let mut denied = initial;
+        let admin = actor(1);
+        let other = actor(6);
+        let decision = |kind, by: &Actor, roles| JoinDecision {
+            request_id: request.request_id,
+            user_id: request.user_id,
+            kind,
+            decided_by: by.user_id,
+            reason: None,
+            decided_at: 2,
+            role_ids: roles,
+        };
+        let approval = approved
+            .apply_operation(
+                &admin,
+                AdminDocumentOperation::GroupJoinDecided {
+                    decision: decision(
+                        JoinDecisionKind::Approved,
+                        &admin,
+                        BTreeSet::from([role_id]),
+                    ),
+                },
+            )
+            .unwrap();
+        let rejection = denied
+            .apply_operation(
+                &other,
+                AdminDocumentOperation::GroupJoinDecided {
+                    decision: decision(JoinDecisionKind::Denied, &other, BTreeSet::new()),
+                },
+            )
+            .unwrap();
+        approved.apply(&rejection).unwrap();
+        denied.apply(&approval).unwrap();
+        assert_eq!(approved.join_requests(), denied.join_requests());
+        assert_eq!(
+            approved.join_requests()[0].decision.as_ref().unwrap().kind,
+            JoinDecisionKind::Approved
+        );
+        assert!(
+            approved.materialized_group_role_user_assignments()[&role_id]
+                .contains(&request.user_id)
+        );
+        assert!(
+            denied.materialized_group_role_user_assignments()[&role_id].contains(&request.user_id)
+        );
+        let before = approved.clone();
+        approved.apply(&approval).unwrap();
+        assert_eq!(approved, before);
+    }
+
+    #[test]
+    fn rejects_forged_withdrawal() {
+        let (mut state, request, _) = pending();
+        let admin = actor(1);
+        let before = state.clone();
+        assert!(
+            state
+                .apply_operation(
+                    &admin,
+                    AdminDocumentOperation::GroupJoinDecided {
+                        decision: JoinDecision {
+                            request_id: request.request_id,
+                            user_id: request.user_id,
+                            kind: JoinDecisionKind::Withdrawn,
+                            decided_by: admin.user_id,
+                            reason: None,
+                            decided_at: 2,
+                            role_ids: BTreeSet::new()
+                        },
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(state, before);
+    }
+}
