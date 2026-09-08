@@ -2218,6 +2218,336 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn membership_request_flow() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+        let (_, owner_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "owner",
+            "Group Owner",
+            None,
+        )
+        .await;
+        let (member, member_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "member",
+            "Prospective Member",
+            None,
+        )
+        .await;
+        let (_, other_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "other",
+            "Other User",
+            None,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let groups_url = format!("{}/api/v1/access/groups", node.base_url);
+        let group = client
+            .post(&groups_url)
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({ "name": "Research group" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(group.status(), StatusCode::CREATED);
+        let group: crate::routes::groups::CreateGroupResponse = group.json().await.unwrap();
+        let groups = client
+            .get(&groups_url)
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(groups.status(), StatusCode::OK);
+        let groups: serde_json::Value = groups.json().await.unwrap();
+        assert!(groups.to_string().contains(&group.group_id));
+        let requests_url = format!("{groups_url}/{}/join-requests", group.group_id);
+        let own_url = format!("{}/api/v1/access/users/join-requests", node.base_url);
+        let request = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({"message":"I would like to join"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(request.status(), StatusCode::CREATED);
+        let request: serde_json::Value = request.json().await.unwrap();
+        assert_eq!(request["status"], "pending");
+        assert_eq!(request["user_id"], member.id);
+        let request_id = request["request_id"].as_str().unwrap();
+        let duplicate: serde_json::Value = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(duplicate["request_id"], request_id);
+        for token in [&member_token, &other_token] {
+            assert_eq!(
+                client
+                    .get(&requests_url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                client
+                    .post(format!("{requests_url}/{request_id}/decide"))
+                    .bearer_auth(token)
+                    .json(&serde_json::json!({"approve":true}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            client
+                .delete(format!("{requests_url}/{request_id}"))
+                .bearer_auth(&other_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let own: serde_json::Value = client
+            .get(&own_url)
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(own["requests"].as_array().unwrap().len(), 1);
+        let other: serde_json::Value = client
+            .get(&own_url)
+            .bearer_auth(&other_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(other["requests"].as_array().unwrap().is_empty());
+        let inbox: serde_json::Value = client
+            .get(format!("{requests_url}?status=pending"))
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(inbox["requests"][0]["user_name"], "Prospective Member");
+        let denied = client
+            .post(format!("{requests_url}/{request_id}/decide"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({"approve":false,"reason":"Not yet"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::OK);
+        let denied: serde_json::Value = denied.json().await.unwrap();
+        assert_eq!(denied["request"]["status"], "denied");
+        assert_eq!(denied["request"]["decision_reason"], "Not yet");
+        let members_url = format!("{groups_url}/{}/members", group.group_id);
+        let members: serde_json::Value = client
+            .get(&members_url)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !members["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["user_id"] == member.id)
+        );
+        let withdrawn: serde_json::Value = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let withdrawn_id = withdrawn["request_id"].as_str().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .delete(format!("{requests_url}/{withdrawn_id}"))
+                    .bearer_auth(&member_token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(
+            client
+                .post(format!("{requests_url}/{withdrawn_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(&serde_json::json!({"approve":true}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let pending: serde_json::Value = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let pending_id = pending["request_id"].as_str().unwrap();
+        let page: serde_json::Value = client
+            .get(format!("{own_url}?limit=1"))
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["requests"].as_array().unwrap().len(), 1);
+        let first_id = page["requests"][0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cursor = page["next_start_after"].as_str().unwrap();
+        let page: serde_json::Value = client
+            .get(format!("{own_url}?limit=1&start_after={cursor}"))
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            std::collections::BTreeSet::from([
+                first_id.as_str(),
+                page["requests"][0]["request_id"].as_str().unwrap()
+            ]),
+            std::collections::BTreeSet::from([request_id, pending_id]),
+        );
+        assert!(page["next_start_after"].is_null());
+        assert_eq!(
+            client
+                .post(format!("{requests_url}/{pending_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(
+                    &serde_json::json!({"approve":true,"role_ids":[Ulid::generate().to_string()]})
+                )
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        for _ in 0..2 {
+            let approved = client
+                .post(format!("{requests_url}/{pending_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(&serde_json::json!({"approve":true}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(approved.status(), StatusCode::OK);
+            let approved: serde_json::Value = approved.json().await.unwrap();
+            assert_eq!(approved["request"]["status"], "approved");
+        }
+        let members: serde_json::Value = client
+            .get(&members_url)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            members["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["user_id"] == member.id)
+        );
+        assert_eq!(
+            client
+                .post(&requests_url)
+                .bearer_auth(&member_token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .post(format!("{requests_url}/{pending_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(&serde_json::json!({"approve":false}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        install_deny_policy(&node, "permission == 'write'").await;
+        assert_eq!(
+            client
+                .post(&requests_url)
+                .bearer_auth(&other_token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
     async fn public_profile_search() {
         let issuer = "https://issuer.example";
         let kid = "main-key";

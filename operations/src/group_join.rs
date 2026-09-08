@@ -503,3 +503,6 @@ impl Operation for GroupJoinOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
