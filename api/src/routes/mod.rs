@@ -18,6 +18,7 @@ pub mod device;
 pub mod device_compute;
 pub mod drs;
 pub mod group_backends;
+pub mod group_join;
 pub mod groups;
 pub mod info;
 pub mod job_audit;
@@ -66,6 +67,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(device::router())
         .merge(device_compute::router())
         .merge(groups::router())
+        .merge(group_join::router())
         .merge(job_session::router())
         .merge(jobs::router())
         .merge(job_audit::router())

@@ -20,6 +20,21 @@ const BOUNDARY: &[&str] = &[
 /// is still authorized. A new route must gain a check or a reviewed entry here.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
+        "group_join.rs",
+        "submit_join",
+        "self-scoped request with unrestricted realm auth and deny policies; operation binds requester to caller",
+    ),
+    (
+        "group_join.rs",
+        "own_joins",
+        "self-scoped request list with unrestricted realm auth and deny policies; operation filters by caller",
+    ),
+    (
+        "group_join.rs",
+        "withdraw_join",
+        "self-scoped withdrawal with unrestricted realm auth and deny policies; operation checks stored requester",
+    ),
+    (
         "users.rs",
         "search_users",
         "unrestricted realm directory read with policy checks; only user-selected public fields match",
