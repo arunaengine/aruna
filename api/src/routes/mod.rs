@@ -142,6 +142,14 @@ mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/access/groups/{id}/join-requests"),
+        ("GET", "/access/groups/{id}/join-requests"),
+        ("DELETE", "/access/groups/{id}/join-requests/{request_id}"),
+        (
+            "POST",
+            "/access/groups/{id}/join-requests/{request_id}/decide",
+        ),
+        ("GET", "/access/users/join-requests"),
         ("DELETE", "/access/devices/{node_id}"),
         ("DELETE", "/access/onboarding/secrets/{id}"),
         ("DELETE", "/data/sync/quarantine"),
