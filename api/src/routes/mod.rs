@@ -18,6 +18,7 @@ pub mod device;
 pub mod device_compute;
 pub mod drs;
 pub mod group_backends;
+pub mod group_join;
 pub mod groups;
 pub mod info;
 pub mod job_audit;
@@ -66,6 +67,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(device::router())
         .merge(device_compute::router())
         .merge(groups::router())
+        .merge(group_join::router())
         .merge(job_session::router())
         .merge(jobs::router())
         .merge(job_audit::router())
@@ -140,6 +142,14 @@ mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/access/groups/{id}/join-requests"),
+        ("GET", "/access/groups/{id}/join-requests"),
+        ("DELETE", "/access/groups/{id}/join-requests/{request_id}"),
+        (
+            "POST",
+            "/access/groups/{id}/join-requests/{request_id}/decide",
+        ),
+        ("GET", "/access/users/join-requests"),
         ("DELETE", "/access/devices/{node_id}"),
         ("DELETE", "/access/onboarding/secrets/{id}"),
         ("DELETE", "/data/sync/quarantine"),

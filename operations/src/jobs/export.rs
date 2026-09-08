@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{AuthorizationError, BlobError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -19,10 +19,11 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{GroupId, Key, NodeId, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
-use async_zip::{Compression, ZipEntryBuilder};
+use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};
 #[cfg(test)]
 use bytes::Bytes;
 use byteview::ByteView;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use futures_util::StreamExt;
 use futures_util::io::AsyncWriteExt;
 use oxrdf::{NamedOrBlankNode, Term};
@@ -123,10 +124,19 @@ impl Default for ExportCheckpoint {
     }
 }
 
+/// The bucket and key an entity was authored against, used to lay the archive
+/// out like the source prefix instead of by content hash.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StorageKey {
+    bucket: String,
+    key: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ExportEntity {
     entity_id: String,
     local_path: Option<String>,
+    storage_key: Option<StorageKey>,
     exact: Option<VersionedObjectArn>,
     hash: Option<[u8; 32]>,
     hash_realm: Option<RealmId>,
@@ -184,6 +194,7 @@ struct PlannedEntry {
     path: String,
     source: PlannedSource,
     expected_blake3: [u8; 32],
+    modified_ms: u64,
 }
 
 #[derive(Debug)]
@@ -231,10 +242,10 @@ enum CandidateOpen {
     Status(OpenStatus),
 }
 
-struct EntityIdentity {
-    exact: Option<VersionedObjectArn>,
-    hash: Option<[u8; 32]>,
-    hash_realm: Option<RealmId>,
+pub(crate) struct EntityIdentity {
+    pub(crate) exact: Option<VersionedObjectArn>,
+    pub(crate) hash: Option<[u8; 32]>,
+    pub(crate) hash_realm: Option<RealmId>,
 }
 
 pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
@@ -639,8 +650,19 @@ async fn extend_hash_candidates(
             .keys()
             .map(|(group_id, _)| *group_id)
             .collect::<BTreeSet<_>>();
-        load_rules(ctx, spec, permission_rules, groups.iter().copied()).await?;
-        load_policies(ctx, spec, policies, groups).await?;
+        load_rules(ctx, spec, permission_rules, groups).await?;
+        // Only a group whose rules already allow an alias needs its object
+        // policy; a foreign group is denied before its policy is consulted.
+        let allowed_groups = distinct
+            .keys()
+            .filter(|(group_id, path)| {
+                permission_rules
+                    .get(group_id)
+                    .is_some_and(|rules| rules.allows(path, &Permission::READ))
+            })
+            .map(|(group_id, _)| *group_id)
+            .collect::<BTreeSet<_>>();
+        load_policies(ctx, spec, policies, allowed_groups).await?;
         let mut resolved = Vec::new();
         let mut alias_denied = false;
         for key in distinct.keys() {
@@ -1021,7 +1043,7 @@ async fn check_read_txn(
     evaluator: &PolicyEvaluator,
     txn_id: TxnId,
 ) -> Result<bool, ExportFailure> {
-    let allowed = drive(
+    let allowed = match drive(
         CheckPermissionsOperation::new_with_txn(
             CheckPermissionsConfig {
                 auth_context: spec.auth_context.clone(),
@@ -1033,7 +1055,12 @@ async fn check_read_txn(
         ctx,
     )
     .await
-    .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    {
+        Ok(allowed) => allowed,
+        // Missing authorization state denies; it must not retry the job.
+        Err(AuthorizationError::AuthDocNotFound | AuthorizationError::GroupNotFound) => false,
+        Err(error) => return Err(ExportFailure::Retryable(error.to_string())),
+    };
     if !allowed {
         return Ok(false);
     }
@@ -1150,9 +1177,16 @@ async fn load_rules(
             auth_context: spec.auth_context.clone(),
             path: format!("/{}/g/{group_id}", spec.auth_context.realm_id),
         };
-        let loaded = drive(PermissionRulesOperation::new(config), &ctx.driver)
-            .await
-            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+        let loaded = match drive(PermissionRulesOperation::new(config), &ctx.driver).await {
+            Ok(loaded) => loaded,
+            // A group whose authorization state this node cannot read grants
+            // the caller nothing. That is a denial, not an outage, so the
+            // export omits its aliases instead of retrying forever.
+            Err(AuthorizationError::AuthDocNotFound | AuthorizationError::GroupNotFound) => {
+                PermissionRules::default()
+            }
+            Err(error) => return Err(ExportFailure::Retryable(error.to_string())),
+        };
         rules.insert(group_id, loaded);
     }
     Ok(())
@@ -1709,21 +1743,36 @@ fn plan_export(
     checkpoint: &mut ExportCheckpoint,
     opened: &[ProbedEntry],
 ) -> Result<(), ExportFailure> {
+    let sources = opened
+        .iter()
+        .map(|entry| {
+            source_key(
+                &checkpoint.entities[entry.entity_index],
+                entry.candidate_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let layout = KeyLayout::new(&sources);
     let mut paths = HashSet::new();
-    for entry in opened {
+    for (entry, source) in opened.iter().zip(&sources) {
         let entity = &mut checkpoint.entities[entry.entity_index];
         entity.report_source = Some(entry.report_source);
         entity.resolved_version = entry.resolved_version;
+        let reserved = |path: &String| path == METADATA_PATH || path == REPORT_PATH;
         let explicit = entity
             .local_path
             .as_deref()
             .and_then(safe_zip_path)
-            .filter(|path| path != METADATA_PATH && path != REPORT_PATH);
+            .filter(|path| !reserved(path));
+        let derived = source
+            .as_ref()
+            .and_then(|source| layout.path(source))
+            .filter(|path| !reserved(path));
         let path = match explicit {
             Some(path) => path,
             None => {
                 entity.path_synthesized = true;
-                synthesized_path(entry.hash, &entity.entity_id)
+                derived.unwrap_or_else(|| synthesized_path(entry.hash, &entity.entity_id))
             }
         };
         if path.len() as u64 > spec.limits.key_bytes {
@@ -1849,10 +1898,21 @@ fn recognize_entities(
         if !files.remove(&subject) {
             continue;
         }
-        let identity = entity_identity(
-            &entity_id,
-            content_urls.get(&subject).map_or(&[], Vec::as_slice),
-        );
+        let urls = content_urls.get(&subject).map_or(&[][..], Vec::as_slice);
+        let identity = entity_identity(&entity_id, urls);
+        let storage_key = identity
+            .exact
+            .as_ref()
+            .filter(|exact| exact.realm_id == realm_id)
+            .map(|exact| StorageKey {
+                bucket: exact.bucket.clone(),
+                key: exact.key.clone(),
+            })
+            .or_else(|| {
+                std::iter::once(entity_id.as_str())
+                    .chain(urls.iter().map(String::as_str))
+                    .find_map(object_location)
+            });
         let external = identity.exact.is_none() && identity.hash.is_none();
         let hash_realm = identity.hash_realm;
         let supported_exact = identity
@@ -1869,6 +1929,7 @@ fn recognize_entities(
         entities.push(ExportEntity {
             entity_id,
             local_path,
+            storage_key,
             exact: identity.exact,
             hash: identity.hash,
             hash_realm,
@@ -1986,7 +2047,9 @@ fn term_value(term: &Term) -> Option<String> {
     }
 }
 
-fn entity_identity(entity_id: &str, content_urls: &[String]) -> EntityIdentity {
+/// Reads an Aruna object identity out of a data entity's `@id` and
+/// `contentUrl` values: a versioned ARN, or a content hash W3ID or ARN.
+pub(crate) fn entity_identity(entity_id: &str, content_urls: &[String]) -> EntityIdentity {
     let mut exact = None;
     let mut hash = None;
     let mut hash_realm = None;
@@ -2073,6 +2136,95 @@ fn jsonld_path(path: &str) -> String {
 fn synthesized_path(hash: [u8; 32], entity_id: &str) -> String {
     let suffix = blake3::hash(entity_id.as_bytes()).to_hex();
     format!("data/{}-{}", hex::encode(hash), &suffix[..12])
+}
+
+fn object_location(value: &str) -> Option<StorageKey> {
+    let (bucket, key) = value.strip_prefix("s3://")?.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then(|| StorageKey {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    })
+}
+
+/// The authored location wins over the resolved candidate: a content hash may
+/// be served from any alias, and only the authored key matches the crate.
+fn source_key(entity: &ExportEntity, candidate_index: usize) -> Option<StorageKey> {
+    if let Some(storage_key) = entity.storage_key.clone() {
+        return Some(storage_key);
+    }
+    match &entity.candidates.get(candidate_index)?.source {
+        CandidateSource::Local { bucket, key, .. } => Some(StorageKey {
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }),
+        CandidateSource::RemoteExact { target, .. } => Some(StorageKey {
+            bucket: target.bucket.clone(),
+            key: target.key.clone(),
+        }),
+        CandidateSource::RemoteHash { .. } => None,
+    }
+}
+
+/// How keys become archive paths: one bucket drops the directory prefix every
+/// payload shares, several buckets keep the whole key under the bucket name.
+struct KeyLayout {
+    dropped: usize,
+    with_bucket: bool,
+}
+
+impl KeyLayout {
+    fn new(sources: &[Option<StorageKey>]) -> Self {
+        let mut buckets = BTreeSet::new();
+        let mut shared: Option<Vec<&str>> = None;
+        for source in sources.iter().flatten() {
+            buckets.insert(source.bucket.as_str());
+            let parents = key_parents(&source.key);
+            shared = Some(match shared {
+                Some(shared) => common_prefix(shared, &parents),
+                None => parents,
+            });
+        }
+        let single = buckets.len() == 1;
+        Self {
+            dropped: if single {
+                shared.map_or(0, |shared| shared.len())
+            } else {
+                0
+            },
+            with_bucket: !single,
+        }
+    }
+
+    fn path(&self, source: &StorageKey) -> Option<String> {
+        let relative = source
+            .key
+            .split('/')
+            .skip(self.dropped)
+            .collect::<Vec<_>>()
+            .join("/");
+        let candidate = if self.with_bucket {
+            format!("{}/{relative}", source.bucket)
+        } else {
+            relative
+        };
+        safe_zip_path(&candidate)
+    }
+}
+
+fn key_parents(key: &str) -> Vec<&str> {
+    let mut parents = key.split('/').collect::<Vec<_>>();
+    parents.pop();
+    parents
+}
+
+fn common_prefix<'a>(mut shared: Vec<&'a str>, parents: &[&str]) -> Vec<&'a str> {
+    let common = shared
+        .iter()
+        .zip(parents)
+        .take_while(|(left, right)| left == right)
+        .count();
+    shared.truncate(common);
+    shared
 }
 
 fn scan_unrewritten(
@@ -2474,6 +2626,7 @@ async fn assemble_export(
         .ok_or_else(|| ExportFailure::Permanent("rewritten metadata is missing".to_string()))?;
     let mut entries = Vec::with_capacity(opened.len());
     let source_spec = std::sync::Arc::new(spec.clone());
+    let job_ms = unix_timestamp_millis();
     for entry in opened {
         let entity = &checkpoint.entities[entry.entity_index];
         let path = entity
@@ -2498,6 +2651,9 @@ async fn assemble_export(
                 candidate,
             },
             expected_blake3: entry.hash,
+            modified_ms: entry
+                .resolved_version
+                .map_or(job_ms, |version| version.timestamp_ms()),
         });
     }
     let report = checkpoint.report_json.clone();
@@ -2511,7 +2667,7 @@ async fn assemble_export(
     let cancel = ctx.cancel.clone();
     let shutdown = ctx.shutdown.clone();
     let writer_task = tokio::spawn(Box::pin(write_archive_checked(
-        writer, metadata, entries, report, policies, cancel, shutdown,
+        writer, metadata, entries, report, policies, cancel, shutdown, job_ms,
     )));
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
@@ -2566,6 +2722,7 @@ async fn assemble_export(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_archive_checked(
     writer: tokio::io::DuplexStream,
     metadata: Vec<u8>,
@@ -2574,11 +2731,12 @@ async fn write_archive_checked(
     policies: std::sync::Arc<BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>>,
     cancel: tokio_util::sync::CancellationToken,
     shutdown: tokio_util::sync::CancellationToken,
+    job_ms: u64,
 ) -> Result<(), ExportFailure> {
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
     archive
-        .write_entry_whole(zip_entry(METADATA_PATH), &metadata)
+        .write_entry_whole(zip_entry(METADATA_PATH, job_ms), &metadata)
         .await
         .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     for entry in entries {
@@ -2588,6 +2746,7 @@ async fn write_archive_checked(
             path,
             source,
             expected_blake3,
+            modified_ms,
         } = entry;
         let opened = match source {
             PlannedSource::Candidate {
@@ -2637,7 +2796,7 @@ async fn write_archive_checked(
             }
         };
         let mut writer = archive
-            .write_entry_stream(zip_entry(&path))
+            .write_entry_stream(zip_entry(&path, modified_ms))
             .await
             .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
         let mut hasher = blake3::Hasher::new();
@@ -2682,7 +2841,7 @@ async fn write_archive_checked(
     }
     if let Some(report) = report {
         archive
-            .write_entry_whole(zip_entry(REPORT_PATH), &report)
+            .write_entry_whole(zip_entry(REPORT_PATH, job_ms), &report)
             .await
             .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     }
@@ -2693,8 +2852,28 @@ async fn write_archive_checked(
     Ok(())
 }
 
-fn zip_entry(path: &str) -> ZipEntryBuilder {
+fn zip_entry(path: &str, modified_ms: u64) -> ZipEntryBuilder {
     ZipEntryBuilder::new(path.to_string().into(), Compression::Stored)
+        .last_modification_date(zip_date(modified_ms))
+}
+
+/// MS-DOS ZIP timestamps only cover 1980 through 2107, so a moment outside
+/// that window keeps its month and day but clamps to the nearest year.
+fn zip_date(modified_ms: u64) -> ZipDateTime {
+    let Some(moment) = i64::try_from(modified_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+    else {
+        return ZipDateTime::default();
+    };
+    ZipDateTimeBuilder::new()
+        .year(moment.year().clamp(1980, 2107))
+        .month(moment.month())
+        .day(moment.day())
+        .hour(moment.hour())
+        .minute(moment.minute())
+        .second(moment.second())
+        .build()
 }
 
 fn stream_status(error: &StreamError) -> OpenStatus {
@@ -2904,6 +3083,10 @@ fn permanent(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::permanent(message.into()))
 }
 
+/// 2026-02-03T04:05:06Z: a fixed moment keeps fixture archives byte-identical.
+#[cfg(test)]
+const FIXTURE_MOMENT_MS: u64 = 1_770_091_506_000;
+
 #[cfg(test)]
 async fn probe_sources(
     ctx: &JobContext,
@@ -2963,6 +3146,7 @@ async fn write_archive(
         std::sync::Arc::new(BTreeMap::new()),
         cancel,
         shutdown,
+        FIXTURE_MOMENT_MS,
     )
     .await
 }
@@ -3373,14 +3557,20 @@ mod tests {
             ("notes/unlisted.txt", b"unlisted payload".as_slice()),
         ] {
             writer
-                .write_entry_whole(zip_entry(&format!("{prefix}{path}")), bytes)
+                .write_entry_whole(
+                    zip_entry(&format!("{prefix}{path}"), FIXTURE_MOMENT_MS),
+                    bytes,
+                )
                 .await
                 .unwrap();
         }
         if eln {
             writer
                 .write_entry_whole(
-                    zip_entry(&format!("{prefix}ro-crate-metadata.json.minisig")),
+                    zip_entry(
+                        &format!("{prefix}ro-crate-metadata.json.minisig"),
+                        FIXTURE_MOMENT_MS,
+                    ),
                     b"untrusted fixture signature",
                 )
                 .await
@@ -3574,6 +3764,7 @@ mod tests {
                 path: entity.zip_path.clone().unwrap(),
                 source: PlannedSource::Ready(byte_stream(FIXTURE_BYTES)),
                 expected_blake3: payload_hash,
+                modified_ms: FIXTURE_MOMENT_MS,
             })
             .collect();
         let (writer, mut reader) = tokio::io::duplex(64 * 1024);
@@ -3984,6 +4175,66 @@ mod tests {
         node.net.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn denies_foreign_alias() {
+        // A hash alias in a group whose authorization document this node cannot
+        // read must deny that alias, not fail the export with a retryable error.
+        let (node, owner, candidate) = local_candidate().await;
+        let realm_id = owner.realm_id;
+        let hash = candidate.expected_blake3.unwrap();
+        let foreign = Ulid::from_bytes([200; 16]);
+        let alias = HashPathIndexKey::new(
+            hash,
+            Ulid::from_bytes([201; 16]),
+            realm_id,
+            foreign,
+            node.net.node_id(),
+            "restricted",
+            "secret.csv",
+        );
+        assert!(matches!(
+            node.driver
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                    key: alias.to_bytes().unwrap().into(),
+                    value: Vec::new().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let spec = remote_spec(realm_id, owner);
+        let ctx = job_context(node.driver.clone(), node.net.node_id());
+        let mut candidates = Vec::new();
+        let mut denied = false;
+        extend_hash_candidates(
+            &ctx,
+            &spec,
+            hash,
+            None,
+            &mut candidates,
+            &mut denied,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        )
+        .await
+        .expect("a foreign group must deny instead of failing the export");
+
+        assert!(denied);
+        assert!(!candidates.iter().any(|candidate| matches!(
+            &candidate.source,
+            CandidateSource::Local { group_id, .. } if *group_id == foreign
+        )));
+        node.net.shutdown().await;
+    }
+
     #[test]
     fn learns_probe_hash() {
         let realm_id = RealmId::from_bytes([2; 32]);
@@ -4180,6 +4431,7 @@ mod tests {
                     path: "data/b".to_string(),
                     source: PlannedSource::Ready(byte_stream(b"b")),
                     expected_blake3: *blake3::hash(b"b").as_bytes(),
+                    modified_ms: FIXTURE_MOMENT_MS,
                 },
                 PlannedEntry {
                     entity_index: 1,
@@ -4187,6 +4439,7 @@ mod tests {
                     path: "data/a".to_string(),
                     source: PlannedSource::Ready(byte_stream(b"a")),
                     expected_blake3: *blake3::hash(b"a").as_bytes(),
+                    modified_ms: FIXTURE_MOMENT_MS,
                 },
             ],
             Some(b"report".to_vec()),
@@ -4392,6 +4645,193 @@ mod tests {
         ));
     }
 
+    fn stored_file(hash: u8, location: &str) -> JsonValue {
+        json!({
+            "@id": format!(
+                "{}{}",
+                aruna_core::structs::ARUNA_DATA_PREFIX,
+                hex::encode([hash; 32])
+            ),
+            "@type": "File",
+            "name": "payload",
+            "contentUrl": location
+        })
+    }
+
+    fn crate_document(parts: &[JsonValue]) -> JsonValue {
+        let mut graph = vec![
+            json!({
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "test",
+                "description": "test crate",
+                "datePublished": "2026-07-23",
+                "hasPart": parts
+                    .iter()
+                    .map(|part| json!({"@id": part["@id"]}))
+                    .collect::<Vec<_>>()
+            }),
+            json!({
+                "@id": METADATA_PATH,
+                "@type": "CreativeWork",
+                "about": {"@id": "./"},
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+            }),
+        ];
+        graph.extend(parts.iter().cloned());
+        json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": graph})
+    }
+
+    fn planned_paths(
+        realm_id: RealmId,
+        document: &JsonValue,
+    ) -> Result<Vec<String>, ExportFailure> {
+        let spec = remote_spec(realm_id, UserId::nil(realm_id));
+        let entities = recognized_entities(document, realm_id).unwrap();
+        let opened = entities
+            .iter()
+            .enumerate()
+            .map(|(entity_index, entity)| ProbedEntry {
+                entity_index,
+                candidate_index: 0,
+                size: 1,
+                hash: entity.hash.unwrap_or([0; 32]),
+                report_source: ExportReportSource::Local,
+                resolved_version: None,
+            })
+            .collect::<Vec<_>>();
+        let mut checkpoint = ExportCheckpoint {
+            raw_jsonld: Some(document.to_string()),
+            entities,
+            ..ExportCheckpoint::default()
+        };
+        plan_export(&spec, &mut checkpoint, &opened)?;
+        Ok(checkpoint
+            .entities
+            .iter()
+            .filter_map(|entity| entity.zip_path.clone())
+            .collect())
+    }
+
+    #[test]
+    fn keeps_subcrate_reference() {
+        let realm_id = RealmId::from_bytes([26; 32]);
+        let child = "https://w3id.org/aruna/01JCHILD0000000000000000A";
+        let descriptor = "https://api.example.test/metadata/01JCHILD0000000000000000A/rocrate";
+        let file = stored_file(1, "s3://reads/one.csv");
+        let document = json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "test",
+                    "description": "test crate",
+                    "datePublished": "2026-07-23",
+                    "hasPart": [{"@id": file["@id"]}, {"@id": child}]
+                },
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+                },
+                file,
+                {
+                    "@id": child,
+                    "@type": "Dataset",
+                    "name": "restricted child",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate"},
+                    "identifier": "01JCHILD0000000000000000A",
+                    "subjectOf": {"@id": descriptor}
+                },
+                {
+                    "@id": descriptor,
+                    "@type": "CreativeWork",
+                    "encodingFormat": "application/ld+json"
+                }
+            ]
+        });
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec!["one.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_path_wins() {
+        let realm_id = RealmId::from_bytes([21; 32]);
+        let mut part = stored_file(1, "s3://reads/raw/one.csv");
+        part["localPath"] = json!("data/authored.csv");
+        let document = crate_document(&[part]);
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+        assert_eq!(entities[0].local_path.as_deref(), Some("data/authored.csv"));
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec!["data/authored.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn drops_shared_prefix() {
+        let realm_id = RealmId::from_bytes([22; 32]);
+        let document = crate_document(&[
+            stored_file(1, "s3://reads/raw/2024/one.csv"),
+            stored_file(2, "s3://reads/raw/2025/two.csv"),
+        ]);
+
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec!["2024/one.csv".to_string(), "2025/two.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn separates_buckets() {
+        let realm_id = RealmId::from_bytes([23; 32]);
+        let document = crate_document(&[
+            stored_file(1, "s3://reads/raw/one.csv"),
+            stored_file(2, "s3://results/two.csv"),
+        ]);
+
+        assert_eq!(
+            planned_paths(realm_id, &document).unwrap(),
+            vec![
+                "reads/raw/one.csv".to_string(),
+                "results/two.csv".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_path_collision() {
+        let realm_id = RealmId::from_bytes([24; 32]);
+        let mut authored = stored_file(1, "s3://reads/one.csv");
+        authored["localPath"] = json!("two.csv");
+        let document = crate_document(&[authored, stored_file(2, "s3://reads/two.csv")]);
+
+        assert!(matches!(
+            planned_paths(realm_id, &document),
+            Err(ExportFailure::Permanent(message))
+                if message.contains("resolve to ZIP path `two.csv`")
+        ));
+    }
+
+    #[test]
+    fn keeps_reserved_names() {
+        let realm_id = RealmId::from_bytes([25; 32]);
+        let document = crate_document(&[stored_file(1, &format!("s3://reads/{METADATA_PATH}"))]);
+
+        let paths = planned_paths(realm_id, &document).unwrap();
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with("data/"));
+    }
+
     #[test]
     fn plans_ordered_paths() {
         assert_eq!(safe_zip_path("./a/b.txt").as_deref(), Some("a/b.txt"));
@@ -4412,6 +4852,7 @@ mod tests {
         let entities = [ExportEntity {
             entity_id: "payload".to_string(),
             local_path: Some("data/payload".to_string()),
+            storage_key: None,
             exact: None,
             hash: None,
             hash_realm: None,
@@ -4528,6 +4969,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clamps_zip_dates() {
+        assert_eq!(zip_date(FIXTURE_MOMENT_MS).year(), 2026);
+        assert_eq!(zip_date(0).year(), 1980);
+        assert_eq!(zip_date(u64::MAX).year(), 1980);
+        assert_eq!(
+            zip_date(Ulid::from_bytes([74; 16]).timestamp_ms()).year(),
+            2107
+        );
+    }
+
+    #[tokio::test]
+    async fn stamps_entry_dates() {
+        let bytes = sample_archive().await;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).unwrap();
+            let moment = entry
+                .last_modified()
+                .expect("entry carries a modification date");
+            assert_eq!(moment.year(), 2026);
+        }
+    }
+
+    #[tokio::test]
+    async fn dates_follow_versions() {
+        let version = Ulid::from_bytes([74; 16]);
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let task = tokio::spawn(write_archive(
+            writer,
+            b"metadata".to_vec(),
+            vec![PlannedEntry {
+                entity_index: 0,
+                candidate_index: 0,
+                path: "data/a".to_string(),
+                source: PlannedSource::Ready(byte_stream(b"a")),
+                expected_blake3: *blake3::hash(b"a").as_bytes(),
+                modified_ms: version.timestamp_ms(),
+            }],
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap().unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let metadata_year = archive
+            .by_name(METADATA_PATH)
+            .unwrap()
+            .last_modified()
+            .unwrap()
+            .year();
+        let payload_year = archive
+            .by_name("data/a")
+            .unwrap()
+            .last_modified()
+            .unwrap()
+            .year();
+
+        assert_eq!(metadata_year, 2026);
+        assert_eq!(payload_year, 2107);
+    }
+
     #[tokio::test]
     async fn archives_are_deterministic() {
         assert_eq!(sample_archive().await, sample_archive().await);
@@ -4549,6 +5055,7 @@ mod tests {
             entities: vec![ExportEntity {
                 entity_id: "data/corrupt".to_string(),
                 local_path: None,
+                storage_key: None,
                 exact: None,
                 hash: Some(hash),
                 hash_realm: Some(realm_id),
@@ -4590,6 +5097,7 @@ mod tests {
                 path: "data/corrupt".to_string(),
                 source: PlannedSource::Ready(byte_stream(b"wrong")),
                 expected_blake3: [0; 32],
+                modified_ms: FIXTURE_MOMENT_MS,
             }],
             None,
             tokio_util::sync::CancellationToken::new(),
@@ -4625,6 +5133,7 @@ mod tests {
                     Result<Bytes, std::io::Error>,
                 >())),
                 expected_blake3: [0; 32],
+                modified_ms: FIXTURE_MOMENT_MS,
             }],
             None,
             cancel,
@@ -4641,7 +5150,10 @@ mod tests {
         let mut writer = async_zip::base::write::ZipFileWriter::new(Vec::<u8>::new());
         for index in 0..70_000u32 {
             writer
-                .write_entry_whole(zip_entry(&format!("data/{index:08}")), &[])
+                .write_entry_whole(
+                    zip_entry(&format!("data/{index:08}"), FIXTURE_MOMENT_MS),
+                    &[],
+                )
                 .await
                 .unwrap();
         }
@@ -4681,7 +5193,7 @@ mod tests {
             enabled: Arc::clone(&sparse),
         });
         let mut entry = writer
-            .write_entry_stream(zip_entry("data/large"))
+            .write_entry_stream(zip_entry("data/large", FIXTURE_MOMENT_MS))
             .await
             .unwrap();
         let zeros = vec![0; CHUNK_SIZE];

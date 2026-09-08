@@ -35,6 +35,21 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "public DRS service-info discovery",
     ),
     (
+        "group_join.rs",
+        "own_joins",
+        "self-scoped request list with unrestricted realm auth and deny policies; operation filters by caller",
+    ),
+    (
+        "group_join.rs",
+        "submit_join",
+        "self-scoped request with unrestricted realm auth and deny policies; operation binds requester to caller",
+    ),
+    (
+        "group_join.rs",
+        "withdraw_join",
+        "self-scoped withdrawal with unrestricted realm auth and deny policies; operation checks stored requester",
+    ),
+    (
         "groups.rs",
         "get_group",
         "realm directory read, member-only fields hidden by map_roles_with_visibility",
@@ -399,9 +414,19 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "users.rs",
+        "resolve_users",
+        "unrestricted realm directory read with policy checks; only user-selected public fields returned",
+    ),
+    (
+        "users.rs",
         "revoke_user_device",
         "self-scoped: RemoveDeviceNodeOperation re-checks that the node is a \
          User device owned by the caller",
+    ),
+    (
+        "users.rs",
+        "search_users",
+        "unrestricted realm directory read with policy checks; only user-selected public fields match",
     ),
     (
         "vault.rs",

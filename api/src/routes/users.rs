@@ -148,7 +148,7 @@ pub struct ResolveUsersRequest {
 pub struct ResolveUserResult {
     pub user_id: String,
     pub name: String,
-    /// Scholarly attributes only; sensitive keys such as email are excluded.
+    /// Only attributes the user explicitly marks public.
     pub attributes: HashMap<String, String>,
 }
 
@@ -835,6 +835,8 @@ user document and takes no user id.
 **Behavior**
 - Fields left out change nothing, and removals are applied before sets, so a key named in both ends
   up set to the new value.
+- Profile visibility uses `profile.visibility.<field>` attributes set to `public` or `private`.
+  Names default to public; other attributes default to private.
 - UI preferences are ordinary attributes: `ui.theme`, `ui.preferred_profile_path`,
   `ui.favourite_metadata_ids` as a comma separated list, and `ui.dashboard_scope`.
 - The write is durable here and reaches the other realm nodes through document sync.
@@ -1055,29 +1057,56 @@ async fn list_users(
     ))
 }
 
+pub(crate) async fn authorize_directory(
+    state: &ServerState,
+    auth: &AuthContext,
+    user_id: Option<&str>,
+) -> ServerResult<()> {
+    crate::auth::require_unrestricted_realm_auth(state, Some(auth.clone()))?;
+    if auth.user_id.is_nil() || auth.user_id.realm_id != auth.realm_id {
+        return Err(ServerError::Forbidden);
+    }
+    let path = format!(
+        "/{}/admin/u/{}",
+        state.get_realm_id(),
+        user_id.unwrap_or("**")
+    );
+    aruna_operations::request_policy::enforce_policies(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        &aruna_operations::request_policy::policy_request_with(
+            &path,
+            &Permission::READ,
+            Some(auth),
+            aruna_operations::request_policy::PolicyRequestExtras::rest(),
+        ),
+    )
+    .await
+    .map_err(|error| match error {
+        aruna_operations::request_policy::PolicyEnforcementError::Denied { .. } => {
+            ServerError::Forbidden
+        }
+        other => ServerError::InternalError(other.to_string()),
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/access/users/search",
     tag = "access/users",
-    summary = "Search this realm's users by name or email",
-    description = r#"Pages this realm's users whose display name or email attribute contains the query.
+    summary = "Search public user profile fields",
+    description = r#"Searches public profile fields of users in this realm.
 
-**Authentication**: realm bearer token with READ on the realm's user administration path, the same
-grant as the full listing.
+**Authentication**: unrestricted realm bearer token. Realm request policies may deny the read.
 
 **Behavior**
-- The query is trimmed and matched case insensitively as a substring of the display name and of the
-  email attribute, over the users this node holds; a user registered elsewhere is found once the
-  document arrives here.
-- A result carries only the user id and the display name, never attributes.
-- Pagination is cursor based, and the absence of `next_start_after` means the scan reached the end
-  of the realm's users, not that no further match exists on a later page.
-
-**Limits**
-- `q` must hold at least 2 characters after trimming.
-- `limit` defaults to 20 and is clamped into 1 to 20."#,
+- Matches public names and explicitly public attributes case insensitively. Private fields never
+  participate in matching. Names are public by default; other attributes are private by default.
+- Returns user ids and public display names. A private name is replaced by the user id.
+- Reads this node's replicated user directory. Pagination uses `next_start_after`.
+- `q` must contain at least 2 trimmed characters. `limit` defaults to 20, clamped to 1 to 20."#,
     params(
-        ("q" = String, Query, description = "Substring matched case insensitively against the user name and the email attribute; at least 2 characters"),
+        ("q" = String, Query, description = "Substring matched against public profile fields; at least 2 characters"),
         ("limit" = Option<usize>, Query, description = "Page size; defaults to 20 and is clamped into 1 to 20"),
         ("start_after" = Option<String>, Query, description = "Exclusive cursor: the `next_start_after` of the previous page; omit it to start at the first user")
     ),
@@ -1098,7 +1127,7 @@ grant as the full listing.
         ),
         (status = 400, description = "The query is shorter than 2 characters after trimming, or the `start_after` cursor is not a user id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the realm's user administration path", body = ErrorResponse)
+        (status = 403, description = "Token belongs to another realm, or the token is path-restricted, or realm policy denies the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1123,13 +1152,7 @@ async fn search_users(
     if let Some(start_after) = &query.start_after {
         UserId::from_string(start_after).map_err(|_| ServerError::BadRequest)?;
     }
-    ensure_permission(
-        &state,
-        &auth,
-        format!("/{realm_id}/admin/u/**"),
-        Permission::READ,
-    )
-    .await?;
+    authorize_directory(&state, &auth, None).await?;
 
     let output = drive(
         SearchUsersOperation::new(SearchUsersInput {
@@ -1166,13 +1189,13 @@ async fn search_users(
     summary = "Resolve user ids to directory entries",
     description = r#"Resolves a batch of user ids to directory entries held by this node.
 
-**Authentication**: realm bearer token with READ on the realm's user administration path.
+**Authentication**: unrestricted realm bearer token. Realm request policies may deny the read.
 
 **Behavior**
 - Duplicate ids collapse and ids unknown to this node are dropped silently, so the result may be
   shorter than the request and carries no positional mapping; match the entries by user id.
-- Only the directory safe attributes `orcid`, `affiliation` and `department` are exposed; `email`
-  and every other attribute are withheld here.
+- Only explicitly public attributes are returned. Names default to public; a private name is
+  replaced by the user id.
 - The response body is a JSON array, not an object.
 
 **Limits**
@@ -1190,7 +1213,7 @@ async fn search_users(
     responses(
         (
             status = 200,
-            description = "Directory entries for the ids this node could resolve, with only the safe attributes",
+            description = "Directory entries for the ids this node could resolve, with only their public attributes",
             body = [ResolveUserResult],
             example = json!([
                 {
@@ -1205,7 +1228,7 @@ async fn search_users(
         ),
         (status = 400, description = "More than 100 user ids were sent, or an entry is not a user id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the realm's user administration path", body = ErrorResponse)
+        (status = 403, description = "Token belongs to another realm, or the token is path-restricted, or realm policy denies the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1227,13 +1250,7 @@ async fn resolve_users(
         .iter()
         .map(|user_id| UserId::from_string(user_id).map_err(|_| ServerError::BadRequest))
         .collect::<ServerResult<Vec<_>>>()?;
-    ensure_permission(
-        &state,
-        &auth,
-        format!("/{realm_id}/admin/u/**"),
-        Permission::READ,
-    )
-    .await?;
+    authorize_directory(&state, &auth, None).await?;
 
     let output = drive(
         ResolveUsersOperation::new(ResolveUsersInput { realm_id, user_ids }),
@@ -1265,8 +1282,9 @@ async fn resolve_users(
     summary = "Get a user of this realm by id",
     description = r#"Returns one user document of this realm as held by the responding node.
 
-**Authentication**: realm bearer token with READ on that specific user's administration path. The
-realm request policies are evaluated as well and may deny a read the role grant would allow.
+**Authentication**: realm bearer token. An unrestricted caller can read public profile fields.
+The caller's own profile is complete; READ on the user's administration path also returns the
+complete document. Realm request policies may deny either read.
 
 **Behavior**
 - This is a node-local read of a replicated document, so a user registered on another node appears
@@ -1288,9 +1306,9 @@ realm request policies are evaluated as well and may deny a read the role grant 
                 }
             })
         ),
-        (status = 400, description = "Declared for malformed input; in practice an id that is not a user id is refused by the authorization check with 403 instead", body = ErrorResponse),
+        (status = 400, description = "Malformed user id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller lacks READ on that user's administration path; the same answer is given whether or not the user exists", body = ErrorResponse),
+        (status = 403, description = "Path-restricted token without a matching grant, or realm policy denies the read", body = ErrorResponse),
         (status = 404, description = "This node holds no user with that id, and the caller is allowed to know that", body = ErrorResponse),
         (status = 501, description = "The token was issued by another trusted realm; forwarding the read to the owning realm is not implemented", body = ErrorResponse)
     ),
@@ -1307,13 +1325,37 @@ async fn get_user(
         // TODO: Forwarding for foreign realm users
         return Err(ServerError::Unimplemented);
     }
-    ensure_permission(
+    let target = UserId::from_string(&user_id).map_err(|_| ServerError::BadRequest)?;
+    if target.realm_id != realm_id {
+        return Err(ServerError::NotFound);
+    }
+    let privileged = crate::auth::permission_granted(
         &state,
         &auth,
         format!("/{realm_id}/admin/u/{user_id}"),
         Permission::READ,
     )
     .await?;
+    if !privileged {
+        authorize_directory(&state, &auth, Some(&user_id)).await?;
+        let user = drive(ReadUserDocumentOperation::new(target), &state.get_ctx())
+            .await
+            .map_err(|error| match error {
+                ReadUserDocumentError::NotFound => ServerError::NotFound,
+                other => ServerError::InternalError(other.to_string()),
+            })?;
+        let response = if auth.user_id == target {
+            user.into()
+        } else {
+            GetUserResponse {
+                user_id: user.user_id.to_string(),
+                name: user.public_name(),
+                subject_ids: Vec::new(),
+                attributes: user.public_attributes(),
+            }
+        };
+        return Ok((StatusCode::OK, Json(response)));
+    }
 
     let user = drive(
         GetUserOperation::new(GetUserInput {
@@ -1735,7 +1777,6 @@ async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> Ser
 mod tests {
     use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
     use crate::auth::{OidcValidator, handle_token};
-    use crate::error::ErrorResponse;
     use crate::routes::sessions::{CreateSessionRequest, CreateSessionResponse};
     use crate::server::Server;
     use crate::server::ServerConfig;
@@ -2177,7 +2218,449 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_user_for_regular_registered_user_returns_forbidden() {
+    async fn membership_request_flow() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+        let (_, owner_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "owner",
+            "Group Owner",
+            None,
+        )
+        .await;
+        let (member, member_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "member",
+            "Prospective Member",
+            None,
+        )
+        .await;
+        let (_, other_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "other",
+            "Other User",
+            None,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let groups_url = format!("{}/api/v1/access/groups", node.base_url);
+        let group = client
+            .post(&groups_url)
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({ "name": "Research group" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(group.status(), StatusCode::CREATED);
+        let group: crate::routes::groups::CreateGroupResponse = group.json().await.unwrap();
+        let groups = client
+            .get(&groups_url)
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(groups.status(), StatusCode::OK);
+        let groups: serde_json::Value = groups.json().await.unwrap();
+        assert!(groups.to_string().contains(&group.group_id));
+        let requests_url = format!("{groups_url}/{}/join-requests", group.group_id);
+        let own_url = format!("{}/api/v1/access/users/join-requests", node.base_url);
+        let request = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({"message":"I would like to join"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(request.status(), StatusCode::CREATED);
+        let request: serde_json::Value = request.json().await.unwrap();
+        assert_eq!(request["status"], "pending");
+        assert_eq!(request["user_id"], member.id);
+        let request_id = request["request_id"].as_str().unwrap();
+        let duplicate: serde_json::Value = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(duplicate["request_id"], request_id);
+        for token in [&member_token, &other_token] {
+            assert_eq!(
+                client
+                    .get(&requests_url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                client
+                    .post(format!("{requests_url}/{request_id}/decide"))
+                    .bearer_auth(token)
+                    .json(&serde_json::json!({"approve":true}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            client
+                .delete(format!("{requests_url}/{request_id}"))
+                .bearer_auth(&other_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let own: serde_json::Value = client
+            .get(&own_url)
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(own["requests"].as_array().unwrap().len(), 1);
+        let other: serde_json::Value = client
+            .get(&own_url)
+            .bearer_auth(&other_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(other["requests"].as_array().unwrap().is_empty());
+        let inbox: serde_json::Value = client
+            .get(format!("{requests_url}?status=pending"))
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(inbox["requests"][0]["user_name"], "Prospective Member");
+        let denied = client
+            .post(format!("{requests_url}/{request_id}/decide"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({"approve":false,"reason":"Not yet"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::OK);
+        let denied: serde_json::Value = denied.json().await.unwrap();
+        assert_eq!(denied["request"]["status"], "denied");
+        assert_eq!(denied["request"]["decision_reason"], "Not yet");
+        let members_url = format!("{groups_url}/{}/members", group.group_id);
+        let members: serde_json::Value = client
+            .get(&members_url)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !members["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["user_id"] == member.id)
+        );
+        let withdrawn: serde_json::Value = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let withdrawn_id = withdrawn["request_id"].as_str().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .delete(format!("{requests_url}/{withdrawn_id}"))
+                    .bearer_auth(&member_token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(
+            client
+                .post(format!("{requests_url}/{withdrawn_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(&serde_json::json!({"approve":true}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let pending: serde_json::Value = client
+            .post(&requests_url)
+            .bearer_auth(&member_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let pending_id = pending["request_id"].as_str().unwrap();
+        let page: serde_json::Value = client
+            .get(format!("{own_url}?limit=1"))
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["requests"].as_array().unwrap().len(), 1);
+        let first_id = page["requests"][0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cursor = page["next_start_after"].as_str().unwrap();
+        let page: serde_json::Value = client
+            .get(format!("{own_url}?limit=1&start_after={cursor}"))
+            .bearer_auth(&member_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            std::collections::BTreeSet::from([
+                first_id.as_str(),
+                page["requests"][0]["request_id"].as_str().unwrap()
+            ]),
+            std::collections::BTreeSet::from([request_id, pending_id]),
+        );
+        assert!(page["next_start_after"].is_null());
+        assert_eq!(
+            client
+                .post(format!("{requests_url}/{pending_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(
+                    &serde_json::json!({"approve":true,"role_ids":[Ulid::generate().to_string()]})
+                )
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        for _ in 0..2 {
+            let approved = client
+                .post(format!("{requests_url}/{pending_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(&serde_json::json!({"approve":true}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(approved.status(), StatusCode::OK);
+            let approved: serde_json::Value = approved.json().await.unwrap();
+            assert_eq!(approved["request"]["status"], "approved");
+        }
+        let members: serde_json::Value = client
+            .get(&members_url)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            members["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["user_id"] == member.id)
+        );
+        assert_eq!(
+            client
+                .post(&requests_url)
+                .bearer_auth(&member_token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .post(format!("{requests_url}/{pending_id}/decide"))
+                .bearer_auth(&owner_token)
+                .json(&serde_json::json!({"approve":false}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        install_deny_policy(&node, "permission == 'write'").await;
+        assert_eq!(
+            client
+                .post(&requests_url)
+                .bearer_auth(&other_token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn public_profile_search() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+        let (_, reader_token) =
+            register_via_oidc(&node, issuer, kid, &signing_key, "reader", "Reader", None).await;
+        let (target, target_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "target",
+            "Searchable Alice",
+            None,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let me_url = format!("{}/api/v1/access/users/me", node.base_url);
+        let search_url = format!("{}/api/v1/access/users/search", node.base_url);
+        let profile_url = format!("{}/api/v1/access/users/{}", node.base_url, target.id);
+        let patch = client
+            .patch(&me_url)
+            .bearer_auth(&target_token)
+            .json(&serde_json::json!({ "set_attributes": { "email": "secret@example.test" } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        for (query, expected) in [("Searchable", 1), ("secret", 0)] {
+            let response = client
+                .get(format!("{search_url}?q={query}"))
+                .bearer_auth(&reader_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: super::SearchUsersResponse = response.json().await.unwrap();
+            assert_eq!(body.users.len(), expected);
+        }
+        let body: super::GetUserResponse = client
+            .get(&profile_url)
+            .bearer_auth(&reader_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body.name, "Searchable Alice");
+        assert!(body.attributes.is_empty());
+        assert!(body.subject_ids.is_empty());
+        let patch = client
+            .patch(&me_url)
+            .bearer_auth(&target_token)
+            .json(&serde_json::json!({ "set_attributes": {
+                "profile.visibility.email": "public", "profile.visibility.name": "private",
+            } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        for (query, expected) in [("Searchable", 0), ("secret", 1)] {
+            let response = client
+                .get(format!("{search_url}?q={query}"))
+                .bearer_auth(&reader_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: super::SearchUsersResponse = response.json().await.unwrap();
+            assert_eq!(body.users.len(), expected);
+            if let Some(user) = body.users.first() {
+                assert_eq!(user.name, target.id);
+            }
+        }
+        let body: super::GetUserResponse = client
+            .get(&profile_url)
+            .bearer_auth(&reader_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body.name, target.id);
+        assert_eq!(
+            body.attributes,
+            std::collections::HashMap::from([("email".into(), "secret@example.test".into()),])
+        );
+        assert!(body.subject_ids.is_empty());
+        let denied = client
+            .get(format!("{search_url}?q=secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        install_deny_policy(&node, "permission == 'read'").await;
+        let denied = client
+            .get(format!("{search_url}?q=secret"))
+            .bearer_auth(&reader_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn reads_own_profile() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -2205,9 +2688,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let body: ErrorResponse = response.json().await.unwrap();
-        assert_eq!(body.error, "Forbidden");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: super::GetUserResponse = response.json().await.unwrap();
+        assert_eq!(body.name, "Alice");
+        assert!(!body.subject_ids.is_empty());
 
         node.server_task.abort();
         node.net.shutdown().await;
@@ -2292,7 +2776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_user_for_missing_user_without_admin_permissions_returns_forbidden() {
+    async fn missing_public_profile() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -2321,7 +2805,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         node.server_task.abort();
         node.net.shutdown().await;
@@ -2877,13 +3361,14 @@ mod resolve_tests {
     }
 
     #[tokio::test]
-    async fn requires_directory_read() {
-        // A realm member without the admin user directory grant may not resolve.
+    async fn rejects_restricted_directory() {
         let (state, _tempdir) = setup_state().await;
         let realm_id = state.get_realm_id();
+        let mut auth = realm_auth(realm_id);
+        auth.path_restrictions = Some(Vec::new());
         let result = resolve_users(
             State(state),
-            Extension(Some(realm_auth(realm_id))),
+            Extension(Some(auth)),
             Json(ResolveUsersRequest { user_ids: vec![] }),
         )
         .await;

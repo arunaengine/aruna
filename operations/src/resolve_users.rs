@@ -5,7 +5,6 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{RealmId, User};
 use aruna_core::types::{Effects, Key, UserId, Value};
-use aruna_core::user_update_validation::SAFE_USER_ATTRIBUTE_KEYS;
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -58,13 +57,6 @@ pub enum ResolveUsersError {
     },
     #[error("resolve users did not finish")]
     NotFinished,
-}
-
-fn safe_attributes(attributes: HashMap<String, String>) -> HashMap<String, String> {
-    attributes
-        .into_iter()
-        .filter(|(key, _)| SAFE_USER_ATTRIBUTE_KEYS.contains(&key.as_str()))
-        .collect()
 }
 
 impl ResolveUsersOperation {
@@ -153,8 +145,8 @@ impl ResolveUsersOperation {
             }
             users.push(ResolvedUser {
                 user_id: user.user_id,
-                name: user.name,
-                attributes: safe_attributes(user.attributes),
+                name: user.public_name(),
+                attributes: user.public_attributes(),
             });
         }
         Ok(self.emit_finish(users))
@@ -317,8 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn exposes_only_safe_attributes() {
-        // email and unlisted keys must never reach the output.
+    fn exposes_public_attributes() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let mut alice = user(realm_id, 2, "Alice");
         alice.attributes = HashMap::from([
@@ -327,6 +318,9 @@ mod tests {
             ("affiliation".into(), "Lab".into()),
             ("department".into(), "Bio".into()),
             ("ui.theme".into(), "dark".into()),
+            ("profile.visibility.orcid".into(), "public".into()),
+            ("profile.visibility.affiliation".into(), "public".into()),
+            ("profile.visibility.department".into(), "public".into()),
         ]);
         let mut operation = ResolveUsersOperation::new(input(realm_id, vec![alice.user_id]));
 

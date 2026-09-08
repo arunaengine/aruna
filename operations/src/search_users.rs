@@ -131,14 +131,6 @@ impl SearchUsersOperation {
         }
     }
 
-    fn matches_query(user: &User, query: &str) -> bool {
-        user.name.to_lowercase().contains(query)
-            || user
-                .attributes
-                .get("email")
-                .is_some_and(|email| email.to_lowercase().contains(query))
-    }
-
     fn collect_matches(
         &mut self,
         values: Vec<(Key, Value)>,
@@ -152,13 +144,13 @@ impl SearchUsersOperation {
             }
 
             let user = User::from_bytes(&value)?;
-            if user.user_id.realm_id != self.input.realm_id || !Self::matches_query(&user, &query) {
+            if user.user_id.realm_id != self.input.realm_id || !user.public_matches(&query) {
                 continue;
             }
 
             self.matches.push(SearchUsersMatch {
                 user_id: user.user_id,
-                name: user.name,
+                name: user.public_name(),
             });
         }
 
@@ -326,7 +318,10 @@ mod tests {
     fn matches_email_attribute() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let mut bob = user(realm_id, 2, "bob");
-        bob.attributes = HashMap::from([("email".into(), "Alice@Example.org".into())]);
+        bob.attributes = HashMap::from([
+            ("email".into(), "Alice@Example.org".into()),
+            ("profile.visibility.email".into(), "public".into()),
+        ]);
         let carol = user(realm_id, 3, "carol");
         let mut operation = SearchUsersOperation::new(input(realm_id, "example", 10));
         operation.start();

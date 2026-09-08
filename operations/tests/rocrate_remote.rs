@@ -129,9 +129,10 @@ async fn remote_export_streams() -> TestResult {
     let artifact = result.artifact.ok_or("export artifact is missing")?;
     let bytes = artifact_bytes(&exporter.context, &artifact).await?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    // The entry is named after the object key, not the content hash.
     let payload_name = archive_names(&mut archive)?
         .into_iter()
-        .find(|name| name.starts_with("data/"))
+        .find(|name| name == KEY)
         .ok_or("payload entry is missing from the artifact")?;
     let mut payload = Vec::new();
     archive.by_name(&payload_name)?.read_to_end(&mut payload)?;

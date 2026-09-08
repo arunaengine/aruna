@@ -6276,6 +6276,8 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
             | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
             | AdminDocumentOperation::GroupPoliciesSet { .. }
+            | AdminDocumentOperation::GroupJoinRequested { .. }
+            | AdminDocumentOperation::GroupJoinDecided { .. }
             | AdminDocumentOperation::GroupDisplayNameSet { .. }
     ) {
         return Err(NetError::Bootstrap(
@@ -7028,6 +7030,16 @@ fn materialize_group_authorization(
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
 ) {
+    if let AdminDocumentOperation::GroupJoinDecided { decision } = &event.op {
+        for role_id in &decision.role_ids {
+            overlay_group_authorization_role_assignment_reducer_materialization(
+                auth_doc,
+                reducer_state,
+                *role_id,
+            );
+        }
+        return;
+    }
     if let AdminDocumentOperation::GroupPoliciesSet { .. } = &event.op {
         if !reducer_state
             .conflicts
@@ -7244,7 +7256,11 @@ fn materialize_user_admin_document_operation(
         | AdminDocumentOperation::UserAttributeRemoved { key } => {
             let path = user_attribute_path(key);
             if reducer_state.conflicts.contains_key(&path) {
-                user.attributes.remove(key);
+                if key.starts_with(aruna_core::user_profile::VISIBILITY_PREFIX) {
+                    user.attributes.insert(key.clone(), "private".to_string());
+                } else {
+                    user.attributes.remove(key);
+                }
             } else {
                 match reducer_state
                     .user_attributes
@@ -8359,7 +8375,9 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::GroupRoleRemoved { .. }
         | AdminDocumentOperation::GroupCreated { .. }
         | AdminDocumentOperation::GroupDisplayNameSet { .. }
-        | AdminDocumentOperation::GroupPoliciesSet { .. } => AdminOperationFamily::Group,
+        | AdminDocumentOperation::GroupPoliciesSet { .. }
+        | AdminDocumentOperation::GroupJoinRequested { .. }
+        | AdminDocumentOperation::GroupJoinDecided { .. } => AdminOperationFamily::Group,
         AdminDocumentOperation::RealmRoleAdded { .. }
         | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
@@ -8463,6 +8481,8 @@ async fn validate_replicated_admin_event(
     }
 
     match &event.op {
+        AdminDocumentOperation::GroupJoinRequested { .. }
+        | AdminDocumentOperation::GroupJoinDecided { .. } => {}
         AdminDocumentOperation::GroupCreated {
             realm_id, owner, ..
         } => {
@@ -8666,7 +8686,7 @@ async fn validate_replicated_admin_event(
                     .await?
                 }
                 AdminOperationFamily::Group => {
-                    validate_group_admin_authority(storage, event).await?
+                    validate_group_admin_authority(storage, event, previous_state.as_ref()).await?
                 }
                 _ => validate_user_admin_authority(storage, event, previous_state.as_ref()).await?,
             };
@@ -9183,6 +9203,7 @@ async fn validate_realm_authorization_admin_authority(
 async fn validate_group_admin_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
+    previous_state: Option<&AdminDocumentReducerState>,
 ) -> Result<AdminEventValidation> {
     let AdminDocumentTarget::Group { group_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
@@ -9247,6 +9268,72 @@ async fn validate_group_admin_authority(
             "stored group identity does not match the event".to_string(),
         ));
     }
+    if let AdminDocumentOperation::GroupJoinRequested { request } = &event.op {
+        if request.user_id != event.actor.user_id || request.group_id != group_id {
+            return Ok(AdminEventValidation::Rejected(
+                "requester does not match actor or group".into(),
+            ));
+        }
+        if let Some(existing) = previous_state
+            .into_iter()
+            .flat_map(|state| state.join_requests())
+            .find(|entry| entry.request.request_id == request.request_id)
+            && existing.request != *request
+        {
+            return Ok(AdminEventValidation::Rejected(
+                "membership request identity is immutable".into(),
+            ));
+        }
+        return Ok(AdminEventValidation::Accepted);
+    }
+    if let AdminDocumentOperation::GroupJoinDecided { decision } = &event.op {
+        let Some(previous) = previous_state else {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "membership request is unavailable".into(),
+            });
+        };
+        let Some(request) = previous
+            .join_requests()
+            .into_iter()
+            .find(|entry| entry.request.request_id == decision.request_id)
+        else {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "membership request is unavailable".into(),
+            });
+        };
+        if request.request.user_id != decision.user_id {
+            return Ok(AdminEventValidation::Rejected(
+                "decision requester does not match the request".into(),
+            ));
+        }
+        if !previous.applied_event_ids.contains(&event.event_id) {
+            let path = aruna_core::join_request::decision_path(decision.request_id);
+            let observed = previous
+                .user_subject_ids
+                .get(&path)
+                .is_some_and(|version| event.observed.observes(&version.dot))
+                || previous.conflicts.get(&path).is_some_and(|conflict| {
+                    conflict
+                        .values
+                        .iter()
+                        .any(|value| event.observed.observes(&value.dot))
+                });
+            if observed {
+                return Ok(AdminEventValidation::Rejected(
+                    "membership request was already decided".into(),
+                ));
+            }
+        }
+        if decision.kind == aruna_core::join_request::JoinDecisionKind::Withdrawn {
+            return Ok(if decision.user_id == event.actor.user_id {
+                AdminEventValidation::Accepted
+            } else {
+                AdminEventValidation::Rejected("only the requester may withdraw".into())
+            });
+        }
+    }
     if group.owner == event.actor.user_id {
         return Ok(AdminEventValidation::Accepted);
     }
@@ -9289,6 +9376,9 @@ async fn validate_group_admin_authority(
     // Any one of these paths carries the authority; a rename is also open to a
     // realm administrator who is not a member of the group.
     let paths = match &event.op {
+        AdminDocumentOperation::GroupJoinDecided { .. } => {
+            vec![format!("/{realm_id}/g/{group_id}/admin/users/**")]
+        }
         AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
         | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. } => {
             vec![format!("/{realm_id}/g/{group_id}/admin/users/{user_id}")]
@@ -13102,6 +13192,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_authority_replication() {
+        use aruna_core::join_request::{JoinDecision, JoinDecisionKind, JoinRequest};
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([59; 32]);
+        let group_id = Ulid::from_bytes([3; 16]);
+        let owner = test_actor(
+            11,
+            UserId::local(Ulid::from_bytes([1; 16]), realm_id),
+            realm_id,
+        );
+        let member = test_actor(
+            11,
+            UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+            realm_id,
+        );
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(owner.node_id, RealmNodeKind::Management);
+        let auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner.user_id, realm_id, group_id);
+        let role_id = auth
+            .roles
+            .values()
+            .find(|role| role.name == "user")
+            .unwrap()
+            .role_id;
+        let group = Group {
+            display_name: "Group".into(),
+            group_id,
+            realm_id,
+            owner: owner.user_id,
+            roles: auth.roles.keys().copied().collect(),
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let target = AdminDocumentTarget::Group { group_id };
+        let document = DocumentSyncTarget::GroupAuthorization { group_id };
+        let mut reducer = AdminDocumentReducerState::new(target.clone());
+        storage_batch_write_to(
+            &storage,
+            vec![
+                target_write_entry(
+                    DocumentSyncTarget::RealmConfig { realm_id },
+                    config.to_bytes(&owner).unwrap().into(),
+                ),
+                target_write_entry(
+                    DocumentSyncTarget::RealmAuthorization { realm_id },
+                    realm_auth.to_bytes(&owner).unwrap().into(),
+                ),
+                target_write_entry(document.clone(), auth.to_bytes(&owner).unwrap().into()),
+                (
+                    GROUP_KEYSPACE.into(),
+                    group_id.to_bytes().into(),
+                    group.to_bytes(&owner).unwrap().into(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        let request = JoinRequest {
+            request_id: Ulid::from_bytes([5; 16]),
+            group_id,
+            user_id: member.user_id,
+            message: None,
+            created_at: 1,
+        };
+        let requested = reducer
+            .apply_operation(
+                &member,
+                AdminDocumentOperation::GroupJoinRequested {
+                    request: request.clone(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            validate_group_admin_authority(&storage, &requested, None)
+                .await
+                .unwrap(),
+            AdminEventValidation::Accepted
+        ));
+        apply_admin_document_operation_to_storage(&storage, document.clone(), requested)
+            .await
+            .unwrap();
+        let denied = test_admin_event(
+            Ulid::from_bytes([6; 16]),
+            target,
+            &member,
+            2,
+            AdminDocumentOperation::GroupJoinDecided {
+                decision: JoinDecision {
+                    request_id: request.request_id,
+                    user_id: member.user_id,
+                    kind: JoinDecisionKind::Approved,
+                    decided_by: member.user_id,
+                    reason: None,
+                    decided_at: 2,
+                    role_ids: BTreeSet::from([role_id]),
+                },
+            },
+        );
+        assert!(matches!(
+            validate_group_admin_authority(&storage, &denied, Some(&reducer))
+                .await
+                .unwrap(),
+            AdminEventValidation::Rejected(_)
+        ));
+        let approved = reducer
+            .apply_operation(
+                &owner,
+                AdminDocumentOperation::GroupJoinDecided {
+                    decision: JoinDecision {
+                        request_id: request.request_id,
+                        user_id: member.user_id,
+                        kind: JoinDecisionKind::Approved,
+                        decided_by: owner.user_id,
+                        reason: None,
+                        decided_at: 2,
+                        role_ids: BTreeSet::from([role_id]),
+                    },
+                },
+            )
+            .unwrap();
+        let previous = read_admin_reducer_state(&storage, &reducer.target)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            validate_group_admin_authority(&storage, &approved, Some(&previous))
+                .await
+                .unwrap(),
+            AdminEventValidation::Accepted
+        ));
+        apply_admin_document_operation_to_storage(&storage, document, approved)
+            .await
+            .unwrap();
+        assert!(
+            read_group_auth_doc(&storage, group_id).await.roles[&role_id]
+                .assigned_users
+                .contains(&member.user_id)
+        );
+        let saved = read_admin_reducer_state(&storage, &reducer.target)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.join_requests()[0].decision.as_ref().unwrap().kind,
+            JoinDecisionKind::Approved
+        );
+    }
+
+    #[tokio::test]
     async fn policies_authority_gate() {
         // GroupPoliciesSet must reach the config-path check, not the unreachable
         // arm: a non-owner config admin is accepted, one without config write is
@@ -13196,7 +13435,7 @@ mod tests {
             .await
             .expect("group auth doc writes");
 
-            let validation = validate_group_admin_authority(&storage, &event)
+            let validation = validate_group_admin_authority(&storage, &event, None)
                 .await
                 .expect("validation runs without panic");
             assert_eq!(
@@ -14106,6 +14345,38 @@ mod tests {
             .await
             .is_some()
         );
+    }
+
+    #[test]
+    fn visibility_conflicts_private() {
+        let realm_id = RealmId::from_bytes([44; 32]);
+        let user_id = UserId::local(Ulid::from_parts(210, 1), realm_id);
+        let mut reducer = AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id });
+        let mut event = test_admin_event(
+            Ulid::from_parts(211, 1),
+            reducer.target.clone(),
+            &test_actor(1, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserAttributeSet {
+                key: "profile.visibility.name".into(),
+                value: "public".into(),
+            },
+        );
+        reducer.apply(&event).unwrap();
+        event = test_admin_event(
+            Ulid::from_parts(212, 1),
+            reducer.target.clone(),
+            &test_actor(2, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserAttributeSet {
+                key: "profile.visibility.name".into(),
+                value: "private".into(),
+            },
+        );
+        reducer.apply(&event).unwrap();
+        let user = materialize_user_admin_document_operation(user_id, None, &reducer, &event);
+        assert_eq!(user.attributes["profile.visibility.name"], "private");
+        assert!(!user.field_public("name"));
     }
 
     #[tokio::test]

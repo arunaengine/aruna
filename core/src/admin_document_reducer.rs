@@ -42,6 +42,8 @@ pub enum AdminDocumentReducerError {
     TargetMismatch,
     #[error("admin document event operation is not supported for target")]
     UnsupportedTarget,
+    #[error("invalid group join request or decision")]
+    InvalidJoinRequest,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeValidationError),
     #[error("placement labels must not set the derived label `{0}`")]
@@ -1067,6 +1069,65 @@ impl AdminDocumentReducerState {
                     GROUP_DISPLAY_NAME_PATH,
                     Some(display_name.to_string()),
                 );
+            }
+            (
+                AdminDocumentTarget::Group { group_id },
+                AdminDocumentOperation::GroupJoinRequested { request },
+            ) => {
+                if request.group_id != *group_id
+                    || request.request_id.is_nil()
+                    || request.user_id != event.actor.user_id
+                    || request.user_id.is_nil()
+                    || request.user_id.realm_id != event.actor.realm_id
+                    || !crate::join_request::valid_message(&request.message)
+                {
+                    return Err(AdminDocumentReducerError::InvalidJoinRequest);
+                }
+                let value = serde_json::to_string(request)
+                    .map_err(|_| AdminDocumentReducerError::InvalidJoinRequest)?;
+                self.apply_group_field(
+                    event,
+                    &crate::join_request::request_path(request.request_id),
+                    Some(value),
+                );
+            }
+            (
+                AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupJoinDecided { decision },
+            ) => {
+                use crate::join_request::JoinDecisionKind;
+                if decision.request_id.is_nil()
+                    || decision.user_id.is_nil()
+                    || decision.user_id.realm_id != event.actor.realm_id
+                    || decision.decided_by != event.actor.user_id
+                    || !crate::join_request::valid_message(&decision.reason)
+                    || decision.role_ids.iter().any(Ulid::is_nil)
+                    || match decision.kind {
+                        JoinDecisionKind::Approved => decision.role_ids.is_empty(),
+                        JoinDecisionKind::Denied | JoinDecisionKind::Withdrawn => {
+                            !decision.role_ids.is_empty()
+                        }
+                    }
+                    || (decision.kind == JoinDecisionKind::Withdrawn
+                        && decision.user_id != event.actor.user_id)
+                {
+                    return Err(AdminDocumentReducerError::InvalidJoinRequest);
+                }
+                let value = serde_json::to_string(decision)
+                    .map_err(|_| AdminDocumentReducerError::InvalidJoinRequest)?;
+                self.apply_group_field(
+                    event,
+                    &crate::join_request::decision_path(decision.request_id),
+                    Some(value),
+                );
+                for role_id in &decision.role_ids {
+                    self.apply_group_role_user_assignment(
+                        event,
+                        role_id,
+                        &decision.user_id,
+                        Some(decision.user_id.to_string()),
+                    );
+                }
             }
             (
                 AdminDocumentTarget::Group { .. },
@@ -2858,6 +2919,19 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
             vec![group_role_user_assignment_path(role_id, user_id)]
+        }
+        AdminDocumentOperation::GroupJoinRequested { request } => {
+            vec![crate::join_request::request_path(request.request_id)]
+        }
+        AdminDocumentOperation::GroupJoinDecided { decision } => {
+            let mut paths = vec![crate::join_request::decision_path(decision.request_id)];
+            paths.extend(
+                decision
+                    .role_ids
+                    .iter()
+                    .map(|role_id| group_role_user_assignment_path(role_id, &decision.user_id)),
+            );
+            paths
         }
         AdminDocumentOperation::UserAttributeSet { key, .. }
         | AdminDocumentOperation::UserAttributeRemoved { key } => vec![user_attribute_path(key)],

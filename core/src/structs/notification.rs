@@ -79,6 +79,11 @@ pub enum NotificationKind {
         error: String,
         actor_user_id: UserId,
     },
+    GroupJoinRequested {
+        group_id: GroupId,
+        request_id: Ulid,
+        actor_user_id: UserId,
+    },
 }
 
 impl NotificationKind {
@@ -88,7 +93,8 @@ impl NotificationKind {
         match self {
             NotificationKind::AddedToGroup { .. }
             | NotificationKind::RemovedFromGroup { .. }
-            | NotificationKind::GroupMemberAdded { .. } => "group.membership",
+            | NotificationKind::GroupMemberAdded { .. }
+            | NotificationKind::GroupJoinRequested { .. } => "group.membership",
             NotificationKind::NodeOnboarded { .. } => "node.onboarding",
             NotificationKind::MetadataCreated { .. }
             | NotificationKind::DataUploaded { .. }
@@ -103,6 +109,7 @@ impl NotificationKind {
             NotificationKind::AddedToGroup { .. } => "added_to_group",
             NotificationKind::RemovedFromGroup { .. } => "removed_from_group",
             NotificationKind::GroupMemberAdded { .. } => "group_member_added",
+            NotificationKind::GroupJoinRequested { .. } => "group_join_requested",
             NotificationKind::NodeOnboarded { .. } => "node_onboarded",
             NotificationKind::MetadataCreated { .. } => "metadata_created",
             NotificationKind::DataUploaded { .. } => "data_uploaded",
@@ -201,6 +208,11 @@ pub enum ResourceEvent {
     NodeOnboarded {
         realm_id: RealmId,
         node_id: NodeId,
+    },
+    GroupJoinRequested {
+        group_id: GroupId,
+        request_id: Ulid,
+        actor_user_id: UserId,
     },
 }
 
@@ -350,6 +362,11 @@ mod tests {
         let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(8);
         for kind in [
+            NotificationKind::GroupJoinRequested {
+                group_id: Ulid::generate(),
+                request_id: Ulid::generate(),
+                actor_user_id: user(1, 3),
+            },
             NotificationKind::AddedToGroup {
                 group_id: Ulid::generate(),
                 actor_user_id: user(1, 3),
