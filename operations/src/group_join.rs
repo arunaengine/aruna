@@ -391,3 +391,115 @@ fn normalized(value: &Option<String>) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
+
+impl Operation for GroupJoinOperation {
+    type Output = JoinRequestState;
+    type Error = GroupJoinError;
+
+    fn start(&mut self) -> Effects {
+        if self.state != State::Init {
+            return self.fail(GroupJoinError::UnexpectedEvent);
+        }
+        if self.input.auth.path_restrictions.is_some()
+            || self.input.actor.user_id.is_nil()
+            || self.input.auth.user_id != self.input.actor.user_id
+            || self.input.auth.realm_id != self.input.actor.realm_id
+            || self.input.actor.user_id.realm_id != self.input.actor.realm_id
+        {
+            return self.fail(GroupJoinError::Unauthorized);
+        }
+        if matches!(self.input.action, JoinAction::Decide { .. }) {
+            self.state = State::Auth;
+            return smallvec![Effect::SubOperation(boxed_suboperation(
+                CheckPermissionsOperation::new(CheckPermissionsConfig {
+                    auth_context: self.input.auth.clone(),
+                    path: format!(
+                        "/{}/g/{}/admin/users/**",
+                        self.input.actor.realm_id, self.input.group_id
+                    ),
+                    required_permission: Permission::WRITE,
+                }),
+                |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
+            ))];
+        }
+        self.begin()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            return self.fail(error.into());
+        }
+        match (self.state, event) {
+            (
+                State::Auth,
+                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
+            ) => match allowed {
+                Ok(true) => self.begin(),
+                Ok(false) => self.fail(GroupJoinError::Unauthorized),
+                Err(error) => self.fail(error.into()),
+            },
+            (State::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.read(txn_id)
+            }
+            (State::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                match self.mutate(values) {
+                    Ok(effects) => effects,
+                    Err(error) => self.fail(error),
+                }
+            }
+            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                if self.deletes.is_empty() {
+                    return self.fence();
+                }
+                self.state = State::Delete;
+                smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes: std::mem::take(&mut self.deletes),
+                    txn_id: self.txn_id
+                })]
+            }
+            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => self.fence(),
+            (State::Fence, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                if !self.fence.admits(&values) {
+                    return self.fail(GroupJoinError::PlacementFenced);
+                }
+                self.commit()
+            }
+            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { txn_id }))
+                if Some(txn_id) == self.txn_id =>
+            {
+                self.txn_id = None;
+                if self.changed {
+                    self.state = State::Schedule;
+                    smallvec![schedule_outbox_drain_effect()]
+                } else {
+                    self.state = State::Done;
+                    smallvec![]
+                }
+            }
+            (
+                State::Schedule,
+                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
+            ) => {
+                self.state = State::Done;
+                smallvec![]
+            }
+            _ => self.fail(GroupJoinError::UnexpectedEvent),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, State::Done | State::Failed)
+    }
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        if !self.is_complete() {
+            return Err(GroupJoinError::NotFinished);
+        }
+        self.output.ok_or(GroupJoinError::NotFinished)?
+    }
+    fn abort(&mut self) -> Effects {
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
+    }
+}
