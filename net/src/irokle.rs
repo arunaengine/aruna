@@ -7244,7 +7244,11 @@ fn materialize_user_admin_document_operation(
         | AdminDocumentOperation::UserAttributeRemoved { key } => {
             let path = user_attribute_path(key);
             if reducer_state.conflicts.contains_key(&path) {
-                user.attributes.remove(key);
+                if key.starts_with(aruna_core::user_profile::VISIBILITY_PREFIX) {
+                    user.attributes.insert(key.clone(), "private".to_string());
+                } else {
+                    user.attributes.remove(key);
+                }
             } else {
                 match reducer_state
                     .user_attributes
@@ -14106,6 +14110,38 @@ mod tests {
             .await
             .is_some()
         );
+    }
+
+    #[test]
+    fn visibility_conflicts_private() {
+        let realm_id = RealmId::from_bytes([44; 32]);
+        let user_id = UserId::local(Ulid::from_parts(210, 1), realm_id);
+        let mut reducer = AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id });
+        let mut event = test_admin_event(
+            Ulid::from_parts(211, 1),
+            reducer.target.clone(),
+            &test_actor(1, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserAttributeSet {
+                key: "profile.visibility.name".into(),
+                value: "public".into(),
+            },
+        );
+        reducer.apply(&event).unwrap();
+        event = test_admin_event(
+            Ulid::from_parts(212, 1),
+            reducer.target.clone(),
+            &test_actor(2, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserAttributeSet {
+                key: "profile.visibility.name".into(),
+                value: "private".into(),
+            },
+        );
+        reducer.apply(&event).unwrap();
+        let user = materialize_user_admin_document_operation(user_id, None, &reducer, &event);
+        assert_eq!(user.attributes["profile.visibility.name"], "private");
+        assert!(!user.field_public("name"));
     }
 
     #[tokio::test]

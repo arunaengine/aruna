@@ -20,6 +20,16 @@ const BOUNDARY: &[&str] = &[
 /// is still authorized. A new route must gain a check or a reviewed entry here.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
+        "users.rs",
+        "search_users",
+        "unrestricted realm directory read with policy checks; only user-selected public fields match",
+    ),
+    (
+        "users.rs",
+        "resolve_users",
+        "unrestricted realm directory read with policy checks; only user-selected public fields returned",
+    ),
+    (
         "credentials.rs",
         "list_s3_credentials",
         "self-scoped: only credentials whose identity is the caller",

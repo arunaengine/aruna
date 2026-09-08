@@ -630,13 +630,13 @@ fn format_system_time(time: std::time::SystemTime) -> String {
 
 **Authentication**: realm bearer token. Each section is authorized on its own terms: every node
 filters its own document and bucket hits, a group hit is filtered against READ on the group's data
-so a caller never learns of a group it may not read, and the user directory is an admin-scoped read.
+so a caller never learns of a group it may not read, and the user directory searches only public profile fields.
 
 **Behavior**
 - Documents and buckets fan out over at most 32 of the realm's serving nodes under one shared
   deadline of about 12 seconds; groups are matched locally.
-- A caller without the admin-scoped directory read gets no `users` section instead of an error, and
-  a section that was not requested is omitted.
+- A path-restricted caller or a realm policy denial omits the `users` section.
+  A section that was not requested is omitted.
 - An answer can be partial and is still 200: for documents and buckets a non-zero `nodes_failed`
   means hits may be missing rather than absent.
 - Documents set `truncated` when paging stopped at the server-side depth cap, groups when the
@@ -980,11 +980,10 @@ async fn run_users(
     if !requested {
         return Ok(None);
     }
-    // The user directory is an admin-scoped read, so a caller without it gets no
-    // user section instead of a failed search.
-    let path = format!("/{}/admin/u/**", state.get_realm_id());
-    if !crate::auth::permission_granted(state, auth, path, Permission::READ).await? {
-        return Ok(None);
+    match crate::routes::users::authorize_directory(state, auth, None).await {
+        Ok(()) => {}
+        Err(ServerError::Forbidden) => return Ok(None),
+        Err(error) => return Err(error),
     }
     let output = drive(
         SearchUsersOperation::new(SearchUsersInput {
