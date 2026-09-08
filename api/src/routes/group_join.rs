@@ -264,7 +264,15 @@ async fn list(
 
 #[utoipa::path(post, path = "/access/groups/{id}/join-requests", tag = "access/groups",
     summary = "Request group membership",
-    description = "An unrestricted realm user requests membership for themselves. Existing pending requests are returned unchanged; existing members receive 409. A message is limited to 2000 bytes. The request is committed and replicated as a signed group operation; only group membership administrators may decide it.",
+    description = r#"Requests group membership for the calling user.
+
+**Authentication**: unrestricted realm bearer token. Realm and group request policies may deny.
+
+**Behavior**
+- Returns an existing pending request unchanged; existing members receive 409.
+- Commits the request and replicates it as a signed group operation.
+- Only group membership administrators may approve or deny the request.
+- An optional message is limited to 2000 bytes."#,
     params(("id" = Ulid, Path, description = "Group id")),
     request_body(content = CreateJoinRequest, example = json!({"message": "I would like to collaborate."})),
     responses((status = 201, body = JoinResponse, description = "Pending request", example = json!({"request_id":"01JABCDEF0123456789ABCDEFG","group_id":"01JABCDEF0123456789ABCDEFG","user_id":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","message":null,"status":"pending","decided_by":null,"decision_reason":null,"created_at":"2026-09-08T00:00:00+00:00","decided_at":null})),
@@ -297,7 +305,15 @@ async fn submit_join(
 
 #[utoipa::path(get, path = "/access/groups/{id}/join-requests", tag = "access/groups",
     summary = "List group membership requests",
-    description = "Requires an unrestricted realm token with WRITE on the group's admin/users/** path. Request messages are visible only to their requester and group membership administrators. Use status=pending for the approval inbox; pagination is cursor based.",
+    description = r#"Lists membership requests for a group.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the group's admin/users/** path.
+Realm and group request policies may deny.
+
+**Behavior**
+- Request messages are visible only to their requester and membership administrators.
+- Use status=pending for the approval inbox.
+- Follow next_start_after for further pages; page size is clamped to 1 to 100."#,
     params(("id" = Ulid, Path, description = "Group id"), ("status" = Option<String>, Query, description = "Optional pending filter"), ("start_after" = Option<String>, Query, description = "Cursor from the previous page"), ("limit" = Option<usize>, Query, description = "Page size, 1 to 100")),
     responses((status = 200, body = JoinPage, description = "Membership requests", example = json!({"requests":[],"next_start_after":null})),
         (status = 400, body = ErrorResponse, description = "Invalid filter or cursor"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Membership administration required")), security(("bearer_auth" = [])))]
@@ -320,8 +336,16 @@ async fn list_joins(
 
 #[utoipa::path(get, path = "/access/users/join-requests", tag = "access/users",
     summary = "List your membership requests",
-    description = "Requires an unrestricted realm token. Returns only the caller's requests, including approved and denied history; withdrawn requests are omitted. Results cover the group state held by this node. Follow next_start_after until null.",
-    params(("start_after" = Option<String>, Query, description = "Cursor from the previous page"), ("limit" = Option<usize>, Query, description = "Page size, 1 to 100")),
+    description = r#"Lists the calling user's membership requests.
+
+**Authentication**: unrestricted realm bearer token. Realm request policies may deny.
+
+**Behavior**
+- Returns only the caller's requests, including approved and denied history.
+- Withdrawn requests are omitted; status=pending selects only pending requests.
+- Results cover the group state held by this node.
+- Follow next_start_after until null; page size is clamped to 1 to 100."#,
+    params(("status" = Option<String>, Query, description = "Optional pending filter"), ("start_after" = Option<String>, Query, description = "Cursor from the previous page"), ("limit" = Option<usize>, Query, description = "Page size, 1 to 100")),
     responses((status = 200, body = JoinPage, description = "Your membership requests", example = json!({"requests":[],"next_start_after":null})),
         (status = 400, body = ErrorResponse, description = "Invalid cursor"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Restricted token or policy denial")), security(("bearer_auth" = [])))]
 async fn own_joins(
@@ -336,7 +360,15 @@ async fn own_joins(
 
 #[utoipa::path(delete, path = "/access/groups/{id}/join-requests/{request_id}", tag = "access/groups",
     summary = "Withdraw your pending membership request",
-    description = "Only the requester with an unrestricted realm token may withdraw a pending request. A repeated withdrawal succeeds. An approved or denied request cannot be withdrawn.",
+    description = r#"Withdraws the calling user's pending membership request.
+
+**Authentication**: unrestricted realm bearer token belonging to the requester.
+Realm and group request policies may deny.
+
+**Behavior**
+- A repeated withdrawal succeeds without another change.
+- An approved or denied request cannot be withdrawn.
+- The withdrawal is committed and replicated as a signed group operation."#,
     params(("id" = Ulid, Path, description = "Group id"), ("request_id" = Ulid, Path, description = "Membership request id")),
     responses((status = 204, description = "Withdrawn"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Not the requester or policy denial"), (status = 404, body = ErrorResponse, description = "Request not found"), (status = 409, body = ErrorResponse, description = "Already decided, concurrent change, or device node")), security(("bearer_auth" = [])))]
 async fn withdraw_join(
@@ -352,7 +384,16 @@ async fn withdraw_join(
 
 #[utoipa::path(post, path = "/access/groups/{id}/join-requests/{request_id}/decide", tag = "access/groups",
     summary = "Approve or deny a membership request",
-    description = "Requires an unrestricted realm token with WRITE on admin/users/**. Approval atomically records the decision and assigns the requested roles, defaulting to the group's single user role. Denial grants no roles. Repeating the same decision returns its existing result; changing a terminal decision returns 409. Concurrent decisions on different nodes retain approval if either accepted approval granted membership.",
+    description = r#"Approves or denies one pending membership request.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the group's admin/users/** path.
+Realm and group request policies may deny.
+
+**Behavior**
+- Approval atomically records the decision and assigns the requested roles.
+- Omitted roles default to the group's single user role; denial grants no roles.
+- Repeating a decision returns its saved result; changing a terminal decision returns 409.
+- Concurrent decisions retain approval if either node accepted an approval granting membership."#,
     params(("id" = Ulid, Path, description = "Group id"), ("request_id" = Ulid, Path, description = "Membership request id")),
     request_body(content = DecideJoinRequest, example = json!({"approve":true,"role_ids":[]})),
     responses((status = 200, body = JoinDecisionResponse, description = "Saved decision", example = json!({"request":{"request_id":"01JABCDEF0123456789ABCDEFG","group_id":"01JABCDEF0123456789ABCDEFG","user_id":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","message":null,"status":"approved","decided_by":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","decision_reason":null,"created_at":"2026-09-08T00:00:00+00:00","decided_at":"2026-09-08T01:00:00+00:00"}})),
