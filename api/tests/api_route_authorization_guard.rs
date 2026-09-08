@@ -20,31 +20,6 @@ const BOUNDARY: &[&str] = &[
 /// is still authorized. A new route must gain a check or a reviewed entry here.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
-        "group_join.rs",
-        "submit_join",
-        "self-scoped request with unrestricted realm auth and deny policies; operation binds requester to caller",
-    ),
-    (
-        "group_join.rs",
-        "own_joins",
-        "self-scoped request list with unrestricted realm auth and deny policies; operation filters by caller",
-    ),
-    (
-        "group_join.rs",
-        "withdraw_join",
-        "self-scoped withdrawal with unrestricted realm auth and deny policies; operation checks stored requester",
-    ),
-    (
-        "users.rs",
-        "search_users",
-        "unrestricted realm directory read with policy checks; only user-selected public fields match",
-    ),
-    (
-        "users.rs",
-        "resolve_users",
-        "unrestricted realm directory read with policy checks; only user-selected public fields returned",
-    ),
-    (
         "credentials.rs",
         "list_s3_credentials",
         "self-scoped: only credentials whose identity is the caller",
@@ -58,6 +33,21 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "drs.rs",
         "get_service_info",
         "public DRS service-info discovery",
+    ),
+    (
+        "group_join.rs",
+        "own_joins",
+        "self-scoped request list with unrestricted realm auth and deny policies; operation filters by caller",
+    ),
+    (
+        "group_join.rs",
+        "submit_join",
+        "self-scoped request with unrestricted realm auth and deny policies; operation binds requester to caller",
+    ),
+    (
+        "group_join.rs",
+        "withdraw_join",
+        "self-scoped withdrawal with unrestricted realm auth and deny policies; operation checks stored requester",
     ),
     (
         "groups.rs",
@@ -424,9 +414,19 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "users.rs",
+        "resolve_users",
+        "unrestricted realm directory read with policy checks; only user-selected public fields returned",
+    ),
+    (
+        "users.rs",
         "revoke_user_device",
         "self-scoped: RemoveDeviceNodeOperation re-checks that the node is a \
          User device owned by the caller",
+    ),
+    (
+        "users.rs",
+        "search_users",
+        "unrestricted realm directory read with policy checks; only user-selected public fields match",
     ),
     (
         "vault.rs",
