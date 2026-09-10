@@ -42,7 +42,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::queue_backoff::queue_retry_after_ms;
+use crate::queue_backoff::{due_after, queue_retry_after_ms};
 
 use super::iri_index::MetadataIriIndexError;
 use super::profile_validation::{assess_render, violation_count};
@@ -1499,10 +1499,6 @@ async fn filter_live_jobs(
         }
     }
     Ok((live, dead))
-}
-
-fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
-    Duration::from_millis(due_at_ms.saturating_sub(now_ms))
 }
 
 #[derive(Debug, Default)]

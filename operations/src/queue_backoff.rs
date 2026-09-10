@@ -13,6 +13,14 @@ pub(crate) fn retry_after_ms(attempts: u32, base_ms: u64, max_ms: u64) -> u64 {
     base_ms.saturating_mul(multiplier).min(max_ms)
 }
 
+pub(crate) fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
+    Some(current.map_or(due_at_ms, |current| current.min(due_at_ms)))
+}
+
+pub(crate) fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
+    Duration::from_millis(due_at_ms.saturating_sub(now_ms))
+}
+
 // Deterministic jitter from the caller's own id decorrelates the retries of
 // drivers that conflict on one record, and the wait lets the winner commit.
 pub(crate) fn conflict_backoff(attempt: usize, seed: &[u8]) -> Duration {
