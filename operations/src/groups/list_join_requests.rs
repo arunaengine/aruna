@@ -1,4 +1,4 @@
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_core::admin_document_reducer::decode_admin_document_reducer_state;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
