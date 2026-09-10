@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding_secret_state::secret_state_write_entry;
+use crate::onboarding::secret_state::secret_state_write_entry;
 
 pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
 /// Secrets one page of the outstanding-secret scan reads. The scan follows its

@@ -11,10 +11,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::create_onboarding_secret::{
+use crate::onboarding::create_onboarding_secret::{
     enrolled_devices, pending_devices, scan_secrets, secret_record_key,
 };
-use crate::onboarding_secret_state::{
+use crate::onboarding::secret_state::{
     resolve_secret_state, secret_state_key, secret_state_write_entry,
 };
 
@@ -502,10 +502,10 @@ mod tests {
         ReserveOnboardingSecretError, ReserveOnboardingSecretInput,
         ReserveOnboardingSecretOperation,
     };
-    use crate::create_onboarding_secret::{
+    use crate::driver::{DriverContext, drive};
+    use crate::onboarding::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
