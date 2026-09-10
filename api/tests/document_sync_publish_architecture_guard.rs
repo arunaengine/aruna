@@ -49,7 +49,7 @@ fn document_sync_publish_constructors_stay_outbox_owned() {
 
 fn allowed_publish_use(publish_use: &PublishUse) -> bool {
     match publish_use.path.as_str() {
-        "operations/src/task_incoming.rs" => {
+        "operations/src/tasks/task_incoming.rs" => {
             publish_use.function.as_deref() == Some("document_publish_from_outbox")
         }
         "net/src/irokle.rs" => {

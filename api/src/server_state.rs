@@ -15,21 +15,21 @@ use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{
     Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId, RoCrateLimits,
 };
-use aruna_operations::auth::{
+use aruna_operations::auth::bearer_token::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
-};
-use aruna_operations::claim_initial_realm_admin::{
-    ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    ClaimInitialRealmAdminResult,
 };
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::issue_onboarding_sync_ticket::{
+use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::onboarding::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketInput, IssueOnboardingSyncTicketOperation,
     ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
-use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::realm::claim_initial_realm_admin::{
+    ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    ClaimInitialRealmAdminResult,
+};
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;

@@ -6,7 +6,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::{AuthContext, UserVault};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::driver::drive;
-use aruna_operations::user_vault::{
+use aruna_operations::users::user_vault::{
     DeleteVaultOperation, ReadVaultOperation, VaultStoreError, WriteVaultOperation,
 };
 use axum::extract::State;
