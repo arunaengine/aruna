@@ -9,7 +9,7 @@ use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::{MetadataAuthToken, MetadataError};
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::storage::StorageHandle;
@@ -26,9 +26,9 @@ use crate::metadata::forward::{
     MetadataWriteError, apply_batch_routed, create_metadata_document_routed,
 };
 use crate::process_placements::load_realm_config;
-use crate::queue_backoff::queue_retry_after_ms;
 use crate::update_metadata_document::UpdateMetadataDocumentError;
 
+use super::backlog::{BacklogDrain, arm_timer, drain_backlog, exhausted, retry_due_ms};
 use super::replica::{read_replica, store_replica};
 use super::repository::{
     IntakeEntry, IntakeKind, IntakeState, MAX_INTAKE_ATTEMPTS, entry_with_state, intake_entry,
@@ -66,32 +66,48 @@ pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
     };
 
     let now = unix_timestamp_millis();
-    let mut cursor = None;
-    let mut due = false;
-    loop {
-        let Some((entries, next_cursor)) = read_page(context, cursor).await else {
-            return DrainOutcome::Deferred;
-        };
-        for entry in entries {
-            if !entry.is_due(now) {
-                continue;
-            }
-            due = true;
-            let Some(claim) = claim_entry(context, &config, realm_id, node_id, &entry).await else {
-                continue;
-            };
-            let next = publish_entry(context, realm_id, node_id, &entry, &claim).await;
-            store_entry(context, &entry_with_state(&entry, next)).await;
-        }
-        match next_cursor {
-            Some(next_cursor) => cursor = Some(next_cursor),
-            None => break,
-        }
+    drain_backlog(
+        now,
+        IntakeDrain {
+            context,
+            config: &config,
+            realm_id,
+            node_id,
+        },
+    )
+    .await
+}
+
+/// One intake drain plane handed to the shared page loop.
+struct IntakeDrain<'a> {
+    context: &'a Arc<DriverContext>,
+    config: &'a RealmConfigDocument,
+    realm_id: RealmId,
+    node_id: aruna_core::NodeId,
+}
+
+impl BacklogDrain for IntakeDrain<'_> {
+    type Row = IntakeEntry;
+
+    async fn read(&mut self, cursor: Option<Key>) -> Option<(Vec<IntakeEntry>, Option<Key>)> {
+        read_page(self.context, cursor).await
     }
-    if due {
-        DrainOutcome::More
-    } else {
-        DrainOutcome::Idle
+
+    async fn forward(&mut self, entry: IntakeEntry) -> bool {
+        let Some(claim) = claim_entry(
+            self.context,
+            self.config,
+            self.realm_id,
+            self.node_id,
+            &entry,
+        )
+        .await
+        else {
+            return true;
+        };
+        let next = publish_entry(self.context, self.realm_id, self.node_id, &entry, &claim).await;
+        store_entry(self.context, &entry_with_state(&entry, next)).await;
+        true
     }
 }
 
@@ -423,7 +439,7 @@ fn permanent(error: &MetadataWriteError) -> bool {
 
 /// Backoff before the entry is minted: nothing has been forwarded yet.
 fn retry_state(attempts: u32, reason: String) -> IntakeState {
-    if attempts >= MAX_INTAKE_ATTEMPTS {
+    if exhausted(attempts, MAX_INTAKE_ATTEMPTS) {
         return IntakeState::Failed {
             reason,
             retryable: true,
@@ -431,7 +447,7 @@ fn retry_state(attempts: u32, reason: String) -> IntakeState {
         };
     }
     IntakeState::Pending {
-        due_at_ms: next_due(attempts),
+        due_at_ms: retry_due_ms(attempts),
         attempts,
         last_error: Some(reason),
     }
@@ -440,7 +456,7 @@ fn retry_state(attempts: u32, reason: String) -> IntakeState {
 /// Backoff after a forward whose outcome is unknown. The minted id is kept so
 /// the next attempt is the same create rather than a second document.
 fn publishing_retry(document_id: Ulid, attempts: u32, reason: String) -> IntakeState {
-    if attempts >= MAX_INTAKE_ATTEMPTS {
+    if exhausted(attempts, MAX_INTAKE_ATTEMPTS) {
         return IntakeState::Failed {
             reason: format!("{reason} (document id {document_id})"),
             retryable: true,
@@ -449,13 +465,9 @@ fn publishing_retry(document_id: Ulid, attempts: u32, reason: String) -> IntakeS
     }
     IntakeState::Publishing {
         document_id,
-        due_at_ms: next_due(attempts),
+        due_at_ms: retry_due_ms(attempts),
         attempts,
     }
-}
-
-fn next_due(attempts: u32) -> u64 {
-    unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts))
 }
 
 /// Re-arms the drain when the queue still holds entries.
@@ -480,12 +492,13 @@ pub async fn restore_intake_timer(storage: &StorageHandle, task_handle: &TaskHan
             return;
         }
     };
-    if has_entries
-        && let TaskEvent::Error { message, .. } = task_handle
-            .schedule_timer_if_idle(TaskKey::DrainDeviceIntake, Duration::ZERO)
-            .await
-    {
-        warn!(message = %message, "Failed to restore the device intake timer");
+    if has_entries {
+        arm_timer(
+            task_handle,
+            TaskKey::DrainDeviceIntake,
+            "Failed to restore the device intake timer",
+        )
+        .await;
     }
 }
 

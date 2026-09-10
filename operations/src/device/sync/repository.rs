@@ -15,6 +15,8 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::device::backlog::BacklogState;
+
 /// Folders one device may bind. A device serves one person's machine, so this
 /// is a human-sized list rather than an inventory.
 pub const MAX_SYNCED_FOLDERS: usize = 64;
@@ -70,17 +72,11 @@ impl SyncUpload {
     }
 
     pub fn is_due(&self, now_ms: u64) -> bool {
-        match &self.state {
-            UploadState::Pending { due_at_ms, .. } => *due_at_ms <= now_ms,
-            UploadState::Failed { .. } => false,
-        }
+        self.state.is_due(now_ms)
     }
 
     pub fn attempts(&self) -> u32 {
-        match &self.state {
-            UploadState::Pending { attempts, .. } => *attempts,
-            UploadState::Failed { .. } => 0,
-        }
+        self.state.attempts()
     }
 }
 

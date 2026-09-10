@@ -2,6 +2,7 @@
 //! owner's node controls. Nothing here is realm authority; a queued intent
 //! becomes realm state only when the drain forwards it as an ordinary create.
 
+pub mod backlog;
 pub mod compute;
 pub mod delete_draft;
 pub mod drain;
