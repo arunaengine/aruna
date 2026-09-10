@@ -38,7 +38,7 @@ use super::executor::{JobContext, JobRunOutcome};
 use super::rocrate_jsonld::{
     JsonLdKeywords, RDF_TYPE_IRI, SCHEMA_MEDIA_HTTPS_IRI, SCHEMA_MEDIA_IRI, is_file_type,
 };
-use super::store::{put_job_entry, put_rocrate_checkpoint};
+use super::store::{put_job_entry, put_state, read_state};
 use crate::blob::hidden::delete_hidden;
 use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
@@ -2951,34 +2951,23 @@ async fn read_export_checkpoint(
     ctx: &JobContext,
     job_id: JobId,
 ) -> Result<Option<ExportCheckpoint>, String> {
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(job_id.to_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        event => Err(format!("unexpected export checkpoint event: {event:?}")),
-    }
+    read_state(
+        &ctx.driver.storage_handle,
+        ROCRATE_JOB_STATE_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        "export checkpoint",
+    )
+    .await
 }
 
 async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ExportCheckpoint) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    put_rocrate_checkpoint(
+    put_state(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        Value::from(value),
+        ROCRATE_JOB_STATE_KEYSPACE,
+        ByteView::from(ctx.job_id.to_bytes().to_vec()),
+        checkpoint,
     )
     .await
     .map_err(|error| error.to_string())

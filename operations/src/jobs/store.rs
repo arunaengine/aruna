@@ -22,6 +22,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -365,21 +366,45 @@ where
     ))
 }
 
-pub async fn put_staging_checkpoint(
+/// Read and postcard-decode a state row, keeping a missing row distinct from a malformed one.
+pub(super) async fn read_state<T: DeserializeOwned>(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: Key,
+    label: &str,
+) -> Result<Option<T>, String> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => postcard::from_bytes(value.as_ref())
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected {label} event: {other:?}")),
+    }
+}
+
+/// Postcard-encode `row` and persist it through the token-guarded checkpoint write.
+pub(super) async fn put_state<T: Serialize>(
     storage: &StorageHandle,
     job_id: JobId,
     token: Ulid,
-    value: Value,
+    key_space: &str,
+    key: Key,
+    row: &T,
 ) -> Result<(), JobMutationError> {
-    put_job_checkpoint(
-        storage,
-        job_id,
-        token,
-        STAGING_JOB_STATE_KEYSPACE,
-        ByteView::from(job_id.to_bytes().to_vec()),
-        value,
-    )
-    .await
+    let value = postcard::to_allocvec(row)
+        .map(ByteView::from)
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    put_job_checkpoint(storage, job_id, token, key_space, key, value).await
 }
 
 pub async fn put_purge_checkpoint(
@@ -420,40 +445,6 @@ pub async fn read_purge_checkpoint(
             .map_err(|error| JobMutationError::Storage(error.to_string()))
     })
     .transpose()
-}
-
-pub async fn put_rocrate_checkpoint(
-    storage: &StorageHandle,
-    job_id: JobId,
-    token: Ulid,
-    value: Value,
-) -> Result<(), JobMutationError> {
-    put_job_checkpoint(
-        storage,
-        job_id,
-        token,
-        ROCRATE_JOB_STATE_KEYSPACE,
-        ByteView::from(job_id.to_bytes().to_vec()),
-        value,
-    )
-    .await
-}
-
-pub async fn put_rocrate_plan(
-    storage: &StorageHandle,
-    job_id: JobId,
-    token: Ulid,
-    value: Value,
-) -> Result<(), JobMutationError> {
-    put_job_checkpoint(
-        storage,
-        job_id,
-        token,
-        ROCRATE_JOB_STATE_KEYSPACE,
-        rocrate_plan_key(job_id),
-        value,
-    )
-    .await
 }
 
 async fn put_job_checkpoint(
@@ -3014,27 +3005,41 @@ mod tests {
             panic!("job must be claimed")
         };
         let token = record.claim.unwrap().claim_token;
-        put_staging_checkpoint(&storage, job_id, token, b"newer".to_vec().into())
-            .await
-            .unwrap();
+        let key = ByteView::from(job_id.to_bytes().to_vec());
+        put_state(
+            &storage,
+            job_id,
+            token,
+            STAGING_JOB_STATE_KEYSPACE,
+            key.clone(),
+            &b"newer".to_vec(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
-            put_staging_checkpoint(&storage, job_id, Ulid::generate(), b"stale".to_vec().into(),)
-                .await,
+            put_state(
+                &storage,
+                job_id,
+                Ulid::generate(),
+                STAGING_JOB_STATE_KEYSPACE,
+                key.clone(),
+                &b"stale".to_vec(),
+            )
+            .await,
             Err(JobMutationError::TokenMismatch)
         ));
         assert_eq!(
-            read_raw(
+            read_state::<Vec<u8>>(
                 &storage,
                 STAGING_JOB_STATE_KEYSPACE,
-                ByteView::from(job_id.to_bytes().to_vec()),
-                None,
+                key,
+                "staging checkpoint",
             )
             .await
             .unwrap()
-            .unwrap()
-            .as_ref(),
-            b"newer"
+            .unwrap(),
+            b"newer".to_vec()
         );
     }
 

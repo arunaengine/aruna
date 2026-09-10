@@ -40,7 +40,6 @@ use aruna_core::structs::{
     VersionedObjectArn, blob_bucket_permission_path, blob_object_permission_path, job_entry_key,
     rocrate_plan_key,
 };
-use aruna_core::types::Value;
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -58,7 +57,7 @@ use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
-use super::store::{list_job_entries, put_job_entry, put_rocrate_checkpoint, put_rocrate_plan};
+use super::store::{list_job_entries, put_job_entry, put_state, read_state};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
@@ -1580,68 +1579,46 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
 }
 
 async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, String> {
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(ctx.job_id.to_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected import checkpoint event: {other:?}")),
-    }
+    read_state(
+        &ctx.driver.storage_handle,
+        ROCRATE_JOB_STATE_KEYSPACE,
+        ByteView::from(ctx.job_id.to_bytes().to_vec()),
+        "import checkpoint",
+    )
+    .await
 }
 
 async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: rocrate_plan_key(ctx.job_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected import plan event: {other:?}")),
-    }
+    read_state(
+        &ctx.driver.storage_handle,
+        ROCRATE_JOB_STATE_KEYSPACE,
+        rocrate_plan_key(ctx.job_id),
+        "import plan",
+    )
+    .await
 }
 
 async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ImportCheckpoint) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    put_rocrate_checkpoint(
+    put_state(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        Value::from(value),
+        ROCRATE_JOB_STATE_KEYSPACE,
+        ByteView::from(ctx.job_id.to_bytes().to_vec()),
+        checkpoint,
     )
     .await
     .map_err(|error| error.to_string())
 }
 
 async fn persist_plan(ctx: &JobContext, plan: &ImportPlan) -> Result<(), String> {
-    let value = postcard::to_allocvec(plan).map_err(|error| error.to_string())?;
-    put_rocrate_plan(
+    put_state(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        Value::from(value),
+        ROCRATE_JOB_STATE_KEYSPACE,
+        rocrate_plan_key(ctx.job_id),
+        plan,
     )
     .await
     .map_err(|error| error.to_string())
