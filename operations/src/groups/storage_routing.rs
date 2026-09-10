@@ -1,4 +1,4 @@
-use crate::group_backends::{RecordReadError, index_prefix, parse_iter, parse_read};
+use crate::groups::backends::{RecordReadError, index_prefix, parse_iter, parse_read};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -427,7 +427,7 @@ mod tests {
         GroupRoutingInputsOperation, PutGroupRoutingError, PutGroupRoutingOperation,
         RecordReadError, routing_key,
     };
-    use crate::group_backends::{index_key, index_prefix};
+    use crate::groups::backends::{index_key, index_prefix};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{

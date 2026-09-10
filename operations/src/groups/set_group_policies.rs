@@ -23,11 +23,11 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetGroupPoliciesConfig {
@@ -494,9 +494,9 @@ fn apply_reducer_policies(
 #[cfg(test)]
 mod tests {
     use super::{SetGroupPoliciesConfig, SetGroupPoliciesError, SetGroupPoliciesOperation};
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::get_group::{GetGroupConfig, GetGroupOperation};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::{AuthorizationError, StorageError};
