@@ -107,11 +107,6 @@ impl SubjectScanOperation {
         }
     }
 
-    pub fn with_txn(mut self, txn_id: TxnId) -> Self {
-        self.txn_id = Some(txn_id);
-        self
-    }
-
     fn gate_context(&self) -> Option<GateContext> {
         // This walk is the revalidation the block waits for, so it evaluates
         // under the new subject instead of refusing itself.

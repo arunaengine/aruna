@@ -22,13 +22,6 @@ pub const NOTIFICATION_PRUNE_SCAN_PAGE_SIZE: usize = 512;
 pub const NOTIFICATION_PRUNE_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
 pub const NOTIFICATION_PRUNE_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-pub fn schedule_notification_prune_effect(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::PruneNotifications,
-        after,
-    })
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct NotificationPruneOutcome {
     pub expired: usize,
