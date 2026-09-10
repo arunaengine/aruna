@@ -9,7 +9,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::onboarding_secret_state::{resolve_secret_state, secret_state_key};
+use crate::onboarding::secret_state::{resolve_secret_state, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnboardingSecretListEntry {

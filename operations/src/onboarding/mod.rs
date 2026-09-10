@@ -1,0 +1,9 @@
+pub mod bootstrap_onboarding_finalize;
+pub mod consume_onboarding_secret;
+pub mod create_onboarding_secret;
+pub mod delete_onboarding_secret;
+pub mod inspect_onboarding_secret;
+pub mod issue_onboarding_sync_ticket;
+pub mod list_onboarding_secrets;
+pub mod reserve_onboarding_secret;
+pub mod secret_state;
