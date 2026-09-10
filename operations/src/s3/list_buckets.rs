@@ -214,6 +214,9 @@ impl Operation for ListBucketsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.emit_error(error.clone().into());
+        }
         match self.state {
             ListBucketsState::Init => self.handle_init(),
             ListBucketsState::ReadBuckets => self.handle_bucket_list(event),

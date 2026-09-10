@@ -94,6 +94,9 @@ impl Operation for GetBucketInfoOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.emit_error(error.clone().into());
+        }
         match self.state {
             GetBucketInfoState::Init => self.handle_init(),
             GetBucketInfoState::ReadBucket => self.handle_bucket_read(event),

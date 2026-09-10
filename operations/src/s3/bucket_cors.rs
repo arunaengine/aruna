@@ -92,6 +92,9 @@ impl Operation for PutBucketCorsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             PutBucketCorsState::Init => self.start(),
             PutBucketCorsState::StartTransaction => {
@@ -270,6 +273,9 @@ impl Operation for GetBucketCorsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             GetBucketCorsState::Init => self.start(),
             GetBucketCorsState::ReadBucket => {
@@ -401,6 +407,9 @@ impl Operation for DeleteBucketCorsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             DeleteBucketCorsState::Init => self.start(),
             DeleteBucketCorsState::StartTransaction => {
