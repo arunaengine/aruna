@@ -33,12 +33,12 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
-use crate::replicate_documents::replicate_documents_effect;
+use crate::sync::replicate_documents::replicate_documents_effect;
 
 const MAX_USER_NAME_LEN: usize = 256;
 
