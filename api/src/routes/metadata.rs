@@ -776,6 +776,109 @@ impl MetadataDocumentListItem {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_create_metadata(
+    state: &ServerState,
+    auth: &AuthContext,
+    extras: PolicyRequestExtras,
+    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    group_id: Ulid,
+    path: String,
+    public: bool,
+    payload: CreateMetadataDocumentPayload,
+) -> ServerResult<MetadataRegistryRecord> {
+    let path = MetadataRegistryRecord::normalize_document_path(&path);
+    if path.is_empty() {
+        return Err(ServerError::BadRequest);
+    }
+    let ctx = state.get_ctx();
+    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?;
+    let realm_config = load_realm_config(ctx.as_ref(), state.get_realm_id())
+        .await
+        .ok_or(ServerError::ServiceUnavailable)?;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: state.get_realm_id(),
+    };
+    let document_id = if user_origin {
+        mint_forward_document(&realm_config, &actor, group_id, &path)
+            .map_err(map_create_error)?
+            .as_ulid()
+    } else {
+        match mint_local_document(&realm_config, &actor, group_id, &path) {
+            Ok(document_id) => document_id.as_ulid(),
+            Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
+                mint_forward_document(&realm_config, &actor, group_id, &path)
+                    .map_err(map_create_error)?
+                    .as_ulid()
+            }
+            Err(error) => return Err(map_create_error(error)),
+        }
+    };
+    if !user_origin {
+        if auth.realm_id != state.get_realm_id() {
+            return Err(ServerError::Forbidden);
+        }
+        crate::auth::ensure_permission_with(
+            state,
+            auth,
+            format!("/{}/g/{group_id}/meta/**", state.get_realm_id()),
+            Permission::WRITE,
+            extras.clone(),
+        )
+        .await?;
+        crate::auth::ensure_permission_with(
+            state,
+            auth,
+            MetadataRegistryRecord::permission_path_for(
+                &auth.realm_id,
+                group_id,
+                &path,
+                document_id,
+            ),
+            Permission::WRITE,
+            extras,
+        )
+        .await?;
+    }
+    let created = run_create_metadata_document(
+        CreateMetadataDocumentOperation::new_for_generated_document_id(
+            CreateMetadataDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path: path,
+                public,
+                payload,
+            },
+        ),
+        ctx.clone(),
+        forwarded_auth_token(bearer_token)?,
+    )
+    .await
+    .map_err(map_metadata_write_error)?;
+    let event_id = created.event_id;
+    let record = created.record;
+
+    // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
+    // emission only warns and never affects the already-successful create.
+    emit_metadata_created(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        auth.user_id,
+        record.group_id,
+        record.document_id,
+        &record.document_path,
+        event_id,
+    )
+    .await;
+
+    Ok(record)
+}
+
 #[utoipa::path(
     post,
     path = "/metadata",
@@ -902,83 +1005,17 @@ pub async fn create_metadata_document(
             },
         ),
     };
-    let path = MetadataRegistryRecord::normalize_document_path(&path);
-    if path.is_empty() {
-        return Err(ServerError::BadRequest);
-    }
-    let ctx = state.get_ctx();
-    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
-        .await
-        .map_err(map_metadata_api_error)?;
-    let realm_config = load_realm_config(ctx.as_ref(), state.get_realm_id())
-        .await
-        .ok_or(ServerError::ServiceUnavailable)?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
-    let document_id = if user_origin {
-        mint_forward_document(&realm_config, &actor, group_id, &path)
-            .map_err(map_create_error)?
-            .as_ulid()
-    } else {
-        match mint_local_document(&realm_config, &actor, group_id, &path) {
-            Ok(document_id) => document_id.as_ulid(),
-            Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
-                mint_forward_document(&realm_config, &actor, group_id, &path)
-                    .map_err(map_create_error)?
-                    .as_ulid()
-            }
-            Err(error) => return Err(map_create_error(error)),
-        }
-    };
-    if !user_origin {
-        ensure_metadata_scope(&state, &auth, group_id, Permission::WRITE).await?;
-        ensure_permission(
-            &state,
-            auth.clone(),
-            MetadataRegistryRecord::permission_path_for(
-                &auth.realm_id,
-                group_id,
-                &path,
-                document_id,
-            ),
-            Permission::WRITE,
-        )
-        .await?;
-    }
-    let created = run_create_metadata_document(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor,
-                group_id,
-                document_id,
-                document_path: path,
-                public,
-                payload,
-            },
-        ),
-        ctx.clone(),
-        forwarded_auth_token(bearer_token)?,
+    let result = run_create_metadata(
+        &state,
+        &auth,
+        PolicyRequestExtras::rest(),
+        bearer_token,
+        group_id,
+        path,
+        public,
+        payload,
     )
-    .await
-    .map_err(map_metadata_write_error)?;
-    let event_id = created.event_id;
-    let result = created.record;
-
-    // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
-    // emission only warns and never affects the already-successful create.
-    emit_metadata_created(
-        ctx.as_ref(),
-        state.get_realm_id(),
-        auth.user_id,
-        result.group_id,
-        result.document_id,
-        &result.document_path,
-        event_id,
-    )
-    .await;
+    .await?;
 
     Ok((
         StatusCode::CREATED,

@@ -7,6 +7,7 @@ const BOUNDARIES: &[&str] = &[
     "enforce_policies",
     "ensure_permission",
     "request_authorization::authorize",
+    "run_create_metadata",
     "submit_execution",
 ];
 const TOOL_COUNT: usize = 37;
