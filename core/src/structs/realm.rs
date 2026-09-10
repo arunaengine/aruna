@@ -773,16 +773,24 @@ impl RealmConfigDocument {
     }
 
     /// Bucket one immutable policy document rides: its policy id hashed into
-    /// the class-bound strategy's shards. It says where the rule is replicated,
-    /// never which subjects the rule allows.
+    /// the resolved strategy's shards, never which subjects the rule allows.
     pub fn policy_placement(&self, policy_id: Ulid) -> Option<PlacementRef> {
-        let strategy = self
-            .class_strategy(DocumentClass::PlacementPolicy)
-            .ok()?
-            .or_else(|| self.strategies.first())?;
+        let subject = policy_id.to_bytes();
+        let override_ = self
+            .placement_overrides
+            .iter()
+            .find(|over| over.subject == subject);
+        let strategy = match override_.and_then(|over| over.strategy_id) {
+            Some(strategy_id) => self.strategy(&strategy_id)?,
+            None => match self.class_strategy(DocumentClass::PlacementPolicy) {
+                Ok(Some(strategy)) => strategy,
+                Ok(None) => self.strategies.first()?,
+                Err(_) => return None,
+            },
+        };
         Some(PlacementRef {
             strategy_id: strategy.strategy_id,
-            shard: shard_for_subject(&policy_id.to_bytes(), strategy.shard_count),
+            shard: shard_for_subject(&subject, strategy.shard_count),
         })
     }
 
@@ -1120,10 +1128,12 @@ mod test {
     use crate::auth::REVOCATION_GRACE_SECS;
     use crate::request_policy::{PolicyKind, RequestPolicy};
     use crate::structs::{
-        Actor, CandidatePlacementMap, DynamicDiscoveryMethod, KIND_LABEL_KEY,
-        MetadataGroupReplicationOverride, MetadataPathReplicationOverride, NODE_LABEL_KEY,
-        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
-        RealmId, RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
+        Actor, BindingScope, CandidatePlacementMap, DocumentClass, DynamicDiscoveryMethod,
+        KIND_LABEL_KEY, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
+        NODE_LABEL_KEY, OidcProviderConfig, PlacementOverride, PlacementRef, PlacementStrategy,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind, StrategyBinding, SubmissionId, TokenRevocation,
+        default_realm_discovery_config, shard_for_subject,
     };
     use crate::types::UserId;
     use ulid::Ulid;
@@ -2017,6 +2027,110 @@ mod test {
         assert_eq!(first, repeat);
         assert_eq!(Some(first.strategy_id), config.default_strategy_id);
         assert_ne!(first, other);
+    }
+
+    fn strategy(seed: u8, shard_count: u32) -> PlacementStrategy {
+        PlacementStrategy {
+            strategy_id: Ulid::from_bytes([seed; 16]),
+            name: format!("strategy-{seed}"),
+            replica_count: Some(2),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count,
+        }
+    }
+
+    fn expect_ref(strategy: &PlacementStrategy, policy_id: Ulid) -> PlacementRef {
+        PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard: shard_for_subject(&policy_id.to_bytes(), strategy.shard_count),
+        }
+    }
+
+    #[test]
+    fn policy_class_binding() {
+        let bound = strategy(1, 4);
+        let default = strategy(2, 8);
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.default_strategy_id = Some(default.strategy_id);
+        config.strategies = vec![default, bound.clone()];
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::PlacementPolicy),
+            strategy_id: bound.strategy_id,
+        }];
+        let policy_id = Ulid::from_bytes([3u8; 16]);
+        assert_eq!(
+            config.policy_placement(policy_id),
+            Some(expect_ref(&bound, policy_id))
+        );
+    }
+
+    #[test]
+    fn policy_override_steers() {
+        let bound = strategy(1, 4);
+        let steered = strategy(2, 8);
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.default_strategy_id = Some(bound.strategy_id);
+        config.strategies = vec![bound.clone(), steered.clone()];
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::PlacementPolicy),
+            strategy_id: bound.strategy_id,
+        }];
+        let policy_id = Ulid::from_bytes([3u8; 16]);
+        config.placement_overrides.push(PlacementOverride {
+            subject: policy_id.to_bytes().to_vec(),
+            pinned: Vec::new(),
+            excluded: Vec::new(),
+            strategy_id: Some(steered.strategy_id),
+        });
+        assert_eq!(
+            config.policy_placement(policy_id),
+            Some(expect_ref(&steered, policy_id))
+        );
+    }
+
+    #[test]
+    fn override_dangling_fails() {
+        let bound = strategy(1, 4);
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.default_strategy_id = Some(bound.strategy_id);
+        config.strategies = vec![bound.clone()];
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::PlacementPolicy),
+            strategy_id: bound.strategy_id,
+        }];
+        let policy_id = Ulid::from_bytes([3u8; 16]);
+        config.placement_overrides.push(PlacementOverride {
+            subject: policy_id.to_bytes().to_vec(),
+            pinned: Vec::new(),
+            excluded: Vec::new(),
+            strategy_id: Some(Ulid::from_bytes([9u8; 16])),
+        });
+        assert_eq!(config.policy_placement(policy_id), None);
+    }
+
+    #[test]
+    fn class_dangling_fails() {
+        let fallback = strategy(1, 4);
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.strategies = vec![fallback];
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::PlacementPolicy),
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+        }];
+        assert_eq!(config.policy_placement(Ulid::from_bytes([3u8; 16])), None);
+    }
+
+    #[test]
+    fn policy_strategy_fallback() {
+        let first = strategy(1, 4);
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.strategies = vec![first.clone(), strategy(2, 8)];
+        let policy_id = Ulid::from_bytes([3u8; 16]);
+        assert_eq!(
+            config.policy_placement(policy_id),
+            Some(expect_ref(&first, policy_id))
+        );
     }
 
     #[test]
