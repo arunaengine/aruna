@@ -1,5 +1,4 @@
 //! Profiles the node validates from embedded shapes, with no realm document.
-//!
 //! Their shapes ship with the binary, so a revision is a constant rather than a
 //! registry event id, and no registry row backs them.
 

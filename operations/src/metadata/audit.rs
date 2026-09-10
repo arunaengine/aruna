@@ -27,10 +27,10 @@ use ulid::Ulid;
 
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive_until};
 use crate::placement::selector::select_top_peers;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
 
 pub const MAX_AUDIT_PAGE_SIZE: usize = MAX_AUDIT_RECORDS;
 pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 50;
