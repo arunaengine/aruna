@@ -1,8 +1,6 @@
 //! Server-side SHACL evaluation for registered metadata Profiles.
-//!
-//! Shapes and candidate documents live in a dedicated craqle store that is
-//! never committed to: documents are only prepared, so production graph
-//! listing, replication, and search never observe a validation run.
+//! Shapes and candidates live in a dedicated craqle store that is never
+//! committed to, so graph listing, replication and search never observe a run.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
@@ -308,10 +306,8 @@ fn iri_value(term: &str) -> Option<&str> {
 }
 
 /// Rewrites a shape's reference to the crate base into the encoded crate root.
-///
 /// Craqle stores every other crate-local id in relative form, which its shapes
-/// compiler rejects, so such a reference fails closed instead of silently
-/// matching nothing.
+/// compiler rejects, so such a reference fails closed rather than matching nothing.
 fn shapes_iri(node: &NamedNode) -> Result<EncodedTerm, ProfileShaclError> {
     let iri = node.as_str();
     let relative = iri

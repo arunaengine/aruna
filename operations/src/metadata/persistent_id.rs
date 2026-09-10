@@ -1,11 +1,6 @@
-//! The document-scoped PID authority.
-//!
-//! Creation writes `Requested` with its fenced job. The authority advances that
-//! exact typed intent through `Processing` to `Active`; projection absence keeps
-//! it retryable. `AdminWithdrawn` and deletion `Tombstoned` are distinct terminal
-//! states. Every transition is a compare-and-set transaction that also enqueues
-//! its durable sync publish, so replay cannot mint twice or revive a retirement.
-//! Routing lives in [`crate::metadata::forward`].
+//! The document-scoped PID authority. It advances a fenced `Requested` intent
+//! through `Processing` to `Active`; each step is a compare-and-set txn that
+//! also enqueues its sync publish, so replay cannot mint twice.
 
 use aruna_core::document::DocumentSyncOutboxEvent;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -24,14 +19,14 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::create_metadata_document::resolve_metadata_id;
-use crate::document_sync_outbox::{
-    new_outbox_record, outbox_write_entry, schedule_outbox_drain_effect,
-};
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
+use crate::metadata::create_metadata_document::resolve_metadata_id;
 use crate::metadata::repository::{metadata_audit_key, read_registry_by_document_effect};
 use crate::placement::resolve_shard_holders;
+use crate::sync::document_sync_outbox::{
+    new_outbox_record, outbox_write_entry, schedule_outbox_drain_effect,
+};
 
 /// Storage conflicts are optimistic and short-lived; a caller that exhausts these
 /// gets a retryable error rather than a lost transition.
@@ -90,9 +85,8 @@ pub async fn read_mapping(
 }
 
 /// Activate the Conceptual PID selected by the create transaction. Returns the
-/// authoritative mapping and whether this call activated it. If projection has
-/// not produced the live registry row yet, `Processing` is committed and the
-/// caller must defer without spending a terminal retry.
+/// authoritative mapping and whether this call activated it; if projection has
+/// not produced the registry row, `Processing` is committed and the caller defers.
 pub async fn mint_persistent_id(
     ctx: &DriverContext,
     realm_id: RealmId,
