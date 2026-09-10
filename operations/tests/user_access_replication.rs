@@ -11,11 +11,11 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, PathRestriction, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
 use aruna_operations::s3::get_user_access::GetUserAccessOperation;
 use aruna_operations::s3::revoke_user_access::RevokeUserAccessOperation;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -193,7 +193,7 @@ async fn install_realm_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::startup::restore_shard_subscriptions(
+            aruna_operations::node::startup::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 *realm_id,
@@ -202,7 +202,7 @@ async fn install_realm_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::process_placements::process_shard_placements(
+            retry |= aruna_operations::placement::process_placements::process_shard_placements(
                 &node.context,
                 *realm_id,
                 node.net.node_id(),

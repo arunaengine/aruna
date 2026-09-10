@@ -16,13 +16,15 @@ use aruna_core::structs::{
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::replicate_documents::{
-    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+use aruna_operations::node::usage_stats::{
+    RealmUsageScope, load_realm_usage, publish_usage_snapshots,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::task_incoming::initialize_task_incoming;
-use aruna_operations::usage_stats::{RealmUsageScope, load_realm_usage, publish_usage_snapshots};
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -492,7 +494,7 @@ async fn install_realm_config(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             *realm_id,
             node.net.node_id(),
