@@ -58,9 +58,7 @@ impl Drop for OutboxBarrier {
     }
 }
 
-use crate::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
-};
+use crate::blob::blob_holders::RefreshBlobHoldersOperation;
 use crate::blob::cleanup::{
     BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_cleanup_batch, sweep_stale_uploads,
 };
@@ -70,8 +68,6 @@ use crate::blob::hidden::{
 use crate::blob::reclaim::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
-use crate::blob_holders::RefreshBlobHoldersOperation;
-use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::device::drain::{
     DrainOutcome, INTAKE_CONTINUE_AFTER, INTAKE_DEFER_RETRY_AFTER, restore_intake_timer,
 };
@@ -79,12 +75,8 @@ use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_RETRY_AFTER, restore_sync_timers,
 };
-use crate::document_sync_outbox::{
-    OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
-    restore_document_sync_outbox_timers,
-};
 use crate::driver::{DriverContext, drive};
-use crate::group_backends::remove::remove_drained_backends;
+use crate::groups::backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::lifecycle::outbox::{OUTBOX_RETRY_AFTER, drain_family_outbox};
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, settle_terminals};
@@ -109,6 +101,10 @@ use crate::metadata::prune_queue::{
     metadata_graph_prune_jobs_exist, process_metadata_graph_prune_batch,
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
+use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::node::usage_stats::{
+    refresh_realm_usage_summary_for_targets, restore_usage_snapshot_publish_timer,
+};
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::outbox::{
@@ -126,9 +122,11 @@ use crate::notifications::watch::interest::{
     WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
     refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
-use crate::placement_policy::observe_placement;
-use crate::process_placements::{PlacementReconcileStatus, process_shard_placements};
-use crate::queue_backoff::{queue_retry_after_ms, retry_after_ms};
+use crate::placement::policy::observe_placement;
+use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
+use crate::realm::announce_realm_presence::{
+    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
+};
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
@@ -136,18 +134,20 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync_mirror_repair::{
-    MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
+use crate::sync::document_sync_outbox::{
+    OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
+    restore_document_sync_outbox_timers,
 };
-use crate::sync_placement::{
+use crate::sync::shard_placement::{
     DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX,
     SYNC_PLACEMENT_RETRY_AFTER,
 };
-use crate::task_persistence::{
-    delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
+use crate::sync::sync_mirror_repair::{
+    MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
 };
-use crate::usage_stats::{
-    refresh_realm_usage_summary_for_targets, restore_usage_snapshot_publish_timer,
+use crate::tasks::queue_backoff::{queue_retry_after_ms, retry_after_ms};
+use crate::tasks::task_persistence::{
+    delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
 
 /// Process-wide tally of document sync outbox records ever classified
@@ -342,10 +342,9 @@ struct DrainSyncOutcome {
     blocked_origins: Vec<aruna_core::NodeId>,
 }
 
-/// Resolves the shard placement a drained record publishes under. A record
-/// that already carries a real ref keeps it; a NIL ref (admin-operation
-/// emitters leave one) is resolved from the realm config for the target. Shared
-/// realm targets ignore the placement, so resolving them is harmless.
+/// Resolves the shard placement a drained record publishes under: a real ref is
+/// kept, a NIL ref (from admin-operation emitters) is resolved from the realm
+/// config. Shared realm targets ignore placement, so resolving is harmless.
 fn resolve_publish_placement(
     config: Option<&aruna_core::structs::RealmConfigDocument>,
     target: &DocumentSyncTarget,
@@ -531,26 +530,9 @@ enum DeferOutcome {
     Undeliverable,
 }
 
-/// Splits FIFO-ordered drain records into those to publish now, those deferred
-/// because their shard topic has no local genesis yet, and those that can never
-/// publish from this node at all.
-///
-/// Holdership is checked *before* topic availability, and it is the only thing
-/// that decides publishability. Joining a shard topic is not holder-gated — a
-/// non-holder can adopt a co-holder's genesis, and the drain's own bootstrap pass
-/// will happily pull one — but its publishes onto that topic are not accepted. So
-/// "the topic exists locally" is not evidence this node may publish onto it, and
-/// classifying on that first would route a non-holder's records into a publish
-/// that silently goes nowhere instead of into the forwarding path.
-///
-/// Each topic's holdership and genesis presence are decided once per run (state
-/// persists in `defer`); once a topic defers, every later record of that topic
-/// defers too. Splitting FIFO-adjacent records of one topic across a
-/// defer/publish boundary would let the newer op publish first, invert its origin
-/// sequence on receivers, and drop the older op forever as StaleOriginSequence —
-/// so a topic never straddles that boundary within a run, across pages included.
-/// `publishes_shared` is whether this node may publish into the shared realm
-/// topics at all; a device may not, so its records there are undeliverable.
+/// Splits FIFO-ordered drain records into publish-now, deferred (no local shard genesis
+/// yet) and undeliverable. Holdership decides publishability, not local topic presence,
+/// and a topic never straddles the defer/publish boundary; `publishes_shared` gates devices.
 fn partition_drain_records(
     records: Vec<DrainRecord>,
     defer: &mut DrainDeferState,
@@ -618,10 +600,9 @@ fn partition_drain_records(
     (to_publish, deferred, undeliverable)
 }
 
-/// Whether a record whose shard topic is missing locally can ever publish from
-/// here. Holdership is read from the live realm config, never from the presence
-/// of a local copy: a rebalance leaves a stale copy on a node that has lost the
-/// bucket. Without a readable config nothing is decided and the record retries.
+/// Whether a record whose shard topic is missing locally can ever publish from here.
+/// Holdership comes from the live realm config, never a local copy (rebalances leave
+/// stale copies). Without a readable config nothing is decided and the record retries.
 fn classify_deferred_record(
     config: Option<&aruna_core::structs::RealmConfigDocument>,
     net_handle: &aruna_net::NetHandle,
@@ -631,12 +612,9 @@ fn classify_deferred_record(
         return DeferOutcome::Retry;
     };
     let node_id = net_handle.node_id();
-    // A draining former-holder still owns publish rights on the shards it held
-    // until it has flushed (flush-then-leave), so its retained records are
-    // publishable, not undeliverable. A true non-holder — one that never held the
-    // bucket, or is fully removed rather than draining — stays undeliverable
-    // (DECISIONS K3): the receiver's history cutoff bounds a departing holder to
-    // its pre-cutover ops.
+    // A draining former-holder keeps publish rights until flushed (flush-then-leave),
+    // so its retained records are publishable; a true non-holder stays undeliverable
+    // (DECISIONS K3), as the receiver's history cutoff bounds a departing holder.
     if crate::placement::holds_placement(config, &record.placement, node_id)
         || crate::placement::is_draining_former_holder(config, &record.placement, node_id)
         || crate::placement::retained_departing_holder(config, &record.placement, node_id)
@@ -718,18 +696,9 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Handles records this node cannot publish itself.
-    ///
-    /// This node holds none of the record's bucket, so it may neither mint that
-    /// bucket's topic genesis nor join the topic. An administrative record is
-    /// relayed: its envelope is signed by this node as origin, so a holder can
-    /// republish the exact bytes while every receiver still authorizes the
-    /// origin, and the local copy is deleted once a holder takes custody. An
-    /// upsert or delete carries no origin signature, so relaying it would
-    /// publish under the holder's identity with no proof it was
-    /// permission-checked: those stay in the outbox, error-logged on every
-    /// drain, until a config change makes this node a holder or an operator
-    /// intervenes. Returns the keys whose custody moved to a holder.
+    /// Handles records this node cannot publish itself: admin records are relayed under
+    /// this node's origin signature and deleted once a holder takes custody, while
+    /// unsigned upserts/deletes stay in the outbox. Returns keys whose custody moved.
     async fn relay_undeliverable_records(
         &self,
         config: Option<&aruna_core::structs::RealmConfigDocument>,
@@ -781,7 +750,7 @@ impl OperationsTaskHandler {
         };
         config
             .and_then(|config| {
-                crate::mutate_realm_placement::node_kind(config, net_handle.node_id())
+                crate::realm::mutate_realm_placement::node_kind(config, net_handle.node_id())
             })
             .is_some_and(|kind| !kind.is_sync_eligible())
     }
@@ -851,12 +820,9 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Backoff interval for the next re-arm of `key`, derived from the in-memory
-    /// attempt count without mutating it. The drain re-arm is the only path that
-    /// delivers an already-accepted write after a transient sync failure, so it
-    /// retries on the queue scale (250ms doubling to the 30s cap), not a
-    /// 30s-base timer: a single failed peer sync must not stall convergence for
-    /// tens of seconds.
+    /// Backoff interval for the next re-arm of `key`, from the in-memory attempt count
+    /// without mutating it. The drain re-arm is the only retry path for an accepted
+    /// write after a transient sync failure, so it uses the queue scale, not a 30s base.
     fn backoff_after(&self, key: &TaskKey) -> Duration {
         let attempts = self
             .retry_backoff
@@ -898,11 +864,9 @@ impl OperationsTaskHandler {
             .expect("reclaim cursor mutex poisoned") = cursor;
     }
 
-    /// Keeps the first missing-topic pull retry prompt, then doubles each
-    /// subsequent full placement scan from the pull base up to the placement
-    /// interval. A new holder usually only needs its co-holders to apply the
-    /// same config change, so the ladder must not cliff to 30s on the second
-    /// attempt.
+    /// Keeps the first missing-topic pull retry prompt, then doubles each subsequent
+    /// full placement scan up to the placement interval. New holders only need their
+    /// co-holders to apply the same config, so the ladder must not cliff to 30s.
     fn placement_pull_retry_after(&self, key: &TaskKey) -> Duration {
         self.retry_ladder(
             key,
@@ -1006,7 +970,7 @@ impl OperationsTaskHandler {
         )
         .await;
         if fetched {
-            crate::device::status::note_contact(&self.context).await;
+            crate::device::sync_status::note_contact(&self.context).await;
         }
         let mut state = self
             .realm_documents
@@ -1027,7 +991,7 @@ impl OperationsTaskHandler {
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
         if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
-            crate::device::status::note_sync(&self.context).await;
+            crate::device::sync_status::note_sync(&self.context).await;
         }
     }
 
@@ -1294,7 +1258,7 @@ impl OperationsTaskHandler {
                 continue;
             }
             let mut peer_key = bootstrap_peers.clone();
-            crate::sync_placement::sort_node_ids(&mut peer_key);
+            crate::sync::shard_placement::sort_node_ids(&mut peer_key);
             missing_topics
                 .entry(peer_key)
                 .or_insert_with(|| (bootstrap_peers, BTreeSet::new()))
@@ -1424,7 +1388,7 @@ impl OperationsTaskHandler {
                 record.allow_genesis,
             );
             let mut peer_key = record.peers.clone();
-            crate::sync_placement::sort_node_ids(&mut peer_key);
+            crate::sync::shard_placement::sort_node_ids(&mut peer_key);
             let (peers, subbatches) = publish_groups
                 .entry(peer_key)
                 .or_insert_with(|| (record.peers.clone(), Vec::new()));
@@ -1831,7 +1795,7 @@ impl OperationsTaskHandler {
         };
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
-        match crate::usage_stats::publish_and_refresh_usage_snapshots(
+        match crate::node::usage_stats::publish_and_refresh_usage_snapshots(
             &self.context,
             node_id,
             realm_id,
@@ -1844,7 +1808,7 @@ impl OperationsTaskHandler {
                 warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
                 self.reschedule_timer(
                     TaskKey::PublishUsageSnapshots,
-                    crate::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+                    crate::node::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
                 )
                 .await;
             }
@@ -1855,9 +1819,12 @@ impl OperationsTaskHandler {
         if let Some(net_handle) = self.context.net_handle.as_ref() {
             let node_id = net_handle.node_id();
             let realm_id = *net_handle.realm_id();
-            if let Err(error) =
-                crate::node_info::refresh_node_info_heartbeat(&self.context, node_id, realm_id)
-                    .await
+            if let Err(error) = crate::node::node_info::refresh_node_info_heartbeat(
+                &self.context,
+                node_id,
+                realm_id,
+            )
+            .await
             {
                 warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
             }
@@ -1868,7 +1835,7 @@ impl OperationsTaskHandler {
         // outcome so a transient failure never stops the heartbeat.
         self.reschedule_timer(
             TaskKey::PublishNodeInfo,
-            crate::node_info::NODE_INFO_PUBLISH_INTERVAL,
+            crate::node::node_info::NODE_INFO_PUBLISH_INTERVAL,
         )
         .await;
     }
@@ -2632,8 +2599,11 @@ async fn durable_rearm_loop(
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
-        crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
-            .await;
+        crate::node::node_info::restore_node_info_publish_timer(
+            &context.storage_handle,
+            &task_handle,
+        )
+        .await;
         restore_notification_outbox_timer_if_idle(
             &context.storage_handle,
             &task_handle,
@@ -2763,8 +2733,11 @@ impl TaskQueues {
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
-        crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
-            .await;
+        crate::node::node_info::restore_node_info_publish_timer(
+            &context.storage_handle,
+            &task_handle,
+        )
+        .await;
         restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO)
             .await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
@@ -2996,10 +2969,10 @@ impl InboundTaskHandler for OperationsTaskHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document_sync_outbox::{
+    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, read_job_record};
+    use crate::sync::document_sync_outbox::{
         outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
     };
-    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, read_job_record};
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
         DocumentSyncOutboxRecord, DocumentSyncRevision,
@@ -3165,7 +3138,7 @@ mod tests {
         net.ensure_document_sync_topics(&[topic], Vec::new())
             .expect("shared topic genesis");
         for index in 1..=2u128 {
-            let record = crate::document_sync_outbox::new_outbox_record_with_id(
+            let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
                 Ulid::from_parts(1, index),
                 node(1),
                 target.clone(),
@@ -3473,7 +3446,7 @@ mod tests {
         let timer: aruna_core::task::PersistedTaskTimer =
             postcard::from_bytes(&persisted[0].1).expect("persisted timer decodes");
         assert_eq!(timer.key, key);
-        let retry_ms = crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64;
+        let retry_ms = crate::sync::shard_placement::SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64;
         assert!(timer.due_at_unix_millis >= before_ms.saturating_add(retry_ms));
         assert!(timer.due_at_unix_millis <= after_ms.saturating_add(retry_ms));
     }
@@ -3540,7 +3513,7 @@ mod tests {
     }
 
     fn shard_topic_record(origin_seq: u64) -> DocumentSyncOutboxRecord {
-        crate::document_sync_outbox::new_outbox_record(
+        crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
             vec![node(2)],
@@ -3554,10 +3527,8 @@ mod tests {
     }
 
     // Two FIFO-adjacent records for one shard topic must never split across a
-    // defer/publish boundary: if the genesis "arrives" (availability flips
-    // false→true) between the two records, the older would defer and the newer
-    // publish first, inverting their origin sequence on receivers. The fix
-    // evaluates availability once per topic, so both defer together.
+    // defer/publish boundary, or a between-records availability flip would publish the
+    // newer first and invert origin sequence. Availability is evaluated once per topic.
     #[test]
     fn drain_partition_never_splits_a_topic_when_availability_flips() {
         let topic = irokle::TopicId::hash(b"shard-genesis-race");
@@ -3609,7 +3580,7 @@ mod tests {
             AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
         };
         let user_id = aruna_core::types::UserId::nil(realm_id);
-        crate::document_sync_outbox::new_outbox_record(
+        crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target,
             Vec::new(),
@@ -3772,7 +3743,7 @@ mod tests {
         let healthy_topic = healthy_target.sync_topic_id(realm_id, &healthy_change.placement);
         net.ensure_document_sync_topics(&[healthy_topic], Vec::new())
             .expect("healthy topic genesis");
-        let blocked = crate::document_sync_outbox::new_outbox_record_with_id(
+        let blocked = crate::sync::document_sync_outbox::new_outbox_record_with_id(
             Ulid::from_parts(1, 1),
             node(1),
             blocked_target,
@@ -3784,7 +3755,7 @@ mod tests {
             aruna_core::structs::PlacementRef::NIL,
             true,
         );
-        let healthy = crate::document_sync_outbox::new_outbox_record_with_id(
+        let healthy = crate::sync::document_sync_outbox::new_outbox_record_with_id(
             Ulid::from_parts(1, 2),
             node(1),
             healthy_target,
@@ -4199,7 +4170,7 @@ mod tests {
             strategy_id: Ulid::from_bytes([48; 16]),
             shard: 1,
         };
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
             Vec::new(),
@@ -4342,7 +4313,7 @@ mod tests {
         };
         let mut writes = Vec::with_capacity(OUTBOX_DRAIN_BATCH_SIZE + 1);
         for index in 0..OUTBOX_DRAIN_BATCH_SIZE {
-            let record = crate::document_sync_outbox::new_outbox_record_with_id(
+            let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
                 Ulid::from_parts(1, index as u128),
                 node(1),
                 deferred_target.clone(),
@@ -4355,13 +4326,14 @@ mod tests {
                 false,
             );
             writes.push(
-                crate::document_sync_outbox::outbox_write_entry(&record).expect("outbox entry"),
+                crate::sync::document_sync_outbox::outbox_write_entry(&record)
+                    .expect("outbox entry"),
             );
         }
 
         // One later origin record for a shared (non-shard) topic, ordered
         // strictly after the head page, so only pagination reaches it.
-        let publish_record = crate::document_sync_outbox::new_outbox_record_with_id(
+        let publish_record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
             Ulid::from_parts(2, 0),
             node(1),
             DocumentSyncTarget::RealmAuthorization { realm_id },
@@ -4374,8 +4346,9 @@ mod tests {
             true,
         );
         let publish_key = outbox_key(&publish_record).to_vec();
-        writes
-            .push(crate::document_sync_outbox::outbox_write_entry(&publish_record).expect("entry"));
+        writes.push(
+            crate::sync::document_sync_outbox::outbox_write_entry(&publish_record).expect("entry"),
+        );
 
         match storage
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
@@ -4470,7 +4443,7 @@ mod tests {
             target: DocumentSyncTarget,
             event: DocumentSyncOutboxEvent,
         ) -> DocumentSyncOutboxRecord {
-            crate::document_sync_outbox::new_outbox_record_with_id(
+            crate::sync::document_sync_outbox::new_outbox_record_with_id(
                 Ulid::from_parts(1, id),
                 node(1),
                 target,
@@ -4652,7 +4625,7 @@ mod tests {
         );
         let total = u128::from(OUTBOX_CONTINUATION_STREAK) + 2;
         for index in 1..=total {
-            let record = crate::document_sync_outbox::new_outbox_record_with_id(
+            let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
                 Ulid::from_parts(1, index),
                 node(1),
                 target.clone(),
@@ -4743,7 +4716,7 @@ mod tests {
             .expect("shared topic genesis");
         let mut shard_change = change();
         shard_change.placement = placement;
-        let shared = crate::document_sync_outbox::new_outbox_record_with_id(
+        let shared = crate::sync::document_sync_outbox::new_outbox_record_with_id(
             Ulid::from_parts(1, 1),
             node(1),
             shared_target,
@@ -4755,7 +4728,7 @@ mod tests {
             aruna_core::structs::PlacementRef::NIL,
             true,
         );
-        let shard = crate::document_sync_outbox::new_outbox_record_with_id(
+        let shard = crate::sync::document_sync_outbox::new_outbox_record_with_id(
             Ulid::from_parts(1, 2),
             node(1),
             shard_target.clone(),
@@ -4902,7 +4875,7 @@ mod tests {
             "the rank-0 shard topic must not exist before the config change is drained"
         );
 
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             net.node_id(),
             DocumentSyncTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -4915,7 +4888,7 @@ mod tests {
         );
         write_outbox_record(&storage, &record).await;
         task_handle
-            .send_effect(crate::document_sync_outbox::schedule_outbox_drain_effect())
+            .send_effect(crate::sync::document_sync_outbox::schedule_outbox_drain_effect())
             .await;
 
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -4933,12 +4906,9 @@ mod tests {
         net.shutdown().await;
     }
 
-    // Post-rebalance genesis adoption: the shard's live holders no longer
-    // include the emit-time stamped holder that carries the topic's genesis.
-    // The bootstrap pull must reach that ex-holder (union of the stamp and the
-    // live holders); pulling only from the re-resolved holders would leave the
-    // genesis unreachable and a fresh one would fork the topic, evicting
-    // acknowledged writes.
+    // Post-rebalance genesis adoption: live holders no longer include the emit-time
+    // stamped holder carrying the genesis, so the bootstrap pull must union stamp and
+    // live holders; otherwise a fresh genesis could fork the topic and evict writes.
     #[tokio::test]
     async fn pull_reaches_ex_holder() {
         let realm_id = RealmId::from_bytes([53u8; 32]);
@@ -4976,7 +4946,7 @@ mod tests {
         ex_holder.add_peer_addr(net.endpoint_addr()).await;
         // The ex-holder must serve inbound sync streams for the pull to reach
         // its genesis.
-        crate::incoming::initialize_net_incoming(Arc::new(DriverContext {
+        crate::sync::incoming::initialize_net_incoming(Arc::new(DriverContext {
             storage_handle: ex_storage.clone(),
             net_handle: Some(ex_holder.clone()),
             blob_handle: None,
@@ -5034,7 +5004,7 @@ mod tests {
 
         let mut change = change();
         change.placement = placement;
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             net.node_id(),
             target,
             vec![ex_holder.node_id()],
@@ -5104,7 +5074,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
             vec![node(2)],
@@ -5128,7 +5098,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
             vec![node(2)],
@@ -5247,7 +5217,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("storage opens"))
             .expect("storage opens");
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
             vec![node(2)],
@@ -5315,7 +5285,7 @@ mod tests {
             compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
             vec![node(2)],
@@ -5364,7 +5334,7 @@ mod tests {
             compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-        let record = crate::document_sync_outbox::new_outbox_record(
+        let record = crate::sync::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
             vec![node(2)],
@@ -5989,7 +5959,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         });
-        crate::incoming::initialize_net_incoming(context_b.clone());
+        crate::sync::incoming::initialize_net_incoming(context_b.clone());
 
         let context_a = Arc::new(DriverContext {
             storage_handle: storage_a.clone(),
