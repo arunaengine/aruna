@@ -12,7 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
@@ -20,9 +20,9 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
-    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
-    metadata_pending_projection_delete_entry, metadata_pending_projection_key,
-    metadata_pending_projection_target, metadata_registry_delete_entries,
+    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_pending_projection_delete_entry,
+    metadata_pending_projection_key, metadata_pending_projection_target,
+    metadata_registry_delete_entries,
 };
 use aruna_core::structs::{
     MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId,
@@ -46,8 +46,10 @@ use crate::metadata::materialization_queue::{
     schedule_metadata_materialization_drain_effect,
 };
 use crate::metadata::repository::{
-    create_records_and_outbox_write_entries,
-    create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
+    StorageReadError, create_records_and_outbox_write_entries,
+    create_records_outbox_and_materialization_write_entries, parse_graph_lifecycle_read,
+    parse_materialization_status_read, read_graph_lifecycle_effect,
+    read_materialization_status_effect, read_registry_by_document_effect,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync_placement::sort_node_ids;
@@ -1085,28 +1087,16 @@ async fn metadata_graph_deleted(
     context: &DriverContext,
     graph_iri: &str,
 ) -> Result<bool, MetadataProjectionError> {
-    match context
+    let event = context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(graph_iri),
-            txn_id: None,
+        .send_effect(read_graph_lifecycle_effect(graph_iri, None))
+        .await;
+    parse_graph_lifecycle_read(event)
+        .map(|record| record.is_some_and(|record| record.is_deleted()))
+        .map_err(|error| match error {
+            StorageReadError::Storage(error) => error.into(),
+            StorageReadError::Conversion(error) => error.into(),
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let record: MetadataGraphLifecycleRecord =
-                postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            Ok(record.is_deleted())
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
 }
 
 fn audit_record(event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
@@ -1151,24 +1141,14 @@ async fn read_materialization_status(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataProjectionError> {
-    match context
+    let event = context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-            key: metadata_materialization_status_key(document_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| postcard::from_bytes(&value).map_err(ConversionError::from))
-            .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
+        .send_effect(read_materialization_status_effect(document_id, None))
+        .await;
+    parse_materialization_status_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => error.into(),
+        StorageReadError::Conversion(error) => error.into(),
+    })
 }
 
 async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataProjectionError> {

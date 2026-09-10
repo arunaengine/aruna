@@ -8,23 +8,22 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
-    METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
-    METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE,
+    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
+    METADATA_MATERIALIZATION_PRUNE_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataBatch, MetadataCreateCrateRequest,
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy,
-    MetadataMaterializationDeadLetterRecord, MetadataMaterializationJobRecord,
-    MetadataMaterializationState, MetadataMaterializationStatusRecord, MetadataRawRevision,
-    MetadataRequestDurability, deterministic_materialization_actor,
+    MetadataEvent, MetadataGraphPolicy, MetadataMaterializationDeadLetterRecord,
+    MetadataMaterializationJobRecord, MetadataMaterializationState,
+    MetadataMaterializationStatusRecord, MetadataRawRevision, MetadataRequestDurability,
+    deterministic_materialization_actor,
 };
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, materialization_prune_entry, materialization_prune_key,
-    metadata_event_log_key, metadata_graph_lifecycle_key,
-    metadata_materialization_document_job_key, metadata_materialization_document_job_prefix,
+    metadata_event_log_key, metadata_materialization_document_job_key,
+    metadata_materialization_document_job_prefix,
     metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
     metadata_materialization_job_write_entry, metadata_materialization_status_key,
     metadata_materialization_status_write_entry, metadata_profile_validation_status_write_entry,
@@ -52,6 +51,10 @@ use super::queue_storage::{
     start_write_transaction,
 };
 use super::raw::{MetadataRawReadError, RawStateCache};
+use super::repository::{
+    StorageReadError, parse_graph_lifecycle_read, parse_materialization_status_read,
+    read_graph_lifecycle_effect, read_materialization_status_effect,
+};
 
 const MATERIALIZATION_SCAN_PAGE_SIZE: usize = 512;
 const MATERIALIZATION_BATCH_SIZE: usize = 512;
@@ -1865,25 +1868,13 @@ async fn read_materialization_status(
     document_id: Ulid,
     txn_id: Option<Ulid>,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataMaterializationQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-            key: metadata_materialization_status_key(document_id),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(Some(
-            postcard::from_bytes(&value).map_err(ConversionError::from)?,
-        )),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
+    let event = storage
+        .send_effect(read_materialization_status_effect(document_id, txn_id))
+        .await;
+    parse_materialization_status_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => error.into(),
+        StorageReadError::Conversion(error) => error.into(),
+    })
 }
 
 fn materialization_status_is_final(status: &MetadataMaterializationStatusRecord) -> bool {
@@ -2082,27 +2073,15 @@ async fn metadata_graph_deleted(
     storage: &StorageHandle,
     graph_iri: &str,
 ) -> Result<bool, MetadataMaterializationQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(graph_iri),
-            txn_id: None,
+    let event = storage
+        .send_effect(read_graph_lifecycle_effect(graph_iri, None))
+        .await;
+    parse_graph_lifecycle_read(event)
+        .map(|record| record.is_some_and(|record| record.is_deleted()))
+        .map_err(|error| match error {
+            StorageReadError::Storage(error) => error.into(),
+            StorageReadError::Conversion(error) => error.into(),
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let record: MetadataGraphLifecycleRecord =
-                postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            Ok(record.is_deleted())
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
 }
 
 struct MaterializedCreateEvent {

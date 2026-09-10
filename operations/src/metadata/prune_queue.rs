@@ -5,13 +5,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE};
+use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_graph_lifecycle_key, metadata_graph_prune_job_key,
-    metadata_graph_prune_job_write_entry,
+    metadata_graph_prune_job_key, metadata_graph_prune_job_write_entry,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -30,6 +29,9 @@ use crate::queue_backoff::queue_retry_after_ms;
 use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
     start_write_transaction,
+};
+use super::repository::{
+    StorageReadError, parse_graph_lifecycle_read, read_graph_lifecycle_effect,
 };
 
 const PRUNE_SCAN_PAGE_SIZE: usize = 512;
@@ -532,27 +534,15 @@ async fn metadata_graph_deleted(
     storage: &StorageHandle,
     graph_iri: &str,
 ) -> Result<bool, MetadataGraphPruneQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(graph_iri),
-            txn_id: None,
+    let event = storage
+        .send_effect(read_graph_lifecycle_effect(graph_iri, None))
+        .await;
+    parse_graph_lifecycle_read(event)
+        .map(|record| record.is_some_and(|record| record.is_deleted()))
+        .map_err(|error| match error {
+            StorageReadError::Storage(error) => error.into(),
+            StorageReadError::Conversion(error) => error.into(),
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let record: MetadataGraphLifecycleRecord =
-                postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            Ok(record.is_deleted())
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
 }
 
 async fn write_graph_prune_job(

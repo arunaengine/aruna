@@ -21,7 +21,6 @@ use aruna_core::metadata::{
     MetadataQuadOp, MetadataQueryResults, MetadataRequestDurability, MetadataRoCratePage,
     MetadataSearchHit, MetadataUpsertEntityRequest, MetadataValidationViolation,
 };
-use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
     AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
     SyncRelationship, TokenClaims, blob_bucket_permission_path,
@@ -68,7 +67,10 @@ use super::protocol::{
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
 };
-use super::repository::{iter_registry_effect, parse_registry_iter};
+use super::repository::{
+    StorageReadError, iter_registry_effect, parse_graph_lifecycle_read, parse_registry_iter,
+    read_graph_lifecycle_effect,
+};
 use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title, hit_types};
 use super::summary_cache::summary_cache;
@@ -1549,7 +1551,7 @@ impl MetadataHandle {
                                 )
                                 .await
                                 .map(Box::new)
-                                .map_err(super::api::preflight_read_error)
+                                .map_err(super::forward::read_error)
                             }
                             None => Err(MetadataReadError::Unavailable),
                         },
@@ -1734,7 +1736,7 @@ impl MetadataHandle {
                                         auth.as_ref(),
                                     )
                                     .await
-                                    .map_err(claim_read_error);
+                                    .map_err(super::forward::read_error);
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -1792,7 +1794,7 @@ impl MetadataHandle {
                                             conflicts: result.conflicts,
                                         })
                                     })
-                                    .map_err(claim_read_error);
+                                    .map_err(super::forward::read_error);
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -3160,25 +3162,13 @@ async fn graph_lifecycle_record(
     storage_handle: StorageHandle,
     graph_iri: &str,
 ) -> Result<Option<MetadataGraphLifecycleRecord>, MetadataError> {
-    match storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(graph_iri),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes(&bytes)
-                    .map_err(|error| MetadataError::Backend(error.to_string()))
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
-        other => Err(MetadataError::Backend(format!(
-            "unexpected metadata graph lifecycle read result: {other:?}"
-        ))),
-    }
+    let event = storage_handle
+        .send_effect(read_graph_lifecycle_effect(graph_iri, None))
+        .await;
+    parse_graph_lifecycle_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => MetadataError::Storage(error),
+        StorageReadError::Conversion(error) => MetadataError::Backend(error.to_string()),
+    })
 }
 
 async fn metadata_graph_deleted(
@@ -4879,15 +4869,6 @@ fn record_metadata_query_result_counts(span: &Span, results: &MetadataQueryResul
         MetadataQueryResults::Graph(triples) => {
             span.record("triple_count", triples.len() as u64);
         }
-    }
-}
-
-fn claim_read_error(error: super::api::MetadataApiError) -> MetadataReadError {
-    match error {
-        super::api::MetadataApiError::Unauthorized => MetadataReadError::Unauthorized,
-        super::api::MetadataApiError::Forbidden => MetadataReadError::Forbidden,
-        super::api::MetadataApiError::NotFound => MetadataReadError::NotFound,
-        _ => MetadataReadError::Unavailable,
     }
 }
 
@@ -7391,6 +7372,7 @@ mod tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::metadata::MetadataApplyRoCrateRequest;
+    use aruna_core::storage_entries::metadata_graph_lifecycle_key;
     use aruna_core::structs::{
         ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
         SyncMode, SyncState, SyncStatusSnapshot, TokenClaims, TokenRevocation,
