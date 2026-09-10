@@ -23,12 +23,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::placement_ref_for_target;
+use crate::realm::mutate_realm_placement::is_management;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::mutate_realm_placement::is_management;
-use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetRealmQuotaConfig {
@@ -184,10 +184,9 @@ impl SetRealmQuotaOperation {
                 quota: self.config.quota.clone(),
             },
         )?;
-        // Derive the stored quota from the reducer's materialized state (rather
-        // than assigning the input directly) so the local write path agrees with
-        // the replicated overlay in net/src/irokle.rs: when the quota path is
-        // conflicted, both leave the previously stored quota in place.
+        // Derive the stored quota from the reducer's materialized state so this path
+        // agrees with the replicated overlay in net/src/irokle.rs: when the quota path
+        // is conflicted, both leave the previously stored quota in place.
         apply_reducer_quota(&mut document, &reducer_state);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
@@ -403,10 +402,8 @@ impl Operation for SetRealmQuotaOperation {
 }
 
 /// Overlays the reducer's materialized quota onto the config document, mirroring
-/// the replicated materialization in `net::irokle`: the stored quota is only
-/// updated from a non-conflicted, materialized value, so a conflicted quota path
-/// leaves the last agreed quota untouched instead of clobbering it with the
-/// caller's input.
+/// `net::irokle`: only a non-conflicted materialized value updates the stored quota,
+/// so a conflicted path leaves the last agreed quota untouched.
 fn apply_reducer_quota(
     document: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
@@ -494,7 +491,7 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::realm::get_realm_config::GetRealmConfigOperation;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;

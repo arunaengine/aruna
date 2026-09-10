@@ -20,12 +20,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::placement_ref_for_target;
+use crate::realm::mutate_realm_placement::is_management;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::mutate_realm_placement::is_management;
-use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetRealmPoliciesConfig {
@@ -432,9 +432,9 @@ fn apply_reducer_policies(
 #[cfg(test)]
 mod tests {
     use super::{SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use crate::realm::get_realm_config::GetRealmConfigOperation;
     use aruna_core::UserId;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::{Effect, StorageEffect};

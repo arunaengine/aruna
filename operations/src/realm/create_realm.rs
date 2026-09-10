@@ -23,10 +23,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::{
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
@@ -540,10 +540,9 @@ fn seed_placement_defaults(config: &mut RealmConfigDocument) {
     config.seed_default_placement();
 }
 
-/// Reducer events that seed one fresh realm config's placement identity: its
-/// strategies, seeded placement bindings, default and job-family strategies,
-/// and class strategy bindings. Every bootstrap path applies them, so a
-/// reducer-only rebuild materializes the same document whichever path ran.
+/// Reducer events that seed one fresh realm config's placement identity:
+/// strategies, seeded placement bindings, default/job-family strategies and class
+/// bindings. Every bootstrap path applies them, so rebuilds materialize identically.
 pub(crate) fn seed_placement_events(
     state: &mut AdminDocumentReducerState,
     actor: &Actor,
@@ -622,8 +621,8 @@ mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     fn actor(realm_id: RealmId, node_seed: u8, user_seed: u8) -> Actor {
         Actor {
