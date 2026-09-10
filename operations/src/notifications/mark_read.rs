@@ -278,49 +278,17 @@ impl Operation for MarkReadOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::notifications::inbox::upsert_inbox_records;
+    use crate::notifications::test_support::{context_with_storage, seed, user};
     use aruna_core::keyspaces::NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE;
-    use aruna_core::structs::{
-        NotificationClass, NotificationKind, RealmId, notification_inbox_key,
-    };
-    use aruna_storage::storage::{FjallStorage, StorageHandle};
-    use tempfile::{TempDir, tempdir};
-
-    fn context_with_storage() -> (TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        (tempdir, context)
-    }
-
-    fn user(realm: u8, seed: u8) -> UserId {
-        UserId::new(Ulid::from_bytes([seed; 16]), RealmId([realm; 32]))
-    }
+    use aruna_core::structs::{NotificationClass, notification_inbox_key};
+    use aruna_storage::storage::StorageHandle;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {
-        NotificationRecord::new(
+        crate::notifications::test_support::record(
             recipient,
             NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: user(recipient.realm_id.0[0], 200),
-            },
             created_at_ms,
         )
-    }
-
-    async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
-        assert_eq!(
-            upsert_inbox_records(storage, records).await,
-            Ok(records.len())
-        );
     }
 
     async fn read_all(storage: &StorageHandle, recipient: UserId) -> Vec<NotificationRecord> {

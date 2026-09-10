@@ -227,6 +227,21 @@ mod tests {
     }
 
     #[test]
+    fn list_rejects_event() {
+        let mut operation = ListStagingSourceOperation::new(sample_input());
+        operation.start();
+
+        let effects = operation.step(Event::Search());
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(ListStagingSourceError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
     fn list_preserves_truncation() {
         let mut operation = ListStagingSourceOperation::new(sample_input());
         operation.start();
