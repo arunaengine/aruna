@@ -103,18 +103,6 @@ pub fn delete_registry_effect(
     })
 }
 
-pub fn write_document_index_effect(
-    record: &MetadataRegistryRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
-        key: metadata_document_key(record.document_id),
-        value: postcard::to_allocvec(record)?.into(),
-        txn_id,
-    }))
-}
-
 pub fn delete_document_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
@@ -135,28 +123,6 @@ pub fn iter_registry_effect(
         limit: LIST_METADATA_PAGE_SIZE,
         txn_id,
     })
-}
-
-pub fn iter_all_registry_effect(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        prefix: None,
-        start: start_after.map(IterStart::After),
-        limit: REGISTRY_FILL_PAGE_SIZE,
-        txn_id,
-    })
-}
-
-pub fn write_holders_effect(
-    record: &MetadataRegistryRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: METADATA_HOLDERS_KEYSPACE.to_string(),
-        key: metadata_registry_key(record.group_id, record.document_id),
-        value: postcard::to_allocvec(&record.holder_node_ids)?.into(),
-        txn_id,
-    }))
 }
 
 pub fn write_graph_lifecycle_effect(
@@ -234,31 +200,6 @@ pub fn write_audit_effect(
         value: postcard::to_allocvec(record)?.into(),
         txn_id,
     }))
-}
-
-pub fn write_metadata_event_effect(
-    event: &MetadataCreateEventRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes: metadata_create_event_and_pending_projection_write_entries(event)?,
-        txn_id,
-    }))
-}
-
-pub fn write_create_event_effect(
-    event: &MetadataCreateEventRecord,
-) -> Result<Effect, ConversionError> {
-    write_metadata_event_effect(event, None)
-}
-
-pub fn write_create_records_effect(
-    record: &MetadataRegistryRecord,
-    audit: &MetadataAuditRecord,
-    audit_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    write_create_records_and_outbox_effect(record, audit, audit_id, None, txn_id)
 }
 
 pub fn write_create_records_and_outbox_effect(
@@ -362,30 +303,6 @@ fn outbox_document_lifecycle_upsert(
     };
     let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
     Ok(Some((lifecycle, *change)))
-}
-
-pub fn write_create_records_outbox_and_materialization_effect(
-    record: &MetadataRegistryRecord,
-    audit: &MetadataAuditRecord,
-    audit_id: Ulid,
-    outbox: Option<&DocumentSyncOutboxRecord>,
-    materialization_status: &MetadataMaterializationStatusRecord,
-    materialization_job: &MetadataMaterializationJobRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    let base_writes = create_records_outbox_and_materialization_write_entries(
-        record,
-        audit,
-        audit_id,
-        outbox,
-        materialization_status,
-        materialization_job,
-    )?;
-
-    Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes: base_writes,
-        txn_id,
-    }))
 }
 
 pub fn create_records_outbox_and_materialization_write_entries(

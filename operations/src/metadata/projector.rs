@@ -85,10 +85,6 @@ fn max_clock_skew_ms() -> u64 {
     })
 }
 
-pub fn clock_skew_rejection_count() -> u64 {
-    CLOCK_SKEW_REJECTIONS.load(Ordering::Relaxed)
-}
-
 fn exceeds_clock_skew(event: &MetadataCreateEventRecord, now_ms: u64, max_skew_ms: u64) -> bool {
     let limit = now_ms.saturating_add(max_skew_ms);
     event.record.updated_at_ms > limit || event.occurred_at_ms > limit

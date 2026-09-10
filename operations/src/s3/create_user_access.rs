@@ -50,11 +50,6 @@ pub enum CreateUserAccessError {
     RestrictionLimit(#[from] RestrictionLimitError),
     #[error(transparent)]
     Encryption(#[from] EncryptionError),
-    #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
-    InvalidState {
-        current: CreateUserAccessState,
-        expected: String,
-    },
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
         state: CreateUserAccessState,
@@ -71,8 +66,6 @@ pub enum CreateUserAccessError {
     NotFinished,
     #[error("User access creation failed")]
     CreateUserAccessFailed,
-    #[error("User access creation aborted")]
-    CreateUserAccessAborted,
 }
 
 #[derive(Debug, PartialEq)]

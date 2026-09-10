@@ -56,10 +56,8 @@ pub(crate) struct ManifestPagePlan {
     ranges: Vec<Range<usize>>,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize)]
 enum BorrowedShardTransportResponse<'a> {
-    Reject,
     ManifestPage(BorrowedShardManifestPage<'a>),
 }
 
