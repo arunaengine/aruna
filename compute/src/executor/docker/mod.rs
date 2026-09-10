@@ -1447,7 +1447,10 @@ impl ExecutorBackend for DockerBackend {
         let mut stream = self.docker.logs(container_id, Some(opts));
         let mut stdout = BoundedTail::new(limits.max_bytes_per_stream);
         let mut stderr = BoundedTail::new(limits.max_bytes_per_stream);
-        while let Some(item) = stream.next().await {
+        while let Some(item) = tokio::time::timeout(self.config.pull_deadline, stream.next())
+            .await
+            .map_err(|_| BackendError::Timeout("Docker log fetch timed out".to_string()))?
+        {
             use bollard::container::LogOutput;
             match item.map_err(|e| classify(&e))? {
                 LogOutput::StdOut { message } | LogOutput::Console { message } => {
