@@ -29,7 +29,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_materialization_status,
@@ -43,7 +42,8 @@ use crate::metadata::repository::{
     StorageReadError, metadata_event_projection_write_entries, parse_registry_read,
     read_registry_effect,
 };
-use crate::sync_placement::sort_node_ids;
+use crate::sync::document_sync_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
+use crate::sync::shard_placement::sort_node_ids;
 
 const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
 
@@ -76,10 +76,8 @@ pub enum UpdateMetadataDocumentMutation {
 }
 
 /// Validates a metadata update and persists the event plus projection work.
-///
-/// A successful operation means the update has been accepted into the durable
-/// event/projection pipeline. Graph materialization and replica convergence may
-/// still be pending.
+/// Success means acceptance into the durable event/projection pipeline, not
+/// completed graph materialization or replica convergence.
 #[derive(Debug, PartialEq)]
 pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,

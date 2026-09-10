@@ -12,7 +12,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::get_metadata_document::load_metadata_record_by_document;
+use crate::metadata::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::repository::{StorageReadError, delete_index_keys};
 use crate::storage_read::parse_storage_scan;
 
@@ -35,12 +35,8 @@ pub struct UpdatedRecordsPage {
 }
 
 /// Enumerate registry records whose `updated_at_ms` is in `[from_ms, until_ms]`,
-/// ascending, up to `limit` records. Local realm only (registry rows are
-/// realm-complete on each node).
-///
-/// Lazy old-key cleanup means an index key can outlive its record's datestamp, so
-/// every key is validated against the current record and mismatches are skipped.
-/// This never under-lists: the current-datestamp key is always present.
+/// ascending, up to `limit` records, local realm only. Keys are validated
+/// against the current record; stale keys are skipped, never under-listing.
 pub async fn enumerate_updated(
     context: &DriverContext,
     from_ms: u64,
@@ -110,9 +106,8 @@ pub struct SweepPass {
 }
 
 /// Deletes index keys whose record moved to a newer datestamp or was deleted.
-///
-/// Racing a concurrent write is benign: the writer re-adds the current key in its
-/// own batch, and readers validate every key against the record regardless.
+/// Racing a concurrent write is benign: the writer re-adds the current key,
+/// and readers validate every key against the record regardless.
 pub async fn sweep_stale_keys(
     context: &DriverContext,
     after: Option<Key>,
