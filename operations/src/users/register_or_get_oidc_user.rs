@@ -25,11 +25,11 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::{
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
-use crate::user_subject_index::rewrite_subject_index_effects;
+use crate::users::user_subject_index::rewrite_subject_index_effects;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserInput {
     pub actor: Actor,
