@@ -468,6 +468,7 @@ pub async fn delete_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::test_support::{test_context, test_state, test_storage};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
         Actor, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS, MAX_ASSISTANT_CHATS,
@@ -475,24 +476,13 @@ mod tests {
     };
     use aruna_core::types::UserId;
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::FjallStorage;
     use axum::response::IntoResponse;
     use tempfile::TempDir;
     use ulid::Ulid;
 
     async fn setup_state() -> (TempDir, Arc<ServerState>, AuthContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let (dir, storage) = test_storage();
+        let context = Arc::new(test_context(storage));
         let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         let user_id = UserId::local(Ulid::generate(), realm_id);
@@ -515,14 +505,11 @@ mod tests {
         .await
         .unwrap();
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 context,
                 realm_id,
                 node_id,
                 NodeCapabilities::management_node(signing_key).unwrap(),
-                false,
-                None,
-                JobsRuntime::new(),
             )
             .await,
         );

@@ -2552,6 +2552,7 @@ mod tests {
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
+    use crate::routes::test_support::{test_context, test_state, test_storage};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
@@ -2585,30 +2586,19 @@ mod tests {
     use ulid::Ulid;
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let (tempdir, storage_handle) = test_storage();
+        let driver_ctx = Arc::new(test_context(storage_handle));
 
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
 
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

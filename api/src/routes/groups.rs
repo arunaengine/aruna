@@ -1996,6 +1996,7 @@ mod tests {
     };
     use crate::auth::ValidatedArunaBearerTokenCarrier;
     use crate::error::{ServerError, ServerResult};
+    use crate::routes::test_support::{seed_realm_auth, test_context, test_state, test_storage};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -2009,8 +2010,8 @@ mod tests {
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmAuthorizationDocument, RealmId, RealmNodeKind, Role, User, VersionKey,
-        blob_bucket_permission_path, blob_object_permission_path,
+        RealmId, RealmNodeKind, Role, User, VersionKey, blob_bucket_permission_path,
+        blob_object_permission_path,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::driver::drive;
@@ -2108,27 +2109,16 @@ mod tests {
     }
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let (tempdir, storage_handle) = test_storage();
+        let driver_ctx = Arc::new(test_context(storage_handle));
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 iroh::SecretKey::generate().public(),
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -2140,15 +2130,7 @@ mod tests {
             user_id: UserId::nil(realm_id),
             realm_id,
         };
-        store_bytes(
-            &state,
-            AUTH_KEYSPACE,
-            realm_id.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
-                .to_bytes(&actor)
-                .unwrap(),
-        )
-        .await;
+        seed_realm_auth(&state.get_ctx(), realm_id, &actor).await;
         // Policy loading fails closed without the realm config document, and a
         // node the configuration does not name has no resolvable kind.
         let mut config =

@@ -804,43 +804,30 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
 mod tests {
     use super::*;
     use crate::error::ServerError;
+    use crate::routes::test_support::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context,
+        test_state as build_state, test_storage,
+    };
     use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::NodeCapabilities;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
-        Actor, AuthContext, Group, GroupAuthorizationDocument, PathRestriction, Permission,
-        RealmAuthorizationDocument, RealmConfigDocument, blob_group_permission_path,
+        Actor, AuthContext, PathRestriction, Permission, blob_group_permission_path,
     };
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::FjallStorage;
     use std::sync::Arc;
     use tempfile::TempDir;
     use ulid::Ulid;
 
     async fn test_state() -> (TempDir, Arc<ServerState>, AuthContext) {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let (storage_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let state = Arc::new(
-            ServerState::new(
-                Arc::new(DriverContext {
-                    storage_handle: storage,
-                    net_handle: None,
-                    blob_handle: None,
-                    metadata_handle: None,
-                    task_handle: None,
-                    compute_handle: None,
-                }),
+            build_state(
+                Arc::new(test_context(storage)),
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                JobsRuntime::new(),
             )
             .await,
         );
@@ -875,51 +862,17 @@ mod tests {
             user_id: auth.user_id,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(auth.user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "credential-group".to_string(),
-            group_id,
+        seed_realm_config(&state.get_ctx(), realm_id, &actor).await;
+        seed_realm_auth(&state.get_ctx(), realm_id, &actor).await;
+        seed_group_docs(
+            &state.get_ctx(),
             realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: auth.user_id,
-        };
-        for (key_space, key, value) in [
-            (
-                REALM_CONFIG_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                    .to_bytes(&actor)
-                    .unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                realm_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                GROUP_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group.to_bytes(&actor).unwrap(),
-            ),
-        ] {
-            state
-                .get_ctx()
-                .storage_handle
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: key_space.to_string(),
-                    key: key.into(),
-                    value: value.into(),
-                    txn_id: None,
-                })
-                .await;
-        }
+            &actor,
+            group_id,
+            "credential-group",
+            auth.user_id,
+        )
+        .await;
 
         let (access_key_id, _, _) = drive(
             CreateUserAccessOperation::new(

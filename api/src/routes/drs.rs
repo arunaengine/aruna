@@ -1196,21 +1196,21 @@ mod tests {
         parse_requested_object_id, post_objects, resolve_object, routed_deadline,
     };
     use crate::openapi::ApiDoc;
+    use crate::routes::test_support::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context,
+        test_state as build_state, test_storage,
+    };
     use crate::server_state::ServerState;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, SourceMetadata, VersionKey, VersionedObjectArn,
+        NodeCapabilities, RealmId, SourceMetadata, VersionKey, VersionedObjectArn,
     };
     use aruna_core::{NodeId, UserId};
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::storage::FjallStorage;
     use axum::Extension;
     use axum::body::to_bytes;
     use axum::extract::{ConnectInfo, Path, State};
@@ -1258,25 +1258,12 @@ mod tests {
     }
 
     async fn test_state() -> (TempDir, Arc<ServerState>) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let ctx = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let state = ServerState::new(
-            ctx,
+        let (dir, storage) = test_storage();
+        let state = build_state(
+            Arc::new(test_context(storage)),
             test_realm_id(),
             test_node_id(),
             NodeCapabilities::user_node(test_realm_id()).expect("capabilities"),
-            false,
-            None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         (dir, Arc::new(state))
@@ -1327,48 +1314,19 @@ mod tests {
             user_id: owner,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
-        let group = Group {
-            display_name: "drs-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner,
-        };
         // Request-policy loading fails closed without the realm config, the group
         // record, and the group auth document.
-        write_fixture(
-            state,
-            REALM_CONFIG_KEYSPACE,
-            realm_id.as_bytes().to_vec(),
-            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .expect("realm config serializes"),
+        seed_realm_config(&state.get_ctx(), realm_id, &actor).await;
+        seed_group_docs(
+            &state.get_ctx(),
+            realm_id,
+            &actor,
+            group_id,
+            "drs-group",
+            owner,
         )
         .await;
-        write_fixture(
-            state,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            group.to_bytes(&actor).expect("group serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            realm_id.as_bytes().to_vec(),
-            realm_auth.to_bytes(&actor).expect("realm auth serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            group_auth.to_bytes(&actor).expect("group auth serializes"),
-        )
-        .await;
+        seed_realm_auth(&state.get_ctx(), realm_id, &actor).await;
 
         let bucket = "mybucket";
         let key = "path/file @ 1.txt";

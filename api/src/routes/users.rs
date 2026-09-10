@@ -3299,40 +3299,28 @@ mod tests {
 mod resolve_tests {
     use super::{ResolveUsersRequest, resolve_users};
     use crate::error::ServerError;
+    use crate::routes::test_support::{test_context, test_state, test_storage};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::FjallStorage;
     use axum::extract::State;
     use axum::{Extension, Json};
     use std::sync::Arc;
-    use tempfile::{TempDir, tempdir};
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     pub(super) async fn setup_state() -> (Arc<ServerState>, TempDir) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let (tempdir, storage_handle) = test_storage();
+        let driver_ctx = Arc::new(test_context(storage_handle));
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 iroh::SecretKey::generate().public(),
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

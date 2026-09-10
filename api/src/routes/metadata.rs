@@ -3607,6 +3607,9 @@ pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::test_support::{
+        seed_group_docs, seed_realm_auth, test_context, test_state, test_storage,
+    };
     use aruna_core::keys::generate_signing_key;
 
     use aruna_core::effects::{Effect, StorageEffect};
@@ -7818,10 +7821,8 @@ mod tests {
     }
 
     async fn setup_state() -> TestState {
-        let storage_dir = tempfile::tempdir().unwrap();
+        let (storage_dir, storage_handle) = test_storage();
         let metadata_dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
         let realm_id = test_realm_id(3);
         let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
@@ -7840,47 +7841,21 @@ mod tests {
         )
         .unwrap();
         let task_handle = TaskHandle::new();
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: Some(metadata_handle),
-            task_handle: Some(task_handle),
-            compute_handle: None,
-        });
+        let mut context = test_context(storage_handle);
+        context.metadata_handle = Some(metadata_handle);
+        context.task_handle = Some(task_handle);
+        let driver_ctx = Arc::new(context);
         let group_id = Ulid::generate();
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "metadata-group".to_string(),
-            group_id,
+        seed_group_docs(
+            &driver_ctx,
             realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: user_id,
-        };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            realm_auth.to_bytes(&actor).unwrap().into(),
+            &actor,
+            group_id,
+            "metadata-group",
+            user_id,
         )
         .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().into(),
-            group_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().into(),
-            group.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
+        seed_realm_auth(&driver_ctx, realm_id, &actor).await;
 
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
@@ -7895,14 +7870,11 @@ mod tests {
         .await;
 
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -7923,10 +7895,8 @@ mod tests {
 
     // Net-capable variant for tests that need node discovery or cursor signing.
     async fn setup_state_with_net() -> TestState {
-        let storage_dir = tempfile::tempdir().unwrap();
+        let (storage_dir, storage_handle) = test_storage();
         let metadata_dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let realm_id = test_realm_id(3);
         let net = NetHandle::new(
             NetConfig {
@@ -7958,14 +7928,11 @@ mod tests {
         )
         .unwrap();
         let task_handle = TaskHandle::new();
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: Some(net.clone()),
-            blob_handle: None,
-            metadata_handle: Some(metadata_handle),
-            task_handle: Some(task_handle),
-            compute_handle: None,
-        });
+        let mut context = test_context(storage_handle);
+        context.net_handle = Some(net.clone());
+        context.metadata_handle = Some(metadata_handle);
+        context.task_handle = Some(task_handle);
+        let driver_ctx = Arc::new(context);
         // Single-node realm config so the holder proxy serves mutations locally.
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
@@ -7996,48 +7963,23 @@ mod tests {
         .await
         .unwrap();
         let group_id = Ulid::generate();
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "metadata-group".to_string(),
-            group_id,
+        seed_group_docs(
+            &driver_ctx,
             realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: user_id,
-        };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            realm_auth.to_bytes(&actor).unwrap().into(),
+            &actor,
+            group_id,
+            "metadata-group",
+            user_id,
         )
         .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().into(),
-            group_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().into(),
-            group.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
+        seed_realm_auth(&driver_ctx, realm_id, &actor).await;
 
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

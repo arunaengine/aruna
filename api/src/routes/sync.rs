@@ -1370,20 +1370,17 @@ fn map_time(value: Option<SystemTime>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::test_support::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context,
+        test_state as build_state, test_storage, write_doc,
+    };
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-        SYNC_MIRROR_REPAIR_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE};
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction, RealmId,
     };
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::FjallStorage;
     use tempfile::TempDir;
 
     fn test_node(seed: u8) -> NodeId {
@@ -1422,27 +1419,16 @@ mod tests {
     }
 
     async fn test_state() -> (TempDir, Arc<ServerState>, AuthContext, SyncRelationship) {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let (storage_dir, storage) = test_storage();
         let relationship = test_relationship();
         let realm_id = relationship.source.realm_id;
         let node_id = relationship.source.node_id;
         let state = Arc::new(
-            ServerState::new(
-                Arc::new(DriverContext {
-                    storage_handle: storage,
-                    net_handle: None,
-                    blob_handle: None,
-                    metadata_handle: None,
-                    task_handle: None,
-                    compute_handle: None,
-                }),
+            build_state(
+                Arc::new(test_context(storage)),
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                JobsRuntime::new(),
             )
             .await,
         );
@@ -1452,74 +1438,37 @@ mod tests {
             realm_id,
         };
         let group_id = test_group();
-        let storage = &state.get_ctx().storage_handle;
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth = GroupAuthorizationDocument::new_default_group_doc(
-            relationship.created_by,
-            realm_id,
-            group_id,
-        );
-        let group = aruna_core::structs::Group {
-            display_name: "sync-test".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: relationship.created_by,
-        };
         // Request-policy loading fails closed without the realm config document.
-        for (key_space, key, value) in [
-            (
-                REALM_CONFIG_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                    .to_bytes(&actor)
-                    .unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                realm_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                GROUP_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group.to_bytes(&actor).unwrap(),
-            ),
-        ] {
-            storage
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: key_space.to_string(),
-                    key: key.into(),
-                    value: value.into(),
-                    txn_id: None,
-                })
-                .await;
-        }
+        seed_realm_config(&state.get_ctx(), realm_id, &actor).await;
+        seed_realm_auth(&state.get_ctx(), realm_id, &actor).await;
+        seed_group_docs(
+            &state.get_ctx(),
+            realm_id,
+            &actor,
+            group_id,
+            "sync-test",
+            relationship.created_by,
+        )
+        .await;
         for bucket in ["source", "target"] {
-            storage
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: bucket.as_bytes().to_vec().into(),
-                    value: BucketInfo {
-                        group_id,
-                        created_at: SystemTime::UNIX_EPOCH,
-                        created_by: relationship.created_by,
-                        cors_configuration: None,
-                        storage_routing: Vec::new(),
-                        placement_policies: Vec::new(),
-                        placement_policy_generation: 0,
-                    }
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-                    txn_id: None,
-                })
-                .await;
+            write_doc(
+                &state.get_ctx(),
+                S3_BUCKET_KEYSPACE,
+                bucket.as_bytes().to_vec().into(),
+                BucketInfo {
+                    group_id,
+                    created_at: SystemTime::UNIX_EPOCH,
+                    created_by: relationship.created_by,
+                    cors_configuration: None,
+                    storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+            )
+            .await;
         }
         let auth = AuthContext {
             user_id: relationship.created_by,

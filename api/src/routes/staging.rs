@@ -1556,8 +1556,10 @@ fn format_system_time(value: std::time::SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
+    use crate::routes::test_support::{
+        seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
+    };
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -1567,14 +1569,13 @@ mod tests {
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
-        PathRestriction, PortableSourceDescriptor, RealmAuthorizationDocument, RealmConfigDocument,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+        PathRestriction, PortableSourceDescriptor, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::queue::{
         LiveReplicationObligationRecord, live_replication_obligation_key,
     };
-    use aruna_storage::storage;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
@@ -2115,9 +2116,7 @@ mod tests {
     }
 
     async fn setup_state() -> TestState {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let (storage_dir, storage_handle) = test_storage();
         let realm_signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         let realm_id =
             aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
@@ -2129,14 +2128,7 @@ mod tests {
             user_id: user_with_source_read,
             realm_id,
         };
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let driver_ctx = Arc::new(test_context(storage_handle));
 
         let bucket_group_id = Ulid::generate();
         let source_group_id = Ulid::generate();
@@ -2171,24 +2163,8 @@ mod tests {
             owner: user_with_source_read,
             roles: source_auth.roles.keys().copied().collect(),
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
-
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            realm_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            realm_config_target.storage_keyspace(),
-            realm_config_target.storage_key(),
-            realm_config.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
+        seed_realm_auth(&driver_ctx, realm_id, &actor).await;
+        seed_realm_config(&driver_ctx, realm_id, &actor).await;
         write_doc(
             &driver_ctx,
             AUTH_KEYSPACE,
@@ -2240,14 +2216,11 @@ mod tests {
         .await;
 
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
