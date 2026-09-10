@@ -160,6 +160,9 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck scripts/*.sh scripts/tests/*.sh
 
+      - name: Run session-helper tests
+        run: python3 -m unittest discover -s scripts/session-helper
+
   compose-config:
     runs-on: ubuntu-latest
 
