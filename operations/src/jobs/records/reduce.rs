@@ -1,9 +1,6 @@
-//! The deterministic reducer.
-//!
-//! It reads only immutable authentic records. Arrival order, arrival batching,
-//! duplication, the responder's clock, its local tasks, and its reachability are
-//! never inputs, so every replica holding the same record set produces the same
-//! projection.
+//! The deterministic reducer. It reads only immutable authentic records: arrival
+//! order and batching, duplication, the responder's clock, tasks, and reachability
+//! are never inputs, so replicas with the same record set produce the same projection.
 
 use std::collections::BTreeMap;
 

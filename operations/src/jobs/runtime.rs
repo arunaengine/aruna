@@ -484,10 +484,9 @@ impl JobsRuntime {
         }
     }
 
-    /// At startup every claimed/running holder is definitionally dead: re-queue the
-    /// in-process ones. External attempts route to the reconcile hook instead, since a
-    /// blind requeue would spawn a second container for a job that may still be running.
-    /// The restart itself costs them no attempt; only an adoption that fails does.
+    /// At startup every claimed/running holder is definitionally dead. Re-queue
+    /// the in-process ones and route external attempts to the reconcile hook,
+    /// since a blind requeue would double-run; a restart costs them no attempt.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
         let now_ms = unix_timestamp_millis();
         let mut job_ids = Vec::new();
@@ -572,9 +571,8 @@ async fn run_job(
     shutdown: CancellationToken,
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
-    // lease there reconciles rather than requeues (spec 16.7). A shutdown mid-supervise
-    // hands the lease back through `JobsRuntime::shutdown`, so the attempt is adopted
-    // rather than re-run.
+    // lease reconciles rather than requeues. A shutdown mid-supervise hands the
+    // lease back through `JobsRuntime::shutdown`, so the attempt is adopted too.
     if record.execution_class == JobExecutionClass::ExternalAttempt {
         Box::pin(super::workflow::run_execution_job(context, record, cancel)).await;
         return;
@@ -744,10 +742,9 @@ fn terminal_or_none(result: Result<JobRecord, JobMutationError>, job_id: JobId) 
 
 const TERMINAL_WRITE_MAX_ATTEMPTS: u32 = 5;
 
-/// Retry a terminal write past transient storage failures. The execution already
-/// finished, so a bare storage error would otherwise leave the job `Running` until the
-/// sweep re-runs it and can flip a succeeded job to `Failed`; token/transition races are
-/// legitimate outcomes and are returned unretried.
+/// Retry a terminal write past transient storage failures: the execution already
+/// finished, so a storage error would otherwise leave it `Running` until the sweep
+/// re-runs it. Token/transition races are legitimate and returned unretried.
 async fn retry_terminal<F, Fut>(mut op: F) -> Result<JobRecord, JobMutationError>
 where
     F: FnMut() -> Fut,
