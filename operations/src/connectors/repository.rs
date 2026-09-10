@@ -1,5 +1,4 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
@@ -49,30 +48,6 @@ pub fn read_connector_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -
         key: source_connector_secret_key(connector_id),
         txn_id,
     })
-}
-
-pub fn write_connector_effect(
-    record: &SourceConnector,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
-        key: source_connector_key(record.group_id, record.connector_id),
-        value: record.to_bytes()?.into(),
-        txn_id,
-    }))
-}
-
-pub fn write_connector_secret_effect(
-    record: &SourceConnectorSecret,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-        key: source_connector_secret_key(record.connector_id),
-        value: record.to_bytes()?.into(),
-        txn_id,
-    }))
 }
 
 pub fn delete_connector_effect(

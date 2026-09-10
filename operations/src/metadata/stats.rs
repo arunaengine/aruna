@@ -255,11 +255,6 @@ pub(crate) fn classify_root_summary(
     Ok(DocumentPurpose::Dataset)
 }
 
-pub fn summary_is_profile(summary: &str, graph_iri: &str) -> Result<bool, MetadataApiError> {
-    classify_root_summary(summary, graph_iri)
-        .map(|purpose| matches!(purpose, DocumentPurpose::Profile))
-}
-
 /// Classifies the validated create payload before projection. Imported crates
 /// may still name their root as `./`, so fall back to the descriptor's `about`
 /// target when the final graph IRI is not present yet.

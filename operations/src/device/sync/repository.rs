@@ -148,14 +148,6 @@ pub fn action_entry(record: &SyncActionRecord) -> Result<(String, Key, Value), C
     ))
 }
 
-pub fn read_folder(folder_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: SYNCED_FOLDER_KEYSPACE.to_string(),
-        key: folder_key(folder_id),
-        txn_id,
-    })
-}
-
 pub fn scan_folders(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Iter {
         key_space: SYNCED_FOLDER_KEYSPACE.to_string(),

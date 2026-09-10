@@ -108,6 +108,7 @@ pub fn watch_permission_path(
 /// prefix. A prefix with no canonical resource identity, and any non-user owner,
 /// is unauthorized. A check that cannot be evaluated is an error, never a grant,
 /// so callers fail closed.
+#[cfg(test)]
 pub async fn is_watch_authorized(
     context: &DriverContext,
     realm_id: RealmId,

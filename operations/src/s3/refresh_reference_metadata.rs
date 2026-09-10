@@ -27,7 +27,6 @@ use crate::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
 const REFRESH_SCAN_PAGE_SIZE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;
 
-pub const REFERENCE_METADATA_REFRESH_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const REFERENCE_METADATA_REFRESH_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
