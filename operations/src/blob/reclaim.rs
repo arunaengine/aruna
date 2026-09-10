@@ -23,13 +23,13 @@ use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::blob::blob_keyspace_helper::{blob_location_read, iter_hash_path_index_effect};
+use crate::blob::blob_storage::{blob_location_read, iter_hash_path_index_effect};
 use crate::blob::cleanup::schedule_blob_cleanup_effect;
 use crate::driver::{DriverContext, drive, node_routing};
-use crate::group_backends::{RecordReadError, backend_key, parse_read};
+use crate::groups::backends::{RecordReadError, backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::task_persistence::persist_task_effect;
-use crate::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::tasks::task_persistence::persist_task_effect;
 
 pub const RECLAIM_SWEEP_AFTER: Duration = Duration::from_secs(15 * 60);
 pub const RECLAIM_SWEEP_RETRY: Duration = Duration::from_secs(60);
@@ -82,11 +82,9 @@ pub struct ReclaimOutcome {
     pub next_start_after: Option<Key>,
 }
 
-/// Pages the queue from `start_after` so a candidate that keeps failing cannot
-/// starve the rows behind it: the cap moves the cursor past it either way.
-// Deferred (#359): recount / candidate-persistence hardening on top of this
-// already-working per-(hash,backend) reclaim sweep. The reference-cache GC part
-// of #359 is moot while the verified reference cache (#375) is deferred.
+/// Pages the queue from `start_after` so a failing candidate cannot starve rows
+/// behind it: the cap moves the cursor past it either way.
+// Deferred (#359): recount and candidate-persistence hardening.
 pub async fn process_reclaim_batch(
     context: &DriverContext,
     start_after: Option<Key>,

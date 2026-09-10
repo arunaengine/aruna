@@ -21,10 +21,10 @@ use tokio_util::io::ReaderStream;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::connectors::resolver::{ARUNA_NATIVE_ORIGIN_NODE_ID, ARUNA_NATIVE_RELATIONSHIP_ID};
 use crate::driver::{DriverContext, drive};
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
@@ -32,8 +32,8 @@ use crate::s3::get_object::{
 use crate::s3::head_object::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
-use crate::sync_relationship::{
+use crate::sync::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::sync::sync_relationship::{
     GetSyncRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 

@@ -68,10 +68,9 @@ impl RelationshipReplicaNodesOperation {
         })]
     }
 
-    /// The live queue's own admission rule, minus the loop guards that need the
-    /// inbound origin of a write this query does not have. The key runs through
-    /// replication's own mapping, so a prefix rewrite is asked about where the
-    /// copy actually lands.
+    /// The live queue's admission rule minus loop guards needing a write origin this
+    /// query lacks. The key runs through replication's mapping, so a prefix rewrite is
+    /// asked about where the copy actually lands.
     fn target_of(&self, relationship: &SyncRelationship) -> Option<ReplicaTarget> {
         if !matches!(
             relationship.mode,

@@ -36,9 +36,9 @@ use super::version_replication::{
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
-use crate::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::sync::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::tasks::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
 
 const REPLICATION_SCAN_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;

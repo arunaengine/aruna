@@ -8,11 +8,8 @@ pub const HARVEST_PATH_BYTES: usize = 512;
 pub const DIGEST_SEGMENT_BYTES: usize = 67;
 
 /// Canonical form of a harvest target prefix, or `None` when no record could
-/// land under it.
-///
-/// Surrounding whitespace and slashes are not part of the prefix, and a prefix
-/// that leaves less than one full digest segment of the path budget is refused
-/// outright rather than failing every record later.
+/// land under it. Whitespace and slashes are trimmed; a prefix leaving less
+/// than a full digest segment of budget is refused outright.
 pub fn normalize_target_prefix(prefix: &str) -> Option<String> {
     let prefix = prefix.trim().trim_matches('/').trim();
     if prefix.is_empty() {

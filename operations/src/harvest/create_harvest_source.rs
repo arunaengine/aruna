@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::harvest::oai::request::{normalize_metadata_prefix, normalize_set};
+use crate::harvest::oai_request::{normalize_metadata_prefix, normalize_set};
 use crate::harvest::repository::{StorageReadError, read_connector_effect, write_source_effect};
 use crate::harvest::target_path::{normalize_target_prefix, prefix_is_blank};
 
