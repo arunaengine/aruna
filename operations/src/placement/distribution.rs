@@ -1,7 +1,6 @@
 //! Deterministic statistical distribution gates for the weighted resolver.
-//!
-//! Subjects are drawn from a blake3 counter stream (no RNG) so the observed
-//! shares are reproducible on every run and platform.
+//! Subjects come from a blake3 counter stream (no RNG), so observed shares
+//! reproduce on every run and platform.
 
 use std::collections::BTreeMap;
 

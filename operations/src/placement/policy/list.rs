@@ -1,5 +1,4 @@
 //! Responder-local listing of the placement policies this node holds.
-//!
 //! Documents replicate only to the holders their policy id resolves to, so a
 //! page names what this node stores and never claims to be the realm catalog.
 
@@ -16,7 +15,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 /// Page size a listing uses when the caller names none.
 pub const POLICY_LIST_DEFAULT: usize = 50;
@@ -28,8 +27,7 @@ pub struct ListPoliciesInput {
     pub auth_context: AuthContext,
     /// Names a group: the page then holds the realm-wide rules plus that
     /// group's own, and administering the group is enough to read it. Without
-    /// it the caller must administer the realm configuration and sees every
-    /// rule this node holds.
+    /// it the caller must administer the realm configuration and sees all.
     pub group_id: Option<GroupId>,
     /// Exclusive cursor: the storage key of the last policy of the previous page.
     pub start_after: Option<Key>,
@@ -213,7 +211,7 @@ mod tests {
     use aruna_core::types::{Key, NodeId, UserId};
     use ulid::Ulid;
 
-    use crate::placement_policy::fixtures::signed_document;
+    use crate::placement::policy::fixtures::signed_document;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
