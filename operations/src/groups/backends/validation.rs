@@ -1,4 +1,4 @@
-use crate::endpoint;
+use crate::endpoint_screening;
 use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, ensure_confined_relative_path};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -190,12 +190,12 @@ pub fn validate_backend_input(
         if !endpoint.starts_with("https://") {
             return Err(GroupBackendError::InsecureEndpoint(endpoint.clone()));
         }
-        if !endpoint::is_canonical(endpoint) {
+        if !endpoint_screening::is_canonical(endpoint) {
             return Err(GroupBackendError::AmbiguousEndpoint(endpoint.clone()));
         }
     }
     if let Some(bucket) = public.get("bucket")
-        && endpoint::breaks_authority(bucket)
+        && endpoint_screening::breaks_authority(bucket)
     {
         return Err(GroupBackendError::UnsafeBucket(bucket.clone()));
     }
