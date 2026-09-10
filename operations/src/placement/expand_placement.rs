@@ -1,12 +1,6 @@
-//! Machine-initiated placement expansion at onboarding.
-//!
-//! A joining node no longer siphons buckets by merely existing: holder sets are
-//! pinned to an activated candidate map, so a below-RF realm needs an explicit
-//! transition to reach RF. This issues one - but only for buckets whose target
-//! set contains their current set. Nothing moves off any node, the old holders
-//! stay write authority throughout, and the grace release is a no-op, yet the
-//! full barrier/pull/verify/proof machinery still runs. Weight changes,
-//! removals, and drains are never auto-issued.
+//! Machine-initiated placement expansion at onboarding: a joining node does not
+//! siphon buckets by existing. Only buckets whose target set contains their
+//! current set get a transition; weight changes, removals and drains never do.
 
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{Actor, CandidatePlacementMap, RealmConfigDocument, TransitionLimits};
@@ -14,23 +8,17 @@ use aruna_core::util::unix_timestamp_millis;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
-use crate::mutate_realm_placement::{
+use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
+use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
     RealmPlacementMutation,
 };
-use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
-use crate::queue_backoff::conflict_backoff;
+use crate::tasks::queue_backoff::conflict_backoff;
 
-/// Publishes the realm's first candidate map and hands every strategy's
-/// activations to the reducer.
-///
-/// While no map exists, resolution runs over the live view - the bootstrap
-/// bridge, which is exactly right for the single node that created the realm
-/// and must be closed before a second node is registered, or the join itself
-/// would move buckets. A literal activation written into a document is not
-/// enough: only activations initialized through the reducer advance when a
-/// transition completes.
+/// Publishes the realm's first candidate map and initializes every strategy's
+/// activations through the reducer; this must run before a second node registers,
+/// and only reducer-initialized activations advance when a transition completes.
 pub async fn ensure_activated_map(
     context: &DriverContext,
     actor: &Actor,

@@ -1,8 +1,6 @@
 //! Display names for policy refs, read from the rows this node already holds.
-//!
-//! A ref this node does not hold is simply absent from the answer: the lookup
-//! is a display convenience for a caller that already holds the refs, never an
-//! existence oracle, and it never fetches from a holder.
+//! A ref this node does not hold is absent from the answer: the lookup is a
+//! display convenience, never an existence oracle, and it never fetches.
 
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -191,7 +189,7 @@ mod tests {
             PolicyNamesOperation::new(realm(), &[held.policy_ref(), unknown.policy_ref()]);
         operation.start();
 
-        let document = crate::placement_policy::tests::signed_document(realm(), &held, 1);
+        let document = crate::placement::policy::tests::signed_document(realm(), &held, 1);
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -227,7 +225,7 @@ mod tests {
         let mut operation = PolicyNamesOperation::new(realm(), &[held.policy_ref()]);
         operation.start();
 
-        let document = crate::placement_policy::tests::signed_document(
+        let document = crate::placement::policy::tests::signed_document(
             RealmId::from_bytes([9u8; 32]),
             &held,
             1,

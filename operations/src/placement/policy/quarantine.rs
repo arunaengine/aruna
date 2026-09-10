@@ -1,12 +1,6 @@
-//! Operator resolution of quarantined local copies.
-//!
-//! A subject scan that leaves any copy quarantined keeps this node draining:
-//! it serves nothing governed and admits no new governed work until an operator
-//! decides what happens to those copies. This is that decision. Releasing drops
-//! the local registrations of one exact version, which makes it locally
-//! unavailable rather than serveable, and the revalidation walk afterwards is
-//! the same one the transition uses, so the block ends exactly when nothing
-//! quarantined is left.
+//! Operator resolution of quarantined local copies. A scan leaving copies
+//! quarantined keeps this node draining; releasing drops one version's local
+//! registrations and the block ends once nothing quarantined remains.
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -21,8 +15,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::info;
 
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 use super::subject::{SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation};
 

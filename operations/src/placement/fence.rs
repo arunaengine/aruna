@@ -1,13 +1,6 @@
 //! Per-bucket write-admission fence.
-//!
-//! An empty outbox scan proves nothing on its own: a write that resolved the
-//! bucket before the cutover can still commit its row afterwards, and the
-//! departing holder has by then given up its publish authority. So a
-//! holder-authoritative writer reads the bucket's fence inside the very
-//! transaction that commits its domain mutation and outbox row. The departing
-//! holder closes that fence durably before it drains, which conflicts every
-//! predecessor-generation transaction that has not committed yet and leaves a
-//! finite remainder to drain.
+//! A writer reads the bucket's fence in its commit transaction, so a departing
+//! holder's durable close conflicts every uncommitted predecessor generation.
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -129,11 +122,9 @@ impl WriteFence {
     }
 }
 
-/// Durably closes `placement` through `generation`, so no later transaction
-/// can be admitted at it and every uncommitted one conflicts. Monotone and
-/// idempotent: a repeat after a crash re-closes the same generation. An
-/// unparseable stored value is overwritten, since it admits no generation at
-/// all and would otherwise leave the bucket permanently unwritable.
+/// Durably closes `placement` through `generation`, so no later transaction is
+/// admitted and every uncommitted one conflicts. Monotone and idempotent; an
+/// unparseable stored value is overwritten rather than bricking the bucket.
 pub async fn close(
     storage: &StorageHandle,
     realm_id: &RealmId,

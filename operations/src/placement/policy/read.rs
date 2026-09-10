@@ -1,8 +1,6 @@
 //! Reading one immutable policy document by ref: local row first, then a
-//! bounded fetch from the holders the policy id resolves to. No catalog is
-//! consulted; a document that does not hash to the requested digest, or whose
-//! publication was not accepted under realm-admin authority, is refused rather
-//! than returned.
+//! bounded fetch from the holders its id resolves to. No catalog is consulted;
+//! a document failing the hash or realm-admin authority is refused, not returned.
 
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{
@@ -463,7 +461,7 @@ impl Operation for ReadPolicyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement_policy::tests::{admin_user, realm_view, signed_document};
+    use crate::placement::policy::tests::{admin_user, realm_view, signed_document};
     use aruna_core::NodeId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::{

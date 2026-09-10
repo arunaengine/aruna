@@ -1,9 +1,6 @@
 //! Sequential resolution of a bounded ref set through the authenticated read
-//! path, shared by the administration operations.
-//!
-//! Nothing here evaluates a subject: it only obtains the definitions an
-//! administrative mutation must authenticate before it stores a ref, and the
-//! resolutions a later placement evaluation needs.
+//! path, shared by the administration operations. It never evaluates a subject;
+//! it only obtains the definitions a mutation must authenticate before use.
 
 use aruna_core::NodeId;
 use aruna_core::events::Event;

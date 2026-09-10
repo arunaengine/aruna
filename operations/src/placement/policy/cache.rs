@@ -1,12 +1,6 @@
-//! Node-local durable cache of resolved placement policies.
-//!
-//! The key is `(policy_id, digest)`: an id-only key could accept changed bytes
-//! under a known id, which policy immutability forbids. A stored positive entry
-//! is bytes, never a trusted document, so every lookup verifies the definition
-//! and its publication signature again before it may be matched against a
-//! subject. The realm-admin authority behind that publication was verified
-//! before the entry was written, and the retained publication keeps it
-//! auditable afterwards.
+//! Durable node-local cache of resolved placement policies, keyed by
+//! `(policy_id, digest)` since an id-only key could accept changed bytes. A
+//! positive entry is bytes, never a trusted document, so it is re-verified.
 
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
@@ -252,7 +246,7 @@ pub fn plan_eviction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement_policy::tests::signed_document;
+    use crate::placement::policy::tests::signed_document;
     use aruna_core::structs::{PlacementPolicy, PlacementSelector};
     use ulid::Ulid;
 

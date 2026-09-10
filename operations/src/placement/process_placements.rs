@@ -15,28 +15,15 @@ use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
 use crate::placement::{bucket_membership, draining_former_holders, resolve_shard_holders};
-use crate::sync_placement::{
+use crate::sync::shard_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 
-/// Reconciles every shard topic the local node holds, whatever its rank.
-///
-/// Rank-0 is a politeness device for who acts first, never a precondition for
-/// the work happening: the rank-0 holder eagerly creates the genesis (so
-/// creation has exactly one origin per shard, race-free by rank uniqueness),
-/// while every other holder independently pulls the topic from a co-holder and
-/// tops up co-holder membership. A freshly added holder therefore converges on
-/// its own instead of waiting to be pushed to.
-///
-/// Join-before-create: a config change can move rank-0 (e.g. a new node ranks
-/// first for a shard whose genesis the previous rank-0 already created), so a
-/// missing topic is first adopted from a co-holder; only what no co-holder
-/// knows either is created fresh.
-/// Returns whether any genesis was withheld (a co-holder was unreachable or
-/// refused a probe) or a held topic could not be pulled, so the caller can
-/// schedule a placement retry.
+/// Reconciles every shard topic the local node holds: rank-0 creates the genesis,
+/// other holders pull it from a co-holder. Missing topics are adopted before
+/// create; returns whether any genesis was withheld or a held topic is unpulled.
 #[derive(Clone, Copy, Debug, Default)]
 struct HeldTopicOutcome {
     /// A rank-0 genesis was withheld (co-holder unreachable or refusing).
@@ -65,10 +52,9 @@ async fn ensure_held_shard_topics(
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            // Per-bucket membership: admitted targets join for delivery, and
-            // retained departing holders stay through their bucket's grace
-            // (#399 bounds the peak at |old U new|); publish authority stays
-            // with activated plus retained holders only.
+            // Admitted targets join for delivery and retained departing holders
+            // stay through grace (#399 bounds the peak at |old U new|); publish
+            // authority stays with activated plus retained holders only.
             let membership = bucket_membership(config, &placement, now_ms);
             if !membership.members.contains(&local_node_id) {
                 continue;
@@ -141,14 +127,9 @@ async fn ensure_held_shard_topics(
         )
         .await;
     }
-    // Non-rank-0 held shards. A topic not known locally is pulled from a
-    // co-holder: `sync_document_topics` is join-only (it adopts an existing
-    // genesis, it can never mint one), so this is safe at any rank and cannot
-    // fork. Without it a freshly added holder would stay passive forever,
-    // depending on an existing member pushing to it — and when the shard's
-    // origin is drained out of the holder set, nobody does.
-    // Topics already known are topped up with the current co-holder set, which
-    // is what admits a freshly added holder on the pushing side.
+    // Non-rank-0 held shards: an unknown topic is pulled from a co-holder
+    // (`sync_document_topics` is join-only and can never fork), and known topics
+    // are topped up with the current co-holder set.
     for ((co_members, publishers, retained), topics) in member_groups {
         if co_members.is_empty() {
             continue;
@@ -184,7 +165,7 @@ async fn ensure_held_shard_topics(
             let event = net_handle
                 .sync_document_topics(missing.clone(), co_members.clone())
                 .await;
-            crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+            crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
             for topic in missing {
                 if net_handle
                     .document_sync_topic_exists(topic)
@@ -212,35 +193,9 @@ async fn ensure_held_shard_topics(
     outcome
 }
 
-/// Ensures the shard topics of one rank-0 co-holder group, creating a fresh
-/// genesis only with positive confirmation that none exists.
-///
-/// Topics already known locally are ensured (membership top-up only, never a
-/// create). For a missing topic the co-holders are probed: one that a co-holder
-/// already holds is adopted via anti-entropy; one that every reached co-holder
-/// positively confirmed unknown (an empty summary) is created fresh; but if any
-/// co-holder was unreachable, or a reached one refused the topic (holds it but
-/// the prober may not open it yet — its summary is silently omitted), creation
-/// is withheld and left for the next placement pass — either might hold a
-/// genesis, and forking a second one is a permanent split-brain. A sole holder
-/// (no co-holders) creates immediately: no peer can hold a divergent genesis.
-///
-/// Returns whether any genesis was withheld (or an adopt failed to land), so the
-/// caller schedules a placement retry instead of deferring writes forever.
-/// Splits `topics` into the ones this node may safely hold or create and a flag
-/// saying whether any creation was withheld.
-///
-/// A topic a co-holder already holds is adopted by anti-entropy; one every
-/// reached co-holder positively confirmed unknown is safe to create; but if any
-/// co-holder was unreachable, or a reached one refused the topic (it holds the
-/// genesis but the prober may not open it yet), creation is withheld — either
-/// might hold a genesis, and forking a second one is a permanent split-brain.
-/// A sole holder creates immediately: no peer can hold a divergent genesis.
-/// The withheld flag tells the caller to retry rather than strand the topic.
-///
-/// `may_mint` is the caller's single-minter decision. Positive absence is a
-/// snapshot, not a lock, so a caller that is not the designated minter for these
-/// topics adopts only and leaves an absent topic withheld.
+/// Splits `topics` into ones this node may safely hold or create, flagging
+/// whether creation was withheld. Co-held topics are adopted; only positive
+/// absence with `may_mint` allows a genesis, since a fork is a split-brain.
 pub(crate) async fn resolve_creatable_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
@@ -308,7 +263,7 @@ pub(crate) async fn resolve_creatable_topics(
         let event = net_handle
             .sync_document_topics(to_adopt.clone(), co_members.to_vec())
             .await;
-        crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+        crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
         // Only keep topics whose genesis actually landed; an adopt that failed
         // must not fall through to a fresh create - retry it on the next pass.
         for topic in to_adopt {
@@ -448,24 +403,9 @@ enum RealmConfigLoadOutcome {
     StorageFailure,
 }
 
-/// Reconciles the local node's held shard topics with their co-holders.
-///
-/// First reconciles every held shard topic (see [`ensure_held_shard_topics`]):
-/// rank-0 shards get their genesis created, every other held shard is pulled
-/// from a co-holder. Then iterates the
-/// [`SYNC_PLACEMENT_KEYSPACE`] records the write path left behind (one per
-/// shard that was not fully replicated at write time), re-resolves each
-/// shard's holder set from the current realm config, and makes those holders
-/// the shard topic's exact members and accepted publishers. Membership changes
-/// schedule an irokle topic recheck, so the resync loop then pushes the shard's
-/// events to any freshly added co-holder. A satisfied record is removed; a
-/// record the local node no longer holds is dropped; a record whose shard
-/// topic has no genesis locally yet (non-rank-0 holder, genesis in flight) is
-/// kept for retry.
-///
-/// A withheld genesis or an incomplete record schedules a [`TaskKey::SyncPlacements`]
-/// retry so a down/refusing co-holder returning re-runs the reconciler; the
-/// returned [`PlacementReconcileOutcome`] reports whether that retry was armed.
+/// Reconciles the local node's held shard topics with their co-holders: held
+/// topics get genesis/pull work, then pending [`SYNC_PLACEMENT_KEYSPACE`] records
+/// set exact members/publishers; withheld work arms a [`TaskKey::SyncPlacements`] retry.
 pub async fn process_shard_placements(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -523,7 +463,7 @@ async fn reconcile_placements(
     .await;
     let mut retry_needed = held.withheld || held.pull_pending;
     if run_transitions {
-        retry_needed |= crate::process_transitions::process_placement_transitions(
+        retry_needed |= crate::placement::process_transitions::process_placement_transitions(
             context,
             realm_id,
             local_node_id,
@@ -535,7 +475,7 @@ async fn reconcile_placements(
     {
         // A pure transition target never mutates the config, so nothing else
         // arms its timer; fire the deferred execution now.
-        let effect = crate::sync_placement::schedule_placement_retry_after(
+        let effect = crate::sync::shard_placement::schedule_placement_retry_after(
             realm_id,
             local_node_id,
             std::time::Duration::ZERO,
@@ -556,7 +496,7 @@ async fn reconcile_placements(
     if let Some(deadline) = crate::placement::next_release_ms(&config, deadline_now)
         && let Some(task_handle) = context.task_handle.as_ref()
     {
-        let effect = crate::sync_placement::schedule_placement_deadline(
+        let effect = crate::sync::shard_placement::schedule_placement_deadline(
             realm_id,
             local_node_id,
             std::time::Duration::from_millis(deadline.saturating_sub(deadline_now)),
@@ -651,12 +591,9 @@ async fn reconcile_placements(
             }
 
             let topic = shard_topic_id(realm_id, &record.placement);
-            // Genesis creation is owned by `ensure_rank0_shard_topics` (gated on
-            // positive co-holder confirmation); this loop only tops up membership
-            // on a topic already known locally. A topic whose genesis is not yet
-            // local — a rank-0 create withheld for a down co-holder, or a
-            // non-rank-0 holder still awaiting gossip — is kept for the next pass
-            // rather than force-created into a fork.
+            // Genesis creation is owned by `ensure_rank0_shard_topics`; this loop
+            // only tops up membership on a locally known topic, keeping records
+            // whose genesis is not local yet for the next pass instead of forking.
             if !net_handle
                 .document_sync_topic_exists(topic)
                 .unwrap_or(false)
@@ -724,12 +661,15 @@ async fn reconcile_placements(
         // retries on the short cadence; a withheld genesis waits out the full
         // interval (re-probing a down co-holder is expensive).
         let after = if held.pull_pending {
-            crate::sync_placement::SHARD_TOPIC_PULL_RETRY_AFTER
+            crate::sync::shard_placement::SHARD_TOPIC_PULL_RETRY_AFTER
         } else {
-            crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER
+            crate::sync::shard_placement::SYNC_PLACEMENT_RETRY_AFTER
         };
-        let effect =
-            crate::sync_placement::schedule_placement_retry_after(realm_id, local_node_id, after);
+        let effect = crate::sync::shard_placement::schedule_placement_retry_after(
+            realm_id,
+            local_node_id,
+            after,
+        );
         let _ = task_handle.send_effect(effect).await;
         return PlacementReconcileOutcome::retry_scheduled(held.pull_pending);
     }
@@ -892,7 +832,7 @@ async fn prune_released_transitions(
         return false;
     };
     let before = stored.placement_transitions.len();
-    crate::ensure_realm_config::overlay_realm_config_reducer_materialization(
+    crate::realm::ensure_realm_config::overlay_realm_config_reducer_materialization(
         &mut stored,
         &state,
         now_ms,

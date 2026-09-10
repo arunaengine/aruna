@@ -1,9 +1,6 @@
-//! Resolving one policy ref to a verified policy: durable cache first, then the
-//! ordinary placement-resolved read, then a bounded cache insert.
-//!
-//! The cache is a latency device only. A failed cache read, eviction, or write
-//! never changes the answer, and a missing policy is reported as unavailable,
-//! never as a denial.
+//! Resolving one policy ref to a verified policy: durable cache first, the
+//! ordinary read, then a bounded cache insert. Cache misses are latency only
+//! and never change the answer; a missing policy is unavailable, not denied.
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
