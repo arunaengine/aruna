@@ -339,6 +339,9 @@ impl Operation for CreateMultipartUploadOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.emit_error(error.clone().into());
+        }
         match self.state {
             CreateMultipartUploadState::Init => self.handle_init(),
             CreateMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),

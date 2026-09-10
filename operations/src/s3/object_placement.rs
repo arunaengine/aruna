@@ -115,6 +115,9 @@ impl Operation for ObjectPlacementOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.finish(Err(error.clone().into()));
+        }
         match self.state {
             ReadState::Init => self.start(),
             ReadState::ReadHead => {

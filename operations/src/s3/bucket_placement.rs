@@ -287,6 +287,9 @@ impl Operation for PutBucketPlacementOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             PutPlacementState::Init => self.start(),
             PutPlacementState::Authorize => {

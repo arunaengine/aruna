@@ -101,6 +101,9 @@ impl Operation for GetUserAccessOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.emit_error(error.clone().into());
+        }
         match self.state {
             GetUserAccessState::Init => self.handle_init(),
             GetUserAccessState::GetUserAccess => self.handle_user_access_received(event),
