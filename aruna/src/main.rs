@@ -837,8 +837,7 @@ async fn bind_servers(
                 cors,
                 metrics,
             )
-            .await
-            .unwrap()
+            .await?
             .with_concurrency_limits(
                 config.rate_limits.s3_max_connections as usize,
                 config.rate_limits.s3_max_requests as usize,
@@ -850,20 +849,18 @@ async fn bind_servers(
                 config.rate_limits.ip_burst,
                 config.rate_limits.principal_per_minute,
                 config.rate_limits.principal_burst,
-            ))
-            .unwrap();
+            ))?;
 
-            let s3_listener = TcpListener::bind(s3_address).await.unwrap();
-            let s3_bound_addr = s3_listener.local_addr().unwrap();
+            let s3_listener = TcpListener::bind(s3_address).await?;
+            let s3_bound_addr = s3_listener.local_addr()?;
             state
                 .register_s3_interface(
                     s3_bound_addr,
                     config.s3_public_url.as_deref().unwrap_or(s3_host),
                 )
                 .await;
-            let (_s3_addr, s3_handle) = s3_server
-                .run_with_listener(s3_listener, shutdown.token())
-                .unwrap();
+            let (_s3_addr, s3_handle) =
+                s3_server.run_with_listener(s3_listener, shutdown.token())?;
             bind_session_s3(
                 session_s3,
                 s3_host,
