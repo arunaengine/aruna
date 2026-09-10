@@ -3,6 +3,10 @@
 //! Determinism is the whole contract: identical inputs must produce identical
 //! rankings on every platform, so no floating point appears outside `#[cfg(test)]`.
 
+use std::cmp::Ordering;
+
+use aruna_core::NodeId;
+
 pub const PLACEMENT_DOMAIN: &[u8] = b"aruna-placement-rendezvous-v3";
 pub const ROLE_LOCATION: u8 = b'L';
 pub const ROLE_NODE: u8 = b'N';
@@ -44,6 +48,61 @@ pub fn neg_log2_q48(h: u64) -> u64 {
         x = y as u64;
     }
     (((z as u64) + 1) << 48) - f
+}
+
+/// Rendezvous rank of one node under `subject`; lower is better.
+pub(crate) fn peer_rank(subject: &[u8], node_id: NodeId) -> u64 {
+    neg_log2_q48(selector_hash(ROLE_NODE, subject, node_id.as_bytes()))
+}
+
+fn rank_order(left: &(u64, NodeId), right: &(u64, NodeId)) -> Ordering {
+    left.0
+        .cmp(&right.0)
+        .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+}
+
+/// Keeps the `limit` best-ranked nodes, ties by node bytes ascending and
+/// deduplicated. Each candidate that leaves the selection is reported to
+/// `on_omitted` in scan order.
+pub(crate) fn select_top_peers<I, F>(
+    nodes: I,
+    subject: &[u8],
+    limit: usize,
+    mut on_omitted: F,
+) -> Vec<NodeId>
+where
+    I: IntoIterator<Item = NodeId>,
+    F: FnMut(NodeId),
+{
+    let mut selected: Vec<(u64, NodeId)> = Vec::with_capacity(limit);
+    for node_id in nodes {
+        if selected.iter().any(|(_, candidate)| *candidate == node_id) {
+            continue;
+        }
+        let score = peer_rank(subject, node_id);
+        if selected.len() < limit {
+            selected.push((score, node_id));
+            continue;
+        }
+        let worst = selected
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| rank_order(left, right))
+            .map(|(index, candidate)| (index, *candidate));
+        match worst {
+            Some((index, (worst_score, worst_node))) => {
+                if (score, node_id.as_bytes()) < (worst_score, worst_node.as_bytes()) {
+                    selected[index] = (score, node_id);
+                    on_omitted(worst_node);
+                } else {
+                    on_omitted(node_id);
+                }
+            }
+            None => on_omitted(node_id),
+        }
+    }
+    selected.sort_unstable_by(rank_order);
+    selected.into_iter().map(|(_, node_id)| node_id).collect()
 }
 
 /// Ranks candidate indices best-first by weighted rendezvous score `-log2(u)/weight`.
