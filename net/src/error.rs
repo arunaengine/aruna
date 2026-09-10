@@ -1,3 +1,4 @@
+use aruna_core::errors::StorageError;
 use iroh::endpoint::VarIntBoundsExceeded;
 use std::time::Duration;
 use thiserror::Error;
@@ -12,6 +13,9 @@ pub enum NetError {
 
     #[error("DHT error: {0}")]
     Dht(String),
+
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
 
     #[error("Stream error: {0}")]
     Stream(String),

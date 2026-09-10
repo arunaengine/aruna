@@ -1393,7 +1393,7 @@ impl NetHandle {
             .await
         {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
             other => Err(NetError::Dht(format!(
                 "unexpected storage event while reading realm config: {other:?}"
             ))),
