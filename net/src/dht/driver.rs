@@ -2942,15 +2942,10 @@ async fn write_response_to_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::make_node;
     use aruna_core::structs::RealmId;
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
-
-    fn make_node(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&bytes).public()
-    }
 
     fn make_entry(seed: u8, key: DhtKeyId, expires_at: u64) -> StoredEntry {
         make_entry_rev(seed, key, expires_at, 1)
