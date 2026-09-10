@@ -10,10 +10,10 @@ use aruna_core::handle::Handle;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
 use aruna_core::structs::{Actor, User};
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::node_info::read_node_info_document;
+use aruna_operations::node::node_info::read_node_info_document;
 use aruna_operations::placement::build_view;
-use aruna_operations::register_or_get_oidc_user::{
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::users::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
 use byteview::ByteView;

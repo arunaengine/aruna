@@ -37,7 +37,7 @@ use aruna_operations::jobs::records::keys::alias_family;
 use aruna_operations::jobs::records::rows::{
     ConflictRecord, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
 };
-use aruna_operations::placement_policy::PolicyCacheEntry;
+use aruna_operations::placement::policy::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -1378,7 +1378,7 @@ fn load_pending_placements(
     for entry in snapshot.iter(&keyspace) {
         let (_, value) = entry.into_inner()?;
         placements.push(
-            aruna_operations::sync_placement::decode_placement(value.as_ref())
+            aruna_operations::sync::shard_placement::decode_placement(value.as_ref())
                 .map_err(|error| ExplorerError::Decode(error.to_string()))?,
         );
     }
@@ -1651,7 +1651,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         ),
         SYNC_PLACEMENT_KEYSPACE => decode_value_with(
             value,
-            aruna_operations::sync_placement::decode_placement,
+            aruna_operations::sync::shard_placement::decode_placement,
             |data| DecodedValue::PendingDocumentPlacement {
                 data: JsonPendingDocumentPlacement(data),
             },
@@ -1977,7 +1977,7 @@ mod tests {
     };
     use aruna_net::dht::storage::StoredEntry;
     use aruna_operations::jobs::records::rows::PROJECTION_CACHE_VERSION;
-    use aruna_operations::placement_policy::PolicyCacheEntry;
+    use aruna_operations::placement::policy::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -2777,14 +2777,14 @@ mod tests {
         };
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
         let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
-        let placement = aruna_operations::sync_placement::new_placement(
+        let placement = aruna_operations::sync::shard_placement::new_placement(
             realm_id,
             placement_ref,
             authoritative_node_id,
             vec![selected_peer],
         );
         let value = postcard::to_allocvec(&placement).unwrap();
-        let key = aruna_operations::sync_placement::placement_key(realm_id, &placement_ref);
+        let key = aruna_operations::sync::shard_placement::placement_key(realm_id, &placement_ref);
 
         let decoded = decode_entry(SYNC_PLACEMENT_KEYSPACE, key.as_ref(), &value);
         assert_eq!(

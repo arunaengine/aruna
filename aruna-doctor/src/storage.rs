@@ -512,12 +512,12 @@ mod tests {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::claim_initial_realm_admin::{
+    use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
+    use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use aruna_operations::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::s3::create_bucket::CreateBucketOperation;
     use aruna_operations::s3::create_user_access::{
         CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
