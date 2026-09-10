@@ -1,4 +1,4 @@
-use crate::document_sync_outbox::{
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
@@ -28,8 +28,8 @@ use thiserror::Error;
 use tracing::{trace, warn};
 use ulid::Ulid;
 
+use crate::groups::update_group::{MAX_GROUP_NAME_LEN, normalize_group_name};
 use crate::placement::placement_ref_for_target;
-use crate::update_group::{MAX_GROUP_NAME_LEN, normalize_group_name};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -673,8 +673,8 @@ impl Operation for CreateGroupOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{
@@ -1197,7 +1197,7 @@ mod test {
         let second = drive(CreateGroupOperation::new(capped("second")), &context).await;
         assert!(matches!(
             second,
-            Err(crate::create_group::CreateGroupError::OwnedGroupLimitReached { limit: 1 })
+            Err(crate::groups::create_group::CreateGroupError::OwnedGroupLimitReached { limit: 1 })
         ));
 
         // Uncapped (realm admin) creation still works past the limit.

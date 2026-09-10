@@ -25,14 +25,14 @@ use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
-};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::placement::placement_ref_for_target;
-use crate::replicate_documents::replicate_documents_effect;
+use crate::sync::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
+use crate::sync::replicate_documents::replicate_documents_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddUserToGroupInput {
@@ -888,12 +888,12 @@ pub mod test {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::add_user_to_group::{
+    use crate::driver::{DriverContext, drive};
+    use crate::groups::add_user_to_group::{
         AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation, AddUserToGroupState,
     };
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

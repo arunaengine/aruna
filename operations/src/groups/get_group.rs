@@ -310,9 +310,9 @@ impl Operation for GetGroupOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::get_group::{GetGroupConfig, GetGroupOperation};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
     use aruna_core::structs::Actor;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -390,7 +390,7 @@ mod test {
         assert!(effects.is_empty());
         assert!(matches!(
             operation.finalize(),
-            Err(crate::get_group::GetGroupError::UnexpectedEvent { .. })
+            Err(crate::groups::get_group::GetGroupError::UnexpectedEvent { .. })
         ));
     }
 }
