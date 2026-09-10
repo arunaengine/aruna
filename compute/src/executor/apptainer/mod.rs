@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
@@ -16,13 +14,14 @@ use aruna_core::compute::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::channel::ChannelStream;
 use super::config::ApptainerConfig;
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
@@ -1020,16 +1019,6 @@ async fn stream_file(path: PathBuf, tx: mpsc::Sender<Result<Bytes, BackendError>
     .await;
     if let Err(error) = result {
         let _ = tx.send(Err(error)).await;
-    }
-}
-
-struct ChannelStream(mpsc::Receiver<Result<Bytes, BackendError>>);
-
-impl Stream for ChannelStream {
-    type Item = Result<Bytes, BackendError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(context)
     }
 }
 
