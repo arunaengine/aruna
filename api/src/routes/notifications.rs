@@ -12,8 +12,8 @@ use aruna_core::structs::{
     NotificationRecord, Permission, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
     WatchSubscription, data_watch_resource_path, parse_data_watch_resource_path,
 };
-use aruna_operations::dashboard::subscribe_dashboard_changes;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::node::dashboard::subscribe_dashboard_changes;
 use aruna_operations::notifications::dispatch::{
     InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
     delete_watch_for_user, list_notifications_for_user, list_watches_for_user, mark_read_for_user,
@@ -388,7 +388,7 @@ async fn authorize_watch(
         auth,
         permission_path,
         Permission::READ,
-        aruna_operations::request_policy::PolicyRequestExtras::operation(
+        aruna_operations::auth::request_policy::PolicyRequestExtras::operation(
             "notifications.create_watch",
         ),
     )

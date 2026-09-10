@@ -15,8 +15,8 @@ use aruna_core::metrics::NodeMetrics;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::queue_lag::{QueueLagReporter, QueueLagSnapshot};
-use aruna_operations::startup::{RecoveryOutcome, RecoveryState, RecoveryStatus};
+use aruna_operations::node::startup::{RecoveryOutcome, RecoveryState, RecoveryStatus};
+use aruna_operations::tasks::queue_lag::{QueueLagReporter, QueueLagSnapshot};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -623,7 +623,7 @@ async fn register_queue_metrics(metrics: &NodeMetrics, ctx: Arc<DriverContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_operations::startup::RecoveryError;
+    use aruna_operations::node::startup::RecoveryError;
     use aruna_storage::{FjallStorage, StorageHandle};
     use axum::body::{Body, to_bytes};
     use http::Request;

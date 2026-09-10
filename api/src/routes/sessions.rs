@@ -311,7 +311,7 @@ mod tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef};
     use aruna_core::types::UserId;
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 

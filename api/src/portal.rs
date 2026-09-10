@@ -208,8 +208,8 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, RealmId};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::body::{Body, to_bytes};

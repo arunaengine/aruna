@@ -11,6 +11,7 @@ use aruna_core::structs::{
     SyncState, SyncStatusSnapshot, blob_bucket_permission_path, ensure_confined_relative_path,
 };
 use aruna_core::util::unix_timestamp_millis;
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::replication::protocol::ReplicationMode;
@@ -18,13 +19,12 @@ use aruna_operations::replication::queue::{QueueBlobReplicationOperation, relati
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::sync_mirror_repair::{
+use aruna_operations::sync::sync_mirror_repair::{
     SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
 };
-use aruna_operations::sync_relationship::{
+use aruna_operations::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, ListSyncRelationshipsOperation,
     StoreSyncRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
     create_sync_relationship, remove_outgoing_relationship,

@@ -429,7 +429,7 @@ mod tests {
     use aruna_core::compute::Secret;
     use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::structs::{AssistantHeaders, AssistantProviderSecret, AssistantProviderStatus};
-    use aruna_operations::assistant_provider::CreateProviderOperation;
+    use aruna_operations::assistant::provider::CreateProviderOperation;
     use aruna_operations::driver::drive;
     use axum::body::Bytes;
     use axum::response::IntoResponse;

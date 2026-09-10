@@ -25,8 +25,8 @@ use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
 };
 use aruna_operations::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
+use aruna_operations::device::intake::{IntakeEntry, IntakeState};
 use aruna_operations::device::list_drafts::ListDraftsOperation;
-use aruna_operations::device::repository::{IntakeEntry, IntakeState};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile_validation::preview_submission;
 use aruna_operations::metadata::public_preview::restricted_files;
@@ -464,7 +464,7 @@ mod tests {
         Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::UserId;
-    use aruna_operations::device::repository::{IntakeEntry, IntakeState};
+    use aruna_operations::device::intake::{IntakeEntry, IntakeState};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_operations::metadata::MetadataHandle;

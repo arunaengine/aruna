@@ -9,12 +9,12 @@ use aruna_core::request_policy::{
 };
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::set_group_policies::{
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::groups::set_group_policies::{
     SetGroupPoliciesConfig, SetGroupPoliciesError, SetGroupPoliciesOperation,
 };
-use aruna_operations::set_realm_policies::{
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::set_realm_policies::{
     SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
 };
 use axum::extract::{Path, Query, State};
@@ -301,7 +301,7 @@ async fn realm_policies(
     .await
     {
         Ok(config) => Ok(config.request_policies),
-        Err(aruna_operations::get_realm_config::GetRealmConfigError::DocumentNotFound) => {
+        Err(aruna_operations::realm::get_realm_config::GetRealmConfigError::DocumentNotFound) => {
             Ok(Vec::new())
         }
         Err(error) => Err(ServerError::InternalError(error.to_string())),
@@ -322,8 +322,8 @@ async fn group_policies(
     {
         Ok((_, auth_doc)) => Ok(auth_doc.policies),
         Err(
-            aruna_operations::get_group::GetGroupError::GroupNotFound
-            | aruna_operations::get_group::GetGroupError::AuthDocNotFound,
+            aruna_operations::groups::get_group::GetGroupError::GroupNotFound
+            | aruna_operations::groups::get_group::GetGroupError::AuthDocNotFound,
         ) => Ok(Vec::new()),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
@@ -1064,12 +1064,12 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::structs::{NodeCapabilities, RealmId};
-    use aruna_operations::claim_initial_realm_admin::{
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use aruna_operations::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::DriverContext;
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use ulid::Ulid;

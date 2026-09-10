@@ -2,7 +2,7 @@ use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
 use aruna_core::metadata::{MetadataProfileValidationFinding, MetadataValidationViolation};
-use aruna_operations::auth::ArunaBearerTokenError;
+use aruna_operations::auth::bearer_token::ArunaBearerTokenError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

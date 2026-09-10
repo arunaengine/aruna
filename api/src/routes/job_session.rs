@@ -13,10 +13,10 @@ use aruna_compute::session::{
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{AuthContext, JobId, JobPayload, JobRecord, JobState, key_content_type};
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::service::read_session_reason;
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::s3::copy_object::{CopyObjectInput, CopySourceConditions, copy_object};
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use axum::extract::{Path, Query, State};

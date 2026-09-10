@@ -999,7 +999,7 @@ async fn compute_probe(
     server: &McpServer,
     auth: &aruna_core::structs::AuthContext,
     permission: Permission,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, permission, extras)
         .await

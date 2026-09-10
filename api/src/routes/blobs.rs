@@ -5,7 +5,7 @@ use aruna_core::structs::{
     AuthContext, BucketInfo, CopyOrigin, Permission, blob_bucket_permission_path,
     blob_object_permission_path,
 };
-use aruna_operations::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
+use aruna_operations::blob::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::location_summary::{
     LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,

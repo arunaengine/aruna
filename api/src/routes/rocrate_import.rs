@@ -9,13 +9,13 @@ use aruna_core::structs::{
     ImportRoCrateTarget, JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType,
     blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
 };
-use aruna_operations::create_metadata_document::mint_job_document;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::jobs::import::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
     load_rocrate_upload,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
+use aruna_operations::metadata::create_metadata_document::mint_job_document;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{

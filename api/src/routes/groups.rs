@@ -12,38 +12,40 @@ use aruna_core::structs::{
     usage_group_key,
 };
 use aruna_core::types::RoleId;
-use aruna_operations::add_group_role::{
-    AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
-};
-use aruna_operations::add_user_to_group::{
-    AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
-};
-use aruna_operations::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::groups::add_group_role::{
+    AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
+};
+use aruna_operations::groups::add_user_to_group::{
+    AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
+};
+use aruna_operations::groups::create_group::{
+    CreateGroupConfig, CreateGroupError, CreateGroupOperation,
+};
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_operations::groups::list_groups::ListGroupOperation;
+use aruna_operations::groups::remove_group_role::{
+    RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
+};
+use aruna_operations::groups::remove_user_from_group::{
+    RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
+};
+use aruna_operations::groups::update_group::{
+    UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
+};
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::forward::{
     ForwardGroupError, forward_group_create, is_user_origin,
 };
 use aruna_operations::metadata::stats::count_group_documents_by_purpose;
-use aruna_operations::remove_group_role::{
-    RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
-};
-use aruna_operations::remove_user_from_group::{
-    RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
-};
-use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
 };
-use aruna_operations::update_group::{
-    UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
-};
+use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -1011,7 +1013,7 @@ pub(crate) async fn run_group_usage(
     let local = crate::routes::info::load_usage_counters(state, usage_group_key(group_id)).await?;
     let realm = crate::routes::info::load_realm_usage(
         state,
-        aruna_operations::usage_stats::RealmUsageScope::Group(group_id),
+        aruna_operations::node::usage_stats::RealmUsageScope::Group(group_id),
     )
     .await?;
 
@@ -2015,7 +2017,7 @@ mod tests {
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::driver::drive;
-    use aruna_operations::list_groups::ListGroupOperation;
+    use aruna_operations::groups::list_groups::ListGroupOperation;
     use aruna_storage::storage;
     use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
@@ -2179,8 +2181,8 @@ mod tests {
             realm_id,
         };
         drive(
-            aruna_operations::create_realm::CreateRealmOperation::new(
-                aruna_operations::create_realm::CreateRealmConfig {
+            aruna_operations::realm::create_realm::CreateRealmOperation::new(
+                aruna_operations::realm::create_realm::CreateRealmConfig {
                     actor: actor.clone(),
                     realm_description: "groups".to_string(),
                     oidc_providers: Vec::new(),
@@ -2194,8 +2196,8 @@ mod tests {
         .await
         .unwrap();
         drive(
-            aruna_operations::claim_initial_realm_admin::ClaimInitialRealmAdminOperation::new(
-                aruna_operations::claim_initial_realm_admin::ClaimInitialRealmAdminInput { actor },
+            aruna_operations::realm::claim_initial_realm_admin::ClaimInitialRealmAdminOperation::new(
+                aruna_operations::realm::claim_initial_realm_admin::ClaimInitialRealmAdminInput { actor },
             ),
             &driver_ctx,
         )
@@ -2223,7 +2225,7 @@ mod tests {
     ) {
         let realm_id = state.get_realm_id();
         let mut config = drive(
-            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            aruna_operations::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
             &state.get_ctx(),
         )
         .await

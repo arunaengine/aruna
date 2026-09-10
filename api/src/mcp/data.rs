@@ -10,7 +10,7 @@ use aruna_core::structs::{
     blob_object_permission_path, key_content_type,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
@@ -873,7 +873,7 @@ pub(crate) async fn read_text(
     server: &McpServer,
     auth: &AuthContext,
     input: ReadObjectInput,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<ReadObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let max_bytes = bounded_bytes(input.max_bytes)?;
@@ -964,7 +964,7 @@ pub(crate) async fn write_text(
     server: &McpServer,
     auth: &AuthContext,
     input: WriteObjectInput,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<WriteObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let size = input.text.len();
@@ -1142,7 +1142,7 @@ fn encode_cursor(cursor: &ListObjectsV2ContinuationToken) -> Result<String, Call
 async fn authorize_search(
     server: &McpServer,
     auth: &AuthContext,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(server.state.as_ref(), auth, Permission::READ, extras)
         .await

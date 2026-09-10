@@ -11,7 +11,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::location_summary::{
     LocationSummaryError, RemoteLocationSummaryOperation,
 };

@@ -4,15 +4,15 @@ use super::{
     parse_ulid, request_auth, server_error, tool_extras,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
-use aruna_operations::create_metadata_document::CreateMetadataDocumentPayload;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, MetadataDocumentQueryRequest, MetadataQueryRequest,
     MetadataReferencesRequest, MetadataRoCrateExportView, MetadataSearchRequest, query_metadata,
     query_metadata_document, references_metadata, search_metadata,
 };
+use aruna_operations::metadata::create_metadata_document::CreateMetadataDocumentPayload;
 use aruna_operations::metadata::forward::{export_rocrate_routed, update_metadata_document_routed};
 use aruna_operations::metadata::profile_validation::preview_submission;
-use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -709,7 +709,7 @@ async fn metadata_probe(
     server: &McpServer,
     auth: &AuthContext,
     _tool: &str,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, Permission::READ, extras)
         .await
@@ -727,7 +727,7 @@ async fn authorize_summary(
     path: &str,
     document_id: &str,
     _tool: &str,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     let group_id = crate::auth::parse_group_id(group_id).map_err(server_error)?;
     let document_id =

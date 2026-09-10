@@ -6,7 +6,7 @@ use aruna_core::structs::{
     blob_bucket_permission_path, target_warnings,
 };
 use aruna_operations::driver::{drive, node_routing};
-use aruna_operations::group_routing::{
+use aruna_operations::groups::storage_routing::{
     GetGroupRoutingOperation, GroupRoutingInputsOperation, PutGroupRoutingError,
     PutGroupRoutingOperation,
 };
