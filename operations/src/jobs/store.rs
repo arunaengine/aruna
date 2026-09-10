@@ -288,17 +288,16 @@ where
             .await
             .map_err(JobMutationError::Storage)?;
         match Box::pin(mutate_in_txn(storage, txn_id, job_id, &mut mutate, None)).await {
-            Ok(record) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(record),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
-                }
-                CommitResult::Conflict => {
-                    return Err(JobMutationError::Storage(
-                        "job mutation exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            Ok(record) => match commit_write(
+                storage,
+                txn_id,
+                attempt,
+                "job mutation exhausted conflict retries",
+            )
+            .await?
+            {
+                CommitStep::Committed => return Ok(record),
+                CommitStep::Retry => continue,
             },
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -344,17 +343,16 @@ where
         ))
         .await
         {
-            Ok(record) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(record),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
-                }
-                CommitResult::Conflict => {
-                    return Err(JobMutationError::Storage(
-                        "job mutation exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            Ok(record) => match commit_write(
+                storage,
+                txn_id,
+                attempt,
+                "job mutation exhausted conflict retries",
+            )
+            .await?
+            {
+                CommitStep::Committed => return Ok(record),
+                CommitStep::Retry => continue,
             },
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -486,15 +484,16 @@ async fn put_job_checkpoint(
         }
         .await;
         match result {
-            Ok(()) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(()),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-                CommitResult::Conflict => {
-                    return Err(JobMutationError::Storage(
-                        "checkpoint write exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            Ok(()) => match commit_write(
+                storage,
+                txn_id,
+                attempt,
+                "checkpoint write exhausted conflict retries",
+            )
+            .await?
+            {
+                CommitStep::Committed => return Ok(()),
+                CommitStep::Retry => continue,
             },
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -544,15 +543,16 @@ pub async fn put_job_entry<T: Serialize>(
         }
         .await;
         match result {
-            Ok(()) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(()),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-                CommitResult::Conflict => {
-                    return Err(JobMutationError::Storage(
-                        "job entry write exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            Ok(()) => match commit_write(
+                storage,
+                txn_id,
+                attempt,
+                "job entry write exhausted conflict retries",
+            )
+            .await?
+            {
+                CommitStep::Committed => return Ok(()),
+                CommitStep::Retry => continue,
             },
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -1589,15 +1589,16 @@ pub async fn record_attempt_intent(
         }
         .await;
         match result {
-            Ok(commit) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(commit),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-                CommitResult::Conflict => {
-                    return Err(JobMutationError::Storage(
-                        "attempt commit exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            Ok(commit) => match commit_write(
+                storage,
+                txn_id,
+                attempt,
+                "attempt commit exhausted conflict retries",
+            )
+            .await?
+            {
+                CommitStep::Committed => return Ok(commit),
+                CommitStep::Retry => continue,
             },
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -1723,15 +1724,16 @@ where
         }
         .await;
         match result {
-            Ok(value) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(value),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-                CommitResult::Conflict => {
-                    return Err(JobMutationError::Storage(
-                        "attempt mutation exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            Ok(value) => match commit_write(
+                storage,
+                txn_id,
+                attempt,
+                "attempt mutation exhausted conflict retries",
+            )
+            .await?
+            {
+                CommitStep::Committed => return Ok(value),
+                CommitStep::Retry => continue,
             },
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -2398,6 +2400,29 @@ async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> CommitResult {
         }) => CommitResult::Conflict,
         Event::Storage(StorageEvent::Error { error }) => CommitResult::Failed(error.to_string()),
         other => CommitResult::Failed(format!("unexpected storage event: {other:?}")),
+    }
+}
+
+pub(super) enum CommitStep {
+    Committed,
+    Retry,
+}
+
+/// Commits one write transaction, sleeping between bounded conflict retries.
+pub(super) async fn commit_write(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    attempt: u32,
+    exhausted: &str,
+) -> Result<CommitStep, JobMutationError> {
+    match commit_txn(storage, txn_id).await {
+        CommitResult::Committed => Ok(CommitStep::Committed),
+        CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
+            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+            Ok(CommitStep::Retry)
+        }
+        CommitResult::Conflict => Err(JobMutationError::Storage(exhausted.to_string())),
+        CommitResult::Failed(error) => Err(JobMutationError::Storage(error)),
     }
 }
 
