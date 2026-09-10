@@ -3558,7 +3558,7 @@ fn holds_metadata_id(
         .is_ok_and(|placement| holds_placement(config, &placement, local_node_id))
 }
 
-fn read_error(error: MetadataApiError) -> MetadataReadError {
+pub(crate) fn read_error(error: MetadataApiError) -> MetadataReadError {
     match error {
         MetadataApiError::Unauthorized => MetadataReadError::Unauthorized,
         MetadataApiError::Forbidden => MetadataReadError::Forbidden,

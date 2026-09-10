@@ -2957,7 +2957,7 @@ pub async fn references_preflight(
                 endpoint,
             )
             .await
-            .map_err(preflight_read_error)
+            .map_err(super::forward::read_error)
         },
     );
     let remote_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> = metadata_node_call(
@@ -3164,15 +3164,6 @@ fn preflight_fingerprint(
         &postcard::to_allocvec(targets).expect("preflight cursor fingerprint payload serializes"),
     );
     *hasher.finalize().as_bytes()
-}
-
-pub(crate) fn preflight_read_error(error: MetadataApiError) -> MetadataReadError {
-    match error {
-        MetadataApiError::Unauthorized => MetadataReadError::Unauthorized,
-        MetadataApiError::Forbidden => MetadataReadError::Forbidden,
-        MetadataApiError::NotFound => MetadataReadError::NotFound,
-        _ => MetadataReadError::Unavailable,
-    }
 }
 
 async fn resolve_graph_reference(
