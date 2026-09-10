@@ -1,12 +1,6 @@
-//! Per-node execution of placement transitions.
-//!
-//! Nobody drives a transition centrally (DECISIONS D9): every node acts on its
-//! own replicated observation of the record and the reducer settles the result.
-//! An old holder freezes its frontier; a target holder joins the existing topic,
-//! pulls its complete history, verifies it against an old holder with the shard
-//! manifest machinery, and signs the digest it converged on. A target never
-//! mints a genesis - with every source unreachable the bucket stalls instead
-//! (#400), because a rival genesis is a permanent split-brain.
+//! Per-node execution of placement transitions (DECISIONS D9): old holders freeze
+//! their frontier; targets join, pull, verify and sign the converged digest. A
+//! target never mints a genesis (#400): a rival genesis is a permanent split-brain.
 
 use std::sync::Arc;
 
@@ -20,13 +14,13 @@ use aruna_core::types::UserId;
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
-use crate::mutate_realm_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
-    is_management,
-};
 use crate::placement::fence;
 use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
+};
+use crate::realm::mutate_realm_placement::{
+    MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
+    is_management,
 };
 use crate::shard::verify::converge_with_barrier;
 use crate::shard::{assemble_shard_manifest, frontier_root};
@@ -150,7 +144,7 @@ pub async fn process_placement_transitions(
     // leaves it a member only until the grace elapses, so whatever it accepted
     // before the cutover has to reach the topic inside that window.
     if departed {
-        crate::task_incoming::drive_document_sync_outbox_drain(context.clone()).await;
+        crate::tasks::task_incoming::drive_document_sync_outbox_drain(context.clone()).await;
     }
     pending
 }
@@ -179,9 +173,8 @@ fn transition_stale(config: &RealmConfigDocument, transition: &PlacementTransiti
 }
 
 /// Closes the bucket's write fence, then reports it drained once no journalled
-/// eviction and no record of a closed generation remains. The close comes first
-/// and is durable: without it an empty scan says nothing about a write that
-/// resolved the bucket before the cutover and commits its row afterwards.
+/// eviction and no closed-generation record remains. The durable close comes
+/// first: an empty scan alone proves nothing about a pre-cutover writer.
 async fn drain_step(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -249,10 +242,10 @@ async fn drain_blocker(
     {
         return Some(DrainBlocker::Eviction);
     }
-    for prefix in crate::document_sync_outbox::outbox_stream_prefixes() {
+    for prefix in crate::sync::document_sync_outbox::outbox_stream_prefixes() {
         let mut start_after: Option<Vec<u8>> = None;
         loop {
-            let batch = match crate::document_sync_outbox::read_outbox_records(
+            let batch = match crate::sync::document_sync_outbox::read_outbox_records(
                 &context.storage_handle,
                 prefix,
                 start_after.take(),
@@ -364,7 +357,7 @@ async fn completion_step(
         let event = net_handle
             .sync_document_topics(vec![topic], sources.clone())
             .await;
-        crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+        crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
     }
 
     let mut required = irokle::ActorClock::default();
@@ -488,10 +481,8 @@ async fn submit_steps(
 }
 
 /// Starts the successor expansion for a strategy whose activations trail the
-/// newest map once its active transition is terminal (F10): a join during an
-/// active expansion publishes the newer map, and this picks it up. Only the
-/// strategy's rank-0 node under the newest map issues the plan; everyone else
-/// reports pending so their timer keeps watching.
+/// newest map once its active transition is terminal (F10). Only a management
+/// node issues the plan; everyone else reports pending so their timer keeps watching.
 async fn ensure_expansions(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -516,10 +507,9 @@ async fn ensure_expansions(
         }) {
             continue;
         }
-        // Successors only: the first expansion is onboarding's to issue, so a
-        // record for the strategy must already exist. A lagging node that has
-        // the newest map but not yet the started record can then never
-        // double-issue inside the publish-to-start window.
+        // Successors only: the first expansion is onboarding's, so a record for
+        // the strategy must already exist. This stops a lagging node from
+        // double-issuing inside the publish-to-start window.
         if !config
             .placement_transitions
             .iter()
@@ -579,8 +569,7 @@ async fn ensure_expansions(
 
 /// Activates the newest map for a strategy that has none, publishing the
 /// successor map first when that map predates the strategy. Only a management
-/// node issues either; the activation record is an immutable value, so a
-/// concurrent duplicate coalesces.
+/// node issues either; concurrent duplicates coalesce as immutable values.
 async fn ensure_strategy_activations(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -600,7 +589,9 @@ async fn ensure_strategy_activations(
     // The successor map is durable in the local config the moment it commits,
     // so the activations it unblocks resolve in this pass. Deferring them to
     // the retry interval leaves the node owing work after it reports quiet.
-    if let Some(published) = crate::process_placements::load_realm_config(context, realm_id).await {
+    if let Some(published) =
+        crate::placement::process_placements::load_realm_config(context, realm_id).await
+    {
         activate_newest_map(context, realm_id, local_node_id, &published).await;
     }
     pending
@@ -657,14 +648,9 @@ async fn activate_newest_map(
     (pending, unfrozen)
 }
 
-/// Freezes a strategy the newest map predates into its successor, so a
-/// strategy created after that map cannot stay unresolvable forever. Returns
-/// whether this node published one.
-///
-/// The epoch is published by one deterministic issuer and derived
-/// byte-identically from the config, so a second issuer's copy coalesces in
-/// the reducer instead of leaving the epoch conflicted and unusable. A stale
-/// caller view cannot stream epochs: admission rejects an occupied epoch.
+/// Freezes a strategy the newest map predates into its successor. The epoch is
+/// derived byte-identically, so a second issuer's copy coalesces rather than
+/// conflicting; admission rejects an occupied epoch.
 async fn publish_successor_map(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -685,9 +671,8 @@ async fn publish_successor_map(
 }
 
 /// The realm's candidate-map issuer: the lowest-id Management node. Publishing
-/// from every Management node at once risks two divergent values at one epoch,
-/// which keeps that epoch permanently unusable. A removed issuer hands the
-/// role to the next node; an unreachable one defers publication.
+/// from every Management node risks divergent values at one epoch, which stays
+/// permanently unusable. A removed issuer hands the role to the next node.
 fn map_publisher(config: &RealmConfigDocument) -> Option<&str> {
     config
         .nodes
@@ -704,7 +689,7 @@ async fn config_activation(
     realm_id: RealmId,
     placement: &PlacementRef,
 ) -> Option<u64> {
-    let config = crate::process_placements::load_realm_config(context, realm_id).await?;
+    let config = crate::placement::process_placements::load_realm_config(context, realm_id).await?;
     config
         .activation(&placement.strategy_id, placement.shard)
         .map(|activation| activation.activation_epoch)
@@ -893,7 +878,7 @@ mod tests {
     }
 
     async fn load_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigDocument {
-        crate::process_placements::load_realm_config(context, realm_id)
+        crate::placement::process_placements::load_realm_config(context, realm_id)
             .await
             .expect("the realm config is stored")
     }
@@ -1133,7 +1118,7 @@ mod tests {
             kind: aruna_core::document::DocumentSyncChangeKind::Delete,
             placement,
         };
-        let record = crate::document_sync_outbox::new_outbox_record_with_id(
+        let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
             Ulid::from_bytes([seed; 16]),
             node(1),
             DocumentSyncTarget::MetadataDocumentLifecycle {
@@ -1146,7 +1131,8 @@ mod tests {
         )
         .fenced_at(generation);
         let (key_space, key, value) =
-            crate::document_sync_outbox::outbox_write_entry(&record).expect("the row encodes");
+            crate::sync::document_sync_outbox::outbox_write_entry(&record)
+                .expect("the row encodes");
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1182,7 +1168,7 @@ mod tests {
         );
         assert_eq!(closed_generation(&context, realm_id, &placement).await, 1);
 
-        crate::document_sync_outbox::delete_outbox_records(
+        crate::sync::document_sync_outbox::delete_outbox_records(
             &context.storage_handle,
             vec![predecessor],
         )
