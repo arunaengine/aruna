@@ -10,5 +10,7 @@ pub mod placement;
 pub mod protocol;
 pub mod prune;
 pub mod routing;
+#[cfg(test)]
+mod test_support;
 pub mod unread;
 pub mod watch;

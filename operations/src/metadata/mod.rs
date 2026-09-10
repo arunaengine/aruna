@@ -22,6 +22,8 @@ mod search_enrichment;
 pub mod stats;
 mod summary_cache;
 pub mod sync_pull;
+#[cfg(test)]
+mod test_support;
 pub mod timestamp_index;
 pub mod visibility_index;
 

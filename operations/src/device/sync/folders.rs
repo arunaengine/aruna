@@ -531,8 +531,8 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::test_support::context;
     use aruna_core::structs::{EntrySide, SyncedBytes};
-    use aruna_storage::FjallStorage;
 
     #[test]
     fn refuses_nested_roots() {
@@ -593,28 +593,13 @@ mod tests {
         }
     }
 
-    async fn context() -> (tempfile::TempDir, Arc<DriverContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        (
-            dir,
-            Arc::new(DriverContext {
-                storage_handle: storage,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            }),
-        )
-    }
-
     // An unbind interrupted after its state was persisted must finish on the
     // next call: the binding is the durable handle on the cleanup, so it may
     // never be missing while rows it owns are still there.
     #[tokio::test]
     async fn resumes_interrupted_unbind() {
         let (_dir, context) = context().await;
+        let context = Arc::new(context);
         let folder = bound_folder(FolderState::Deleting);
         store_folder(&context, &folder).await.expect("row stored");
         let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
@@ -647,6 +632,7 @@ mod tests {
     #[tokio::test]
     async fn marks_folder_deleting() {
         let (_dir, context) = context().await;
+        let context = Arc::new(context);
         let folder = bound_folder(FolderState::Active);
         store_folder(&context, &folder).await.expect("row stored");
 

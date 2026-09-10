@@ -787,25 +787,13 @@ async fn abort_and_classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::test_support::{context, temp_storage, user};
     use aruna_core::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
         RealmId, WatchEventKind, data_watch_resource_path,
     };
-    use aruna_storage::FjallStorage;
-    use tempfile::tempdir;
-
-    fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (dir, storage)
-    }
-
-    fn user(realm: u8, seed: u8) -> UserId {
-        UserId::new(Ulid::from_bytes([seed; 16]), RealmId([realm; 32]))
-    }
 
     fn mask() -> WatchEventMask {
         WatchEventMask::from_kinds([
@@ -820,17 +808,6 @@ mod tests {
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn test_context(storage: StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
     }
 
     async fn install_auth(
@@ -998,11 +975,11 @@ mod tests {
             .expect("dead row create");
         }
 
-        let context = test_context(storage);
+        let driver_ctx = context(&storage);
         let authorized_prefix = data_watch_resource_path(group_id, node_id, "bucket", "reports/");
         assert_eq!(
             create_replicated_watch_subscription(
-                &context,
+                &driver_ctx,
                 node_id,
                 owner,
                 authorized_prefix,
@@ -1014,7 +991,7 @@ mod tests {
             Err(WatchSubscriptionError::CapExceeded)
         );
         assert_eq!(
-            list_watch_subscriptions(&context.storage_handle, owner)
+            list_watch_subscriptions(&driver_ctx.storage_handle, owner)
                 .await
                 .expect("durable rows remain listable")
                 .len(),

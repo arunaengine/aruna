@@ -346,18 +346,15 @@ async fn batch_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::test_support::{context, record, temp_storage, user};
     use aruna_core::storage_entries::{
         notification_inbox_update_entry, notification_inbox_write_entries,
     };
-    use aruna_core::structs::{NotificationKind, RealmId};
     use aruna_core::types::UserId;
-    use aruna_storage::FjallStorage;
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use tempfile::tempdir;
     use tokio::sync::mpsc;
-    use ulid::Ulid;
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -370,44 +367,6 @@ mod tests {
         async fn handle_timer(&self, key: TaskKey) {
             let _ = self.seen.send(key).await;
         }
-    }
-
-    fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (dir, storage)
-    }
-
-    fn context(storage: &StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
-
-    fn user(realm: u8, u: u8) -> UserId {
-        UserId::new(Ulid::from_bytes([u; 16]), RealmId([realm; 32]))
-    }
-
-    fn record(
-        recipient: UserId,
-        class: NotificationClass,
-        created_at_ms: u64,
-    ) -> NotificationRecord {
-        NotificationRecord::new(
-            recipient,
-            class,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: user(1, 200),
-            },
-            created_at_ms,
-        )
     }
 
     /// Writes rows directly so fixtures can exceed the upsert-time transient cap.

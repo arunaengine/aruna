@@ -381,6 +381,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unexpected_event() {
+        let mut op = ResolveBlobPermissionPathsOperation::new([7u8; 32]);
+        op.start();
+        let txn_id = Ulid::generate();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+
+        let effects = op.step(Event::Search());
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(ResolveBlobPermissionPathsError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
     fn rejects_alias_overflow() {
         let mut op = ResolveBlobPermissionPathsOperation::new([10u8; 32]);
         op.start();

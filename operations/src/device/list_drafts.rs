@@ -135,28 +135,11 @@ mod tests {
     use super::ListDraftsOperation;
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::repository::{INTAKE_PAGE_SIZE, IntakeEntry};
-    use crate::driver::{DriverContext, drive};
+    use crate::device::test_support::context;
+    use crate::driver::drive;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
-    use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
-
-    async fn context() -> (tempfile::TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        (
-            tempdir,
-            DriverContext {
-                storage_handle,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            },
-        )
-    }
 
     #[tokio::test]
     async fn lists_queued_drafts() {

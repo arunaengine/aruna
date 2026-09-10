@@ -179,15 +179,11 @@ async fn restore_notification_outbox_timer_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{
-        NotificationClass, NotificationKind, RealmId, notification_outbox_key,
-    };
-    use aruna_core::types::UserId;
-    use aruna_storage::FjallStorage;
+    use crate::notifications::test_support::{record, temp_storage, user};
+    use aruna_core::structs::{NotificationClass, notification_outbox_key};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use tempfile::tempdir;
     use tokio::sync::{Semaphore, mpsc};
 
     struct RecordingHandler {
@@ -219,29 +215,10 @@ mod tests {
         }
     }
 
-    fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (dir, storage)
-    }
-
-    fn make_record() -> NotificationRecord {
-        NotificationRecord::new(
-            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32])),
-            },
-            1_000,
-        )
-    }
-
     fn outbox_record_with_id(id: Ulid) -> NotificationOutboxRecord {
         NotificationOutboxRecord {
             outbox_id: id,
-            record: make_record(),
+            record: record(user(1, 2), NotificationClass::Direct, 1_000),
         }
     }
 
