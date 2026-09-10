@@ -42,7 +42,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::queue_backoff::{due_after, queue_retry_after_ms};
+use crate::tasks::queue_backoff::{due_after, queue_retry_after_ms};
 
 use super::iri_index::MetadataIriIndexError;
 use super::profile_validation::{assess_render, violation_count};
@@ -50,7 +50,7 @@ use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
     start_write_transaction,
 };
-use super::raw::{MetadataRawReadError, RawStateCache};
+use super::raw_revision::{MetadataRawReadError, RawStateCache};
 use super::repository::{
     StorageReadError, parse_graph_lifecycle_read, parse_materialization_status_read,
     read_graph_lifecycle_effect, read_materialization_status_effect,
@@ -532,10 +532,9 @@ async fn finish_chunks(
     Ok(())
 }
 
-// The IRI reference index cannot be scanned per document, so this walks the
-// whole keyspace: once per batch, never once per chunk. Cleanup only, so it
-// runs after the chunks commit rather than inside them, and a failure is parked
-// durably: the finished jobs are gone, so nothing else would retry it.
+// The IRI index cannot be scanned per document, so this walks the whole keyspace
+// once per batch. Cleanup only, it runs after the chunks commit; a failure is
+// parked durably because the finished jobs are gone and nothing else would retry.
 async fn prune_superseded_rows(
     storage: &StorageHandle,
     mut superseding: HashMap<Ulid, Ulid>,
@@ -962,7 +961,7 @@ fn parked_dead_letter(
 }
 
 fn requeue_after_ms(parks: u32) -> u64 {
-    crate::queue_backoff::retry_after_ms(
+    crate::tasks::queue_backoff::retry_after_ms(
         parks.saturating_sub(1),
         DEAD_LETTER_REQUEUE_BASE_MS,
         DEAD_LETTER_REQUEUE_MAX_MS,
@@ -1294,10 +1293,9 @@ async fn read_document_job(
     }
 }
 
-// The due index is due-ordered and its rows are valid only when the sidecar row
-// exists with a matching due time. Rows resolve in slices of the outstanding
-// limit, each slice costing three batch reads, and a page prunes its dead rows
-// in one delete: a full batch costs O(slices) requests, not O(due jobs).
+// The due index is due-ordered and a row is valid only when the sidecar row
+// matches its due time. Rows resolve in slices of the outstanding limit; a page
+// prunes dead rows at once, so a full batch costs O(slices) requests.
 async fn scan_due_materialization_jobs(
     storage: &StorageHandle,
     now_ms: u64,
@@ -2094,7 +2092,8 @@ async fn materialize_create_event(
     if let MetadataCreateEventPayload::ApplyBatch { batch, .. } = &event.payload {
         return merge_batch_event(context, event, batch, raw_state_cache).await;
     }
-    let raw_plan = crate::metadata::raw::prepare_raw_event(context, event, raw_state_cache).await?;
+    let raw_plan =
+        crate::metadata::raw_revision::prepare_raw_event(context, event, raw_state_cache).await?;
     let metadata_handle = context
         .metadata_handle
         .as_ref()
@@ -2124,10 +2123,9 @@ async fn materialize_create_event(
     }
 }
 
-/// Merges the origin's batch, then re-renders and re-validates the graph.
-///
-/// The merge is order independent and idempotent by dot, so every holder ends
-/// at the same graph whatever order the events arrive in.
+/// Merges the origin's batch, then re-renders and re-validates the graph. The
+/// merge is order independent and idempotent by dot, so every holder converges
+/// whatever order events arrive in.
 async fn merge_batch_event(
     context: &DriverContext,
     event: &MetadataCreateEventRecord,
@@ -2196,7 +2194,7 @@ async fn merge_batch_event(
     )
     .await;
     let findings = violation_count(&status);
-    let raw_plan = crate::metadata::raw::prepare_merged_event(
+    let raw_plan = crate::metadata::raw_revision::prepare_merged_event(
         context,
         event,
         render,

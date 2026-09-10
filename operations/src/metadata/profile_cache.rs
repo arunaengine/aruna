@@ -12,10 +12,8 @@ use ulid::Ulid;
 const PROFILE_CACHE_ENTRIES: usize = 64;
 
 /// Shape sources of one Profile revision.
-///
 /// The key carries the revision, so a republished Profile is a different entry
-/// and a cached one is never served for a revision that moved on. Usability is
-/// decided from the registry row before every lookup, never from this cache.
+/// and a stale one is never served; usability is decided from the registry row.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ProfileCacheKey {
     profile_id: Ulid,

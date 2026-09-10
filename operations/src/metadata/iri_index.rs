@@ -397,10 +397,9 @@ pub(crate) async fn superseded_iri_reference_keys(
     .await
 }
 
-/// Keys the full rebuild must drop. A row survives only at the cursor the
-/// rebuild just projected or the document's current registry cursor, so a
-/// materialization that raced ahead keeps its rows; rows for documents in
-/// neither map (deleted or reverted) are pruned.
+/// Keys the full rebuild must drop: a row survives only at the cursor just
+/// projected or the document's current registry cursor, so a raced-ahead
+/// materialization keeps its rows; rows in neither map (deleted, reverted) are pruned.
 async fn stale_rebuild_iri_reference_keys(
     storage: &StorageHandle,
     reprojected: &HashMap<Ulid, Ulid>,

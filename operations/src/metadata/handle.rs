@@ -73,23 +73,23 @@ use super::repository::{
 use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title, hit_types};
 use super::summary_cache::summary_cache;
-use crate::auth::{
+use crate::auth::bearer_token::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
     decode_aruna_bearer_token, realm_token_revoked, validate_aruna_bearer_token,
 };
+use crate::auth::permission_rules::GroupPermissionRules;
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::permission_rules::GroupPermissionRules;
-use crate::realm_peer::{PeerTrust, RealmPeerError, ensure_peer_trust};
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
+use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 use crate::s3::search_objects::{
     ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput, search_local_objects,
 };
-use crate::sync_mirror_repair::RECONCILE_GRACE;
-use crate::sync_relationship::{
+use crate::sync::sync_mirror_repair::RECONCILE_GRACE;
+use crate::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
@@ -1532,7 +1532,7 @@ impl MetadataHandle {
                     let result = match self.authorize_read_peer(peer, auth_token, false).await {
                         Ok(auth) => match context.net_handle.as_ref() {
                             Some(net) => {
-                                let endpoint = crate::node_info::read_node_info_document(
+                                let endpoint = crate::node::node_info::read_node_info_document(
                                     &context.storage_handle,
                                     net.node_id(),
                                 )
@@ -1909,7 +1909,7 @@ impl MetadataHandle {
             }
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
                 Box::pin(async {
-                    crate::placement_policy::serve_local_policy(context, peer, policy_ref).await
+                    crate::placement::policy::serve_local_policy(context, peer, policy_ref).await
                 })
                 .await
             }
@@ -1945,17 +1945,17 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardCreatePlacementPolicy { .. } => {
                 Box::pin(async {
-                    crate::placement_policy::apply_forwarded_policy(context, peer, forward).await
+                    crate::placement::policy::apply_forwarded_policy(context, peer, forward).await
                 })
                 .await
             }
             pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
-                Box::pin(async { super::sync_pull::serve_sync_pull(context, peer, pull).await })
+                Box::pin(async { super::device_pull::serve_sync_pull(context, peer, pull).await })
                     .await
             }
             listing @ MetadataTransportMessage::ForwardListVersions { .. } => {
                 Box::pin(async {
-                    super::sync_pull::serve_list_versions(context, peer, listing).await
+                    super::device_pull::serve_list_versions(context, peer, listing).await
                 })
                 .await
             }
@@ -3361,15 +3361,9 @@ async fn add_graph_topic_peers(
     .map_err(metadata_error_from_craqle)
 }
 
-/// Creates the graph topic genesis under the single-minter discipline.
-///
-/// Only the deterministic rank-0 holder mints, and only with positive
-/// confirmation that no co-holder already holds a genesis, so a config change
-/// that moved rank-0 cannot fork a rival one. Rank-0 is a tie-break for who acts
-/// first, never a correctness precondition: graph content is materialized
-/// locally on every holder independently of this topic, and the irokle genesis
-/// tie-break converges any residual race. A non-rank-0 holder withholds and
-/// adopts rank-0's genesis once it lands.
+/// Creates the graph topic genesis under the single-minter discipline: only
+/// rank-0 mints, after confirming no co-holder holds a genesis, so a rank-0 move
+/// cannot fork a rival. Rank-0 ties only; content materializes on every holder.
 async fn ensure_graph_topic_genesis(
     inner: &Arc<MetadataInner>,
     net_handle: &NetHandle,
@@ -6484,10 +6478,8 @@ async fn search_allowed_graphs(
 type HitDescribe = Arc<dyn Fn(&str, &str) -> Vec<(String, Term)> + Send + Sync>;
 
 /// Enriches hits in parallel, one blocking task per chunk of `targets`.
-///
-/// The returned properties align with `targets` by index: chunks stay
-/// contiguous and are concatenated in chunk order, so hit order never depends
-/// on which task finished first.
+/// Returned properties align with `targets` by index: chunks are contiguous and
+/// concatenated in order, so hit order never depends on task completion order.
 async fn describe_hits_parallel(
     read_permits: &Arc<tokio::sync::Semaphore>,
     targets: Vec<(String, String)>,
@@ -6602,10 +6594,8 @@ impl CraqleAuthorizer for AllowedGraphAuthorizer {
 }
 
 /// Lazy counterpart of [`AllowedGraphAuthorizer`], answering craqle per hit.
-///
-/// Craqle's stored policy is ignored on purpose: the registry record, the
-/// lifecycle tombstones and the caller's collected rules are authoritative
-/// here, and a graph without a registry record stays invisible.
+/// Craqle's stored policy is ignored on purpose: the registry record, lifecycle
+/// tombstones and collected rules are authoritative, unknown graphs stay invisible.
 struct ScopeAuthorizer<'a> {
     scope: &'a GraphVisibilityScope,
     visibility_cache: &'a MetadataVisibilityCache,
@@ -6907,7 +6897,7 @@ async fn resolve_graph_visibility_scope(
     // RBAC/public visibility is additionally constrained by the metadata.read
     // request policies; a policy-denied record is dropped from the scope so the
     // eager and lazy (SPARQL) paths both fail closed on it.
-    let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
+    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
         &context,
         records
             .iter()
@@ -8551,9 +8541,11 @@ mod tests {
         record
     }
 
-    fn read_rules(patterns: &[(&str, Permission)]) -> crate::permission_rules::PermissionRules {
-        crate::permission_rules::PermissionRules::from_roles(
-            vec![crate::permission_rules::CollectedRole {
+    fn read_rules(
+        patterns: &[(&str, Permission)],
+    ) -> crate::auth::permission_rules::PermissionRules {
+        crate::auth::permission_rules::PermissionRules::from_roles(
+            vec![crate::auth::permission_rules::CollectedRole {
                 role: aruna_core::structs::Role {
                     role_id: Ulid::generate(),
                     name: "test".to_string(),
