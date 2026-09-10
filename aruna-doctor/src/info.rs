@@ -190,10 +190,11 @@ impl ConfigView {
             blob_root: blob_root.unwrap_or_default(),
             blob_backends: backend_views()?,
             blob_bucket_prefix: dotenvy::var("BLOB_BUCKET_PREFIX").ok(),
-            blob_max_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?,
+            blob_max_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?.or(Some(100_000)),
             blob_multipart_bucket: dotenvy::var("BLOB_MULTIPART_BUCKET")
                 .ok()
-                .filter(|value| !value.trim().is_empty()),
+                .filter(|value| !value.trim().is_empty())
+                .or(Some("uploaded-parts".to_string())),
             blob_control_plane_connect_timeout_secs: parse_optional_env(
                 "BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS",
             )?
@@ -212,7 +213,8 @@ impl ConfigView {
             max_concurrent_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
             p2p_additional_relay_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
             default_metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
-                .unwrap_or(3),
+                .unwrap_or(3)
+                .max(1),
             s3_host: dotenvy::var("S3_HOST").unwrap_or_default(),
             api_public_url: optional_nonempty_env("API_PUBLIC_URL"),
             s3_public_url: optional_nonempty_env("S3_PUBLIC_URL"),
@@ -305,6 +307,17 @@ mod tests {
                 .collect::<Vec<_>>();
             for (key, value) in vars {
                 unsafe { std::env::set_var(key, value) };
+            }
+            Self { previous }
+        }
+
+        fn remove(keys: &[&str]) -> Self {
+            let previous = keys
+                .iter()
+                .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for key in keys {
+                unsafe { std::env::remove_var(key) };
             }
             Self { previous }
         }
@@ -480,6 +493,33 @@ mod tests {
 
         assert_eq!(view.http_base_url, "http://127.0.0.1:3000");
         assert!(view.onboarding_secret_present);
+    }
+
+    #[tokio::test]
+    async fn doctor_matches_node_defaults() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = TestEnvGuard::set(&[
+            ("STORAGE_PATH", "/tmp/aruna-doctor-defaults".to_string()),
+            ("BLOB_ROOT", "/tmp/aruna-doctor-defaults/blobs".to_string()),
+            ("METADATA_REPLICATION_FACTOR", "0".to_string()),
+        ]);
+        let _unset = TestEnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+        let settings = aruna::config::read_settings().unwrap();
+
+        assert_eq!(view.blob_max_bucket_size, Some(100_000));
+        assert_eq!(
+            view.blob_multipart_bucket.as_deref(),
+            Some("uploaded-parts")
+        );
+        assert_eq!(view.default_metadata_replication_factor, 1);
+        assert_eq!(view.blob_max_bucket_size, settings.blob_max_bucket_size);
+        assert_eq!(view.blob_multipart_bucket, settings.blob_multipart_bucket);
+        assert_eq!(
+            view.default_metadata_replication_factor,
+            settings.default_metadata_replication_factor
+        );
     }
 
     #[tokio::test]
