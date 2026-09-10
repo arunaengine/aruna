@@ -250,6 +250,14 @@ assert_port_free() {
   [[ -z "$listeners" ]] || die "port $port is already in use; set ARUNA_TEST_DEPLOY_BASE_PORT to another range"
 }
 
+assert_udp_free() {
+  local port=$1
+  local listeners
+
+  listeners="$(ss -lunH "sport = :$port" || true)"
+  [[ -z "$listeners" ]] || die "port $port is already in use; set ARUNA_TEST_DEPLOY_BASE_PORT to another range"
+}
+
 compact_json() {
   local json=$1
 
@@ -589,7 +597,7 @@ assert_node_ports_free() {
 
   for node_index in "${!NODE_NAMES[@]}"; do
     assert_port_free "${NODE_HTTP_PORTS[$node_index]}"
-    assert_port_free "${NODE_P2P_PORTS[$node_index]}"
+    assert_udp_free "${NODE_P2P_PORTS[$node_index]}"
     assert_port_free "${NODE_S3_PORTS[$node_index]}"
     assert_port_free "${NODE_OPS_PORTS[$node_index]}"
     # The portal port is only bound when a portal dist is deployed.
