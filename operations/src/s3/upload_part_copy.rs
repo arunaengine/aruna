@@ -1,5 +1,5 @@
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
-use crate::placement_policy::{PolicyGateError, gate_decision, union_refs, write_gate};
+use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
 use crate::s3::copy_object::{CopySourceConditions, evaluate_source_conditions};
 use crate::s3::get_object::{
     GetObjectError, GetObjectInput, GetObjectOperation, ObjectRangeRequest,
@@ -320,7 +320,7 @@ async fn validate_destination_upload(
 mod test {
     use super::*;
     use crate::driver::gate_context;
-    use crate::placement_policy::fixtures::{seed_gate, subject};
+    use crate::placement::policy::fixtures::{seed_gate, subject};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;

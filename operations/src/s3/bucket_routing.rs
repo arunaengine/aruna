@@ -1,4 +1,4 @@
-use crate::group_routing::load_group_inputs;
+use crate::groups::storage_routing::load_group_inputs;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};

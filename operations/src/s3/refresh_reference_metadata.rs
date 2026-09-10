@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
+use crate::tasks::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
 
 const REFRESH_SCAN_PAGE_SIZE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;

@@ -1,4 +1,4 @@
-use crate::usage_stats::{
+use crate::node::usage_stats::{
     UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::effects::{Effect, StorageEffect};

@@ -1,4 +1,4 @@
-use crate::blob::blob_keyspace_helper::{
+use crate::blob::blob_storage::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
@@ -6,19 +6,19 @@ use crate::blob::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
 };
-use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
-use crate::placement_policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
-    split_drift_reads, union_refs, write_gate,
-};
-use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::replication::util::dht_registration_effect;
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::write_cleanup::{CleanupEvent, WriteCleanup};
-use crate::usage_stats::{
+use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
+use crate::placement::policy::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
+};
+use crate::replication::dht_registration::dht_registration_effect;
+use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::write_cleanup::{CleanupEvent, WriteCleanup};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -1524,7 +1524,7 @@ impl Operation for PutObjectOperation {
 #[cfg(test)]
 mod routing_test {
     use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-    use crate::group_backends::BackendFenceError;
+    use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -1825,7 +1825,7 @@ mod test {
         PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
     };
 
-    use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
+    use crate::node::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::blob::{BackendRegistry, NodeBackend};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -3577,7 +3577,7 @@ mod test {
 #[cfg(test)]
 mod gate_test {
     use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-    use crate::placement_policy::{GateContext, PolicyCacheEntry, PolicyGateError};
+    use crate::placement::policy::{GateContext, PolicyCacheEntry, PolicyGateError};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -3718,12 +3718,12 @@ mod gate_test {
         assert!(!materializes(&operation.start()));
         let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
         assert!(!materializes(&effects));
-        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
+        let effects = operation.step(crate::placement::policy::fixtures::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(operation.is_complete());
@@ -3828,7 +3828,7 @@ mod gate_test {
 
     fn subject_row(generation: u64, blocked: bool) -> Value {
         let mut record = aruna_core::structs::NodeSubjectRecord::seed(
-            crate::placement_policy::fixtures::subject(node(9), "eu-west"),
+            crate::placement::policy::fixtures::subject(node(9), "eu-west"),
         )
         .expect("subject is valid");
         record.subject.generation = generation;
@@ -3845,12 +3845,12 @@ mod gate_test {
         let mut operation = operation("eu-west");
         operation.start();
         operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
-        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::fixtures::authority(realm()));
         operation.step(fence_clear());
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
@@ -3882,9 +3882,9 @@ mod gate_test {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
         }
-        let (config_value, auth_value) = crate::placement_policy::fixtures::realm_view(
+        let (config_value, auth_value) = crate::placement::policy::fixtures::realm_view(
             &config,
-            crate::placement_policy::fixtures::admin_user(realm()),
+            crate::placement::policy::fixtures::admin_user(realm()),
         );
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {
@@ -3906,7 +3906,7 @@ mod gate_test {
         operation.step(read(Some(bucket(vec![requested.policy_ref()], 1))));
         operation.step(read(None));
         let substituted =
-            crate::placement_policy::fixtures::signed_document(realm(), &policy("us-east"), 9);
+            crate::placement::policy::fixtures::signed_document(realm(), &policy("us-east"), 9);
         let effects = operation.step(opened(Some(ByteView::from(
             substituted.to_bytes().expect("document encodes"),
         ))));
@@ -3928,12 +3928,12 @@ mod gate_test {
         let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
         assert!(!materializes(&effects));
 
-        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
+        let effects = operation.step(crate::placement::policy::fixtures::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(matches!(
@@ -3952,12 +3952,12 @@ mod gate_test {
         let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
         assert!(!materializes(&effects));
 
-        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+        let effects = operation.step(crate::placement::policy::fixtures::group_authority(
             realm(),
             Ulid::from_bytes([8u8; 16]),
         ));

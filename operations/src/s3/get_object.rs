@@ -1,10 +1,11 @@
-use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::blob_holders::GetBlobHoldersOperation;
+use crate::blob::blob_storage::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
-use crate::blob_holders::GetBlobHoldersOperation;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
 use crate::driver::{DriverContext, drive};
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget, ReferenceAdvance};
 use crate::replication::queue::{
@@ -15,7 +16,6 @@ use crate::s3::object_lookup::{
     CopyNodeId, LookupError, location_from_read, managed_copy_check, managed_copy_read,
     multipart_summary_read, summary_from_read,
 };
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
     ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
@@ -1283,9 +1283,8 @@ impl Operation for GetObjectOperation {
 }
 
 /// Reads an object, continuing against the realm's holders when this node holds
-/// the version record but not its bytes. Only a User node routes: on an
-/// infrastructure node a missing local blob is a fault, not a miss. A ranged
-/// request is not routed, because a bao read serves whole blobs.
+/// the version record but not its bytes. Only User nodes route, since elsewhere a
+/// missing local blob is a fault; ranged requests are not routed (bao serves whole blobs).
 pub async fn get_object_routed(
     context: &DriverContext,
     input: GetObjectInput,
@@ -1387,13 +1386,13 @@ fn routed_result(
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
+    use crate::node::usage_stats::UsageCounterUpdate;
     use crate::replication::protocol::ReferenceAdvance;
     use crate::replication::queue::LiveReplicationObligationRecord;
     use crate::s3::get_object::{
         GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, MAX_AUTO_ADVANCES,
         MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
     };
-    use crate::usage_stats::UsageCounterUpdate;
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
