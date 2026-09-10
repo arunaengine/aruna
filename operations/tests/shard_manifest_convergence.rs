@@ -13,24 +13,24 @@ use aruna_core::structs::{
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
 };
+use aruna_operations::realm::announce_realm_presence::{
+    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+};
+use aruna_operations::realm::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::shard::assemble_shard_manifest;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -373,7 +373,7 @@ async fn install_realm_config(
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             *realm_id,
             node.net.node_id(),

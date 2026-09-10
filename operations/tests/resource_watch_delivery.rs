@@ -22,7 +22,6 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::notifications::dispatch::{
     WatchDispatchError, create_watch_for_user, delete_watch_for_user, list_notifications_for_user,
     list_watches_for_user,
@@ -35,10 +34,11 @@ use aruna_operations::notifications::watch::interest::{
     refresh_watch_interest_for_targets,
 };
 use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
-use aruna_operations::replicate_documents::{
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -922,7 +922,7 @@ async fn install_config_document(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             realm_id,
             node.net.node_id(),

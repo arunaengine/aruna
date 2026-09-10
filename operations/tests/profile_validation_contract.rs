@@ -18,12 +18,12 @@ use aruna_core::structs::{
     RealmId, RealmNodeKind,
 };
 use aruna_core::types::UserId;
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::DriverContext;
+use aruna_operations::metadata::MetadataReadError;
+use aruna_operations::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_local_document,
 };
-use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::forward::{
     MetadataWriteError, admits_profile_peer, create_metadata_document_routed, export_profile_local,
 };
@@ -31,14 +31,14 @@ use aruna_operations::metadata::profile_validation::{
     current_validation_status, load_validation_status, preview_submission, profile_public_iri,
     revalidate_current,
 };
+use aruna_operations::metadata::update_metadata_document::{
+    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
+    UpdateMetadataDocumentOperation, update_metadata_document,
+};
 use aruna_operations::metadata::{
     MetadataHandle, MetadataHandleOptions,
     materialization_queue::process_metadata_materialization_batch,
     projector::drain_pending_metadata_projection_queue,
-};
-use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-    UpdateMetadataDocumentOperation, update_metadata_document,
 };
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -1383,7 +1383,7 @@ async fn create_crate(
     path: &str,
     jsonld: String,
 ) -> Result<
-    aruna_operations::create_metadata_document::CreateMetadataDocumentResult,
+    aruna_operations::metadata::create_metadata_document::CreateMetadataDocumentResult,
     CreateMetadataDocumentError,
 > {
     match create_metadata_document_routed(

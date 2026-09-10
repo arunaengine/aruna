@@ -12,18 +12,18 @@ use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, NodeUrls, RealmNodeKind, User,
 };
 use aruna_core::util::unix_timestamp_secs;
-use aruna_operations::auth::realm_token_revoked;
-use aruna_operations::device::realm_documents::fetch_realm_documents;
-use aruna_operations::driver::drive;
-use aruna_operations::list_groups::ListGroupOperation;
-use aruna_operations::node_info::{read_node_info_documents, seed_node_info_document};
-use aruna_operations::read_user_document::ReadUserDocumentOperation;
-use aruna_operations::replicate_documents::{
-    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
-};
-use aruna_operations::revoke_token::{
+use aruna_operations::auth::bearer_token::realm_token_revoked;
+use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
+use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::driver::drive;
+use aruna_operations::groups::list_groups::ListGroupOperation;
+use aruna_operations::node::node_info::{read_node_info_documents, seed_node_info_document};
+use aruna_operations::sync::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
+use aruna_operations::users::read_user_document::ReadUserDocumentOperation;
 use ulid::Ulid;
 
 use topology::{

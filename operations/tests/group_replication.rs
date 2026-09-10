@@ -13,14 +13,14 @@ use aruna_core::structs::{
     RealmNodeKind, shard_for_subject,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::placement::{
     PlacementResolutionContext, placement_ref_for_target, resolve_shard_holders,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -250,7 +250,7 @@ async fn install_realm_config(
     // the genesis yet defers, so run the hook until nothing is left pending.
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::startup::restore_shard_subscriptions(
+            aruna_operations::node::startup::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 *realm_id,
@@ -259,7 +259,7 @@ async fn install_realm_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::process_placements::process_shard_placements(
+            retry |= aruna_operations::placement::process_placements::process_shard_placements(
                 &node.context,
                 *realm_id,
                 node.net.node_id(),

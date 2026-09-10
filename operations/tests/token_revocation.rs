@@ -18,16 +18,16 @@ use aruna_core::structs::{
 };
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::auth::{
+use aruna_operations::auth::bearer_token::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
     realm_token_revoked,
 };
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::revoke_token::{
+use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
@@ -277,7 +277,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             realm_id,
             node.net.node_id(),

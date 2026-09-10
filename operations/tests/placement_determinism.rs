@@ -16,23 +16,23 @@ use aruna_core::structs::{
 };
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::mutate_realm_placement::{
+use aruna_operations::node::node_info::{read_node_info_document, seed_node_info_document};
+use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
-use aruna_operations::node_info::{read_node_info_document, seed_node_info_document};
-use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
-use aruna_operations::replicate_documents::{
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -590,7 +590,7 @@ async fn install_realm_config(
     // before the fixture starts publishing or changing placement.
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::startup::restore_shard_subscriptions(
+            aruna_operations::node::startup::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 realm_id,
@@ -599,7 +599,7 @@ async fn install_realm_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::process_placements::process_shard_placements(
+            retry |= aruna_operations::placement::process_placements::process_shard_placements(
                 &node.context,
                 realm_id,
                 node.net.node_id(),

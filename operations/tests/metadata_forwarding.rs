@@ -28,40 +28,40 @@ use aruna_core::structs::{
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_forward_document, mint_local_document,
+use aruna_operations::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
 };
 use aruna_operations::device::drain::{DrainOutcome, drain_intake};
 use aruna_operations::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
 use aruna_operations::device::inspect_draft::InspectDraftOperation;
-use aruna_operations::device::repository::{
-    INTAKE_PAGE_SIZE, IntakeEntry, IntakeState, intake_entry,
-};
-use aruna_operations::document_sync_outbox::{
-    new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
-};
+use aruna_operations::device::intake::{INTAKE_PAGE_SIZE, IntakeEntry, IntakeState, intake_entry};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::get_metadata_document::load_metadata_record_by_document;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::create_metadata_document::{
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_forward_document, mint_local_document,
+};
 use aruna_operations::metadata::forward::{
     ForwardGroupError, MetadataWriteError, create_metadata_document_routed, forward_group_create,
     forward_token_revoke, update_metadata_document_routed,
 };
-use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
-use aruna_operations::placement::resolve_shard_holders;
-use aruna_operations::set_realm_policies::{
-    SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
-};
-use aruna_operations::task_incoming::{OutboxDrainer, initialize_task_incoming};
-use aruna_operations::update_metadata_document::{
+use aruna_operations::metadata::get_metadata_document::load_metadata_record_by_document;
+use aruna_operations::metadata::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
+use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
+use aruna_operations::placement::resolve_shard_holders;
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::set_realm_policies::{
+    SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
+};
+use aruna_operations::sync::document_sync_outbox::{
+    new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
+};
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::{OutboxDrainer, initialize_task_incoming};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -1214,7 +1214,7 @@ async fn install_realm_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::startup::restore_shard_subscriptions(
+            aruna_operations::node::startup::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 realm_id,
@@ -1223,7 +1223,7 @@ async fn install_realm_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::process_placements::process_shard_placements(
+            retry |= aruna_operations::placement::process_placements::process_shard_placements(
                 &node.context,
                 realm_id,
                 node.net.node_id(),

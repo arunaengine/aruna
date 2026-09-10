@@ -15,22 +15,22 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::get_metadata_document::GetMetadataDocumentOperation;
 use aruna_operations::metadata::materialization_queue::metadata_materialization_jobs_exist;
 use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::realm::announce_realm_presence::{
+    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+};
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -611,7 +611,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             *realm_id,
             node.net.node_id(),
