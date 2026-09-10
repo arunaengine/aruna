@@ -11,40 +11,42 @@ use aruna_core::structs::{
     Role, SessionKind, User,
 };
 use aruna_core::util::unix_timestamp_secs as now_timestamp;
-use aruna_operations::consume_onboarding_secret::{
-    ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
-};
-use aruna_operations::delete_onboarding_secret::{
-    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
-};
-use aruna_operations::driver::drive;
-use aruna_operations::ensure_canonical_user_token_subject::{
+use aruna_operations::auth::ensure_canonical_user_token_subject::{
     EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
 };
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
-use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use aruna_operations::get_user::{GetUserInput, GetUserOperation};
-use aruna_operations::inspect_onboarding_secret::{
-    InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
-};
-use aruna_operations::list_groups::ListGroupOperation;
-use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
-use aruna_operations::read_realm_authorization::{
-    ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
-};
-use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
-use aruna_operations::register_or_get_oidc_user::{
-    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-};
-use aruna_operations::remove_device_node::{
+use aruna_operations::device::remove_device_node::{
     DeviceEvictionScope, RemoveDeviceNodeConfig, RemoveDeviceNodeError, RemoveDeviceNodeOperation,
 };
-use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
-use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_operations::driver::drive;
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::groups::list_groups::ListGroupOperation;
+use aruna_operations::onboarding::consume_onboarding_secret::{
+    ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::delete_onboarding_secret::{
+    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::inspect_onboarding_secret::{
+    InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::list_onboarding_secrets::ListOnboardingSecretsOperation;
+use aruna_operations::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::read_realm_authorization::{
+    ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
+};
 use aruna_operations::session::{CreateSessionConfig, CreateSessionError, CreateSessionOperation};
-use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
+use aruna_operations::users::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
+use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
+use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
+use aruna_operations::users::read_user_document::{
+    ReadUserDocumentError, ReadUserDocumentOperation,
+};
+use aruna_operations::users::register_or_get_oidc_user::{
+    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
+};
+use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_operations::users::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
@@ -936,16 +938,20 @@ async fn patch_user_info(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_operations::update_user::UpdateUserError::InvalidUserName
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
-        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::Unauthorized => {
+            ServerError::Forbidden
+        }
+        aruna_operations::users::update_user::UpdateUserError::UserNotFound => {
+            ServerError::NotFound
+        }
+        aruna_operations::users::update_user::UpdateUserError::InvalidUserName
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_operations::users::update_user::UpdateUserError::TooManyAttributes
+        | aruna_operations::users::update_user::UpdateUserError::ConversionError(_) => {
             ServerError::BadRequest
         }
-        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1040,9 +1046,11 @@ async fn list_users(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::list_users::ListUsersError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::list_users::ListUsersError::ConversionError(_) => ServerError::BadRequest,
-        aruna_operations::list_users::ListUsersError::AuthorizationError(_) => {
+        aruna_operations::users::list_users::ListUsersError::Unauthorized => ServerError::Forbidden,
+        aruna_operations::users::list_users::ListUsersError::ConversionError(_) => {
+            ServerError::BadRequest
+        }
+        aruna_operations::users::list_users::ListUsersError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1071,19 +1079,19 @@ pub(crate) async fn authorize_directory(
         state.get_realm_id(),
         user_id.unwrap_or("**")
     );
-    aruna_operations::request_policy::enforce_policies(
+    aruna_operations::auth::request_policy::enforce_policies(
         &state.get_ctx(),
         state.get_realm_id(),
-        &aruna_operations::request_policy::policy_request_with(
+        &aruna_operations::auth::request_policy::policy_request_with(
             &path,
             &Permission::READ,
             Some(auth),
-            aruna_operations::request_policy::PolicyRequestExtras::rest(),
+            aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
         ),
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::request_policy::PolicyEnforcementError::Denied { .. } => {
+        aruna_operations::auth::request_policy::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1367,8 +1375,8 @@ async fn get_user(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::get_user::GetUserError::UserNotFound => ServerError::NotFound,
+        aruna_operations::users::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
+        aruna_operations::users::get_user::GetUserError::UserNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     })?;
 
@@ -1473,16 +1481,20 @@ async fn update_user(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_operations::update_user::UpdateUserError::InvalidUserName
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
-        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::Unauthorized => {
+            ServerError::Forbidden
+        }
+        aruna_operations::users::update_user::UpdateUserError::UserNotFound => {
+            ServerError::NotFound
+        }
+        aruna_operations::users::update_user::UpdateUserError::InvalidUserName
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_operations::users::update_user::UpdateUserError::TooManyAttributes
+        | aruna_operations::users::update_user::UpdateUserError::ConversionError(_) => {
             ServerError::BadRequest
         }
-        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1795,20 +1807,20 @@ mod tests {
         RealmConfigDocument, RealmId, SessionKind, TokenClaims, User, oidc_subject_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::announce_realm_presence::{
-        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-    };
-    use aruna_operations::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use aruna_operations::create_onboarding_secret::{
+    use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::onboarding::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::incoming::initialize_net_incoming;
-    use aruna_operations::task_incoming::initialize_task_incoming;
+    use aruna_operations::realm::announce_realm_presence::{
+        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    };
+    use aruna_operations::realm::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::sync::incoming::initialize_net_incoming;
+    use aruna_operations::tasks::task_incoming::initialize_task_incoming;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
@@ -3420,15 +3432,15 @@ mod device_tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId, RealmNodeKind};
-    use aruna_operations::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use aruna_operations::create_onboarding_secret::{
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::onboarding::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::ensure_realm_config::{
+    use aruna_operations::realm::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::ensure_realm_config::{
         EnsureRealmConfigConfig, EnsureRealmConfigOperation,
     };
     use aruna_storage::FjallStorage;
