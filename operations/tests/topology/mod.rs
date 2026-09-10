@@ -44,24 +44,24 @@ use aruna_core::structs::{
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::expand_placement::expand_realm_placement;
-use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::groups::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
-use aruna_operations::mutate_realm_placement::{
-    MutateRealmPlacementConfig, RealmPlacementMutation, drive_realm_placement_mutation,
-};
+use aruna_operations::placement::expand_placement::expand_realm_placement;
 use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
 use aruna_operations::placement::{
     PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::realm::announce_realm_presence::{
+    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+};
+use aruna_operations::realm::mutate_realm_placement::{
+    MutateRealmPlacementConfig, RealmPlacementMutation, drive_realm_placement_mutation,
+};
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -868,7 +868,7 @@ impl Topology {
         // The joiner runs the startup hook and joins the realm-config topic, as
         // a freshly started node does; without it no admin event reaches it.
         let node = self.find(node_id);
-        aruna_operations::startup::restore_shard_subscriptions(
+        aruna_operations::node::startup::restore_shard_subscriptions(
             &node.context,
             node_id,
             self.realm_id,
@@ -1166,7 +1166,7 @@ async fn install_realm_config(
         "shard placement reconciliation never reported clean",
         || async {
             join_all(nodes.iter().map(|node| {
-                aruna_operations::startup::restore_shard_subscriptions(
+                aruna_operations::node::startup::restore_shard_subscriptions(
                     &node.context,
                     node.node_id(),
                     realm_id,
@@ -1174,7 +1174,7 @@ async fn install_realm_config(
             }))
             .await;
             let outcomes = join_all(nodes.iter().map(|node| {
-                aruna_operations::process_placements::process_shard_placements(
+                aruna_operations::placement::process_placements::process_shard_placements(
                     &node.context,
                     realm_id,
                     node.node_id(),
@@ -1280,7 +1280,7 @@ async fn seed_config_topic(
 async fn reconcile_nodes(
     nodes: &[TestNode],
     realm_id: RealmId,
-) -> Vec<aruna_operations::process_placements::PlacementReconcileOutcome> {
+) -> Vec<aruna_operations::placement::process_placements::PlacementReconcileOutcome> {
     join_all(nodes.iter().map(|node| {
         let span = tracing::info_span!(
             "node_pass",
@@ -1289,7 +1289,7 @@ async fn reconcile_nodes(
         async move {
             let started = std::time::Instant::now();
             let outcome = tracing::Instrument::instrument(
-                aruna_operations::process_placements::process_shard_placements(
+                aruna_operations::placement::process_placements::process_shard_placements(
                     &node.context,
                     realm_id,
                     node.node_id(),
@@ -1320,7 +1320,9 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             node = %&node.node_id().to_string()[..8]
         );
         tracing::Instrument::instrument(
-            aruna_operations::task_incoming::drive_document_sync_outbox_drain(node.context.clone()),
+            aruna_operations::tasks::task_incoming::drive_document_sync_outbox_drain(
+                node.context.clone(),
+            ),
             span,
         )
     }))

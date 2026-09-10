@@ -12,8 +12,8 @@ mod topology;
 
 use aruna_core::structs::{PlacementRef, TransitionLimits};
 use aruna_core::util::unix_timestamp_millis;
-use aruna_operations::mutate_realm_placement::RealmPlacementMutation;
 use aruna_operations::placement::transition::{preview_transition, transition_health};
+use aruna_operations::realm::mutate_realm_placement::RealmPlacementMutation;
 
 use topology::{TestResult, Topology};
 
