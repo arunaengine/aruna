@@ -1,5 +1,6 @@
-//! Integration tests against a real Docker daemon. Each test skips with a
-//! clear message when no daemon is reachable, but is written to run for real.
+//! Integration tests against a real Docker daemon. Ignored by default; run
+//! with `--ignored` on a host with a daemon. Without one they skip with a
+//! clear message instead of failing.
 #![cfg(feature = "docker")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,6 +226,7 @@ async fn wait_running(backend: &DockerBackend, attempt: &AttemptRef) {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn idempotent_submit() {
     // Submitting the same external name twice adopts the one container.
     let backend = backend_or_skip!();
@@ -254,6 +256,7 @@ async fn idempotent_submit() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn resubmit_after_removal() {
     // A removed container must not license a second run of the same attempt.
     let backend = backend_or_skip!();
@@ -278,6 +281,7 @@ async fn resubmit_after_removal() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn exit_code_capture() {
     // Distinct exit codes surface as distinct terminal evidence.
     let backend = backend_or_skip!();
@@ -300,6 +304,7 @@ async fn exit_code_capture() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn file_transfer() {
     let backend = backend_or_skip!();
     let cancel = CancellationToken::new();
@@ -326,6 +331,7 @@ async fn file_transfer() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn wildcard_outputs() {
     // A pattern selects the matching files of the terminal container only.
     let backend = backend_or_skip!();
@@ -360,6 +366,7 @@ async fn wildcard_outputs() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn chunked_transfer() {
     // A multi-chunk input stream round-trips through the container and comes
     // back as a multi-chunk output stream, byte for byte.
@@ -399,6 +406,7 @@ async fn chunked_transfer() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn cancelled_submit() {
     let backend = backend_or_skip!();
     let spec = sh(&unique("cancelled-submit"), "sleep 300");
@@ -416,6 +424,7 @@ async fn cancelled_submit() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn cancel_stops() {
     // A long-running container is stopped with definitive evidence.
     let backend = backend_or_skip!();
@@ -443,6 +452,7 @@ async fn cancel_stops() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn created_cancel_removes() {
     let warm_backend = backend_or_skip!();
     let warmup = sh(&unique("created-warmup"), "true");
@@ -516,6 +526,7 @@ async fn created_cancel_removes() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn reconcile_adopts() {
     // A fresh backend (simulating restart) re-adopts a running container by name.
     let submitter = backend_or_skip!();
@@ -549,6 +560,7 @@ async fn reconcile_adopts() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn log_bounds() {
     // A chatty container's captured tail is bounded; totals show truncation.
     let backend = backend_or_skip!();
@@ -590,6 +602,7 @@ async fn log_bounds() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn resource_limits() {
     // Memory / CPU / pids ceilings are actually applied to the container config.
     let backend = backend_or_skip!();
@@ -613,6 +626,7 @@ async fn resource_limits() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn foreign_not_adopted() {
     // A same-named container created outside Aruna (no aruna-engine.org/* labels) is
     // neither adopted as evidence nor removed by cleanup.
@@ -676,6 +690,7 @@ async fn foreign_not_adopted() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn wait_is_observational() {
     // Operations owns walltime cancellation; backend wait only observes.
     let backend = backend_or_skip!();
