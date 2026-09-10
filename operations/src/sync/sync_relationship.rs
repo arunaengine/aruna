@@ -109,13 +109,9 @@ pub async fn create_sync_relationship(
     Err(StorageError::TransactionConflict.into())
 }
 
-/// Removes an outgoing relationship on behalf of a delete flow.
-///
-/// Relationships serving references are detached instead of deleted: the target keeps
-/// `BlobVersion::Reference` records bound to this relationship id, and the
-/// native reference path authorizes every read through the outgoing record,
-/// so a serving-only stub must survive for the retained data to stay
-/// readable. All other modes are removed outright.
+/// Removes an outgoing relationship on behalf of a delete flow. Relationships
+/// serving references are detached, not deleted: reads are authorized through the
+/// outgoing record, so a stub must survive for retained data to stay readable.
 pub async fn remove_outgoing_relationship(
     context: &crate::driver::DriverContext,
     relationship: SyncRelationship,
