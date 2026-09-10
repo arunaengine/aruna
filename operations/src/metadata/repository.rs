@@ -30,6 +30,9 @@ use smallvec::smallvec;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::storage_read::{parse_storage_iter, parse_storage_read};
+
+pub use crate::storage_read::StorageReadError;
 
 pub const LIST_METADATA_PAGE_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage
@@ -428,76 +431,33 @@ pub fn metadata_event_projection_write_entries(
 pub fn parse_registry_read(
     event: Event,
 ) -> Result<Option<MetadataRegistryRecord>, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes(&bytes)
-                    .map_err(|error| StorageReadError::Conversion(error.into()))
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
-        )),
-    }
+    parse_storage_read(event, |bytes| {
+        postcard::from_bytes(bytes).map_err(ConversionError::from)
+    })
 }
 
 pub fn parse_materialization_status_read(
     event: Event,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes(&bytes)
-                    .map_err(|error| StorageReadError::Conversion(error.into()))
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
-        )),
-    }
+    parse_storage_read(event, |bytes| {
+        postcard::from_bytes(bytes).map_err(ConversionError::from)
+    })
 }
 
 pub fn parse_graph_lifecycle_read(
     event: Event,
 ) -> Result<Option<MetadataGraphLifecycleRecord>, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes(&bytes)
-                    .map_err(|error| StorageReadError::Conversion(error.into()))
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
-        )),
-    }
+    parse_storage_read(event, |bytes| {
+        postcard::from_bytes(bytes).map_err(ConversionError::from)
+    })
 }
 
 pub fn parse_registry_iter(
     event: Event,
 ) -> Result<(Vec<MetadataRegistryRecord>, Option<Key>), StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => {
-            let records = values
-                .into_iter()
-                .map(|(_, value)| {
-                    postcard::from_bytes(&value)
-                        .map_err(|error| StorageReadError::Conversion(error.into()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((records, next_start_after))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
-        )),
-    }
+    parse_storage_iter(event, |bytes| {
+        postcard::from_bytes(bytes).map_err(ConversionError::from)
+    })
 }
 
 pub fn empty_effects() -> Effects {
@@ -533,10 +493,4 @@ pub async fn delete_index_keys(
             aruna_core::errors::StorageError::WriteError("unexpected event".to_string()),
         )),
     }
-}
-
-#[derive(Debug)]
-pub enum StorageReadError {
-    Storage(aruna_core::errors::StorageError),
-    Conversion(ConversionError),
 }

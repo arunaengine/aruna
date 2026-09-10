@@ -96,6 +96,7 @@ pub mod shard;
 pub mod staging;
 pub mod startup;
 pub mod status;
+mod storage_read;
 pub mod sync_mirror_repair;
 pub mod sync_placement;
 pub mod sync_quarantine;
