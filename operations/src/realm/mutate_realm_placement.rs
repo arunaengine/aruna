@@ -36,12 +36,12 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
-use crate::sync_placement::schedule_placement_revalidation_effect;
+use crate::sync::shard_placement::schedule_placement_revalidation_effect;
 
 const STRATEGY_REFERENCE_SCAN_PAGE_SIZE: usize = 8_192;
 
@@ -229,10 +229,9 @@ impl RealmPlacementMutation {
         })
     }
 
-    /// Local parity with the receiving side's admission: an authority-moving
-    /// mutation needs a current Management node, a participant may only
-    /// self-report the role the plan names it for, and a Server may append
-    /// only a binding it allocated itself.
+    /// Local parity with the receiving side's admission: authority-moving mutations
+    /// need a current Management node, participants may only self-report their named
+    /// role, and a Server may append only a binding it allocated itself.
     fn authorize(
         &self,
         document: &RealmConfigDocument,
@@ -1395,11 +1394,9 @@ impl Operation for MutateRealmPlacementOperation {
     }
 }
 
-/// Drives a realm placement mutation, then — when it drains the local node —
-/// kicks the installed outbox drain owner so records accepted before holdership
-/// loss are retried without creating a second concurrent drainer or replacing a
-/// persisted failure deadline. `auth_context` carries the requesting caller's
-/// token, and is `None` for a mutation the node originates itself.
+/// Drives a realm placement mutation, then when it drains the local node kicks the
+/// installed outbox drain owner so pre-holdership-loss records retry without a second
+/// drainer or replacing a persisted deadline. `auth_context` is `None` for local origin.
 pub async fn drive_realm_placement_mutation(
     config: MutateRealmPlacementConfig,
     auth_context: Option<AuthContext>,
@@ -1417,7 +1414,7 @@ pub async fn drive_realm_placement_mutation(
     };
     let outcome = crate::driver::drive(operation, context).await;
     if outcome.is_ok() && drains_node && context.net_handle.is_some() {
-        crate::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
+        crate::tasks::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
             context.clone(),
         ))
         .await;
@@ -1447,8 +1444,8 @@ mod tests {
 
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::get_realm_config::GetRealmConfigOperation;
     use crate::placement::transition::{TransitionRequest, plan_transition};
+    use crate::realm::get_realm_config::GetRealmConfigOperation;
     use aruna_core::structs::{PlacementTransition, ProofClaim, TransitionLimits};
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -2772,7 +2769,7 @@ mod tests {
             .expect("the realm config survives a rejected mutation");
         assert!(stored.candidate_maps.is_empty());
         assert!(
-            crate::document_sync_outbox::read_outbox_tails(&context.storage_handle)
+            crate::sync::document_sync_outbox::read_outbox_tails(&context.storage_handle)
                 .await
                 .expect("outbox scan")
                 .is_empty()

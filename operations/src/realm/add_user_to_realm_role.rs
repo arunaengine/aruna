@@ -21,11 +21,11 @@ use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::replicate_documents::replicate_documents_effect;
+use crate::sync::replicate_documents::replicate_documents_effect;
 use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -683,14 +683,14 @@ fn apply_admin_reducer_operation(
 pub mod test {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-    use crate::add_user_to_realm_role::{
+    use crate::driver::{DriverContext, drive};
+    use crate::realm::add_user_to_realm_role::{
         AddUserToRealmRolesError, AddUserToRealmRolesInput, AddUserToRealmRolesOperation,
     };
-    use crate::claim_initial_realm_admin::{
+    use crate::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::{
         AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,

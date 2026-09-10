@@ -31,10 +31,10 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::{
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureRealmConfigConfig {
@@ -377,7 +377,7 @@ impl EnsureRealmConfigOperation {
                 .materialized_realm_config_placement_strategies()
                 .is_empty()
         {
-            admin_events.extend(crate::create_realm::seed_placement_events(
+            admin_events.extend(crate::realm::create_realm::seed_placement_events(
                 &mut reducer_state,
                 &self.config.actor,
                 &document,

@@ -21,10 +21,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::{
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::replicate_documents::replicate_documents_effect;
+use crate::sync::replicate_documents::replicate_documents_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaimInitialRealmAdminInput {
@@ -589,8 +589,8 @@ mod tests {
         ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
         ClaimInitialRealmAdminResult, ClaimInitialRealmAdminState,
     };
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{
