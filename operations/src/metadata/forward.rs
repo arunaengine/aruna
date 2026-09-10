@@ -73,7 +73,7 @@ use crate::metadata::protocol::{
 };
 use crate::metadata::raw::{MetadataRawView, load_raw_view};
 use crate::node_info::read_node_info_documents;
-use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
+use crate::placement::selector::select_top_peers;
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
 use crate::realm_peer::{PeerTrust, ensure_peer_trust};
@@ -273,29 +273,7 @@ where
 }
 
 fn rank_revoke_peers(peers: impl IntoIterator<Item = NodeId>, subject: &[u8]) -> Vec<NodeId> {
-    let mut ranked = Vec::with_capacity(TOKEN_REVOKE_PEER_LIMIT);
-    for peer in peers {
-        let score = neg_log2_q48(selector_hash(ROLE_NODE, subject, peer.as_bytes()));
-        insert_revoke_peer(&mut ranked, peer, score);
-    }
-    ranked.into_iter().map(|(peer, _)| peer).collect()
-}
-
-fn insert_revoke_peer(ranked: &mut Vec<(NodeId, u64)>, peer: NodeId, score: u64) {
-    if ranked.iter().any(|candidate| candidate.0 == peer) {
-        return;
-    }
-    let position = ranked.iter().position(|candidate| {
-        score < candidate.1 || (score == candidate.1 && peer.as_bytes() < candidate.0.as_bytes())
-    });
-    let Some(position) = position else {
-        if ranked.len() < TOKEN_REVOKE_PEER_LIMIT {
-            ranked.push((peer, score));
-        }
-        return;
-    };
-    ranked.insert(position, (peer, score));
-    ranked.truncate(TOKEN_REVOKE_PEER_LIMIT);
+    select_top_peers(peers, subject, TOKEN_REVOKE_PEER_LIMIT, |_| {})
 }
 
 /// Whether the origin currently holds a structured metadata document's bucket.

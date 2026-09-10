@@ -31,7 +31,6 @@ use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use aruna_core::{MetaResourceId, NodeId, StructuredId};
 use aruna_storage::StorageHandle;
-use base64::Engine;
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream;
@@ -51,10 +50,10 @@ use super::protocol::{
     MetadataTransportMessage,
 };
 use super::search_cursor::{
-    METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
+    CursorEnvelopeError, METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
     METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
-    SearchPageCursor, SearchWatermark, merge_search_hits, paginate, query_fingerprint,
-    resume_fetch_limit,
+    SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits, paginate,
+    query_fingerprint, resume_fetch_limit,
 };
 use super::summary_cache::summary_cache;
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
@@ -71,7 +70,9 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_by_document_effect,
 };
 use crate::permission_rules::GroupPermissionRules;
-use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
+use crate::placement::selector::{
+    ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
+};
 use crate::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
@@ -365,37 +366,17 @@ struct ObjectSearchCursorPartition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ObjectSearchCursor {
-    version: u8,
-    signer: [u8; 32],
-    fingerprint: [u8; 32],
+struct ObjectSearchCursorPayload {
     as_of: SystemTime,
     partitions: Vec<ObjectSearchCursorPartition>,
     failed_partitions: Vec<[u8; 32]>,
     discovery_failed: bool,
     omitted_partitions: usize,
-    signature: iroh::Signature,
 }
 
-#[derive(Serialize)]
-struct ObjectSearchCursorSignaturePayload<'a> {
-    version: u8,
-    signer: [u8; 32],
-    fingerprint: [u8; 32],
-    as_of: SystemTime,
-    partitions: &'a [ObjectSearchCursorPartition],
-    failed_partitions: &'a [[u8; 32]],
-    discovery_failed: bool,
-    omitted_partitions: usize,
-}
+type ObjectSearchCursor = SignedCursor<ObjectSearchCursorPayload>;
 
-impl ObjectSearchCursor {
-    fn encode(&self) -> Result<String, MetadataApiError> {
-        let bytes = postcard::to_allocvec(self)
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-    }
-
+impl SignedCursor<ObjectSearchCursorPayload> {
     fn decode(
         raw: &str,
         fingerprint: [u8; 32],
@@ -406,40 +387,37 @@ impl ObjectSearchCursor {
                 "invalid object search cursor".to_string(),
             ));
         }
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(raw)
-            .map_err(|_| {
+        let cursor = Self::decode_envelope(
+            raw,
+            OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            authorized_signers,
+            |cursor| {
+                if cursor.version != OBJECT_SEARCH_CURSOR_VERSION
+                    || cursor.fingerprint != fingerprint
+                {
+                    Err(CursorEnvelopeError::QueryMismatch)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .map_err(|error| match error {
+            CursorEnvelopeError::Invalid => {
                 MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
-            })?;
-        let cursor: Self = postcard::from_bytes(&bytes).map_err(|_| {
-            MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
-        })?;
-        if cursor.version != OBJECT_SEARCH_CURSOR_VERSION || cursor.fingerprint != fingerprint {
-            return Err(MetadataApiError::InvalidCursor(
+            }
+            CursorEnvelopeError::QueryMismatch => MetadataApiError::InvalidCursor(
                 "object search cursor does not match query".to_string(),
-            ));
-        }
-        let signer = NodeId::from_bytes(&cursor.signer).map_err(|_| {
-            MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+            ),
         })?;
-        if !authorized_signers.contains(&signer)
-            || signer
-                .verify(&cursor.signing_bytes(), &cursor.signature)
-                .is_err()
-        {
-            return Err(MetadataApiError::InvalidCursor(
-                "invalid object search cursor".to_string(),
-            ));
-        }
-        if cursor.partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
-            || cursor.failed_partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+        if cursor.payload.partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+            || cursor.payload.failed_partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
         {
             return Err(MetadataApiError::InvalidCursor(
                 "invalid object search cursor".to_string(),
             ));
         }
         let mut nodes = HashSet::new();
-        for partition in &cursor.partitions {
+        for partition in &cursor.payload.partitions {
             NodeId::from_bytes(&partition.node_id).map_err(|_| {
                 MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
             })?;
@@ -454,7 +432,7 @@ impl ObjectSearchCursor {
                 ));
             }
         }
-        for node_id in &cursor.failed_partitions {
+        for node_id in &cursor.payload.failed_partitions {
             NodeId::from_bytes(node_id).map_err(|_| {
                 MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
             })?;
@@ -465,6 +443,7 @@ impl ObjectSearchCursor {
             }
         }
         if !cursor
+            .payload
             .partitions
             .iter()
             .any(|partition| !partition.exhausted)
@@ -477,7 +456,8 @@ impl ObjectSearchCursor {
     }
 
     fn partition_states(&self) -> Result<Vec<ObjectSearchPartitionState>, MetadataApiError> {
-        self.partitions
+        self.payload
+            .partitions
             .iter()
             .map(|partition| {
                 Ok(ObjectSearchPartitionState {
@@ -493,7 +473,8 @@ impl ObjectSearchCursor {
     }
 
     fn failed_nodes(&self) -> Result<Vec<NodeId>, MetadataApiError> {
-        self.failed_partitions
+        self.payload
+            .failed_partitions
             .iter()
             .map(|node_id| {
                 NodeId::from_bytes(node_id).map_err(|_| {
@@ -513,8 +494,7 @@ impl ObjectSearchCursor {
         omitted_partitions: usize,
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
-    ) -> Self {
-        let signer = *signer.as_bytes();
+    ) -> Result<Self, postcard::Error> {
         let partitions: Vec<ObjectSearchCursorPartition> = partitions
             .iter()
             .map(|partition| ObjectSearchCursorPartition {
@@ -528,72 +508,21 @@ impl ObjectSearchCursor {
             .iter()
             .map(|node_id| *node_id.as_bytes())
             .collect();
-        let signing_bytes = object_search_cursor_signing_bytes(
+        Self::build_signed(
             OBJECT_SEARCH_CURSOR_VERSION,
-            signer,
+            OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
             fingerprint,
-            as_of,
-            &partitions,
-            &failed_partitions,
-            discovery_failed,
-            omitted_partitions,
-        );
-        let signature = sign(&signing_bytes);
-        Self {
-            version: OBJECT_SEARCH_CURSOR_VERSION,
+            ObjectSearchCursorPayload {
+                as_of,
+                partitions,
+                failed_partitions,
+                discovery_failed,
+                omitted_partitions,
+            },
             signer,
-            fingerprint,
-            as_of,
-            partitions,
-            failed_partitions,
-            discovery_failed,
-            omitted_partitions,
-            signature,
-        }
-    }
-
-    fn signing_bytes(&self) -> Vec<u8> {
-        object_search_cursor_signing_bytes(
-            self.version,
-            self.signer,
-            self.fingerprint,
-            self.as_of,
-            &self.partitions,
-            &self.failed_partitions,
-            self.discovery_failed,
-            self.omitted_partitions,
+            sign,
         )
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn object_search_cursor_signing_bytes(
-    version: u8,
-    signer: [u8; 32],
-    fingerprint: [u8; 32],
-    as_of: SystemTime,
-    partitions: &[ObjectSearchCursorPartition],
-    failed_partitions: &[[u8; 32]],
-    discovery_failed: bool,
-    omitted_partitions: usize,
-) -> Vec<u8> {
-    let payload = ObjectSearchCursorSignaturePayload {
-        version,
-        signer,
-        fingerprint,
-        as_of,
-        partitions,
-        failed_partitions,
-        discovery_failed,
-        omitted_partitions,
-    };
-    let payload = postcard::to_allocvec(&payload).expect("object search cursor serializes");
-    let mut bytes =
-        Vec::with_capacity(OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT.len() + 1 + payload.len());
-    bytes.extend_from_slice(OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT);
-    bytes.push(0);
-    bytes.extend_from_slice(&payload);
-    bytes
 }
 
 #[derive(Debug, Clone)]
@@ -2130,7 +2059,10 @@ pub async fn search_metadata(
                     SearchCursorError::QueryMismatch.to_string(),
                 ));
             }
-            (Some(cursor.watermark.clone()), cursor.resume_positions())
+            (
+                Some(cursor.payload.watermark.clone()),
+                cursor.resume_positions(),
+            )
         }
         None => (None, HashMap::new()),
     };
@@ -2197,7 +2129,9 @@ pub async fn search_metadata(
                     net.node_id(),
                     |bytes| net.sign(bytes),
                 )
-                .encode(),
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+                .encode()
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
             )
         }
         None => None,
@@ -2896,7 +2830,10 @@ pub async fn references_preflight(
                     SearchCursorError::QueryMismatch.to_string(),
                 ));
             }
-            (Some(cursor.watermark.clone()), cursor.resume_positions())
+            (
+                Some(cursor.payload.watermark.clone()),
+                cursor.resume_positions(),
+            )
         }
         None => (None, HashMap::new()),
     };
@@ -3105,7 +3042,9 @@ pub async fn references_preflight(
                     net.node_id(),
                     |bytes| net.sign(bytes),
                 )
-                .encode(),
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+                .encode()
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
             )
         }
         None => None,
@@ -3998,12 +3937,7 @@ fn metadata_record_matches_filters(
 
 fn metadata_path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
     let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
-    let normalized_prefix = MetadataRegistryRecord::normalize_document_path(path_prefix);
-    normalized_prefix.is_empty()
-        || normalized_path == normalized_prefix
-        || normalized_path
-            .strip_prefix(&normalized_prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    crate::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
 }
 
 async fn export_rocrate_jsonld(
@@ -4130,7 +4064,7 @@ fn ensure_supported_query_form(query: &str) -> Result<(), MetadataApiError> {
     Ok(())
 }
 
-fn graph_pattern_contains_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+pub(crate) fn graph_pattern_contains_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
     use spargebra::algebra::GraphPattern;
 
     match pattern {
@@ -4300,62 +4234,27 @@ pub fn deduplicate_fanout_nodes(nodes: Vec<NodeId>) -> Vec<NodeId> {
 }
 
 fn select_fanout_nodes(nodes: &[NodeId], local_node_id: NodeId, subject: &[u8]) -> Vec<NodeId> {
-    let mut ranked = Vec::with_capacity(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
-    let mut local_score = None;
-    for &node_id in nodes {
-        let score = neg_log2_q48(selector_hash(ROLE_NODE, subject, node_id.as_bytes()));
-        if node_id == local_node_id {
-            local_score = Some(score);
-            continue;
-        }
-        if ranked.iter().any(|(candidate, _)| *candidate == node_id) {
-            continue;
-        }
-        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
-            ranked.push((node_id, score));
-            continue;
-        }
-        let Some((worst_index, (worst_node, worst_score))) =
-            ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
-                left.1
-                    .cmp(&right.1)
-                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
-            })
-        else {
-            continue;
-        };
-        if score < *worst_score
-            || (score == *worst_score && node_id.as_bytes() < worst_node.as_bytes())
-        {
-            ranked[worst_index] = (node_id, score);
-        }
-    }
-    if local_score.is_none() {
-        local_score = Some(neg_log2_q48(selector_hash(
-            ROLE_NODE,
-            subject,
-            local_node_id.as_bytes(),
-        )));
-    }
-    if let Some(score) = local_score {
-        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
-            ranked.push((local_node_id, score));
-        } else if let Some((worst_index, _)) =
-            ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
-                left.1
-                    .cmp(&right.1)
-                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
-            })
-        {
-            ranked[worst_index] = (local_node_id, score);
-        }
+    let mut ranked = select_top_peers(
+        nodes
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != local_node_id),
+        subject,
+        METADATA_DISTRIBUTED_QUERY_MAX_NODES,
+        |_| {},
+    );
+    if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+        ranked.push(local_node_id);
+    } else if !ranked.is_empty() {
+        ranked.pop();
+        ranked.push(local_node_id);
     }
     ranked.sort_unstable_by(|left, right| {
-        left.1
-            .cmp(&right.1)
-            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+        peer_rank(subject, *left)
+            .cmp(&peer_rank(subject, *right))
+            .then_with(|| left.as_bytes().cmp(right.as_bytes()))
     });
-    ranked.into_iter().map(|(node_id, _)| node_id).collect()
+    ranked
 }
 
 pub fn forwarded_bearer(
@@ -4866,11 +4765,11 @@ pub async fn search_objects(
                     ));
                 }
                 (
-                    cursor.as_of,
+                    cursor.payload.as_of,
                     partitions,
                     cursor.failed_nodes()?,
-                    cursor.discovery_failed,
-                    cursor.omitted_partitions,
+                    cursor.payload.discovery_failed,
+                    cursor.payload.omitted_partitions,
                 )
             }
             None => {
@@ -5098,7 +4997,9 @@ pub async fn search_objects(
                 net.node_id(),
                 |bytes| net.sign(bytes),
             )
-            .encode()?,
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+            .encode()
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
         )
     } else {
         None
@@ -7629,7 +7530,8 @@ mod tests {
             0,
             signer,
             |bytes| secret.sign(bytes),
-        );
+        )
+        .expect("object search cursor signs");
 
         assert!(
             ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver, signer])
@@ -7639,7 +7541,7 @@ mod tests {
             ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver]),
             Err(MetadataApiError::InvalidCursor(_))
         ));
-        cursor.omitted_partitions = 1;
+        cursor.payload.omitted_partitions = 1;
         assert!(matches!(
             ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[signer]),
             Err(MetadataApiError::InvalidCursor(_))
@@ -7921,10 +7823,11 @@ mod tests {
                     next.resume,
                     node_id,
                     |bytes| secret.sign(bytes),
-                );
-                let decoded = SearchCursor::decode(&cursor.encode(), &[node_id]).unwrap();
+                )
+                .expect("search cursor signs");
+                let decoded = SearchCursor::decode(&cursor.encode().unwrap(), &[node_id]).unwrap();
                 assert_eq!(decoded.fingerprint, fingerprint);
-                decoded.watermark
+                decoded.payload.watermark
             });
         }
 

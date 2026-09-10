@@ -5,6 +5,7 @@ use aruna_core::NodeId;
 use aruna_core::metadata::MetadataSearchHit;
 use aruna_core::types::GroupId;
 use base64::Engine;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -29,26 +30,127 @@ pub struct SearchWatermark {
     pub subject_iri: String,
 }
 
-/// Opaque, query-bound continuation token. Serialized with postcard and base64url
-/// so it stays compact and URL-safe.
+/// Signed, query-bound continuation envelope. Serialized with postcard and
+/// base64url so it stays compact and URL-safe; `payload` holds query fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SearchCursor {
-    pub version: u8,
-    pub signer: [u8; 32],
-    pub fingerprint: [u8; 32],
-    pub watermark: SearchWatermark,
-    pub resume: Vec<([u8; 32], u32)>,
-    pub signature: iroh::Signature,
+pub(crate) struct SignedCursor<P> {
+    pub(crate) version: u8,
+    pub(crate) signer: [u8; 32],
+    pub(crate) fingerprint: [u8; 32],
+    pub(crate) payload: P,
+    pub(crate) signature: iroh::Signature,
 }
 
-#[derive(Serialize)]
-struct SearchCursorSignaturePayload<'a> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum CursorEnvelopeError {
+    #[error("invalid cursor")]
+    Invalid,
+    #[error("cursor does not match query")]
+    QueryMismatch,
+}
+
+impl<P: Serialize> SignedCursor<P> {
+    pub(crate) fn encode(&self) -> Result<String, postcard::Error> {
+        let bytes = postcard::to_allocvec(self)?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    pub(crate) fn build_signed(
+        version: u8,
+        context: &[u8],
+        fingerprint: [u8; 32],
+        payload: P,
+        signer: NodeId,
+        sign: impl FnOnce(&[u8]) -> iroh::Signature,
+    ) -> Result<Self, postcard::Error> {
+        let signer = *signer.as_bytes();
+        let signing_bytes = cursor_signing_bytes(context, version, signer, fingerprint, &payload)?;
+        let signature = sign(&signing_bytes);
+        Ok(Self {
+            version,
+            signer,
+            fingerprint,
+            payload,
+            signature,
+        })
+    }
+
+    fn signing_bytes(&self, context: &[u8]) -> Result<Vec<u8>, postcard::Error> {
+        cursor_signing_bytes(
+            context,
+            self.version,
+            self.signer,
+            self.fingerprint,
+            &self.payload,
+        )
+    }
+}
+
+impl<P: Serialize + DeserializeOwned> SignedCursor<P> {
+    pub(crate) fn decode_envelope<F>(
+        raw: &str,
+        context: &[u8],
+        authorized_signers: &[NodeId],
+        check: F,
+    ) -> Result<Self, CursorEnvelopeError>
+    where
+        F: FnOnce(&Self) -> Result<(), CursorEnvelopeError>,
+    {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| CursorEnvelopeError::Invalid)?;
+        let cursor: Self =
+            postcard::from_bytes(&bytes).map_err(|_| CursorEnvelopeError::Invalid)?;
+        check(&cursor)?;
+        let signer =
+            NodeId::from_bytes(&cursor.signer).map_err(|_| CursorEnvelopeError::Invalid)?;
+        if !authorized_signers.contains(&signer) {
+            return Err(CursorEnvelopeError::Invalid);
+        }
+        let signing_bytes = cursor
+            .signing_bytes(context)
+            .map_err(|_| CursorEnvelopeError::Invalid)?;
+        signer
+            .verify(&signing_bytes, &cursor.signature)
+            .map_err(|_| CursorEnvelopeError::Invalid)?;
+        Ok(cursor)
+    }
+}
+
+fn cursor_signing_bytes<P: Serialize>(
+    context: &[u8],
     version: u8,
     signer: [u8; 32],
     fingerprint: [u8; 32],
-    watermark: &'a SearchWatermark,
-    resume: &'a [([u8; 32], u32)],
+    payload: &P,
+) -> Result<Vec<u8>, postcard::Error> {
+    #[derive(Serialize)]
+    struct SigningPayload<'a, P> {
+        version: u8,
+        signer: [u8; 32],
+        fingerprint: [u8; 32],
+        payload: &'a P,
+    }
+    let payload = postcard::to_allocvec(&SigningPayload {
+        version,
+        signer,
+        fingerprint,
+        payload,
+    })?;
+    let mut bytes = Vec::with_capacity(context.len() + 1 + payload.len());
+    bytes.extend_from_slice(context);
+    bytes.push(0);
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SearchCursorPayload {
+    pub(crate) watermark: SearchWatermark,
+    pub(crate) resume: Vec<([u8; 32], u32)>,
+}
+
+pub type SearchCursor = SignedCursor<SearchCursorPayload>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SearchCursorError {
@@ -58,15 +160,23 @@ pub enum SearchCursorError {
     QueryMismatch,
 }
 
-impl SearchCursor {
+impl From<CursorEnvelopeError> for SearchCursorError {
+    fn from(error: CursorEnvelopeError) -> Self {
+        match error {
+            CursorEnvelopeError::Invalid => Self::Invalid,
+            CursorEnvelopeError::QueryMismatch => Self::QueryMismatch,
+        }
+    }
+}
+
+impl SignedCursor<SearchCursorPayload> {
     pub fn new_signed(
         fingerprint: [u8; 32],
         watermark: SearchWatermark,
         resume: Vec<(NodeId, u32)>,
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
-    ) -> Self {
-        let signer = *signer.as_bytes();
+    ) -> Result<Self, postcard::Error> {
         let mut resume: Vec<_> = resume
             .into_iter()
             .map(|(node_id, position)| (*node_id.as_bytes(), position))
@@ -77,62 +187,37 @@ impl SearchCursor {
             resume.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
             resume.truncate(SEARCH_CURSOR_MAX_RESUME_NODES);
         }
-        let signing_bytes = cursor_signing_bytes(
+        Self::build_signed(
             SEARCH_CURSOR_VERSION,
-            signer,
+            SEARCH_CURSOR_SIGNATURE_CONTEXT,
             fingerprint,
-            &watermark,
-            &resume,
-        );
-        let signature = sign(&signing_bytes);
-        Self {
-            version: SEARCH_CURSOR_VERSION,
+            SearchCursorPayload { watermark, resume },
             signer,
-            fingerprint,
-            watermark,
-            resume,
-            signature,
-        }
-    }
-
-    pub fn encode(&self) -> String {
-        let bytes = postcard::to_allocvec(self).expect("search cursor serializes");
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    }
-
-    pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(raw)
-            .map_err(|_| SearchCursorError::Invalid)?;
-        let cursor: SearchCursor =
-            postcard::from_bytes(&bytes).map_err(|_| SearchCursorError::Invalid)?;
-        if cursor.version != SEARCH_CURSOR_VERSION
-            || cursor.resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES
-        {
-            return Err(SearchCursorError::Invalid);
-        }
-        let signer = NodeId::from_bytes(&cursor.signer).map_err(|_| SearchCursorError::Invalid)?;
-        if !authorized_signers.contains(&signer) {
-            return Err(SearchCursorError::Invalid);
-        }
-        signer
-            .verify(&cursor.signing_bytes(), &cursor.signature)
-            .map_err(|_| SearchCursorError::Invalid)?;
-        Ok(cursor)
-    }
-
-    fn signing_bytes(&self) -> Vec<u8> {
-        cursor_signing_bytes(
-            self.version,
-            self.signer,
-            self.fingerprint,
-            &self.watermark,
-            &self.resume,
+            sign,
         )
     }
 
+    pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
+        Self::decode_envelope(
+            raw,
+            SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            authorized_signers,
+            |cursor| {
+                if cursor.version != SEARCH_CURSOR_VERSION
+                    || cursor.payload.resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES
+                {
+                    Err(CursorEnvelopeError::Invalid)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .map_err(SearchCursorError::from)
+    }
+
     pub fn resume_positions(&self) -> HashMap<NodeId, u32> {
-        self.resume
+        self.payload
+            .resume
             .iter()
             .filter_map(|(bytes, position)| {
                 NodeId::from_bytes(bytes)
@@ -141,28 +226,6 @@ impl SearchCursor {
             })
             .collect()
     }
-}
-
-fn cursor_signing_bytes(
-    version: u8,
-    signer: [u8; 32],
-    fingerprint: [u8; 32],
-    watermark: &SearchWatermark,
-    resume: &[([u8; 32], u32)],
-) -> Vec<u8> {
-    let payload = SearchCursorSignaturePayload {
-        version,
-        signer,
-        fingerprint,
-        watermark,
-        resume,
-    };
-    let payload = postcard::to_allocvec(&payload).expect("search cursor payload serializes");
-    let mut bytes = Vec::with_capacity(SEARCH_CURSOR_SIGNATURE_CONTEXT.len() + 1 + payload.len());
-    bytes.extend_from_slice(SEARCH_CURSOR_SIGNATURE_CONTEXT);
-    bytes.push(0);
-    bytes.extend_from_slice(&payload);
-    bytes
 }
 
 /// Binds a cursor to the query that produced it. Recomputed on every continuation
@@ -442,6 +505,7 @@ mod tests {
         SearchCursor::new_signed(fingerprint, watermark, resume, secret.public(), |bytes| {
             secret.sign(bytes)
         })
+        .expect("search cursor signs")
     }
 
     fn hit(graph: &str, subject: &str, score: f32) -> MetadataSearchHit {
@@ -471,9 +535,9 @@ mod tests {
             vec![(node_id(1), 3), (node_id(2), 0)],
             9,
         );
-        let decoded = SearchCursor::decode(&cursor.encode(), &[signer]).unwrap();
+        let decoded = SearchCursor::decode(&cursor.encode().unwrap(), &[signer]).unwrap();
         assert_eq!(decoded, cursor);
-        assert_eq!(decoded.watermark.score.to_bits(), 0.8f32.to_bits());
+        assert_eq!(decoded.payload.watermark.score.to_bits(), 0.8f32.to_bits());
         let positions = decoded.resume_positions();
         assert_eq!(positions.get(&node_id(1)), Some(&3));
         assert_eq!(positions.get(&node_id(2)), Some(&0));
@@ -502,7 +566,7 @@ mod tests {
         );
         cursor.version = 1;
         assert_eq!(
-            SearchCursor::decode(&cursor.encode(), &[node_id(1)]),
+            SearchCursor::decode(&cursor.encode().unwrap(), &[node_id(1)]),
             Err(SearchCursorError::Invalid)
         );
     }
@@ -522,14 +586,14 @@ mod tests {
         );
 
         assert_eq!(
-            SearchCursor::decode(&cursor.encode(), &[node_id(9)]),
+            SearchCursor::decode(&cursor.encode().unwrap(), &[node_id(9)]),
             Err(SearchCursorError::Invalid)
         );
 
         let mut forged = cursor;
-        forged.resume[0].1 = 99;
+        forged.payload.resume[0].1 = 99;
         assert_eq!(
-            SearchCursor::decode(&forged.encode(), &[signer]),
+            SearchCursor::decode(&forged.encode().unwrap(), &[signer]),
             Err(SearchCursorError::Invalid)
         );
     }
@@ -549,7 +613,7 @@ mod tests {
                 .collect(),
             1,
         );
-        assert!(SearchCursor::decode(&at_cap.encode(), &[node_id(1)]).is_ok());
+        assert!(SearchCursor::decode(&at_cap.encode().unwrap(), &[node_id(1)]).is_ok());
 
         // A cursor forged past the cap (bypassing issuance) is still rejected.
         let secret = secret_key(1);
@@ -557,23 +621,27 @@ mod tests {
             .map(|index| (*node_id(index as u8).as_bytes(), 0u32))
             .collect();
         let mark = watermark();
+        let payload = SearchCursorPayload {
+            watermark: mark,
+            resume,
+        };
         let signing_bytes = cursor_signing_bytes(
+            SEARCH_CURSOR_SIGNATURE_CONTEXT,
             SEARCH_CURSOR_VERSION,
             *secret.public().as_bytes(),
             [0u8; 32],
-            &mark,
-            &resume,
-        );
+            &payload,
+        )
+        .unwrap();
         let forged = SearchCursor {
             version: SEARCH_CURSOR_VERSION,
             signer: *secret.public().as_bytes(),
             fingerprint: [0u8; 32],
-            watermark: mark,
-            resume,
+            payload,
             signature: secret.sign(&signing_bytes),
         };
         assert_eq!(
-            SearchCursor::decode(&forged.encode(), &[secret.public()]),
+            SearchCursor::decode(&forged.encode().unwrap(), &[secret.public()]),
             Err(SearchCursorError::Invalid)
         );
     }
@@ -593,8 +661,8 @@ mod tests {
                 .collect(),
             1,
         );
-        assert_eq!(over.resume.len(), SEARCH_CURSOR_MAX_RESUME_NODES);
-        assert!(SearchCursor::decode(&over.encode(), &[node_id(1)]).is_ok());
+        assert_eq!(over.payload.resume.len(), SEARCH_CURSOR_MAX_RESUME_NODES);
+        assert!(SearchCursor::decode(&over.encode().unwrap(), &[node_id(1)]).is_ok());
     }
 
     #[test]
