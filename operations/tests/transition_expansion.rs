@@ -14,12 +14,12 @@ mod topology;
 
 use aruna_core::StructuredId;
 use aruna_core::structs::{PlacementRef, RealmNodeKind};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::drive;
+use aruna_operations::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     create_metadata_document, mint_local_document,
 };
-use aruna_operations::driver::drive;
-use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_metadata_document::GetMetadataDocumentOperation;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use ulid::Ulid;
 

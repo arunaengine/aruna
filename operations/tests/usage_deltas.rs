@@ -19,8 +19,9 @@ use aruna_core::structs::{
 };
 use aruna_core::types::NodeId;
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::blob::blob_keyspace_helper::HeadAliasContext;
+use aruna_operations::blob::blob_storage::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::node::usage_stats::RebuildUsageStatsOperation;
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
@@ -46,7 +47,6 @@ use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation, UploadPartResult};
-use aruna_operations::usage_stats::RebuildUsageStatsOperation;
 use aruna_storage::storage;
 use tempfile::TempDir;
 use ulid::Ulid;
