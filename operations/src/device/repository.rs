@@ -11,6 +11,8 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::backlog::BacklogState;
+
 /// Entries one device may hold. A device authors for one person, so the queue
 /// is a human-sized backlog rather than an unbounded spool.
 pub const MAX_INTAKE_ENTRIES: usize = 256;
@@ -195,23 +197,13 @@ impl IntakeEntry {
 
     /// Whether the drain may pick this entry up now.
     pub fn is_due(&self, now_ms: u64) -> bool {
-        match &self.state {
-            IntakeState::Pending { due_at_ms, .. } | IntakeState::Publishing { due_at_ms, .. } => {
-                *due_at_ms <= now_ms
-            }
-            IntakeState::Published { .. } | IntakeState::Failed { .. } => false,
-        }
+        self.state.is_due(now_ms)
     }
 
     /// Attempts already spent, so a park decision does not have to match on
     /// the state twice.
     pub fn attempts(&self) -> u32 {
-        match &self.state {
-            IntakeState::Pending { attempts, .. } | IntakeState::Publishing { attempts, .. } => {
-                *attempts
-            }
-            IntakeState::Published { .. } | IntakeState::Failed { .. } => 0,
-        }
+        self.state.attempts()
     }
 }
 

@@ -12,20 +12,20 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    AuthContext, EntrySide, EntryState, FolderState, SyncBase, SyncPullAck, SyncRefusal,
+    AuthContext, EntrySide, EntryState, FolderState, RealmId, SyncBase, SyncPullAck, SyncRefusal,
     SyncedBytes, SyncedFolder, VersionedObjectArn,
 };
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 
+use crate::device::backlog::{BacklogDrain, arm_timer, drain_backlog, exhausted, retry_due_ms};
 use crate::device::drain::DrainOutcome;
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::queue_backoff::queue_retry_after_ms;
 
 use super::repository::{
     MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, SyncUpload, UploadState, abort_txn, base_entry, base_key,
@@ -46,55 +46,62 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
     let now = unix_timestamp_millis();
-    let mut cursor: Option<Key> = None;
-    let mut due = false;
-    loop {
-        let Some((rows, next)) = read_page(context, cursor).await else {
-            return DrainOutcome::Deferred;
-        };
-        for upload in rows {
-            if !upload.is_due(now) {
-                continue;
-            }
-            let Some(folder) = load_folder(context, upload.folder_id).await else {
-                // The folder is unbound: this row is nobody's work any more, and
-                // leaving it would keep the drain awake for a folder that is gone.
-                drop_upload(context, &upload).await;
-                continue;
-            };
-            // An unbinding folder publishes nothing more; its rows are going.
-            if folder.state == FolderState::Deleting {
-                continue;
-            }
-            let attempts = upload.attempts().saturating_add(1);
-            if !claim_upload(context, &upload, attempts).await {
-                continue;
-            }
-            // Only a row this pass really forwards keeps the drain running.
-            due = true;
-            let source = match VersionedObjectArn::new(
-                realm_id,
-                node_id,
-                folder.local_bucket.clone(),
-                upload.relative.clone(),
-                upload.local_version.unwrap_or_default(),
-            ) {
-                Ok(source) => source,
-                Err(error) => {
-                    park(context, &upload, error.to_string(), false).await;
-                    continue;
-                }
-            };
-            forward_upload(context, &folder, &upload, source, attempts).await;
-        }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
+    drain_backlog(
+        now,
+        UploadDrain {
+            context,
+            realm_id,
+            node_id,
+        },
+    )
+    .await
+}
+
+/// One upload drain plane handed to the shared page loop.
+struct UploadDrain<'a> {
+    context: &'a Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: aruna_core::NodeId,
+}
+
+impl BacklogDrain for UploadDrain<'_> {
+    type Row = SyncUpload;
+
+    async fn read(&mut self, cursor: Option<Key>) -> Option<(Vec<SyncUpload>, Option<Key>)> {
+        read_page(self.context, cursor).await
     }
-    match due {
-        true => DrainOutcome::More,
-        false => DrainOutcome::Idle,
+
+    async fn forward(&mut self, upload: SyncUpload) -> bool {
+        let Some(folder) = load_folder(self.context, upload.folder_id).await else {
+            // The folder is unbound: this row is nobody's work any more, and
+            // leaving it would keep the drain awake for a folder that is gone.
+            drop_upload(self.context, &upload).await;
+            return false;
+        };
+        // An unbinding folder publishes nothing more; its rows are going.
+        if folder.state == FolderState::Deleting {
+            return false;
+        }
+        let attempts = upload.attempts().saturating_add(1);
+        if !claim_upload(self.context, &upload, attempts).await {
+            return false;
+        }
+        // Only a claimed row keeps the drain awake.
+        let source = match VersionedObjectArn::new(
+            self.realm_id,
+            self.node_id,
+            folder.local_bucket.clone(),
+            upload.relative.clone(),
+            upload.local_version.unwrap_or_default(),
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                park(self.context, &upload, error.to_string(), false).await;
+                return true;
+            }
+        };
+        forward_upload(self.context, &folder, &upload, source, attempts).await;
+        true
     }
 }
 
@@ -276,7 +283,7 @@ fn settled_base(upload: &SyncUpload, ack: &SyncPullAck, current: Option<SyncBase
 /// read, so a concurrent unbind or a newer version wins instead of coming back.
 async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload, attempts: u32) -> bool {
     let next = UploadState::Pending {
-        due_at_ms: unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts)),
+        due_at_ms: retry_due_ms(attempts),
         attempts,
         last_error: None,
     };
@@ -284,13 +291,13 @@ async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload, attempt
 }
 
 async fn retry(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String, attempts: u32) {
-    let next = match attempts >= MAX_UPLOAD_ATTEMPTS {
+    let next = match exhausted(attempts, MAX_UPLOAD_ATTEMPTS) {
         true => UploadState::Failed {
             reason,
             retryable: true,
         },
         false => UploadState::Pending {
-            due_at_ms: unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts)),
+            due_at_ms: retry_due_ms(attempts),
             attempts,
             last_error: Some(reason),
         },
@@ -400,12 +407,12 @@ pub async fn restore_upload_timer(storage: &StorageHandle, task_handle: &TaskHan
     if !has_rows(storage, SYNC_UPLOAD_OUTBOX_KEYSPACE).await {
         return;
     }
-    if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_timer_if_idle(TaskKey::DrainSyncUploadOutbox, Duration::ZERO)
-        .await
-    {
-        warn!(message = %message, "Failed to restore the synced-folder upload timer");
-    }
+    arm_timer(
+        task_handle,
+        TaskKey::DrainSyncUploadOutbox,
+        "Failed to restore the synced-folder upload timer",
+    )
+    .await;
 }
 
 /// Whether a keyspace holds at least one row.
