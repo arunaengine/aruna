@@ -1,5 +1,5 @@
-use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
-use crate::placement_policy::{
+use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
@@ -390,7 +390,7 @@ mod tests {
     use super::{
         CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
     };
-    use crate::group_backends::BackendFenceError;
+    use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;

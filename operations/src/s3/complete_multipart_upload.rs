@@ -1,11 +1,15 @@
-use crate::blob::blob_keyspace_helper::{
+use crate::blob::blob_storage::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::schedule_blob_cleanup_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
-use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
-use crate::placement_policy::{
+use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::node::usage_stats::{
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    schedule_usage_snapshot_publish_effect,
+};
+use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
@@ -13,10 +17,6 @@ use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::write_cleanup::{
     CleanupEvent, UploadTargetError, WriteCleanup, delete_records_effect, validate_upload_target,
-};
-use crate::usage_stats::{
-    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_usage_snapshot_publish_effect,
 };
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -281,11 +281,9 @@ impl CompleteMultipartUploadOperation {
         self
     }
 
-    /// The uploader's credential restrictions. They are persisted on the durable
-    /// replication obligation, so a scoped upload cannot escalate to unscoped
-    /// when the obligation repair path enqueues replication instead.
-    /// The destination this completion is evaluated against. Omitting it leaves
-    /// the ungoverned path untouched and fails every governed one closed.
+    /// The uploader's credential restrictions, persisted on the durable
+    /// replication obligation so a scoped upload cannot escalate. The gate
+    /// destination: omitting it fails every governed completion closed.
     pub fn with_gate(mut self, context: GateContext) -> Self {
         self.gate_context = Some(context);
         self
@@ -316,10 +314,9 @@ impl CompleteMultipartUploadOperation {
 
     fn schedule_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
         self.cleanup.set_error(error);
-        // Any open finalize transaction must be aborted before we start the reset
-        // transaction, otherwise the old txn is orphaned in the storage actor and
-        // pins an LSM snapshot forever. The original error is preserved in
-        // `pending_error` and surfaced once cleanup completes.
+        // Abort any open finalize transaction before starting the reset one, or
+        // the orphaned txn pins an LSM snapshot forever. The original error stays
+        // in `pending_error` and surfaces once cleanup completes.
         if let Some(txn_id) = self.txn_id.take() {
             self.state = CompleteMultipartUploadState::AbortFinalizeTransaction;
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
@@ -1562,10 +1559,9 @@ impl CompleteMultipartUploadOperation {
         }
     }
 
-    /// A commit whose outcome is unknown may already own the composed object, so
-    /// only a proven refusal rolls it back. The rest moves to the reconciliation
-    /// queue, out of reach of `abort`, and the committed blob location row
-    /// decides its fate.
+    /// A commit with unknown outcome may already own the composed object, so only
+    /// a proven refusal rolls it back; the rest moves to the reconciliation queue,
+    /// out of reach of `abort`, where the committed location row decides its fate.
     fn handle_finalize_failure(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::Error { error }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
@@ -3249,7 +3245,7 @@ mod tests {
 mod gate_tests {
     use super::tests::TEST_NOW_MS;
     use super::*;
-    use crate::placement_policy::PolicyCacheEntry;
+    use crate::placement::policy::PolicyCacheEntry;
     use aruna_core::structs::{
         BackendRef, MultipartUploadChecksumHint, PlacementPolicy, PlacementSelector,
         PlacementSubject, VerifiedPolicy,
@@ -3383,12 +3379,12 @@ mod gate_tests {
         let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
         assert!(!composes(&effects));
 
-        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(cached.into())));
-        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
+        let effects = operation.step(crate::placement::policy::fixtures::authority(realm()));
 
         assert!(!composes(&effects));
         assert_eq!(

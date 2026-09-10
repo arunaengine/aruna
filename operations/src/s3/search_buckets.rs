@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
-use crate::request_policy::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
+use crate::driver::{DriverContext, drive};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {

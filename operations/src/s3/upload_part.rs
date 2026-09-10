@@ -1,5 +1,5 @@
-use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
-use crate::placement_policy::PolicyGateError;
+use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::placement::policy::PolicyGateError;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::write_cleanup::{
     CleanupEvent, UploadTargetError, WriteCleanup, validate_upload_target,

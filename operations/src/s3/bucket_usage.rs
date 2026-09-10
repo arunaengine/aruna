@@ -1,8 +1,6 @@
-//! Per-bucket inventory for the portal's bucket overview.
-//!
-//! There is no per-bucket usage counter: the maintained counters are keyed
-//! globally, per group and per backend. This bounded scan reuses the version and
-//! multipart listings the deletion preflight already runs and adds the byte sum.
+//! Per-bucket inventory for the portal's bucket overview. No per-bucket usage
+//! counter exists (counters are global, per group and per backend), so this
+//! bounded scan reuses the deletion preflight listings and adds the byte sum.
 
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;

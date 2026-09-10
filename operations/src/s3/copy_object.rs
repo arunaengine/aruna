@@ -372,7 +372,7 @@ async fn preserve_reference(
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use crate::placement_policy::fixtures::{seed_gate, subject};
+    use crate::placement::policy::fixtures::{seed_gate, subject};
     use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;

@@ -1,20 +1,16 @@
-//! Explicit policy attachment as a successor version.
-//!
-//! Attaching, tightening or relaxing a policy never rewrites a stored version:
-//! it mints one successor carrying the new effective refs and advances the head
-//! from an exact expected pointer. The successor VersionId is durably assigned
-//! under the caller's `mutation_id`, so a lost response or restart resolves to
-//! that same version instead of minting another one.
+//! Explicit policy attachment as a successor version. It never rewrites a stored
+//! version: it mints a successor and advances the head from an exact pointer, with
+//! the VersionId durably assigned under `mutation_id` so retries resolve to it.
 
-use crate::blob::blob_keyspace_helper::HeadAliasContext;
+use crate::blob::blob_storage::HeadAliasContext;
 use crate::blob::managed_copy::{
     COPY_PAGE_LIMIT, CopyRegistration, CopyRequest, ManagedCopyError, ManagedCopyPage,
     register_entry, scan_effect, validate_registration, version_scope,
 };
-use crate::placement_policy::{PolicyGateError, drift_reads, split_drift_reads};
+use crate::node::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use crate::placement::policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -996,7 +992,7 @@ mod tests {
         CapturedDefault, MintPolicySuccessorOperation, MintState, SuccessorError, SuccessorMint,
         SuccessorOutcome, SuccessorPlan, successor_version,
     };
-    use crate::blob::blob_keyspace_helper::HeadAliasContext;
+    use crate::blob::blob_storage::HeadAliasContext;
     use crate::s3::purge_fence::PurgeFenceError;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};

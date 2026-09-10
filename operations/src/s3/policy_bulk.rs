@@ -1,16 +1,11 @@
-//! Bounded bulk application of a bucket default to current heads.
-//!
-//! A run captures one `(bucket identity, generation, target refs)` target in its
-//! own transaction. Each object is minted through the same per-version
-//! sub-operation the single-object mutation uses, which re-reads the captured
-//! default, the head and the intent inside its commit boundary. The application
-//! is additive: it unions the captured refs with the head re-read inside the mint
-//! transaction, so applying a default never removes an object's constraints.
+//! Bounded bulk application of a bucket default to current heads. Each run
+//! captures one target per transaction and mints via the single-object
+//! sub-operation, which re-reads default/head/intent and unions, never removes.
 
-use crate::blob::blob_keyspace_helper::HeadAliasContext;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement_policy::foreign_owner;
-use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::blob_storage::HeadAliasContext;
+use crate::placement::policy::foreign_owner;
+use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
     CapturedDefault, MintPolicySuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
@@ -970,13 +965,13 @@ impl Operation for PolicyBulkOperation {
 #[cfg(test)]
 mod tests {
     use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
-    use crate::claim_initial_realm_admin::{
+    use crate::driver::{DriverContext, drive, gate_context};
+    use crate::placement::policy::cache::cache_key;
+    use crate::placement::policy::fixtures::{seed_gate, subject};
+    use crate::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive, gate_context};
-    use crate::placement_policy::cache::cache_key;
-    use crate::placement_policy::fixtures::{seed_gate, subject};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;

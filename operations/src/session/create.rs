@@ -1,5 +1,5 @@
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
-use crate::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
+use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::compute::Secret;
 use aruna_core::effects::{Effect, StorageEffect};
