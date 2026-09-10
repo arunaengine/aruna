@@ -30,7 +30,7 @@ use crate::metadata::forward::export_profile_routed;
 use crate::metadata::profile_shacl::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
-use crate::metadata::raw::load_raw_revision;
+use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::repository::{
     StorageReadError, parse_registry_read, read_registry_by_document_effect,
 };
@@ -50,12 +50,9 @@ const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
 const PROFILE_PUBLIC_PREFIX: &str = "https://w3id.org/aruna/profile/";
 const EVALUATOR_NAME: &str = "craqle-shacl-core/0.2";
 
-/// Authoritative backend SHACL support for Profile validation.
-///
-/// Shapes are compiled and executed by craqle's native SHACL Core Subset v1
-/// engine. Every construct outside this set, including SHACL-SPARQL, SHACL-JS,
-/// SHACL-AF, custom components and targets, recursive shapes, RDF-star, and
-/// remote `owl:imports`, fails closed with an `unsupported_constraint` finding.
+/// Authoritative backend SHACL support for Profile validation: craqle's native
+/// SHACL Core Subset v1 engine. Anything outside it (SHACL-SPARQL/JS/AF, custom
+/// targets, recursion, RDF-star, remote `owl:imports`) fails closed with `unsupported_constraint`.
 pub const SUPPORTED_PROFILE_CONSTRAINTS: &[&str] = &[
     "sh:targetClass",
     "sh:targetNode",
@@ -123,12 +120,8 @@ struct ResolvedProfile {
 }
 
 /// Which registered Profiles a validation may resolve.
-///
-/// Usability is a property of the registry row alone: a Profile serves the
-/// Datasets of its own group, and everyone once it is public. Whoever reaches
-/// validation already proved WRITE on the Dataset's path in that group, or READ
-/// on the group's metadata for a preview, so no caller identity takes part in
-/// the decision.
+/// Usability follows the registry row alone: group-mates, then everyone once
+/// public. The caller already proved WRITE or READ, so identity takes no part.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileScope {
     /// Datasets of this group, so its own Profiles resolve as well.
@@ -636,7 +629,7 @@ async fn validation_is_current(
     let Some(digest) = status.dataset_digest else {
         return Ok(status.dataset_revision == record.last_event_id);
     };
-    let current = crate::metadata::raw::load_raw_digest(context, record.document_id)
+    let current = crate::metadata::raw_revision::load_raw_digest(context, record.document_id)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     Ok(current == Some(digest))
@@ -1388,12 +1381,12 @@ mod tests {
                 .unwrap()
         );
 
-        let plan = crate::metadata::raw::prepare_merged_event(
+        let plan = crate::metadata::raw_revision::prepare_merged_event(
             &context,
             &event,
             render,
             0,
-            &mut crate::metadata::raw::RawStateCache::default(),
+            &mut crate::metadata::raw_revision::RawStateCache::default(),
         )
         .await
         .expect("merged raw state");

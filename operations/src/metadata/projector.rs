@@ -39,7 +39,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::schedule_outbox_drain_effect;
 use crate::driver::DriverContext;
 use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_materialization_status,
@@ -52,8 +51,9 @@ use crate::metadata::repository::{
     read_materialization_status_effect, read_registry_by_document_effect,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
-use crate::sync_placement::sort_node_ids;
-use crate::task_persistence::persist_task_effect;
+use crate::sync::document_sync_outbox::schedule_outbox_drain_effect;
+use crate::sync::shard_placement::sort_node_ids;
+use crate::tasks::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const PENDING_PROJECTION_PAGE_SIZE: usize = 256;
@@ -67,9 +67,8 @@ pub struct PendingMetadataProjectionDrainResult {
 }
 
 /// Conflict resolution is last-writer-wins on wall-clock time, so an event
-/// stamped far in the future would win every conflict forever. Inbound
-/// events beyond the configured skew are deferred until retry; operators must
-/// run NTP.
+/// stamped far ahead would win forever. Events beyond the configured skew are
+/// deferred until retry; operators must run NTP.
 const DEFAULT_MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 static CLOCK_SKEW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -578,7 +577,7 @@ pub async fn project_metadata_create_events(
         }
         if let Some(registry_outbox) = registry_outbox.flatten() {
             writes.push(
-                crate::document_sync_outbox::outbox_write_entry(&registry_outbox)
+                crate::sync::document_sync_outbox::outbox_write_entry(&registry_outbox)
                     .map_err(ConversionError::from)?,
             );
             outboxes.push(registry_outbox);
@@ -968,22 +967,9 @@ async fn read_realm_config(
     }
 }
 
-/// The document's registry row, published on the registry class's own topic
-/// rather than the document's bucket topic.
-///
-/// The bucket is replica-capped, so on a realm larger than the replication factor
-/// most nodes never see the document's bucket topic at all — and every registry
-/// row a node has today arrives as a side effect of that topic's lifecycle
-/// events. Those nodes would therefore never learn the document exists: a GET
-/// through them 404s forever, and update/delete could not even load the record
-/// they need in order to decide to forward it to a holder. The registry class is
-/// bound "everywhere", so this row reaches every node and gives each one the
-/// `document_id -> placement -> holders` mapping the routing layer runs on.
-///
-/// `None` without a readable realm config (no strategy to resolve, and a
-/// NIL-placed shard record would derive a NIL topic) and `None` when the registry
-/// bucket has no holder at all: the realm has no eligible node, so there is nobody
-/// to publish to, and replay re-plans the row once there is.
+/// The document's registry row, published on the registry class's own
+/// everywhere-bound topic rather than the replica-capped bucket topic, so every
+/// node learns the routing mapping. `None` without config or a holder; replay re-plans.
 pub fn registry_outbox_record(
     event: &MetadataCreateEventRecord,
     realm_config: Option<&RealmConfigDocument>,
