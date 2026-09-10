@@ -30,6 +30,7 @@ use crate::driver::DriverContext;
 use crate::metadata::repository::{StorageReadError, delete_index_keys};
 use crate::metadata::timestamp_index::enumerate_updated;
 use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
+use crate::storage_read::parse_storage_scan;
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
 const BUILD_BATCH: usize = 256;
@@ -337,22 +338,6 @@ fn scan_effect(start: IterStart, limit: usize) -> Effect {
     })
 }
 
-/// A scanned index batch: its entries and the storage cursor to resume after.
-type IndexBatch = (Vec<(Key, Value)>, Option<Key>);
-
-fn parse_scan(event: Event) -> Result<IndexBatch, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError(
-            "unexpected event".to_string(),
-        ))),
-    }
-}
-
 /// Rewrites a cursor minted against an older generation onto the current one, so
 /// a resumption token survives a rebuild without restarting the enumeration.
 fn rebase_cursor(cursor: &Key, generation: u64) -> Option<Key> {
@@ -403,7 +388,7 @@ pub async fn visible_page(
             .storage_handle
             .send_effect(scan_effect(start.clone(), SCAN_BATCH))
             .await;
-        let (batch, next) = parse_scan(event)?;
+        let (batch, next) = parse_storage_scan(event)?;
         if batch.is_empty() {
             more = false;
             break;
@@ -713,7 +698,7 @@ async fn prune_pass(
         .storage_handle
         .send_effect(scan_effect(start, bounds.prune))
         .await;
-    let (batch, next) = parse_scan(event)?;
+    let (batch, next) = parse_storage_scan(event)?;
     let mut stale = Vec::new();
     for (key, _) in batch {
         let (key_generation, _, _) =
@@ -1240,7 +1225,7 @@ mod tests {
                 .storage_handle
                 .send_effect(scan_effect(start.clone(), SCAN_BATCH))
                 .await;
-            let (batch, next) = parse_scan(event).unwrap();
+            let (batch, next) = parse_storage_scan(event).unwrap();
             keys.extend(batch.into_iter().map(|(key, _)| key.as_ref().to_vec()));
             match next {
                 Some(next) => start = IterStart::After(next),

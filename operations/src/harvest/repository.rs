@@ -14,7 +14,7 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 pub use crate::connectors::repository::StorageReadError;
-use crate::connectors::repository::parse_storage_read;
+use crate::storage_read::parse_storage_read;
 
 pub const HARVEST_SCAN_PAGE_SIZE: usize = 128;
 
