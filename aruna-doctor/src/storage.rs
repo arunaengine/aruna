@@ -501,7 +501,7 @@ mod tests {
         KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError,
         import_snapshot_into_new_database, snapshot_database,
     };
-    use crate::test_support::env_lock;
+    use crate::test_support::{TestEnvGuard, env_lock};
     use aruna::config::load;
     use aruna_api::server_state::ServerState;
     use aruna_blob::blob::BlobHandler;
@@ -531,36 +531,6 @@ mod tests {
     use tempfile::tempdir;
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
-
-    struct TestEnvGuard {
-        previous: Vec<(String, Option<String>)>,
-    }
-
-    impl TestEnvGuard {
-        fn set(vars: &[(&str, String)]) -> Self {
-            let previous = vars
-                .iter()
-                .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-                .collect::<Vec<_>>();
-
-            for (key, value) in vars {
-                unsafe { std::env::set_var(key, value) };
-            }
-
-            Self { previous }
-        }
-    }
-
-    impl Drop for TestEnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.previous.drain(..) {
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-            }
-        }
-    }
 
     #[tokio::test]
     async fn snapshot_round_trip_preserves_database_contents() {
