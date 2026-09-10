@@ -15,11 +15,11 @@ use aruna_core::types::{GroupId, Key, TxnId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
-use crate::request_policy::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
+use crate::driver::{DriverContext, drive};
 
 const HEAD_SCAN_BATCH: usize = 1_000;
 pub const OBJECT_SEARCH_MAX_LIMIT: usize = 100;

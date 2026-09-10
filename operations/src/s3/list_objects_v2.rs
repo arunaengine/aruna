@@ -400,11 +400,9 @@ impl ListObjectsV2Operation {
         let round_len = values.len();
         self.round_exhausted = round_len < self.scan_limit;
 
-        // Collect the candidate heads for this round. Their current version has
-        // to be read before we know whether the latest version is a delete
-        // marker, which decides both Contents membership and common-prefix
-        // roll-up. Keys inside an already-emitted group are skipped here: the
-        // group is represented, only the cursor has to advance past them.
+        // Collect this round's candidate heads: their current version decides
+        // delete-marker status, hence Contents membership and prefix roll-up. Keys
+        // in an already-emitted group are skipped; only the cursor advances past them.
         let mut candidates: Vec<(BlobHeadKey, Ulid, Vec<u8>)> = Vec::new();
         for (key, value) in values.into_iter() {
             if let Some(group_prefix) = self.cursor_group_prefix.as_deref()

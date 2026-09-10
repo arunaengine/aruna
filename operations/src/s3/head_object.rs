@@ -1,4 +1,4 @@
-use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::blob_storage::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,

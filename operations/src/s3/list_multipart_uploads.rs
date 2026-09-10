@@ -1,7 +1,5 @@
-//! List multipart uploads for a bucket.
-//!
-//! Scans the global multipart keyspace and filters, sorts, and paginates in
-//! memory because no per-bucket index exists.
+//! List multipart uploads for a bucket. Scans the global multipart keyspace and
+//! filters, sorts, and paginates in memory because no per-bucket index exists.
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

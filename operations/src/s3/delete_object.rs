@@ -1,13 +1,13 @@
-use crate::blob::blob_keyspace_helper::{
+use crate::blob::blob_storage::{
     HeadAliasContext, blob_location_read, build_head_transition_effects,
     delete_blob_version_effect, delete_hash_path_index_effect, write_blob_version_effect,
 };
 use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
-use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::usage_stats::{
+use crate::node::usage_stats::{
     UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
 };
+use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};

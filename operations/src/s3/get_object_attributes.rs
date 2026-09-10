@@ -1,4 +1,4 @@
-use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::blob_storage::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::s3::object_lookup::{
     CopyNodeId, LookupError, location_from_read, managed_copy_check, managed_copy_read,
