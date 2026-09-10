@@ -61,6 +61,7 @@ pub mod native_reference;
 pub mod node_info;
 pub mod notifications;
 pub mod onboarding_secret_state;
+mod owner_index;
 pub mod permission_rules;
 pub mod persistent_id;
 pub mod placement;
