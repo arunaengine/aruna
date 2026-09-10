@@ -23,14 +23,7 @@ use aruna_core::structs::{
     user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_forward_document, mint_local_document,
-};
 use aruna_operations::driver::drive;
-use aruna_operations::get_metadata_document::{
-    GetMetadataDocumentError, GetMetadataDocumentOperation, load_metadata_record_by_document,
-};
 use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::drain::{JobClassBudget, process_job_queue_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -46,13 +39,20 @@ use aruna_operations::metadata::api::{
     MetadataApiQueryMode, MetadataDocumentQueryRequest, MetadataRoCrateExportView,
     query_metadata_document,
 };
+use aruna_operations::metadata::create_metadata_document::{
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_forward_document, mint_local_document,
+};
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
     export_rocrate_routed, origin_holds_document, update_metadata_document_routed,
 };
+use aruna_operations::metadata::get_metadata_document::{
+    GetMetadataDocumentError, GetMetadataDocumentOperation, load_metadata_record_by_document,
+};
 use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::sync_placement::sort_node_ids;
-use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
+use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
 use ulid::Ulid;
 

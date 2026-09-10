@@ -24,30 +24,30 @@ use aruna_core::structs::{
     Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_local_document,
 };
-use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_metadata_document::{
+use aruna_operations::metadata::delete_metadata_document::DeleteMetadataDocumentOperation;
+use aruna_operations::metadata::get_metadata_document::{
     GetMetadataDocumentError, GetMetadataDocumentOperation,
 };
-use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::{
     drain_pending_metadata_projection_queue, project_metadata_create_event_from_log,
     project_metadata_create_events, replay_metadata_event_log,
     schedule_pending_metadata_projection_drain,
 };
+use aruna_operations::metadata::update_metadata_document::{
+    UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
+};
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
-use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
-};
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;

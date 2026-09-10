@@ -14,8 +14,6 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::notifications::client::{mark_read_remote, unread_count_remote};
 use aruna_operations::notifications::dispatch::{
     NotificationDispatchError, list_notifications_for_user, mark_read_for_user,
@@ -24,7 +22,9 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::task_incoming::{drain_notification_outbox, initialize_task_incoming};
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::{drain_notification_outbox, initialize_task_incoming};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -578,7 +578,7 @@ async fn install_realm_config(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             realm_id,
             node.net.node_id(),

@@ -5,7 +5,7 @@ use aruna_core::auth::bearer_token_hash;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::{RealmId, TokenClaims};
 use aruna_core::util::unix_timestamp_secs;
-use aruna_operations::auth::{
+use aruna_operations::auth::bearer_token::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, validate_aruna_bearer_token,
 };
 use async_trait::async_trait;
