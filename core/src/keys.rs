@@ -15,13 +15,6 @@ pub fn generate_signing_key() -> SigningKey {
     SigningKey::from_bytes(&bytes)
 }
 
-/// Derive a DHT key from arbitrary bytes using BLAKE3.
-#[must_use]
-#[inline]
-pub fn dht_key_from_bytes(input: &[u8]) -> DhtKeyId {
-    DhtKeyId::from_data(input)
-}
-
 /// Domain-separated key derivation using BLAKE3 keyed hash.
 #[inline]
 fn derive_key_with_domain(domain: &[u8], input: &[u8]) -> [u8; 32] {

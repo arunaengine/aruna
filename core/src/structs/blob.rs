@@ -716,26 +716,6 @@ impl HashPathIndexKey {
         }
     }
 
-    pub fn from_blake3_hash(
-        hash: &[u8],
-        version_id: Ulid,
-        realm_id: RealmId,
-        group_id: GroupId,
-        node_id: NodeId,
-        bucket: impl Into<String>,
-        key: impl Into<String>,
-    ) -> Result<Self, ConversionError> {
-        Ok(Self::new(
-            hash.try_into()?,
-            version_id,
-            realm_id,
-            group_id,
-            node_id,
-            bucket,
-            key,
-        ))
-    }
-
     pub fn hash_prefix(hash: &[u8]) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&HashPathIndexKeyPrefix {
             blake3_hash: hash.try_into()?,

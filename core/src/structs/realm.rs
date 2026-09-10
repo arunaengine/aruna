@@ -10,7 +10,7 @@ use crate::structs::{
     KIND_LABEL_KEY, METADATA_HANDLE, NODE_LABEL_KEY, NodePlacementEntry, PlacementActivation,
     PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
     PlacementTransition, SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start,
-    coordinator_spans, shard_for_subject,
+    shard_for_subject,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -176,7 +176,7 @@ pub struct RealmConfigDocument {
     pub placement_handle_ranges: Vec<HandleRange>,
     /// Append-only coordinator band pools forming a causal delegation tree.
     /// Each coordinator grants node bands only from pools it owns; precedence
-    /// is by lineage (see [`coordinator_spans`]).
+    /// is by lineage (see [`crate::structs::placement::coordinator_spans`]).
     pub band_pools: Vec<BandPool>,
     /// Immutable snapshots of the placement view. `placement_map` stays the
     /// edit surface; only a published map can become a holder-set input.
@@ -930,11 +930,6 @@ impl RealmConfigDocument {
     /// Rebuilds the derived Handle Range Directory from the granted set.
     pub fn handle_range_directory(&self) -> HandleRangeDirectory {
         HandleRangeDirectory::from_ranges(&self.placement_handle_ranges)
-    }
-
-    /// Handle spans `node` may grant bands from (see [`coordinator_spans`]).
-    pub fn coordinator_pool(&self, node: &NodeId) -> Vec<(u32, u32)> {
-        coordinator_spans(&self.band_pools, node)
     }
 
     /// `node`'s JobControl handle: the reserved first handle of its lowest

@@ -1,4 +1,5 @@
 use crate::NodeId;
+#[cfg(test)]
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{DocumentSyncEvent, DocumentSyncTarget};
 use crate::errors::ConversionError;
@@ -208,23 +209,6 @@ fn event_origin(event: &DocumentSyncEvent) -> NodeId {
             change.current.actor
         }
         DocumentSyncEvent::AdminOperation { event, .. } => event.origin_node_id,
-    }
-}
-
-/// The document-sync target an admin operation rides under, mirroring the arms
-/// of the admin apply dispatch.
-pub fn admin_sync_target(target: &AdminDocumentTarget) -> DocumentSyncTarget {
-    match target {
-        AdminDocumentTarget::Group { group_id } => DocumentSyncTarget::GroupAuthorization {
-            group_id: *group_id,
-        },
-        AdminDocumentTarget::Realm { realm_id } => DocumentSyncTarget::RealmAuthorization {
-            realm_id: *realm_id,
-        },
-        AdminDocumentTarget::RealmConfig { realm_id } => DocumentSyncTarget::RealmConfig {
-            realm_id: *realm_id,
-        },
-        AdminDocumentTarget::User { user_id } => DocumentSyncTarget::User { user_id: *user_id },
     }
 }
 
