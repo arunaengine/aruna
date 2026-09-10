@@ -33,7 +33,8 @@ use super::constants::{
 use super::kbucket::K;
 use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
-    DhtOutputValue, InboundId, OpId, RpcPhase, StorageStage,
+    DhtOutputValue, InboundId, OpId, RpcPhase, StorageStage, dht_input_kind, dht_io_inbound_id,
+    dht_io_kind, dht_io_op_id,
 };
 use super::rpc::{
     DhtRequest, DhtResponse, ErrorCode, decode_request_with_trace_context, decode_response,
@@ -2477,26 +2478,6 @@ fn output_op_id(output: &DhtOutput) -> OpId {
     }
 }
 
-fn dht_input_kind(input: &DhtInput) -> &'static str {
-    match input {
-        DhtInput::Cmd(cmd) => dht_cmd_kind(cmd),
-        DhtInput::Io(io) => dht_io_kind(io),
-        DhtInput::Clock { .. } => "clock",
-        DhtInput::Tick { .. } => "tick",
-    }
-}
-
-fn dht_cmd_kind(cmd: &DhtCmd) -> &'static str {
-    match cmd {
-        DhtCmd::Put { .. } => "put",
-        DhtCmd::Get { .. } => "get",
-        DhtCmd::Cancel { .. } => "cancel",
-        DhtCmd::Bootstrap { .. } => "bootstrap",
-        DhtCmd::RoutingTableSize { .. } => "routing_table_size",
-        DhtCmd::AddPeer { .. } => "add_peer",
-    }
-}
-
 fn dht_effect_kind(effect: &DhtEffect) -> &'static str {
     match effect {
         DhtEffect::IoRequest(request) => dht_io_request_kind(request),
@@ -2508,54 +2489,6 @@ fn dht_output_kind(output: &DhtOutput) -> &'static str {
     match output {
         DhtOutput::Completed { .. } => "completed",
         DhtOutput::Failed { .. } => "failed",
-    }
-}
-
-fn dht_io_kind(io: &DhtIo) -> &'static str {
-    match io {
-        DhtIo::RpcResponse { .. } => "rpc_response",
-        DhtIo::RpcError { .. } => "rpc_error",
-        DhtIo::InboundRequest { .. } => "inbound_request",
-        DhtIo::InboundReadError { .. } => "inbound_read_error",
-        DhtIo::InboundDropped { .. } => "inbound_dropped",
-        DhtIo::StorageReadResult { .. } => "storage_read_result",
-        DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
-        DhtIo::StorageWriteResult { .. } => "storage_write_result",
-        DhtIo::StorageIterResult { .. } => "storage_iter_result",
-        DhtIo::StorageError { .. } => "storage_error",
-        DhtIo::PeerSeen { .. } => "peer_seen",
-    }
-}
-
-fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
-    match io {
-        DhtIo::RpcResponse { op_id, .. }
-        | DhtIo::RpcError { op_id, .. }
-        | DhtIo::StorageReadResult { op_id, .. }
-        | DhtIo::StorageRevisionResult { op_id, .. }
-        | DhtIo::StorageWriteResult { op_id, .. }
-        | DhtIo::StorageIterResult { op_id, .. }
-        | DhtIo::StorageError { op_id, .. } => Some(*op_id),
-        DhtIo::InboundRequest { .. }
-        | DhtIo::InboundReadError { .. }
-        | DhtIo::InboundDropped { .. }
-        | DhtIo::PeerSeen { .. } => None,
-    }
-}
-
-fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
-    match io {
-        DhtIo::InboundRequest { inbound_id, .. }
-        | DhtIo::InboundReadError { inbound_id, .. }
-        | DhtIo::InboundDropped { inbound_id } => Some(*inbound_id),
-        DhtIo::RpcResponse { .. }
-        | DhtIo::RpcError { .. }
-        | DhtIo::StorageReadResult { .. }
-        | DhtIo::StorageRevisionResult { .. }
-        | DhtIo::StorageWriteResult { .. }
-        | DhtIo::StorageIterResult { .. }
-        | DhtIo::StorageError { .. }
-        | DhtIo::PeerSeen { .. } => None,
     }
 }
 
