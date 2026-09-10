@@ -1,7 +1,5 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
-use crate::blob::managed_copy::{
-    CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
-};
+use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob_holders::GetBlobHoldersOperation;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
@@ -13,23 +11,24 @@ use crate::replication::queue::{
     LiveReplicationObligationRecord, QueueLiveVersionReplicationInput,
     QueueLiveVersionReplicationOperation, live_obligation_entry,
 };
+use crate::s3::object_lookup::{
+    CopyNodeId, LookupError, location_from_read, managed_copy_check, managed_copy_read,
+    multipart_summary_read, summary_from_read,
+};
 use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
     ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType,
-    MultipartObjectMetadataKey, MultipartObjectSummary, PathRestriction, PlacementPolicyError,
-    PlacementPolicyRef, ResolvedSourceAccess, SourceMetadata, UsageDelta, VersionKey,
-    VersionSourceBinding,
+    PathRestriction, PlacementPolicyError, PlacementPolicyRef, ResolvedSourceAccess,
+    SourceMetadata, UsageDelta, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
@@ -330,6 +329,19 @@ impl GetObjectOperation {
         smallvec![]
     }
 
+    fn lookup_error(&self, expected: &'static str, error: LookupError) -> GetObjectError {
+        match error {
+            LookupError::Conversion(err) => GetObjectError::ConversionError(err),
+            LookupError::Managed(err) => GetObjectError::ManagedCopyError(err),
+            LookupError::InvalidEvent(received) => GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected,
+                received,
+            },
+            LookupError::Missing => GetObjectError::GetObjectFailed,
+        }
+    }
+
     /// Fails the read and releases the advance transaction it holds, so a policy
     /// rejection never leaves a write transaction open.
     fn abort_with_error(&mut self, error: GetObjectError) -> Effects {
@@ -526,74 +538,57 @@ impl GetObjectOperation {
         blob_hash: [u8; 32],
         backend: BackendRef,
     ) -> Effects {
-        let key = ManagedCopyKey::new(
-            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
-            backend.clone(),
-        );
-        let effect = match serve_reads(&key, self.txn_id) {
-            Ok(effect) => effect,
+        let check = match managed_copy_check(
+            &self.input.bucket,
+            &self.input.key,
+            version_id,
+            blob_hash,
+            backend,
+            self.txn_id,
+        ) {
+            Ok(check) => check,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.pending_copy = Some(key);
-        self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
+        self.pending_copy = Some(check.copy_key);
+        self.pending_location = Some(check.location_key);
         self.state = GetObjectState::CheckManagedCopy;
-        smallvec![effect]
+        smallvec![check.effect]
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
-            });
-        };
-        let (copy, subject) = match split_serve_reads(values) {
-            Ok(split) => split,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        let (Some(copy_key), Some(key)) = (self.pending_copy.take(), self.pending_location.take())
-        else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        if let Err(err) = validate_registration(
-            copy.as_deref(),
-            &CopyRequest {
-                key: &copy_key,
-                node_id: Some(self.input.node_id),
-                blake3: Some(key.blake3_hash),
-                refs: &self.source_policies,
-                subject_generation: Some(subject.subject.generation),
-            },
+        let key = match managed_copy_read(
+            event,
+            &mut self.pending_copy,
+            &mut self.pending_location,
+            &self.source_policies,
+            CopyNodeId::Given(self.input.node_id),
         ) {
-            return self.emit_error(err.into());
-        }
+            Ok(key) => key,
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
+                return self.emit_error(error);
+            }
+        };
         self.read_blob_location(key)
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-
-        let Some(value) = value else {
-            return match self.missing_blake3 {
-                Some(blake3) => self.emit_error(GetObjectError::BlobNotLocal {
-                    blake3,
-                    version_id: self.resolved_version_id,
-                    metadata: self.metadata.clone(),
-                }),
-                None => self.emit_error(GetObjectError::GetObjectFailed),
-            };
-        };
-
-        let location = match BackendLocation::from_bytes(value.as_ref()) {
-            Ok(location) => location,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        let location = match location_from_read(event) {
+            Ok(Some(location)) => location,
+            Ok(None) => {
+                return match self.missing_blake3 {
+                    Some(blake3) => self.emit_error(GetObjectError::BlobNotLocal {
+                        blake3,
+                        version_id: self.resolved_version_id,
+                        metadata: self.metadata.clone(),
+                    }),
+                    None => self.emit_error(GetObjectError::GetObjectFailed),
+                };
+            }
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
+                return self.emit_error(error);
+            }
         };
 
         self.read_multipart_summary(location, self.resolved_version_id)
@@ -634,31 +629,25 @@ impl GetObjectOperation {
             return self.commit_and_read_blob();
         };
 
-        let key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
-            Ok(key) => key.into(),
+        let effect = match multipart_summary_read(version_id, Some(txn_id)) {
+            Ok(effect) => effect,
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
         self.state = GetObjectState::ReadMultipartSummary;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        })]
+        smallvec![effect]
     }
 
     pub fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
+        let summary = match summary_from_read(event) {
+            Ok(summary) => summary,
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
+                return self.emit_error(error);
+            }
         };
 
-        if let Some(summary) =
-            value.and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok())
-        {
+        if let Some(summary) = summary {
             self.checksum_type = summary.checksum_type;
             self.composite_hashes = summary.composite_hashes;
             self.part_count = Some(summary.part_count);
