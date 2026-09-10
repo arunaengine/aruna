@@ -22,9 +22,9 @@ use crate::metadata::projector::{
     project_metadata_create_events, project_metadata_create_events_from_log,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::node::usage_stats::refresh_realm_usage_summary_for_targets;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::placement::{draining_former_holders, resolve_shard_holders};
-use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
 /// these; see [`DocumentSyncTarget::sync_topic_id`]).
@@ -47,10 +47,9 @@ fn shared_targets(
     ]
 }
 
-/// Whether a shared target belongs to the realm rather than to one node. A
-/// node-owned target names its node in the topic id, so only that node ever
-/// plans it; a realm-wide one is planned by every node and needs a single
-/// designated minter instead.
+/// Whether a shared target belongs to the realm rather than to one node.
+/// Node-owned targets are planned by that node alone; realm-wide ones need a
+/// single designated minter.
 pub(crate) fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
     matches!(
         target,
@@ -683,25 +682,32 @@ async fn reconcile_phase(
     // Transition steps run on the SyncPlacements timer instead of inline:
     // recovery must not gate presence and readiness on a cluster-wide
     // transition draining.
-    let placements =
-        crate::process_placements::reconcile_shard_topics(context, config.realm_id, config.node_id)
-            .await;
+    let placements = crate::placement::process_placements::reconcile_shard_topics(
+        context,
+        config.realm_id,
+        config.node_id,
+    )
+    .await;
     let outcome = match placements.status {
-        crate::process_placements::PlacementReconcileStatus::Clean => {
+        crate::placement::process_placements::PlacementReconcileStatus::Clean => {
             *pending = false;
             PhaseOutcome {
                 progress: true,
                 error: None,
             }
         }
-        crate::process_placements::PlacementReconcileStatus::RetryScheduled => PhaseOutcome {
-            progress: false,
-            error: Some(RecoveryError::PeerUnavailable),
-        },
-        crate::process_placements::PlacementReconcileStatus::StorageFailure => PhaseOutcome {
-            progress: false,
-            error: Some(RecoveryError::Storage),
-        },
+        crate::placement::process_placements::PlacementReconcileStatus::RetryScheduled => {
+            PhaseOutcome {
+                progress: false,
+                error: Some(RecoveryError::PeerUnavailable),
+            }
+        }
+        crate::placement::process_placements::PlacementReconcileStatus::StorageFailure => {
+            PhaseOutcome {
+                progress: false,
+                error: Some(RecoveryError::Storage),
+            }
+        }
     };
     info!(
         event = "startup.recovery.progress",
@@ -733,8 +739,8 @@ async fn presence_phase(
         };
     }
     let result = crate::driver::drive(
-        crate::announce_realm_presence::AnnounceRealmPresenceOperation::new(
-            crate::announce_realm_presence::AnnounceRealmPresenceConfig {
+        crate::realm::announce_realm_presence::AnnounceRealmPresenceOperation::new(
+            crate::realm::announce_realm_presence::AnnounceRealmPresenceConfig {
                 realm_id: config.realm_id,
                 node_id: config.node_id,
                 schedule_refresh: true,
@@ -769,7 +775,7 @@ async fn usage_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let result = crate::usage_stats::publish_and_refresh_usage_snapshots(
+    let result = crate::node::usage_stats::publish_and_refresh_usage_snapshots(
         context.as_ref(),
         config.node_id,
         config.realm_id,
@@ -817,17 +823,9 @@ impl RestoreShardSummary {
     }
 }
 
-/// Restarts the local node's document-sync subscriptions from the shards it
-/// holds instead of re-announcing every stored document.
-///
-/// Loads the realm config, and for each bound strategy × shard the local node
-/// resolves into a holder of, ensures the shard sync topic with its co-holders
-/// and runs one anti-entropy pass against them (digest exchange, not a
-/// per-document re-announce). The fixed shared realm topics are restored the
-/// same way. Shard topics sharing co-holder and retained sets are batched into
-/// one ensure and one sync so a restart costs O(held shards), not O(stored
-/// documents). The returned [`RestoreShardSummary`] reports the (small) topic
-/// count for callers and the restart-traffic gate.
+/// Restarts the local node's document-sync subscriptions from held shards (plus
+/// fixed shared realm topics) via batched anti-entropy passes, so restart costs
+/// O(held shards), not O(stored documents). Returns the small topic counts.
 pub async fn restore_shard_subscriptions(
     context: &Arc<DriverContext>,
     node_id: NodeId,
@@ -963,7 +961,8 @@ pub async fn restore_shard_pass(
     if !unresolved_topics.is_empty()
         && let Some(task_handle) = context.task_handle.as_ref()
     {
-        let effect = crate::sync_placement::schedule_placement_retry_effect(realm_id, node_id);
+        let effect =
+            crate::sync::shard_placement::schedule_placement_retry_effect(realm_id, node_id);
         let _ = task_handle.send_effect(effect).await;
     }
 
@@ -1082,13 +1081,9 @@ fn plan_shard_groups(
 
     let mut shared_peers = shared_topic_peers(config, node_id);
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    // One designated minter for the realm-wide topics, derived from the config
-    // every node materializes: the lowest sync-eligible node id, the same rank-0
-    // rule the metadata graph topics use. Positive absence alone lets every
-    // observer mint the same topic at once, which forks the realm document. The
-    // eligibility check is what makes the choice agree everywhere: peers resolve
-    // the minter over sync-eligible nodes only, so a node outside that set must
-    // never read itself as the lowest.
+    // One designated minter for realm-wide topics: the lowest sync-eligible node
+    // id, as rank-0 metadata graph topics use. Eligibility must bound the choice
+    // everywhere, or concurrent minters fork the realm document.
     let realm_minter = sync_eligible_node(config, node_id)
         && shared_peers
             .iter()
@@ -1391,7 +1386,7 @@ async fn restore_shared(
     // A peer that is unreachable, or that refuses a topic it already holds,
     // might hold this genesis; minting a second one forks the realm document
     // permanently. Withheld topics stay unresolved so recovery retries them.
-    let (to_ensure, withheld) = crate::process_placements::resolve_creatable_topics(
+    let (to_ensure, withheld) = crate::placement::process_placements::resolve_creatable_topics(
         context,
         net_handle,
         node_id,
@@ -1443,7 +1438,7 @@ async fn restore_rank0(
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
     // An unreachable co-holder might hold the genesis; never fork a second one.
-    let group_withheld = crate::process_placements::ensure_rank0_shard_group(
+    let group_withheld = crate::placement::process_placements::ensure_rank0_shard_group(
         context,
         net_handle,
         node_id,
@@ -1996,7 +1991,7 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        crate::incoming::initialize_net_incoming(context.clone());
+        crate::sync::incoming::initialize_net_incoming(context.clone());
         RecoveryNode {
             _dir: dir,
             net,
@@ -2342,7 +2337,7 @@ mod tests {
         // the designated minter creates the realm-wide shared topics, so a peer
         // that never restores would strand them whichever node that is.
         restore_shard_subscriptions(&blocked.context, blocked.net.node_id(), realm_id).await;
-        crate::process_placements::process_shard_placements(
+        crate::placement::process_placements::process_shard_placements(
             &blocked.context,
             realm_id,
             blocked.net.node_id(),
