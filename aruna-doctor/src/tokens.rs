@@ -512,7 +512,7 @@ mod tests {
         load_oidc_providers_from_env, oidc_password_grant_body, request_oidc_token,
         token_view_from_token,
     };
-    use crate::test_support::env_lock;
+    use crate::test_support::{TestEnvGuard, env_lock};
     use aruna::bootstrap::ensure_initial_local_onboarding_secret;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListOnboardingSecretsResponse;
@@ -559,15 +559,6 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use ulid::Ulid;
-
-    fn restore_env(previous: Vec<(String, Option<String>)>) {
-        for (key, value) in previous {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
 
     #[derive(Clone)]
     struct OidcTestState {
@@ -888,7 +879,9 @@ mod tests {
                 realm_id,
                 net.node_id(),
                 capabilities.clone(),
-                false,
+                // The bootstrap flow claims admin through this node, as the
+                // initial production node does.
+                true,
                 Some(Arc::new(OidcValidator::new().unwrap())),
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
@@ -925,11 +918,8 @@ mod tests {
         }
     }
 
-    fn set_oidc_env(
-        base_url: &str,
-        provider: &OidcProviderConfig,
-    ) -> Vec<(String, Option<String>)> {
-        let vars = [
+    fn set_oidc_env(base_url: &str, provider: &OidcProviderConfig) -> TestEnvGuard {
+        TestEnvGuard::set(&[
             (
                 "SOCKET_ADDRESS",
                 base_url.trim_start_matches("http://").to_string(),
@@ -938,15 +928,7 @@ mod tests {
             ("OIDC_MAIN_ISSUER", provider.issuer.clone()),
             ("OIDC_MAIN_AUDIENCE", provider.audience.clone()),
             ("OIDC_MAIN_DISCOVERY_URL", provider.discovery_url.clone()),
-        ];
-        let previous: Vec<_> = vars
-            .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-        previous
+        ])
     }
 
     fn decode_token_claims(token: &str) -> TokenClaims {
@@ -1176,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn loads_oidc_providers_from_environment() {
         let _guard = env_lock().lock().await;
-        let vars = [
+        let _env = TestEnvGuard::set(&[
             ("OIDC_PROVIDER_IDS", "main".to_string()),
             ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
             ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
@@ -1184,22 +1166,13 @@ mod tests {
                 "OIDC_MAIN_DISCOVERY_URL",
                 "https://issuer.example/.well-known/openid-configuration".to_string(),
             ),
-        ];
-        let previous: Vec<_> = vars
-            .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
+        ]);
 
         let providers = load_oidc_providers_from_env().unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "main");
         assert_eq!(providers[0].audience, "aruna-api");
-
-        restore_env(previous);
     }
 
     #[tokio::test]
@@ -1213,7 +1186,7 @@ mod tests {
         let (provider, oidc_task) =
             spawn_oidc_provider(issuer, kid, &signing_key, oidc_token).await;
         let node = spawn_test_node(provider.clone(), true).await;
-        let previous = set_oidc_env(&node.base_url, &provider);
+        let _env = set_oidc_env(&node.base_url, &provider);
 
         let token = create_oidc_token(
             "alice".to_string(),
@@ -1229,7 +1202,6 @@ mod tests {
         assert_eq!(user.name, "Alice");
         assert_regular_token_cannot_manage_onboarding(&node, &token).await?;
 
-        restore_env(previous);
         node.server_task.abort();
         node.net.shutdown().await;
         oidc_task.abort();
@@ -1255,7 +1227,7 @@ mod tests {
         )
         .await?
         .encode()?;
-        let previous = set_oidc_env(&node.base_url, &provider);
+        let _env = set_oidc_env(&node.base_url, &provider);
 
         let token = create_local_bootstrap_token(
             "alice".to_string(),
@@ -1270,12 +1242,8 @@ mod tests {
         let user = read_user(node.context.as_ref(), user_id).await;
         assert_eq!(user.name, "Admin");
         let status = list_onboarding_with_token(&node, &token).await?;
-        assert!(matches!(
-            status,
-            reqwest::StatusCode::OK | reqwest::StatusCode::FORBIDDEN
-        ));
+        assert_eq!(status, reqwest::StatusCode::OK);
 
-        restore_env(previous);
         node.server_task.abort();
         node.net.shutdown().await;
         oidc_task.abort();
