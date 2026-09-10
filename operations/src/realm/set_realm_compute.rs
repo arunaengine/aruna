@@ -1,9 +1,6 @@
-//! Realm-admin replacement of the compute configuration.
-//!
-//! The directed location links the planner estimates transfers with and the
-//! standing group compute quotas are replaced wholesale, through the same
-//! admin-document path every other realm-config mutation uses, so a concurrent
-//! change converges instead of one writer silently winning.
+//! Realm-admin replacement of the compute configuration: the directed location links
+//! and standing group quotas are replaced wholesale through the shared admin-document
+//! path, so concurrent changes converge instead of one writer silently winning.
 
 use aruna_core::admin_document_reducer::{
     AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_COMPUTE_PATH,
@@ -28,12 +25,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::placement_ref_for_target;
+use crate::realm::mutate_realm_placement::is_management;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::mutate_realm_placement::is_management;
-use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetRealmComputeConfig {
@@ -434,7 +431,7 @@ fn apply_reducer_compute(
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::realm::get_realm_config::GetRealmConfigOperation;
     use aruna_core::compute_quota::ComputeQuota;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
