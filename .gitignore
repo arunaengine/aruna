@@ -1,10 +1,12 @@
 target/
 docs/
-/docker/
+docker/
 .compose-data/
 .idea
 .env
 **/.env
 !.env.example
-/docker/*
+docker/*
 portal*
+aruna/compute-state/
+__pycache__/
