@@ -3,16 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
-};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataIriReferenceIndexRecord, MetadataMaterializationState,
     MetadataMaterializationStatusRecord,
 };
 use aruna_core::storage_entries::{
     metadata_iri_reference_key_ids, metadata_iri_reference_prefix,
-    metadata_iri_reference_write_entry, metadata_materialization_status_key,
+    metadata_iri_reference_write_entry,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
@@ -23,6 +22,9 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 
 use super::handle::METADATA_REGISTRY_CANDIDATE_LIMIT;
+use super::repository::{
+    StorageReadError, parse_materialization_status_read, read_materialization_status_effect,
+};
 
 const IRI_INDEX_PAGE_SIZE: usize = 128;
 const IRI_INDEX_WRITE_BATCH_SIZE: usize = 128;
@@ -513,21 +515,13 @@ async fn read_materialization_status(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataIriIndexError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-            key: metadata_materialization_status_key(document_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
-            .transpose()
-            .map_err(MetadataIriIndexError::from),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataIriIndexError::UnexpectedEvent(format!("{other:?}"))),
-    }
+    let event = storage
+        .send_effect(read_materialization_status_effect(document_id, None))
+        .await;
+    parse_materialization_status_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => error.into(),
+        StorageReadError::Conversion(error) => error.into(),
+    })
 }
 
 async fn write_metadata_iri_references(
