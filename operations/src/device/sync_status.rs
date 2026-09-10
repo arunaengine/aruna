@@ -1,8 +1,6 @@
 //! What this device still owes the realm, and how to make it run now.
-//!
-//! Everything here is derived from state the device already keeps: the replica
-//! ledger, the authoring intake and the synced-folder rows. Nothing is asked of
-//! the realm, so the Sync view answers while the realm is out of reach.
+//! Derived only from local state (replica ledger, intake, folder rows), so the
+//! Sync view answers while the realm is out of reach.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,8 +21,8 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 
 use super::drain::claim_state;
+use super::intake::{IntakeEntry, IntakeState, scan_intake};
 use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
-use super::repository::{IntakeEntry, IntakeState, scan_intake};
 use super::sync::folders::{list_folders, list_transfers};
 use super::sync::repository::{scan_folder, scan_page};
 
@@ -401,8 +399,8 @@ async fn read_bases(context: &Arc<DriverContext>, folder_id: Ulid) -> Vec<SyncBa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::intake::intake_entry;
     use crate::device::replica::ReplicaOrigin;
-    use crate::device::repository::intake_entry;
     use aruna_core::structs::{FolderMode, RealmId, RemoteBinding};
     use aruna_core::types::UserId;
 

@@ -17,23 +17,23 @@ use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::create_metadata_document::{
+use crate::driver::DriverContext;
+use crate::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_forward_document,
 };
-use crate::driver::DriverContext;
 use crate::metadata::forward::{
     MetadataWriteError, apply_batch_routed, create_metadata_document_routed,
 };
-use crate::process_placements::load_realm_config;
-use crate::update_metadata_document::UpdateMetadataDocumentError;
+use crate::metadata::update_metadata_document::UpdateMetadataDocumentError;
+use crate::placement::process_placements::load_realm_config;
 
 use super::backlog::{BacklogDrain, arm_timer, drain_backlog, exhausted, retry_due_ms};
-use super::replica::{read_replica, store_replica};
-use super::repository::{
+use super::intake::{
     IntakeEntry, IntakeKind, IntakeState, MAX_INTAKE_ATTEMPTS, entry_with_state, intake_entry,
     read_intake, scan_intake,
 };
+use super::replica::{read_replica, store_replica};
 use super::selection::track_created;
 
 /// Delay before a deferred pass looks for the realm again.
@@ -267,10 +267,9 @@ async fn claim_entry(
         }
     };
 
-    // The minted id is stored before the forward, so a crash mid-publish
-    // re-forwards the same id and the holder answers from its create fence. A
-    // claim that does not commit stops the attempt: forwarding without it would
-    // mint a second id after a crash, and would resurrect a deleted entry.
+    // The minted id is stored before the forward, so a crash mid-publish re-forwards
+    // the same id and the holder's create fence dedups it. A claim that does not
+    // commit stops the attempt; forwarding anyway would mint a second id on crash.
     claim_state(
         context,
         entry,
@@ -509,7 +508,7 @@ mod tests {
     };
     use crate::device::delete_draft::DeleteDraftOperation;
     use crate::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
-    use crate::device::repository::{IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, intake_entry};
+    use crate::device::intake::{IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, intake_entry};
     use crate::device::test_support::context;
     use crate::driver::{DriverContext, drive};
     use crate::metadata::forward::MetadataWriteError;

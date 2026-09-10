@@ -11,10 +11,10 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
-use crate::queue_backoff::queue_retry_after_ms;
+use crate::tasks::queue_backoff::queue_retry_after_ms;
 
 use super::drain::DrainOutcome;
-use super::repository::{IntakeEntry, IntakeState};
+use super::intake::{IntakeEntry, IntakeState};
 use super::sync::repository::{SyncUpload, UploadState};
 
 /// The due/attempt view both device backlog states expose.

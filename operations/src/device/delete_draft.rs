@@ -10,7 +10,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::repository::{IntakeEntry, IntakeState, intake_key, read_intake};
+use super::intake::{IntakeEntry, IntakeState, intake_key, read_intake};
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteDraftOperation {
@@ -216,7 +216,7 @@ fn fail(operation: &mut DeleteDraftOperation, error: DeleteDraftError) -> Effect
 #[cfg(test)]
 mod tests {
     use super::{DeleteDraftError, DeleteDraftOperation};
-    use crate::device::repository::{IntakeEntry, IntakeState, intake_entry};
+    use crate::device::intake::{IntakeEntry, IntakeState, intake_entry};
     use crate::device::test_support::context;
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;

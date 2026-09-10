@@ -1,10 +1,6 @@
 //! The metadata documents this device keeps a local craqle replica of.
-//!
-//! The ledger is what makes a device usable offline: it names the documents the
-//! owner selected, remembers how far each replica has been synced, and carries
-//! the registry record and the last valid render so a read answers without a
-//! holder. Nothing here is realm authority; a replica becomes realm state only
-//! when the intake drain forwards the edits made on it.
+//! The ledger names selected documents, sync progress, registry records and last
+//! valid renders so reads work offline; only the intake drain makes it realm state.
 
 use std::sync::Arc;
 
@@ -22,7 +18,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use super::repository::{IntakeEntry, IntakeState};
+use super::intake::{IntakeEntry, IntakeState};
 
 /// Documents one device may keep a replica of. A device serves one person, so
 /// this is a working set rather than an archive.

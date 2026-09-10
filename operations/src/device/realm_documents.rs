@@ -1,17 +1,6 @@
-//! A device's copy of the realm-wide documents.
-//!
-//! A device runs no document sync, so nothing pushes the realm configuration to
-//! it. It fetches the documents from a realm node as an ordinary routed read
-//! and installs the copies into the same keyspaces a realm node uses, so every
-//! local read and permission check runs unchanged. The copies are never
-//! published on: a device originates no realm administration.
-//!
-//! What it installs never regresses. A copy is refused unless its realm-config
-//! clock covers the installed one, and every revocation the device already
-//! holds survives whatever the answer says, so neither a lagging node nor one
-//! the realm evicted can hand a device back a revoked token. Only the realm's
-//! own nodes count in that clock, and a marker every peer disagrees with is
-//! re-based rather than left to lock the device out of its realm.
+//! A device's copy of the realm-wide documents, fetched by routed read into the
+//! realm keyspaces. Installs never regress, so revocations survive, and a marker
+//! every peer disagrees with is re-based.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -43,13 +32,12 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
-use crate::mutate_realm_placement::node_kind;
-use crate::node_info::{read_node_info_document, write_node_info_document};
+use crate::node::node_info::{read_node_info_document, write_node_info_document};
+use crate::realm::mutate_realm_placement::node_kind;
 
 /// Attempts in which every answering peer served a copy the marker does not
-/// cover before the marker itself is treated as the wrong one. A marker can
-/// only be too high through a peer that lied, and the realm agreeing against it
-/// is the evidence that it did.
+/// cover before the marker is treated as wrong. The realm agreeing against a
+/// too-high marker is evidence a peer lied.
 const REBASE_ATTEMPTS: u32 = 3;
 
 /// How many cached groups one reconciliation looks at. Above
@@ -128,10 +116,9 @@ pub async fn fetch_realm_documents(context: &Arc<DriverContext>, budget: Duratio
     fetch_with_plan(context, plan, budget).await
 }
 
-/// The same fetch for a device that holds no realm configuration yet: the owner
-/// and the peers to ask are given instead of read back from a stored copy. This
-/// is the onboarding path, where the realm documents are what the device is
-/// still missing.
+/// The same fetch for a device that holds no realm configuration yet: owner and
+/// peers are supplied instead of read from a stored copy. This is the onboarding
+/// path, where the realm documents are what the device is missing.
 pub async fn fetch_from_peers(
     context: &Arc<DriverContext>,
     owner: UserId,

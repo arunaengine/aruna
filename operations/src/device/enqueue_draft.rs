@@ -9,7 +9,7 @@ use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::repository::{IntakeEntry, IntakeKind, MAX_INTAKE_ENTRIES, intake_entry};
+use super::intake::{IntakeEntry, IntakeKind, MAX_INTAKE_ENTRIES, intake_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnqueueDraftInput {
@@ -229,7 +229,7 @@ fn fail(operation: &mut EnqueueDraftOperation, error: EnqueueDraftError) -> Effe
 #[cfg(test)]
 mod tests {
     use super::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
-    use crate::device::repository::{IntakeEntry, MAX_INTAKE_ENTRIES, intake_entry};
+    use crate::device::intake::{IntakeEntry, MAX_INTAKE_ENTRIES, intake_entry};
     use crate::device::test_support::context;
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
