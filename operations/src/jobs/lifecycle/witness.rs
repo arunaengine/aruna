@@ -1,10 +1,6 @@
-//! Leaderless witness scheduling.
-//!
-//! Every current holder of a submission family is a witness. Each computes the
-//! same rank from the immutable identity, so the admitting node plans at once
-//! and later ranks only step in after their own persisted delay. No witness
-//! holds a lease, and a partition may therefore produce one execution per
-//! participating witness.
+//! Leaderless witness scheduling: every current holder of a submission family is
+//! a witness, and each computes the same rank from the immutable identity. No
+//! witness holds a lease, so a partition may produce one execution per witness.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -41,7 +37,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
-use crate::node_info::read_node_info_document;
+use crate::node::node_info::read_node_info_document;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
@@ -85,9 +81,8 @@ pub fn schedule_witness_drain(after: Duration) -> Effect {
 }
 
 /// Position of `node` in the witness order. The admitting node ranks first,
-/// because it already holds the request and every input decision it made; the
-/// remaining witnesses follow the domain-separated digest of the immutable
-/// identity, which is identical on every node and unbiasable by any publisher.
+/// because it already holds the request; remaining witnesses follow the
+/// domain-separated digest of the immutable identity, identical on every node.
 pub fn witness_rank(
     holders: &[NodeId],
     family: &JobFamilyId,
@@ -704,10 +699,9 @@ async fn record_decline(
     let _ = write_row(context, JOB_PLAN_EXPLAIN_KEYSPACE, &key, &explain).await;
 }
 
-/// Whether a launch is suppressed by a success, cancellation, permanent
-/// failure, or an execution that may still finish. An unfinished execution on a
-/// node in `silent` no longer suppresses: that node stopped reporting, so its
-/// execution is no longer evidence that the work is still under way.
+/// Whether a launch is suppressed by a success, cancellation, permanent failure,
+/// or an execution that may still finish. An unfinished execution on a `silent`
+/// node no longer suppresses: that node stopped reporting.
 pub(crate) fn suppressed(
     family: JobFamilyId,
     records: &[JobRecordEnvelope],

@@ -305,12 +305,9 @@ async fn prepare_record(
     })
 }
 
-/// Owner-directed requests are answered only by the derived owner, the sole
-/// absence authority: a non-owner or unresolved owner answers `Unavailable`,
-/// and only a provably invalid id is `NotFound`.
 /// Who may answer for a job here: its immutable owner, or any node that knows
-/// the request family the alias belongs to. An external job has no single
-/// owner, so a family holder or its executor answers for it.
+/// the request family the alias belongs to. Only the derived owner is absence
+/// authority: others answer `Unavailable`, and an invalid id is `NotFound`.
 async fn owner_gate(
     context: &DriverContext,
     job_id: JobId,

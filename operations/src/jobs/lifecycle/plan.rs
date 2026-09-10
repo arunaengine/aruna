@@ -1,9 +1,6 @@
-//! Assembling the pinned values one planning round decides on.
-//!
-//! Everything here is resolved before the pure planner runs: exact input
-//! versions and their known holders, the advertised targets, and the membership
-//! details of the nodes that published them. Membership comes from the
-//! authenticated realm config, never from an advertisement's own claims.
+//! Assembling the pinned values one planning round decides on: exact input
+//! versions and holders, advertised targets, and publisher membership. Membership
+//! comes from the authenticated realm config, never from an advertisement's claims.
 
 use std::collections::BTreeMap;
 
@@ -24,12 +21,12 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::ids;
-use crate::blob_holders::GetBlobHoldersOperation;
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::blob::blob_holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
-use crate::node_info::read_node_info_document;
-use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
-use crate::request_authorization::authorize;
-use crate::request_policy::PolicyRequestExtras;
+use crate::node::node_info::read_node_info_document;
+use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 
 /// Tag that pins the container network mode, shared with the executor path.
 const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
@@ -147,9 +144,8 @@ struct Scan {
 }
 
 /// One candidate per advertised backend, screened in pages of at most
-/// [`MAX_TARGET_SCAN`]. `node_kind` and `active` come from the realm config; a
-/// document may only describe a backend, never its own standing. Eligibility is
-/// decided by the planner over the whole scan, never here.
+/// [`MAX_TARGET_SCAN`]. A document may only describe a backend, never its own
+/// standing; eligibility is decided by the planner over the whole scan.
 async fn candidates(
     context: &DriverContext,
     config: &RealmConfigDocument,
@@ -352,9 +348,8 @@ pub async fn version_hash(
 }
 
 /// The source endpoint owns the stored bucket/key/version, and every node the
-/// DHT lists for the same content hash holds a registered copy of the bytes, so
-/// running next to one of them saves the transfer. A failed lookup adds no
-/// holder, which leaves the source endpoint as the only route.
+/// DHT lists for the same content hash holds a registered copy, so running next
+/// to one saves the transfer; a failed lookup leaves the source as the only route.
 async fn input_holders(
     context: &DriverContext,
     config: &RealmConfigDocument,

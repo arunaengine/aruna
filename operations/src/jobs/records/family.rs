@@ -1,9 +1,6 @@
-//! Complete reads of one job family.
-//!
-//! Scheduling, admission, and state publication may only decide on the whole
-//! family. A prefix of it, a row that failed to decode, or a scan that stopped
-//! at its bound is an availability failure, never evidence that a record does
-//! not exist.
+//! Complete reads of one job family. Scheduling, admission, and state publication
+//! may only decide on the whole family: a prefix, a failed decode, or a bounded
+//! scan is an availability failure, never evidence that a record does not exist.
 
 use std::future::Future;
 

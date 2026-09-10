@@ -18,16 +18,11 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_job_document,
-};
-use crate::get_metadata_document::load_metadata_record_by_document;
-use crate::harvest::oai::mapping::dc_to_jsonld;
-use crate::harvest::oai::parse::{
+use crate::harvest::oai_mapping::dc_to_jsonld;
+use crate::harvest::oai_parse::{
     OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
 };
-use crate::harvest::oai::request::{format_window, identify_url, list_records_url};
+use crate::harvest::oai_request::{format_window, identify_url, list_records_url};
 use crate::harvest::repository::{
     StorageReadError, parse_connector_read, parse_provenance_read, parse_source_read,
     read_connector_effect, read_provenance_effect, read_source_effect, write_provenance_effect,
@@ -37,11 +32,16 @@ use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::MetadataAuthToken;
+use crate::metadata::create_metadata_document::{
+    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentPayload, mint_job_document,
+};
 use crate::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
     update_metadata_document_routed,
 };
-use crate::update_metadata_document::UpdateMetadataDocumentMutation;
+use crate::metadata::get_metadata_document::load_metadata_record_by_document;
+use crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a
@@ -69,10 +69,9 @@ enum HarvestFailure {
     Job(JobError),
 }
 
-/// Run one harvest of a repository source: page through OAI-PMH ListRecords,
-/// apply each record through the metadata write seam with the source's group
-/// authority, and advance the cursor. Idempotent by harvest provenance, so a
-/// fenced re-run re-applies nothing.
+/// Run one harvest: page through OAI-PMH ListRecords, apply each record through
+/// the metadata write seam with the source's group authority, and advance the
+/// cursor. Idempotent by harvest provenance, so a fenced re-run re-applies nothing.
 pub async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
     match harvest(ctx, spec).await {
         Ok(counts) => JobRunOutcome::Succeeded(JobResultPayload::Harvest {
@@ -357,12 +356,8 @@ async fn apply_record(
 }
 
 /// Prove the harvested document is gone before its provenance may go terminal.
-///
-/// An empty local registry read is not evidence of absence: the row is a
-/// projection of a create that may still be queued here, and a `Tombstoned` row
-/// written over that race would leave the document live forever. Only a routed
-/// delete that succeeds, or one every holder answers as already absent, retires
-/// the identity; anything else is retryable and keeps the prior state.
+/// An empty local read is not evidence of absence, since the create may still be
+/// queued here; only a routed delete that succeeds or an all-absent answer retires it.
 async fn confirm_withdrawn(
     ctx: &JobContext,
     source: &HarvestSource,
@@ -436,9 +431,8 @@ async fn projection_pending(ctx: &JobContext, document_id: Ulid) -> Result<bool,
 }
 
 /// Allocate a structured document id, record it as `PendingCreate` before the
-/// create runs, then confirm it. A crash anywhere in between leaves a retry the
-/// same id, so a replay converges on one document instead of orphaning one per
-/// attempt.
+/// create runs, then confirm it. A crash in between leaves a retry the same id,
+/// so a replay converges on one document instead of orphaning one per attempt.
 async fn mint_and_create(
     ctx: &JobContext,
     source: &HarvestSource,
@@ -549,14 +543,9 @@ fn next_version(existing: Option<&HarvestProvenance>) -> u64 {
         .unwrap_or(1)
 }
 
-/// Land a source record under its target prefix at a stable, path-safe segment
-/// derived from the OAI identifier.
-///
-/// Every identifier is encoded into one of two disjoint domains so no two raw
-/// identifiers can ever share a segment: `b64-` carries the exact identifier as
-/// URL-safe unpadded base64 whenever it fits the path budget, `b3-` carries the
-/// full 256-bit BLAKE3 digest of anything longer. Provenance keeps the raw
-/// identifier, so the encoding never has to be reversed.
+/// Land a source record under its target prefix at a stable, path-safe segment.
+/// `b64-` carries the OAI identifier as URL-safe base64 when it fits the budget,
+/// `b3-` its BLAKE3 digest; the disjoint domains prevent segment collisions.
 fn harvest_document_path(prefix: &str, identifier: &str) -> Result<String, HarvestFailure> {
     let Some(prefix) = normalize_target_prefix(prefix) else {
         return Err(permanent(format!(
@@ -623,12 +612,9 @@ async fn discover_granularity(
     parse_granularity(&body)
 }
 
-/// Fetch one OAI-PMH response under a hard byte cap and a total wall-clock
-/// deadline.
-///
-/// The egress client only bounds connect and read *inactivity*, so a slow-drip
-/// or endless response would otherwise run until the node stops. Chunks are
-/// counted after decoding, which is what a compressed body expands to.
+/// Fetch one OAI-PMH response under a hard byte cap and wall-clock deadline.
+/// Egress bounds only connect and read *inactivity*, so a slow-drip response
+/// would otherwise run until the node stops; the cap counts decoded bytes.
 async fn fetch(
     ctx: &JobContext,
     blob: &BlobHandle,

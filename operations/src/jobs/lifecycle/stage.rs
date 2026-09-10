@@ -1,10 +1,6 @@
-//! Cross-node staging of one stored input version.
-//!
-//! The target may not hold the bytes an execution needs. It then reads them
-//! from a legal holder through the managed-copy handshake, which challenges a
-//! policy-unaware request, teaches the refs, and retries only once this node's
-//! own destination subject complies. The bytes land through the ordinary
-//! policy-gated workspace write, verified against the stored hash.
+//! Cross-node staging of one stored input version: a target missing the bytes
+//! reads them from a legal holder through the managed-copy handshake, then writes
+//! them through the policy-gated workspace write, verified against the stored hash.
 
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
@@ -13,7 +9,7 @@ use aruna_core::structs::{
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::blob_holders::GetBlobHoldersOperation;
+use crate::blob::blob_holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};

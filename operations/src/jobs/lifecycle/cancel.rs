@@ -1,10 +1,6 @@
-//! Append-only cancellation of one request family.
-//!
-//! Cancelling is a replicated intent, not a global stop: a holder that checked
-//! the caller's permission against the stored spec signs a token-free record,
-//! every holder that observes it stops launching, and known active executions
-//! are asked to stop. A partitioned execution may still finish, and its late
-//! success is projected with `cancel_requested` set.
+//! Append-only cancellation of one request family: a permission-checked holder
+//! signs a token-free record; observers stop launching and active executions are
+//! asked to stop. A partitioned execution may finish with `cancel_requested` set.
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::jobs::{JobRequest, JobResponse};
@@ -19,6 +15,8 @@ use ulid::Ulid;
 
 use super::routing::{family_of_alias, family_projection};
 use super::updates::{SETTLE_RETRY_AFTER, publish_terminal, schedule_terminal_settle};
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::protocol::send_job_request;
@@ -30,8 +28,6 @@ use crate::jobs::service::kick_drain;
 use crate::jobs::store::{CancelRequestOutcome, JobMutationError, set_cancel_requested};
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::load_realm_config;
-use crate::request_authorization::authorize;
-use crate::request_policy::PolicyRequestExtras;
 
 /// Cancels one external job through its family. `None` means the alias names no
 /// family here, so the caller keeps its ordinary local cancellation.
