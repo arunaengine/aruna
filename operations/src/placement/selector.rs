@@ -1,7 +1,6 @@
 //! Integer-only weighted two-level rendezvous primitives.
-//!
-//! Determinism is the whole contract: identical inputs must produce identical
-//! rankings on every platform, so no floating point appears outside `#[cfg(test)]`.
+//! Determinism is the contract: identical inputs must produce identical rankings
+//! on every platform, so no floating point appears outside `#[cfg(test)]`.
 
 use std::cmp::Ordering;
 
@@ -28,10 +27,8 @@ pub fn selector_hash(role: u8, subject: &[u8], id: &[u8]) -> u64 {
 }
 
 /// Exact UQ16.48 fixed-point encoding of `-log2(h / 2^64)` for nonzero `h`.
-///
-/// Normalises `h` by its leading zeros to a mantissa `m ∈ [1, 2)`; the integer
-/// part is `leading_zeros + 1`. The 48 fraction bits are peeled by repeated
-/// squaring: `m² ≥ 2` yields a set bit and halves the mantissa back into range.
+/// Normalises `h` to a mantissa in [1, 2), with integer part `leading_zeros + 1`;
+/// the 48 fraction bits are peeled by repeated squaring.
 pub fn neg_log2_q48(h: u64) -> u64 {
     debug_assert!(h != 0);
     let z = h.leading_zeros();
@@ -106,9 +103,8 @@ where
 }
 
 /// Ranks candidate indices best-first by weighted rendezvous score `-log2(u)/weight`.
-///
-/// `i` precedes `j` iff `L_i·w_j < L_j·w_i`; ties break by `(L, id bytes)` ascending,
-/// so zero-weight candidates (never a numerator advantage) sort after all positive ones.
+/// `i` precedes `j` iff `L_i·w_j < L_j·w_i`; ties break by `(L, id bytes)`, so
+/// zero-weight candidates sort after all positive ones.
 pub fn rank_weighted<I: AsRef<[u8]>>(
     role: u8,
     subject: &[u8],

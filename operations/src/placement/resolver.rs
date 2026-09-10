@@ -30,13 +30,8 @@ pub struct PlacementResolutionContext<'a> {
 }
 
 /// Assembles one [`ResolvedNode`] per configured node with a parseable id.
-///
-/// Placement fields come from the matching `placement_map` entry; unmapped
-/// nodes fall back to [`DEFAULT_LOCATION`] / [`DEFAULT_NODE_WEIGHT`] and clear
-/// status flags. Labels are the entry's `labels`, overlaid by the derived
-/// read-only kind label (which always wins). The label input is the replicated
-/// class-1 placement-map entry, never the eventually-consistent `NodeInfo`, so
-/// holder sets stay a pure function of the placement map.
+/// Placement fields come from the matching `placement_map` entry (unmapped nodes
+/// use defaults); labels come from that entry, never eventually-consistent `NodeInfo`.
 pub fn build_view(config: &RealmConfigDocument) -> PlacementView {
     PlacementView {
         nodes: config.candidate_nodes(),
@@ -52,10 +47,8 @@ pub fn view_from_map(map: &CandidatePlacementMap) -> PlacementView {
 }
 
 /// Resolves holders for `subject` in rank order (downstream retry order).
-///
 /// Available pinned nodes lead (bypassing affinity filters), then the weighted
-/// two-level walk fills up to `strategy.replica_count` from the eligible nodes;
-/// `None` takes every eligible node.
+/// two-level walk fills up to `strategy.replica_count`; `None` takes every node.
 pub fn resolve_holders(
     view: &PlacementView,
     strategy: &PlacementStrategy,
@@ -131,11 +124,8 @@ pub fn resolve_holders(
 }
 
 /// Resolves the placement strategy and any subject override for `target`.
-///
-/// Precedence: override strategy id > longest matching metadata path prefix >
-/// group binding > class binding > realm binding > `default_strategy_id`,
-/// falling back to the first configured strategy only when no configured ref
-/// applies. Returns `None` when a configured ref points at no strategy.
+/// Precedence: override > longest metadata path prefix > group > class > realm >
+/// `default_strategy_id`, then the first strategy; `None` if a ref is dangling.
 pub fn strategy_for_target<'a>(
     config: &'a RealmConfigDocument,
     target: &DocumentSyncTarget,
@@ -212,11 +202,9 @@ pub fn subject_bytes(target: &DocumentSyncTarget) -> Vec<u8> {
     }
 }
 
-/// Canonical bucket-choice subject for a Meta Resource (spec 6.3.6): the byte
-/// serialization of `(realm_id, group_id, normalized_canonical_path)`. It is
-/// known before the MetaResourceId is generated, so bucket choice never
-/// substitutes the id and becomes circular. The fixed-width `realm_id ‖ group_id`
-/// prefix keeps the trailing path unambiguous.
+/// Canonical bucket-choice subject for a Meta Resource (spec 6.3.6): bytes of
+/// `(realm_id, group_id, normalized_canonical_path)`, known before the id exists
+/// so bucket choice is never circular. Fixed-width prefix keeps paths unambiguous.
 pub fn meta_bucket_subject(realm_id: RealmId, group_id: GroupId, normalized_path: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(32 + 16 + normalized_path.len());
     bytes.extend_from_slice(realm_id.as_bytes());
