@@ -2430,14 +2430,11 @@ fn rpc_phase_order(phase: RpcPhase) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{make_node, make_secret};
     use aruna_core::structs::RealmNodeKind;
     use aruna_core::types::UserId;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-
-    fn make_node(seed: u8) -> NodeId {
-        make_secret(seed).public()
-    }
 
     fn user_kinds(peer: NodeId) -> PeerKinds {
         Arc::new(parking_lot::RwLock::new(BTreeMap::from([(
@@ -2446,12 +2443,6 @@ mod tests {
                 owner: UserId::nil(make_realm(1)),
             },
         )])))
-    }
-
-    fn make_secret(seed: u8) -> iroh::SecretKey {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&seed_bytes)
     }
 
     fn make_realm(seed: u8) -> RealmId {
