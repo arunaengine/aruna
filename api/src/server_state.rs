@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
+use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{
@@ -370,22 +370,6 @@ impl ServerState {
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {
         self.jobs_runtime.clone()
     }
-    pub fn get_pubkey(&self) -> [u8; 113] {
-        match self.node_capabilities {
-            NodeCapabilities::Management {
-                realm_verifying_key,
-                ..
-            } => realm_verifying_key,
-            NodeCapabilities::Server {
-                realm_verifying_key,
-                ..
-            } => realm_verifying_key,
-            NodeCapabilities::User {
-                realm_verifying_key,
-            } => realm_verifying_key,
-        }
-    }
-
     pub fn get_realm_id(&self) -> RealmId {
         self.realm_id
     }
@@ -629,23 +613,6 @@ impl ServerState {
             .await
             .get(realm_id)
             .is_some()
-    }
-
-    pub async fn user_exists(&self, user_id: aruna_core::UserId) -> Result<bool, StorageError> {
-        match self
-            .driver_ctx
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: USER_KEYSPACE.to_string(),
-                key: ByteView::from(user_id.to_bytes()),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-            Event::Storage(StorageEvent::Error { error }) => Err(error),
-            _ => Err(StorageError::InvalidEffect),
-        }
     }
 
     pub async fn claim_initial_realm_admin(

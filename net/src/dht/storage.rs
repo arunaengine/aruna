@@ -195,13 +195,6 @@ pub fn encode_entries(entries: &[StoredEntry]) -> Result<Vec<u8>, postcard::Erro
     postcard::to_allocvec(entries)
 }
 
-pub fn live_entries(entries: Vec<StoredEntry>, now: u64) -> Vec<StoredEntry> {
-    entries
-        .into_iter()
-        .filter(|entry| entry_is_fresh(entry.expires_at, now))
-        .collect()
-}
-
 pub fn retained_entries(entries: Vec<StoredEntry>, now: u64) -> Vec<StoredEntry> {
     entries
         .into_iter()

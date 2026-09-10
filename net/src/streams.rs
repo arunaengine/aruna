@@ -290,16 +290,11 @@ impl AsyncRead for LeasedRecvStream {
 
 pub struct StreamsService {
     connection_pool: ConnectionPool,
-    #[allow(dead_code)]
-    shutdown: CancellationToken,
 }
 
 impl StreamsService {
-    pub fn new(connection_pool: ConnectionPool, shutdown: CancellationToken) -> Self {
-        Self {
-            connection_pool,
-            shutdown,
-        }
+    pub fn new(connection_pool: ConnectionPool) -> Self {
+        Self { connection_pool }
     }
 
     #[tracing::instrument(
