@@ -11,9 +11,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::connectors::reference_scan::{ReferenceScan, ReferenceScanPhase};
 use crate::connectors::repository::{
-    StorageReadError, blob_version_references_connector, delete_connector_secret_effect,
-    iter_connector_reference_versions_effect, parse_blob_version_iter, parse_connector_read,
+    StorageReadError, delete_connector_secret_effect, parse_connector_read,
     parse_connector_secret_read, read_connector_effect, read_connector_secret_effect,
     source_connector_key, source_connector_secret_key,
 };
@@ -103,30 +103,6 @@ impl ReplaceSourceConnectorOperation {
         }
     }
 
-    fn emit_error(&mut self, error: ReplaceSourceConnectorError) -> Effects {
-        self.state = ReplaceSourceConnectorState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn abort_with_error(&mut self, error: ReplaceSourceConnectorError) -> Effects {
-        let Some(txn_id) = self.txn_id.take() else {
-            return self.emit_error(error);
-        };
-
-        self.state = ReplaceSourceConnectorState::AbortTransaction;
-        self.output = Some(Err(error));
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn fail_or_abort(&mut self, error: ReplaceSourceConnectorError) -> Effects {
-        if self.txn_id.is_some() {
-            self.abort_with_error(error)
-        } else {
-            self.emit_error(error)
-        }
-    }
-
     fn handle_init(&mut self) -> Effects {
         if let Err(error) = validate_connector_input(
             &self.input.name,
@@ -205,47 +181,6 @@ impl ReplaceSourceConnectorOperation {
                 received,
             }),
         }
-    }
-
-    fn current_txn_id(&mut self) -> Result<TxnId, Effects> {
-        self.txn_id.ok_or_else(|| {
-            self.emit_error(ReplaceSourceConnectorError::StorageError(
-                StorageError::TransactionNotFound,
-            ))
-        })
-    }
-
-    fn scan_reference_versions(&mut self, start_after: Option<aruna_core::types::Key>) -> Effects {
-        let txn_id = match self.current_txn_id() {
-            Ok(txn_id) => txn_id,
-            Err(effects) => return effects,
-        };
-
-        self.state = ReplaceSourceConnectorState::ScanReferenceVersions;
-        smallvec![iter_connector_reference_versions_effect(
-            start_after,
-            Some(txn_id),
-        )]
-    }
-
-    fn handle_reference_versions_scanned(&mut self, event: Event) -> Effects {
-        let (versions, next_start_after) = match parse_blob_version_iter(event) {
-            Ok(result) => result,
-            Err(error) => return self.abort_with_error(error.into()),
-        };
-
-        if versions
-            .iter()
-            .any(|version| blob_version_references_connector(version, self.input.connector_id))
-        {
-            return self.abort_with_error(ReplaceSourceConnectorError::ReferencedByObjectVersion);
-        }
-
-        if let Some(start_after) = next_start_after {
-            return self.scan_reference_versions(Some(start_after));
-        }
-
-        self.write_records()
     }
 
     fn write_records(&mut self) -> Effects {
@@ -345,39 +280,6 @@ impl ReplaceSourceConnectorOperation {
         self.finish()
     }
 
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                self.finish()
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.txn_id = None;
-                self.emit_error(error.into())
-            }
-            received => self.fail_or_abort(ReplaceSourceConnectorError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received,
-            }),
-        }
-    }
-
-    fn handle_transaction_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = ReplaceSourceConnectorState::Error;
-                smallvec![]
-            }
-            received => self.emit_error(ReplaceSourceConnectorError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received,
-            }),
-        }
-    }
-
     fn finish(&mut self) -> Effects {
         let Some(connector) = self.replacement.clone() else {
             return self.emit_error(ReplaceSourceConnectorError::ReplaceSourceConnectorFailed);
@@ -389,6 +291,48 @@ impl ReplaceSourceConnectorOperation {
             has_secret_config: self.replacement_secret.is_some(),
         }));
         smallvec![]
+    }
+}
+
+impl ReferenceScan for ReplaceSourceConnectorOperation {
+    fn scan_connector_id(&self) -> Ulid {
+        self.input.connector_id
+    }
+
+    fn scan_txn_id(&mut self) -> &mut Option<TxnId> {
+        &mut self.txn_id
+    }
+
+    fn scan_phase(&mut self, phase: ReferenceScanPhase) {
+        self.state = match phase {
+            ReferenceScanPhase::Scan => ReplaceSourceConnectorState::ScanReferenceVersions,
+            ReferenceScanPhase::Abort => ReplaceSourceConnectorState::AbortTransaction,
+            ReferenceScanPhase::Error => ReplaceSourceConnectorState::Error,
+        };
+    }
+
+    fn scan_error_output(&mut self, error: Self::Error) {
+        self.output = Some(Err(error));
+    }
+
+    fn scan_referenced(&self) -> Self::Error {
+        ReplaceSourceConnectorError::ReferencedByObjectVersion
+    }
+
+    fn invalid_event(&self, expected: &'static str, received: Event) -> Self::Error {
+        ReplaceSourceConnectorError::InvalidStateEvent {
+            state: self.state.clone(),
+            expected,
+            received,
+        }
+    }
+
+    fn scan_done(&mut self) -> Effects {
+        self.write_records()
+    }
+
+    fn commit_done(&mut self) -> Effects {
+        self.finish()
     }
 }
 
