@@ -21,6 +21,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use ulid::Ulid;
 
+impl From<BlobError> for BlobLibError {
+    fn from(error: BlobError) -> Self {
+        BlobLibError::IoError(std::io::Error::other(error.to_string()))
+    }
+}
+
 const BUCKET_STATS_RETRIES: u32 = 32;
 const BUCKET_STATS_BACKOFF: Duration = Duration::from_millis(1);
 const BUCKET_STATS_BACKOFF_CAP: Duration = Duration::from_millis(50);
@@ -97,7 +103,7 @@ pub(super) fn intent_value(location: &BackendLocation) -> Result<ByteView, BlobE
 }
 
 impl BlobHandler {
-    pub(super) async fn ensure_multipart_bucket(&self) -> Result<(), BlobLibError> {
+    pub(super) async fn ensure_multipart_bucket(&self) -> Result<(), BlobError> {
         for (_, backend) in self.registry.entries() {
             if backend.config.backend_type != Backend::S3 {
                 continue;
@@ -105,9 +111,7 @@ impl BlobHandler {
             let Some(bucket) = backend.config.multipart_bucket.as_deref() else {
                 continue;
             };
-            make_bucket(bucket, &backend.config.service_config)
-                .await
-                .map_err(|err| BlobLibError::IoError(std::io::Error::other(err.to_string())))?;
+            make_bucket(bucket, &backend.config.service_config).await?;
         }
         Ok(())
     }
