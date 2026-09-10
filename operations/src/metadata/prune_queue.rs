@@ -24,7 +24,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
+use crate::tasks::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
 
 use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,

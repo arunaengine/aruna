@@ -325,9 +325,8 @@ pub(crate) async fn prepare_raw_event(
 }
 
 /// Raw state after `event`'s batch merged and the graph re-rendered.
-///
-/// Out-of-order arrival needs no replay: the OR-Set already converged, so the
-/// render describes every batch this node has merged.
+/// Out-of-order arrival needs no replay: the render describes every batch
+/// this node has merged.
 pub(crate) async fn prepare_merged_event(
     context: &DriverContext,
     event: &MetadataCreateEventRecord,
