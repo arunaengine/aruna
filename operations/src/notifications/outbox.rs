@@ -453,10 +453,18 @@ mod tests {
 
         restore_notification_outbox_timer(&storage, &task_handle, Duration::ZERO).await;
 
+        // A zero-delay timer armed by restore is dispatched before this abort
+        // command, so the running count witnesses whether a timer was armed.
+        let TaskEvent::RunningHandlersAborted { count, .. } = task_handle
+            .abort_running_handlers(TaskKey::DrainNotificationOutbox)
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 0, "empty outbox must not arm a drain timer");
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), seen_rx.recv())
-                .await
-                .is_err()
+            seen_rx.try_recv().is_err(),
+            "empty outbox must not invoke the drain handler"
         );
     }
 
@@ -522,13 +530,21 @@ mod tests {
             .expect("handler should send first key");
         assert_eq!(first, TaskKey::DrainNotificationOutbox);
 
-        restore_notification_outbox_timer_if_idle(&storage, &task_handle, Duration::ZERO).await;
-        release.add_permits(1);
+        restore_notification_outbox_timer_if_idle(&storage, &task_handle, Duration::from_secs(10))
+            .await;
 
+        // A timer left by restore_if_idle would report its ~10s deadline here;
+        // a running drain returns the 3600s requested by the probe instead.
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_timer_if_idle(TaskKey::DrainNotificationOutbox, Duration::from_secs(3600))
+            .await
+        else {
+            panic!("expected timer scheduled");
+        };
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), seen_rx.recv())
-                .await
-                .is_err()
+            after > Duration::from_secs(3000),
+            "restore_if_idle must not arm a drain timer while the drain runs"
         );
+        release.add_permits(1);
     }
 }
