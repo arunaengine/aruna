@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
@@ -36,6 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
+use super::channel::ChannelStream;
 use super::config::{DockerConfig, SESSION_NETWORK};
 use super::logs::BoundedTail;
 use super::staging::StageLayout;
@@ -727,17 +726,6 @@ impl std::error::Error for TransferLimitError {}
 
 fn transfer_error() -> BackendError {
     BackendError::InvalidSpec(TransferLimitError.to_string())
-}
-
-/// `mpsc::Receiver` as a `Stream`; carries archive chunks across task borders.
-struct ChannelStream<T>(mpsc::Receiver<T>);
-
-impl<T> Stream for ChannelStream<T> {
-    type Item = T;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.0.poll_recv(cx)
-    }
 }
 
 /// Byte-counting tar sink feeding the upload body channel.

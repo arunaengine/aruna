@@ -15,7 +15,7 @@ use aruna_core::compute::{
 use aruna_core::util::tail_str;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use json_patch::Patch as JsonPatch;
 use k8s_openapi::api::authorization::v1::SelfSubjectAccessReview;
 use k8s_openapi::api::batch::v1::Job;
@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
+use super::channel::ChannelStream;
 use super::config::{KubernetesConfig, MAX_NODE_SELECTOR_ENTRIES};
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
@@ -2271,16 +2272,6 @@ async fn join_exec(mut attached: kube::api::AttachedProcess) -> Result<(), Backe
             .or(status.reason)
             .unwrap_or_else(|| "Kubernetes exec failed".to_string()),
     ))
-}
-
-struct ChannelStream(mpsc::Receiver<Result<Bytes, BackendError>>);
-
-impl Stream for ChannelStream {
-    type Item = Result<Bytes, BackendError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(context)
-    }
 }
 
 fn api_code(error: &kube::Error) -> Option<u16> {

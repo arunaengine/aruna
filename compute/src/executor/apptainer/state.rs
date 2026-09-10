@@ -1,10 +1,14 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{AttemptPhase, BackendError, FenceContext, TombstoneEvidence};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::executor::control_store::{
+    self, ControlError, ControlGuard as StoredGuard, ControlState,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlRecord {
@@ -12,6 +16,20 @@ pub struct ControlRecord {
     pub highest_generation: u64,
     pub cancel: bool,
     pub tombstone_ref: Option<String>,
+}
+
+impl ControlState for ControlRecord {
+    fn attempt_epoch(&self) -> u64 {
+        self.attempt_epoch
+    }
+
+    fn highest_generation(&self) -> u64 {
+        self.highest_generation
+    }
+
+    fn set_highest_generation(&mut self, generation: u64) {
+        self.highest_generation = generation;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,24 +107,16 @@ impl StateRoot {
 
     pub fn control(&self, context: &FenceContext) -> Result<ControlGuard, BackendError> {
         let directory = self.control_dir(context);
-        std::fs::create_dir_all(&directory).map_err(state_error)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(directory.join("control.lock"))
-            .map_err(state_error)?;
-        lock.lock().map_err(state_error)?;
-        let path = directory.join("control.json");
-        let record = read_optional(&path)?;
-        let mut guard = ControlGuard {
-            _lock: lock,
-            path,
-            record,
-        };
-        guard.accept(context)?;
-        Ok(guard)
+        let guard = StoredGuard::open(&directory, context, |attempt_epoch, highest_generation| {
+            ControlRecord {
+                attempt_epoch,
+                highest_generation,
+                cancel: false,
+                tombstone_ref: None,
+            }
+        })
+        .map_err(control_error)?;
+        Ok(ControlGuard(guard))
     }
 
     pub fn read(&self, context: &FenceContext) -> Result<Option<ControlRecord>, BackendError> {
@@ -135,41 +145,11 @@ impl StateRoot {
     }
 }
 
-pub struct ControlGuard {
-    _lock: File,
-    path: PathBuf,
-    record: Option<ControlRecord>,
-}
+pub struct ControlGuard(StoredGuard<ControlRecord>);
 
 impl ControlGuard {
-    fn accept(&mut self, context: &FenceContext) -> Result<(), BackendError> {
-        match self.record.as_mut() {
-            Some(record) if record.attempt_epoch != context.attempt_epoch => {
-                return Err(BackendError::Conflict("attempt epoch mismatch".to_string()));
-            }
-            Some(record) if context.controller_generation < record.highest_generation => {
-                return Err(BackendError::Fenced);
-            }
-            Some(record) if context.controller_generation > record.highest_generation => {
-                record.highest_generation = context.controller_generation;
-                self.persist()?;
-            }
-            Some(_) => {}
-            None => {
-                self.record = Some(ControlRecord {
-                    attempt_epoch: context.attempt_epoch,
-                    highest_generation: context.controller_generation,
-                    cancel: false,
-                    tombstone_ref: None,
-                });
-                self.persist()?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn tombstone(&self) -> Option<TombstoneEvidence> {
-        let record = self.record.as_ref()?;
+        let record = self.0.record()?;
         record
             .tombstone_ref
             .as_ref()
@@ -181,21 +161,21 @@ impl ControlGuard {
 
     pub fn mark_cancel(&mut self) -> Result<(), BackendError> {
         let record = self
-            .record
-            .as_mut()
+            .0
+            .record_mut()
             .ok_or_else(|| BackendError::Api("missing Apptainer control record".to_string()))?;
         record.cancel = true;
-        self.persist()
+        self.0.persist().map_err(control_error)
     }
 
     pub fn store(&mut self, reference: String) -> Result<TombstoneEvidence, BackendError> {
         let record = self
-            .record
-            .as_mut()
+            .0
+            .record_mut()
             .ok_or_else(|| BackendError::Api("missing Apptainer control record".to_string()))?;
         record.tombstone_ref = Some(reference.clone());
         let attempt_epoch = record.attempt_epoch;
-        self.persist()?;
+        self.0.persist().map_err(control_error)?;
         Ok(TombstoneEvidence {
             backend_ref: reference,
             attempt_epoch,
@@ -203,57 +183,36 @@ impl ControlGuard {
     }
 }
 
-impl ControlGuard {
-    fn persist(&self) -> Result<(), BackendError> {
-        write_json(
-            &self.path,
-            self.record
-                .as_ref()
-                .ok_or_else(|| BackendError::Api("missing control record".to_string()))?,
-        )
-    }
-}
-
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, BackendError> {
-    let mut file = File::open(path).map_err(state_error)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(state_error)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| BackendError::Api(format!("decode Apptainer state: {error}")))
+    control_store::read_required(path).map_err(control_error)
 }
 
 pub fn read_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, BackendError> {
-    match File::open(path) {
-        Ok(mut file) => {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(state_error)?;
-            serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|error| BackendError::Api(format!("decode Apptainer state: {error}")))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(state_error(error)),
-    }
+    control_store::read_optional(path).map_err(control_error)
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), BackendError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| BackendError::Api(format!("serialize Apptainer state: {error}")))?;
-    let temp = path.with_extension("json.tmp");
-    let mut file = File::create(&temp).map_err(state_error)?;
-    file.write_all(&bytes).map_err(state_error)?;
-    file.sync_all().map_err(state_error)?;
-    std::fs::rename(&temp, path).map_err(state_error)?;
-    sync_dir(
-        path.parent()
-            .ok_or_else(|| BackendError::Api("state path has no parent".to_string()))?,
-    )
+    control_store::write_json(path, value).map_err(control_error)
 }
 
 pub fn sync_dir(path: &Path) -> Result<(), BackendError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(state_error)
+    control_store::sync_dir(path).map_err(control_error)
+}
+
+fn control_error(error: ControlError) -> BackendError {
+    match error {
+        ControlError::Io(error) => state_error(error),
+        ControlError::Decode(error) => {
+            BackendError::Api(format!("decode Apptainer state: {error}"))
+        }
+        ControlError::Encode(error) => {
+            BackendError::Api(format!("serialize Apptainer state: {error}"))
+        }
+        ControlError::NoParent => BackendError::Api("state path has no parent".to_string()),
+        ControlError::Missing => BackendError::Api("missing control record".to_string()),
+        ControlError::EpochMismatch => BackendError::Conflict("attempt epoch mismatch".to_string()),
+        ControlError::Fenced => BackendError::Fenced,
+    }
 }
 
 fn state_error(error: std::io::Error) -> BackendError {
