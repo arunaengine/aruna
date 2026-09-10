@@ -1191,16 +1191,11 @@ fn map_list_error(error: ListStagingSourceError) -> ServerError {
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
-    use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmConfigDocument,
+    use crate::routes::test_support::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
     };
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::storage;
+    use aruna_core::UserId;
+    use aruna_core::structs::{Actor, NodeCapabilities};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1540,9 +1535,7 @@ mod tests {
     }
 
     async fn setup_state() -> TestState {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let (storage_dir, storage_handle) = test_storage();
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
         let user_id = UserId::local(Ulid::generate(), realm_id);
@@ -1552,68 +1545,28 @@ mod tests {
             user_id,
             realm_id,
         };
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let driver_ctx = Arc::new(test_context(storage_handle));
         let group_id = Ulid::generate();
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "connector-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: user_id,
-        };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
 
         // Request-policy loading fails closed without the realm config document.
-        write_doc(
+        seed_realm_config(&driver_ctx, realm_id, &actor).await;
+        seed_realm_auth(&driver_ctx, realm_id, &actor).await;
+        seed_group_docs(
             &driver_ctx,
-            REALM_CONFIG_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .unwrap()
-                .into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            realm_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().into(),
-            group_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().into(),
-            group.to_bytes(&actor).unwrap().into(),
+            realm_id,
+            &actor,
+            group_id,
+            "connector-group",
+            user_id,
         )
         .await;
 
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -1635,26 +1588,5 @@ mod tests {
             group_id,
             state,
         }
-    }
-
-    async fn write_doc(
-        driver_ctx: &Arc<DriverContext>,
-        key_space: &str,
-        key: byteview::ByteView,
-        value: byteview::ByteView,
-    ) {
-        let event = driver_ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key,
-                value,
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
     }
 }
