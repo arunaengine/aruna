@@ -3,8 +3,8 @@
 //! absent policy state all deny.
 
 use crate::driver::{DriverContext, drive};
-use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+use crate::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use crate::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
     RequestPolicy, policy_set_hash,

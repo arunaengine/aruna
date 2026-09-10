@@ -2,11 +2,11 @@
 //! RBAC and public visibility first, then every applicable deny/require policy.
 //! Bulk routes reuse [`PolicyEvaluator`] to read one group's policy state once.
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
-use crate::request_policy::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
 };
+use crate::driver::{DriverContext, drive};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{AuthContext, Permission, RealmId};
 use thiserror::Error;
