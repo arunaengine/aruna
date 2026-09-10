@@ -1,7 +1,6 @@
 //! Shared durable-queue lag sampling for tracing and Prometheus metrics.
-//! `queue.lag` lines are emitted only while a traced queue is non-empty plus
-//! one final line when it drains. Idle cost is one limit-1 storage probe per
-//! durable queue per tick.
+//! `queue.lag` lines are emitted only while a traced queue is non-empty plus one
+//! final drain line; idle cost is one limit-1 probe per queue per tick.
 
 use std::future::Future;
 use std::time::Duration;
