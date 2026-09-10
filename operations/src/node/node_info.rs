@@ -34,14 +34,14 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
-use crate::mutate_realm_placement::node_kind;
 use crate::placement::{build_view, held_buckets};
-use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::mutate_realm_placement::node_kind;
+use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
@@ -98,9 +98,8 @@ pub async fn seed_node_info_document(
 }
 
 /// Seeds this node's current info document and replicates it over the shared
-/// realm topic. Bootstrap callers must use [`seed_node_info_document`] before
-/// announcing the core documents so the authorized announcement is queued
-/// first.
+/// realm topic. Bootstrap callers must seed via [`seed_node_info_document`]
+/// before announcing the core documents so the authorized announcement queues first.
 pub async fn publish_node_info(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -111,13 +110,9 @@ pub async fn publish_node_info(
     replicate_node_info(ctx, node_id, realm_id).await
 }
 
-/// This node's advertised execution targets: every enabled backend at the
-/// current placement subject. A node without a subject holds and executes
-/// nothing governed, so it advertises no target at all.
-///
-/// Availability is derived from each backend's static ceilings minus what this
-/// node has actually reserved. It ranks targets and never authorizes: exact
-/// admission stays the target-side reservation.
+/// This node's advertised execution targets: every enabled backend at the current
+/// placement subject (none without one), with availability as static ceilings minus
+/// local reservations. Ranking only: exact admission stays the target-side reservation.
 async fn advertised_executors(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
@@ -186,13 +181,9 @@ async fn read_reservations(ctx: &DriverContext) -> Result<Vec<JobReservationReco
     }
 }
 
-/// Bounded logical admission demand this node observes: every request family it
-/// holds records for that is admitted and not terminal, with the group and
-/// resources its immutable spec stored. Replicas deduplicate by family, so a
-/// family several holders observe still counts once.
-///
-/// Truncation is per group: a group that overflows the shared family budget is
-/// flagged alone, so one busy group never understates another group's view.
+/// Bounded logical admission demand this node observes: admitted, nonterminal request
+/// families with their group and resources (replicas dedupe by family). Truncation is
+/// per group, so one busy group never understates another group's view.
 async fn demand_snapshot(
     ctx: &DriverContext,
     epoch: AdvertisementEpoch,
@@ -421,13 +412,9 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
     }
 }
 
-/// Heartbeat: refreshes the persisted node-info document's placement-view
-/// labels, utilization, and timestamps, then republishes it. URLs remain the
-/// startup-seeded values. A missing document is a no-op: the startup seed always
-/// runs first.
-///
-/// The scans run outside the revision, so a drain or departure published while
-/// they ran is read again by [`revise_node_info`] and never carried backwards.
+/// Heartbeat: refreshes the persisted node-info document's placement-view labels,
+/// utilization and timestamps, then republishes it; URLs stay startup-seeded. Scans
+/// run outside the revision, so [`revise_node_info`] never carries stale drain backwards.
 pub async fn refresh_node_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -469,10 +456,8 @@ pub async fn refresh_node_info_heartbeat(
 const NODE_INFO_ATTEMPTS: usize = 3;
 
 /// Applies `revise` to the current node-info row inside one write transaction,
-/// which also stamps the next epoch and re-reads the drain and departure state
-/// the row publishes. Every publisher goes through this, so no round can
-/// overwrite a change another one committed while it worked.
-/// `Ok(false)` means no row exists yet, so there was nothing to revise.
+/// also stamping the next epoch and re-reading published drain/departure state. All
+/// publishers use it, so concurrent rounds cannot overwrite; `Ok(false)` means no row.
 async fn revise_node_info(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -565,16 +550,9 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
     }
 }
 
-/// The locally observed nonterminal admitted demand of one group: this node's
-/// own current families merged with every advertisement it holds for a current
-/// realm member. The bool reports that some publisher understated its demand.
-///
-/// This is the input of [`aruna_core::compute_quota::admits`]. It is exact for
-/// this node's own admissions, which is what makes a local cap race exact, and
-/// approximate across partitions, which is the accepted overshoot bound. A node
-/// the realm no longer places is skipped: its usage stays in audit but is no
-/// longer capacity of the remaining realm. An advertisement that does not decode
-/// is skipped the same way a currently unobservable publisher is.
+/// Locally observed nonterminal admitted demand of one group: own families merged
+/// with advertisements from current realm members; the bool flags an understated
+/// publisher. Exact locally, approximate across partitions; feeds [`aruna_core::compute_quota::admits`].
 pub async fn group_demand(
     ctx: &DriverContext,
     realm_id: RealmId,
@@ -624,14 +602,9 @@ const DEPARTURE_KEY: &[u8] = b"departure";
 /// returning to placement can never silently undrain a node an operator drained.
 const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
 
-/// Applies an observed departure, or a return, to this node's compute plane.
-///
-/// Departing stops new offers and admissions immediately, publishes the final
-/// snapshots, and records every still-reserved execution as unresolved. It
-/// waits for nothing: membership removal is never blocked, and a reserved
-/// execution is never declared terminal. Returning clears the flags so the
-/// rejoined node advertises again under its new membership generation.
-/// `Ok(false)` means the state already matched, so nothing was republished.
+/// Applies an observed departure, or a return, to this node's compute plane. Departing
+/// stops offers/admissions, records reserved executions as unresolved without blocking
+/// removal; returning clears the flags. `Ok(false)` means the state already matched.
 pub async fn set_departure_state(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -674,12 +647,9 @@ pub async fn set_departure_state(
     Ok(true)
 }
 
-/// Sets or clears the operator's own compute drain and republishes the
-/// advertisement. A drained node plans no new execution here; work that already
-/// holds a receipt is never cancelled by it, and departure state is untouched.
-/// `Ok(false)` means the durable flag already had this value, so nothing
-/// changed; `Ok(true)` means the flag moved, and the advertisement follows it
-/// as soon as this node has one to republish.
+/// Sets or clears the operator's own compute drain and republishes the advertisement.
+/// A drained node plans no new execution and never cancels work holding a receipt;
+/// departure state is untouched. `Ok(false)` means the durable flag already matched.
 pub async fn set_operator_drain(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -883,9 +853,11 @@ fn node_labels(
 }
 
 async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
-    Ok(crate::usage_stats::read_local_global(&ctx.storage_handle)
-        .await?
-        .stored_bytes)
+    Ok(
+        crate::node::usage_stats::read_local_global(&ctx.storage_handle)
+            .await?
+            .stored_bytes,
+    )
 }
 
 /// Counts documents this node holds, degrading to `None` with a warning so a
@@ -1069,10 +1041,9 @@ async fn node_info_row(
     }
 }
 
-/// Reads the persisted info documents for the given nodes, skipping those with
-/// no document yet. Keyed by node id for the realm-nodes read surface. Takes the
-/// driver context so API routes drive this through the operations layer rather
-/// than touching the storage handle directly.
+/// Reads the persisted info documents for the given nodes, skipping missing ones,
+/// keyed by node id. Takes the driver context so API routes stay in the operations
+/// layer rather than touching the storage handle directly.
 pub async fn read_node_info_documents(
     ctx: &DriverContext,
     node_ids: &[NodeId],
@@ -1999,7 +1970,7 @@ mod tests {
         config.placement_map.clear();
         config.nodes.clear();
         write_realm_config(&ctx, &config).await;
-        crate::placement_policy::observe_placement(&ctx, realm_id, local, 10)
+        crate::placement::policy::observe_placement(&ctx, realm_id, local, 10)
             .await
             .expect("observation completes");
 
