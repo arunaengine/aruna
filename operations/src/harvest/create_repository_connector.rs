@@ -12,7 +12,7 @@ use aruna_core::types::{Effects, GroupId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::endpoint;
+use crate::endpoint_screening;
 use crate::harvest::repository::connector_writes;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,7 +97,7 @@ impl CreateConnectorOperation {
         }
         // Every harvest fetch is built from this string, so a spelling the http
         // client reads as another host fails here rather than at first use.
-        if !endpoint::is_canonical(&self.input.endpoint) {
+        if !endpoint_screening::is_canonical(&self.input.endpoint) {
             return self.emit_error(CreateConnectorError::AmbiguousEndpoint(
                 self.input.endpoint.clone(),
             ));

@@ -1,4 +1,4 @@
-use crate::blob::blob_keyspace_helper::iter_hash_page;
+use crate::blob::blob_storage::iter_hash_page;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -253,7 +253,7 @@ mod tests {
         MAX_HASH_ALIASES, ResolveBlobPermissionPathsError, ResolveBlobPermissionPathsOperation,
         ResolveBlobPermissionPathsState,
     };
-    use crate::blob::blob_keyspace_helper::add_hash_path_index_effect;
+    use crate::blob::blob_storage::add_hash_path_index_effect;
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -474,7 +474,7 @@ mod tests {
             "path/file.txt",
         );
         let effect = add_hash_path_index_effect(
-            &crate::blob::blob_keyspace_helper::HeadAliasContext::new(
+            &crate::blob::blob_storage::HeadAliasContext::new(
                 alias.realm_id,
                 alias.group_id,
                 alias.node_id,

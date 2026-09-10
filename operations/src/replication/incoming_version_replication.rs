@@ -1,14 +1,19 @@
-use crate::blob::blob_keyspace_helper::{
+use crate::blob::blob_storage::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read,
     build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
-use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
-use crate::group_routing::load_group_inputs;
-use crate::placement_policy::{
+use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::groups::storage_routing::load_group_inputs;
+use crate::node::usage_stats::{
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    schedule_usage_snapshot_publish_effect,
+};
+use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
+use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,
@@ -16,13 +21,8 @@ use crate::replication::protocol::{
 use crate::replication::queue::{
     LiveReplicationObligationRecord, live_obligation_effect, schedule_blob_replication_drain_effect,
 };
-use crate::replication::util::dht_registration_effect;
 use crate::s3::create_bucket::CreateBucketOperation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::usage_stats::{
-    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_usage_snapshot_publish_effect,
-};
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
@@ -5576,7 +5576,7 @@ mod tests {
 mod gate_tests {
     use super::tests::{make_manifest, make_reference_manifest};
     use super::*;
-    use crate::placement_policy::PolicyCacheEntry;
+    use crate::placement::policy::PolicyCacheEntry;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::structs::{
         PlacementPolicy, PlacementSelector, PlacementSubject, ReplicationItemKind, VerifiedPolicy,
@@ -5644,7 +5644,7 @@ mod gate_tests {
         let mut operation = governed(&rule).with_gate(gate("eu-west"));
         operation.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion);
 
-        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
@@ -5652,7 +5652,7 @@ mod gate_tests {
             key: Vec::new().into(),
             value: Some(cached.into()),
         }));
-        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::fixtures::authority(realm()));
 
         assert!(rejected(&operation));
     }

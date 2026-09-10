@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::replication::util::dht_registration_effect;
+use crate::replication::dht_registration::dht_registration_effect;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -20,7 +20,7 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::group_backends::{backend_key, parse_read};
+use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
 use crate::s3::abort_multipart_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
 

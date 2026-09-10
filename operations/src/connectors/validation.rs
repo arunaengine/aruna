@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::endpoint;
+use crate::endpoint_screening;
 use aruna_core::structs::{OFFERED_DIRECTORY_BUCKET, SourceConnectorKind};
 use thiserror::Error;
 
@@ -117,12 +117,12 @@ pub fn validate_connector_input(
     }
 
     if let Some(endpoint) = public_config.get("endpoint")
-        && !endpoint::is_canonical(endpoint)
+        && !endpoint_screening::is_canonical(endpoint)
     {
         return Err(ValidationError::AmbiguousEndpoint(endpoint.clone()));
     }
     if let Some(bucket) = public_config.get("bucket")
-        && endpoint::breaks_authority(bucket)
+        && endpoint_screening::breaks_authority(bucket)
     {
         return Err(ValidationError::UnsafeBucket(bucket.clone()));
     }

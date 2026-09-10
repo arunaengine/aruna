@@ -6,11 +6,8 @@ use aruna_core::structs::{HarvestGranularity, HarvestSelector};
 pub const DEFAULT_METADATA_PREFIX: &str = "oai_dc";
 
 /// Canonical `metadataPrefix` for a requested schema, or the rejected value.
-///
-/// Omitted, empty and whitespace-only inputs all mean "unset" and resolve to
-/// the only schema the parser and mapper understand; every other value must be
-/// exactly that schema once padding is removed, because a repository answers a
-/// blank or padded prefix with `badArgument`.
+/// Omitted, empty and whitespace-only inputs resolve to the only supported
+/// schema; anything else must match it exactly.
 pub fn normalize_metadata_prefix(prefix: Option<&str>) -> Result<String, String> {
     let Some(prefix) = prefix.map(str::trim).filter(|prefix| !prefix.is_empty()) else {
         return Ok(DEFAULT_METADATA_PREFIX.to_string());
@@ -30,10 +27,8 @@ pub fn normalize_set(set: Option<&str>) -> Option<String> {
 }
 
 /// Build a ListRecords request URL.
-///
-/// Per the OAI-PMH protocol, a `resumptionToken` is exclusive: when resuming, the
-/// only arguments are `verb` and `resumptionToken`. A fresh request instead
-/// carries `metadataPrefix` and the optional `set`/`from` window.
+/// A `resumptionToken` is exclusive: resuming carries only `verb` and the token;
+/// a fresh request carries `metadataPrefix` and the optional `set`/`from`.
 pub fn list_records_url(
     endpoint: &str,
     selector: &HarvestSelector,
@@ -79,12 +74,8 @@ pub fn format_from(datestamp_ms: u64) -> Option<String> {
 }
 
 /// Format a harvest cursor as an inclusive `from` bound at the provider's
-/// advertised granularity. Re-fetched boundary records are rejected by
-/// provenance staleness.
-///
-/// The epoch is not a harvest position but the absence of one: sending it would
-/// make every first harvest carry a `from`, which a day-granularity repository
-/// answers with `badArgument`.
+/// advertised granularity; re-fetched boundary records fall to provenance
+/// staleness. The epoch means no position, so it sends no `from`.
 pub fn format_window(datestamp_ms: u64, granularity: HarvestGranularity) -> Option<String> {
     if datestamp_ms == 0 {
         return None;

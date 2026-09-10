@@ -1,15 +1,13 @@
 //! Offering a directory as a read-only bucket on the device that holds it.
-//!
-//! The bucket's objects are observations: a reference version per file, bound
-//! to the device-local registration and never to a path. Writes to such a
-//! bucket are refused; the files change only on the owner's own filesystem.
+//! Objects are reference versions bound to the device-local registration, not a
+//! path; writes are refused and files change only on the owner's filesystem.
 
-use crate::blob::blob_keyspace_helper::{
+use crate::blob::blob_storage::{
     HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
 };
 use crate::driver::{DriverContext, drive};
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
@@ -138,9 +136,8 @@ pub async fn guard_bucket_write(
 }
 
 /// Registers `root` as a read-only bucket and mints one reference version per
-/// file it currently holds. Re-offering the same bucket refreshes the inventory:
-/// unchanged files keep their version, changed ones gain a successor and files
-/// that vanished are tombstoned.
+/// file. Re-offering refreshes the inventory: unchanged files keep their version,
+/// changed ones gain a successor, and vanished files are tombstoned.
 pub async fn offer_directory(
     context: &DriverContext,
     input: OfferDirectoryInput,
@@ -215,12 +212,9 @@ pub async fn list_offers(
     }
 }
 
-/// Withdraws one offer: the registration goes first, then every observation it
-/// made becomes a delete marker. Answers how many live objects it removed.
-///
-/// The registration is what a read resolves the root through, so an interrupted
-/// sweep still leaves the bucket unservable rather than half-offered. A realm
-/// node that references an offered version can no longer resolve it.
+/// Withdraws one offer: registration first, then observations become delete
+/// markers (returning the live count removed). An interrupted sweep leaves the
+/// bucket unservable, and referencing realm nodes can no longer resolve versions.
 pub async fn withdraw_offer(
     context: &DriverContext,
     input: WithdrawOfferInput,

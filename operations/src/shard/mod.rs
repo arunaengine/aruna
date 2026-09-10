@@ -21,9 +21,7 @@ const SHARD_MANIFEST_SCAN_PAGE: usize = 512;
 
 /// Builds the local node's [`ShardManifest`] for one shard on demand: a prefix
 /// scan of the manifest keyspace for the entry set, plus the shard topic's
-/// irokle `sync_fingerprint` (digest) and persisted `ActorClock` (cursor). Never
-/// persisted — a new holder fetches a co-holder's over the shard ALPN and
-/// compares digests. A digest match against a co-holder means convergence.
+/// irokle fingerprint (digest) and persisted clock (cursor). Never persisted.
 pub async fn assemble_shard_manifest(
     context: &DriverContext,
     realm_id: RealmId,
@@ -117,11 +115,9 @@ async fn scan_shard_manifest_entries(
     Ok(entries)
 }
 
-// Digest and cursor come straight from irokle. A topic with no local genesis is
-// not special-cased here: it reports the (non-zero) empty fingerprint and an
-// empty cursor, and only a storage error falls back to the zero digest.
-// Verification therefore gates on the topic actually existing (see
-// `shard::verify`), never on the digest value.
+// Digest and cursor come straight from irokle. A genesis-less topic reports the
+// empty fingerprint and cursor, and only a storage error falls back to the zero
+// digest, so verification gates on the topic existing (see `shard::verify`).
 fn topic_digest_and_cursor(net_handle: &NetHandle, topic: irokle::TopicId) -> ([u8; 32], Vec<u8>) {
     let node = net_handle.document_sync_node();
     let digest = node

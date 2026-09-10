@@ -38,9 +38,8 @@ pub enum OaiParseError {
 }
 
 /// Parse a ListRecords, ListIdentifiers, or GetRecord response.
-///
-/// An `<error code="noRecordsMatch">` is a valid empty page, not an error, so an
-/// incremental harvest that finds nothing succeeds instead of failing.
+/// A `noRecordsMatch` error is a valid empty page, so an incremental harvest
+/// finding nothing succeeds.
 pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
     // Keep raw text: a value split around an entity must not lose its spaces.
     // commit_text trims the fully reassembled value instead.

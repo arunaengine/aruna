@@ -1,6 +1,6 @@
 use serde_json::{Map, Value};
 
-use crate::harvest::oai::parse::{OaiRecord, parse_datestamp_ms};
+use crate::harvest::oai_parse::{OaiRecord, parse_datestamp_ms};
 
 /// RO-Crate context the metadata registry validates against.
 const ROCRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
@@ -11,16 +11,9 @@ const DC_ELEMENTS: &str = "http://purl.org/dc/elements/1.1/";
 /// Stand-in publication date when neither Dublin Core nor the header carries one.
 const UNKNOWN_DATE: &str = "1970-01-01";
 
-/// Map one `oai_dc` record to an RO-Crate JSON-LD document.
-///
-/// DEFAULT mapping (not locked, swappable): the record is one `./` Dataset
-/// entity whose properties are the Dublin Core elements keyed by their DCMI term
-/// IRI. Repeated elements become arrays; `name` mirrors the first title so the
-/// document is human-labelled.
-///
-/// The `ro-crate-metadata.json` descriptor, `conformsTo`, `description` and a
-/// single `datePublished` are all mandatory for the checked create/replace seam,
-/// so each is synthesized when the record does not supply one.
+/// Map one `oai_dc` record to an RO-Crate JSON-LD document (default, swappable):
+/// one `./` Dataset keyed by DCMI term IRIs with repeats as arrays; descriptor,
+/// `conformsTo`, `description` and `datePublished` are synthesized when absent.
 pub fn dc_to_jsonld(record: &OaiRecord) -> String {
     let mut entity = Map::new();
     entity.insert("@id".to_string(), Value::String("./".to_string()));
@@ -145,14 +138,9 @@ const SCHEMA_CROSSWALK: [(&str, &str); 14] = [
     ("hasPart", "relation"),
 ];
 
-/// Map a stored RO-Crate JSON-LD document to `oai_dc` element pairs, in canonical
-/// Dublin Core order.
-///
-/// DEFAULT crosswalk (not locked, swappable), mirroring `dc_to_jsonld`: a
-/// harvested document carrying explicit DCMI-IRI properties round-trips
-/// losslessly; a native schema.org document is down-projected with the standard
-/// crosswalk. `oai_dc` is the lowest-common-denominator format, so a lossy
-/// down-mapping is expected. Always yields at least a `title`.
+/// Map a stored RO-Crate JSON-LD document to `oai_dc` pairs in canonical order
+/// (default crosswalk, swappable): DCMI-IRI properties round-trip, schema.org
+/// documents down-project lossily, and the result always carries a `title`.
 pub fn jsonld_to_dc(jsonld: &str, fallback_title: &str) -> Vec<(String, String)> {
     let mut collected: Vec<(&'static str, Vec<String>)> = DC_ELEMENT_ORDER
         .iter()
@@ -277,7 +265,7 @@ fn extract_values(value: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harvest::oai::parse::OaiHeader;
+    use crate::harvest::oai_parse::OaiHeader;
 
     fn record() -> OaiRecord {
         OaiRecord {

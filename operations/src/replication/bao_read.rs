@@ -30,16 +30,16 @@ use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
-use crate::placement_policy::{
+use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOperation, gate_decision, union_refs, write_gate,
 };
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
-use crate::blob::blob_keyspace_helper::blob_location_read;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::mutate_realm_placement::node_kind;
-use crate::realm_peer::ensure_realm_peer;
-use crate::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::blob::blob_storage::blob_location_read;
+use crate::realm::mutate_realm_placement::node_kind;
+use crate::realm::peer_trust::ensure_realm_peer;
 
 #[derive(Debug, PartialEq)]
 pub enum BaoReadOutput {
@@ -306,13 +306,9 @@ impl Operation for BaoReadOperation {
 /// so a second `Required` for the same set is a protocol dead end, not a loop.
 const CHALLENGE_ATTEMPTS: usize = 2;
 
-/// A governed remote read with the plan's destination challenge (5.6/10).
-///
-/// The request carries this node's advertised subject, so the source can
-/// evaluate it independently. On `PlacementPolicyRequired` the refs are
-/// resolved through the ordinary policy resolver, which verifies publication
-/// authority and caches the result, then evaluated locally; the read is retried
-/// only when the local subject complies. Echoed refs are never authority.
+/// A governed remote read with the plan's destination challenge (5.6/10): the
+/// request carries this node's subject, refs resolve and cache locally, retries
+/// need local compliance, and echoed refs are never authority.
 pub async fn managed_read(
     context: &DriverContext,
     node_id: NodeId,
@@ -338,10 +334,9 @@ pub async fn managed_read(
         if refs.is_empty() || refs == taught {
             return Err(BaoReadError::PolicyRequired { refs });
         }
-        // The refs are only a hint: this node decides on its own resolution,
-        // which also caches the verified publication for every later read.
-        // No bucket names the destination of a read, so the owning group is
-        // checked by the write that registers the copy these bytes become.
+        // The refs are only a hint; this node decides on its own resolution, which also
+        // caches the verified publication. No bucket names the destination of a read, so
+        // the owning group is checked by the write registering these bytes.
         let Some(gate) = write_gate(destination.as_ref(), &refs, None)? else {
             return Err(BaoReadError::NoDestination);
         };
@@ -887,10 +882,9 @@ impl IncomingBaoReadOperation {
         }
     }
 
-    /// Who this serve runs as. A User peer is owner-bound: it is admitted as a
-    /// realm member without internal trust, and the auth context is forced to
-    /// the owner its realm config names, so a device cannot read as anyone else
-    /// (D12). Every other kind keeps the internal-trust gate unchanged.
+    /// Who this serve runs as. A User peer is owner-bound: admitted as a realm member
+    /// without internal trust and forced to its config-named owner, so a device cannot
+    /// read as anyone else (D12). Other kinds keep the internal-trust gate.
     fn admit_peer(&mut self, document: &RealmConfigDocument) -> Option<BaoReadRefusal> {
         let owner = node_kind(document, self.peer).and_then(|kind| kind.owner());
         let internal_trust = owner.is_none();
@@ -1190,10 +1184,9 @@ impl IncomingBaoReadOperation {
         (*claimed == expected).then_some(expected)
     }
 
-    /// Teaches the requester every rule it has not resolved, then evaluates the
-    /// authenticated destination independently. Authorization has already
-    /// passed here, so the refs may be disclosed; echoing one is never
-    /// authority.
+    /// Teaches the requester every unresolved rule, then evaluates the authenticated
+    /// destination independently. Authorization already passed, so refs may be
+    /// disclosed; echoing one is never authority.
     fn challenge_destination(&mut self, location: BackendLocation) -> Effects {
         let missing: Vec<PlacementPolicyRef> = self
             .version_refs

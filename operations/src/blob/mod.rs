@@ -1,4 +1,5 @@
-pub mod blob_keyspace_helper;
+pub mod blob_holders;
+pub mod blob_storage;
 pub mod cleanup;
 pub mod hidden;
 pub mod managed_copy;

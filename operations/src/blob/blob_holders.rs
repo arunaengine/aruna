@@ -13,7 +13,7 @@ use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::replication::util::dht_registration_effect;
+use crate::replication::dht_registration::dht_registration_effect;
 
 const HOLDER_REFRESH_PAGE_SIZE: usize = 256;
 
