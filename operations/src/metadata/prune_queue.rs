@@ -841,6 +841,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::metadata::MetadataHandle;
+    use crate::metadata::test_support::{storage_key_exists, write_entries};
 
     fn lifecycle(graph_iri: &str) -> MetadataGraphLifecycleRecord {
         MetadataGraphLifecycleRecord::deleted(
@@ -874,33 +875,6 @@ mod tests {
             updated_at_ms: 1,
             establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
-        }
-    }
-
-    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => panic!("unexpected storage event: {other:?}"),
-        }
-    }
-
-    async fn storage_key_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
-        match storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
-                key: ByteView::from(key),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
-            other => panic!("unexpected storage event: {other:?}"),
         }
     }
 
@@ -1131,7 +1105,9 @@ mod tests {
 
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
-        assert!(!storage_key_exists(&storage, corrupt_key).await);
+        assert!(
+            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, corrupt_key).await
+        );
     }
 
     #[tokio::test]
@@ -1155,7 +1131,9 @@ mod tests {
         .await;
 
         assert!(metadata_graph_prune_jobs_exist(&storage).await.unwrap());
-        assert!(!storage_key_exists(&storage, corrupt_key).await);
+        assert!(
+            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, corrupt_key).await
+        );
     }
 
     #[tokio::test]
@@ -1199,9 +1177,16 @@ mod tests {
             vec![(metadata_graph_prune_job_key(&due_job).to_vec(), due_job)]
         );
         assert!(!has_more_due);
-        assert!(!storage_key_exists(&storage, misplaced_key).await);
         assert!(
-            storage_key_exists(&storage, metadata_graph_prune_job_key(&future_job).to_vec()).await
+            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, misplaced_key).await
+        );
+        assert!(
+            storage_key_exists(
+                &storage,
+                METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+                metadata_graph_prune_job_key(&future_job).to_vec(),
+            )
+            .await
         );
     }
 
@@ -1246,7 +1231,9 @@ mod tests {
             vec![(metadata_graph_prune_job_key(&due_job).to_vec(), due_job)]
         );
         assert!(!has_more_due);
-        assert!(!storage_key_exists(&storage, misplaced_key).await);
+        assert!(
+            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, misplaced_key).await
+        );
     }
 
     #[tokio::test]
@@ -1289,7 +1276,9 @@ mod tests {
         assert!(jobs.is_empty());
         assert!(!has_more_due);
         assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
-        assert!(!storage_key_exists(&storage, misplaced_key).await);
+        assert!(
+            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, misplaced_key).await
+        );
         assert_eq!(
             read_job_at_key(&storage, future_key.to_vec()).await,
             Some(future_job)
@@ -1332,7 +1321,14 @@ mod tests {
         assert!(jobs.is_empty());
         assert!(!has_more_due);
         assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
-        assert!(!storage_key_exists(&storage, stale_key.to_vec()).await);
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+                stale_key.to_vec(),
+            )
+            .await
+        );
         assert_eq!(
             read_job_at_key(&storage, future_key.to_vec()).await,
             Some(future_job)

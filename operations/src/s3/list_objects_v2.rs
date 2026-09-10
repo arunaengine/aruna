@@ -745,6 +745,7 @@ impl Operation for ListObjectsV2Operation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::s3::test_support::{test_context, test_storage};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -758,21 +759,11 @@ mod test {
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_list_objects_v2_skips_deleted_versions() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = DriverContext {
-            storage_handle: storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let group_id = Ulid::generate();
         let realm_id = RealmId([7u8; 32]);
@@ -880,10 +871,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_with_prefix() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let group_id = Ulid::generate();
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -937,10 +926,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_prefix_scan_does_not_stop_on_prefix_miss() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let group_id = Ulid::generate();
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -988,17 +975,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_honors_explicit_zero_max_keys() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = DriverContext {
-            storage_handle: storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let group_id = Ulid::generate();
         let realm_id = RealmId([7u8; 32]);
@@ -1065,10 +1043,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_pagination_without_prefix() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let group_id = Ulid::generate();
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1123,17 +1099,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_empty_bucket() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = DriverContext {
-            storage_handle: storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let group_id = Ulid::generate();
 
@@ -1160,17 +1127,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_reference_object() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = DriverContext {
-            storage_handle: storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let group_id = Ulid::generate();
         let realm_id = RealmId([7u8; 32]);
@@ -1266,17 +1224,6 @@ mod test {
         assert_eq!(result.objects[0].origin_node_id, None);
         assert_eq!(result.objects[0].last_refresh, Some(last_refresh));
         assert!(result.continuation_token.is_none());
-    }
-
-    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
     }
 
     async fn seed_materialized_keys(
@@ -1415,10 +1362,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_prefix_includes_key_equal_to_prefix() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
@@ -1438,10 +1383,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_prefix_scan_with_interleaved_shorter_key() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["rare0", "rare/1"], created_by).await;
@@ -1452,10 +1395,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_returns_keys_in_lexicographic_order() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["b", "aa", "a/1"], created_by).await;
@@ -1466,10 +1407,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_start_after_skips_preceding_keys() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["a", "b", "c"], created_by).await;
@@ -1486,10 +1425,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_start_after_beyond_prefix_range_returns_empty() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["docs/1", "docs/2"], created_by).await;
@@ -1528,10 +1465,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_delimiter_groups_keys() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
@@ -1556,10 +1491,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_delimiter_pagination_never_repeats_prefixes() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
@@ -1601,10 +1534,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_batched_hydration_preserves_key_order() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
@@ -1813,10 +1744,8 @@ mod test {
 
     #[tokio::test]
     async fn test_list_objects_v2_paginates_past_large_group() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         let group_keys: Vec<String> = (0..30).map(|index| format!("dir/{index:02}")).collect();
@@ -1858,10 +1787,8 @@ mod test {
     // including the zero-byte folder marker key equal to the listing prefix.
     #[tokio::test]
     async fn test_list_objects_v2_delete_marker_absent_from_contents() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["docs/readme.md"], created_by).await;
@@ -1883,10 +1810,8 @@ mod test {
     // and lists nothing, even though the head keys still physically exist.
     #[tokio::test]
     async fn test_list_objects_v2_delimiter_hides_fully_deleted_prefix() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["a.txt"], created_by).await;
@@ -1915,10 +1840,8 @@ mod test {
     // the scan keeps looking for a live sibling before dropping the prefix.
     #[tokio::test]
     async fn test_list_objects_v2_delimiter_keeps_mixed_prefix() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
@@ -1950,10 +1873,8 @@ mod test {
     // inflate a page or short-count it.
     #[tokio::test]
     async fn test_list_objects_v2_pagination_skips_delete_markers() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let (_temp_handle, storage_handle) = test_storage();
+        let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["a", "c", "e"], created_by).await;

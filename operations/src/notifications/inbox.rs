@@ -263,33 +263,15 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::test_support::{record, temp_storage, user};
     use aruna_core::keyspaces::{
         NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     };
     use aruna_core::storage_entries::notification_inbox_update_entry;
-    use aruna_core::structs::{NotificationClass, NotificationKind, RealmId};
-    use aruna_core::types::UserId;
-    use aruna_storage::FjallStorage;
-    use tempfile::tempdir;
-    use ulid::Ulid;
-
-    fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (dir, storage)
-    }
+    use aruna_core::structs::NotificationClass;
 
     fn make_record() -> NotificationRecord {
-        NotificationRecord::new(
-            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::from_bytes([9u8; 16]),
-                actor_user_id: UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32])),
-            },
-            1_000,
-        )
+        record(user(1, 2), NotificationClass::Direct, 1_000)
     }
 
     fn transient_record() -> NotificationRecord {

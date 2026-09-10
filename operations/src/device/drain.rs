@@ -510,31 +510,14 @@ mod tests {
     use crate::device::delete_draft::DeleteDraftOperation;
     use crate::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
     use crate::device::repository::{IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, intake_entry};
+    use crate::device::test_support::context;
     use crate::driver::{DriverContext, drive};
     use crate::metadata::forward::MetadataWriteError;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
-    use aruna_storage::storage;
     use std::sync::Arc;
-    use tempfile::tempdir;
     use ulid::Ulid;
-
-    async fn context() -> (tempfile::TempDir, Arc<DriverContext>) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        (
-            tempdir,
-            Arc::new(DriverContext {
-                storage_handle,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            }),
-        )
-    }
 
     fn entry() -> IntakeEntry {
         IntakeEntry::new(
@@ -572,6 +555,7 @@ mod tests {
     async fn defers_without_realm() {
         // No net handle means the realm is unreachable: nothing may be touched.
         let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
         let entry = entry();
         store(&context, &entry).await;
         assert_eq!(drain_intake(&context).await, DrainOutcome::Deferred);
@@ -634,6 +618,7 @@ mod tests {
         // The owner's delete committed while the page was in flight: the entry
         // must stay gone instead of coming back as publishing.
         let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
         let entry = entry();
         store(&context, &entry).await;
         drive(DeleteDraftOperation::new(entry.draft_id), context.as_ref())
@@ -650,6 +635,7 @@ mod tests {
     #[tokio::test]
     async fn skips_advanced_entry() {
         let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
         let entry = entry();
         let advanced = IntakeEntry {
             state: IntakeState::Failed {
@@ -674,6 +660,7 @@ mod tests {
     #[tokio::test]
     async fn claims_unchanged_entry() {
         let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
         let entry = entry();
         store(&context, &entry).await;
 

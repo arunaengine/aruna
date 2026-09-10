@@ -3087,6 +3087,21 @@ mod tests {
         assert_eq!(read_jobs(&storage).await.len(), 1);
     }
 
+    #[test]
+    fn queue_rejects_event() {
+        let mut operation = QueueBlobReplicationOperation::new(on_demand_input(), None);
+        operation.start();
+
+        let effects = operation.step(Event::Search());
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(BlobReplicationQueueError::UnexpectedEvent(_))
+        ));
+    }
+
     #[tokio::test]
     async fn retry_preserves_fields() {
         let temp_dir = tempdir().expect("temp dir");

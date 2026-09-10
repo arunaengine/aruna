@@ -17,4 +17,6 @@ pub mod repository;
 pub mod selection;
 pub mod status;
 pub mod sync;
+#[cfg(test)]
+mod test_support;
 pub mod wipe;

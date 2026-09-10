@@ -170,19 +170,17 @@ pub fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Effect {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::notifications::test_support::{context_with_storage, record, user};
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
-    use aruna_core::structs::{
-        NotificationClass, NotificationKind, RealmId, notification_outbox_key,
-    };
+    use aruna_core::structs::{NotificationClass, notification_outbox_key};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-    use aruna_core::types::UserId;
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::time::Duration;
-    use tempfile::{TempDir, tempdir};
+    use tempfile::tempdir;
     use tokio::sync::mpsc;
 
     struct RecordingTaskHandler {
@@ -196,34 +194,8 @@ mod tests {
         }
     }
 
-    fn make_user(realm: u8, user: u8) -> UserId {
-        UserId::new(Ulid::from_bytes([user; 16]), RealmId([realm; 32]))
-    }
-
-    fn make_record(realm: u8, user: u8) -> NotificationRecord {
-        NotificationRecord::new(
-            make_user(realm, user),
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: make_user(realm, 100),
-            },
-            1_000,
-        )
-    }
-
-    fn context_with_storage() -> (TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        (tempdir, context)
+    fn make_record(realm: u8, user_seed: u8) -> NotificationRecord {
+        record(user(realm, user_seed), NotificationClass::Direct, 1_000)
     }
 
     async fn read_outbox_rows(context: &DriverContext) -> Vec<(Vec<u8>, NotificationOutboxRecord)> {

@@ -2467,6 +2467,8 @@ mod tests {
     use std::thread;
     use tempfile::tempdir;
 
+    use crate::metadata::test_support::{storage_key_exists, write_entries};
+
     #[tokio::test]
     async fn delete_waits_fence() {
         let graph_iri = "urn:test:graph-fence";
@@ -2544,33 +2546,6 @@ mod tests {
     ) -> MetadataCreateEventRecord {
         event.payload = payload;
         event
-    }
-
-    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => panic!("unexpected storage event: {other:?}"),
-        }
-    }
-
-    async fn storage_key_exists(storage: &StorageHandle, key_space: &str, key: Vec<u8>) -> bool {
-        match storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: key_space.to_string(),
-                key: ByteView::from(key),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
-            other => panic!("unexpected storage event: {other:?}"),
-        }
     }
 
     // Loads the document's group first, exactly as the drain does before it
