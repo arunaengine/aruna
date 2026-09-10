@@ -1,9 +1,6 @@
 //! Two-way synced folders on the owner's own machine.
-//!
-//! A folder is bound to one realm bucket prefix. The device observes its files
-//! as a read-only local bucket, asks the realm node to pull what changed, and
-//! writes what the realm changed back to disk through guarded local writes.
-//! Local data always wins locally: see `aruna_core::structs::decide`.
+//! One realm bucket prefix per folder: local files form a read-only bucket the
+//! node pulls from, realm changes return through guarded writes, local data wins.
 
 pub mod actions;
 pub mod folders;

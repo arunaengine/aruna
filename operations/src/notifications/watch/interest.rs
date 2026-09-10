@@ -24,7 +24,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::notifications::protocol::{
     NOTIFICATION_WATCH_DIRTY_REALM_CAP, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
@@ -34,12 +33,12 @@ use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_watch_subscriptions,
 };
-use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
-/// Debounce window for the coalesced watch-interest publisher. `ShortenTimer`
-/// makes the timer fire this long after the *first* dirty write of a burst and
-/// keeps every later write inside the same window, so a run of watch CRUD
-/// collapses into one publish with bounded latency.
+/// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
+/// fires this long after the first dirty write, collapsing a run of watch CRUD
+/// into one publish with bounded latency.
 pub const WATCH_INTEREST_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Ensures this node has a document to announce when joining the shared
@@ -96,11 +95,9 @@ pub fn schedule_watch_interest_publish_effect() -> Effect {
     })
 }
 
-/// Dirty marker written, in the same transaction as a subscription row
-/// write/delete, so the debounced publisher knows which realm's digest to
-/// rebuild. The value is a fresh generation id: the publisher only clears a
-/// marker whose stored generation still matches the one it observed, so a CRUD
-/// that re-dirties a realm mid-publish keeps its retry signal.
+/// Dirty marker written in the same transaction as a subscription row change,
+/// so the debounced publisher knows which realm's digest to rebuild. The value
+/// is a generation id; a marker is only cleared if its generation still matches.
 pub fn watch_interest_dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
     let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
     (
@@ -152,16 +149,9 @@ pub async fn mark_watch_interest_dirty(
     }
 }
 
-/// Rebuilds this node's watch-interest digest for every realm with a pending
-/// dirty marker and distributes it over the sync layer. The digest is the union
-/// of the path prefixes covered by every subscription the node holds for that
-/// realm; an empty digest (the last watch was deleted) is still published so
-/// peers drop the node's stale interest.
-///
-/// The dirty markers are only cleared after replication has durably accepted the
-/// digests, and only for markers whose generation was not bumped by a concurrent
-/// CRUD, so a failed publish or a racing write always leaves a retry signal
-/// behind. Returns whether any digest was published.
+/// Rebuilds each dirty realm's digest (union of subscribed path prefixes) and syncs
+/// it, publishing empties so stale interest drops. Markers clear only after replication
+/// accepts with the generation unchanged, so failures and racing writes still retry.
 pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Result<bool, String> {
     let storage = &ctx.storage_handle;
 
@@ -408,11 +398,9 @@ async fn write_documents(
     }
 }
 
-/// Deletes each observed dirty marker, but only if its stored generation still
-/// matches the one seen when the publish run started. Re-reading the markers
-/// inside the write transaction makes fjall abort the commit if a concurrent
-/// CRUD re-dirtied any of them after they were observed, so a racing write never
-/// loses its retry signal.
+/// Deletes each observed dirty marker only if its stored generation still matches
+/// the one seen when the publish run started. Re-reading inside the write
+/// transaction makes a concurrent re-dirty abort the commit, preserving retries.
 async fn clear_consumed_markers(
     storage: &StorageHandle,
     observed: Vec<(Key, Value)>,
@@ -595,11 +583,8 @@ pub async fn rebuild_watch_interest_table(storage: &StorageHandle) -> WatchInter
 }
 
 /// Refreshes the in-memory watch-interest cache for realms whose interest or
-/// membership changed, and schedules local digest rebuilds when replicated
-/// subscriptions or placement membership changed. Mirrors
-/// `refresh_realm_usage_summary_for_targets`: shared by every reconcile handler
-/// (inbound apply, durable outbox drain, and the `SyncDocument` timer) so a
-/// digest that lands on any of those paths updates the origin-side table.
+/// membership changed and schedules rebuilds when replicated subscriptions or
+/// placement changed; shared by every reconcile handler.
 pub async fn refresh_watch_interest_for_targets(
     ctx: &DriverContext,
     targets: &[DocumentSyncTarget],

@@ -1,9 +1,6 @@
-//! Seeding and refreshing the replicas this device keeps.
-//!
-//! A device holds no bucket, so nothing pushes a metadata document to it. It
-//! asks a holder for the document's graph state and joins the snapshot into its
-//! own replica: an OR-Set union, so a refresh never drops an edit this device
-//! has not published yet and repeating it changes nothing.
+//! Seeding and refreshing the replicas this device keeps: with no bucket to push
+//! to it, a device pulls a holder's graph snapshot and joins it as an OR-Set
+//! union, so unpublished local edits survive and repeats are no-ops.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,12 +18,12 @@ use rand::seq::SliceRandom;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::create_metadata_document::resolve_metadata_id;
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
+use crate::metadata::create_metadata_document::resolve_metadata_id;
 use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
-use crate::mutate_realm_placement::node_kind;
 use crate::placement::read_holder_sets;
+use crate::realm::mutate_realm_placement::node_kind;
 
 use super::replica::{ReplicaRecord, ReplicaState, list_replicas, read_replica, store_replica};
 

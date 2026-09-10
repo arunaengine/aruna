@@ -1,10 +1,6 @@
 //! Eviction of an enrolled device.
-//!
-//! Membership is replicated realm state, so the eviction travels as an ordinary
-//! realm-config administrative event: only a management node may originate one.
-//! Who may ask is the scope: an owner reaches only the devices the configuration
-//! binds to them, a realm admin reaches every enrolled device but never an
-//! infrastructure node.
+//! A management-node-only realm-config event: an owner reaches its bound devices,
+//! a realm admin every enrolled device but never an infrastructure node.
 
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
@@ -27,12 +23,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::document_sync_outbox::{
+use crate::placement::placement_ref_for_target;
+use crate::realm::ensure_realm_config::overlay_realm_config_reducer_materialization;
+use crate::realm::mutate_realm_placement::is_management;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::ensure_realm_config::overlay_realm_config_reducer_materialization;
-use crate::mutate_realm_placement::is_management;
-use crate::placement::placement_ref_for_target;
 
 /// Which devices the caller may reach. The admin path is authorized on the
 /// realm's onboarding admin path before the operation runs, so here it only
@@ -406,7 +402,7 @@ impl Operation for RemoveDeviceNodeOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::realm::get_realm_config::GetRealmConfigOperation;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::{RealmId, RealmNodeKind};

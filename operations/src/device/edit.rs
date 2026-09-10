@@ -1,9 +1,6 @@
 //! Edits the owner makes on this device's own replicas.
 //!
-//! The edit is planned against the local graph, queued, and then merged, so a
-//! queue failure leaves the graph unchanged and the realm receives exactly the
-//! change set the device applies. Nothing here decides realm authority: the
-//! holder re-checks the owner's permission when the drain forwards the batch.
+//! Planned against the local graph, queued, then merged; the holder re-checks authority on forward.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +19,11 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::device::enqueue_draft::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
+use crate::device::intake::{IntakeEntry, IntakeKind, IntakeState};
 use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
-use crate::device::repository::{IntakeEntry, IntakeKind, IntakeState};
-use crate::device::status::read_intake_entries;
+use crate::device::sync_status::read_intake_entries;
 use crate::driver::{DriverContext, drive};
-use crate::update_metadata_document::UpdateMetadataDocumentMutation;
+use crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DeviceEditError {
@@ -52,10 +49,7 @@ pub fn device_edit_actor(node_id: NodeId, draft_id: Ulid) -> [u8; 32] {
 
 /// Applies one edit to the local replica and queues it for the realm.
 ///
-/// The batch craqle produced is the edit: the holder merges that same change
-/// set, so both sides converge whatever else happened while the device was
-/// away. Answers with the record this device holds, which the realm confirms
-/// when the drain forwards the batch.
+/// The holder merges the same craqle batch so both sides converge; the drain confirms the record.
 pub async fn apply_local_edit(
     context: &Arc<DriverContext>,
     owner: UserId,
@@ -219,10 +213,9 @@ async fn request_persist(context: &Arc<DriverContext>) {
     }
 }
 
-/// Whether one queued entry's batch has to go back into the local graph after a
-/// restart. An edit that is still on its way to the realm is the only local
-/// change nothing else would restore; a published one comes back with the next
-/// refresh, and a parked one is not this device's state to keep.
+/// Whether one queued entry's batch must be re-merged after a restart: only an
+/// edit still on its way to the realm, which nothing else restores. A published
+/// entry returns by refresh; a parked one is not this device's state.
 pub fn replays_edit(entry: &IntakeEntry) -> bool {
     matches!(entry.kind, IntakeKind::Edit { .. })
         && matches!(
@@ -231,12 +224,9 @@ pub fn replays_edit(entry: &IntakeEntry) -> bool {
         )
 }
 
-/// Re-merges every queued edit into this device's replicas, and answers how
-/// many were replayed.
+/// Re-merges every queued edit into this device's replicas, returning the count.
 ///
-/// Local edits are written to craqle's WAL and persisted afterwards, so a crash
-/// in between can leave the graph behind the queue. Merging is idempotent by
-/// dot, so a batch the graph already carries costs nothing.
+/// A crash between the WAL write and persist can leave the graph behind; merging is idempotent by dot.
 pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
     let Some(metadata) = context.metadata_handle.as_ref() else {
         return 0;
@@ -279,10 +269,10 @@ pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{DeviceEditError, apply_local_edit, device_edit_actor, replays_edit};
-    use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
-    use crate::device::repository::{
+    use crate::device::intake::{
         IntakeEntry, IntakeKind, IntakeState, MAX_INTAKE_ENTRIES, intake_entry,
     };
+    use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
     use crate::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
     use aruna_core::effects::StorageEffect;
@@ -453,7 +443,7 @@ mod tests {
                 owner,
                 node(1),
                 &replica,
-                crate::update_metadata_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
+                crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
                     jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
                 },
             )

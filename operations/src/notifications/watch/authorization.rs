@@ -13,13 +13,13 @@ use aruna_core::types::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::request_policy::{
+    PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
+};
 use crate::driver::{DriverContext, drive};
 use crate::notifications::placement::filter_locally_held_watch_subscriptions;
 use crate::notifications::watch::subscriptions::list_watch_subscriptions;
-use crate::request_policy::{
-    PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
-};
 
 const WATCH_CREATE_OPERATION: &str = "notifications.create_watch";
 const WATCH_LIST_OPERATION: &str = "notifications.list_watches";
@@ -103,11 +103,9 @@ pub fn watch_permission_path(
     }
 }
 
-/// The single canonical authorization result every watch surface shares: the
-/// owner must still hold READ on the permission path derived from the watched
-/// prefix. A prefix with no canonical resource identity, and any non-user owner,
-/// is unauthorized. A check that cannot be evaluated is an error, never a grant,
-/// so callers fail closed.
+/// Canonical authorization result every watch surface shares: the owner must
+/// still hold READ on the watched prefix's permission path. No resource
+/// identity or a non-user owner denies; unevaluable checks are errors, not grants.
 #[cfg(test)]
 pub async fn is_watch_authorized(
     context: &DriverContext,
@@ -284,11 +282,9 @@ async fn evaluate_permission_path(
     .await
     {
         Ok(allowed) => allowed,
-        // A path whose realm, group or authorization state is absent is simply
-        // unreadable. Answering it exactly as a denied role keeps a watch from
-        // separating "does not exist" from "you may not read it", which is the
-        // same choice the metadata surface makes. Internally, retain that the
-        // state was unavailable so interest publication leaves a retry marker.
+        // Absent realm, group or authorization state is unreadable: answering it as
+        // denied avoids leaking existence, matching the metadata surface. Retain that
+        // the state was unavailable so interest publication leaves a retry marker.
         Err(
             error @ (AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId
@@ -802,10 +798,9 @@ mod tests {
         }
     }
 
-    // A public (Everyone) role granting READ on the watched bucket would let a
-    // nil caller through on the permission path alone. Anonymous callers own no
-    // inbox to deliver into, so the nil-owner guard must still refuse the watch
-    // before any role is evaluated, even where the resource is publicly readable.
+    // A public READ role would let a nil caller through on the permission path alone,
+    // but anonymous callers own no inbox, so the nil-owner guard must refuse the watch
+    // before any role is evaluated, even for a publicly readable resource.
     #[tokio::test]
     async fn current_owner_decides() {
         let (_dir, context) = temp_context();

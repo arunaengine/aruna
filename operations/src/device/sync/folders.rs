@@ -16,8 +16,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::realm::get_realm_config::GetRealmConfigOperation;
 use crate::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
 };
@@ -269,12 +269,9 @@ pub async fn read_bound(
         .ok_or(FolderError::NotFound)
 }
 
-/// Stops syncing one folder. Nothing on the owner's filesystem is touched: the
-/// device only withdraws what it published about the directory.
+/// Stops syncing one folder; the owner's filesystem is untouched.
 ///
-/// The binding is marked `Deleting` first and removed last, so a crash or a
-/// failure in the middle leaves a folder that the next call resumes instead of
-/// an orphaned offer, outbox row or audit log with nothing pointing at it.
+/// Marked `Deleting` first and removed last, so a crash mid-way leaves work the next call resumes.
 pub async fn unbind_folder(
     context: &Arc<DriverContext>,
     folder_id: Ulid,

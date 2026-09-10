@@ -1,8 +1,6 @@
 //! Owner-driven wipe of the device this node runs on.
-//!
-//! Realm-side eviction is a separate, earlier step: the desktop calls
-//! `DELETE /users/me/devices/{id}` on a management node so the realm drops the
-//! membership, then asks this node to erase what it holds locally.
+//! Realm-side eviction is an earlier, separate step: the desktop calls
+//! `DELETE /users/me/devices/{id}` on a management node, then asks this node to erase.
 
 use std::fs;
 use std::path::{Path, PathBuf};

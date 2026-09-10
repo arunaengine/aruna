@@ -8,7 +8,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::repository::{IntakeEntry, read_intake};
+use super::intake::{IntakeEntry, read_intake};
 
 #[derive(Debug, PartialEq)]
 pub struct InspectDraftOperation {
@@ -131,7 +131,7 @@ fn fail(operation: &mut InspectDraftOperation, error: InspectDraftError) -> Effe
 mod tests {
     use super::{InspectDraftError, InspectDraftOperation};
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
-    use crate::device::repository::IntakeEntry;
+    use crate::device::intake::IntakeEntry;
     use crate::device::test_support::context;
     use crate::driver::drive;
     use aruna_core::structs::RealmId;

@@ -784,7 +784,6 @@ async fn read_realm_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::incoming::initialize_net_incoming;
     use crate::notifications::client::{
         create_watch_remote, delete_watch_remote, deliver_remote, deliver_watch_events_remote,
         list_remote, list_watches_remote, mark_read_remote, send_notification_request,
@@ -794,6 +793,7 @@ mod tests {
     use crate::notifications::watch::subscriptions::{
         WATCH_SUBSCRIPTION_UNAUTHORIZED, create_watch_subscription, list_watch_subscriptions,
     };
+    use crate::sync::incoming::initialize_net_incoming;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
         NOTIFICATION_WATCH_INTEREST_KEYSPACE,

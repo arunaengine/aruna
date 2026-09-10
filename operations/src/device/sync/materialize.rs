@@ -1,10 +1,6 @@
 //! Writes one remote version into a synced folder and records what happened.
 //!
-//! The guard travels with the write: the adapter refuses the rename when the
-//! file no longer carries the bytes the decision was taken on, and the refusal
-//! becomes a pending entry the owner resolves explicitly. When the write is an
-//! explicit owner action, its audit row is committed in the same transaction as
-//! the base row that records it.
+//! The guard refuses renames once bytes changed, leaving a pending entry; an action's audit joins its base row.
 
 use std::sync::Arc;
 
