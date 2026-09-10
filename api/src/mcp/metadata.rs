@@ -3,23 +3,15 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
-use aruna_core::StructuredId;
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_forward_document, mint_local_document,
-};
+use aruna_operations::create_metadata_document::CreateMetadataDocumentPayload;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, MetadataDocumentQueryRequest, MetadataQueryRequest,
-    MetadataReferencesRequest, MetadataRoCrateExportView, MetadataSearchRequest, load_realm_config,
-    query_metadata, query_metadata_document, references_metadata, search_metadata,
+    MetadataReferencesRequest, MetadataRoCrateExportView, MetadataSearchRequest, query_metadata,
+    query_metadata_document, references_metadata, search_metadata,
 };
-use aruna_operations::metadata::forward::{
-    create_metadata_document_routed, export_rocrate_routed, is_user_origin,
-    update_metadata_document_routed,
-};
+use aruna_operations::metadata::forward::{export_rocrate_routed, update_metadata_document_routed};
 use aruna_operations::metadata::profile_validation::preview_submission;
-use aruna_operations::notifications::watch::emit::emit_metadata_created;
 use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
@@ -395,104 +387,27 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<CreateDatasetInput>,
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
-        let extras = tool_extras("create_dataset", &input)?;
         let group_id = parse_group(&input.group_id)?;
-        let path = MetadataRegistryRecord::normalize_document_path(&input.path);
-        if path.is_empty() {
-            return Err(bad_request(
+        let jsonld = rocrate_json(&input.rocrate.0)?;
+        let record = crate::routes::metadata::run_create_metadata(
+            &self.state,
+            &auth,
+            tool_extras("create_dataset", &input)?,
+            request_bearer(&parts),
+            group_id,
+            input.path,
+            input.public.unwrap_or(false),
+            CreateMetadataDocumentPayload::RoCrate { jsonld },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::error::ServerError::BadRequest => bad_request(
                 "path must name a document inside the group, such as \
                  datasets/mouse-liver-2026; it is empty once leading and trailing slashes are \
                  trimmed",
-            ));
-        }
-        let jsonld = rocrate_json(&input.rocrate.0)?;
-        let ctx = self.state.get_ctx();
-        let realm = load_realm_config(ctx.as_ref(), self.state.get_realm_id())
-            .await
-            .ok_or_else(|| server_error(crate::error::ServerError::ServiceUnavailable))?;
-        let actor = Actor {
-            node_id: self.state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: self.state.get_realm_id(),
-        };
-        let user_origin = is_user_origin(&ctx, self.state.get_realm_id(), self.state.get_node_id())
-            .await
-            .map_err(crate::routes::metadata::map_metadata_api_error)
-            .map_err(server_error)?;
-        let document_id = if user_origin {
-            mint_forward_document(&realm, &actor, group_id, &path)
-                .map_err(crate::routes::metadata::map_create_error)
-                .map_err(server_error)?
-                .as_ulid()
-        } else {
-            match mint_local_document(&realm, &actor, group_id, &path) {
-                Ok(document_id) => document_id.as_ulid(),
-                Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
-                    mint_forward_document(&realm, &actor, group_id, &path)
-                        .map_err(crate::routes::metadata::map_create_error)
-                        .map_err(server_error)?
-                        .as_ulid()
-                }
-                Err(error) => {
-                    return Err(server_error(crate::routes::metadata::map_create_error(
-                        error,
-                    )));
-                }
-            }
-        };
-        authorize_tool(
-            &self.state,
-            &auth,
-            metadata_group_path(self, group_id),
-            Permission::WRITE,
-            extras.clone(),
-        )
-        .await
-        .map_err(write_error)?;
-        authorize_tool(
-            &self.state,
-            &auth,
-            MetadataRegistryRecord::permission_path_for(
-                &auth.realm_id,
-                group_id,
-                &path,
-                document_id,
             ),
-            Permission::WRITE,
-            extras,
-        )
-        .await
-        .map_err(write_error)?;
-        let created = create_metadata_document_routed(
-            CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
-                    actor,
-                    group_id,
-                    document_id,
-                    document_path: path,
-                    public: input.public.unwrap_or(false),
-                    payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
-                },
-            ),
-            ctx.clone(),
-            crate::routes::metadata::forwarded_auth_token(request_bearer(&parts))
-                .map_err(server_error)?,
-        )
-        .await
-        .map_err(crate::routes::metadata::map_metadata_write_error)
-        .map_err(server_error)?;
-        let event_id = created.event_id;
-        let record = created.record;
-        emit_metadata_created(
-            ctx.as_ref(),
-            self.state.get_realm_id(),
-            auth.user_id,
-            record.group_id,
-            record.document_id,
-            &record.document_path,
-            event_id,
-        )
-        .await;
+            error => write_error(error),
+        })?;
         let summary = crate::routes::metadata::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
