@@ -4,7 +4,7 @@ use super::backend::{
 };
 use super::group::GROUP_WRITE_CHUNK;
 use crate::hash::Hasher;
-use crate::opendal::abort_partial_writer;
+use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -582,7 +582,13 @@ impl BlobHandler {
         if let Some(writer) = writer
             && !abandoned
         {
-            match self.abort_writer(writer).await {
+            match abort_writer(
+                writer,
+                self.control_plane_io_timeout(),
+                UnsupportedAbort::DeletePath,
+            )
+            .await
+            {
                 Ok(()) => return Ok(()),
                 // Other abort failures stay uncertain and must not delete.
                 Err(BlobError::CleanupUnsupported) => {}
@@ -592,22 +598,6 @@ impl BlobHandler {
         match (operator, storage_path) {
             (Some(operator), Some(path)) => self.delete_path(operator, path).await,
             _ => Ok(()),
-        }
-    }
-
-    async fn abort_writer(&self, writer: &mut opendal::Writer) -> Result<(), BlobError> {
-        match timeout(self.control_plane_io_timeout(), writer.abort()).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) if error.kind() == ErrorKind::Unsupported => {
-                Err(BlobError::CleanupUnsupported)
-            }
-            Ok(Err(error)) => Err(BlobError::DeleteError(format!(
-                "partial blob cleanup is uncertain: {error}"
-            ))),
-            Err(_) => Err(BlobError::DeleteError(
-                "partial blob cleanup is uncertain: timed out aborting partial blob writer"
-                    .to_string(),
-            )),
         }
     }
 
