@@ -21,12 +21,8 @@ use ulid::{DecodeError, Ulid};
 
 /// Highest allocatable placement handle; handle zero is reserved.
 pub const MAX_PLACEMENT_HANDLE: u32 = layout::MAX_HANDLE;
-/// Highest bucket value the 12-bit field can hold.
-pub const MAX_BUCKET_ID: u16 = layout::MAX_BUCKET;
 /// Maximum `bucket_count` a strategy may declare (the 12-bit field cap).
 pub const MAX_BUCKET_COUNT: u16 = layout::MAX_BUCKET_COUNT;
-/// Number of allocatable handles (20 bits, handle zero reserved).
-pub const ALLOCATABLE_HANDLES: u32 = layout::MAX_HANDLE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FieldError {

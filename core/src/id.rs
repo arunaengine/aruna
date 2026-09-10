@@ -65,11 +65,6 @@ impl DhtKeyId {
     pub fn from_data(data: &[u8]) -> Self {
         Self(*blake3::hash(data).as_bytes())
     }
-
-    #[inline]
-    pub fn xor_distance_to_node(&self, node: &NodeId) -> [u8; 32] {
-        xor_distance_32(self.as_bytes(), node.as_bytes())
-    }
 }
 
 impl fmt::Debug for DhtKeyId {

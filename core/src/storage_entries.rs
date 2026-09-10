@@ -746,13 +746,6 @@ pub fn admin_document_reducer_state_write_entry(
     ))
 }
 
-pub fn admin_document_reducer_state_delete_entry(target: &AdminDocumentTarget) -> (KeySpace, Key) {
-    (
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-        admin_document_reducer_state_key(target),
-    )
-}
-
 pub fn admin_document_conflict_write_entry(
     target: &AdminDocumentTarget,
     conflict: &AdminDocumentConflict,

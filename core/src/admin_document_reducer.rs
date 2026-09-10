@@ -2295,11 +2295,6 @@ impl AdminDocumentReducerState {
             .origin(token_hash)
     }
 
-    pub fn revocation_owner(&self, token_hash: &str) -> Option<UserId> {
-        self.revocation_index(self.revocation_floor)
-            .owner(token_hash)
-    }
-
     fn apply_revocation_full(
         &mut self,
         event: &AdminDocumentEvent,
