@@ -1,9 +1,6 @@
-//! Adapter I/O for the job-record and launch-offer effects.
-//!
-//! The transport peer is authenticated as a sync-eligible node of this realm.
-//! That authority is separate from, and never a substitute for, the publisher
-//! signature inside each envelope: a holder that relays a record satisfies no
-//! author rule, and a record keeps its original publisher end to end.
+//! Adapter I/O for the job-record and launch-offer effects. The transport peer is
+//! authenticated as a sync-eligible realm node, but that is never a substitute for
+//! the publisher signature: a relay satisfies no author rule and records keep their publisher.
 
 use std::sync::Arc;
 
@@ -27,11 +24,11 @@ use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::load_kind_complete;
 use super::rows::PendingNeed;
-use crate::dashboard::notify_dashboard_change;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{JobRecordPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
+use crate::node::dashboard::notify_dashboard_change;
 use crate::placement::holds_placement;
 
 /// Publishes one record to the family holders, or reads a bounded page back.
@@ -474,9 +471,8 @@ async fn serve_page(
 }
 
 /// Serves one inbound launch offer. The offer is bounded and kind-checked at
-/// decode; exact admission, the capacity reservation, and the signed receipt
-/// are the target's own decision. An undecidable offer is answered as
-/// unavailable, never as a refusal: the scheduler must be free to retry it.
+/// decode; admission, reservation, and receipt are the target's own decision.
+/// An undecidable offer is answered as unavailable so the scheduler can retry.
 pub async fn serve_launch_offer(
     context: &Arc<DriverContext>,
     peer: NodeId,

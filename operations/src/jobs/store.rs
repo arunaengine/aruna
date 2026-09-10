@@ -30,7 +30,7 @@ use ulid::Ulid;
 
 use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS};
-use crate::queue_backoff::queue_retry_after_ms;
+use crate::tasks::queue_backoff::queue_retry_after_ms;
 
 pub(super) type JobWrites = Vec<(KeySpace, Key, Value)>;
 pub(super) type JobDeletes = Vec<(KeySpace, Key)>;
@@ -104,9 +104,8 @@ fn job_schedule_key(record: &JobRecord) -> Key {
 }
 
 /// Dedup index path. A user-scoped key is prefixed with the submitting user so a
-/// caller cannot squat another's idempotency key; a `global/` key names its own
-/// subject and stays unprefixed, so concurrent submissions by different users
-/// resolve to one job identity.
+/// caller cannot squat another's idempotency key; a `global/` key stays
+/// unprefixed, so different users' submissions resolve to one job identity.
 pub(super) fn job_dedup_index_key(created_by: UserId, dedup_key: &[u8]) -> Key {
     if dedup_key.starts_with(GLOBAL_DEDUP_PREFIX) {
         return ByteView::from(dedup_key.to_vec());
@@ -318,9 +317,8 @@ type JobGuard<'a> =
     &'a mut (dyn FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send);
 
 /// Same transaction as [`mutate_job`], with `guard` re-checking the mutated
-/// record against the attempt control read inside that transaction. A guard
-/// rejection aborts before any write, so its invariant is atomic with the state
-/// change it protects.
+/// record against the attempt control read in that transaction; a rejection
+/// aborts before any write, so the invariant is atomic with the state change.
 pub async fn mutate_job_guarded<F, G>(
     storage: &StorageHandle,
     job_id: JobId,
@@ -1112,10 +1110,9 @@ pub async fn complete_cancelled(
     .await
 }
 
-/// The storage-level success invariant: `Succeeded` commits in the same
-/// transaction that reads the attempt control, and only when every output binds
-/// the active ExecutionId, names a reserved version, and the execution's exact
-/// immutable output record is already durable under the named digest.
+/// The storage-level success invariant: `Succeeded` commits in the transaction
+/// that reads the attempt control, and only when every output binds the active
+/// ExecutionId, names a reserved version, and the exact output record is durable.
 async fn commit_success<G>(
     storage: &StorageHandle,
     job_id: JobId,
@@ -1259,10 +1256,9 @@ pub enum RequeueOutcome {
     Skipped,
 }
 
-/// `JOB_MAX_ATTEMPTS` are spent. Only a job-specific permanent verdict terminalizes;
-/// a retryable or absent one leaves the outcome `Indeterminate`, because exhausting
-/// this node's attempts proves nothing. An execution keeps a result payload so
-/// terminal cleanup and the run crate still see its workspace.
+/// `JOB_MAX_ATTEMPTS` are spent. Only a permanent verdict terminalizes; a
+/// retryable or absent one leaves the outcome `Indeterminate`, since exhausting
+/// this node's attempts proves nothing. An execution keeps a result payload.
 fn exhaust_attempts(record: &mut JobRecord, now_ms: u64) {
     let permanent = record
         .last_error
@@ -1290,14 +1286,9 @@ fn exhaust_attempts(record: &mut JobRecord, now_ms: u64) {
     record.result = Some(result);
 }
 
-/// Re-queue with backoff, or fail once `JOB_MAX_ATTEMPTS` is spent. `token` is `None`
-/// for the lease sweep and startup recovery. `require_expired_before` makes the sweep
-/// re-check, in-txn, that the job still holds an expired lease: a revived renew is not
-/// revoked, and a claim-less record (already requeued) is not charged a second attempt.
-/// A submitted external attempt that passes those checks is never requeued or charged
-/// here; it returns `NeedsReconcile` untouched, so a restart or hand-off whose adoption
-/// succeeds costs it nothing. Its cap is spent by the park that follows a failed
-/// adoption, which is what bounds a repeating failure.
+/// Re-queue with backoff, or fail once `JOB_MAX_ATTEMPTS` is spent; `token` is
+/// `None` for the sweep and recovery, and `require_expired_before` re-checks the
+/// expired lease in-txn. External attempts return `NeedsReconcile` untouched.
 pub async fn requeue_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -1907,9 +1898,8 @@ pub enum ParkOutcome {
 }
 
 /// Park an ambiguous external attempt in `Indeterminate`, keeping the claim so the
-/// lease sweep later re-routes it to reconciliation. Exits only on evidence, or on
-/// the attempt cap. The park is the single charge point of a supervision cycle: an
-/// adoption that resumes supervision is free, one that fails here terminalizes.
+/// lease sweep later re-routes it to reconciliation. Exits only on evidence or the
+/// attempt cap; adoption that resumes supervision is free, a failure terminalizes.
 pub async fn mark_indeterminate(
     storage: &StorageHandle,
     job_id: JobId,

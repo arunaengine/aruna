@@ -47,7 +47,7 @@ use crate::jobs::lifecycle::updates::{
     SETTLE_RETRY_AFTER, publish_progress, publish_terminal, schedule_terminal_settle,
 };
 use crate::jobs::workflow::workspace::mint_workspace_credential;
-use crate::placement_policy::subject::read_local_subject;
+use crate::placement::policy::subject::read_local_subject;
 use aruna_compute::session::{EndReason, Session, SessionConfig};
 use aruna_core::structs::{DEFAULT_SESSION_IDLE_AFTER_MS, SessionReportDetail, SessionReportRow};
 use compute::{RecoveryAction, recovery_action};
@@ -354,11 +354,8 @@ pub async fn run_execution_job(
 }
 
 /// Resolve the backend for a spec, or a permanent error when none is eligible.
-///
-/// A receipted execution is fenced to the exact execution site its receipt
-/// stored: subject drift refuses the start instead of running accepted work
-/// somewhere nobody authorized. A local job without a receipt keeps the
-/// unfenced selection.
+/// A receipted execution is fenced to the receipt's execution site: subject drift
+/// refuses the start. A local job without a receipt keeps the unfenced selection.
 pub async fn resolve_backend(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -661,9 +658,8 @@ pub(super) fn build_task_spec(
 }
 
 /// A submit error after the write-ahead intent is ambiguous: the container may
-/// already exist (created, or even running when the final status read faulted).
-/// Requeueing would erase the intent and launch a second container under the
-/// next attempt name, so the error is resolved by the deterministic name instead.
+/// already exist or run. Requeueing would erase the intent and launch a second
+/// container under the next attempt name, so the deterministic name is used instead.
 #[allow(clippy::too_many_arguments)]
 async fn recover_failed_submit(
     context: &Arc<DriverContext>,

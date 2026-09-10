@@ -127,13 +127,7 @@ enum SubmitState {
 
 /// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the
 /// existing id (matching plan digest) or raises `JobPlanConflict` (differing
-/// digest), in both cases only after verifying that job's record still exists
-/// and decodes. A dangling entry (record quarantined or gone) falls through to a
-/// fresh create whose transactional batch write repoints the dedup row, so a ghost
-/// row can neither poison its key nor conflict against a dead job. Concurrent
-/// creates are serialized by the storage transaction.
-/// Execution is at-least-once: consumers must be idempotent (`Probe`'s marker file is
-/// the example).
+/// digest), a dangling entry creates fresh; at-least-once, so consumers must be idempotent.
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,

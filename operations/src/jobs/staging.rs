@@ -11,9 +11,9 @@ use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
 use super::store::{put_state, read_state};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
-use crate::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_realm_config::GetRealmConfigOperation;
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };

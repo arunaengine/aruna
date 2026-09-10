@@ -24,15 +24,15 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     quota_marked_routing, routing_snapshot,
 };
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::store::reserve_output_commits;
+use crate::realm::get_realm_config::GetRealmConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
@@ -1405,9 +1405,8 @@ fn storage_retryable(error: &StorageError) -> bool {
 }
 
 /// Attribute this execution's outputs under the declared prefixes. A listed key
-/// counts only when this execution durably reserved its VersionId before
-/// writing: the current head may belong to a duplicate execution or to an
-/// unrelated later write, and stamping it here would forge provenance.
+/// counts only when this execution durably reserved its VersionId before writing;
+/// the current head may otherwise belong to a duplicate or unrelated write.
 pub async fn collect_outputs(
     context: &DriverContext,
     spec: &ExecutionSpec,

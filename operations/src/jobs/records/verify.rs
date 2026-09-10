@@ -1,8 +1,6 @@
 //! The local view and the retained evidence one job record is judged against.
-//!
-//! Every input here comes from this node's own replicated state: the realm
-//! config it synchronized and the records it already stored as authentic. A
-//! relaying peer supplies bytes, never authority and never evidence.
+//! Every input comes from this node's replicated state: the synchronized realm
+//! config and the records it stored as authentic. A relay supplies bytes only.
 
 use std::collections::BTreeSet;
 
@@ -28,10 +26,9 @@ pub struct FamilyView {
 }
 
 impl FamilyView {
-    /// Fail-closed derivation: `None` means this node cannot judge authority
-    /// yet, because the family placement, its activation, or the membership is
-    /// unavailable or conflicted. Verifying against an empty view would reject
-    /// every holder-authored record instead of retrying it.
+    /// Fail-closed derivation: `None` means this node cannot judge authority yet,
+    /// because placement, activation, or membership is unavailable or conflicted.
+    /// An empty view would reject holder-authored records instead of retrying them.
     pub fn resolve(
         config: &RealmConfigDocument,
         realm_id: RealmId,
@@ -99,12 +96,9 @@ pub struct Evidence<'a> {
     pub previous_update: Option<&'a ExecutionUpdate>,
 }
 
-/// The predecessor rows one set of candidates must be judged against.
-///
-/// A key is derived wherever the successor's own signed identity addresses its
-/// predecessor exactly. A whole kind is scanned only where selection is by a
-/// digest or an id no record key carries, and that scan must run to completion:
-/// a truncated one proves nothing absent.
+/// The predecessor rows one set of candidates must be judged against. A key is
+/// derived wherever the successor's signed identity addresses its predecessor
+/// exactly; otherwise a whole kind is scanned, which must run to completion.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct EvidencePlan {
     pub keys: BTreeSet<JobRecordKey>,

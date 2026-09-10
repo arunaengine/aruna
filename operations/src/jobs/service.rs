@@ -35,12 +35,12 @@ use super::submit::{
     schedule_job_drain_effect,
 };
 use super::workflow::finalize_followups;
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::load_realm_config;
+use crate::metadata::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::repository::StorageReadError;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
 
 use super::lifecycle::cancel::cancel_family;
 use super::lifecycle::ids::session_of;
@@ -125,8 +125,7 @@ pub(crate) async fn submit_local_job(
 
 /// Normalizes one execution request and enforces every bound that holds
 /// regardless of where the job runs: composition, the shared output bound, and
-/// the workspace rules. It is the single gate both the local and the
-/// distributed submission path pass through.
+/// the workspace rules. The single gate both submission paths pass through.
 pub(crate) fn validate_execution(
     spec: &mut ExecutionSpec,
     workspace_mode: WorkspaceMode,
@@ -203,11 +202,9 @@ pub(crate) fn validate_execution(
     Ok(())
 }
 
-/// Submit a container execution job on behalf of `created_by`. The drain claims it
+/// Submit a container execution job on behalf of `created_by`; the drain claims it
 /// and drives the fenced external attempt lifecycle. The idempotency key is
-/// namespaced per user, disjoint from internal obligation keys. `active_cap`
-/// bounds the user's unfinished execution jobs on this node inside the
-/// admitting transaction.
+/// user-namespaced, and `active_cap` is enforced inside the admitting transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
@@ -308,10 +305,8 @@ pub async fn submit_storage_purge_job(
 }
 
 /// Register a w3id PID for a document as a fenced job on the document's PID
-/// authority. The dedup key names the document and is indexed without the
-/// submitting user, so a concurrent re-mint by another authorized user joins the
-/// same job; routing it to the one authority is what makes that hold across
-/// ingress nodes. The job record still carries the real requester.
+/// authority. The dedup key names the document without the submitting user, so a
+/// concurrent re-mint by another user joins the same job across ingress nodes.
 pub async fn submit_mint_pid(
     context: &Arc<DriverContext>,
     spec: MintPersistentIdSpec,
@@ -592,9 +587,8 @@ async fn route_record(
     }
 }
 
-/// Derives the immutable owner from the JobId alone: replicated placement
-/// state is the only input, so resolution never asks another node and can
-/// never be stranded by a placement rebalance. A missing or unsynced binding is
+/// Derives the immutable owner from the JobId alone using replicated placement
+/// state, so resolution never asks another node. A missing or unsynced binding is
 /// `Unavailable` (503); only a provably invalid id maps to `NotFound`.
 pub(crate) async fn resolve_job_owner(
     context: &DriverContext,
@@ -975,14 +969,16 @@ pub async fn read_owned_artifact(
     if location_hash != artifact.blake3 {
         return Err("artifact record does not match its blob location".to_string());
     }
-    let document_path =
-        crate::get_metadata_document::load_metadata_record_by_document(context, spec.document_id)
-            .await
-            .map_err(|error| match error {
-                StorageReadError::Storage(error) => error.to_string(),
-                StorageReadError::Conversion(error) => error.to_string(),
-            })?
-            .map(|record| record.document_path);
+    let document_path = crate::metadata::get_metadata_document::load_metadata_record_by_document(
+        context,
+        spec.document_id,
+    )
+    .await
+    .map_err(|error| match error {
+        StorageReadError::Storage(error) => error.to_string(),
+        StorageReadError::Conversion(error) => error.to_string(),
+    })?
+    .map(|record| record.document_path);
     Ok(ArtifactLookup::Ready(OwnedArtifact {
         job_id: record.job_id,
         created_by: record.created_by,
