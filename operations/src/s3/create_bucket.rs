@@ -207,6 +207,9 @@ impl Operation for CreateBucketOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.emit_error(error.clone().into());
+        }
         match self.state {
             CreateBucketState::Init => self.handle_init(),
             CreateBucketState::StartTransaction => self.handle_transaction_started(event),

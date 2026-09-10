@@ -937,6 +937,9 @@ impl Operation for DeleteObjectOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.emit_error(error.clone().into());
+        }
         match self.state {
             DeleteObjectState::Init => self.handle_init(),
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
@@ -1117,6 +1120,30 @@ mod test {
             aruna_core::structs::BlobDeleteAuditKind::DeleteVersion
         );
         assert_eq!(record.version_id, Some(version_id));
+    }
+
+    #[test]
+    fn typed_storage_failure() {
+        let mut operation = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "reports/a.csv".to_string(),
+            version_id: None,
+            group_id: Ulid::from_bytes([2u8; 16]),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: test_node_id(),
+            deleted_by: test_user_id(),
+        });
+        operation.start();
+
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(DeleteObjectError::StorageError(StorageError::CommitFailed))
+        );
     }
 
     fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {

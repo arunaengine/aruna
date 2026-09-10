@@ -418,6 +418,9 @@ impl Operation for DeleteBucketOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.emit_error(error.clone().into());
+        }
         match self.state {
             DeleteBucketState::Init => self.handle_init(),
             DeleteBucketState::StartTransaction => self.handle_transaction_started(event),
