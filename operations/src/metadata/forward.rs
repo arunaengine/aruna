@@ -811,29 +811,30 @@ pub async fn export_rocrate_routed(
             Ok(export) => {
                 success.get_or_insert(export);
             }
-            Err(MetadataReadError::Unauthorized) => {
-                auth_error.get_or_insert(MetadataApiError::Unauthorized);
-            }
-            Err(MetadataReadError::Forbidden) => {
-                auth_error.get_or_insert(MetadataApiError::Forbidden);
+            Err(error @ (MetadataReadError::Unauthorized | MetadataReadError::Forbidden)) => {
+                auth_error.get_or_insert(error);
             }
             Err(MetadataReadError::NotFound) => not_found += 1,
             Err(MetadataReadError::Unavailable) => unavailable = true,
         }
     }
-    if let Some(error) = auth_error {
-        return Err(error);
-    }
-    if success.is_some() && not_found > 0 {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    if let Some(export) = success {
-        return Ok(export);
-    }
-    if !unavailable && holder_count > 0 && not_found == holder_count {
-        Err(MetadataApiError::NotFound)
-    } else {
-        Err(MetadataApiError::ServiceUnavailable)
+    let conflict = success.is_some() && not_found > 0;
+    let all_not_found = holder_count > 0 && not_found == holder_count;
+    match reduce_holder_reads(
+        success,
+        auth_error,
+        all_not_found,
+        conflict,
+        unavailable,
+        AuthFailure::Fatal,
+    ) {
+        ReadDecision::Success(export) => Ok(export),
+        ReadDecision::NotFound => Err(MetadataApiError::NotFound),
+        ReadDecision::Auth(MetadataReadError::Unauthorized) => Err(MetadataApiError::Unauthorized),
+        ReadDecision::Auth(MetadataReadError::Forbidden) => Err(MetadataApiError::Forbidden),
+        ReadDecision::Auth(_) | ReadDecision::Unavailable => {
+            Err(MetadataApiError::ServiceUnavailable)
+        }
     }
 }
 
@@ -935,23 +936,74 @@ fn collect_profile_export(
 ) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
     let mut not_found = 0usize;
     let mut success = None;
+    let mut auth_error = None;
     let mut unavailable = timed_out;
     for (_, response) in responses {
         match response {
             Ok(export) => {
                 success.get_or_insert(export);
             }
+            Err(error @ (MetadataReadError::Unauthorized | MetadataReadError::Forbidden)) => {
+                auth_error.get_or_insert(error);
+            }
             Err(MetadataReadError::NotFound) => not_found += 1,
-            Err(_) => unavailable = true,
+            Err(MetadataReadError::Unavailable) => unavailable = true,
         }
     }
-    if let Some(export) = success {
-        return Ok(export);
+    let all_not_found = holder_count > 0 && not_found == holder_count;
+    match reduce_holder_reads(
+        success,
+        auth_error,
+        all_not_found,
+        false,
+        unavailable,
+        AuthFailure::Unavailable,
+    ) {
+        ReadDecision::Success(export) => Ok(export),
+        ReadDecision::NotFound => Err(MetadataReadError::NotFound),
+        ReadDecision::Auth(_) | ReadDecision::Unavailable => Err(MetadataReadError::Unavailable),
     }
-    if !unavailable && holder_count > 0 && not_found == holder_count {
-        Err(MetadataReadError::NotFound)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthFailure {
+    Fatal,
+    Unavailable,
+}
+
+pub(crate) enum ReadDecision<T> {
+    Success(T),
+    NotFound,
+    Auth(MetadataReadError),
+    Unavailable,
+}
+
+/// Reduces holder answers; `conflict` outranks success and `all_not_found`
+/// is only `NotFound` while no holder was unavailable.
+pub(crate) fn reduce_holder_reads<T>(
+    success: Option<T>,
+    auth_error: Option<MetadataReadError>,
+    all_not_found: bool,
+    conflict: bool,
+    mut unavailable: bool,
+    auth_failure: AuthFailure,
+) -> ReadDecision<T> {
+    if let Some(error) = auth_error {
+        match auth_failure {
+            AuthFailure::Fatal => return ReadDecision::Auth(error),
+            AuthFailure::Unavailable => unavailable = true,
+        }
+    }
+    if conflict {
+        return ReadDecision::Unavailable;
+    }
+    if let Some(value) = success {
+        return ReadDecision::Success(value);
+    }
+    if all_not_found && !unavailable {
+        ReadDecision::NotFound
     } else {
-        Err(MetadataReadError::Unavailable)
+        ReadDecision::Unavailable
     }
 }
 
@@ -4106,6 +4158,41 @@ mod tests {
         keep_status(&mut selected, validation_status(stale), expected);
 
         assert_eq!(selected.unwrap().dataset_revision, expected);
+    }
+
+    #[test]
+    fn auth_policies_differ() {
+        let success = || Some("export");
+        assert!(matches!(
+            reduce_holder_reads(
+                success(),
+                Some(MetadataReadError::Forbidden),
+                false,
+                false,
+                false,
+                AuthFailure::Fatal,
+            ),
+            ReadDecision::Auth(MetadataReadError::Forbidden)
+        ));
+        assert!(matches!(
+            reduce_holder_reads(
+                success(),
+                Some(MetadataReadError::Forbidden),
+                false,
+                false,
+                false,
+                AuthFailure::Unavailable,
+            ),
+            ReadDecision::Success("export")
+        ));
+        assert!(matches!(
+            reduce_holder_reads(None::<&str>, None, true, false, false, AuthFailure::Fatal),
+            ReadDecision::NotFound
+        ));
+        assert!(matches!(
+            reduce_holder_reads(success(), None, true, true, false, AuthFailure::Fatal),
+            ReadDecision::Unavailable
+        ));
     }
 
     fn config_and_placement() -> (RealmConfigDocument, PlacementRef) {
