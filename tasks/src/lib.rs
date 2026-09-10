@@ -82,11 +82,13 @@ pub struct TaskShutdownReport {
     pub in_flight: usize,
     /// Handlers aborted because they outlived the drain deadline.
     pub aborted: usize,
+    /// No command reached the scheduler, so the drain never ran.
+    pub scheduler_unavailable: bool,
 }
 
 impl TaskShutdownReport {
     pub fn drained(&self) -> bool {
-        self.aborted == 0
+        self.aborted == 0 && !self.scheduler_unavailable
     }
 }
 
@@ -646,101 +648,62 @@ impl TaskHandle {
         }
     }
 
-    async fn reset_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+    async fn dispatch_command<F>(&self, key: TaskKey, build: F) -> TaskEvent
+    where
+        F: FnOnce(TaskKey, oneshot::Sender<TaskEvent>) -> TaskCommand,
+    {
         let command_key = key.clone();
         let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::ResetTimer {
-                key,
-                after,
-                response,
-            })
-            .await
-            .is_err()
-        {
+        if self.command_tx.send(build(key, response)).await.is_err() {
             return scheduler_unavailable(command_key);
         }
 
         result
             .await
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
+    }
+
+    async fn reset_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+        self.dispatch_command(key, |key, response| TaskCommand::ResetTimer {
+            key,
+            after,
+            response,
+        })
+        .await
     }
 
     async fn shorten_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::ShortenTimer {
-                key,
-                after,
-                response,
-            })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+        self.dispatch_command(key, |key, response| TaskCommand::ShortenTimer {
+            key,
+            after,
+            response,
+        })
+        .await
     }
 
     pub async fn schedule_timer_if_idle(&self, key: TaskKey, after: Duration) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::ScheduleTimerIfIdle {
-                key,
-                after,
-                response,
-            })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+        self.dispatch_command(key, |key, response| TaskCommand::ScheduleTimerIfIdle {
+            key,
+            after,
+            response,
+        })
+        .await
     }
 
     async fn cancel_timer(&self, key: TaskKey) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::CancelTimer { key, response })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+        self.dispatch_command(key, |key, response| TaskCommand::CancelTimer {
+            key,
+            response,
+        })
+        .await
     }
 
     pub async fn abort_running_handlers(&self, key: TaskKey) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::AbortRunningHandlers { key, response })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+        self.dispatch_command(key, |key, response| TaskCommand::AbortRunningHandlers {
+            key,
+            response,
+        })
+        .await
     }
 
     /// Permanently stops new timer handlers without waiting for the scheduler.
@@ -770,12 +733,14 @@ impl TaskHandle {
             return TaskShutdownReport {
                 in_flight: 0,
                 aborted: 0,
+                scheduler_unavailable: true,
             };
         };
         if in_flight == 0 {
             return TaskShutdownReport {
                 in_flight: 0,
                 aborted: 0,
+                scheduler_unavailable: false,
             };
         }
 
@@ -790,6 +755,7 @@ impl TaskHandle {
             return TaskShutdownReport {
                 in_flight,
                 aborted: 0,
+                scheduler_unavailable: false,
             };
         }
 
@@ -817,7 +783,11 @@ impl TaskHandle {
             );
         }
 
-        TaskShutdownReport { in_flight, aborted }
+        TaskShutdownReport {
+            in_flight,
+            aborted,
+            scheduler_unavailable: false,
+        }
     }
 }
 
@@ -1286,6 +1256,18 @@ mod tests {
         tokio::time::timeout(Duration::ZERO, dropped.notified())
             .await
             .expect("handler future must drop before shutdown returns");
+    }
+
+    #[test]
+    fn shutdown_reports_unavailable() {
+        let handle = TaskHandle::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime should build");
+        let report = runtime.block_on(handle.shutdown(Duration::ZERO));
+
+        assert!(report.scheduler_unavailable);
+        assert!(!report.drained());
     }
 
     // Admission stops first: timers that fire after shutdown find no handler.
