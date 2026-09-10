@@ -3,17 +3,17 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::structs::{Actor, AuthContext, Permission};
-use aruna_operations::driver::drive;
-use aruna_operations::group_join::{
-    GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,
-};
-use aruna_operations::list_join_requests::{
-    ListJoinRequestsError, ListJoinRequestsInput, ListJoinRequestsOperation,
-};
-use aruna_operations::request_policy::{
+use aruna_operations::auth::request_policy::{
     PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
 };
-use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_operations::driver::drive;
+use aruna_operations::groups::join_request::{
+    GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,
+};
+use aruna_operations::groups::list_join_requests::{
+    ListJoinRequestsError, ListJoinRequestsInput, ListJoinRequestsOperation,
+};
+use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::StatusCode;

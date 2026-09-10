@@ -13,28 +13,28 @@ use aruna_core::structs::{
     StaticRealmEndpoint,
 };
 use aruna_core::util::unix_timestamp_secs as now_timestamp;
-use aruna_operations::bootstrap_onboarding_finalize::{
+use aruna_operations::auth::request_policy::{
+    PolicyRequestExtras, enforce_policies, policy_request_with,
+};
+use aruna_operations::driver::drive;
+use aruna_operations::onboarding::bootstrap_onboarding_finalize::{
     BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
     bootstrap_onboarding_finalize,
 };
-use aruna_operations::consume_onboarding_secret::ConsumeOnboardingSecretError;
-use aruna_operations::create_onboarding_secret::{
+use aruna_operations::onboarding::consume_onboarding_secret::ConsumeOnboardingSecretError;
+use aruna_operations::onboarding::create_onboarding_secret::{
     CreateOnboardingSecretError, CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
-use aruna_operations::delete_onboarding_secret::{
+use aruna_operations::onboarding::delete_onboarding_secret::{
     DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
 };
-use aruna_operations::driver::drive;
-use aruna_operations::ensure_realm_config::EnsureRealmConfigError;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::inspect_onboarding_secret::{
+use aruna_operations::onboarding::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
-use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
-use aruna_operations::reserve_onboarding_secret::ReserveOnboardingSecretError;
+use aruna_operations::onboarding::list_onboarding_secrets::ListOnboardingSecretsOperation;
+use aruna_operations::onboarding::reserve_onboarding_secret::ReserveOnboardingSecretError;
+use aruna_operations::realm::ensure_realm_config::EnsureRealmConfigError;
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -1088,19 +1088,19 @@ mod tests {
         RealmNodeKind, StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::bootstrap_onboarding_finalize::BootstrapOnboardingFinalizeError;
-    use aruna_operations::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use aruna_operations::create_onboarding_secret::{
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::onboarding::bootstrap_onboarding_finalize::BootstrapOnboardingFinalizeError;
+    use aruna_operations::onboarding::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
-    use aruna_operations::reserve_onboarding_secret::{
+    use aruna_operations::onboarding::list_onboarding_secrets::ListOnboardingSecretsOperation;
+    use aruna_operations::onboarding::reserve_onboarding_secret::{
         ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
     };
+    use aruna_operations::realm::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::Extension;

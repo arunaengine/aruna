@@ -17,18 +17,18 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::metadata::forward::MetadataWriteError;
-use aruna_operations::placement_policy::create::{CreatePolicyConfig, CreatePolicyError};
-use aruna_operations::placement_policy::diagnostics::{
+use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
+use aruna_operations::placement::policy::diagnostics::{
     DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,
 };
-use aruna_operations::placement_policy::list::{
+use aruna_operations::placement::policy::list::{
     ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
 };
-use aruna_operations::placement_policy::names::PolicyNamesOperation;
-use aruna_operations::placement_policy::read::{
+use aruna_operations::placement::policy::names::PolicyNamesOperation;
+use aruna_operations::placement::policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
-use aruna_operations::placement_policy::{
+use aruna_operations::placement::policy::{
     PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
     ResolveQuarantineOperation, create_policy_routed,
 };
@@ -1259,7 +1259,7 @@ pub async fn mint_object_placement(
         Ulid::from_string(&request.expected_version_id).map_err(|_| ServerError::BadRequest)?;
     let outcome = drive(
         PolicyMutationOperation::new(PolicyMutationConfig {
-            context: aruna_operations::blob::blob_keyspace_helper::HeadAliasContext::new(
+            context: aruna_operations::blob::blob_storage::HeadAliasContext::new(
                 auth.realm_id,
                 info.group_id,
                 state.get_node_id(),

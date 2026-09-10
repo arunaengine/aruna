@@ -7,12 +7,12 @@ use crate::server_state::ServerState;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_core::util::unix_timestamp_secs;
+use aruna_operations::auth::revoke_token::{
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::forward::{forward_token_revoke, is_user_origin};
-use aruna_operations::revoke_token::{
-    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
-};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -179,11 +179,11 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{Actor, NodeCapabilities, PathRestriction, RealmId, TokenRevocation};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::DriverContext;
-    use aruna_operations::get_realm_config::GetRealmConfigOperation;
     use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
     use aruna_storage::storage::FjallStorage;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;

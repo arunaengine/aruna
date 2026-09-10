@@ -7,7 +7,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session};
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::s3::session::{
     CreateS3SessionConfig, CreateS3SessionOperation, GetS3SessionOperation,
     ListS3SessionsOperation, RefreshS3SessionConfig, RefreshS3SessionOperation,

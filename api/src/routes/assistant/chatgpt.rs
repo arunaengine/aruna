@@ -9,7 +9,7 @@ use aruna_core::structs::{
     AssistantProviderStatus, AuthContext,
 };
 use aruna_core::util::unix_timestamp_secs;
-use aruna_operations::assistant_provider::CreateProviderOperation;
+use aruna_operations::assistant::provider::CreateProviderOperation;
 use aruna_operations::driver::drive;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
