@@ -1,0 +1,10 @@
+pub mod get_oidc_user;
+pub mod get_user;
+pub mod list_users;
+pub mod read_user_document;
+pub mod register_or_get_oidc_user;
+pub mod resolve_users;
+pub mod search_users;
+pub mod update_user;
+pub mod user_subject_index;
+pub mod user_vault;

@@ -9,7 +9,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetUserInput {
