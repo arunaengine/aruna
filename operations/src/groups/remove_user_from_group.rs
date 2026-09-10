@@ -24,13 +24,13 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
-};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoveUserFromGroupInput {
@@ -866,14 +866,14 @@ pub mod test {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::get_group::{GetGroupConfig, GetGroupOperation};
-    use crate::remove_user_from_group::{
+    use crate::groups::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
+    use crate::groups::remove_user_from_group::{
         RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
     };
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
         let random_path = tempdir().unwrap();

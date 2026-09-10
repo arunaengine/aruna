@@ -25,11 +25,11 @@ use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
 use aruna_core::structs::Permission;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -771,13 +771,13 @@ pub mod test {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::remove_group_role::{
+    use crate::groups::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::groups::remove_group_role::{
         RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
     };
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
         let random_path = tempdir().unwrap();
