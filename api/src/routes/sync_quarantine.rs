@@ -10,7 +10,7 @@ use aruna_core::document::DocumentSyncEvent;
 use aruna_core::structs::{
     AuthContext, Permission, SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage,
 };
-use aruna_operations::sync_quarantine::{
+use aruna_operations::sync::sync_quarantine::{
     QuarantineAdminError, QuarantinePageRequest, acknowledge_quarantine_row,
     list_quarantine_records, prune_quarantine_records, read_quarantine_record,
 };
@@ -468,11 +468,11 @@ mod tests {
         quarantine_usage_entry,
     };
     use aruna_core::types::UserId;
-    use aruna_operations::claim_initial_realm_admin::{
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use ulid::Ulid;

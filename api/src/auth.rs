@@ -5,10 +5,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::structs::{
     AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
 };
-use aruna_operations::auth::{
+use aruna_operations::auth::bearer_token::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
 };
-use aruna_operations::request_authorization::AuthorizeError;
+use aruna_operations::auth::request_authorization::AuthorizeError;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -533,7 +533,7 @@ pub(crate) async fn ensure_permission(
         auth,
         path,
         required_permission,
-        aruna_operations::request_policy::PolicyRequestExtras::rest(),
+        aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
     )
     .await
 }
@@ -546,11 +546,11 @@ pub(crate) async fn ensure_permission_with(
     auth: &AuthContext,
     path: String,
     required_permission: Permission,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> ServerResult<()> {
     aruna_core::telemetry::time_stage(
         "permission",
-        aruna_operations::request_authorization::authorize(
+        aruna_operations::auth::request_authorization::authorize(
             &state.get_ctx(),
             state.get_realm_id(),
             auth,
@@ -632,15 +632,15 @@ mod test {
         Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId, TokenClaims,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::register_or_get_oidc_user::{
-        RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-    };
-    use aruna_operations::request_authorization::AuthorizeError;
-    use aruna_operations::revoke_token::{
+    use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::auth::request_authorization::AuthorizeError;
+    use aruna_operations::auth::revoke_token::{
         RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
+    };
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::users::register_or_get_oidc_user::{
+        RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
     };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

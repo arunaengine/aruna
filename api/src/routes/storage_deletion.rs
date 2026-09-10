@@ -15,7 +15,7 @@ use aruna_operations::s3::list_multipart_uploads::{
 use aruna_operations::s3::list_object_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
-use aruna_operations::sync_relationship::{
+use aruna_operations::sync::sync_relationship::{
     ListSyncRelationshipsOperation, SyncRelationshipDirection,
 };
 use axum::extract::State;

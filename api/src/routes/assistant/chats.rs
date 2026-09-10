@@ -5,7 +5,7 @@ use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{AssistantChatHead, AssistantChatTurn, AuthContext};
 use aruna_core::util::unix_timestamp_secs;
-use aruna_operations::assistant_chat::{
+use aruna_operations::assistant::{
     ChatStoreError, DeleteChatOperation, ListChatHeadsOperation, ReadChatTurnsOperation,
     WriteChatHeadOperation, WriteChatTurnOperation,
 };
@@ -475,7 +475,7 @@ mod tests {
         MAX_ASSISTANT_TURN_BYTES, NodeCapabilities, RealmId,
     };
     use aruna_core::types::UserId;
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use axum::response::IntoResponse;
     use tempfile::TempDir;
     use ulid::Ulid;

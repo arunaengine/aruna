@@ -21,7 +21,7 @@ use aruna_core::structs::{
     AssistantProviderStatus, AuthContext,
 };
 use aruna_core::util::unix_timestamp_secs;
-use aruna_operations::assistant_provider::{
+use aruna_operations::assistant::provider::{
     CreateProviderOperation, DeleteProviderOperation, GetProviderOperation, ListProviderOperation,
     ProviderStoreError, UpdateProviderOperation,
 };
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn store_error_mapping() {
-        use aruna_operations::assistant_provider::ProviderStoreError;
+        use aruna_operations::assistant::provider::ProviderStoreError;
         assert!(matches!(
             map_store_error(ProviderStoreError::NotFound),
             ServerError::NotFound

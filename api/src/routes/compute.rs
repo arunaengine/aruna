@@ -14,12 +14,12 @@ use aruna_core::structs::{
     policy_admin_path,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use aruna_operations::node_info::{
+use aruna_operations::node::node_info::{
     departure_report, group_demand, read_node_info_documents, read_operator_drain,
     set_operator_drain,
 };
-use aruna_operations::set_realm_compute::{
+use aruna_operations::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::set_realm_compute::{
     SetRealmComputeConfig, SetRealmComputeError, SetRealmComputeOperation,
 };
 use axum::extract::{Query, State};
