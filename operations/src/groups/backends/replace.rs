@@ -301,8 +301,8 @@ impl Operation for ReplaceGroupBackendOperation {
 #[cfg(test)]
 mod tests {
     use super::ReplaceGroupBackendOperation;
-    use crate::group_backends::create::{CreateGroupBackendError, CreateGroupBackendInput};
-    use crate::group_backends::validation::GroupBackendError;
+    use crate::groups::backends::create::{CreateGroupBackendError, CreateGroupBackendInput};
+    use crate::groups::backends::validation::GroupBackendError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;

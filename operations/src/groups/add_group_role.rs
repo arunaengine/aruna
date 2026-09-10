@@ -27,14 +27,14 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
-};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::placement::placement_ref_for_target;
-use crate::replicate_documents::replicate_documents_effect;
+use crate::sync::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
+use crate::sync::replicate_documents::replicate_documents_effect;
 use aruna_core::structs::Permission;
 use aruna_core::structs::ResourceEvent;
 
@@ -1044,13 +1044,13 @@ fn newly_materialized_members(
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use crate::add_group_role::{
+    use crate::driver::{DriverContext, drive};
+    use crate::groups::add_group_role::{
         AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation, AddGroupRoleState,
     };
-    use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::groups::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::{
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
