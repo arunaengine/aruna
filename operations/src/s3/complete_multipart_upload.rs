@@ -2,7 +2,7 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
-use crate::blob::cleanup::{PendingCleanup, schedule_blob_cleanup_effect};
+use crate::blob::cleanup::schedule_blob_cleanup_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::{
@@ -11,6 +11,9 @@ use crate::placement_policy::{
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::write_cleanup::{
+    CleanupEvent, UploadTargetError, WriteCleanup, delete_records_effect, validate_upload_target,
+};
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
@@ -145,6 +148,16 @@ pub enum CompleteMultipartUploadError {
     CompleteMultipartUploadFailed,
 }
 
+impl From<UploadTargetError> for CompleteMultipartUploadError {
+    fn from(error: UploadTargetError) -> Self {
+        match error {
+            UploadTargetError::TargetMismatch => Self::UploadTargetMismatch,
+            UploadTargetError::NotOpen => Self::UploadNotOpen,
+            UploadTargetError::CompletionInProgress => Self::CompletionInProgress,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompleteMultipartPart {
     pub part_number: u16,
@@ -198,8 +211,7 @@ pub struct CompleteMultipartUploadOperation {
     /// A pre-finalize write has no committed owner, even when its hash is absent.
     delete_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
-    release_id: Option<Ulid>,
-    pending_cleanup: PendingCleanup,
+    cleanup: WriteCleanup<CompleteMultipartUploadError>,
     cleanup_closed: bool,
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
@@ -210,7 +222,6 @@ pub struct CompleteMultipartUploadOperation {
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
-    pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
@@ -242,8 +253,7 @@ impl CompleteMultipartUploadOperation {
             reconcile_location: None,
             delete_location: None,
             rollback_location: None,
-            release_id: None,
-            pending_cleanup: PendingCleanup::default(),
+            cleanup: WriteCleanup::default(),
             cleanup_closed: false,
             final_location: None,
             composite_hashes: HashMap::new(),
@@ -254,7 +264,6 @@ impl CompleteMultipartUploadOperation {
             was_live: false,
             usage_update: None,
             quota_gate: None,
-            pending_error: None,
             output: None,
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
@@ -306,7 +315,7 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn schedule_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
-        self.pending_error = Some(error);
+        self.cleanup.set_error(error);
         // Any open finalize transaction must be aborted before we start the reset
         // transaction, otherwise the old txn is orphaned in the storage actor and
         // pins an LSM snapshot forever. The original error is preserved in
@@ -389,7 +398,7 @@ impl CompleteMultipartUploadOperation {
         if self.cleanup_closed {
             return self.fail_node();
         }
-        let Some(effect) = self.pending_cleanup.queue(work) else {
+        let Some(effect) = self.cleanup.queue(work) else {
             return self.release_or_error();
         };
         self.state = CompleteMultipartUploadState::QueueCleanupRow;
@@ -397,24 +406,16 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                self.pending_cleanup.accepted();
-                self.release_or_error()
-            }
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::ChannelClosed,
-            }) => {
+        match self.cleanup.handle_queued(event) {
+            CleanupEvent::Effect(effect) => smallvec![effect],
+            CleanupEvent::Accepted | CleanupEvent::Exhausted => self.release_or_error(),
+            CleanupEvent::Closed => {
                 self.cleanup_closed = true;
                 self.fail_node()
             }
-            Event::Storage(StorageEvent::Error { error }) => {
-                match self.pending_cleanup.retry(&error) {
-                    Some(effect) => smallvec![effect],
-                    None => self.release_or_error(),
-                }
+            CleanupEvent::Invalid => {
+                self.emit_error(CompleteMultipartUploadError::InvalidOperationState)
             }
-            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
         }
     }
 
@@ -422,8 +423,8 @@ impl CompleteMultipartUploadOperation {
         self.state = CompleteMultipartUploadState::Error;
         if !matches!(self.output.as_ref(), Some(Err(_))) {
             self.output = Some(Err(self
-                .pending_error
-                .take()
+                .cleanup
+                .take_error()
                 .unwrap_or(CompleteMultipartUploadError::CompleteMultipartUploadFailed)));
         }
         smallvec![]
@@ -433,22 +434,22 @@ impl CompleteMultipartUploadOperation {
         if self.has_cleanup() {
             return self.rollback_composed_blob();
         }
-        let Some(id) = self.release_id else {
+        let Some(effect) = self.cleanup.release_effect() else {
             return self.emit_pending_error();
         };
         self.state = CompleteMultipartUploadState::ReleaseReservation;
-        smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+        smallvec![effect]
     }
 
     fn handle_release(&mut self, event: Event) -> Effects {
         let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
             return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
         };
-        if self.release_id != Some(id) {
+        if self.cleanup.release_id() != Some(id) {
             return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
         }
-        self.release_id = None;
-        if self.pending_error.is_some() {
+        self.cleanup.clear_release();
+        if self.cleanup.error_pending() {
             self.emit_pending_error()
         } else {
             self.finish_commit()
@@ -502,36 +503,15 @@ impl CompleteMultipartUploadOperation {
                 .or_else(|| self.rollback_location.take());
             self.reconcile_location = location;
         }
-        self.release_id = None;
+        self.cleanup.clear_release();
     }
 
     fn emit_pending_error(&mut self) -> Effects {
-        let error = match (self.pending_error.take(), self.output.take()) {
+        let error = match (self.cleanup.take_error(), self.output.take()) {
             (Some(error), _) | (None, Some(Err(error))) => error,
             _ => CompleteMultipartUploadError::CompleteMultipartUploadFailed,
         };
         self.emit_error(error)
-    }
-
-    /// A `Completing` record whose lease lapsed is taken over: the previous
-    /// attempt lost its request future, so refusing it would strand the upload.
-    fn validate_upload_target(
-        &self,
-        record: &MultipartUpload,
-    ) -> Result<(), CompleteMultipartUploadError> {
-        if record.bucket != self.input.bucket || record.key != self.input.key {
-            return Err(CompleteMultipartUploadError::UploadTargetMismatch);
-        }
-        match record.status {
-            MultipartUploadStatus::Open => Ok(()),
-            MultipartUploadStatus::Completing if record.completion_stale(self.input.now_ms) => {
-                Ok(())
-            }
-            MultipartUploadStatus::Completing => {
-                Err(CompleteMultipartUploadError::CompletionInProgress)
-            }
-            MultipartUploadStatus::Aborting => Err(CompleteMultipartUploadError::UploadNotOpen),
-        }
     }
 
     fn validate_checksum_contract(
@@ -619,8 +599,14 @@ impl CompleteMultipartUploadOperation {
             Ok(record) => record,
             Err(err) => return self.emit_error(err.into()),
         };
-        if let Err(err) = self.validate_upload_target(&record) {
-            return self.schedule_error(err);
+        if let Err(err) = validate_upload_target(
+            &record,
+            &self.input.bucket,
+            &self.input.key,
+            false,
+            Some(self.input.now_ms),
+        ) {
+            return self.schedule_error(err.into());
         }
         if let Err(err) = self.validate_checksum_contract(&record) {
             return self.schedule_error(err);
@@ -873,7 +859,7 @@ impl CompleteMultipartUploadOperation {
         let location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
-                self.release_id = Some(location.ulid);
+                self.cleanup.set_release(location.ulid);
                 self.delete_location = Some(location);
                 return self
                     .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -1334,26 +1320,13 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn delete_upload_records(&mut self) -> Effects {
-        let mut deletes = Vec::with_capacity(self.upload_parts.len() + 1);
-        for record in &self.upload_parts {
-            let key = match MultipartUploadPartKey::new(self.input.upload_id, record.part_number)
-                .to_bytes()
-            {
-                Ok(key) => key,
+        let effect =
+            match delete_records_effect(self.input.upload_id, &self.upload_parts, self.txn_id) {
+                Ok(effect) => effect,
                 Err(err) => return self.schedule_error(err.into()),
             };
-            deletes.push((S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(), key.into()));
-        }
-        deletes.push((
-            S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
-            self.input.upload_id.to_bytes().to_vec().into(),
-        ));
-
         self.state = CompleteMultipartUploadState::DeleteUploadRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: self.txn_id,
-        })]
+        smallvec![effect]
     }
 
     fn handle_upload_records_deleted(&mut self, event: Event) -> Effects {
@@ -1642,7 +1615,7 @@ impl CompleteMultipartUploadOperation {
             part_count: self.resolved_parts.len(),
         }));
         if let Some(id) = release_id {
-            self.release_id = Some(id);
+            self.cleanup.set_release(id);
             self.state = CompleteMultipartUploadState::ReleaseReservation;
             smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
         } else {
@@ -1748,7 +1721,7 @@ impl CompleteMultipartUploadOperation {
 
     fn reset_failed(&mut self, error: Option<CompleteMultipartUploadError>) -> Effects {
         if let Some(error) = error {
-            self.pending_error = Some(error);
+            self.cleanup.set_error(error);
         }
         self.state = CompleteMultipartUploadState::CleanupFailedCompose;
         if let Some(txn_id) = self.txn_id.take() {
@@ -1926,13 +1899,13 @@ impl Operation for CompleteMultipartUploadOperation {
             }
             if self.state != CompleteMultipartUploadState::Error
                 || self.has_cleanup()
-                || self.release_id.is_some()
+                || self.cleanup.release_id().is_some()
             {
                 self.state = CompleteMultipartUploadState::CleanupFailedCompose;
             }
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
-        if let Some(effect) = self.pending_cleanup.retry(&StorageError::Timeout) {
+        if let Some(effect) = self.cleanup.retry(&StorageError::Timeout) {
             self.state = CompleteMultipartUploadState::QueueCleanupRow;
             return smallvec![effect];
         }
@@ -1941,9 +1914,9 @@ impl Operation for CompleteMultipartUploadOperation {
         if self.needs_reset() || self.has_cleanup() {
             return self.continue_error_cleanup();
         }
-        if let Some(id) = self.release_id {
+        if let Some(effect) = self.cleanup.release_effect() {
             self.state = CompleteMultipartUploadState::ReleaseReservation;
-            return smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })];
+            return smallvec![effect];
         }
         self.state = CompleteMultipartUploadState::Error;
         if !matches!(self.output.as_ref(), Some(Err(_))) {
@@ -2231,7 +2204,7 @@ mod tests {
             "expected the finalize transaction to abort, got {effects:?}"
         );
         assert_eq!(
-            op.pending_error,
+            op.cleanup.pending_error,
             Some(BackendFenceError::Unavailable.into())
         );
     }
@@ -2247,7 +2220,7 @@ mod tests {
         }));
 
         assert!(matches!(
-            op.pending_error,
+            op.cleanup.pending_error,
             Some(CompleteMultipartUploadError::BackendFenceError(
                 BackendFenceError::Read(_)
             ))
@@ -2352,13 +2325,13 @@ mod tests {
             vec![7u8; 32],
         );
         let id = location.ulid;
-        op.pending_error = Some(CompleteMultipartUploadError::StorageError(
+        op.cleanup.pending_error = Some(CompleteMultipartUploadError::StorageError(
             StorageError::CommitFailed,
         ));
-        op.release_id = Some(id);
+        op.cleanup.set_release(id);
         op.state = CompleteMultipartUploadState::QueueCleanupRow;
         assert!(
-            op.pending_cleanup
+            op.cleanup
                 .queue(BlobCleanupWork::ReconcileWrite {
                     location,
                     owner: WriteOwner::Blob {
@@ -2418,7 +2391,7 @@ mod tests {
         );
         assert_eq!(op.delete_location, Some(location.clone()));
         assert_eq!(op.reconcile_location, None);
-        assert_eq!(op.release_id, Some(release_id));
+        assert_eq!(op.cleanup.release_id(), Some(release_id));
 
         let reset_txn = TxnId::generate();
         op.step(Event::Storage(StorageEvent::TransactionStarted {
@@ -2564,7 +2537,8 @@ mod tests {
         let location = composed_location(Ulid::from_bytes([5u8; 16]));
         op.composed_location = Some(location.clone());
         op.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-        op.pending_error = Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        op.cleanup.pending_error =
+            Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         op.state = CompleteMultipartUploadState::CommitResetTransaction;
 
         let effects = op.step(Event::Storage(StorageEvent::Error {
@@ -2594,7 +2568,8 @@ mod tests {
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         let location = composed_location(Ulid::from_bytes([5u8; 16]));
         op.composed_location = Some(location.clone());
-        op.pending_error = Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        op.cleanup.pending_error =
+            Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         op.state = CompleteMultipartUploadState::AbortFinalizeTransaction;
 
         let effects = op.step(Event::Storage(StorageEvent::Error {
@@ -2615,17 +2590,18 @@ mod tests {
             BlobCleanupWork::ReconcileReservation { location: observed }
                 if observed == location
         ));
-        assert_eq!(op.release_id, None);
+        assert_eq!(op.cleanup.release_id(), None);
     }
 
     #[test]
     fn cleanup_close_stops() {
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         let location = composed_location(Ulid::from_bytes([5u8; 16]));
-        op.pending_error = Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        op.cleanup.pending_error =
+            Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         op.state = CompleteMultipartUploadState::QueueCleanupRow;
         assert!(
-            op.pending_cleanup
+            op.cleanup
                 .queue(BlobCleanupWork::ReconcileReservation { location })
                 .is_some()
         );
@@ -2757,7 +2733,7 @@ mod tests {
                 if *aborted == txn_id
         ));
         assert_eq!(
-            op.pending_error,
+            op.cleanup.pending_error,
             Some(CompleteMultipartUploadError::CompletionInProgress)
         );
     }
@@ -3151,7 +3127,7 @@ mod tests {
             CompleteMultipartUploadState::ResetUploadTransaction
         );
         assert_eq!(
-            op.pending_error,
+            op.cleanup.pending_error,
             Some(CompleteMultipartUploadError::QuotaExceeded {
                 limit: 30,
                 usage: 35
@@ -3218,7 +3194,7 @@ mod tests {
         );
         assert_eq!(operation.txn_id, None);
         assert_eq!(
-            operation.pending_error,
+            operation.cleanup.pending_error,
             Some(CompleteMultipartUploadError::StorageError(
                 StorageError::CommitFailed
             ))
@@ -3416,7 +3392,7 @@ mod gate_tests {
 
         assert!(!composes(&effects));
         assert_eq!(
-            operation.pending_error,
+            operation.cleanup.pending_error,
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Denied {
                     policy_ids: vec![rule.policy().policy_id]
@@ -3438,7 +3414,7 @@ mod gate_tests {
 
         assert!(!composes(&effects));
         assert!(matches!(
-            operation.pending_error,
+            operation.cleanup.pending_error,
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Unavailable { .. }
             ))
@@ -3458,7 +3434,7 @@ mod gate_tests {
 
         assert!(!composes(&effects));
         assert_eq!(
-            operation.pending_error,
+            operation.cleanup.pending_error,
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::NoSubject
             ))
@@ -3494,7 +3470,7 @@ mod gate_tests {
         }));
 
         assert_eq!(
-            operation.pending_error,
+            operation.cleanup.pending_error,
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Drift
             ))

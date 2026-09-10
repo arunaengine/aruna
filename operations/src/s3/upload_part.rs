@@ -1,7 +1,9 @@
-use crate::blob::cleanup::PendingCleanup;
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::PolicyGateError;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::write_cleanup::{
+    CleanupEvent, UploadTargetError, WriteCleanup, validate_upload_target,
+};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -13,7 +15,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     BackendLocation, BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, NODE_SUBJECT_KEY, NodeSubjectRecord, ResolvedBackend, WriteOwner,
+    NODE_SUBJECT_KEY, NodeSubjectRecord, ResolvedBackend, WriteOwner,
 };
 use aruna_core::types::{Effects, Key, TxnId, UserId};
 use bytes::Bytes;
@@ -87,6 +89,17 @@ pub enum UploadPartError {
     UploadPartFailed,
 }
 
+impl From<UploadTargetError> for UploadPartError {
+    fn from(error: UploadTargetError) -> Self {
+        match error {
+            UploadTargetError::TargetMismatch => Self::UploadTargetMismatch,
+            UploadTargetError::NotOpen | UploadTargetError::CompletionInProgress => {
+                Self::UploadNotOpen
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct UploadPartInput {
     pub bucket: String,
@@ -115,9 +128,7 @@ pub struct UploadPartOperation {
     written_location: Option<BackendLocation>,
     replaced_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
-    release_id: Option<Ulid>,
-    pending_cleanup: PendingCleanup,
-    pending_error: Option<UploadPartError>,
+    cleanup: WriteCleanup<UploadPartError>,
     output: Option<Result<UploadPartResult, UploadPartError>>,
 }
 
@@ -131,9 +142,7 @@ impl UploadPartOperation {
             written_location: None,
             replaced_location: None,
             rollback_location: None,
-            release_id: None,
-            pending_cleanup: PendingCleanup::default(),
-            pending_error: None,
+            cleanup: WriteCleanup::default(),
             output: None,
         }
     }
@@ -176,16 +185,6 @@ impl UploadPartOperation {
         })]
     }
 
-    fn validate_upload_record(&self, record: &MultipartUpload) -> Result<(), UploadPartError> {
-        if record.bucket != self.input.bucket || record.key != self.input.key {
-            return Err(UploadPartError::UploadTargetMismatch);
-        }
-        if record.status != MultipartUploadStatus::Open {
-            return Err(UploadPartError::UploadNotOpen);
-        }
-        Ok(())
-    }
-
     fn handle_upload_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(UploadPartError::InvalidOperationState);
@@ -210,8 +209,10 @@ impl UploadPartOperation {
             Ok(record) => record,
             Err(err) => return self.emit_error(err.into()),
         };
-        if let Err(err) = self.validate_upload_record(&record) {
-            return self.emit_error(err);
+        if let Err(err) =
+            validate_upload_target(&record, &self.input.bucket, &self.input.key, false, None)
+        {
+            return self.emit_error(err.into());
         }
         // Cheap re-check of the create-time refs: no ref is resolved again, but
         // a subject that moved since then stops the part before any byte moves.
@@ -285,7 +286,7 @@ impl UploadPartOperation {
     /// must not queue a second one. A copy stays behind so a delete that fails
     /// can still be handed to the durable cleanup queue.
     fn cleanup_failed_write(&mut self, error: UploadPartError) -> Effects {
-        self.pending_error = Some(error);
+        self.cleanup.set_error(error);
         self.state = UploadPartState::CleanupFailedWrite;
         if let Some(location) = self.written_location.take() {
             self.rollback_location = Some(location.clone());
@@ -312,7 +313,7 @@ impl UploadPartOperation {
         let Some(location) = self.rollback_location.clone() else {
             return self.emit_pending_error();
         };
-        let Some(effect) = self.pending_cleanup.queue(BlobCleanupWork::DeleteBlob {
+        let Some(effect) = self.cleanup.queue(BlobCleanupWork::DeleteBlob {
             location: location.clone(),
         }) else {
             return self.emit_pending_error();
@@ -326,7 +327,7 @@ impl UploadPartOperation {
     /// row keeps the location until storage accepts it, so a refused write can
     /// still be retried rather than losing the only record of the bytes.
     fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
-        let Some(effect) = self.pending_cleanup.queue(work) else {
+        let Some(effect) = self.cleanup.queue(work) else {
             return self.release_or_error();
         };
         self.state = UploadPartState::QueueCleanupRow;
@@ -334,26 +335,21 @@ impl UploadPartOperation {
     }
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                self.pending_cleanup.accepted();
+        match self.cleanup.handle_queued(event) {
+            CleanupEvent::Effect(effect) => smallvec![effect],
+            CleanupEvent::Accepted => {
                 if self.rollback_location.is_some() || self.written_location.is_some() {
                     return self.abort();
                 }
                 self.release_or_error()
             }
-            Event::Storage(StorageEvent::Error { error }) => {
-                match self.pending_cleanup.retry(&error) {
-                    Some(effect) => smallvec![effect],
-                    None => self.release_or_error(),
-                }
-            }
-            _ => self.emit_error(UploadPartError::InvalidOperationState),
+            CleanupEvent::Exhausted | CleanupEvent::Closed => self.release_or_error(),
+            CleanupEvent::Invalid => self.emit_error(UploadPartError::InvalidOperationState),
         }
     }
 
     fn emit_pending_error(&mut self) -> Effects {
-        if let Some(error) = self.pending_error.take() {
+        if let Some(error) = self.cleanup.take_error() {
             return self.emit_error(error);
         }
         if self.output.is_some() {
@@ -364,18 +360,18 @@ impl UploadPartOperation {
     }
 
     fn release_or_error(&mut self) -> Effects {
-        let Some(id) = self.release_id else {
+        let Some(effect) = self.cleanup.release_effect() else {
             return self.emit_pending_error();
         };
         self.state = UploadPartState::ReleaseReservation;
-        smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+        smallvec![effect]
     }
 
     /// The part is durably committed, so a refused release must not fail the
     /// request: the reconciliation row that committed with the part record
     /// clears this reservation on the next cleanup drain.
     fn defer_release(&mut self) -> Effects {
-        let Some(id) = self.release_id.take() else {
+        let Some(id) = self.cleanup.take_release() else {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
         warn!(
@@ -392,16 +388,16 @@ impl UploadPartOperation {
 
     fn handle_release(&mut self, event: Event) -> Effects {
         let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
-            if self.pending_error.is_none() {
+            if !self.cleanup.error_pending() {
                 return self.defer_release();
             }
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
-        if self.release_id != Some(id) {
+        if self.cleanup.release_id() != Some(id) {
             return self.emit_error(UploadPartError::InvalidOperationState);
         }
-        self.release_id = None;
-        if self.pending_error.is_some() {
+        self.cleanup.clear_release();
+        if self.cleanup.error_pending() {
             self.emit_pending_error()
         } else {
             self.state = UploadPartState::Finish;
@@ -466,8 +462,10 @@ impl UploadPartOperation {
             Ok(record) => record,
             Err(err) => return self.cleanup_failed_write(err.into()),
         };
-        if let Err(err) = self.validate_upload_record(&record) {
-            return self.cleanup_failed_write(err);
+        if let Err(err) =
+            validate_upload_target(&record, &self.input.bucket, &self.input.key, false, None)
+        {
+            return self.cleanup_failed_write(err.into());
         }
 
         self.state = UploadPartState::ReadExistingPart;
@@ -629,7 +627,7 @@ impl UploadPartOperation {
         let Some(location) = self.written_location.take() else {
             return self.emit_error(UploadPartError::UploadPartFailed);
         };
-        self.release_id = Some(location.ulid);
+        self.cleanup.set_release(location.ulid);
         self.output = Some(Ok(UploadPartResult { location }));
         self.release_or_error()
     }
@@ -651,7 +649,7 @@ impl UploadPartOperation {
         let Some(location) = self.written_location.take() else {
             return self.emit_error(error.into());
         };
-        self.release_id = Some(location.ulid);
+        self.cleanup.set_release(location.ulid);
         warn!(
             event = "upload_part.commit_outcome_unknown",
             backend = %location.backend,
@@ -659,7 +657,7 @@ impl UploadPartOperation {
             error = %error,
             "Queuing the written part for reconciliation"
         );
-        self.pending_error = Some(error.into());
+        self.cleanup.set_error(error.into());
         self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
             location,
             owner: WriteOwner::UploadPart {
@@ -733,7 +731,7 @@ impl Operation for UploadPartOperation {
 
     fn abort(&mut self) -> Effects {
         let mut effects = smallvec![];
-        if let Some(effect) = self.pending_cleanup.retry(&StorageError::Timeout) {
+        if let Some(effect) = self.cleanup.retry(&StorageError::Timeout) {
             if matches!(self.output, Some(Ok(_))) {
                 self.output = None;
             }
@@ -747,12 +745,12 @@ impl Operation for UploadPartOperation {
                 let work = BlobCleanupWork::DeleteBlob {
                     location: location.clone(),
                 };
-                if let Some(effect) = self.pending_cleanup.queue(work) {
+                if let Some(effect) = self.cleanup.queue(work) {
                     if matches!(self.output, Some(Ok(_))) {
                         self.output = None;
                     }
-                    if self.output.is_none() && self.pending_error.is_none() {
-                        self.pending_error = Some(UploadPartError::UploadPartFailed);
+                    if self.output.is_none() && !self.cleanup.error_pending() {
+                        self.cleanup.set_error(UploadPartError::UploadPartFailed);
                     }
                     self.state = UploadPartState::QueueCleanupRow;
                     effects.push(effect);
@@ -770,7 +768,7 @@ impl Operation for UploadPartOperation {
                 }
             }
         }
-        if let Some(id) = self.release_id.take() {
+        if let Some(id) = self.cleanup.take_release() {
             effects.push(Effect::Blob(BlobEffect::ReleaseReservation { id }));
         }
         if let Some(txn_id) = self.txn_id.take() {
@@ -785,6 +783,7 @@ mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
+    use aruna_core::structs::MultipartUploadStatus;
     use aruna_core::structs::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;

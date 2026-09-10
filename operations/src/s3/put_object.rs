@@ -2,7 +2,6 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
-use crate::blob::cleanup::PendingCleanup;
 use crate::blob::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
@@ -15,6 +14,7 @@ use crate::placement_policy::{
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::write_cleanup::{CleanupEvent, WriteCleanup};
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
@@ -182,14 +182,12 @@ pub struct PutObjectOperation {
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
-    release_id: Option<Ulid>,
-    pending_cleanup: PendingCleanup,
+    cleanup: WriteCleanup<PutObjectError>,
     existing_pointer: Option<CurrentVersionPointer>,
     new_blob: bool,
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
-    pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
     expected_bucket: Option<BucketInfo>,
     metadata: HashMap<String, String>,
@@ -227,14 +225,12 @@ impl PutObjectOperation {
             written_location: None,
             cleanup_location: None,
             rollback_location: None,
-            release_id: None,
-            pending_cleanup: PendingCleanup::default(),
+            cleanup: WriteCleanup::default(),
             existing_pointer: None,
             new_blob: false,
             was_live: false,
             usage_update: None,
             quota_gate: None,
-            pending_error: None,
             output: None,
             expected_bucket: None,
             metadata: HashMap::new(),
@@ -1062,7 +1058,7 @@ impl PutObjectOperation {
             Ok(Some(effects)) => effects,
             Ok(None) => {
                 if gate.is_exceeded() {
-                    self.pending_error = Some(PutObjectError::QuotaExceeded {
+                    self.cleanup.set_error(PutObjectError::QuotaExceeded {
                         limit: gate.ceiling(),
                         usage: gate.projected_usage(),
                     });
@@ -1072,7 +1068,7 @@ impl PutObjectOperation {
                 }
             }
             Err(err) => {
-                self.pending_error = Some(err.into());
+                self.cleanup.set_error(err.into());
                 self.reject_over_quota()
             }
         }
@@ -1125,7 +1121,7 @@ impl PutObjectOperation {
             Ok(Some(effects)) => effects,
             Ok(None) => self.write_cleanup_row(txn_id),
             Err(err) => {
-                self.pending_error = Some(err.into());
+                self.cleanup.set_error(err.into());
                 self.reject_over_quota()
             }
         }
@@ -1175,7 +1171,7 @@ impl PutObjectOperation {
                 // not still hold it.
                 let release_id = self.written_location.take().map(|location| location.ulid);
                 if let Some(id) = release_id {
-                    self.release_id = Some(id);
+                    self.cleanup.set_release(id);
                     self.state = PutObjectState::ReleaseReservation;
                     smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
                 } else {
@@ -1232,8 +1228,8 @@ impl PutObjectOperation {
             error = %error,
             "Queuing the written blob for reconciliation"
         );
-        self.pending_error = Some(error.into());
-        self.release_id = Some(release_id);
+        self.cleanup.set_error(error.into());
+        self.cleanup.set_release(release_id);
         let work = match self.reconcile_work(location) {
             Ok(work) => work,
             Err(_) => return self.release_or_error(),
@@ -1307,7 +1303,7 @@ impl PutObjectOperation {
     }
 
     fn cleanup_failed_write(&mut self, error: PutObjectError) -> Effects {
-        self.pending_error = Some(error);
+        self.cleanup.set_error(error);
         self.rollback_written_blob()
     }
 
@@ -1335,7 +1331,7 @@ impl PutObjectOperation {
     /// row keeps the location until storage accepts it, so a refused write can
     /// still be retried rather than losing the only record of the bytes.
     fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
-        let Some(effect) = self.pending_cleanup.queue(work) else {
+        let Some(effect) = self.cleanup.queue(work) else {
             return self.release_or_error();
         };
         self.state = PutObjectState::QueueCleanupRow;
@@ -1343,33 +1339,26 @@ impl PutObjectOperation {
     }
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                self.pending_cleanup.accepted();
-                self.release_or_error()
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                match self.pending_cleanup.retry(&error) {
-                    Some(effect) => smallvec![effect],
-                    None => self.finish_or_error(),
-                }
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        match self.cleanup.handle_queued(event) {
+            CleanupEvent::Effect(effect) => smallvec![effect],
+            CleanupEvent::Accepted => self.release_or_error(),
+            CleanupEvent::Exhausted | CleanupEvent::Closed => self.finish_or_error(),
+            CleanupEvent::Invalid => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
     fn release_or_error(&mut self) -> Effects {
-        let Some(id) = self.release_id else {
+        let Some(effect) = self.cleanup.release_effect() else {
             return self.finish_or_error();
         };
         self.state = PutObjectState::ReleaseReservation;
-        smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+        smallvec![effect]
     }
 
     /// Only a request that already carries an error fails here: a durable
     /// commit whose reservation release was deferred still succeeds.
     fn finish_or_error(&mut self) -> Effects {
-        if self.pending_error.is_some() {
+        if self.cleanup.error_pending() {
             return self.emit_pending_error();
         }
         self.continue_after_dht_registration()
@@ -1379,7 +1368,7 @@ impl PutObjectOperation {
     /// The reconciliation row clears the reservation and registers the blob;
     /// a duplicate copy is deleted by the cleanup the commit already planned.
     fn defer_release(&mut self) -> Effects {
-        let Some(id) = self.release_id.take() else {
+        let Some(id) = self.cleanup.take_release() else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
         warn!(
@@ -1400,16 +1389,16 @@ impl PutObjectOperation {
 
     fn handle_release(&mut self, event: Event) -> Effects {
         let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
-            if self.pending_error.is_none() {
+            if !self.cleanup.error_pending() {
                 return self.defer_release();
             }
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
-        if self.release_id != Some(id) {
+        if self.cleanup.release_id() != Some(id) {
             return self.emit_error(PutObjectError::InvalidOperationState);
         }
-        self.release_id = None;
-        if self.pending_error.is_some() {
+        self.cleanup.clear_release();
+        if self.cleanup.error_pending() {
             self.emit_pending_error()
         } else {
             self.register_blob_in_dht_or_continue()
@@ -1417,7 +1406,7 @@ impl PutObjectOperation {
     }
 
     fn emit_pending_error(&mut self) -> Effects {
-        let Some(error) = self.pending_error.take() else {
+        let Some(error) = self.cleanup.take_error() else {
             return self.emit_error(PutObjectError::PutObjectFailed);
         };
         self.emit_error(error)
@@ -2471,11 +2460,11 @@ mod test {
             vec![7u8; 32],
         );
         let id = location.ulid;
-        op.pending_error = Some(PutObjectError::StorageError(StorageError::CommitFailed));
-        op.release_id = Some(id);
+        op.cleanup.pending_error = Some(PutObjectError::StorageError(StorageError::CommitFailed));
+        op.cleanup.set_release(id);
         op.state = PutObjectState::QueueCleanupRow;
         assert!(
-            op.pending_cleanup
+            op.cleanup
                 .queue(super::BlobCleanupWork::ReconcileWrite {
                     location,
                     owner: super::WriteOwner::Blob {
@@ -2524,11 +2513,11 @@ mod test {
         ));
         let location = test_location(op.config.user_id);
         let id = location.ulid;
-        op.pending_error = Some(PutObjectError::StorageError(StorageError::ChannelClosed));
-        op.release_id = Some(id);
+        op.cleanup.pending_error = Some(PutObjectError::StorageError(StorageError::ChannelClosed));
+        op.cleanup.set_release(id);
         op.state = PutObjectState::QueueCleanupRow;
         assert!(
-            op.pending_cleanup
+            op.cleanup
                 .queue(super::BlobCleanupWork::ReconcileReservation { location })
                 .is_some()
         );
@@ -2537,8 +2526,8 @@ mod test {
             error: StorageError::ChannelClosed,
         }));
         assert!(effects.is_empty());
-        assert_eq!(op.release_id, Some(id));
-        assert!(op.pending_cleanup.retry(&StorageError::Timeout).is_none());
+        assert_eq!(op.cleanup.release_id(), Some(id));
+        assert!(op.cleanup.retry(&StorageError::Timeout).is_none());
         assert!(op.is_complete());
         assert!(matches!(
             op.finalize(),

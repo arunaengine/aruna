@@ -1,3 +1,6 @@
+use crate::s3::write_cleanup::{
+    UploadTargetError, WriteCleanup, delete_records_effect, validate_upload_target,
+};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -57,6 +60,16 @@ pub enum AbortMultipartUploadError {
     AbortMultipartUploadFailed,
 }
 
+impl From<UploadTargetError> for AbortMultipartUploadError {
+    fn from(error: UploadTargetError) -> Self {
+        match error {
+            UploadTargetError::TargetMismatch => Self::UploadTargetMismatch,
+            UploadTargetError::NotOpen => Self::UploadNotOpen,
+            UploadTargetError::CompletionInProgress => Self::CompletionInProgress,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct AbortMultipartUploadInput {
     pub bucket: String,
@@ -75,7 +88,7 @@ pub struct AbortMultipartUploadOperation {
     upload_parts: Vec<MultipartUploadPart>,
     cleanup_index: usize,
     allow_in_progress: bool,
-    pending_error: Option<AbortMultipartUploadError>,
+    cleanup: WriteCleanup<AbortMultipartUploadError>,
     output: Option<Result<(), AbortMultipartUploadError>>,
 }
 
@@ -89,7 +102,7 @@ impl AbortMultipartUploadOperation {
             upload_parts: Vec::new(),
             cleanup_index: 0,
             allow_in_progress: false,
-            pending_error: None,
+            cleanup: WriteCleanup::default(),
             output: None,
         }
     }
@@ -112,7 +125,7 @@ impl AbortMultipartUploadOperation {
     }
 
     fn schedule_error(&mut self, error: AbortMultipartUploadError) -> Effects {
-        self.pending_error = Some(error);
+        self.cleanup.set_error(error);
         if self.upload_record.is_some() {
             self.state = AbortMultipartUploadState::ResetUploadTransaction;
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -124,31 +137,10 @@ impl AbortMultipartUploadOperation {
     }
 
     fn emit_pending_error(&mut self) -> Effects {
-        let Some(error) = self.pending_error.take() else {
+        let Some(error) = self.cleanup.take_error() else {
             return self.emit_error(AbortMultipartUploadError::AbortMultipartUploadFailed);
         };
         self.emit_error(error)
-    }
-
-    /// A completion whose lease lapsed left the record stranded, so an abort may
-    /// reclaim it; a live lease still owns the upload and is refused.
-    fn validate_upload(&self, record: &MultipartUpload) -> Result<(), AbortMultipartUploadError> {
-        if record.bucket != self.input.bucket || record.key != self.input.key {
-            return Err(AbortMultipartUploadError::UploadTargetMismatch);
-        }
-        if self.allow_in_progress {
-            return Ok(());
-        }
-        match record.status {
-            MultipartUploadStatus::Open => Ok(()),
-            MultipartUploadStatus::Completing if record.completion_stale(self.input.now_ms) => {
-                Ok(())
-            }
-            MultipartUploadStatus::Completing => {
-                Err(AbortMultipartUploadError::CompletionInProgress)
-            }
-            MultipartUploadStatus::Aborting => Err(AbortMultipartUploadError::UploadNotOpen),
-        }
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -182,8 +174,14 @@ impl AbortMultipartUploadOperation {
             Ok(record) => record,
             Err(err) => return self.emit_error(err.into()),
         };
-        if let Err(err) = self.validate_upload(&record) {
-            return self.emit_error(err);
+        if let Err(err) = validate_upload_target(
+            &record,
+            &self.input.bucket,
+            &self.input.key,
+            self.allow_in_progress,
+            Some(self.input.now_ms),
+        ) {
+            return self.emit_error(err.into());
         }
 
         record.status = MultipartUploadStatus::Aborting;
@@ -266,26 +264,13 @@ impl AbortMultipartUploadOperation {
     }
 
     fn delete_upload_records(&mut self) -> Effects {
-        let mut deletes = Vec::with_capacity(self.upload_parts.len() + 1);
-        for part in &self.upload_parts {
-            let key = match MultipartUploadPartKey::new(self.input.upload_id, part.part_number)
-                .to_bytes()
-            {
-                Ok(key) => key,
+        let effect =
+            match delete_records_effect(self.input.upload_id, &self.upload_parts, self.txn_id) {
+                Ok(effect) => effect,
                 Err(err) => return self.schedule_error(err.into()),
             };
-            deletes.push((S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(), key.into()));
-        }
-        deletes.push((
-            S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
-            self.input.upload_id.to_bytes().to_vec().into(),
-        ));
-
         self.state = AbortMultipartUploadState::DeleteUploadRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: self.txn_id,
-        })]
+        smallvec![effect]
     }
 
     fn handle_upload_records_deleted(&mut self, event: Event) -> Effects {
@@ -573,7 +558,7 @@ mod tests {
         );
         assert_eq!(operation.txn_id, None);
         assert_eq!(
-            operation.pending_error,
+            operation.cleanup.pending_error,
             Some(AbortMultipartUploadError::StorageError(
                 StorageError::CommitFailed
             ))
