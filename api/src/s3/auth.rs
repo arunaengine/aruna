@@ -9,12 +9,14 @@ use aruna_core::structs::{
     blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
 };
 use aruna_core::{NodeId, UserId};
+use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::request_policy::{
+use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use aruna_operations::s3::session::{

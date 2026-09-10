@@ -3,7 +3,7 @@ use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
-use aruna_operations::placement_policy::PolicyGateError;
+use aruna_operations::placement::policy::PolicyGateError;
 use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
 use aruna_operations::s3::bucket_cors::{
     DeleteBucketCorsError, GetBucketCorsError, PutBucketCorsError,
@@ -776,7 +776,7 @@ mod tests {
     fn maps_usage_failure() {
         // The counter fault must not leak a Rust error string to an S3 client.
         let error = DeleteObjectError::UsageUpdateError(
-            aruna_operations::usage_stats::UsageUpdateError::UnexpectedEvent(
+            aruna_operations::node::usage_stats::UsageUpdateError::UnexpectedEvent(
                 aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished),
             ),
         )

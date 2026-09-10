@@ -35,18 +35,20 @@ use aruna_core::structs::{
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use aruna_operations::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{
     DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
 };
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
-use aruna_operations::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
@@ -99,11 +101,11 @@ use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperat
 use aruna_operations::s3::upload_part_copy::{
     UploadPartCopyInput as UploadPartCopyData, upload_part_copy,
 };
-use aruna_operations::sync_mirror_repair::{
+use aruna_operations::sync::sync_mirror_repair::{
     SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile,
 };
-use aruna_operations::sync_relationship::{
+use aruna_operations::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, ListSyncRelationshipsOperation,
     StoreSyncRelationshipOperation, SyncRelationshipDirection,
 };
@@ -3350,7 +3352,7 @@ impl S3 for ArunaS3Service {
         // DeleteObjects carries no object key in the request path, so the auth
         // layer defers per-object authorization to here. Load the realm and
         // group policy sets once and evaluate every entry against them in memory.
-        let policy_evaluator = aruna_operations::request_policy::PolicyEvaluator::load(
+        let policy_evaluator = aruna_operations::auth::request_policy::PolicyEvaluator::load(
             &self.state,
             self.realm_id,
             Some(user_access.group_id),
@@ -3391,7 +3393,7 @@ impl S3 for ArunaS3Service {
             )
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
-            let policy_request = aruna_operations::request_policy::policy_request_with(
+            let policy_request = aruna_operations::auth::request_policy::policy_request_with(
                 &object_path,
                 &Permission::WRITE,
                 Some(&replication_auth),
