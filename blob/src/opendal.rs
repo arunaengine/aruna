@@ -16,12 +16,32 @@ pub(crate) async fn abort_partial_writer(
     writer: &mut opendal::Writer,
     timeout_duration: Duration,
 ) -> Result<(), BlobError> {
+    abort_writer(writer, timeout_duration, UnsupportedAbort::Uncertain).await
+}
+
+/// How an abort reports a backend that does not support aborting partial writes.
+pub(crate) enum UnsupportedAbort {
+    /// Report a delete error: the partial object may still exist.
+    Uncertain,
+    /// Report `CleanupUnsupported`, so the caller deletes the final path.
+    DeletePath,
+}
+
+pub(crate) async fn abort_writer(
+    writer: &mut opendal::Writer,
+    timeout_duration: Duration,
+    unsupported: UnsupportedAbort,
+) -> Result<(), BlobError> {
     match timeout(timeout_duration, writer.abort()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "failed to abort partial blob writer");
+        Ok(Err(error)) => {
+            if matches!(unsupported, UnsupportedAbort::Uncertain) {
+                tracing::warn!(error = %error, "failed to abort partial blob writer");
+            } else if error.kind() == opendal::ErrorKind::Unsupported {
+                return Err(BlobError::CleanupUnsupported);
+            }
             Err(BlobError::DeleteError(format!(
-                "partial blob cleanup is uncertain: {err}"
+                "partial blob cleanup is uncertain: {error}"
             )))
         }
         Err(_) => Err(BlobError::DeleteError(
