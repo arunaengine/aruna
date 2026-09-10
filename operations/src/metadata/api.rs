@@ -56,20 +56,18 @@ use super::search_cursor::{
     query_fingerprint, resume_fetch_limit,
 };
 use super::summary_cache::summary_cache;
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::get_metadata_document::{
+use crate::groups::list_groups::ListGroupOperation;
+use crate::metadata::get_metadata_document::{
     is_metadata_record_materialized_for_graph_read, load_metadata_record_by_document,
 };
-use crate::get_realm_config::GetRealmConfigOperation;
-use crate::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use crate::list_groups::ListGroupOperation;
 use crate::metadata::repository::{
     LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
     parse_registry_read, read_registry_by_document_effect,
 };
-use crate::permission_rules::GroupPermissionRules;
 use crate::placement::selector::{
     ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
 };
@@ -77,6 +75,8 @@ use crate::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
 };
+use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 use crate::s3::search_objects::{
@@ -161,10 +161,9 @@ pub struct ListVisibleMetadataDocumentsResult {
     pub limit: usize,
     pub offset: usize,
     pub total_returned: usize,
-    /// Approximate number of documents matching the request filters across all
-    /// pages. Group-granular, so it can over- or under-count against the
-    /// glob-granular read rules. `None` when the request was too small to be a
-    /// browse page and the estimate was not computed.
+    /// Approximate number of matching documents across all pages; group-granular,
+    /// so it may over- or under-count glob read rules. `None` when not computed
+    /// for a request too small to be a browse page.
     pub total_estimate: Option<usize>,
 }
 
@@ -221,7 +220,7 @@ pub enum ExportMetadataRoCrateResult {
     },
     Raw {
         record: MetadataRegistryRecord,
-        raw: crate::metadata::raw::MetadataRawView,
+        raw: crate::metadata::raw_revision::MetadataRawView,
         dataset_digest: Option<[u8; 32]>,
     },
 }
@@ -825,7 +824,7 @@ pub async fn list_visible_metadata_documents(
     .await;
     // RBAC/public visibility is additionally constrained by the metadata.read
     // request policies, loaded once per distinct group (fail-closed on error).
-    let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
+    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
         context,
         records
             .iter()
@@ -882,11 +881,9 @@ pub async fn list_visible_metadata_documents(
         let exports = selected
             .iter()
             .map(|record| async move {
-                // The registry cursor advances at event acceptance, but the
-                // graph only at materialization. Exporting inside that window
-                // would hand out the content (and cache it under the new cursor)
-                // the event just replaced, so a pending document lists without
-                // a summary instead.
+                // Registry cursor advances at event acceptance but graph only at
+                // materialization; exporting in between would hand out (and cache)
+                // superseded content, so pending documents list without a summary.
                 ensure_record_materialized_for_graph_read(context, record).await?;
                 export_rocrate_summary_jsonld(context, &record.graph_iri, record.last_event_id)
                     .await
@@ -1545,7 +1542,7 @@ pub(crate) async fn local_path_candidates(
         records.iter().map(|record| record.group_id),
     )
     .await;
-    let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
+    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
         context,
         records
             .iter()
@@ -1814,15 +1811,16 @@ async fn export_raw_txn(
         Some(txn_id),
     )
     .await?;
-    let raw = crate::metadata::raw::load_raw_view(context, record.document_id, Some(txn_id))
-        .await
-        .map_err(|error| match error {
-            crate::metadata::raw::MetadataRawReadError::LimitExceeded(_) => {
-                MetadataApiError::ServiceUnavailable
-            }
-            error => MetadataApiError::Internal(error.to_string()),
-        })?
-        .ok_or(MetadataApiError::NotFound)?;
+    let raw =
+        crate::metadata::raw_revision::load_raw_view(context, record.document_id, Some(txn_id))
+            .await
+            .map_err(|error| match error {
+                crate::metadata::raw_revision::MetadataRawReadError::LimitExceeded(_) => {
+                    MetadataApiError::ServiceUnavailable
+                }
+                error => MetadataApiError::Internal(error.to_string()),
+            })?
+            .ok_or(MetadataApiError::NotFound)?;
     let dataset_digest = raw.revision.dataset_digest;
     Ok(ExportMetadataRoCrateResult::Raw {
         record,
@@ -2144,11 +2142,9 @@ pub async fn search_metadata(
     })
 }
 
-/// Reference lookup (backlinks). Scans the local IRI reference index for
-/// documents that name `iri` as an object, joins each to its registry record,
-/// and drops any the caller may not read. When the scan is empty and `iri` is a
-/// known graph IRI, or when `resolve` is set, the matching document's summary is
-/// returned as a single predicate-less entry. Local-node-only in v1.
+/// Backlink lookup: scans the local IRI reference index for documents naming
+/// `iri` as an object, joins and filters by read access. Empty scans for known
+/// graph IRIs or `resolve` return one predicate-less summary. Local-node-only in v1.
 pub async fn references_metadata(
     context: &DriverContext,
     realm_id: RealmId,
@@ -3763,11 +3759,11 @@ pub(crate) fn metadata_read_request(
     permission_path: &str,
     auth: Option<&AuthContext>,
 ) -> aruna_core::request_policy::PolicyRequest {
-    crate::request_policy::policy_request_with(
+    crate::auth::request_policy::policy_request_with(
         permission_path,
         &Permission::READ,
         auth,
-        crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+        crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
     )
 }
 
@@ -3781,14 +3777,14 @@ pub(crate) async fn ensure_record_readable(
     if record.public {
         // A policy denial on a found public record must read as NotFound, matching
         // the private-denied path, so read-by-id is not an existence oracle.
-        let request = crate::request_policy::policy_request_with(
+        let request = crate::auth::request_policy::policy_request_with(
             &record.permission_path,
             &Permission::READ,
             auth,
-            crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+            crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
         );
         let result = match txn_id {
-            Some(txn_id) => crate::request_policy::PolicyEvaluator::load_with_txn(
+            Some(txn_id) => crate::auth::request_policy::PolicyEvaluator::load_with_txn(
                 context,
                 realm_id,
                 record.group_id,
@@ -3796,7 +3792,9 @@ pub(crate) async fn ensure_record_readable(
             )
             .await
             .and_then(|evaluator| evaluator.evaluate(&request)),
-            None => crate::request_policy::enforce_policies(context, realm_id, &request).await,
+            None => {
+                crate::auth::request_policy::enforce_policies(context, realm_id, &request).await
+            }
         };
         return result.map_err(|_| MetadataApiError::NotFound);
     }
@@ -3832,14 +3830,14 @@ pub(crate) async fn can_read_record(
     record: &MetadataRegistryRecord,
 ) -> Result<bool, MetadataApiError> {
     if record.public {
-        let allowed = crate::request_policy::enforce_policies(
+        let allowed = crate::auth::request_policy::enforce_policies(
             context,
             realm_id,
-            &crate::request_policy::policy_request_with(
+            &crate::auth::request_policy::policy_request_with(
                 &record.permission_path,
                 &Permission::READ,
                 auth,
-                crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+                crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
             ),
         )
         .await
@@ -3855,13 +3853,13 @@ pub(crate) async fn can_read_record(
 
     match aruna_core::telemetry::time_stage(
         "permission",
-        crate::request_authorization::authorize(
+        crate::auth::request_authorization::authorize(
             context,
             realm_id,
             &auth,
             &record.permission_path,
             &Permission::READ,
-            crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+            crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
         ),
     )
     .await
@@ -3906,20 +3904,20 @@ async fn ensure_permission(
     }
     // Policies must see the permission the RBAC check enforced; a fixed read
     // would let a write-deny policy pass unevaluated.
-    let request = crate::request_policy::policy_request_with(
+    let request = crate::auth::request_policy::policy_request_with(
         &path,
         &required_permission,
         Some(&auth),
-        crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+        crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
     );
     match txn_id {
-        Some(txn_id) => crate::request_policy::PolicyEvaluator::load_with_txn(
+        Some(txn_id) => crate::auth::request_policy::PolicyEvaluator::load_with_txn(
             context, realm_id, group_id, txn_id,
         )
         .await
         .and_then(|evaluator| evaluator.evaluate(&request))
         .map_err(|_| MetadataApiError::Forbidden)?,
-        None => crate::request_policy::enforce_policies(context, realm_id, &request)
+        None => crate::auth::request_policy::enforce_policies(context, realm_id, &request)
             .await
             .map_err(|_| MetadataApiError::Forbidden)?,
     }

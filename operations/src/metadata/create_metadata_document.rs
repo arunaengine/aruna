@@ -33,6 +33,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::metadata::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile_validation::{
     not_profiled_status, submission_has_profile_tag, validate_submission,
 };
@@ -40,13 +41,12 @@ use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{
     metadata_create_event_and_pending_projection_write_entries, read_registry_by_document_effect,
 };
-use crate::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
 use crate::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
-use crate::queue_backoff::conflict_backoff;
-use crate::sync_placement::sort_node_ids;
+use crate::sync::shard_placement::sort_node_ids;
+use crate::tasks::queue_backoff::conflict_backoff;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentConfig {
@@ -73,8 +73,7 @@ pub enum CreateMetadataDocumentPayload {
 
 /// Result returned after a metadata create is durably accepted.
 ///
-/// Completion means the create event was appended for projection. Graph
-/// materialization and replica convergence may still be pending.
+/// Graph materialization and replica convergence may still be pending.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentResult {
     /// Registry state accepted for the create event.
@@ -85,9 +84,7 @@ pub struct CreateMetadataDocumentResult {
 
 /// Validates metadata create input and appends a durable create event.
 ///
-/// A successful operation does not mean the graph has been fully materialized
-/// or replicated; callers should treat completion as acceptance into the
-/// event/projection pipeline.
+/// Success means pipeline acceptance, not materialization or replication.
 #[derive(Debug, PartialEq)]
 pub struct CreateMetadataDocumentOperation {
     config: CreateMetadataDocumentConfig,
