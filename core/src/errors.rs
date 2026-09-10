@@ -261,6 +261,43 @@ pub enum ConversionError {
 
 impl PartialEq for ConversionError {
     fn eq(&self, other: &Self) -> bool {
-        self.to_string() == other.to_string()
+        match (self, other) {
+            (Self::UlidDecodeError(left), Self::UlidDecodeError(right)) => left == right,
+            (Self::Base64DecodeError(left), Self::Base64DecodeError(right)) => left == right,
+            (Self::InvalidLength(left), Self::InvalidLength(right)) => left == right,
+            (Self::InvalidUserId, Self::InvalidUserId) => true,
+            (Self::InvalidSessionClaim, Self::InvalidSessionClaim) => true,
+            (Self::PostcardError(left), Self::PostcardError(right)) => left == right,
+            (Self::FromUtf8Error(left), Self::FromUtf8Error(right)) => left == right,
+            (Self::FromStrError(left), Self::FromStrError(right)) => left == right,
+            (Self::OsStringError, Self::OsStringError) => true,
+            (Self::UnsafePath(left), Self::UnsafePath(right)) => left == right,
+            (Self::ParseIntError(left), Self::ParseIntError(right)) => left == right,
+            // serde_json, signature and slice errors lack PartialEq, so compare renderings.
+            (Self::SerdeJsonError(left), Self::SerdeJsonError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::PublicKeyError(left), Self::PublicKeyError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::FromSliceError(left), Self::FromSliceError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::PublicKeyConversionError(left), Self::PublicKeyConversionError(right)) => {
+                left == right
+            }
+            (Self::PrivateKeyConversionError(left), Self::PrivateKeyConversionError(right)) => {
+                left == right
+            }
+            (Self::InvalidOperationConversion(left), Self::InvalidOperationConversion(right)) => {
+                left == right
+            }
+            (Self::RoCrateError(left), Self::RoCrateError(right)) => left == right,
+            (Self::PlacementPolicyError(left), Self::PlacementPolicyError(right)) => left == right,
+            (Self::AdvertisementError(left), Self::AdvertisementError(right)) => left == right,
+            (Self::NonCanonicalPolicyRefs, Self::NonCanonicalPolicyRefs) => true,
+            (Self::HeadGenerationExhausted, Self::HeadGenerationExhausted) => true,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
     }
 }
