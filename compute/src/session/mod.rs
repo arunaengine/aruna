@@ -735,9 +735,17 @@ impl SessionRegistry {
             return existing;
         }
         let (session, requests) = build_session(config);
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.insert(session.config.job_id.clone(), session.clone());
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = sessions.get(&session.config.job_id)
+            && !existing.done.is_cancelled()
+        {
+            return existing.clone();
         }
+        sessions.insert(session.config.job_id.clone(), session.clone());
+        drop(sessions);
         tokio::spawn(pump(session.clone(), backend, fence, requests));
         tokio::spawn(idle_watch(session.clone()));
         session
