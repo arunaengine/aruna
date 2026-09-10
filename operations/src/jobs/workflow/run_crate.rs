@@ -17,13 +17,13 @@ const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket"
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_status};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::create_metadata_document::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::driver::drive;
+use crate::metadata::MetadataAuthToken;
+use crate::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_job_document,
 };
-use crate::driver::drive;
-use crate::metadata::MetadataAuthToken;
 use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
 use crate::notifications::watch::emit::emit_metadata_created;
 
@@ -512,7 +512,7 @@ fn rfc3339(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_metadata_document::CreateMetadataDocumentError;
+    use crate::metadata::create_metadata_document::CreateMetadataDocumentError;
     use aruna_core::metadata::{
         MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
         MetadataProfileValidationSeverity,
