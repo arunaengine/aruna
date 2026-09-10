@@ -31,11 +31,11 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
-use crate::group_backends::{RecordReadError, parse_read};
-use crate::group_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
+use crate::groups::backends::{RecordReadError, parse_read};
+use crate::groups::storage_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
 use crate::metadata::MetadataHandle;
-use crate::placement_policy::GateContext;
-use crate::task_persistence::persist_task_effect;
+use crate::placement::policy::GateContext;
+use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -119,12 +119,9 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// The destination this node evaluates governed writes and serves against.
-/// `None` means it has never advertised a subject, which fails every governed
-/// operation closed; an ungoverned one never consults it.
-///
-/// A node whose inventory is being revalidated reports `admitting: false`, so
-/// `write_gate` stops its governed writes while ungoverned ones keep working.
+/// The destination this node evaluates governed writes and serves against. `None`
+/// means no subject was ever advertised, failing governed operations closed; a node
+/// revalidating inventory reports `admitting: false` to stop governed writes.
 pub async fn gate_context(
     context: &DriverContext,
     realm_id: RealmId,
@@ -334,8 +331,8 @@ async fn dispatch_effect_until(
             }
         }
         Effect::StagingSource(staging_source_effect) => {
-            if crate::native_reference::is_native_effect(&staging_source_effect) {
-                Box::pin(crate::native_reference::send_native_effect(
+            if crate::staging::native_source::is_native_effect(&staging_source_effect) {
+                Box::pin(crate::staging::native_source::send_native_effect(
                     staging_source_effect,
                     context,
                 ))
@@ -435,11 +432,11 @@ async fn dispatch_effect_until(
         // Policy fetch resolves its holders in the operation and runs only the
         // holder round-trips here.
         Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
-            Box::pin(crate::placement_policy::fetch_policy(context, *fetch)).await,
+            Box::pin(crate::placement::policy::fetch_policy(context, *fetch)).await,
         )),
         // Publication signing needs this node's key, which only the handle holds.
         Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
-            crate::placement_policy::sign_publication(context, *claim),
+            crate::placement::policy::sign_publication(context, *claim),
         )),
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
@@ -3191,7 +3188,7 @@ mod routing_tests {
             disabled: false,
             cleanup: aruna_core::structs::CleanupStrategy::Retain,
         };
-        for (key_space, key, value) in crate::group_backends::record_writes(&record).unwrap() {
+        for (key_space, key, value) in crate::groups::backends::record_writes(&record).unwrap() {
             write(context, &key_space, key.to_vec(), value.to_vec()).await;
         }
         record.backend_id
