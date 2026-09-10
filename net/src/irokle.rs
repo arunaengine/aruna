@@ -4588,7 +4588,7 @@ impl DocumentSyncService {
             .await
         {
             Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
             other => Err(NetError::Dht(format!(
                 "unexpected storage event while applying document sync write: {other:?}"
             ))),
@@ -4761,9 +4761,7 @@ async fn apply_create_event(
             .await
         {
             Ok(()) => return Ok(()),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -5223,9 +5221,7 @@ async fn apply_metadata_registry_upsert_to_storage(
                 .await
                 {
                     Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
-                    Err(NetError::Dht(message))
-                        if message == StorageError::TransactionConflict.to_string() =>
-                    {
+                    Err(NetError::Storage(StorageError::TransactionConflict)) => {
                         let _ = storage
                             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                             .await;
@@ -5332,9 +5328,7 @@ async fn apply_metadata_registry_upsert_to_storage(
             .await
             {
                 Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
-                Err(NetError::Dht(message))
-                    if message == StorageError::TransactionConflict.to_string() =>
-                {
+                Err(NetError::Storage(StorageError::TransactionConflict)) => {
                     let _ = storage
                         .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                         .await;
@@ -5354,9 +5348,7 @@ async fn apply_metadata_registry_upsert_to_storage(
             .await
         {
             Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -5432,9 +5424,7 @@ async fn apply_metadata_graph_lifecycle_to_storage(
         match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
         {
             Ok(()) => return Ok(true),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -5528,9 +5518,7 @@ async fn apply_metadata_document_lifecycle_to_storage(
         .await
         {
             Ok(()) => return Ok(true),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -5627,9 +5615,7 @@ async fn store_pid_mapping(
             .await
         {
             Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -5724,9 +5710,7 @@ async fn store_policy_document(
             .await
         {
             Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -5879,9 +5863,7 @@ async fn delete_registry_record(
             .await
         {
             Ok(()) => return Ok(()),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -5991,7 +5973,7 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<()> {
         Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionNotFound,
         }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while aborting transaction: {other:?}"
         ))),
@@ -6182,9 +6164,7 @@ async fn apply_user_admin_document_operation_to_storage(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -6744,9 +6724,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 abort_txn(storage, txn_id).await?;
             }
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
@@ -7013,9 +6991,7 @@ async fn apply_config_events(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 abort_txn(storage, txn_id).await?;
             }
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
@@ -7743,7 +7719,7 @@ async fn storage_read_from_transaction(
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while applying document sync read: {other:?}"
         ))),
@@ -7756,7 +7732,7 @@ async fn start_storage_transaction(storage: &StorageHandle) -> Result<TxnId> {
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while starting document sync transaction: {other:?}"
         ))),
@@ -7776,7 +7752,7 @@ async fn apply_watch_subscription_change_to_storage(
         {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             Event::Storage(StorageEvent::Error { error }) => {
-                return Err(NetError::Dht(error.to_string()));
+                return Err(error.into());
             }
             other => {
                 return Err(NetError::Dht(format!(
@@ -7809,7 +7785,7 @@ async fn apply_watch_subscription_change_to_storage(
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Err(NetError::Dht(error.to_string()));
+                return Err(error.into());
             }
             other => {
                 let _ = storage
@@ -7871,9 +7847,7 @@ async fn apply_watch_subscription_change_to_storage(
         match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
         {
             Ok(()) => return Ok(true),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
@@ -7903,7 +7877,7 @@ async fn storage_batch_write_to(
         .await
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while applying document sync batch write: {other:?}"
         ))),
@@ -7931,13 +7905,11 @@ async fn storage_batch_delete_and_write_transactionally(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(NetError::Dht(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                last = Some(NetError::Dht(message));
+                last = Some(NetError::Storage(StorageError::TransactionConflict));
             }
             Err(error) => {
                 let _ = storage
@@ -7966,7 +7938,7 @@ async fn storage_batch_delete_and_write_in_transaction(
         {
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
             Event::Storage(StorageEvent::Error { error }) => {
-                return Err(NetError::Dht(error.to_string()));
+                return Err(error.into());
             }
             other => {
                 return Err(NetError::Dht(format!(
@@ -7985,7 +7957,7 @@ async fn storage_batch_delete_and_write_in_transaction(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => {
-            return Err(NetError::Dht(error.to_string()));
+            return Err(error.into());
         }
         other => {
             return Err(NetError::Dht(format!(
@@ -7999,7 +7971,7 @@ async fn storage_batch_delete_and_write_in_transaction(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while committing document sync apply transaction: {other:?}"
         ))),
@@ -8019,7 +7991,7 @@ async fn storage_batch_delete_to(
         .await
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while applying document sync batch delete: {other:?}"
         ))),
