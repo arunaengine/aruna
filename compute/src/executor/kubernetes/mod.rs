@@ -975,6 +975,9 @@ impl ExecutorBackend for KubernetesBackend {
         spec: &TaskSpec,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
         validate_spec(context, spec, &self.config)?;
         self.apply_network().await?;
         let layout = StageLayout::from_spec(spec)?;
@@ -1021,6 +1024,9 @@ impl ExecutorBackend for KubernetesBackend {
                     self.stage(context, spec, cancel).await?;
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
         }
         self.unsuspend(context, cancel).await
     }
