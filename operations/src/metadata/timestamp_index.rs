@@ -2,20 +2,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::storage_entries::{parse_updated_key, updated_index_key};
 use aruna_core::structs::MetadataRegistryRecord;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::Key;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::repository::{StorageReadError, delete_index_keys};
+use crate::storage_read::parse_storage_scan;
 
 /// Storage rows scanned per index batch while assembling one enumeration page.
 const INDEX_SCAN_BATCH: usize = 256;
@@ -61,7 +60,7 @@ pub async fn enumerate_updated(
             .storage_handle
             .send_effect(iter_effect(start.clone()))
             .await;
-        let (entries, iter_next) = parse_iter(event)?;
+        let (entries, iter_next) = parse_storage_scan(event)?;
         if entries.is_empty() {
             break;
         }
@@ -140,7 +139,7 @@ async fn sweep_bounded(
             .storage_handle
             .send_effect(iter_effect(start.clone()))
             .await;
-        let (entries, iter_next) = parse_iter(event)?;
+        let (entries, iter_next) = parse_storage_scan(event)?;
         if entries.is_empty() {
             break;
         }
@@ -212,28 +211,13 @@ fn iter_effect(start: IterStart) -> Effect {
     })
 }
 
-/// A scanned index batch: its entries and the storage cursor to resume after.
-type IndexBatch = (Vec<(Key, Value)>, Option<Key>);
-
-fn parse_iter(event: Event) -> Result<IndexBatch, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError(
-            "unexpected event".to_string(),
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metadata::repository::create_records_and_outbox_write_entries;
     use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, PlacementRef, RealmId};
     use aruna_storage::storage;
     use tempfile::tempdir;

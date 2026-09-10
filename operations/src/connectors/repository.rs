@@ -1,14 +1,17 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
 };
 use aruna_core::structs::{BlobVersion, BlobVersionState, SourceConnector, SourceConnectorSecret};
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
-use thiserror::Error;
 use ulid::Ulid;
+
+use crate::storage_read::{parse_storage_iter, parse_storage_read};
+
+pub use crate::storage_read::StorageReadError;
 
 pub const LIST_SOURCE_CONNECTOR_PAGE_SIZE: usize = 128;
 pub const CONNECTOR_REFERENCE_SCAN_PAGE_SIZE: usize = 128;
@@ -132,48 +135,13 @@ pub fn parse_connector_secret_read(
 pub fn parse_connector_iter(
     event: Event,
 ) -> Result<(Vec<SourceConnector>, Option<Key>), StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => {
-            let records = values
-                .into_iter()
-                .map(|(_, value)| {
-                    SourceConnector::from_bytes(value.as_ref())
-                        .map_err(StorageReadError::Conversion)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((records, next_start_after))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError(
-            "unexpected event".to_string(),
-        ))),
-    }
+    parse_storage_iter(event, SourceConnector::from_bytes)
 }
 
 pub fn parse_blob_version_iter(
     event: Event,
 ) -> Result<(Vec<BlobVersion>, Option<Key>), StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => {
-            let records = values
-                .into_iter()
-                .map(|(_, value)| {
-                    BlobVersion::from_bytes(value.as_ref()).map_err(StorageReadError::Conversion)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((records, next_start_after))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError(
-            "unexpected event".to_string(),
-        ))),
-    }
+    parse_storage_iter(event, BlobVersion::from_bytes)
 }
 
 pub fn blob_version_references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {
@@ -181,29 +149,6 @@ pub fn blob_version_references_connector(version: &BlobVersion, connector_id: Ul
         &version.state,
         BlobVersionState::Reference { source, .. } if source.connector_id == Some(connector_id)
     )
-}
-
-pub(crate) fn parse_storage_read<T>(
-    event: Event,
-    parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
-) -> Result<Option<T>, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| parse(bytes.as_ref()).map_err(StorageReadError::Conversion))
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError(
-            "unexpected event".to_string(),
-        ))),
-    }
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum StorageReadError {
-    #[error(transparent)]
-    Storage(StorageError),
-    #[error(transparent)]
-    Conversion(ConversionError),
 }
 
 #[cfg(test)]
