@@ -23,7 +23,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::jobs::store::iter_prefix_page;
-use crate::task_persistence::persist_task_effect;
+use crate::tasks::task_persistence::persist_task_effect;
 
 const SWEEP_PAGE_SIZE: usize = 128;
 const SWEEP_IO_TIMEOUT: Duration = Duration::from_secs(5);

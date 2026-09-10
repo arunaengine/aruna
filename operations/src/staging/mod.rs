@@ -2,6 +2,7 @@ pub mod check_source;
 pub mod descriptor;
 pub mod head_source;
 pub mod list_source;
+pub mod native_source;
 pub mod offered_directory;
 pub mod read_source;
 pub mod reference;

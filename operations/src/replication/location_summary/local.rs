@@ -1,15 +1,15 @@
 use super::LocationSummaryError;
-use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::blob::blob_storage::blob_location_read;
 use crate::blob::managed_copy::{
     CopyRequest, read_effect, registration_for, serve_reads, split_reads,
 };
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::realm_peer::ensure_realm_peer;
+use crate::realm::peer_trust::ensure_realm_peer;
 use crate::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
     VersionReplicationMessage,
 };
-use crate::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};

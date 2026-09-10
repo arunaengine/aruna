@@ -1,18 +1,18 @@
-use crate::blob::blob_keyspace_helper::{
+use crate::blob::blob_storage::{
     HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
 };
 use crate::connectors::repository::{source_connector_key, source_connector_secret_key};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
+use crate::node::usage_stats::{
+    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_version_source_binding;
 use crate::staging::head_source::{
     HeadStagingSourceError, HeadStagingSourceInput, HeadStagingSourceOperation,
 };
-use crate::task_persistence::persist_task_effect;
-use crate::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
-};
+use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};

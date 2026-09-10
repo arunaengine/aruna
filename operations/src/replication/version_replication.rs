@@ -1,4 +1,8 @@
-use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::auth::permission_rules::{
+    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
+};
+use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
+use crate::blob::blob_storage::blob_location_read;
 use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
@@ -7,10 +11,9 @@ use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
 use crate::driver::{DriverContext, drive};
-use crate::group_backends::{RecordReadError, parse_read};
-use crate::group_routing::load_group_inputs;
-use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
-use crate::placement_policy::{
+use crate::groups::backends::{RecordReadError, parse_read};
+use crate::groups::storage_routing::load_group_inputs;
+use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
 use crate::replication::error::ReplicationError;
@@ -18,7 +21,6 @@ use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReferenceAdvance, ReplicationMode,
     SyncOrigin, VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
-use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
