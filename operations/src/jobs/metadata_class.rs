@@ -2,16 +2,14 @@ use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
 use aruna_core::structs::BindingError;
 
-use crate::create_metadata_document::CreateMetadataDocumentError;
-use crate::delete_metadata_document::DeleteMetadataDocumentError;
+use crate::metadata::create_metadata_document::CreateMetadataDocumentError;
+use crate::metadata::delete_metadata_document::DeleteMetadataDocumentError;
 use crate::metadata::forward::MetadataWriteError;
-use crate::update_metadata_document::UpdateMetadataDocumentError;
+use crate::metadata::update_metadata_document::UpdateMetadataDocumentError;
 
-/// What a job should do about a failed metadata write.
-///
-/// Shared by every job that writes through the metadata seam so one error means
-/// one thing everywhere: a document the backend will never accept is reported,
-/// never retried, while an overloaded or unreachable node is always retried.
+/// What a job should do about a failed metadata write, shared by every job that
+/// writes through the metadata seam: a document the backend will never accept
+/// is reported, never retried; an overloaded or unreachable node is retried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetadataFailure {
     /// The document itself is rejected; retrying cannot change the outcome.
@@ -37,9 +35,8 @@ pub fn classify_metadata(error: MetadataWriteError) -> MetadataFailure {
 }
 
 /// Authorization, validation and invariant breaches are the document's fault
-/// and stay permanent. Capacity, transport and commit-ambiguity failures are
-/// the node's, and every metadata write is fenced by an idempotency check, so
-/// replaying an ambiguous commit is safe.
+/// and stay permanent. Capacity, transport and commit-ambiguity failures are the
+/// node's, and every write is fenced by an idempotency check, so replay is safe.
 pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
     match error {
         MetadataWriteError::Unauthorized
@@ -71,11 +68,9 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
     }
 }
 
-/// A binding set that is merely incomplete here still converges, so an unknown
-/// handle or strategy waits for replication. Divergent tuples and a bucket
-/// outside the strategy's range are settled values of the immutable binding set:
-/// no retry can resolve them, so burning a backoff schedule on them only hides
-/// the fault.
+/// An incomplete binding set still converges, so an unknown handle or strategy
+/// waits for replication. Divergent tuples and out-of-range buckets are settled
+/// values: retry cannot resolve them and only hides the fault.
 fn binding_is_transient(error: &BindingError) -> bool {
     match error {
         BindingError::Unknown(_) | BindingError::UnknownStrategy(_) => true,

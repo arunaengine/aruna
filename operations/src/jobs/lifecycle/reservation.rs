@@ -1,10 +1,6 @@
-//! Exact local capacity held for one accepted execution.
-//!
-//! Advertised availability is stale telemetry that only ranks a target. This is
-//! the authoritative admission: the reservation, the signed receipt, and the
-//! record that makes both visible commit in one transaction, so two concurrent
-//! offers can never oversubscribe the same backend and no work ever starts
-//! before its receipt is durable.
+//! Exact local capacity held for one accepted execution: the reservation, the
+//! signed receipt, and the record making both visible commit in one transaction,
+//! so concurrent offers cannot oversubscribe and no work starts before its receipt.
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::document::DocumentSyncTarget;

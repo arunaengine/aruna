@@ -1,9 +1,6 @@
-//! Local admission of one submission.
-//!
-//! A holder commits the immutable spec and its claim in one transaction, or it
-//! commits nothing: a matching claim replays the canonical alias and a claim of
-//! another request under the same key is a visible conflict. The candidate
-//! records are signed before this runs, so the transaction only decides.
+//! Local admission of one submission: a holder commits the immutable spec and
+//! its claim in one transaction, or nothing. A matching claim replays the alias
+//! and a conflicting claim is visible; signed candidates make this decide only.
 
 use aruna_core::compute_quota::QuotaDenied;
 use aruna_core::document::DocumentSyncTarget;

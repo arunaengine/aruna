@@ -56,10 +56,8 @@ pub struct RewriteOutcome {
 }
 
 /// Validates a crate and returns it with every identifier IRI-encoded.
-///
-/// Normalization happens on the document itself: an identifier that only a
-/// normalized copy makes valid would be dropped by the JSON-LD parser once the
-/// crate reaches the create path, orphaning everything behind it.
+/// Normalization edits the document itself, because the JSON-LD parser would
+/// otherwise drop an identifier only a normalized copy makes valid.
 pub fn validate_document(jsonld: &str) -> Result<ValidatedDocument, CrateValidationError> {
     let mut value: Value = serde_json::from_str(jsonld)
         .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;

@@ -1,9 +1,6 @@
-//! The monotonic execution chain one executor publishes.
-//!
-//! Only the node fenced by its own attempt control may advance an execution.
-//! Each update chains by digest from the receipt, so a gap cannot silently skip
-//! a state or forge a terminal result, and terminal success may only name an
-//! output record that is already durable.
+//! The monotonic execution chain one executor publishes. Only the fenced node may
+//! advance one; each update chains by digest from the receipt, so a gap cannot skip
+//! a state or forge a result, and success names only a durable output.
 
 use std::time::Duration;
 
@@ -22,12 +19,12 @@ use ulid::Ulid;
 use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
 use super::routing::family_of_alias;
 use super::witness::arm_family;
-use crate::dashboard::notify_dashboard_change;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
 };
 use crate::jobs::store::read_job_record;
+use crate::node::dashboard::notify_dashboard_change;
 
 /// The replicated identity of one physical execution, read back from the
 /// receipt that authorized it. Without it there is no distributed chain to

@@ -1,9 +1,6 @@
 //! Replication of locally published records to the other family holders.
-//!
-//! The append-only store queues every record this node authored and proved
-//! against the replicated chain. Delivery is asynchronous and needs no quorum:
-//! every current holder eventually accepts the immutable record, and an
-//! unreachable family leaves the entry queued instead of losing the record.
+//! Delivery is asynchronous and needs no quorum: every current holder eventually
+//! accepts the immutable record, and an unreachable family leaves it queued.
 
 use std::time::Duration;
 
