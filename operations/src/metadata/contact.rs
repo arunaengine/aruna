@@ -1,8 +1,6 @@
 //! When each realm peer last reached this node.
-//!
-//! A device publishes no realm presence, so the only liveness signal a realm
-//! node holds about one is that the device itself reached it. This records that
-//! observation: node-local, in memory, never replicated and never published.
+//! A device publishes no realm presence, so the only liveness signal is that it
+//! reached this node. Node-local, in memory, never replicated and never published.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};

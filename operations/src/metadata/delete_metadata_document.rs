@@ -25,10 +25,10 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::{
-    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect_with_txn,
-};
 use crate::driver::{DriverContext, drive};
+use crate::metadata::persistent_id::{
+    MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
+};
 use crate::metadata::prune_queue::{
     new_graph_prune_job, schedule_metadata_graph_prune_drain_effect, write_graph_prune_job_effect,
 };
@@ -37,11 +37,11 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, write_audit_effect,
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
-use crate::persistent_id::{
-    MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
-};
 use crate::placement::{registry_placement, resolve_shard_holders};
-use crate::queue_backoff::conflict_backoff;
+use crate::sync::document_sync_outbox::{
+    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect_with_txn,
+};
+use crate::tasks::queue_backoff::conflict_backoff;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -225,11 +225,9 @@ impl DeleteMetadataDocumentOperation {
             self.actor.node_id,
             self.document_lifecycle_placement_ref,
         );
-        // Delete tombstones are published by the document's holder onto its own
-        // per-document sync topics; the graph-lifecycle topic in particular is
-        // first written here, so these writes must be able to mint their genesis
-        // or the whole delete batch stalls. Per-document topics are single-origin,
-        // so this does not risk the shared-topic fork this feature guards against.
+        // Delete tombstones publish on the holder's per-document sync topics and
+        // must mint their genesis (the graph-lifecycle topic is first written
+        // here) or the delete batch stalls. Single-origin, so no fork risk.
         Ok(new_outbox_record_with_id(
             lifecycle_record.event_id(),
             self.actor.node_id,
@@ -438,10 +436,9 @@ impl Operation for DeleteMetadataDocumentOperation {
                                     .fail(DeleteMetadataDocumentError::ConversionError(error));
                             }
                         };
-                        // Every record of the document rides the bucket its
-                        // create stamped, so a tombstone lands on the topic the
-                        // document itself lives on. Peers are that bucket's live
-                        // holders, not the event-time stamp.
+                        // Every record rides the bucket its create stamped, so a
+                        // tombstone lands on the document's own topic. Peers are
+                        // that bucket's live holders, not the event-time stamp.
                         self.holder_peers = resolve_shard_holders(&config, &record.placement);
                         self.document_lifecycle_placement_ref = record.placement;
                         self.graph_lifecycle_placement_ref = record.placement;
