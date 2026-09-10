@@ -11,6 +11,7 @@ pub fn group_admin_user_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId
         .values()
         .filter(|role| role.name == "admin")
         .flat_map(|role| role.assigned_users.iter().copied())
+        .filter(|id| !id.is_nil())
         .collect();
     ids.sort();
     ids.dedup();
@@ -23,6 +24,7 @@ pub fn realm_admin_user_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId
         .values()
         .filter(|role| role.name == "realm_admin")
         .flat_map(|role| role.assigned_users.iter().copied())
+        .filter(|id| !id.is_nil())
         .collect();
     ids.sort();
     ids.dedup();
@@ -256,6 +258,47 @@ mod tests {
         let mut expected = vec![creator, u2, u3];
         expected.sort();
         assert_eq!(group_admin_user_ids(&doc), expected);
+    }
+
+    #[test]
+    fn nil_admins_ignored() {
+        let nil = UserId::nil(REALM);
+        let group = group_doc_with_admins(HashSet::from([nil]));
+        assert!(group_admin_user_ids(&group).is_empty());
+        let joins = route_resource_event(
+            &ResourceEvent::GroupJoinRequested {
+                group_id: group.group_id,
+                request_id: Ulid::from_bytes([4; 16]),
+                actor_user_id: user(1),
+            },
+            RoutingContext {
+                group_auth: Some(&group),
+                realm_auth: None,
+            },
+            1,
+        );
+        assert!(joins.is_empty());
+
+        let mut realm = RealmAuthorizationDocument::new_default_realm_doc(REALM);
+        realm
+            .roles
+            .values_mut()
+            .find(|role| role.name == "realm_admin")
+            .expect("default realm admin role exists")
+            .assigned_users = HashSet::from([nil]);
+        assert!(realm_admin_user_ids(&realm).is_empty());
+        let onboarded = route_resource_event(
+            &ResourceEvent::NodeOnboarded {
+                realm_id: REALM,
+                node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),
+            },
+            RoutingContext {
+                group_auth: None,
+                realm_auth: Some(&realm),
+            },
+            1,
+        );
+        assert!(onboarded.is_empty());
     }
 
     #[test]
