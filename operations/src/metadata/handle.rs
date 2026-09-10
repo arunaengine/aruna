@@ -46,7 +46,6 @@ use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode,
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use spareval::{CancellationToken, QueryEvaluator};
-use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::{Query, SparqlParser};
 use tokio::io::AsyncRead;
 use tokio::time::{sleep, timeout, timeout_at};
@@ -5899,100 +5898,12 @@ fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError> {
             ));
         }
     };
-    if graph_pattern_has_service(pattern) {
+    if super::api::graph_pattern_contains_service(pattern) {
         return Err(MetadataError::InvalidInput(
             "SERVICE is not supported in metadata queries".to_string(),
         ));
     }
     Ok(query)
-}
-
-fn graph_pattern_has_service(pattern: &GraphPattern) -> bool {
-    match pattern {
-        GraphPattern::Service { .. } => true,
-        GraphPattern::Join { left, right }
-        | GraphPattern::Lateral { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
-            graph_pattern_has_service(left) || graph_pattern_has_service(right)
-        }
-        GraphPattern::LeftJoin {
-            left,
-            right,
-            expression,
-        } => {
-            graph_pattern_has_service(left)
-                || graph_pattern_has_service(right)
-                || expression.as_ref().is_some_and(expression_has_service)
-        }
-        GraphPattern::Filter { expr, inner } => {
-            graph_pattern_has_service(inner) || expression_has_service(expr)
-        }
-        GraphPattern::Graph { inner, .. }
-        | GraphPattern::Project { inner, .. }
-        | GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. } => graph_pattern_has_service(inner),
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => graph_pattern_has_service(inner) || expression_has_service(expression),
-        GraphPattern::OrderBy { inner, expression } => {
-            graph_pattern_has_service(inner)
-                || expression.iter().any(|order| match order {
-                    OrderExpression::Asc(expr) | OrderExpression::Desc(expr) => {
-                        expression_has_service(expr)
-                    }
-                })
-        }
-        GraphPattern::Group {
-            inner, aggregates, ..
-        } => {
-            graph_pattern_has_service(inner)
-                || aggregates.iter().any(|(_, aggregate)| match aggregate {
-                    AggregateExpression::CountSolutions { .. } => false,
-                    AggregateExpression::FunctionCall { expr, .. } => expression_has_service(expr),
-                })
-        }
-        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
-    }
-}
-
-fn expression_has_service(expression: &Expression) -> bool {
-    match expression {
-        Expression::Exists(pattern) => graph_pattern_has_service(pattern),
-        Expression::Or(left, right)
-        | Expression::And(left, right)
-        | Expression::Equal(left, right)
-        | Expression::SameTerm(left, right)
-        | Expression::Greater(left, right)
-        | Expression::GreaterOrEqual(left, right)
-        | Expression::Less(left, right)
-        | Expression::LessOrEqual(left, right)
-        | Expression::Add(left, right)
-        | Expression::Subtract(left, right)
-        | Expression::Multiply(left, right)
-        | Expression::Divide(left, right) => {
-            expression_has_service(left) || expression_has_service(right)
-        }
-        Expression::In(left, right) => {
-            expression_has_service(left) || right.iter().any(expression_has_service)
-        }
-        Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) | Expression::Not(inner) => {
-            expression_has_service(inner)
-        }
-        Expression::If(condition, then, otherwise) => {
-            expression_has_service(condition)
-                || expression_has_service(then)
-                || expression_has_service(otherwise)
-        }
-        Expression::Coalesce(expressions) | Expression::FunctionCall(_, expressions) => {
-            expressions.iter().any(expression_has_service)
-        }
-        Expression::NamedNode(_)
-        | Expression::Literal(_)
-        | Expression::Variable(_)
-        | Expression::Bound(_) => false,
-    }
 }
 
 fn evaluate_metadata_query_snapshot(

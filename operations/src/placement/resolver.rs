@@ -360,7 +360,7 @@ fn resolve_strategy<'a>(
             .iter()
             .filter_map(|binding| match &binding.scope {
                 BindingScope::MetadataPathPrefix(prefix) => {
-                    metadata_path_prefix_match_len(&path, prefix).map(|len| (len, binding))
+                    path_prefix_match(&path, prefix).map(|len| (len, binding))
                 }
                 _ => None,
             })
@@ -397,7 +397,9 @@ fn resolve_class_strategy(
     config.class_strategy(class)
 }
 
-fn metadata_path_prefix_match_len(normalized_path: &str, prefix: &str) -> Option<usize> {
+/// Length of the normalized prefix when it equals `normalized_path` or is one of
+/// its `/`-boundary ancestors; `None` otherwise.
+pub(crate) fn path_prefix_match(normalized_path: &str, prefix: &str) -> Option<usize> {
     let prefix = MetadataRegistryRecord::normalize_document_path(prefix);
     if prefix.is_empty()
         || normalized_path == prefix
