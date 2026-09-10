@@ -246,8 +246,4 @@ pub trait ExecutorBackend: Send + Sync {
     /// Idempotently delete the external object. Called only after terminal
     /// evidence is durably recorded by the caller.
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError>;
-
-    async fn sweep_orphans(&self, _grace: Duration) -> Result<(), BackendError> {
-        Ok(())
-    }
 }
