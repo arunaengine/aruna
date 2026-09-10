@@ -11,10 +11,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::placement::{document_class, plan_target_placement};
-use crate::sync_placement::{
+use crate::sync::announce::AnnounceTopicOperation;
+use crate::sync::shard_placement::{
     delete_placement_effect, new_placement, placement_satisfied, schedule_placement_retry_effect,
     write_placement_effect,
 };
@@ -25,10 +25,9 @@ pub struct ReplicateDocumentsConfig {
     pub local_node_id: NodeId,
     pub excluded_peers: Vec<NodeId>,
     pub documents: Vec<DocumentSyncTarget>,
-    /// Whether announces this run may mint a missing topic genesis. True for the
-    /// document's origin; for the shared node-usage topic only the realm-bootstrap
-    /// node passes true, so joining nodes ride the TopicNotReady retry instead of
-    /// forking the genesis.
+    /// Whether announces this run may mint a missing topic genesis. True for a
+    /// document's origin; for shared node-usage only the realm-bootstrap node, so
+    /// joiners ride the TopicNotReady retry instead of forking.
     pub allow_genesis: bool,
 }
 
@@ -643,8 +642,8 @@ mod tests {
         else {
             panic!("expected placement write");
         };
-        let record =
-            crate::sync_placement::decode_placement(value.as_ref()).expect("placement decodes");
+        let record = crate::sync::shard_placement::decode_placement(value.as_ref())
+            .expect("placement decodes");
         assert_eq!(record.authoritative_node_id, local_node_id);
         assert!(record.selected_peers.is_empty());
     }
