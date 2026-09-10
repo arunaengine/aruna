@@ -24,7 +24,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::queue_backoff::queue_retry_after_ms;
+use crate::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
 
 use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
@@ -520,14 +520,6 @@ async fn scan_due_graph_prune_jobs(
             None => return Ok((jobs, false, next_due_at_ms)),
         }
     }
-}
-
-fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
-    Some(current.map_or(due_at_ms, |current| current.min(due_at_ms)))
-}
-
-fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
-    Duration::from_millis(due_at_ms.saturating_sub(now_ms))
 }
 
 async fn metadata_graph_deleted(

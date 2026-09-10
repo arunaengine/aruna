@@ -36,7 +36,7 @@ use super::version_replication::{
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
-use crate::queue_backoff::queue_retry_after_ms;
+use crate::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
 
@@ -2571,10 +2571,6 @@ async fn reschedule_blob_replication_job(
     }
 }
 
-fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
-    Some(current.map_or(due_at_ms, |current| current.min(due_at_ms)))
-}
-
 fn merge_due_job(
     jobs: &mut Vec<(Vec<u8>, BlobReplicationJobRecord)>,
     key: Vec<u8>,
@@ -2593,10 +2589,6 @@ fn merge_due_job(
         jobs.push((key, job));
         jobs.len() >= limit
     }
-}
-
-fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
-    Duration::from_millis(due_at_ms.saturating_sub(now_ms))
 }
 
 #[cfg(test)]
