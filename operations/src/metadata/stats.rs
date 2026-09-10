@@ -11,8 +11,8 @@ use serde_json::Value;
 use super::api::MetadataApiError;
 use super::repository::StorageReadError;
 use crate::driver::DriverContext;
-use crate::get_metadata_document::is_metadata_record_materialized_for_graph_read;
 use crate::jobs::workflow::run_crate::PROCESS_PROFILE;
+use crate::metadata::get_metadata_document::is_metadata_record_materialized_for_graph_read;
 
 const GROUP_COUNT_PAGE_SIZE: usize = 1_000;
 const GROUP_PURPOSE_SUMMARY_FANOUT_LIMIT: usize = 8;
@@ -26,18 +26,9 @@ pub struct GroupDocumentPurposeCounts {
     pub process_run_count: u64,
 }
 
-/// Realm-wide number of live metadata documents, not filtered by what any
-/// caller may read.
-///
-/// The count comes from the cached registry snapshot plus one bounded lifecycle
-/// batch, and excludes lifecycle-deleted documents. Returns `None` when the node
-/// runs without a metadata subsystem, so an absent count stays distinguishable
-/// from zero documents.
-///
-/// An exact per-caller count would need per-document glob evaluation, because
-/// read visibility is glob-granular: a `DENY` can subtract a single document
-/// from a group-wide grant. The realm total discloses only document volume,
-/// which callers already reach realm auth to see.
+/// Realm-wide count of live metadata documents, unfiltered by readability and
+/// excluding lifecycle-deleted ones. `None` without a metadata subsystem. Only
+/// document volume is disclosed, never a per-caller glob evaluation.
 pub async fn count_realm_documents(
     context: &DriverContext,
     realm_id: RealmId,
@@ -59,11 +50,9 @@ pub async fn count_realm_documents(
     ))
 }
 
-/// Number of stored groups belonging to one realm.
-///
-/// The group keyspace is read in bounded pages under one read transaction, so
-/// the returned count is a consistent snapshot rather than the 10,000-row
-/// default page exposed by `ListGroupOperation`.
+/// Number of stored groups belonging to one realm. Bounded pages under one
+/// read transaction yield a consistent snapshot, not the default page
+/// `ListGroupOperation` exposes.
 pub async fn count_realm_groups(
     context: &DriverContext,
     realm_id: RealmId,
@@ -147,13 +136,8 @@ pub async fn count_realm_groups(
 }
 
 /// Exact lifecycle-live metadata-document counts for one group, classified
-/// solely from each document's root RO-Crate entity.
-///
-/// The cached group registry plus the shared lifecycle filter select at most
-/// the metadata registry candidate limit. For each live document, the graph
-/// store's root-summary export is read with at most eight reads in flight; full
-/// crates and storage paths are never read for classification. Returns `None`
-/// when this node has no metadata subsystem.
+/// solely from each document's root RO-Crate entity via bounded root-summary
+/// reads; full paths never load. `None` without a metadata subsystem.
 pub async fn count_group_documents_by_purpose(
     context: &DriverContext,
     realm_id: RealmId,

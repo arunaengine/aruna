@@ -5,15 +5,15 @@ use aruna_core::structs::{AuthContext, Permission, RealmId, blob_object_permissi
 use aruna_core::types::{GroupId, NodeId};
 use serde_json::Value as JsonValue;
 
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::blob::blob_holders::GetBlobHoldersOperation;
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::blob_holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive, drive_until};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::export::{EntityIdentity, entity_identity};
+use crate::realm::get_realm_config::GetRealmConfigOperation;
 use crate::replication::location_summary::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 
 const FILE_TYPES: [&str; 4] = [
     "File",
@@ -57,9 +57,8 @@ struct ResolvedPaths {
 }
 
 /// Lists the draft's Aruna data entities that anonymous READ would not reach,
-/// so a dataset about to be published as public can warn about them. Resolution
-/// only follows paths the caller may read; nothing about a foreign object other
-/// than "not publicly readable" is disclosed.
+/// so a public publish can warn about them. Only paths the caller may read are
+/// resolved; nothing beyond "not publicly readable" about a foreign object leaks.
 pub async fn restricted_files(
     context: &DriverContext,
     realm_id: RealmId,
