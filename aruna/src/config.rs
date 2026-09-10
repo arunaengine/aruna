@@ -242,8 +242,6 @@ pub enum SetupError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     StorageLibError(#[from] StorageLibError),
-    #[error("persisted node state is incompatible with this binary")]
-    UnsupportedNodeIdentity,
     #[error("persisted node state does not match derived realm id")]
     PersistedNodeStateMismatch,
     #[error(transparent)]
