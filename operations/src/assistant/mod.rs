@@ -9,6 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 mod heads;
+pub mod provider;
 #[cfg(test)]
 mod tests;
 mod turns;

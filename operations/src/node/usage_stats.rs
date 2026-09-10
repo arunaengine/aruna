@@ -33,7 +33,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
-use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
@@ -170,11 +170,9 @@ impl UsageCounterUpdate {
         }
     }
 
-    /// Writes, in the same transaction as the counter update, the dirty markers
-    /// the debounced publisher scans to rebuild and distribute node snapshots.
-    /// The marker value is a fresh generation id: the publisher only clears a
-    /// marker whose stored generation still matches the one it observed, so a
-    /// write that re-dirties a marker mid-publish keeps its retry signal.
+    /// Writes, in the counter update's transaction, the dirty markers the publisher
+    /// scans. The value is a fresh generation id: the publisher clears a marker only
+    /// if its stored generation still matches, so a mid-publish re-dirty keeps its retry.
     fn dirty_marker_writes(&self) -> Vec<(String, Key, Value)> {
         let generation = ByteView::from(ulid::Ulid::generate().to_bytes().to_vec());
         let mut writes = vec![(
@@ -279,18 +277,9 @@ pub enum QuotaGateError {
     UnexpectedEvent(Event),
 }
 
-/// Embeddable read side of the hard per-group quota gate. Sums the group's
-/// realm-wide `logical_bytes` — the live local group counter plus every remote
-/// node's replicated group snapshot — inside the caller's write transaction right
-/// before it commits the counters, so a concurrent same-group write conflicts on
-/// the group counter key and cannot slip a second write past the ceiling.
-///
-/// `ceiling` already folds in the grace factor; that headroom is deliberately the
-/// budget for remote snapshot staleness, since remote group totals lag the
-/// authoritative counters that produced them.
-///
-/// The write-path reservation (#352) uses this transaction conflict instead of a
-/// separate ledger, because concurrent writes cannot over-commit the ceiling.
+/// Embeddable read side of the hard per-group quota gate: sums the group's
+/// realm-wide `logical_bytes` inside the caller's write transaction, so a concurrent
+/// same-group write conflicts on the group key. `ceiling` already folds in grace.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
@@ -636,11 +625,9 @@ pub enum RebuildUsageStatsError {
     RebuildFailed,
 }
 
-/// Recomputes all usage counters from the underlying keyspaces and writes
-/// them in one transaction. Runs at startup when counters are missing and
-/// doubles as a repair tool; it is not safe to run concurrently with writes.
-/// An object counts as live when its current head points at a non-delete
-/// version, matching the pointer transitions the write operations maintain.
+/// Recomputes all usage counters in one transaction; runs at startup when counters
+/// are missing and as a repair tool, never concurrently with writes. An object is
+/// live when its head points at a non-delete version.
 #[derive(Debug, PartialEq)]
 pub struct RebuildUsageStatsOperation {
     state: RebuildUsageStatsState,
@@ -1068,8 +1055,7 @@ impl Operation for RebuildUsageStatsOperation {
 }
 
 /// Debounce window for the coalesced node-usage snapshot publisher. `ShortenTimer`
-/// makes the timer fire this long after the *first* dirty write of a burst and
-/// keeps every later write inside the same window, so bursts collapse into one
+/// fires this long after a burst's first dirty write, so bursts collapse into one
 /// publish run with bounded latency.
 pub const USAGE_SNAPSHOT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
@@ -1239,16 +1225,9 @@ async fn sum_remote_snapshots(
     Ok(total)
 }
 
-/// Rebuilds this node's snapshot documents from live local counters and
-/// distributes them over the sync layer. In dirty mode only groups with a
-/// pending marker are refreshed; in full mode every group plus the global total
-/// is republished (used at startup and after a counter rebuild), and groups this
-/// node published before but no longer counts are re-published as zero snapshots.
-///
-/// The dirty markers are only cleared after replication has durably accepted the
-/// snapshots, and only for markers whose generation was not bumped by a
-/// concurrent write, so a failed publish or a racing counter update always
-/// leaves a retry signal behind.
+/// Rebuilds this node's snapshot documents from live counters and distributes them
+/// over the sync layer: dirty mode refreshes marked groups, full mode all groups plus
+/// the global. Markers clear only after durable replication, never if re-dirtied.
 pub async fn publish_usage_snapshots(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -1301,10 +1280,9 @@ async fn publish_usage_snapshots_retaining_markers(
                 groups.insert(GroupId::from_bytes(bytes));
             }
         }
-        // Groups this node has a published snapshot for but no live counter (e.g.
-        // their counter key was pruned by a rebuild) are re-published: reading a
-        // missing counter yields zero, so the stale snapshot is overwritten with a
-        // zero total and peers stop summing it.
+        // Re-publish groups with a snapshot but no live counter (e.g. pruned by a
+        // rebuild): a missing counter reads as zero, overwriting the stale snapshot
+        // so peers stop summing it.
         for (key, _) in iter_all(
             storage,
             USAGE_NODE_STATS_KEYSPACE,
@@ -1509,11 +1487,9 @@ async fn write_snapshot_documents(
     }
 }
 
-/// Deletes each observed dirty marker, but only if its stored generation still
-/// matches the one seen when the publish run started. Re-reading the markers
-/// inside the write transaction makes fjall abort the commit if a concurrent
-/// counter update re-dirtied any of them after they were observed, so a racing
-/// write never loses its retry signal.
+/// Deletes each observed dirty marker only if its stored generation still matches
+/// the one seen at publish start. Re-reading inside the transaction makes a racing
+/// counter update abort the commit, so its retry signal is never lost.
 async fn clear_consumed_markers(
     storage: &StorageHandle,
     observed: Vec<(Key, Value)>,
@@ -1701,10 +1677,9 @@ pub async fn recompute_realm_usage_summary(
     }
 }
 
-/// Refreshes the persisted realm usage summed cache for exactly the `NodeUsage`
-/// scopes touched by a document-sync reconcile. Shared by every reconcile
-/// handler (inbound apply, durable outbox drain, and the `SyncDocument` timer) so
-/// remote snapshots that land on any of those paths update the realm aggregate.
+/// Refreshes the persisted realm usage sum cache for exactly the `NodeUsage` scopes
+/// touched by a document-sync reconcile. Shared by all reconcile handlers so remote
+/// snapshots update the realm aggregate on every path.
 pub async fn refresh_realm_usage_summary_for_targets(
     ctx: &DriverContext,
     local_node_id: NodeId,
@@ -2264,10 +2239,9 @@ mod tests {
                 .await;
         }
 
-        // alpha/live.txt: one materialized version, live.
-        // alpha/gone.txt: materialized version superseded by a delete marker.
-        // alpha/ref.txt: one reference version, live.
-        // beta/shared.bin: two materialized versions of the shared blob.
+        // alpha/live.txt live; alpha/gone.txt superseded by a delete marker;
+        // alpha/ref.txt reference version live; beta/shared.bin has two materialized
+        // versions.
         let write_version = async |bucket: &str, key: &str, version: BlobVersion| {
             let version_id = Ulid::generate();
             ctx.storage_handle
