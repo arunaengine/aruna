@@ -133,16 +133,6 @@ impl DiscoveryMethod {
             .collect()
     }
 
-    pub fn dns_origins(&self) -> Vec<String> {
-        let mut origins = Vec::new();
-        for method in self.leaf_methods() {
-            if let Self::CustomDns(method_origins) = method {
-                origins.extend(method_origins.clone());
-            }
-        }
-        origins
-    }
-
     fn leaf_methods(&self) -> Vec<&DiscoveryMethod> {
         let mut methods = Vec::new();
         self.append_leaf_methods(&mut methods);
@@ -649,10 +639,7 @@ impl NetHandle {
         document_sync.set_peer_kinds(inbound_admission.peer_kinds());
         let document_sync = Arc::new(document_sync);
 
-        let streams = Arc::new(StreamsService::new(
-            connection_pool.clone(),
-            shutdown.child_token(),
-        ));
+        let streams = Arc::new(StreamsService::new(connection_pool.clone()));
 
         let (effect_tx, mut effect_rx) = mpsc::channel::<EffectHandle>(256);
 
@@ -1143,29 +1130,6 @@ impl NetHandle {
                 node_id = %endpoint_addr.id,
                 error = %err,
                 "Failed to add endpoint address peer to DHT"
-            );
-        }
-    }
-
-    pub async fn add_peer_node(&self, node_id: NodeId) {
-        if node_id == self.inner.node_id {
-            return;
-        }
-
-        self.inner.inbound_admission.add_bootstrap(node_id);
-        send_peer_connectivity_event(
-            &self.inner.peer_connectivity_tx,
-            PeerConnectivityEvent::ManagePeer {
-                node_id,
-                source: "peer_node".to_string(),
-                immediate: true,
-            },
-        );
-        if let Err(err) = self.inner.dht.add_peer(node_id) {
-            warn!(
-                node_id = %node_id,
-                error = %err,
-                "Failed to add peer node to DHT"
             );
         }
     }
