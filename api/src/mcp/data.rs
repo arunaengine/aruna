@@ -23,6 +23,7 @@ use aruna_operations::s3::list_objects_v2::{
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
+use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -975,6 +976,9 @@ pub(crate) async fn write_text(
             ),
         )));
     }
+    guard_bucket_write(server.state.get_ctx().as_ref(), &input.bucket)
+        .await
+        .map_err(map_offered_error)?;
     let bucket_info = server.bucket_info(&input.bucket).await?;
     authorize_tool(
         &server.state,
@@ -1038,7 +1042,8 @@ pub(crate) async fn write_text(
     .with_metadata(HashMap::from([(
         OBJECT_CONTENT_TYPE_KEY.to_string(),
         content_type.clone(),
-    )]));
+    )]))
+    .with_restrictions(auth.path_restrictions.clone());
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -1081,6 +1086,16 @@ fn object_error(error: crate::error::ServerError, action: &str) -> CallToolResul
             ),
         ),
         error => server_error(error),
+    }
+}
+
+fn map_offered_error(error: OfferedDirectoryError) -> CallToolResult {
+    match error {
+        OfferedDirectoryError::ReadOnly(bucket) => explained(
+            crate::error::ServerError::Forbidden,
+            format!("bucket {bucket} is an offered directory and is read-only"),
+        ),
+        error => internal_error(error),
     }
 }
 
