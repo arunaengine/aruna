@@ -1,9 +1,6 @@
-//! The pure admission decision of the append-only store.
-//!
-//! Nothing here performs I/O: it takes the records this node already stored,
-//! the pending records it retained, and one candidate, and returns exactly what
-//! must become visible. Admitting a record can only ever admit more pending
-//! records, never rewrite or remove a stored one.
+//! The pure admission decision of the append-only store. Nothing here performs
+//! I/O: stored records, retained pending records, and one candidate decide what
+//! becomes visible. Admission can only admit more pending records, never rewrite.
 
 use std::collections::BTreeMap;
 

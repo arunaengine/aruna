@@ -1,15 +1,6 @@
-//! Ingress of one external submission.
-//!
-//! The node that takes the request normalizes it, authorizes it, derives its
-//! replicated identity and family placement, and then either commits it here
-//! because its own unconflicted view selects it as a holder, or forwards the
-//! complete request one hop to a holder it observes. A non-holder never accepts
-//! a job it could not deliver: it writes nothing and returns an availability
-//! error instead.
-//!
-//! A user device is never an authority: it resolves nothing node-local and
-//! always forwards, and the admitting holder pins the outputs to itself and
-//! resolves the inputs the device only referenced.
+//! Ingress of one external submission: the receiver commits it if its unconflicted
+//! view selects it as holder, else forwards it one hop; a non-holder writes
+//! nothing. A device always forwards; the admitting holder pins outputs.
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::errors::StorageError;
@@ -36,6 +27,8 @@ use super::ids::{
 };
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};
 use crate::jobs::records::rows::ProjectionCache;
@@ -47,8 +40,6 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::forward::{is_sync_eligible, peer_acts_for};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
@@ -171,9 +162,8 @@ fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
 }
 
 /// A device forwards without resolving anything: it holds none of the objects it
-/// names, so only the reference shape is its to check and the holder resolves
-/// the rest. Holders follow the submission id alone, so the device selects the
-/// same holder set as the node that recomputes the digest after normalizing.
+/// names, so only the reference shape is checked and the holder resolves the
+/// rest; holder selection follows the submission id alone.
 async fn forward_device(
     context: &DriverContext,
     request: SubmissionRequest,
@@ -384,9 +374,8 @@ fn family_view(
 }
 
 /// Mints the alias, signs the immutable spec and its claim, and commits them.
-/// The alias it answers with is the canonical one at this accept: a fresh
-/// admission holds the only claim, and a replay settles on the claim the family
-/// already reduces as canonical.
+/// The answered alias is canonical at this accept: a fresh admission holds the
+/// only claim, and a replay settles on the already-reduced claim.
 async fn admit_here(
     context: &DriverContext,
     request: &SubmissionRequest,
@@ -478,9 +467,8 @@ async fn admit_here(
 }
 
 /// The state this holder currently reduces for `family`. The cached projection
-/// answers when it is current; otherwise the family is reduced once from its own
-/// records. A family this node cannot fully reduce, including one too large to
-/// project at once, is reported as indeterminate rather than as queued work.
+/// answers when current; otherwise the family is reduced once from its records.
+/// A family this node cannot fully reduce is reported as indeterminate.
 async fn observed_state(context: &DriverContext, family: JobFamilyId) -> LogicalJobState {
     let cached = match cached_projection(context, &family).await {
         Ok(cached) => cached,
@@ -540,9 +528,8 @@ async fn cached_projection(
 const ADMISSION_ATTEMPTS: usize = 3;
 
 /// Decides the standing quota and commits the admission. A replay is settled
-/// from records this node already holds, so it never reads the quota view, and
-/// a transaction a concurrent submission of the same group won is retried
-/// instead of surfacing as an availability failure.
+/// from already-held records and never reads the quota view; a lost transaction
+/// against a concurrent submission of the same group is retried.
 async fn admit_with_quota(
     context: &DriverContext,
     config: &RealmConfigDocument,

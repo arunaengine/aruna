@@ -1,12 +1,6 @@
-//! Exact admission at the execution target.
-//!
-//! The target owns this decision alone. It re-fetches and verifies the stored
-//! spec, checks that the offering scheduler is a holder in its own current
-//! view, re-authorizes the stored submitter, re-evaluates placement against its
-//! own execution subject, reserves exact local capacity, and only then signs and
-//! persists the receipt that authorizes work. Replaying one launch returns the
-//! same receipt instead of admitting a second execution, and a launch for a
-//! family this node already runs, or already ran successfully, is declined.
+//! Exact admission at the execution target. The target alone verifies the stored
+//! spec, re-authorizes the submitter, re-evaluates placement, reserves capacity,
+//! then signs the authorizing receipt. Replays return it; a ran family is declined.
 
 use std::sync::Arc;
 
@@ -41,6 +35,8 @@ use super::cancel::cancel_local_run;
 use super::ids::{self, workspace_of};
 use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive, gate_context, now_ms};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
@@ -50,11 +46,9 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
-use crate::node_info::{read_node_info_document, read_operator_drain};
+use crate::node::node_info::{read_node_info_document, read_operator_drain};
+use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::placement::resolve_shard_holders;
-use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
-use crate::request_authorization::authorize;
-use crate::request_policy::PolicyRequestExtras;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -531,10 +525,8 @@ pub(crate) fn existing_receipt(
 }
 
 /// An execution of the same family this node already accepted. A second launch
-/// is refused while that execution may still finish, after it succeeded, and
-/// after it failed permanently, because a permanent failure suppresses retry.
-/// So one family never runs twice here. The refusal is retryable: another
-/// target may still take the launch.
+/// is refused while that execution may finish, after success, and after permanent
+/// failure, so one family never runs twice here. The refusal is retryable.
 pub(crate) fn already_running(
     family: JobFamilyId,
     records: &[JobRecordEnvelope],
@@ -670,10 +662,9 @@ async fn authorize_submitter(
     .map_err(|_| LaunchDecline::Unauthorized)
 }
 
-/// Whether one pinned input still describes the captured input it names. Any
-/// node may be the pinned source, because a registered copy of the same bytes
-/// serves the read; the captured version, hash and size still bind the content,
-/// and a source naming this target itself would not be a remote read at all.
+/// Whether one pinned input still describes the captured input it names. Any node
+/// may be the pinned source, because a registered copy serves the read; version,
+/// hash, and size bind the content, and the local target is not a remote read.
 pub(crate) fn pin_matches(
     captured: &CapturedInput,
     pin: &PlannedInput,

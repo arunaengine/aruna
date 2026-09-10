@@ -69,10 +69,9 @@ pub struct JobDrainResult {
     pub deferred_saturated: bool,
 }
 
-/// Claim due jobs within each class's `budget` and re-queue expired leases; claimed
-/// records are returned. An expired external attempt is routed to `reconciler`
-/// instead of requeued. Only records owned by `owner_node_id` are claimed: a JobId
-/// executes on its immutable owner and nowhere else.
+/// Claim due jobs within each class's `budget` and re-queue expired leases. An
+/// expired external attempt routes to `reconciler`. Only records owned by
+/// `owner_node_id` are claimed: a JobId executes on its immutable owner.
 pub async fn process_job_queue_batch(
     storage: &StorageHandle,
     owner_node_id: NodeId,

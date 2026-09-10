@@ -58,15 +58,15 @@ use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, valid
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
 use super::store::{list_job_entries, put_job_entry, put_state, read_state};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::create_metadata_document::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
+use crate::metadata::MetadataAuthToken;
+use crate::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
-use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
-use crate::get_realm_config::GetRealmConfigOperation;
-use crate::metadata::MetadataAuthToken;
 use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
 use crate::notifications::watch::emit::emit_metadata_created;
+use crate::realm::get_realm_config::GetRealmConfigOperation;
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -747,10 +747,8 @@ async fn validate_source(
 }
 
 /// Rejects a crate that would fail validation before anything is written.
-///
-/// Every rewritten identifier is already known here. The placeholder content
-/// hash is a literal value rather than a reference, so it cannot change the
-/// graph the validator walks.
+/// Every rewritten identifier is known here, and the literal placeholder content
+/// hash cannot change the graph the validator walks.
 fn preflight_crate(
     spec: &ImportRoCrateSpec,
     node_id: aruna_core::NodeId,
@@ -1108,9 +1106,8 @@ fn rollback_required(checkpoint: &ImportCheckpoint) -> bool {
 }
 
 /// Deletes exactly the object versions this import wrote.
-///
-/// Every version id is minted by this job, so a version another writer owns can
-/// never be removed, even where the import landed on an existing key.
+/// Every version id is minted by this job, so versions another writer owns are
+/// never removed, even where the import landed on an existing key.
 async fn rollback_writes(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
@@ -1984,7 +1981,7 @@ mod tests {
             completeness: aruna_core::metadata::MetadataProfileValidationCompleteness::Incomplete,
         };
         let failure = classify_metadata(MetadataWriteError::Create(
-            crate::create_metadata_document::CreateMetadataDocumentError::MetadataError(
+            crate::metadata::create_metadata_document::CreateMetadataDocumentError::MetadataError(
                 aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
             ),
         ));

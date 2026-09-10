@@ -1,8 +1,6 @@
 //! Request normalization and the identities derived from it.
-//!
 //! The same bytes must produce the same identity on every node, so nothing
-//! assigned locally enters a digest: no job id, no origin, no timestamp, no
-//! resolved server default and no current topology.
+//! locally assigned enters a digest: no job id, origin, timestamp or topology.
 
 use aruna_core::compute::SessionMount;
 use aruna_core::compute::runtimes::{

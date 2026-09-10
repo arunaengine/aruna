@@ -1,9 +1,6 @@
-//! Paginated audit of the immutable log.
-//!
-//! Pages are ordered by the stable record key, never by arrival, so a cursor is
-//! a position in the log rather than a snapshot of one responder. Every claim,
-//! budget, launch, receipt, update, output, and cancellation of the scope is
-//! returned, together with the conflict rows that were refused under a key.
+//! Paginated audit of the immutable log. Pages are ordered by the stable record
+//! key, never by arrival, so a cursor is a position in the log rather than a
+//! responder snapshot, and refused conflict rows are returned too.
 
 use aruna_core::effects::{Effect, FetchCursor, IterStart, PageLimit, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
