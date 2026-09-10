@@ -2695,12 +2695,9 @@ mod tests {
         deliver_remote(&a.net, b.net.node_id(), batch.clone())
             .await
             .expect("redelivery succeeds");
-        assert!(
-            timeout(Duration::from_millis(200), wakes.recv())
-                .await
-                .is_err(),
-            "redelivery must not wake"
-        );
+        // The holder wakes before writing the ack, so the awaited reply orders
+        // this emptiness check after any wake the redelivery could have sent.
+        assert!(wakes.is_empty(), "redelivery must not wake");
     }
 
     #[tokio::test]
@@ -2746,11 +2743,8 @@ mod tests {
                 .expect("mark read again"),
             0
         );
-        assert!(
-            timeout(Duration::from_millis(200), wakes.recv())
-                .await
-                .is_err(),
-            "no-op mark-read must not wake"
-        );
+        // The holder wakes before writing the ack, so the awaited reply orders
+        // this emptiness check after any wake the no-op mark-read could send.
+        assert!(wakes.is_empty(), "no-op mark-read must not wake");
     }
 }
