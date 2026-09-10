@@ -30,7 +30,6 @@ use aruna_operations::recover_initial_admin::{
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
-use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use async_trait::async_trait;
 use jsonwebtoken::dangerous::insecure_decode;
@@ -471,8 +470,7 @@ impl ArunaBearerTokenValidationState for DoctorTokenValidationState {
 }
 
 pub async fn view_token(token: String) -> Result<String, CliError> {
-    let (config, _) = load().await.unwrap();
-    let storage_handle = storage::FjallStorage::open(&config.storage_path).unwrap();
+    let (_, storage_handle) = load().await.map_err(Box::new)?;
 
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
