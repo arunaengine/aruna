@@ -234,35 +234,19 @@ pub async fn authorize_forwarded_watch(
     event_mask: WatchEventMask,
     authorization: &WatchAuthorizationBinding,
 ) -> Result<WatchAuthorization, String> {
-    if !authorization.is_valid()
-        || (!authorization.watch_path_prefix.is_empty()
-            && authorization.watch_path_prefix != path_prefix)
+    if !authorization.watch_path_prefix.is_empty() && authorization.watch_path_prefix != path_prefix
     {
         return Ok(WatchAuthorization::Denied(
             WatchAuthorizationDenial::InvalidState,
         ));
     }
-    let Some(permission_path) = watch_permission_path(realm_id, path_prefix, event_mask) else {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    };
-    if owner.is_nil() || owner.realm_id != realm_id {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidOwner,
-        ));
-    }
-    let auth_context = AuthContext {
-        user_id: owner,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    evaluate_permission_path(
+    evaluate_watch_scope(
         context,
         realm_id,
-        auth_context,
-        permission_path,
+        owner,
+        path_prefix,
+        event_mask,
+        authorization,
         WATCH_CREATE_OPERATION,
     )
     .await
