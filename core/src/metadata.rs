@@ -115,22 +115,11 @@ impl<'de> Deserialize<'de> for MetadataBearerToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("metadata bearer token length {length} exceeds maximum {MAX_METADATA_BEARER_TOKEN_LEN}")]
 pub struct MetadataAuthTokenError {
     length: usize,
 }
-
-impl std::fmt::Display for MetadataAuthTokenError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "metadata bearer token length {} exceeds maximum {}",
-            self.length, MAX_METADATA_BEARER_TOKEN_LEN
-        )
-    }
-}
-
-impl std::error::Error for MetadataAuthTokenError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
