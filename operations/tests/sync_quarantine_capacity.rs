@@ -23,7 +23,7 @@ use aruna_core::structs::{
 use aruna_core::types::Value;
 use aruna_net::document_sync::DocumentSyncService;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::sync_quarantine::{
+use aruna_operations::sync::sync_quarantine::{
     QuarantinePageRequest, acknowledge_quarantine_row, list_quarantine_records,
     prune_quarantine_records, read_quarantine_record, read_quarantine_usage,
 };
