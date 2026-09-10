@@ -248,36 +248,88 @@ struct TestContext {
     storage_handle: aruna_storage::storage::StorageHandle,
 }
 
-async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
+enum TestContextSetup<'a> {
+    Single { max_bucket_size: u64 },
+    TwoFilesystem,
+    S3Mixed(&'a S3Env),
+}
+
+async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let blob_root = format!("{temp_root}/blobstore");
-    std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
         .unwrap();
-    let blob_handle = BlobHandler::new(
-        BackendConfig {
-            backend_type: Backend::FileSystem,
-            root: blob_root,
-            service_config: HashMap::new(),
-            bucket_prefix: Some("aruna-test-".to_string()),
-            max_bucket_size: Some(max_bucket_size),
-            multipart_bucket: Some("uploaded-parts".to_string()),
-            timeouts: Default::default(),
-        },
-        storage_handle.clone(),
-        net_handle,
-    )
-    .await
-    .unwrap();
+
+    let (backends, policy) = match &setup {
+        TestContextSetup::Single { max_bucket_size } => {
+            let blob_root = format!("{temp_root}/blobstore");
+            std::fs::create_dir_all(&blob_root).unwrap();
+            let mut backends = std::collections::BTreeMap::new();
+            backends.insert(
+                BackendRef::DEFAULT_NODE_NAME.to_string(),
+                Arc::new(NodeBackend::new(
+                    BackendConfig {
+                        backend_type: Backend::FileSystem,
+                        root: blob_root,
+                        service_config: HashMap::new(),
+                        bucket_prefix: Some("aruna-test-".to_string()),
+                        max_bucket_size: Some(*max_bucket_size),
+                        multipart_bucket: Some("uploaded-parts".to_string()),
+                        timeouts: Default::default(),
+                    },
+                    None,
+                )),
+            );
+            (backends, EgressPolicy::strict())
+        }
+        TestContextSetup::TwoFilesystem | TestContextSetup::S3Mixed(_) => {
+            let mut backends = std::collections::BTreeMap::new();
+            backends.insert(
+                "default".to_string(),
+                Arc::new(NodeBackend::new(
+                    filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+                    None,
+                )),
+            );
+            let cold = match &setup {
+                TestContextSetup::S3Mixed(env) => NodeBackend::new(
+                    BackendConfig {
+                        backend_type: Backend::S3,
+                        root: String::new(),
+                        service_config: s3_config(env, None),
+                        bucket_prefix: Some(unique_name("aruna-cold-")),
+                        max_bucket_size: None,
+                        multipart_bucket: Some(unique_name("aruna-parts-")),
+                        timeouts: Default::default(),
+                    },
+                    Some("cold".to_string()),
+                ),
+                _ => NodeBackend::new(
+                    filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
+                    Some("cold".to_string()),
+                ),
+            };
+            backends.insert("cold".to_string(), Arc::new(cold));
+            (backends, EgressPolicy::loopback())
+        }
+    };
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let blob_handle =
+        BlobHandler::with_registry(registry, storage_handle.clone(), net_handle, policy)
+            .await
+            .unwrap();
 
     TestContext {
         _temp_dir: temp_dir,
         blob_handle,
         storage_handle,
     }
+}
+
+async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
+    setup_context(TestContextSetup::Single { max_bucket_size }).await
 }
 
 fn stream_from_bytes(
@@ -367,42 +419,7 @@ fn filesystem_backend(root: &str, prefix: &str, parts: &str) -> BackendConfig {
 // Two filesystem backends with distinct roots are the multi-backend fixture:
 // deterministic, hermetic, and enough to prove registry dispatch.
 async fn setup_two_backends() -> TestContext {
-    let temp_dir = tempdir().unwrap();
-    let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
-    let mut backends = std::collections::BTreeMap::new();
-    backends.insert(
-        "default".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
-            None,
-        )),
-    );
-    backends.insert(
-        "cold".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
-            Some("cold".to_string()),
-        )),
-    );
-    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
-    let blob_handle = BlobHandler::with_registry(
-        registry,
-        storage_handle.clone(),
-        net_handle,
-        EgressPolicy::loopback(),
-    )
-    .await
-    .unwrap();
-
-    TestContext {
-        _temp_dir: temp_dir,
-        blob_handle,
-        storage_handle,
-    }
+    setup_context(TestContextSetup::TwoFilesystem).await
 }
 
 fn cold_backend() -> ResolvedBackend {
@@ -2206,8 +2223,8 @@ async fn reservation_forces_rollover() {
     }
 }
 
-/// Coverage against a real S3 endpoint. Every test returns early when the
-/// endpoint variables are unset, so the default lane stays filesystem-only.
+/// Coverage against a real S3 endpoint. Ignored by default; run with
+/// `--ignored` and the `ARUNA_TEST_S3_*` variables set.
 struct S3Env {
     endpoint: String,
     access_key: String,
@@ -2215,13 +2232,16 @@ struct S3Env {
     region: String,
 }
 
-fn s3_env() -> Option<S3Env> {
-    Some(S3Env {
-        endpoint: std::env::var("ARUNA_TEST_S3_ENDPOINT").ok()?,
-        access_key: std::env::var("ARUNA_TEST_S3_ACCESS_KEY").ok()?,
-        secret_key: std::env::var("ARUNA_TEST_S3_SECRET_KEY").ok()?,
+fn s3_env() -> S3Env {
+    S3Env {
+        endpoint: std::env::var("ARUNA_TEST_S3_ENDPOINT")
+            .expect("ARUNA_TEST_S3_ENDPOINT is required for ignored S3 tests"),
+        access_key: std::env::var("ARUNA_TEST_S3_ACCESS_KEY")
+            .expect("ARUNA_TEST_S3_ACCESS_KEY is required for ignored S3 tests"),
+        secret_key: std::env::var("ARUNA_TEST_S3_SECRET_KEY")
+            .expect("ARUNA_TEST_S3_SECRET_KEY is required for ignored S3 tests"),
         region: std::env::var("ARUNA_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-    })
+    }
 }
 
 fn s3_config(env: &S3Env, bucket: Option<&str>) -> HashMap<String, String> {
@@ -2245,55 +2265,13 @@ fn unique_name(prefix: &str) -> String {
 /// A filesystem default plus an S3 `cold` backend, so one handler covers mixed
 /// routing without a second fixture.
 async fn setup_s3_mixed(env: &S3Env) -> TestContext {
-    let temp_dir = tempdir().unwrap();
-    let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
-    let mut backends = std::collections::BTreeMap::new();
-    backends.insert(
-        "default".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
-            None,
-        )),
-    );
-    backends.insert(
-        "cold".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            BackendConfig {
-                backend_type: Backend::S3,
-                root: String::new(),
-                service_config: s3_config(env, None),
-                bucket_prefix: Some(unique_name("aruna-cold-")),
-                max_bucket_size: None,
-                multipart_bucket: Some(unique_name("aruna-parts-")),
-                timeouts: Default::default(),
-            },
-            Some("cold".to_string()),
-        )),
-    );
-    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
-    let blob_handle = BlobHandler::with_registry(
-        registry,
-        storage_handle.clone(),
-        net_handle,
-        EgressPolicy::loopback(),
-    )
-    .await
-    .unwrap();
-
-    TestContext {
-        _temp_dir: temp_dir,
-        blob_handle,
-        storage_handle,
-    }
+    setup_context(TestContextSetup::S3Mixed(env)).await
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_roundtrip_range() {
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
 
@@ -2337,8 +2315,9 @@ async fn s3_roundtrip_range() {
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_multipart_compose() {
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
     let upload_id = Ulid::generate();
@@ -2568,9 +2547,10 @@ async fn needs_paired_secret() {
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn serves_group_backend() {
     // The tenant endpoint path: MinIO stands in for a group-owned store.
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let bucket = unique_name("tenant-");
     make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
@@ -2617,9 +2597,10 @@ async fn serves_group_backend() {
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn routes_backends_apart() {
     // A cold-class rule pins to S3 while the default stays on the filesystem.
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
 

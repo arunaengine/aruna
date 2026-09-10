@@ -11,6 +11,8 @@ mod effect_handlers;
 pub mod error;
 pub mod streams;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::mem;
@@ -2624,15 +2626,10 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::make_secret;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
-
-    fn make_secret(seed: u8) -> iroh::SecretKey {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&seed_bytes)
-    }
 
     fn make_announcement(
         secret: &iroh::SecretKey,
@@ -3319,42 +3316,40 @@ mod tests {
         Ok((handle, temp_dir))
     }
 
-    async fn wait_for_open_connections(handle: &NetHandle, expected: usize) -> NetState {
-        for _ in 0..50 {
+    const WAIT_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+    async fn wait_for_status(
+        handle: &NetHandle,
+        mut done: impl FnMut(&NetState) -> bool,
+    ) -> NetState {
+        let deadline = tokio::time::Instant::now() + WAIT_STATUS_TIMEOUT;
+        loop {
             let status = handle.get_status().await;
-            if protocol_connection_count(&status) >= expected {
+            if done(&status) || tokio::time::Instant::now() >= deadline {
                 return status;
             }
             sleep(Duration::from_millis(20)).await;
         }
+    }
 
-        handle.get_status().await
+    async fn wait_for_open_connections(handle: &NetHandle, expected: usize) -> NetState {
+        wait_for_status(handle, |status| {
+            protocol_connection_count(status) >= expected
+        })
+        .await
     }
 
     async fn wait_for_bootstrap_failure(handle: &NetHandle) -> NetState {
-        for _ in 0..50 {
-            let status = handle.get_status().await;
-            if status.requests.failures > 0 {
-                return status;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        handle.get_status().await
+        wait_for_status(handle, |status| status.requests.failures > 0).await
     }
 
     async fn wait_for_peer_failure(handle: &NetHandle, peer: NodeId) -> NetState {
-        for _ in 0..50 {
-            let status = handle.get_status().await;
-            if status.connections.iter().any(|state| {
+        wait_for_status(handle, |status| {
+            status.connections.iter().any(|state| {
                 state.node_id == peer && state.status == PeerConnectionStatus::Unreachable
-            }) {
-                return status;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-
-        handle.get_status().await
+            })
+        })
+        .await
     }
 
     fn protocol_connection_count(status: &NetState) -> usize {
@@ -3389,15 +3384,10 @@ mod tests {
         side: iroh::endpoint::Side,
         expected: usize,
     ) -> NetState {
-        for _ in 0..50 {
-            let status = handle.get_status().await;
-            if protocol_connection_count_for(&status, node_id, alpn, side) == expected {
-                return status;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-
-        handle.get_status().await
+        wait_for_status(handle, |status| {
+            protocol_connection_count_for(status, node_id, alpn, side) == expected
+        })
+        .await
     }
 
     #[tokio::test]

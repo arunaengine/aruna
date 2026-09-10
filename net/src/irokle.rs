@@ -10339,6 +10339,7 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_endpoint;
     use aruna_core::admin_document_reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
@@ -10963,22 +10964,6 @@ mod tests {
             kind: DocumentSyncChangeKind::Upsert,
             placement: restart_placement(),
         }
-    }
-
-    async fn test_endpoint(seed: u8) -> iroh::Endpoint {
-        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
-            .relay_mode(iroh::RelayMode::Disabled)
-            .alpns(vec![Alpn::DocumentSync.as_bytes().to_vec()])
-            .bind_addr(
-                "127.0.0.1:0"
-                    .parse::<std::net::SocketAddr>()
-                    .expect("valid bind address"),
-            )
-            .expect("endpoint bind address configures")
-            .bind()
-            .await
-            .expect("endpoint binds")
     }
 
     async fn restart_endpoint() -> iroh::Endpoint {

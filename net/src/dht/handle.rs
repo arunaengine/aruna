@@ -313,12 +313,7 @@ impl DhtHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_node(seed: u8) -> NodeId {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&seed_bytes).public()
-    }
+    use crate::test_support::make_node;
 
     #[test]
     fn add_peer_returns_queue_full_when_channel_saturated() {

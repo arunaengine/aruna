@@ -232,14 +232,7 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_node(seed: u8) -> NodeId {
-        // Generate deterministic keys from seed
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        let secret = iroh::SecretKey::from_bytes(&seed_bytes);
-        secret.public()
-    }
+    use crate::test_support::make_node;
 
     #[test]
     fn test_kbucket_insert() {
