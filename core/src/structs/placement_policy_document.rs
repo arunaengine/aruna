@@ -232,7 +232,7 @@ pub fn verify_policy_authority(
 
 /// Whether the given roles grant this user write on the path. An uncompilable
 /// pattern denies, so a malformed role never widens authority.
-fn holds_admin_write<'a>(
+pub fn holds_admin_write<'a>(
     user_id: UserId,
     path: &str,
     roles: impl Iterator<Item = &'a Role>,
