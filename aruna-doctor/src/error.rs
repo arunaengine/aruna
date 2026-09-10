@@ -3,7 +3,7 @@ use crate::storage::SnapshotError;
 use aruna::config::SetupError;
 use aruna::portal::PortalArtifactError;
 use aruna_core::onboarding::OnboardingSecretError;
-use aruna_operations::create_token::CreateTokenError;
+use aruna_operations::auth::create_token::CreateTokenError;
 use aruna_storage::errors::StorageLibError;
 use thiserror::Error;
 use tokio::task::JoinError;

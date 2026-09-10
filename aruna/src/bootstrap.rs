@@ -11,17 +11,17 @@ use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket,
 };
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
-use aruna_operations::create_onboarding_secret::{
-    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-};
 use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::notifications::watch::interest::{
     ensure_local_watch_interest_digest, mark_watch_interest_dirty,
 };
+use aruna_operations::onboarding::create_onboarding_secret::{
+    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+};
 use aruna_operations::placement::placement_ref_for_target;
-use aruna_operations::replicate_documents::{
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
 use byteview::ByteView;
@@ -563,11 +563,11 @@ mod tests {
         watch_interest_dirty_key, watch_interest_node_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::document_sync_outbox::read_outbox_records;
     use aruna_operations::driver::DriverContext;
-    use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::notifications::watch::interest::publish_watch_interest;
-    use aruna_operations::task_incoming::OutboxDrainer;
+    use aruna_operations::sync::document_sync_outbox::read_outbox_records;
+    use aruna_operations::sync::incoming::initialize_net_incoming;
+    use aruna_operations::tasks::task_incoming::OutboxDrainer;
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
     use std::sync::Arc;

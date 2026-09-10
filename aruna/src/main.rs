@@ -30,25 +30,27 @@ use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::NodeCapabilities;
 use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::device::wipe as device_wipe;
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
-use aruna_operations::incoming::initialize_net_holder;
 use aruna_operations::jobs::drain::restore_job_queue_timer;
 use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
-use aruna_operations::s3::session::spawn_session_sweep;
 #[cfg(debug_assertions)]
-use aruna_operations::startup::RecoveryState;
-use aruna_operations::startup::{
+use aruna_operations::node::startup::RecoveryState;
+use aruna_operations::node::startup::{
     RecoveryConfig, RecoveryStatus, prepare_shard_policy, run_recovery,
 };
-use aruna_operations::task_incoming::{TaskQueues, initialize_task_holder};
+use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::realm::ensure_realm_config::{
+    EnsureRealmConfigConfig, EnsureRealmConfigOperation,
+};
+use aruna_operations::s3::session::spawn_session_sweep;
+use aruna_operations::sync::incoming::initialize_net_holder;
+use aruna_operations::tasks::task_incoming::{TaskQueues, initialize_task_holder};
 use aruna_tasks::TaskHandle;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
@@ -1641,11 +1643,11 @@ fn parse_disk_limit(value: Option<&str>) -> Result<Option<u64>, &'static str> {
 /// placement map before it serves anything. A changed subject blocks governed
 /// serving until the local inventory has been revalidated under it.
 async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::placement_policy::sync_subject(
+    aruna_operations::placement::policy::sync_subject(
         ctx,
         config.realm_id,
         config.node_id,
-        aruna_operations::placement_policy::SubjectScanMode::Revalidate(
+        aruna_operations::placement::policy::SubjectScanMode::Revalidate(
             aruna_core::structs::ManagedCopyQuarantine::Rejoin,
         ),
         aruna_operations::driver::now_ms(),
@@ -1656,7 +1658,7 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
 }
 
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::node_info::seed_node_info_document(
+    aruna_operations::node::node_info::seed_node_info_document(
         ctx,
         config.node_id,
         config.realm_id,
@@ -1713,7 +1715,7 @@ async fn ensure_usage_counters(
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::usage_global_shard_keys;
-    use aruna_operations::usage_stats::RebuildUsageStatsOperation;
+    use aruna_operations::node::usage_stats::RebuildUsageStatsOperation;
 
     let shard_keys = usage_global_shard_keys();
     let event = driver_ctx
