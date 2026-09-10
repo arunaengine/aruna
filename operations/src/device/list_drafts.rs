@@ -7,7 +7,7 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::repository::{IntakeEntry, MAX_INTAKE_ENTRIES, scan_intake};
+use super::intake::{IntakeEntry, MAX_INTAKE_ENTRIES, scan_intake};
 
 #[derive(Debug, PartialEq)]
 pub struct ListDraftsOperation {
@@ -134,7 +134,7 @@ fn fail(operation: &mut ListDraftsOperation, error: ListDraftsError) -> Effects 
 mod tests {
     use super::ListDraftsOperation;
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
-    use crate::device::repository::{INTAKE_PAGE_SIZE, IntakeEntry};
+    use crate::device::intake::{INTAKE_PAGE_SIZE, IntakeEntry};
     use crate::device::test_support::context;
     use crate::driver::drive;
     use aruna_core::structs::RealmId;

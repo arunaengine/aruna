@@ -1,8 +1,6 @@
 //! The explicit owner decisions that may change local bytes.
-//!
-//! The automatic sync never replaces divergent bytes and never removes a file.
-//! Both happen only here, only for the exact bytes the owner was shown, and
-//! every one of them leaves an audit row committed with the state it changed.
+//! Automatic sync never replaces divergent bytes or removes files; only these
+//! actions do, for the exact bytes shown, each with an audit row.
 
 use std::sync::Arc;
 

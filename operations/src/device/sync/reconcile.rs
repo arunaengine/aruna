@@ -1,9 +1,6 @@
-//! Decides one page of a synced folder, without touching the network or the
-//! filesystem beyond the strong hashes the decision itself needs.
-//!
-//! The operation only ever writes device-local rows. Bytes reach the disk
-//! through the guarded local-file effects the plan it answers with names, and
-//! reach the realm through the upload rows it queues.
+//! Decides one page of a synced folder, touching no network and only the hashes
+//! the decision needs. It writes only device-local rows; bytes reach disk via
+//! guarded local-file effects and the realm via queued upload rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,8 +1,6 @@
 //! Asks each folder's realm node to pull the local versions that changed.
-//!
-//! The device never pushes: it forwards one request naming the exact local
-//! version, and the realm node reads that version back from this device and
-//! commits its own copy as the owner.
+//! The device never pushes: one request names the exact local version, which the
+//! node reads back and commits as the owner.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -184,11 +182,9 @@ fn permanent(refusal: &SyncRefusal) -> bool {
     )
 }
 
-/// Records the realm version as the entry's new base and drops the outbox row
-/// in one transaction, so an acknowledged pull is never forwarded twice.
-///
-/// A row the owner still has to answer keeps its reported state: the pull only
-/// establishes which realm version these bytes now correspond to.
+/// Records the realm version as the entry's new base and drops the outbox row in
+/// one transaction, so an acknowledged pull is never forwarded twice; a row the
+/// owner must still answer keeps its reported state.
 async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &SyncPullAck) {
     let current = read_value(
         context,

@@ -11,7 +11,6 @@ use tokio::sync::broadcast;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, list_remote, list_watches_remote, mark_read_remote,
     unread_count_remote,
@@ -32,6 +31,7 @@ use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_replicated_watch_subscription,
     delete_replicated_watch_subscription,
 };
+use crate::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the
@@ -73,10 +73,9 @@ impl From<NotificationDispatchError> for WatchDispatchError {
     }
 }
 
-/// Resolves the node currently holding `recipient`'s inbox, using the same
-/// placement the read/write dispatch paths use. Exposed so the live-stream
-/// endpoint can pick between the wake-driven local arm and the holder-polling
-/// remote arm.
+/// Resolves the node currently holding `recipient`'s inbox with the same
+/// placement as read/write dispatch, so the live-stream endpoint can pick the
+/// wake-driven local or holder-polling remote arm.
 pub async fn resolve_inbox_holder_for_user(
     context: &DriverContext,
     recipient: UserId,

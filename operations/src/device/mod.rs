@@ -9,14 +9,15 @@ pub mod drain;
 pub mod edit;
 pub mod enqueue_draft;
 pub mod inspect_draft;
+pub mod intake;
 pub mod list_drafts;
 pub mod realm_documents;
 pub mod refresh;
+pub mod remove_device_node;
 pub mod replica;
-pub mod repository;
 pub mod selection;
-pub mod status;
 pub mod sync;
+pub mod sync_status;
 #[cfg(test)]
 mod test_support;
 pub mod wipe;

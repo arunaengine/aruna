@@ -6,7 +6,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::notifications::client::deliver_watch_events_remote;
 use crate::notifications::placement::filter_locally_held_watch_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
@@ -14,13 +13,11 @@ use crate::notifications::watch::interest::mark_watch_interest_dirty;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_watch_subscriptions,
 };
+use crate::realm::get_realm_config::GetRealmConfigOperation;
 
-/// Post-commit, best-effort emission of an origin watch event. Matches the event
-/// against the in-memory realm interest table plus local durable subscriptions
-/// that may not have published their digest yet, then immediately expands it for
-/// the local holder or forwards it once to each remote holder. Every failure
-/// warns; nothing propagates and nothing panics, so a lost watch event never
-/// affects the host operation. An unmatched event writes nothing.
+/// Post-commit, best-effort emission of an origin watch event. Matches the
+/// in-memory interest table plus local durable subscriptions, then expands for
+/// the local holder or forwards once per remote holder; all failures only warn.
 pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEvent) {
     // Watches are a user-plane feature; system/anonymous writes carry a nil actor
     // and are deliberately not emitted.
@@ -95,10 +92,7 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
 
 /// Post-commit, best-effort `metadata_created` emission shared by every dataset
 /// creation path, so an import or a job notifies exactly like `POST /metadata`.
-///
-/// `event_id` is the durable create event id, and its own timestamp dates the
-/// event, so a retried create that returns the same acceptance keeps the whole
-/// inbox key stable and notifies subscribers once.
+/// `event_id` dates the event, keeping a retried create's inbox key stable.
 pub async fn emit_metadata_created(
     context: &DriverContext,
     realm_id: RealmId,

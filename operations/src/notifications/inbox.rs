@@ -19,20 +19,18 @@ pub(crate) enum UpsertFailure {
     Fatal(String),
 }
 
-/// Result of a holder-local inbox upsert. `recipients` lists the distinct
-/// recipients whose inbox actually gained a record (in first-seen order), so a
-/// caller with net access can fire one wake per woken user; a pure redelivery
-/// reports zero writes and an empty recipient set.
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen
+/// order, recipients that gained a record, so a caller can wake each once; a
+/// pure redelivery reports zero writes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxWriteOutcome {
     pub written: usize,
     pub recipients: Vec<UserId>,
 }
 
-/// Idempotent holder-local upsert. Records whose primary key already exists are
-/// skipped inside the write transaction, so a duplicate delivery never clobbers
-/// a read_at_ms set by a concurrent mark-read. Returns the number of newly
-/// written records.
+/// Idempotent holder-local upsert: existing primary keys are skipped inside the
+/// write transaction, so a duplicate never clobbers a concurrent mark-read's
+/// `read_at_ms`. Returns the number of newly written records.
 pub async fn upsert_inbox_records(
     storage: &StorageHandle,
     records: &[NotificationRecord],

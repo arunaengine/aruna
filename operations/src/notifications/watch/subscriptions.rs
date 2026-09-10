@@ -22,13 +22,13 @@ use aruna_storage::StorageHandle;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
-};
 use crate::driver::DriverContext;
 use crate::notifications::protocol::NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
+use crate::sync::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
 /// always covers a subscription set with a wide safety margin.
@@ -97,10 +97,9 @@ pub async fn create_watch_subscription(
     create_subscription(storage, subscription, None).await
 }
 
-/// The one holder-side create path, used by both the local API arm and the
-/// holder RPC. A proxying peer's assertion is not authority to watch, so the
-/// holder that persists and replicates the subscription re-derives the canonical
-/// permission path and checks the owner's READ itself before any durable write.
+/// The one holder-side create path, used by both the local API arm and the holder
+/// RPC. A proxying peer's assertion is not authority, so the holder re-derives
+/// the permission path and checks READ before any durable write.
 pub async fn create_replicated_watch_subscription(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,

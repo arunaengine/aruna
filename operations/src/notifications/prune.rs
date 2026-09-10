@@ -120,12 +120,9 @@ async fn prune_expired_index_rows(
                 next_due_after = Some(Duration::from_millis(expires_at_ms.saturating_sub(now_ms)));
                 break 'scan;
             }
-            // created_at_ms is not stored in the index key, but equals
-            // expires_at_ms - class.ttl_ms(); the two class TTLs differ, so at most one
-            // candidate can hold a real record (notification_id is unique per record). A
-            // saturated expires_at_ms (u64::MAX) yields candidates that cannot match the
-            // stored created_at_ms and would fall into the orphan arm, but such a row is
-            // always > now, so phase A stops before reaching it.
+            // created_at_ms is not in the index key but equals expires_at_ms - class.ttl_ms();
+            // since the two class TTLs differ, at most one candidate matches. A saturated
+            // expires_at_ms is always > now, so phase A stops before its unmatched candidates.
             let direct_key = notification_inbox_key(
                 recipient,
                 expires_at_ms.saturating_sub(NOTIFICATION_DIRECT_TTL_MS),
