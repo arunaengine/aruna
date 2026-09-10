@@ -1,6 +1,8 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
-use crate::blob::managed_copy::{
-    CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
+use crate::blob::managed_copy::ManagedCopyError;
+use crate::s3::object_lookup::{
+    CopyNodeId, LookupError, location_from_read, managed_copy_check, managed_copy_read,
+    multipart_summary_read,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -125,6 +127,19 @@ impl GetObjectAttributesOperation {
         self.state = GetObjectAttributesState::Error;
         self.output = Some(Err(error));
         smallvec![]
+    }
+
+    fn lookup_error(&self, expected: &'static str, error: LookupError) -> GetObjectAttributesError {
+        match error {
+            LookupError::Conversion(err) => GetObjectAttributesError::ConversionError(err),
+            LookupError::Managed(err) => GetObjectAttributesError::ManagedCopyError(err),
+            LookupError::InvalidEvent(received) => GetObjectAttributesError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected,
+                received,
+            },
+            LookupError::Missing => GetObjectAttributesError::GetObjectAttributesFailed,
+        }
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -282,67 +297,50 @@ impl GetObjectAttributesOperation {
         blob_hash: [u8; 32],
         backend: aruna_core::structs::BackendRef,
     ) -> Effects {
-        let key = ManagedCopyKey::new(
-            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
-            backend.clone(),
-        );
-        let effect = match serve_reads(&key, self.txn_id) {
-            Ok(effect) => effect,
+        let check = match managed_copy_check(
+            &self.input.bucket,
+            &self.input.key,
+            version_id,
+            blob_hash,
+            backend,
+            self.txn_id,
+        ) {
+            Ok(check) => check,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.pending_copy = Some(key);
-        self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
+        self.pending_copy = Some(check.copy_key);
+        self.pending_location = Some(check.location_key);
         self.state = GetObjectAttributesState::CheckManagedCopy;
-        smallvec![effect]
+        smallvec![check.effect]
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
-            });
-        };
-        let (copy, subject) = match split_serve_reads(values) {
-            Ok(split) => split,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        let (Some(copy_key), Some(key)) = (self.pending_copy.take(), self.pending_location.take())
-        else {
-            return self.emit_error(GetObjectAttributesError::GetObjectAttributesFailed);
-        };
-        if let Err(err) = validate_registration(
-            copy.as_deref(),
-            &CopyRequest {
-                key: &copy_key,
-                node_id: Some(subject.subject.node_id),
-                blake3: Some(key.blake3_hash),
-                refs: &self.source_policies,
-                subject_generation: Some(subject.subject.generation),
-            },
+        let key = match managed_copy_read(
+            event,
+            &mut self.pending_copy,
+            &mut self.pending_location,
+            &self.source_policies,
+            CopyNodeId::Subject,
         ) {
-            return self.emit_error(err.into());
-        }
+            Ok(key) => key,
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
+                return self.emit_error(error);
+            }
+        };
         self.read_blob_location(key)
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-
-        let Some(value) = value else {
-            return self.emit_error(GetObjectAttributesError::GetObjectAttributesFailed);
-        };
-
-        let location = match BackendLocation::from_bytes(value.as_ref()) {
-            Ok(location) => location,
-            Err(err) => return self.emit_error(err.into()),
+        let location = match location_from_read(event) {
+            Ok(Some(location)) => location,
+            Ok(None) => {
+                return self.emit_error(GetObjectAttributesError::GetObjectAttributesFailed);
+            }
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
+                return self.emit_error(error);
+            }
         };
         self.location = Some(location);
 
@@ -354,17 +352,13 @@ impl GetObjectAttributesOperation {
             return self.finish_lookup();
         };
 
-        let key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
-            Ok(key) => key.into(),
+        let effect = match multipart_summary_read(version_id, self.txn_id) {
+            Ok(effect) => effect,
             Err(err) => return self.emit_error(err.into()),
         };
 
         self.state = GetObjectAttributesState::ReadMultipartSummary;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
+        smallvec![effect]
     }
 
     fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
