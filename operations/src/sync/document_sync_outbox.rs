@@ -18,11 +18,9 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-// Sized so one single-flight drain run fills several full document sync topic-batch
-// streams per peer instead of paying the per-run scan/projection/fan-out
-// setup for a half-filled one. Records group by peer set, and every peer in
-// the set receives every topic in the group, so the cap scales with stream
-// capacity rather than peer count.
+// Sized so one single-flight drain fills several full document sync topic-batch
+// streams per peer instead of half-filling one. Records group by peer set and each
+// peer receives every topic, so the cap scales with stream capacity, not peer count.
 pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
     4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
 const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
@@ -60,11 +58,9 @@ pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
         bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
     }
     bytes.extend_from_slice(&record.outbox_id.to_bytes());
-    // One event can enqueue several publishes under its own id — a metadata
-    // create emits both the document's lifecycle event and its registry row, each
-    // onto a different topic. Without the target in the key the second would
-    // silently overwrite the first and that publish would simply never happen.
-    // Ordering is untouched: the id still compares first, so this only breaks ties.
+    // One event can enqueue several publishes under its own id (a metadata create
+    // emits lifecycle and registry rows on different topics); without the target in
+    // the key the second overwrites the first. The id still compares first.
     bytes.extend_from_slice(record.target.storage_key().as_ref());
     ByteView::from(bytes)
 }
@@ -119,7 +115,7 @@ pub fn new_outbox_record_with_id(
     admin_placement: PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
-    crate::sync_placement::sort_node_ids(&mut peers);
+    crate::sync::shard_placement::sort_node_ids(&mut peers);
     let placement = match &event {
         DocumentSyncOutboxEvent::Upsert { change, .. }
         | DocumentSyncOutboxEvent::Delete { change } => change.placement,

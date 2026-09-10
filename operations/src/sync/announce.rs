@@ -26,7 +26,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::document_repository;
-use crate::document_sync_outbox::{
+use crate::sync::document_sync_outbox::{
     new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
 };
 
@@ -363,10 +363,9 @@ impl AnnounceTopicOperation {
                 }
                 Ok(placement_policy_change(&document, self.placement))
             }
-            // Node usage snapshots, watch-interest digests, and node info/heartbeat
-            // documents are single-writer per key and applied as plain upserts
-            // (last event wins), so the change only needs a monotonic wall-clock
-            // generation from this node.
+            // These are single-writer per key and applied as plain upserts (last event
+            // wins), so the change only needs a monotonic wall-clock generation from
+            // this node.
             DocumentSyncTarget::NodeUsage { .. }
             | DocumentSyncTarget::WatchInterest { .. }
             | DocumentSyncTarget::NodeInfo { .. } => {

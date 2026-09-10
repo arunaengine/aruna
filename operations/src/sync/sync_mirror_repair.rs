@@ -22,16 +22,16 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataAuthToken;
-use crate::queue_backoff::queue_retry_after_ms;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::sync_relationship::{
+use crate::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
+use crate::tasks::queue_backoff::queue_retry_after_ms;
 
 const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;

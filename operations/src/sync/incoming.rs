@@ -2,15 +2,15 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
-use crate::document_sync_outbox::{
-    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
+use crate::auth::permission_rules::GroupPermissionRules;
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{
+    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
+use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{
     DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
 };
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
@@ -18,24 +18,24 @@ use crate::metadata::projector::{
     project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
-use crate::mutate_realm_placement::node_kind;
+use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::node::usage_stats::refresh_realm_usage_summary_for_targets;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
-use crate::permission_rules::GroupPermissionRules;
-use crate::process_placements::reconcile_shard_topics;
-use crate::queue_backoff::queue_retry_after_ms;
+use crate::placement::process_placements::reconcile_shard_topics;
+use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::mutate_realm_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoReadOperation;
 use crate::replication::incoming_version_replication::{
     IncomingVersionReplicationOperation, IncomingVersionReplicationResult,
 };
 use crate::replication::location_summary::LocationSummaryOperation;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::usage_stats::refresh_realm_usage_summary_for_targets;
+use crate::sync::document_sync_outbox::{
+    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
+};
+use crate::tasks::queue_backoff::queue_retry_after_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
@@ -89,13 +89,9 @@ impl OperationsInboundHandler {
         }
     }
 
-    /// What the bao plane admits this peer as.
-    ///
-    /// Replication is trusted only from realm nodes eligible to hold and sync
-    /// data. An owner-bound device is admitted for bao reads alone, and only by
-    /// a sync-eligible node: it never reaches the manifest or summary branches,
-    /// so it can never become a replication source, and device-to-device
-    /// transfer is not a path. Fails closed when the config is unreadable.
+    /// What the bao plane admits this peer as. Replication is trusted from
+    /// sync-eligible realm nodes only; an owner-bound device gets bao reads alone from
+    /// a sync-eligible node, never becoming a replication source. Fails closed.
     async fn bao_peer_admitted(
         &self,
         realm_id: RealmId,
@@ -922,7 +918,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     .await
                 }
                 Alpn::NativeReference => {
-                    Box::pin(crate::native_reference::handle_native_stream(
+                    Box::pin(crate::staging::native_source::handle_native_stream(
                         self.context.as_ref(),
                         stream,
                         node_id,
@@ -994,18 +990,9 @@ fn close_bao_stream(mut stream: BiStream) {
     _ = stream.1.stop(0u32.into());
 }
 
-/// Re-enqueues the payloads recovered from a genesis tie-break eviction as
-/// document-sync outbox records so they replay onto the winning chain through
-/// the normal drain. Every record reuses the evicted event's own id, which is
-/// the whole safety story: the outbox key is derived from it and appliers dedupe
-/// on it, so repeating this conversion rewrites the same rows instead of
-/// duplicating them. Every record uses `allow_genesis: false` (the loser must
-/// not mint a rival genesis) and empty peers (resolved to the realm default set
-/// at the net layer, exactly like the mutation operations that originate admin
-/// events).
-///
-/// Returns whether every record is durable. Anything less keeps the caller's
-/// journal entry so the payload is retried instead of lost.
+/// Re-enqueues payloads from a genesis tie-break eviction as outbox records replaying
+/// onto the winning chain; the evicted event id makes this idempotent, and no genesis
+/// is minted. Returns whether every record is durable; otherwise the journal is kept.
 async fn reemit_evicted_documents(
     context: &DriverContext,
     documents: Vec<DocumentSyncEvictedDocument>,

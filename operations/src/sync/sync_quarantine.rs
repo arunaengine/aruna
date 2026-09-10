@@ -1,9 +1,6 @@
-//! Admin reads and reclamation for the durable sync-quarantine store (#338).
-//!
-//! Writes come from the replication path, which folds the evidence row and its
-//! usage row into the same transaction as the topic cursor. This module owns the
-//! other half: listing, inspection, acknowledgement, and bounded pruning of
-//! acknowledged rows, each keeping the usage row consistent with the store.
+//! Admin reads and reclamation for the durable sync-quarantine store.
+//! Replication writes evidence plus usage rows transactionally; this module owns
+//! listing, inspection, acknowledgement and bounded pruning of acknowledged rows.
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -310,14 +307,9 @@ async fn acknowledge_in_txn(
     Ok(Some(record))
 }
 
-/// Delete acknowledged rows in one bounded pass, decrementing the usage row in
-/// the same transaction so reclaimed capacity survives a crash. Resumable: the
-/// returned cursor continues the scan even when the pass deleted nothing.
-///
-/// The scan only proposes candidates. Every one is re-read and re-validated
-/// inside the delete transaction, so a redelivery that replaced a selected row
-/// with unacknowledged evidence between scan and commit is neither deleted nor
-/// accounted from its stale value.
+/// Deletes acknowledged rows in one bounded, resumable pass, decrementing usage in
+/// the same transaction. The scan only proposes candidates; each is re-read and
+/// re-validated inside the delete transaction to reject redelivered evidence.
 pub async fn prune_quarantine_records(
     ctx: &DriverContext,
     request: QuarantinePageRequest,
@@ -592,10 +584,9 @@ mod tests {
         );
     }
 
-    /// A redelivery between the scan and the delete transaction replaces the
-    /// selected row with unacknowledged evidence. Prune re-reads every candidate
-    /// inside the transaction, so that evidence is neither deleted nor accounted
-    /// from the value the scan happened to see.
+    /// A redelivery between scan and delete replaces the selected row with
+    /// unacknowledged evidence; prune re-reads every candidate, so that evidence is
+    /// neither deleted nor accounted from the scan's stale value.
     #[tokio::test]
     async fn prune_revalidates_candidates() {
         let (ctx, _dir) = context();
