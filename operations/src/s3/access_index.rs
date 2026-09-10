@@ -7,30 +7,36 @@ use std::collections::BTreeSet;
 pub const MAX_ACTIVE_CREDENTIALS: usize = 16;
 
 pub fn owner_key(user_identity: UserId) -> Key {
-    ByteView::from(user_identity.to_storage_key())
+    crate::owner_index::owner_key(user_identity, None)
 }
 
 pub fn decode_index(value: Option<&ByteView>) -> Result<BTreeSet<String>, ConversionError> {
-    let Some(value) = value else {
-        return Ok(BTreeSet::new());
-    };
-    let index: BTreeSet<String> = postcard::from_bytes(value.as_ref())?;
-    if index.len() > MAX_ACTIVE_CREDENTIALS {
-        return Err(ConversionError::InvalidLength(format!(
-            "credential owner index exceeds {MAX_ACTIVE_CREDENTIALS} entries"
-        )));
-    }
-    for access_key in &index {
-        UserAccess::build_access_key(access_key)?;
-    }
-    Ok(index)
+    crate::owner_index::decode_index(
+        value,
+        MAX_ACTIVE_CREDENTIALS,
+        || {
+            ConversionError::InvalidLength(format!(
+                "credential owner index exceeds {MAX_ACTIVE_CREDENTIALS} entries"
+            ))
+        },
+        |index| {
+            for access_key in index {
+                UserAccess::build_access_key(access_key)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 pub fn encode_index(index: &BTreeSet<String>) -> Result<Value, ConversionError> {
-    if index.len() > MAX_ACTIVE_CREDENTIALS {
-        return Err(ConversionError::InvalidLength(format!(
-            "credential owner index exceeds {MAX_ACTIVE_CREDENTIALS} entries"
-        )));
-    }
-    Ok(ByteView::from(postcard::to_allocvec(index)?))
+    crate::owner_index::encode_index(
+        index,
+        MAX_ACTIVE_CREDENTIALS,
+        || {
+            ConversionError::InvalidLength(format!(
+                "credential owner index exceeds {MAX_ACTIVE_CREDENTIALS} entries"
+            ))
+        },
+        |_| Ok(()),
+    )
 }

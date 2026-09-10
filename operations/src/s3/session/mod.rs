@@ -112,38 +112,43 @@ pub struct S3SessionCredentials {
 }
 
 fn owner_key(user_identity: UserId, group_id: GroupId) -> Key {
-    let mut key = user_identity.to_storage_key();
-    key.extend_from_slice(&group_id.to_bytes());
-    key.into()
+    crate::owner_index::owner_key(user_identity, Some(group_id))
 }
 
 fn decode_index(value: Option<&ByteView>) -> Result<BTreeSet<String>, S3SessionError> {
-    let Some(value) = value else {
-        return Ok(BTreeSet::new());
-    };
-    let index: BTreeSet<String> =
-        postcard::from_bytes(value.as_ref()).map_err(ConversionError::from)?;
-    if index.len() > MAX_GROUP_SESSIONS
-        || index
-            .iter()
-            .any(|access_key| !S3Session::valid_access_key(access_key))
-    {
-        return Err(S3SessionError::IndexInconsistent);
-    }
-    Ok(index)
+    crate::owner_index::decode_index(
+        value,
+        MAX_GROUP_SESSIONS,
+        || S3SessionError::IndexInconsistent,
+        |index| {
+            if index
+                .iter()
+                .all(|access_key| S3Session::valid_access_key(access_key))
+            {
+                Ok(())
+            } else {
+                Err(S3SessionError::IndexInconsistent)
+            }
+        },
+    )
 }
 
 fn encode_index(index: &BTreeSet<String>) -> Result<Value, S3SessionError> {
-    if index.len() > MAX_GROUP_SESSIONS
-        || index
-            .iter()
-            .any(|access_key| !S3Session::valid_access_key(access_key))
-    {
-        return Err(S3SessionError::IndexInconsistent);
-    }
-    Ok(ByteView::from(
-        postcard::to_allocvec(index).map_err(ConversionError::from)?,
-    ))
+    crate::owner_index::encode_index(
+        index,
+        MAX_GROUP_SESSIONS,
+        || S3SessionError::IndexInconsistent,
+        |index| {
+            if index
+                .iter()
+                .all(|access_key| S3Session::valid_access_key(access_key))
+            {
+                Ok(())
+            } else {
+                Err(S3SessionError::IndexInconsistent)
+            }
+        },
+    )
 }
 
 fn expiry_secs(expiry: SystemTime) -> Result<u64, S3SessionError> {
