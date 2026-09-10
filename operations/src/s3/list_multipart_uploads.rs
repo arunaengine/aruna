@@ -14,7 +14,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::s3::listing::common_prefix_of;
+use crate::s3::listing::{ListMarker, pack_page, retain_after_marker};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ListMultipartUploadsState {
@@ -256,18 +256,16 @@ impl ListMultipartUploadsOperation {
     }
 
     fn apply_marker(&self, uploads: &mut Vec<MultipartUpload>) {
-        let Some(key_marker) = self.input.key_marker.as_deref() else {
-            return;
-        };
-        let upload_id_marker = self.input.upload_id_marker;
-
-        uploads.retain(|upload| match upload.key.as_str().cmp(key_marker) {
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Equal => {
-                upload_id_marker.is_some_and(|marker| upload.upload_id > marker)
-            }
+        let marker = self.input.key_marker.as_deref().map(|key| ListMarker {
+            key,
+            id: self.input.upload_id_marker,
         });
+        retain_after_marker(
+            uploads,
+            marker,
+            |upload| upload.key.as_str(),
+            |upload| upload.upload_id,
+        );
     }
 
     fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Effects {
@@ -275,59 +273,27 @@ impl ListMultipartUploadsOperation {
             return self.emit_error(ListMultipartUploadsError::NoTransactionFound);
         };
 
-        let prefix = self.input.prefix.as_deref();
-        let delimiter = self.input.delimiter.as_deref();
-        let max_uploads = self.input.max_uploads;
-
-        let mut result_uploads = Vec::new();
-        let mut common_prefixes = Vec::new();
-        let mut emitted = 0usize;
-        let mut is_truncated = false;
-        let mut next_key_marker = None;
-        let mut next_upload_id_marker = None;
-
-        let mut index = 0;
-        while index < uploads.len() {
-            if emitted >= max_uploads {
-                is_truncated = true;
-                break;
-            }
-            let upload = &uploads[index];
-            match common_prefix_of(&upload.key, prefix, delimiter) {
-                Some(group) => {
-                    let mut last = index;
-                    while last + 1 < uploads.len()
-                        && common_prefix_of(&uploads[last + 1].key, prefix, delimiter).as_deref()
-                            == Some(group.as_str())
-                    {
-                        last += 1;
-                    }
-                    next_key_marker = Some(uploads[last].key.clone());
-                    next_upload_id_marker = Some(uploads[last].upload_id);
-                    common_prefixes.push(group);
-                    emitted += 1;
-                    index = last + 1;
-                }
-                None => {
-                    next_key_marker = Some(upload.key.clone());
-                    next_upload_id_marker = Some(upload.upload_id);
-                    result_uploads.push(upload.clone());
-                    emitted += 1;
-                    index += 1;
-                }
-            }
-        }
-
-        if !is_truncated {
-            next_key_marker = None;
-            next_upload_id_marker = None;
-        }
+        let page = pack_page(
+            &uploads,
+            self.input.max_uploads,
+            self.input.prefix.as_deref(),
+            self.input.delimiter.as_deref(),
+            |upload| upload.key.as_str(),
+        );
+        let (next_key_marker, next_upload_id_marker) =
+            match page.last_index.filter(|_| page.truncated) {
+                Some(index) => (
+                    Some(uploads[index].key.clone()),
+                    Some(uploads[index].upload_id),
+                ),
+                None => (None, None),
+            };
 
         self.state = ListMultipartUploadsState::CommitTransaction;
         self.output = Some(Ok(ListMultipartUploadsResult {
-            uploads: result_uploads,
-            common_prefixes,
-            is_truncated,
+            uploads: page.entries,
+            common_prefixes: page.prefixes,
+            is_truncated: page.truncated,
             next_key_marker,
             next_upload_id_marker,
         }));

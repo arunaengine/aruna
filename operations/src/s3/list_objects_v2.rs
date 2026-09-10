@@ -1,4 +1,5 @@
 use crate::s3::list_object_versions::served_copy;
+use crate::s3::listing::PrefixPage;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -119,13 +120,12 @@ pub struct ListObjectsV2Operation {
     resolved: Vec<ResolvedEntry>,
     location_reads: Vec<(String, Key)>,
     objects: Vec<ListObjectsV2Object>,
-    common_prefixes: Vec<String>,
+    prefixes: PrefixPage,
     continuation_token: Option<ListObjectsV2ContinuationToken>,
     scan_prefix: Vec<u8>,
     scan_limit: usize,
     scan_rounds: usize,
     round_exhausted: bool,
-    resume_common_prefix: Option<String>,
     cursor_group: Option<String>,
     cursor_group_prefix: Option<Vec<u8>>,
     last_consumed_key: Option<Vec<u8>>,
@@ -145,13 +145,12 @@ impl ListObjectsV2Operation {
             resolved: Vec::new(),
             location_reads: Vec::new(),
             objects: Vec::new(),
-            common_prefixes: Vec::new(),
+            prefixes: PrefixPage::default(),
             continuation_token: None,
             scan_prefix: Vec::new(),
             scan_limit: 0,
             scan_rounds: 0,
             round_exhausted: false,
-            resume_common_prefix: None,
             cursor_group: None,
             cursor_group_prefix: None,
             last_consumed_key: None,
@@ -173,7 +172,7 @@ impl ListObjectsV2Operation {
     /// common prefix plus one per resolved object. Delete-markered keys never
     /// reach `resolved`, so they do not consume a slot.
     fn emitted(&self) -> usize {
-        self.common_prefixes.len() + self.resolved.len()
+        self.prefixes.count() + self.resolved.len()
     }
 
     /// Record that the scan cursor now sits inside `group`, so the next round
@@ -270,7 +269,7 @@ impl ListObjectsV2Operation {
         &mut self,
         token: &ListObjectsV2ContinuationToken,
     ) -> Result<(), ListObjectsV2Error> {
-        self.resume_common_prefix = token.last_common_prefix.clone();
+        self.prefixes.set_resume(token.last_common_prefix.clone());
         let Some(group) = token.last_common_prefix.as_deref() else {
             return Ok(());
         };
@@ -375,7 +374,7 @@ impl ListObjectsV2Operation {
         self.state = ListObjectsV2State::CommitTransaction;
         self.output = Some(Ok(ListObjectsV2Result {
             objects: std::mem::take(&mut self.objects),
-            common_prefixes: std::mem::take(&mut self.common_prefixes),
+            common_prefixes: self.prefixes.take(),
             continuation_token: self.continuation_token.clone(),
         }));
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -489,12 +488,10 @@ impl ListObjectsV2Operation {
 
             match self.common_prefix_of(&head.key) {
                 Some(group) => {
-                    let already_emitted = self.resume_common_prefix.as_deref()
-                        == Some(group.as_str())
-                        || self.common_prefixes.last().map(String::as_str) == Some(group.as_str());
+                    let already_emitted = self.prefixes.already_emitted(&group);
                     if already_emitted {
                         // The group is already represented; advance past this key.
-                        self.resume_common_prefix = None;
+                        self.prefixes.set_resume(None);
                         if let Err(err) = self.enter_cursor_group(&group, &key_bytes) {
                             return self.emit_error(err);
                         }
@@ -502,8 +499,8 @@ impl ListObjectsV2Operation {
                         if self.emitted() >= max_keys {
                             return self.truncate_scan();
                         }
-                        self.resume_common_prefix = None;
-                        self.common_prefixes.push(group.clone());
+                        self.prefixes.set_resume(None);
+                        self.prefixes.push(group.clone());
                         if let Err(err) = self.enter_cursor_group(&group, &key_bytes) {
                             return self.emit_error(err);
                         }
@@ -532,7 +529,7 @@ impl ListObjectsV2Operation {
                     if self.emitted() >= max_keys {
                         return self.truncate_scan();
                     }
-                    self.resume_common_prefix = None;
+                    self.prefixes.set_resume(None);
                     self.cursor_group = None;
                     self.cursor_group_prefix = None;
                     self.last_consumed_key = Some(key_bytes);

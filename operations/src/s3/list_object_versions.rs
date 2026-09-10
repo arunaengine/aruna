@@ -20,7 +20,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::blob::managed_copy::{CopyRequest, validate_registration};
-use crate::s3::listing::common_prefix_of;
+use crate::s3::listing::{PrefixPage, common_prefix_of, split_after_marker};
 
 /// Whether this node still holds a serveable registration for one governed
 /// copy. A listing never fails on the answer; it only stops describing bytes.
@@ -143,8 +143,7 @@ pub struct ListObjectVersionsOperation {
     head_exhausted: bool,
     scan_rounds: usize,
     max_scan_rounds: usize,
-    resume_common_prefix: Option<String>,
-    last_emitted_group: Option<String>,
+    prefixes: PrefixPage,
     pending_heads: VecDeque<(String, Ulid)>,
     current_key: Option<(String, Ulid)>,
     version_scan_limit: usize,
@@ -152,7 +151,6 @@ pub struct ListObjectVersionsOperation {
     version_window: VecDeque<(Ulid, BlobVersion)>,
     current_pending: Vec<PendingItem>,
     items: Vec<ListObjectVersionsItem>,
-    common_prefixes: Vec<String>,
     is_truncated: bool,
     last_marker: Option<(String, Option<Ulid>)>,
     next_key_marker: Option<String>,
@@ -177,8 +175,7 @@ impl ListObjectVersionsOperation {
             head_exhausted: false,
             scan_rounds: 0,
             max_scan_rounds: Self::MAX_SCAN_ROUNDS,
-            resume_common_prefix: None,
-            last_emitted_group: None,
+            prefixes: PrefixPage::default(),
             pending_heads: VecDeque::new(),
             current_key: None,
             version_scan_limit: VERSION_SCAN_LIMIT,
@@ -186,7 +183,6 @@ impl ListObjectVersionsOperation {
             version_window: VecDeque::new(),
             current_pending: Vec::new(),
             items: Vec::new(),
-            common_prefixes: Vec::new(),
             is_truncated: false,
             last_marker: None,
             next_key_marker: None,
@@ -218,7 +214,7 @@ impl ListObjectVersionsOperation {
     }
 
     fn emit_count(&self) -> usize {
-        self.items.len() + self.common_prefixes.len()
+        self.items.len() + self.prefixes.count()
     }
 
     fn prefix_str(&self) -> Option<&str> {
@@ -280,7 +276,7 @@ impl ListObjectVersionsOperation {
         if let (Some(delimiter), Some(key_marker)) = (delimiter, key_marker)
             && key_marker.ends_with(delimiter)
         {
-            self.resume_common_prefix = Some(key_marker.to_string());
+            self.prefixes.set_resume(Some(key_marker.to_string()));
         }
 
         let start = match key_marker {
@@ -295,7 +291,7 @@ impl ListObjectVersionsOperation {
                 }
                 // Include the marker key itself when we still owe its older
                 // versions (version_id_marker) or need to skip its group.
-                if self.input.version_id_marker.is_some() || self.resume_common_prefix.is_some() {
+                if self.input.version_id_marker.is_some() || self.prefixes.resume().is_some() {
                     Some(IterStart::At(start_key.into()))
                 } else {
                     Some(IterStart::After(start_key.into()))
@@ -393,9 +389,7 @@ impl ListObjectVersionsOperation {
 
             match common_prefix_of(&key, self.prefix_str(), self.input.delimiter.as_deref()) {
                 Some(group) => {
-                    let already_emitted = self.last_emitted_group.as_deref()
-                        == Some(group.as_str())
-                        || self.resume_common_prefix.as_deref() == Some(group.as_str());
+                    let already_emitted = self.prefixes.already_emitted(&group);
                     self.cursor_group_prefix =
                         match BlobHeadKey::object_prefix(&self.input.bucket, &group) {
                             Ok(bytes) => Some(bytes),
@@ -404,15 +398,15 @@ impl ListObjectVersionsOperation {
                     if already_emitted {
                         continue;
                     }
-                    self.resume_common_prefix = None;
+                    self.prefixes.set_resume(None);
                     if self.try_emit_common_prefix(group) {
                         return self.commit();
                     }
                     continue;
                 }
                 None => {
-                    self.last_emitted_group = None;
-                    self.resume_common_prefix = None;
+                    self.prefixes.clear_last();
+                    self.prefixes.set_resume(None);
                     self.cursor_group_prefix = None;
                     self.current_key = Some((key.clone(), head_version_id));
                     self.version_window.clear();
@@ -487,19 +481,16 @@ impl ListObjectVersionsOperation {
                 .then_with(|| right_id.cmp(left_id))
         });
 
-        let apply_marker = self.input.key_marker.as_deref() == Some(key.as_str());
-        let version_marker = self.input.version_id_marker;
-        let mut marker_seen = !apply_marker || version_marker.is_none();
+        let marker = match self.input.key_marker.as_deref() == Some(key.as_str()) {
+            true => self.input.version_id_marker,
+            false => None,
+        };
 
         let mut location_reads = Vec::new();
         let mut pending = Vec::new();
-        for (version_id, version) in versions {
-            if !marker_seen {
-                if Some(version_id) == version_marker {
-                    marker_seen = true;
-                }
-                continue;
-            }
+        for (version_id, version) in
+            split_after_marker(versions, marker, |(version_id, _)| *version_id)
+        {
             let is_latest = version_id == head_version_id;
             match version.state {
                 BlobVersionState::Deleted => {
@@ -697,9 +688,8 @@ impl ListObjectVersionsOperation {
             self.truncate();
             return true;
         }
-        self.last_emitted_group = Some(group.clone());
-        self.last_marker = Some((group.clone(), None));
-        self.common_prefixes.push(group);
+        self.prefixes.push(group.clone());
+        self.last_marker = Some((group, None));
         false
     }
 
@@ -719,7 +709,7 @@ impl ListObjectVersionsOperation {
         self.state = ListObjectVersionsState::CommitTransaction;
         self.output = Some(Ok(ListObjectVersionsResult {
             items: std::mem::take(&mut self.items),
-            common_prefixes: std::mem::take(&mut self.common_prefixes),
+            common_prefixes: self.prefixes.take(),
             is_truncated: self.is_truncated,
             next_key_marker: self.next_key_marker.take(),
             next_version_id_marker: self.next_version_id_marker.take(),
