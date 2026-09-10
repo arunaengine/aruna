@@ -287,7 +287,3 @@ pub async fn main() -> Result<(), CliError> {
 
     Ok(())
 }
-
-pub async fn connect() -> () {
-    todo!()
-}

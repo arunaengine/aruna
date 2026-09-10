@@ -291,9 +291,6 @@ mod tests {
         async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
             Ok(())
         }
-        async fn sweep_orphans(&self, _grace: std::time::Duration) -> Result<(), BackendError> {
-            Ok(())
-        }
     }
 
     fn subject() -> PlacementSubject {

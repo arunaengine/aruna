@@ -18,8 +18,6 @@ pub enum CliError {
     JwtTokenError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64DecodeError(#[from] base64::DecodeError),
-    #[error("Cannot convert Vec into Slice")]
-    IntoSliceError,
     #[error(transparent)]
     Ed25519Error(#[from] ed25519_dalek::ed25519::Error),
     #[error(transparent)]
@@ -73,14 +71,6 @@ pub enum CliError {
     },
     #[error("OIDC provider '{0}' is not configured")]
     OidcProviderNotFound(String),
-    #[error("OIDC flow requires local Aruna HTTP address to be configured")]
-    MissingArunaHttpAddress,
-    #[error("Local bootstrap flow requires --name")]
-    MissingBootstrapName,
-    #[error("No initial local onboarding secret is available")]
-    MissingInitialOnboardingSecret,
-    #[error("Arbitrary user ids require --unsafe-arbitrary-user-id")]
-    UnsafeUserIdRequired,
     #[error("invalid {key} value {value:?}: {message}")]
     InvalidConfigValue {
         key: &'static str,

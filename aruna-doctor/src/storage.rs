@@ -204,7 +204,7 @@ pub fn import_snapshot_into_new_database(
                 }
 
                 let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
-                keyspace_state = Some(ImportKeyspaceState::new(name, keyspace));
+                keyspace_state = Some(ImportKeyspaceState::new(keyspace));
                 keyspace_count += 1;
             }
             RECORD_ENTRY => {
@@ -281,8 +281,6 @@ pub fn import_snapshot_into_new_database(
 }
 
 struct ImportKeyspaceState {
-    #[allow(dead_code)]
-    name: String,
     keyspace: OptimisticTxKeyspace,
     keyspace_entry_count: u64,
     pending_txn: Option<fjall::OptimisticWriteTx>,
@@ -290,9 +288,8 @@ struct ImportKeyspaceState {
 }
 
 impl ImportKeyspaceState {
-    fn new(name: String, keyspace: OptimisticTxKeyspace) -> Self {
+    fn new(keyspace: OptimisticTxKeyspace) -> Self {
         Self {
-            name,
             keyspace,
             keyspace_entry_count: 0,
             pending_txn: None,

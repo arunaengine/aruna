@@ -1391,10 +1391,6 @@ impl ExecutorBackend for KubernetesBackend {
         // NotFound, which discharges the obligation and leaks the PVC and Secret.
         delete_named(self.jobs(), &context.attempt.external_name()).await
     }
-
-    async fn sweep_orphans(&self, _grace: Duration) -> Result<(), BackendError> {
-        Ok(())
-    }
 }
 
 impl KubernetesBackend {

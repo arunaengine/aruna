@@ -1759,10 +1759,6 @@ impl ExecutorBackend for DockerBackend {
             ))),
         }
     }
-
-    async fn sweep_orphans(&self, _grace: Duration) -> Result<(), BackendError> {
-        Ok(())
-    }
 }
 
 fn check_cancel(cancel: &CancellationToken) -> Result<(), BackendError> {
