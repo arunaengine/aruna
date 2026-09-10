@@ -27,11 +27,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::document_sync_outbox::{
+use crate::placement::placement_ref_for_target;
+use crate::sync::document_sync_outbox::{
     admin_outbox_prefix, new_outbox_record_with_id, outbox_write_entry, revocation_index_entry,
     schedule_outbox_drain_effect,
 };
-use crate::placement::placement_ref_for_target;
 
 const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
 const SELF_SERVICE_REVOCATION_CAP: usize =
@@ -907,10 +907,10 @@ mod tests {
         MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
         RevokeTokenOperation, StorageEffect, StorageEvent, admin_document_reducer_state_key,
     };
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::document_sync_outbox::admin_outbox_prefix;
     use crate::driver::{DriverContext, drive};
-    use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use crate::realm::get_realm_config::GetRealmConfigOperation;
+    use crate::sync::document_sync_outbox::admin_outbox_prefix;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;

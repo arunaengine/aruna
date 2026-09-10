@@ -4,7 +4,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{AuthContext, Permission};
 use aruna_core::types::{Effects, TxnId};
 
-use crate::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
+use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckPermissionsConfig {
@@ -93,16 +93,20 @@ mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation};
-    use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
-    use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
-    use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-    use crate::claim_initial_realm_admin::{
+    use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+    use crate::driver::{DriverContext, drive};
+    use crate::groups::add_group_role::{
+        AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
+    };
+    use crate::groups::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::realm::add_user_to_realm_role::{
+        AddUserToRealmRolesInput, AddUserToRealmRolesOperation,
+    };
+    use crate::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     #[tokio::test]
     pub async fn public_roles_apply_to_everyone_and_are_read_only() {

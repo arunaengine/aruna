@@ -159,7 +159,7 @@ impl Operation for CreateTokenOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::create_token::{
+    use crate::auth::create_token::{
         CreateTokenConfig, CreateTokenError, CreateTokenOperation, mint_token,
     };
     use crate::driver::{DriverContext, drive};
