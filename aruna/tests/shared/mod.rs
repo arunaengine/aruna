@@ -29,22 +29,22 @@ use aruna_core::structs::{
     NodeCapabilities, NodeUrls, PathRestriction, RealmId, TokenClaims, UserAccess,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
+use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::node::node_info::seed_node_info_document;
+use aruna_operations::placement::policy::{SubjectScanMode, sync_subject};
+use aruna_operations::realm::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::claim_initial_realm_admin::{
+use aruna_operations::realm::claim_initial_realm_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
-use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::node_info::seed_node_info_document;
-use aruna_operations::placement_policy::{SubjectScanMode, sync_subject};
+use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::realm::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::s3::get_user_access::GetUserAccessOperation;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
@@ -710,7 +710,7 @@ async fn spawn_seed_node_with_mode(
     // Mirrors the startup path in main.rs: the seed is rank-0 holder of every
     // shard in its single-node realm and must create the shard topic geneses
     // eagerly, or its first shard-classed writes defer forever.
-    aruna_operations::process_placements::process_shard_placements(
+    aruna_operations::placement::process_placements::process_shard_placements(
         &context,
         realm_id,
         net.node_id(),
@@ -859,13 +859,13 @@ async fn spawn_joiner_node_with_mode(
     // Mirrors the startup path in main.rs: join the held shard topics from
     // co-holders, then create the geneses of shards this node is now rank-0
     // holder of (join-before-create adopts geneses the seed already made).
-    aruna_operations::startup::restore_shard_subscriptions(
+    aruna_operations::node::startup::restore_shard_subscriptions(
         &joiner_context,
         config.node_id,
         config.realm_id,
     )
     .await;
-    aruna_operations::process_placements::reconcile_shard_topics(
+    aruna_operations::placement::process_placements::reconcile_shard_topics(
         &joiner_context,
         config.realm_id,
         config.node_id,

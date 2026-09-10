@@ -8,26 +8,26 @@ use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
 use aruna_core::structs::{Actor, OidcProviderConfig, RealmId, TokenClaims};
-use aruna_operations::auth::{
+use aruna_operations::auth::bearer_token::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
 };
-use aruna_operations::claim_initial_realm_admin::{
+use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::onboarding::consume_onboarding_secret::{
+    ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::inspect_onboarding_secret::{
+    InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
+};
+use aruna_operations::realm::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
 };
-use aruna_operations::consume_onboarding_secret::{
-    ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
-};
-use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::inspect_onboarding_secret::{
-    InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
-};
-use aruna_operations::recover_initial_admin::{
+use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::recover_initial_admin::{
     RecoverInitialAdminInput, RecoverInitialAdminOperation,
 };
-use aruna_operations::register_or_get_oidc_user::{
+use aruna_operations::users::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
 use aruna_tasks::TaskHandle;
@@ -530,16 +530,16 @@ mod tests {
         User,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::announce_realm_presence::{
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::announce_realm_presence::{
         AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
     };
-    use aruna_operations::claim_initial_realm_admin::{
+    use aruna_operations::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::incoming::initialize_net_incoming;
-    use aruna_operations::task_incoming::initialize_task_incoming;
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::sync::incoming::initialize_net_incoming;
+    use aruna_operations::tasks::task_incoming::initialize_task_incoming;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::extract::State;
