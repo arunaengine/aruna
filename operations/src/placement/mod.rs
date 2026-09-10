@@ -1,6 +1,11 @@
+pub mod allocate_handle;
 #[cfg(test)]
 mod distribution;
+pub mod expand_placement;
 pub mod fence;
+pub mod policy;
+pub mod process_placements;
+pub mod process_transitions;
 pub mod resolver;
 pub mod selector;
 pub mod transition;
@@ -22,11 +27,8 @@ pub use resolver::{
 };
 
 /// Canonical rendezvous subject for a shard's holder resolution:
-/// `strategy_id(16) ‖ shard(4, big-endian)`. The epoch is deliberately excluded
-/// (spec 6.3.1): the holder set is a pure function of the bucket, so a rebalance
-/// stays a map change and never a per-document rewrite. Every document hashing
-/// into the shard resolves the same holder set from this, so one sync topic per
-/// shard has one authoritative holder set.
+/// `strategy_id(16) ‖ shard(4, big-endian)`. The epoch is excluded (spec 6.3.1),
+/// so the holder set is a pure function of the bucket and never per-document.
 pub fn shard_subject_bytes(placement: &PlacementRef) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(20);
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
@@ -34,10 +36,9 @@ pub fn shard_subject_bytes(placement: &PlacementRef) -> Vec<u8> {
     bytes
 }
 
-/// Holder pin/exclude override for a shard: matched on the shard subject, not
-/// a document subject, because one shard topic has exactly one holder set.
-/// Per-document overrides still steer strategy selection (see
-/// [`strategy_for_target`]); their pin/exclude lists are inert for holders.
+/// Holder pin/exclude override for a shard, matched on the shard subject because
+/// one shard topic has one holder set. Per-document overrides steer strategy
+/// selection only; their pin/exclude lists are inert for holders.
 pub(crate) fn shard_override<'a>(
     config: &'a RealmConfigDocument,
     placement: &PlacementRef,
@@ -49,12 +50,9 @@ pub(crate) fn shard_override<'a>(
         .find(|over| over.subject == subject)
 }
 
-/// Placement reference stamped into a change's sync envelope for `target`.
-///
-/// Resolves the governing strategy from the realm config (passing the metadata
-/// document path when the caller has it). Falls back to [`PlacementRef::NIL`]
-/// only when the realm has no strategies (early bootstrap). Epoch is fixed 0
-/// for this arc.
+/// Placement reference stamped into a change's sync envelope for `target`:
+/// resolves the governing strategy from the realm config, falling back to
+/// [`PlacementRef::NIL`] only when the realm has no strategies (early bootstrap).
 pub fn placement_ref_for_target(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
@@ -69,13 +67,9 @@ pub fn placement_ref_for_target(
     }
 }
 
-/// Bucket the document's registry row rides.
-///
-/// Resolved directly from the registry class, not from the document's general
-/// precedence chain: the registry class is bound "everywhere" so every node
-/// carries the row, while the document's bucket is replica-capped and reaches
-/// only its holders. Document overrides and group/path bindings steer where the
-/// *document* lives and must not cap the registry row too.
+/// Bucket the document's registry row rides: resolved from the registry class,
+/// not the document's precedence chain, so every node carries the row while the
+/// document's replica-capped bucket reaches only its holders.
 pub fn registry_placement(
     config: &RealmConfigDocument,
     record: &aruna_core::structs::MetadataRegistryRecord,
@@ -105,10 +99,9 @@ pub(crate) fn registry_strategy(config: &RealmConfigDocument) -> Option<&Placeme
     resolver::strategy_for_class(config, DocumentClass::MetadataRegistry)
 }
 
-/// Placement plan for a document `target`: its shard's rank-ordered holder set
-/// (the same set every document in the shard resolves), the nominal replica
-/// target the pending machinery tops up toward, and the envelope reference.
-/// `None` when no strategy governs the target.
+/// Placement plan for a document `target`: its shard's rank-ordered holder set,
+/// the nominal replica target the pending machinery tops up toward, and the
+/// envelope reference. `None` when no strategy governs the target.
 pub struct TargetPlacementPlan {
     pub holders: Vec<NodeId>,
     pub desired_count: usize,
@@ -159,11 +152,9 @@ pub enum PlacementResolveError {
     CandidateMapUnavailable(u64),
 }
 
-/// Rank-ordered holders of a specific shard (capped by the strategy's
-/// `replica_count`, or all eligible for an everywhere strategy). Used by the
-/// placement reconciler and the startup restore to enumerate the co-holders of
-/// each shard the local node is responsible for. Returns `Vec::new()` for the
-/// housekeeping callers whenever [`resolve_shard_holders_checked`] fails.
+/// Rank-ordered holders of a specific shard, capped by `replica_count` or all
+/// eligible for an everywhere strategy. Returns `Vec::new()` for housekeeping
+/// callers whenever [`resolve_shard_holders_checked`] fails.
 pub fn resolve_shard_holders(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
@@ -171,9 +162,8 @@ pub fn resolve_shard_holders(
     resolve_shard_holders_checked(config, placement).unwrap_or_default()
 }
 
-/// Holder resolution pinned to the bucket's activated candidate map: selection
-/// runs over the frozen view, so a config edit moves no holder and only a
-/// completed transition can. Routing callers use this variant and map its
+/// Holder resolution pinned to the bucket's activated candidate map: a config
+/// edit moves no holder, only a completed transition can. Routing callers map
 /// failures to 503, because an unresolvable bucket is not an absent document.
 pub fn resolve_shard_holders_checked(
     config: &RealmConfigDocument,
@@ -220,14 +210,9 @@ fn holders_limit_checked(
     Ok(selection.resolve(placement))
 }
 
-/// Read fan-out for a bucket: its activated holders first, then every holder a
-/// transition still names for it, in rank order and deduped.
-///
-/// A bucket in flight has its history on the old set and, once a target has
-/// proved, on the new one; a bucket that just cut over may still be catching a
-/// reader up from an old holder. The transition record's own lifetime is that
-/// window - it is pruned only after the grace release - so no clock is read
-/// here. Writes deliberately do not union: authority is the activation alone.
+/// Read fan-out for a bucket: activated holders first, then every holder a
+/// transition still names, rank-ordered and deduped. The record's lifetime is
+/// the catch-up window, so no clock is read; writes union nothing.
 pub fn read_holder_sets(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
@@ -356,10 +341,8 @@ pub(crate) fn map_selection<'a>(
 }
 
 /// First shard of a referenced strategy that resolves to zero holders while the
-/// realm still has usable capacity: a filter, affinity, or override that leaves
-/// documents routed to it with nowhere to live. Bootstrap, full drain, and
-/// all-full realms have no usable node and are not flagged (fail-early for a
-/// genuine misconfiguration, not for an empty realm).
+/// realm still has usable capacity: a filter, affinity or override leaves
+/// documents with nowhere to live. Usable-node-free realms are not flagged.
 pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<PlacementRef> {
     // Checked against the newest map, which is what a future activation would
     // pin: activated buckets are already frozen and cannot be emptied by an edit.
@@ -417,15 +400,9 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
     None
 }
 
-/// Desired shard-topic membership for a bucket: its activated holders plus
-/// every holder set a live transition still names for it.
-///
-/// A target must be a member to pull the history it has to verify, and an old
-/// holder must stay one until the record is released, or a reader mid-cutover
-/// would lose its source. That window closes `grace_ms` after the bucket cut
-/// over, so repeated transitions bound peak membership at `|old U new|` and
-/// steady-state membership at the holders (#399). `now_ms` only ends the
-/// window; when it starts is carried in the record.
+/// Desired shard-topic membership for a bucket: activated holders plus every
+/// holder a live transition still names. Targets need membership to pull history,
+/// old holders to serve it until release; `grace_ms` bounds the window (#399).
 pub struct BucketMembership {
     /// Sync membership and pull/delivery peers.
     pub members: Vec<NodeId>,
@@ -433,12 +410,9 @@ pub struct BucketMembership {
     pub publishers: Vec<NodeId>,
 }
 
-/// Per-bucket membership and publish authority, derived from each bucket's
-/// own completion and status rather than the transition as a whole:
-/// an admitted incomplete bucket adds its targets as members only, a
-/// completed bucket retains departing old holders (member and publisher)
-/// through its own grace window, and an aborted incomplete bucket adds
-/// nothing beyond the activated holders.
+/// Per-bucket membership and publish authority, derived from each bucket's own
+/// completion and status: admitted incomplete buckets add targets as members
+/// only, completed ones retain departing holders through grace, aborted add none.
 pub fn bucket_membership(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
@@ -558,13 +532,9 @@ pub fn retained_departing_holder(
     })
 }
 
-/// Whether `node_id` holds `placement`, and may therefore publish onto its
-/// topic. [`PlacementRef::NIL`] means no strategy governs the bucket during
-/// early bootstrap: nobody shards it, so it is nobody's to withhold and the
-/// local node counts as a holder.
-///
-/// The presence of a local copy of a document is never evidence of holdership:
-/// a rebalance leaves a stale copy behind on a node that is no longer a holder.
+/// Whether `node_id` holds `placement` and may publish onto its topic. NIL means
+/// no strategy governs the bucket during bootstrap, so all nodes count as
+/// holders. A local document copy is never evidence of holdership.
 pub fn holds_placement(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
@@ -574,13 +544,9 @@ pub fn holds_placement(
     *placement == PlacementRef::NIL || holders.contains(&node_id)
 }
 
-/// Whether `node_id` is a draining former-holder of `placement`: it is marked
-/// draining in the config yet would hold the shard with its own draining flag
-/// cleared. Such a node keeps publish rights on shards it previously held until
-/// its outbox has flushed (flush-then-leave), so its retained records stay
-/// deliverable. A node that was never a holder, or is fully removed from the
-/// config rather than draining, is not a former-holder and its records must
-/// remain undeliverable (DECISIONS K3): only a departing holder may flush.
+/// Whether `node_id` is a draining former-holder of `placement`: marked draining
+/// yet it would hold the shard with that flag cleared. It keeps publish rights
+/// until its outbox flushes (DECISIONS K3); a fully removed node does not.
 pub fn is_draining_former_holder(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
@@ -655,9 +621,8 @@ pub fn first_draining_holder_set_change(
 }
 
 /// Every draining former-holder of `placement` (see [`is_draining_former_holder`]).
-/// Co-holders keep these peers in the shard topic's membership and publisher set
-/// until they leave the config, so their in-flight flush is never cut off. Cheap
-/// no-op when nothing is draining.
+/// Co-holders keep these peers in the topic's membership and publisher set until
+/// they leave the config, so their in-flight flush is never cut off.
 pub fn draining_former_holders(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
@@ -711,9 +676,7 @@ pub fn held_buckets(
 }
 
 /// Bucket the create-receiving node picks for `subject`: the best-ranked of the
-/// buckets it already holds, so the origin is always a holder of the bucket it
-/// stamps and can always publish onto that bucket's topic. Weighted rendezvous
-/// on the subject spreads one node's documents across all its held buckets.
+/// buckets it already holds, so the origin can always publish onto its topic.
 /// `None` when the origin holds no bucket of the strategy.
 pub fn choose_origin_bucket(
     config: &RealmConfigDocument,

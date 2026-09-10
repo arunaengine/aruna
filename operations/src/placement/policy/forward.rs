@@ -1,9 +1,6 @@
-//! Routing a policy publication to a holder of its bucket.
-//!
-//! Only a holder may commit the immutable document, so an origin that holds no
-//! replica forwards the publication instead of writing it. The holder runs the
-//! ordinary create operation, which re-checks realm-admin authority for the
-//! forwarded caller: a relay never becomes the author.
+//! Routing a policy publication to a holder of its bucket. Only a holder may
+//! commit the immutable document, so an origin holding no replica forwards it,
+//! and the holder's create re-checks realm-admin authority for that caller.
 
 use std::sync::Arc;
 
@@ -16,7 +13,7 @@ use crate::metadata::forward::{
     MetadataWriteError, authorize_forwarded_caller, forward_auth_error, forward_to_holders,
 };
 use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
-use crate::placement_policy::create::{
+use crate::placement::policy::create::{
     CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation,
 };
 

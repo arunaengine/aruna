@@ -1,10 +1,6 @@
 //! Responder-local policy diagnostics: what this node enforces, which of its
-//! own registered copies are not serveable, and how much of the durable policy
-//! cache it holds.
-//!
-//! Every number here is an observation of this node's own rows. It says nothing
-//! about another partition, and cache coverage is never policy truth: an evicted
-//! entry only costs a refetch.
+//! own registered copies are not serveable, and its durable policy cache. Every
+//! number observes only this node's rows; cache coverage is not policy truth.
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -22,7 +18,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 use super::cache::{MAX_CACHE_ENTRIES, PolicyCacheEntry};
 
@@ -315,8 +311,8 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 
-    use crate::placement_policy::cache::PolicyCacheEntry;
-    use crate::placement_policy::fixtures::{signed_document, subject};
+    use crate::placement::policy::cache::PolicyCacheEntry;
+    use crate::placement::policy::fixtures::{signed_document, subject};
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])

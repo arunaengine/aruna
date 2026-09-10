@@ -1,10 +1,6 @@
-//! Placement-policy documents: creation on a holder, read by ref, and the
-//! fetch transport a non-holder resolves through.
-//!
-//! Placement of the document and placement allowed by the policy are separate
-//! details. Nothing in this module derives one from the other: the document's
-//! holders come from its policy id, while the subjects the policy admits come
-//! from its selectors and are evaluated only by `evaluate_placement`.
+//! Placement-policy documents: creation, read by ref, and fetch transport.
+//! Document and selector placement are separate: holders come from the policy
+//! id, while admitted subjects come from selectors via `evaluate_placement`.
 
 pub mod cache;
 pub mod create;

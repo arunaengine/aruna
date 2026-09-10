@@ -1,9 +1,6 @@
-//! Resolving a governed ref set and evaluating one subject against it.
-//!
-//! This is the sans-I/O gate every enforcement point shares: it only obtains the
-//! rules and calls the pure evaluator. Realm and group authorization has already
-//! run when it is reached, and a matching selector can never grant access that
-//! authorization denied.
+//! Resolving a governed ref set and evaluating one subject against it. The
+//! sans-I/O gate every enforcement point shares: it obtains the rules and calls
+//! the pure evaluator, and a selector never grants what authorization denied.
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -225,10 +222,9 @@ pub enum PolicyGateError {
     Policy(#[from] aruna_core::structs::PlacementPolicyError),
 }
 
-/// Builds the gate for one governed destination. `Ok(None)` means the ref set
-/// is empty, so the ungoverned path runs unchanged and performs no extra I/O.
-/// A node that stopped admitting governed data refuses only a governed write.
-/// `group_id` owns the destination bucket; `None` skips the ownership check.
+/// Builds the gate for one governed destination. `Ok(None)` means the ref set is
+/// empty, so the ungoverned path runs unchanged; `group_id` owns the destination
+/// bucket, `None` skips the check, and a stopped admission refuses a governed write.
 pub fn write_gate(
     context: Option<&GateContext>,
     refs: &[PlacementPolicyRef],
@@ -556,9 +552,9 @@ mod tests {
         let mut operation = operation(vec![first.policy_ref(), second.policy_ref()], "eu-west");
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&first), 10)));
-        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::fixtures::authority(realm()));
         operation.step(cached(&PolicyCacheEntry::verified(&document(&second), 10)));
-        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::fixtures::authority(realm()));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(
@@ -578,7 +574,7 @@ mod tests {
         let mut operation = operation(vec![rule.policy_ref()], "eu-west");
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::placement_policy::fixtures::group_authority(
+        operation.step(crate::placement::policy::fixtures::group_authority(
             realm(),
             owner,
         ));
@@ -605,9 +601,9 @@ mod tests {
             &document(&realm_wide),
             10,
         )));
-        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::fixtures::authority(realm()));
         operation.step(cached(&PolicyCacheEntry::verified(&document(&owned), 10)));
-        operation.step(crate::placement_policy::fixtures::group_authority(
+        operation.step(crate::placement::policy::fixtures::group_authority(
             realm(),
             group(),
         ));
@@ -626,7 +622,7 @@ mod tests {
         let mut operation = gate_for(vec![rule.policy_ref()], "eu-west", None);
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::placement_policy::fixtures::group_authority(
+        operation.step(crate::placement::policy::fixtures::group_authority(
             realm(),
             owner,
         ));
@@ -724,7 +720,7 @@ mod tests {
     }
 
     fn document(policy: &VerifiedPolicy) -> aruna_core::structs::PlacementPolicyDocument {
-        crate::placement_policy::tests::signed_document(realm(), policy, 1)
+        crate::placement::policy::tests::signed_document(realm(), policy, 1)
     }
 
     fn encoded(policy: &VerifiedPolicy) -> Value {
@@ -738,9 +734,9 @@ mod tests {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
         }
-        let (config_value, auth_value) = crate::placement_policy::tests::realm_view(
+        let (config_value, auth_value) = crate::placement::policy::tests::realm_view(
             &config,
-            crate::placement_policy::tests::admin_user(realm()),
+            crate::placement::policy::tests::admin_user(realm()),
         );
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {

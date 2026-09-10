@@ -1,9 +1,6 @@
-//! Bounded local revalidation of this node's registered copies.
-//!
-//! An observed subject change, a rejoin, and a graceful departure all reduce to
-//! the same walk: advance the local subject, stop serving until the inventory
-//! has been re-evaluated, then page through every registration and decide it
-//! against the new subject. Nothing here waits for a realm-wide acknowledgement.
+//! Bounded local revalidation of this node's registered copies: advance the
+//! local subject, re-evaluate the inventory, then decide every registration
+//! against it, without waiting for a realm-wide acknowledgement.
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -381,13 +378,9 @@ impl Operation for SubjectScanOperation {
     }
 }
 
-/// Reacts to an observed placement change for this node.
-///
-/// A node the realm still places revalidates its inventory under the observed
-/// subject. A node marked draining, or one the realm no longer places at all,
-/// departs: it stops admitting governed data immediately and records every
-/// local copy unresolved. Departure is best effort and never blocks the change
-/// that caused it.
+/// Reacts to an observed placement change for this node. A node the realm still
+/// places revalidates its inventory under the observed subject; one draining or
+/// no longer placed departs, blocking admission and recording copies unresolved.
 pub async fn observe_placement(
     context: &DriverContext,
     realm_id: RealmId,
@@ -423,7 +416,7 @@ pub async fn observe_placement(
     // Compute follows the same observation: a departing node stops offering
     // execution and publishes its final snapshots, a returning one advertises
     // again. Best effort, because departure may never block on it.
-    if let Err(error) = crate::node_info::set_departure_state(
+    if let Err(error) = crate::node::node_info::set_departure_state(
         context,
         node_id,
         realm_id,

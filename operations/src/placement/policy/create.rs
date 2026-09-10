@@ -20,11 +20,11 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_sync_outbox::{
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
+use crate::sync::document_sync_outbox::{
     new_outbox_record, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatePolicyConfig {
@@ -467,12 +467,12 @@ impl Operation for CreatePolicyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claim_initial_realm_admin::{
+    use crate::driver::{DriverContext, drive};
+    use crate::placement::policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
+    use crate::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
-    use crate::placement_policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::handle::Handle;
     use aruna_core::structs::verify_policy_authority;
     use aruna_core::structs::{PlacementSelector, RealmId};
