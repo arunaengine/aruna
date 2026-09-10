@@ -45,7 +45,6 @@ use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
-use aruna_core::permission_path::compile_permission_matcher;
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
@@ -9479,26 +9478,7 @@ fn has_current_write_permission<'a>(
     path: &str,
     roles: impl IntoIterator<Item = &'a Role>,
 ) -> bool {
-    let mut allowed = false;
-    for role in roles {
-        if user_id.is_nil() || !role.assigned_users.contains(&user_id) {
-            continue;
-        }
-        for (pattern, permission) in &role.permissions {
-            let Ok(glob) = compile_permission_matcher(pattern) else {
-                return false;
-            };
-            if !glob.is_match(path) {
-                continue;
-            }
-            match permission {
-                aruna_core::structs::Permission::DENY => return false,
-                aruna_core::structs::Permission::WRITE => allowed = true,
-                aruna_core::structs::Permission::READ => {}
-            }
-        }
-    }
-    allowed
+    !user_id.is_nil() && aruna_core::structs::holds_admin_write(user_id, path, roles.into_iter())
 }
 
 /// Validates the self-consistency of a replicated node-usage snapshot against
@@ -10658,6 +10638,17 @@ mod tests {
             user_id,
             &format!("/{realm_id}/g/{group_id}/admin/config"),
             [&role],
+        ));
+
+        let anonymous = UserId::nil(realm_id);
+        let public_role = Role {
+            assigned_users: HashSet::from([anonymous]),
+            ..role.clone()
+        };
+        assert!(!has_current_write_permission(
+            anonymous,
+            &format!("/{realm_id}/g/{group_id}/admin"),
+            [&public_role],
         ));
     }
 
