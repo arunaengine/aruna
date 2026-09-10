@@ -184,11 +184,9 @@ pub fn delete_holders_effect(
     })
 }
 
-// DEFERRED (#280 audit trail): these durable audit records back the generic audit
-// read endpoint (auth-security branch); the authoritative causal-event contract
-// (retained events, actor/cursor pagination) is the deferred remainder.
-// DEFERRED (#364 lineage, #293 historical replay): both are read/dashboard
-// projections over these audit and event-log records; not built (enhancements).
+// DEFERRED (#280 audit trail): these audit records back the generic audit read
+// endpoint; the causal-event contract is the deferred remainder. DEFERRED (#364
+// lineage, #293 historical replay): read/dashboard projections, not built.
 pub fn write_audit_effect(
     record: &MetadataAuditRecord,
     audit_id: Ulid,
@@ -247,7 +245,9 @@ pub fn create_records_and_outbox_write_entries(
         ),
     ];
     if let Some(outbox) = outbox {
-        writes.push(crate::document_sync_outbox::outbox_write_entry(outbox)?);
+        writes.push(crate::sync::document_sync_outbox::outbox_write_entry(
+            outbox,
+        )?);
         if let Some(revision) = document_lifecycle_revision_from_outbox(outbox)? {
             writes.push(revision);
         }

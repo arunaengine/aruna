@@ -24,17 +24,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
-use crate::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::jobs::lifecycle::ids::SubmissionRequest;
 use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::{
     MetadataReferencePreflightNodeExecution, MetadataReferencePreflightNodeRequest,
     MetadataRoCrateExportView,
 };
-use crate::request_policy::PolicyRequestExtras;
+use crate::metadata::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::s3::search_objects::{ObjectKeyMatch, ObjectSearchNodePage};
-use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
 
@@ -93,9 +93,8 @@ pub enum MetadataTransportMessage {
         result: Result<Vec<MetadataSearchHit>, MetadataReadError>,
     },
     /// A metadata write that arrived at a node holding none of the document's
-    /// bucket, forwarded to a holder. The payloads mirror the HTTP handlers'
-    /// deconstructed request; `auth_token` carries the caller's authority so the
-    /// holder re-runs the same permission checks the origin would have run.
+    /// bucket, forwarded to a holder. The payload mirrors the HTTP request
+    /// and `auth_token` lets the holder re-run the origin's permission checks.
     ForwardCreateDocument {
         auth_token: Option<MetadataAuthToken>,
         config_digest: [u8; 32],
@@ -266,9 +265,8 @@ pub enum MetadataTransportMessage {
         document: Box<PlacementPolicyDocument>,
     },
     /// One immutable job-family record offered to a holder of the family
-    /// placement. The frame is bounded at decode and the envelope keeps its own
-    /// publisher, so the authenticated peer is only the relay. Appended last so
-    /// existing variant indices stay stable.
+    /// placement. The peer is only a relay: the frame is bounded at decode and
+    /// keeps its own publisher. Appended last to keep variant indices stable.
     ForwardJobRecord {
         placement: PlacementRef,
         record: Box<JobRecordFrame>,
@@ -298,10 +296,8 @@ pub enum MetadataTransportMessage {
         result: Result<Box<ReceiptFrame>, LaunchDecline>,
     },
     /// One complete external submission forwarded a single hop to an observed
-    /// family holder, with the identity the ingress preassigned. The holder
-    /// revalidates the caller and recomputes that identity before it commits,
-    /// and never forwards it again. Appended after the earlier variants so
-    /// their indices stay stable.
+    /// family holder with the ingress-preassigned identity; the holder
+    /// revalidates the caller and recomputes it. Appended to keep indices stable.
     ForwardJobSubmission {
         auth_token: MetadataAuthToken,
         submission_id: SubmissionId,
@@ -351,11 +347,8 @@ pub enum MetadataTransportMessage {
         result: Result<Box<MetadataReferencePreflightNodeExecution>, MetadataReadError>,
     },
     /// An administrative event whose origin holds none of the target's shard,
-    /// handed to a holder that relays the exact origin-signed envelope. It
-    /// deliberately carries no caller token: the envelope's origin signature is
-    /// the authority, and every receiver re-authorizes against the origin.
-    /// Appended after the preflight variants so all prior postcard discriminants
-    /// remain stable.
+    /// relayed to a holder by origin-signed envelope; no caller token, as every
+    /// receiver re-authorizes against the origin. Appended to keep indices stable.
     ForwardAdminEvent {
         target: DocumentSyncTarget,
         event: Box<AdminDocumentEvent>,
@@ -377,10 +370,9 @@ pub enum MetadataTransportMessage {
     ForwardedGroupCreateConflict {
         reason: String,
     },
-    /// One device version a synced folder asks its realm node to pull and
-    /// commit as the owner. The realm node reads the exact version from the
-    /// device and writes its own copy, so the device never pushes. Appended
-    /// after the earlier variants so their indices stay stable.
+    /// One device version a synced folder asks its realm node to pull and commit
+    /// as the owner; the realm node reads it back from the device and writes its
+    /// own copy, so the device never pushes. Appended to keep indices stable.
     ForwardSyncPull {
         auth_token: MetadataAuthToken,
         source: Box<VersionedObjectArn>,
@@ -446,11 +438,9 @@ pub enum MetadataTransportMessage {
     ForwardedBucketCreated {
         result: Result<(), SyncRefusal>,
     },
-    /// One registered Profile document a holder serves for validation. It
-    /// deliberately carries no caller token: the responder admits
-    /// infrastructure peers only and answers nothing outside `profiles/`, so
-    /// no user identity is ever asserted across the hop. Appended last so
-    /// every existing postcard discriminant stays stable.
+    /// One registered Profile document a holder serves for validation. No caller
+    /// token: the responder admits infrastructure peers only and serves nothing
+    /// outside `profiles/`. Appended last to keep postcard discriminants stable.
     ForwardExportProfile {
         config_digest: [u8; 32],
         profile_id: Ulid,

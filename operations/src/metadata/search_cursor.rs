@@ -299,10 +299,9 @@ pub struct SearchPage {
     pub truncated: bool,
 }
 
-/// Deduplicate hits on `(graph_iri, subject_iri)` keeping the highest quantized
-/// score (smallest `document_id` on ties), preserving title, snippet and subject
-/// types from whichever copy carries them, and order by score descending with a
-/// `(graph_iri, subject_iri)` tie-break for a stable total order.
+/// Deduplicate hits on `(graph_iri, subject_iri)`, keeping the highest
+/// quantized score (smallest `document_id` on ties) and any title, snippet or
+/// subject types; final order is score descending, then graph and subject IRI.
 pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
     let mut deduped: HashMap<(String, String), MetadataSearchHit> = HashMap::new();
     for hit in hits {
@@ -342,12 +341,9 @@ pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit>
     hits
 }
 
-// Must mirror craqle's limit_search_hits ordering exactly (quantized score key,
-// then graph and subject IRIs) so each node's returned list is a prefix of the
-// merged order; a mismatch would let the watermark permanently skip hits at
-// fetch boundaries. Accepted best-effort gap: exact BM25 ties truncated inside
-// Tantivy's per-graph top-k can still exclude a doc that later resurfaces above
-// the watermark.
+// Must mirror craqle's limit_search_hits ordering (quantized score, then IRIs)
+// or watermarks can permanently skip hits at fetch boundaries. Accepted gap:
+// BM25 ties truncated inside Tantivy's per-graph top-k may resurface later.
 fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
 }
@@ -360,12 +356,8 @@ pub(super) fn compare_hits(left: &MetadataSearchHit, right: &MetadataSearchHit) 
 }
 
 /// Turn merged node results into one page plus an optional continuation.
-///
-/// The `watermark` is the resume point in the merged, deduplicated order: every
-/// hit at or above it was already emitted, so it is dropped here (coordinator-side
-/// dedup-then-filter). Per-node resume positions size the next fetch. A page still
-/// continues when a node was saturated even if this page added nothing, and paging
-/// stops once the deepest resume reaches `max_depth`.
+/// `watermark` drops hits already emitted in merged order; a page continues
+/// while any node is saturated, and paging stops at `max_depth`.
 pub fn paginate(
     node_results: Vec<NodeSearchResult>,
     watermark: Option<SearchWatermark>,
