@@ -100,7 +100,10 @@ pub enum Commands {
         command: ReclaimCommands,
     },
     /// Rewrite job family records stored before execution results carried
-    /// stdout and stderr tails. Run with the node stopped; safe to repeat.
+    /// stdout and stderr tails, rewrite realm config documents stored before
+    /// the compute catch-up wait, and delete the derived projection-cache rows,
+    /// which the node rebuilds. Writes the database: run with the node stopped;
+    /// safe to repeat.
     Migrate {
         database_path: String,
     },
