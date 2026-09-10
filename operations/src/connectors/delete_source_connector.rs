@@ -7,11 +7,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::connectors::reference_scan::{ReferenceScan, ReferenceScanPhase};
 use crate::connectors::repository::{
-    StorageReadError, blob_version_references_connector, iter_connector_reference_versions_effect,
-    parse_blob_version_iter, parse_connector_read, parse_connector_secret_read,
-    read_connector_effect, read_connector_secret_effect, source_connector_key,
-    source_connector_secret_key,
+    StorageReadError, parse_connector_read, parse_connector_secret_read, read_connector_effect,
+    read_connector_secret_effect, source_connector_key, source_connector_secret_key,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,30 +83,6 @@ impl DeleteSourceConnectorOperation {
         }
     }
 
-    fn emit_error(&mut self, error: DeleteSourceConnectorError) -> Effects {
-        self.state = DeleteSourceConnectorState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn abort_with_error(&mut self, error: DeleteSourceConnectorError) -> Effects {
-        let Some(txn_id) = self.txn_id.take() else {
-            return self.emit_error(error);
-        };
-
-        self.state = DeleteSourceConnectorState::AbortTransaction;
-        self.output = Some(Err(error));
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn fail_or_abort(&mut self, error: DeleteSourceConnectorError) -> Effects {
-        if self.txn_id.is_some() {
-            self.abort_with_error(error)
-        } else {
-            self.emit_error(error)
-        }
-    }
-
     fn handle_init(&mut self) -> Effects {
         self.state = DeleteSourceConnectorState::ReadConnector;
         smallvec![read_connector_effect(
@@ -148,8 +123,7 @@ impl DeleteSourceConnectorOperation {
         match event {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
-                self.state = DeleteSourceConnectorState::ScanReferenceVersions;
-                smallvec![iter_connector_reference_versions_effect(None, Some(txn_id))]
+                self.scan_reference_versions(None)
             }
             Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
             received => self.emit_error(DeleteSourceConnectorError::InvalidStateEvent {
@@ -158,47 +132,6 @@ impl DeleteSourceConnectorOperation {
                 received,
             }),
         }
-    }
-
-    fn current_txn_id(&mut self) -> Result<TxnId, Effects> {
-        self.txn_id.ok_or_else(|| {
-            self.emit_error(DeleteSourceConnectorError::StorageError(
-                StorageError::TransactionNotFound,
-            ))
-        })
-    }
-
-    fn scan_reference_versions(&mut self, start_after: Option<aruna_core::types::Key>) -> Effects {
-        let txn_id = match self.current_txn_id() {
-            Ok(txn_id) => txn_id,
-            Err(effects) => return effects,
-        };
-
-        self.state = DeleteSourceConnectorState::ScanReferenceVersions;
-        smallvec![iter_connector_reference_versions_effect(
-            start_after,
-            Some(txn_id),
-        )]
-    }
-
-    fn handle_reference_versions_scanned(&mut self, event: Event) -> Effects {
-        let (versions, next_start_after) = match parse_blob_version_iter(event) {
-            Ok(result) => result,
-            Err(error) => return self.abort_with_error(error.into()),
-        };
-
-        if versions
-            .iter()
-            .any(|version| blob_version_references_connector(version, self.input.connector_id))
-        {
-            return self.abort_with_error(DeleteSourceConnectorError::ReferencedByObjectVersion);
-        }
-
-        if let Some(start_after) = next_start_after {
-            return self.scan_reference_versions(Some(start_after));
-        }
-
-        self.delete_records()
     }
 
     fn delete_records(&mut self) -> Effects {
@@ -245,40 +178,49 @@ impl DeleteSourceConnectorOperation {
         self.output = Some(Ok(DeleteSourceConnectorResult));
         smallvec![]
     }
+}
 
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                self.state = DeleteSourceConnectorState::Finish;
-                self.output = Some(Ok(DeleteSourceConnectorResult));
-                smallvec![]
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.txn_id = None;
-                self.emit_error(error.into())
-            }
-            received => self.fail_or_abort(DeleteSourceConnectorError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received,
-            }),
+impl ReferenceScan for DeleteSourceConnectorOperation {
+    fn scan_connector_id(&self) -> Ulid {
+        self.input.connector_id
+    }
+
+    fn scan_txn_id(&mut self) -> &mut Option<TxnId> {
+        &mut self.txn_id
+    }
+
+    fn scan_phase(&mut self, phase: ReferenceScanPhase) {
+        self.state = match phase {
+            ReferenceScanPhase::Scan => DeleteSourceConnectorState::ScanReferenceVersions,
+            ReferenceScanPhase::Abort => DeleteSourceConnectorState::AbortTransaction,
+            ReferenceScanPhase::Error => DeleteSourceConnectorState::Error,
+        };
+    }
+
+    fn scan_error_output(&mut self, error: Self::Error) {
+        self.output = Some(Err(error));
+    }
+
+    fn scan_referenced(&self) -> Self::Error {
+        DeleteSourceConnectorError::ReferencedByObjectVersion
+    }
+
+    fn invalid_event(&self, expected: &'static str, received: Event) -> Self::Error {
+        DeleteSourceConnectorError::InvalidStateEvent {
+            state: self.state.clone(),
+            expected,
+            received,
         }
     }
 
-    fn handle_transaction_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = DeleteSourceConnectorState::Error;
-                smallvec![]
-            }
-            received => self.emit_error(DeleteSourceConnectorError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received,
-            }),
-        }
+    fn scan_done(&mut self) -> Effects {
+        self.delete_records()
+    }
+
+    fn commit_done(&mut self) -> Effects {
+        self.state = DeleteSourceConnectorState::Finish;
+        self.output = Some(Ok(DeleteSourceConnectorResult));
+        smallvec![]
     }
 }
 
