@@ -41,6 +41,7 @@ use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::MetadataAuthToken;
+use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{
     METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
     METADATA_REGISTRY_CANDIDATE_LIMIT,
@@ -1432,14 +1433,10 @@ async fn forward_path_resolution(
                 }
             }
             Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
-                result: Err(MetadataReadError::Unauthorized),
+                result:
+                    Err(error @ (MetadataReadError::Unauthorized | MetadataReadError::Forbidden)),
             })) => {
-                auth_error.get_or_insert(MetadataApiError::Unauthorized);
-            }
-            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
-                result: Err(MetadataReadError::Forbidden),
-            })) => {
-                auth_error.get_or_insert(MetadataApiError::Forbidden);
+                auth_error.get_or_insert(error);
             }
             Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
                 result: Err(MetadataReadError::NotFound),
@@ -1452,27 +1449,27 @@ async fn forward_path_resolution(
 
 fn reduce_path_response(
     success: Option<MetadataPathLookupResult>,
-    auth_error: Option<MetadataApiError>,
+    auth_error: Option<MetadataReadError>,
     divergent: bool,
     not_found: bool,
     unavailable: bool,
 ) -> Result<MetadataPathLookupResult, MetadataApiError> {
-    if let Some(error) = auth_error {
-        return Err(error);
-    }
-    if divergent || (success.is_some() && (not_found || unavailable)) {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    if let Some(result) = success {
-        return Ok(result);
-    }
-    if unavailable {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    if not_found {
-        Err(MetadataApiError::NotFound)
-    } else {
-        Err(MetadataApiError::ServiceUnavailable)
+    let conflict = divergent || (success.is_some() && (not_found || unavailable));
+    match reduce_holder_reads(
+        success,
+        auth_error,
+        not_found,
+        conflict,
+        unavailable,
+        AuthFailure::Fatal,
+    ) {
+        ReadDecision::Success(result) => Ok(result),
+        ReadDecision::NotFound => Err(MetadataApiError::NotFound),
+        ReadDecision::Auth(MetadataReadError::Unauthorized) => Err(MetadataApiError::Unauthorized),
+        ReadDecision::Auth(MetadataReadError::Forbidden) => Err(MetadataApiError::Forbidden),
+        ReadDecision::Auth(_) | ReadDecision::Unavailable => {
+            Err(MetadataApiError::ServiceUnavailable)
+        }
     }
 }
 
@@ -6419,7 +6416,7 @@ mod tests {
         assert!(matches!(
             reduce_path_response(
                 Some(result.clone()),
-                Some(MetadataApiError::Forbidden),
+                Some(MetadataReadError::Forbidden),
                 false,
                 false,
                 false,
