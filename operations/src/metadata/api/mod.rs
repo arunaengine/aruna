@@ -39,7 +39,7 @@ use thiserror::Error;
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
-use self::path::{select_forward_peers, select_path_holders};
+use self::path::{forward_path_resolution, select_path_holders};
 use super::MetadataAuthToken;
 use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{
@@ -1098,162 +1098,6 @@ pub(crate) async fn resolve_local_path(
     )
     .await?;
     reduce_path_candidates(candidates)
-}
-
-async fn forward_path_resolution(
-    context: &DriverContext,
-    realm_id: RealmId,
-    config: &RealmConfigDocument,
-    request: MetadataPathLookupRequest,
-    auth_token: Option<MetadataAuthToken>,
-    config_digest: [u8; 32],
-    deadline: tokio::time::Instant,
-) -> Result<MetadataPathLookupResult, MetadataApiError> {
-    if request.auth.is_some() && auth_token.is_none() {
-        return Err(MetadataApiError::Unauthorized);
-    }
-    let local_node = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
-    let peers = select_forward_peers(config, realm_id, request.group_id, &normalized, local_node)?;
-    if peers.is_empty() {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let requests = stream::iter(peers.into_iter().map(|peer| {
-        let auth_token = auth_token.clone();
-        let document_path = request.document_path.clone();
-        async move {
-            let response = tokio::time::timeout_at(
-                deadline,
-                metadata.request_forwarded_write(
-                    peer,
-                    MetadataTransportMessage::ForwardPathResolution {
-                        auth_token,
-                        group_id: request.group_id,
-                        document_path,
-                        config_digest,
-                    },
-                ),
-            )
-            .await;
-            (response, peer)
-        }
-    }))
-    .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
-    futures_util::pin_mut!(requests);
-    let mut auth_error = None;
-    let mut divergent = false;
-    let mut not_found = false;
-    let mut unavailable = false;
-    let mut success: Option<MetadataPathLookupResult> = None;
-    loop {
-        let response = match tokio::time::timeout_at(deadline, requests.next()).await {
-            Ok(response) => response,
-            Err(_) => return Err(MetadataApiError::ServiceUnavailable),
-        };
-        let Some((response, _peer)) = response else {
-            break;
-        };
-        match response {
-            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution { result: Ok(result) })) => {
-                if validate_path_resolution(
-                    realm_id,
-                    request.group_id,
-                    &request.document_path,
-                    &result,
-                )
-                .is_ok()
-                {
-                    let candidate = MetadataPathLookupResult {
-                        winner: result.winner,
-                        conflicts: result.conflicts,
-                    };
-                    if success.as_ref().is_some_and(|current| {
-                        current.winner != candidate.winner
-                            || current.conflicts != candidate.conflicts
-                    }) {
-                        divergent = true;
-                    } else {
-                        success.get_or_insert(candidate);
-                    }
-                } else {
-                    unavailable = true;
-                }
-            }
-            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
-                result:
-                    Err(error @ (MetadataReadError::Unauthorized | MetadataReadError::Forbidden)),
-            })) => {
-                auth_error.get_or_insert(error);
-            }
-            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
-                result: Err(MetadataReadError::NotFound),
-            })) => not_found = true,
-            _ => unavailable = true,
-        }
-    }
-    reduce_path_response(success, auth_error, divergent, not_found, unavailable)
-}
-
-fn reduce_path_response(
-    success: Option<MetadataPathLookupResult>,
-    auth_error: Option<MetadataReadError>,
-    divergent: bool,
-    not_found: bool,
-    unavailable: bool,
-) -> Result<MetadataPathLookupResult, MetadataApiError> {
-    let conflict = divergent || (success.is_some() && (not_found || unavailable));
-    match reduce_holder_reads(
-        success,
-        auth_error,
-        not_found,
-        conflict,
-        unavailable,
-        AuthFailure::Fatal,
-    ) {
-        ReadDecision::Success(result) => Ok(result),
-        ReadDecision::NotFound => Err(MetadataApiError::NotFound),
-        ReadDecision::Auth(MetadataReadError::Unauthorized) => Err(MetadataApiError::Unauthorized),
-        ReadDecision::Auth(MetadataReadError::Forbidden) => Err(MetadataApiError::Forbidden),
-        ReadDecision::Auth(_) | ReadDecision::Unavailable => {
-            Err(MetadataApiError::ServiceUnavailable)
-        }
-    }
-}
-
-fn validate_path_resolution(
-    realm_id: RealmId,
-    group_id: GroupId,
-    document_path: &str,
-    resolution: &MetadataPathResolution,
-) -> Result<(), MetadataApiError> {
-    let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
-    let winner_id = MetaResourceId::from_bytes(resolution.winner.document_id.to_bytes())
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    if resolution.winner.realm_id != realm_id
-        || resolution.winner.group_id != group_id
-        || resolution.winner.document_path != normalized
-        || resolution.winner.graph_iri
-            != MetadataRegistryRecord::graph_iri_for(resolution.winner.document_id)
-    {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    let mut seen = HashSet::from([winner_id]);
-    for conflict in &resolution.conflicts {
-        let conflict = MetaResourceId::from_bytes(conflict.to_bytes())
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-        if !seen.insert(conflict) {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-    }
-    Ok(())
 }
 
 struct PathShardView {
@@ -5362,6 +5206,8 @@ pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::path::{reduce_path_response, select_forward_peers, validate_path_resolution};
 
     use std::collections::BTreeMap;
 
