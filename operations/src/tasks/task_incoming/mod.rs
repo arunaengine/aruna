@@ -1028,7 +1028,7 @@ impl OperationsTaskHandler {
         let records = self
             .prepare_drain_records(retry_key, net_handle, config, realm_id, records, invocation)
             .await;
-        let (to_publish, deferred, undeliverable) = partition_drain_records(
+        let (to_publish, deferred, undeliverable) = outbox::partition_drain_records(
             records,
             &mut invocation.defer,
             !self.is_device(config),
@@ -1037,7 +1037,7 @@ impl OperationsTaskHandler {
                     .document_sync_topic_exists(topic)
                     .unwrap_or(false)
             },
-            |record| classify_deferred_record(config, net_handle, record),
+            |record| outbox::classify_deferred_record(config, net_handle, record),
         );
         invocation.deferred += deferred.len();
         let now_ms = unix_timestamp_millis();
@@ -1082,7 +1082,7 @@ impl OperationsTaskHandler {
             (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
         > = BTreeMap::new();
         for (record_key, record, topic) in records {
-            let origin = admin_origin(&record);
+            let origin = outbox::admin_origin(&record);
             let document = outbox::document_publish_from_outbox(
                 record.outbox_id,
                 record.target.clone(),
