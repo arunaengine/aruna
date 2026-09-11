@@ -323,3 +323,68 @@ pub(super) fn placement_override_value(record: &PlacementOverride) -> String {
 pub(super) fn placement_binding_value(binding: &PlacementBinding) -> String {
     serde_json::to_string(binding).expect("admin document placement binding serializes")
 }
+
+pub(super) fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
+    serde_json::to_string(provider).expect("admin document OIDC provider config serializes")
+}
+
+pub(super) fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
+    serde_json::to_string(kind).expect("realm node kind serializes")
+}
+
+pub fn group_role_id_from_path(path: &str) -> Option<RoleId> {
+    let role_id = path.strip_prefix("group.roles.")?;
+
+    if role_id.contains(".assigned_users.") {
+        return None;
+    }
+
+    Ulid::from_string(role_id).ok()
+}
+
+pub fn group_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
+    let path = path.strip_prefix("group.roles.")?;
+    let (role_id, user_id) = path.split_once(".assigned_users.")?;
+
+    Some((
+        Ulid::from_string(role_id).ok()?,
+        UserId::from_string(user_id).ok()?,
+    ))
+}
+
+pub(super) fn group_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+    group_role_user_assignment_from_path(path).map(|(role_id, _)| role_id)
+}
+
+pub fn realm_role_id_from_path(path: &str) -> Option<RoleId> {
+    let role_id = path.strip_prefix("realm.roles.")?;
+
+    if role_id.contains(".assigned_users.") {
+        return None;
+    }
+
+    Ulid::from_string(role_id).ok()
+}
+
+pub fn realm_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
+    let path = path.strip_prefix("realm.roles.")?;
+    let (role_id, user_id) = path.split_once(".assigned_users.")?;
+
+    Some((
+        Ulid::from_string(role_id).ok()?,
+        UserId::from_string(user_id).ok()?,
+    ))
+}
+
+pub(super) fn realm_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+    realm_role_user_assignment_from_path(path).map(|(role_id, _)| role_id)
+}
+
+pub fn realm_config_node_id_from_path(path: &str) -> Option<NodeId> {
+    let node_id = path.strip_prefix("realm_config.nodes.")?;
+    NodeId::from_str(node_id).ok()
+}
+
+pub fn realm_config_oidc_provider_id_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("realm_config.oidc_providers.")
+}
