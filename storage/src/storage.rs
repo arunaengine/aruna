@@ -115,6 +115,9 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
 // Deletes leave tombstones that every later read walks. Small keyspaces never
 // fill a memtable, so compaction has to be triggered by the delete count.
 const COMPACT_AFTER_DELETES: u64 = 5_000;
+// A major compaction rewrites the whole keyspace and rotates its memtable under
+// the database-wide journal lock, so only a small keyspace is compacted here.
+const COMPACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
 const BULK_READ_POOL_THREADS: usize = 2;
@@ -247,6 +250,8 @@ impl Compactor {
             key_space: key_space.to_string(),
             deletes,
             run: Box::new(move || {
+                // fjall 3.1.10 hides both calls from its docs; a version bump
+                // has to recheck that they still exist and still block here.
                 let keyspace: &fjall::Keyspace = keyspace.as_ref();
                 keyspace.rotate_memtable_and_wait()?;
                 keyspace.major_compact()
@@ -277,6 +282,11 @@ impl Drop for Compactor {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Whether a keyspace is small enough for a delete-triggered major compaction.
+fn compactable(disk_space: u64) -> bool {
+    disk_space <= COMPACT_MAX_BYTES
 }
 
 fn run_compaction(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
@@ -2380,6 +2390,7 @@ impl FjallStorage {
 
     /// Counts committed deletes and compacts the keyspace once they cross
     /// `COMPACT_AFTER_DELETES`, because its tombstones slow every later read.
+    /// A keyspace past `COMPACT_MAX_BYTES` only resets its counter.
     fn note_deletes(&mut self, key_space: &str, count: u64) {
         let total = match self.deletes.get_mut(key_space) {
             Some(total) => total,
@@ -2391,7 +2402,20 @@ impl FjallStorage {
         }
         let deletes = std::mem::take(total);
         match self.store.resolve_keyspace(key_space) {
-            Ok(keyspace) => self.compactor.submit(key_space, deletes, keyspace),
+            Ok(keyspace) => {
+                let disk_space = AsRef::<fjall::Keyspace>::as_ref(&keyspace).disk_space();
+                if !compactable(disk_space) {
+                    debug!(
+                        event = "storage.keyspace.compact_skipped",
+                        key_space,
+                        disk_space,
+                        deletes,
+                        "Keyspace is too large for a delete-triggered compaction"
+                    );
+                    return;
+                }
+                self.compactor.submit(key_space, deletes, keyspace)
+            }
             Err(error) => warn!(
                 event = "storage.keyspace.compact_failed",
                 key_space, error = %error, "Keyspace compaction could not resolve the keyspace"
@@ -5691,6 +5715,15 @@ mod tests {
         // a second crossing queues nothing.
         storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
         assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn gate_limits_compaction() {
+        // Only a keyspace small enough to rewrite quickly is compacted on
+        // deletes; a larger one keeps its tombstones for now.
+        assert!(super::compactable(0));
+        assert!(super::compactable(super::COMPACT_MAX_BYTES));
+        assert!(!super::compactable(super::COMPACT_MAX_BYTES + 1));
     }
 
     #[test]
