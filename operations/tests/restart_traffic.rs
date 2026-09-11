@@ -38,7 +38,7 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 mod convergence;
-use convergence::{HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence};
+use convergence::{HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_storage_released};
 
 const PROJECTION_BATCH: usize = 32;
 const SEED_DOCUMENTS: usize = 256;
@@ -240,8 +240,10 @@ async fn restart_node(
     node2.net.clear_inbound_handler();
     let _ = node2.task_handle.shutdown(NO_PROGRESS_TIMEOUT).await;
     node2.net.shutdown().await;
+    let storage = node2.context.storage_handle.clone();
     drop(node2);
     aux.shutdown().await?;
+    wait_storage_released(storage).await?;
     println!("node 2 shut down");
 
     let node2 = respawn_with_retry(realm_id, secret, node2_dir.path()).await?;
@@ -1070,8 +1072,12 @@ async fn stop_peers(mut nodes: Vec<TestNode>) -> Result<(TestNode, TempDir, Temp
     offline_two.net.clear_inbound_handler();
     let _ = offline_two.task_handle.shutdown(NO_PROGRESS_TIMEOUT).await;
     offline_two.net.shutdown().await;
+    let storage_one = offline_one.context.storage_handle.clone();
+    let storage_two = offline_two.context.storage_handle.clone();
     drop(offline_one);
     drop(offline_two);
+    wait_storage_released(storage_one).await?;
+    wait_storage_released(storage_two).await?;
     Ok((live, dir_one, dir_two))
 }
 
