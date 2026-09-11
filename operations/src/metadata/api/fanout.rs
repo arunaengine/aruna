@@ -311,3 +311,39 @@ pub(super) async fn run_metadata_fanout_node<T>(
     record_result(&node_span, &result);
     result
 }
+
+pub(super) async fn metadata_fanout_nodes(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    span: &Span,
+    target_nodes: Option<Vec<NodeId>>,
+    deadline: tokio::time::Instant,
+) -> MetadataRealmNodeDiscovery {
+    match target_nodes {
+        Some(nodes) => {
+            span.record("discovery_ms", 0u64);
+            MetadataRealmNodeDiscovery {
+                nodes: deduplicate_fanout_nodes(nodes),
+                failed: false,
+            }
+        }
+        None => {
+            let discovery_started = Instant::now();
+            let discovery = tokio::time::timeout_at(
+                deadline,
+                aruna_core::telemetry::time_stage(
+                    "discovery",
+                    discover_realm_nodes(context, realm_id, local_node_id),
+                ),
+            )
+            .await
+            .unwrap_or(MetadataRealmNodeDiscovery {
+                nodes: vec![local_node_id],
+                failed: true,
+            });
+            record_elapsed_ms(span, "discovery_ms", discovery_started);
+            discovery
+        }
+    }
+}
