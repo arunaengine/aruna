@@ -91,10 +91,9 @@ fn split_roots<'a>(
     (allowed, denied)
 }
 
-/// The subtrees at or below `root` a caller may reach, taken from its role
-/// patterns and narrowed by a credential's restrictions. Only the subtree is
-/// derived here: whether a concrete path inside it is readable stays with the
-/// ordinary permission check.
+/// The subtrees at or below `root` a caller may reach, from its role patterns
+/// and narrowed by a credential's restrictions. Whether a concrete path inside
+/// one is readable stays with the ordinary permission check.
 pub fn readable_roots(
     granted: &[(String, Permission)],
     restrictions: Option<&[PathRestriction]>,

@@ -36,7 +36,7 @@ async fn flagged(ctx: &DriverContext) -> bool {
 }
 
 #[tokio::test]
-async fn family_cancel_stops_local() {
+async fn cancel_stops_local() {
     // The execution runs on the node that publishes the cancellation, so no
     // network cancel can reach it: its own row has to be flagged here.
     let family = Family::new([41u8; 32]);
@@ -59,7 +59,7 @@ async fn family_cancel_stops_local() {
 }
 
 #[tokio::test]
-async fn repeated_cancel_is_quiet() {
+async fn repeated_cancel_quiet() {
     // A second cancellation must leave the already flagged row untouched.
     let family = Family::new([42u8; 32]);
     let (_dir, ctx) = node_context(&family, &family.target).await;
@@ -113,7 +113,7 @@ async fn admit_cancel(ctx: &Arc<DriverContext>, family: &Family) {
 }
 
 #[tokio::test]
-async fn admitted_cancel_stops_local() {
+async fn admitted_cancel_stops() {
     // The record arrives after this node already admitted the execution, so
     // admission itself has to apply it to the row that is already running.
     let family = Family::new([43u8; 32]);
@@ -129,7 +129,7 @@ async fn admitted_cancel_stops_local() {
 }
 
 #[tokio::test]
-async fn late_cancel_flags_launch() {
+async fn late_cancel_flags() {
     // The cancel is admitted while the launch is still being decided, so it
     // finds no receipt to stop; the committed launch must flag its own row.
     let family = Family::new([45u8; 32]);
@@ -151,7 +151,7 @@ async fn late_cancel_flags_launch() {
 }
 
 #[tokio::test]
-async fn remote_run_stays_untouched() {
+async fn remote_run_untouched() {
     // Another node's execution is stopped by the network cancel only: a holder
     // that runs nothing must not flag a row it does not execute.
     let family = Family::new([44u8; 32]);

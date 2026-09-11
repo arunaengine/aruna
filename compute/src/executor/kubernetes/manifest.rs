@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_dns_by_port() {
+    fn allows_dns_port() {
         // A host-network resolver such as node-local DNS is neither a kube-system
         // pod nor a CIDR peer under Cilium, so the DNS rule carries no peer.
         let mut config = config();
