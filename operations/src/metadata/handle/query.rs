@@ -1,3 +1,4 @@
+use super::lifecycle::list_registry_records_for_local_read;
 use super::search::{LocalReadScope, resolve_graph_visibility_scope};
 use super::*;
 #[tracing::instrument(
