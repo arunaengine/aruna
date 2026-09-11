@@ -2366,6 +2366,65 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_releases_hold() {
+        // Giving up on the cleanup row still releases the reservation before the
+        // pending error is reported.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        let mut location = composed_location(Ulid::from_bytes([5u8; 16]));
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![7u8; 32],
+        );
+        let id = location.ulid;
+        op.cleanup.pending_error = Some(CompleteMultipartUploadError::StorageError(
+            StorageError::Timeout,
+        ));
+        op.cleanup.set_release(id);
+        op.state = CompleteMultipartUploadState::QueueCleanupRow;
+        assert!(
+            op.cleanup
+                .queue(BlobCleanupWork::ReconcileWrite {
+                    location,
+                    owner: WriteOwner::Blob {
+                        blake3: [7u8; 32],
+                        realm_id: op.input.realm_id,
+                        ttl_ms: op.rocrate_limits.holder_ttl_ms,
+                    },
+                })
+                .is_some()
+        );
+
+        for _ in 0..3 {
+            assert!(matches!(
+                op.step(Event::Storage(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                }))
+                .as_slice(),
+                [Effect::Storage(StorageEffect::Write { .. })]
+            ));
+        }
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation { id: observed })] if *observed == id
+        ));
+        assert!(
+            op.step(Event::Blob(BlobEvent::ReservationReleased { id }))
+                .is_empty()
+        );
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(CompleteMultipartUploadError::StorageError(
+                StorageError::Timeout
+            ))
+        ));
+    }
+
+    #[test]
     fn cleanup_keeps_location() {
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);

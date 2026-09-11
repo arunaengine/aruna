@@ -314,6 +314,7 @@ impl Operation for PolicyMutationOperation {
 mod tests {
     use super::{PolicyMutationConfig, PolicyMutationError, PolicyMutationOperation};
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
@@ -328,6 +329,7 @@ mod tests {
     use crate::blob::blob_storage::HeadAliasContext;
     use crate::placement::policy::cache::PolicyCacheEntry;
     use crate::placement::policy::fixtures::signed_document;
+    use crate::s3::policy_successor::SuccessorError;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
@@ -520,5 +522,38 @@ mod tests {
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
         ));
         assert!(!operation.successor_version_id().is_nil());
+    }
+
+    #[test]
+    fn mint_failure_aborts() {
+        // The child mint's typed error must surface while its begun transaction
+        // is still aborted exactly once through the child cleanup.
+        let policy = policy(1);
+        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        operation.start();
+        operation.step(authorized(true));
+        operation.step(cached(&policy));
+        operation.step(crate::placement::policy::fixtures::authority(realm_id()));
+        let txn_id = Ulid::from_bytes([5u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert_eq!(
+            operation.finalize(),
+            Err(PolicyMutationError::Successor(SuccessorError::Storage(
+                StorageError::CommitFailed
+            )))
+        );
     }
 }
