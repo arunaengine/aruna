@@ -710,3 +710,136 @@ fn entity_types(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, 
     }
     Ok(types)
 }
+
+fn entity_name(object: &serde_json::Map<String, Value>) -> Result<String, CraqleError> {
+    object
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                "entity payload must define string `name`".to_string(),
+            ))
+        })
+}
+
+fn property_named_node(property: &str) -> Result<NamedNode, CraqleError> {
+    match property {
+        "@type" | "type" => Ok(vocab::rdf_type()),
+        "name" => Ok(vocab::schema_name()),
+        "description" => Ok(vocab::schema_description()),
+        "keywords" => Ok(vocab::schema_keywords()),
+        "datePublished" => Ok(vocab::schema_date_published()),
+        "license" => Ok(vocab::schema_license()),
+        "about" => Ok(vocab::schema_about()),
+        "conformsTo" => Ok(NamedNode::new_unchecked(
+            super::super::iri_index::DCTERMS_CONFORMS_TO_IRI,
+        )),
+        other if other.contains("://") => Ok(NamedNode::new_unchecked(other)),
+        other if other.contains(':') => expand_known_compact_iri(other),
+        other => Ok(NamedNode::new_unchecked(format!(
+            "http://schema.org/{}",
+            normalize_term(other)
+        ))),
+    }
+}
+
+fn property_value_terms(property: &str, value: &Value) -> Result<Vec<Term>, CraqleError> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Bool(boolean) => Ok(vec![Term::Literal(Literal::new_typed_literal(
+            boolean.to_string(),
+            NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#boolean"),
+        ))]),
+        Value::Number(number) => Ok(vec![number_literal(number)]),
+        Value::String(text) => {
+            let mapped = normalize_entity_id(text);
+            let value = if property_expects_identifier(property) {
+                mapped.as_str()
+            } else {
+                text
+            };
+            Ok(vec![property_value_term(property, value)?])
+        }
+        Value::Array(values) => {
+            let mut objects = Vec::new();
+            for entry in values {
+                objects.extend(property_value_terms(property, entry)?);
+            }
+            Ok(objects)
+        }
+        Value::Object(object) if is_reference_object(object) => {
+            let id = object
+                .get("@id")
+                .or_else(|| object.get("id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(format!(
+                        "property `{property}` reference object is missing string `@id`"
+                    )))
+                })?;
+            Ok(vec![reference_term(&normalize_entity_id(id))?])
+        }
+        Value::Object(object) if is_value_object(object) => Ok(vec![value_object_term(object)?]),
+        Value::Object(_) => Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+            format!(
+                "property `{property}` contains an inline nested object; nested entities must be separate top-level entities referenced by `@id`"
+            ),
+        ))),
+    }
+}
+
+fn property_value_term(property: &str, value: &str) -> Result<Term, CraqleError> {
+    match property {
+        "@type" | "type" => class_term(value),
+        "license" | "about" | "conformsTo" => {
+            if looks_like_identifier(value) {
+                reference_term(value)
+            } else {
+                Ok(Term::Literal(Literal::new_simple_literal(value)))
+            }
+        }
+        _ => Ok(Term::Literal(Literal::new_simple_literal(value))),
+    }
+}
+
+fn class_term(value: &str) -> Result<Term, CraqleError> {
+    let iri = if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else if value.contains(':') {
+        expand_known_compact_iri(value)?.as_str().to_string()
+    } else {
+        format!("http://schema.org/{}", normalize_term(value))
+    };
+    Ok(Term::NamedNode(NamedNode::new_unchecked(iri)))
+}
+
+fn reference_term(value: &str) -> Result<Term, CraqleError> {
+    if let Some(value) = value.strip_prefix("_:") {
+        Ok(Term::BlankNode(BlankNode::new_unchecked(value)))
+    } else if value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('#')
+        || value.contains("://")
+    {
+        Ok(Term::NamedNode(NamedNode::new_unchecked(value)))
+    } else if value.contains(':') {
+        Ok(Term::NamedNode(expand_known_compact_iri(value)?))
+    } else {
+        Err(CraqleError::RoCrate(RoCrateError::UnsupportedTerm(
+            value.to_string(),
+        )))
+    }
+}
+
+fn number_literal(number: &serde_json::Number) -> Term {
+    let datatype = if number.as_i64().is_some() || number.as_u64().is_some() {
+        "http://www.w3.org/2001/XMLSchema#integer"
+    } else {
+        "http://www.w3.org/2001/XMLSchema#double"
+    };
+    Term::Literal(Literal::new_typed_literal(
+        number.to_string(),
+        NamedNode::new_unchecked(datatype),
+    ))
+}
