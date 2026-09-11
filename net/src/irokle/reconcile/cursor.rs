@@ -519,3 +519,41 @@ pub(in crate::document_sync) fn remote_summary_is_empty(
 ) -> bool {
     summary.event_type_id.is_none() && summary.heads.is_empty()
 }
+
+impl PeerTopicProbe {
+    pub(in crate::document_sync) fn merge(&mut self, other: PeerTopicProbe) {
+        self.known.extend(other.known);
+        self.confirmed_unknown.extend(other.confirmed_unknown);
+    }
+}
+
+/// Buckets a peer's Open responses for the `wanted` topics: a non-empty summary
+/// ⇒ the peer holds a genesis; an empty summary (untyped, headless) ⇒ positive
+/// confirmation the peer has none; a topic with no summary is left out of both,
+/// meaning the peer refused it (holds it but the prober may not open it yet).
+pub(in crate::document_sync) fn classify_probe_responses(
+    wanted: &BTreeSet<irokle_crate::TopicId>,
+    responses: Vec<SyncMessage>,
+) -> PeerTopicProbe {
+    let mut probe = PeerTopicProbe::default();
+    for response in responses {
+        if let SyncMessage::Summary(summary) = response
+            && wanted.contains(&summary.topic_id)
+        {
+            if remote_summary_is_empty(&summary) {
+                probe.confirmed_unknown.insert(summary.topic_id);
+            } else {
+                probe.known.insert(summary.topic_id);
+            }
+        }
+    }
+    probe
+}
+
+pub(in crate::document_sync) fn peer_id_to_endpoint_addr(
+    peer_id: PeerId,
+) -> Result<iroh::EndpointAddr> {
+    let endpoint_id = iroh::EndpointId::from_bytes(peer_id.as_bytes())
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok(iroh::EndpointAddr::from(endpoint_id))
+}
