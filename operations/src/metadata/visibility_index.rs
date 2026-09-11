@@ -405,7 +405,7 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    crate::metadata::get_metadata_document::load_metadata_record_by_document(
+                    crate::metadata::get_document::load_metadata_record_by_document(
                         context,
                         document_id,
                     )

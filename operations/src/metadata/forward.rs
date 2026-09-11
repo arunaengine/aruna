@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
-use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget};
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
@@ -21,6 +20,7 @@ use aruna_core::metadata::{
     MetadataEvent, MetadataMaterializationState, MetadataMergedRevision,
     MetadataProfileValidationStatus, MetadataQueryResults, MetadataRawRevision, raw_context_digest,
 };
+use aruna_core::reducer::AdminDocumentReducerState;
 use aruna_core::storage_entries::{
     admin_document_reducer_state_key, metadata_create_acceptance_key,
 };
@@ -56,15 +56,15 @@ use crate::metadata::api::{
     MetadataApiError, MetadataRoCrateExportView, ensure_record_readable, export_metadata_rocrate,
     get_visible_metadata_document, load_record_by_document,
 };
-use crate::metadata::create_metadata_document::{
+use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, CreateMetadataDocumentResult, accepted_create_matches,
     create_metadata_document, mint_forward_document, mint_local_document, resolve_metadata_id,
 };
-use crate::metadata::delete_metadata_document::{
+use crate::metadata::delete_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
 };
-use crate::metadata::get_metadata_document::load_metadata_record_by_document;
+use crate::metadata::get_document::load_metadata_record_by_document;
 use crate::metadata::handle::{
     MetadataRequestDelivery, MetadataRequestError, MetadataWritePeerError,
 };
@@ -75,7 +75,7 @@ use crate::metadata::protocol::{
     PersistentIdResolution, RealmDocuments,
 };
 use crate::metadata::raw_revision::{MetadataRawView, load_raw_view};
-use crate::metadata::update_metadata_document::{
+use crate::metadata::update_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document,
 };
@@ -86,8 +86,8 @@ use crate::placement::selector::select_top_peers;
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
 use crate::realm::peer_trust::{PeerTrust, ensure_peer_trust};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::sync::document_sync_outbox::{
+use crate::s3::get_bucket::GetBucketInfoOperation;
+use crate::sync::document_outbox::{
     new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
 };
 
@@ -162,7 +162,7 @@ pub async fn is_user_origin(
     local_node_id: NodeId,
 ) -> Result<bool, MetadataApiError> {
     let config = drive(
-        crate::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+        crate::realm::get_config::GetRealmConfigOperation::new(realm_id),
         context.as_ref(),
     )
     .await
@@ -280,7 +280,7 @@ pub async fn origin_holds_document(
     document_id: Ulid,
 ) -> Result<bool, MetadataApiError> {
     let config = drive(
-        crate::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+        crate::realm::get_config::GetRealmConfigOperation::new(realm_id),
         context.as_ref(),
     )
     .await
@@ -988,7 +988,7 @@ async fn export_as_owner(
     local_node: NodeId,
     profile_id: Ulid,
 ) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
-    let owner = crate::realm::mutate_realm_placement::node_kind(config, local_node)
+    let owner = crate::realm::mutate_placement::node_kind(config, local_node)
         .and_then(|kind| kind.owner())
         .ok_or(MetadataReadError::Unavailable)?;
     let auth = AuthContext {
@@ -4089,11 +4089,11 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
 mod tests {
     use super::*;
     use crate::device::replica::ReplicaOrigin;
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::metadata::{
         MetadataProfileValidationCompleteness, MetadataProfileValidationState,
     };
     use aruna_core::structs::{METADATA_HANDLE, PlacementStrategy, RealmNodeKind};
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId};
 
     fn node(seed: u8) -> NodeId {
@@ -4588,13 +4588,12 @@ mod tests {
             document_id: Ulid::nil(),
             document_path: "/docs/one/".to_string(),
             public: true,
-            payload:
-                crate::metadata::create_metadata_document::CreateMetadataDocumentPayload::Scaffold {
-                    name: "one".to_string(),
-                    description: String::new(),
-                    date_published: "2026-01-01".to_string(),
-                    license: None,
-                },
+            payload: crate::metadata::create_document::CreateMetadataDocumentPayload::Scaffold {
+                name: "one".to_string(),
+                description: String::new(),
+                date_published: "2026-01-01".to_string(),
+                license: None,
+            },
         };
         assert!(create_record_matches(
             &create,

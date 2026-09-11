@@ -109,12 +109,12 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 use crate::s3::search_objects::{
     ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput, search_local_objects,
 };
-use crate::sync::sync_mirror_repair::RECONCILE_GRACE;
+use crate::sync::mirror_repair::RECONCILE_GRACE;
 use crate::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,

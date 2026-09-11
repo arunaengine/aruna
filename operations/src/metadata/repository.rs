@@ -228,9 +228,7 @@ pub fn create_records_and_outbox_write_entries(
         postcard::to_allocvec(audit)?.into(),
     ));
     if let Some(outbox) = outbox {
-        writes.push(crate::sync::document_sync_outbox::outbox_write_entry(
-            outbox,
-        )?);
+        writes.push(crate::sync::document_outbox::outbox_write_entry(outbox)?);
         if let Some((lifecycle, change)) = outbox_document_lifecycle_upsert(outbox)? {
             writes.push(metadata_document_lifecycle_revision_write_entry(
                 &lifecycle,
@@ -379,7 +377,7 @@ pub async fn delete_index_keys(
 mod tests {
     use super::*;
     use crate::metadata::projector::create_event_outbox_record;
-    use crate::sync::document_sync_outbox::outbox_key;
+    use crate::sync::document_outbox::outbox_key;
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,

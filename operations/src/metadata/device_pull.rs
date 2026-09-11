@@ -28,8 +28,8 @@ use crate::placement::process_placements::load_realm_config;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::list_object_versions::{
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::list_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
 use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};

@@ -38,7 +38,7 @@ use crate::metadata::repository::{
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect_with_txn,
 };
 use crate::tasks::queue_backoff::conflict_backoff;

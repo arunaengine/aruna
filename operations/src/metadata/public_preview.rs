@@ -8,11 +8,11 @@ use serde_json::Value as JsonValue;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::blob::blob_holders::GetBlobHoldersOperation;
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};
 use crate::jobs::export::{EntityIdentity, entity_identity};
-use crate::realm::get_realm_config::GetRealmConfigOperation;
-use crate::replication::location_summary::LocationSummaryOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
 
 const FILE_TYPES: [&str; 4] = [

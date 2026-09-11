@@ -51,7 +51,7 @@ use crate::metadata::repository::{
     read_materialization_status_effect, read_registry_by_document_effect,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
-use crate::sync::document_sync_outbox::schedule_outbox_drain_effect;
+use crate::sync::document_outbox::schedule_outbox_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::task_persistence::persist_task_effect;
 
@@ -577,7 +577,7 @@ pub async fn project_metadata_create_events(
         }
         if let Some(registry_outbox) = registry_outbox.flatten() {
             writes.push(
-                crate::sync::document_sync_outbox::outbox_write_entry(&registry_outbox)
+                crate::sync::document_outbox::outbox_write_entry(&registry_outbox)
                     .map_err(ConversionError::from)?,
             );
             outboxes.push(registry_outbox);

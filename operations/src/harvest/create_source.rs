@@ -227,9 +227,7 @@ impl Operation for CreateSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::harvest::create_repository_connector::{
-        CreateConnectorInput, CreateConnectorOperation,
-    };
+    use crate::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
     use crate::harvest::repository::{parse_source_read, read_source_effect};
     use crate::harvest::target_path::{DIGEST_SEGMENT_BYTES, HARVEST_PATH_BYTES};
     use aruna_core::events::StorageEvent;

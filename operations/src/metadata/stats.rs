@@ -12,7 +12,7 @@ use super::api::MetadataApiError;
 use super::repository::StorageReadError;
 use crate::driver::DriverContext;
 use crate::jobs::workflow::run_crate::PROCESS_PROFILE;
-use crate::metadata::get_metadata_document::is_metadata_record_materialized_for_graph_read;
+use crate::metadata::get_document::is_metadata_record_materialized_for_graph_read;
 
 const GROUP_COUNT_PAGE_SIZE: usize = 1_000;
 const GROUP_PURPOSE_SUMMARY_FANOUT_LIMIT: usize = 8;

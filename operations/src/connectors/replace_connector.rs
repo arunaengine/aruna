@@ -402,7 +402,7 @@ impl Operation for ReplaceSourceConnectorOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::create_source_connector::{
+    use crate::connectors::create_connector::{
         CreateSourceConnectorInput, CreateSourceConnectorOperation,
     };
     use crate::connectors::resolver::{

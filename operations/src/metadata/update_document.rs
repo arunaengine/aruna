@@ -42,7 +42,7 @@ use crate::metadata::repository::{
     StorageReadError, metadata_event_projection_write_entries, parse_registry_read,
     read_registry_effect,
 };
-use crate::sync::document_sync_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
+use crate::sync::document_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
 use crate::sync::shard_placement::sort_node_ids;
 
 const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;

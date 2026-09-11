@@ -21,10 +21,10 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
-use crate::metadata::create_metadata_document::resolve_metadata_id;
+use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::repository::{metadata_audit_key, read_registry_by_document_effect};
 use crate::placement::resolve_shard_holders;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record, outbox_write_entry, schedule_outbox_drain_effect,
 };
 
@@ -948,9 +948,9 @@ mod tests {
         use aruna_core::StructuredId;
         let document_id = aruna_core::MetaResourceId::from_parts(
             13,
-            aruna_core::structured_id::PlacementHandle::new(aruna_core::structs::METADATA_HANDLE)
+            aruna_core::identifiers::PlacementHandle::new(aruna_core::structs::METADATA_HANDLE)
                 .unwrap(),
-            aruna_core::structured_id::BucketId::new(3).unwrap(),
+            aruna_core::identifiers::BucketId::new(3).unwrap(),
             13,
         )
         .expect("the structured id builds")
