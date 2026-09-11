@@ -39,6 +39,10 @@ use thiserror::Error;
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
+use self::distributed::{
+    object_search_fingerprint, record_object_result, record_preflight_node_result,
+    record_query_result, record_search_node_result,
+};
 use self::export::export_rocrate_summary_jsonld;
 pub use self::export::{export_metadata_rocrate, get_visible_metadata_document};
 pub use self::fanout::forwarded_bearer;
@@ -116,6 +120,7 @@ use crate::s3::search_objects::{
     search_local_objects,
 };
 
+mod distributed;
 mod export;
 mod fanout;
 mod path;
@@ -1833,104 +1838,6 @@ pub async fn search_objects(
     })
 }
 
-fn object_search_fingerprint(
-    realm_id: RealmId,
-    query: &str,
-    key_match: ObjectKeyMatch,
-    bucket: Option<&str>,
-    mode: ObjectSearchQueryMode,
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna.object.search.v1\0");
-    hasher.update(realm_id.as_bytes());
-    hasher.update(query.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(&[match key_match {
-        ObjectKeyMatch::Substring => 1,
-        ObjectKeyMatch::Prefix => 2,
-    }]);
-    match bucket {
-        Some(bucket) => {
-            hasher.update(&[1]);
-            hasher.update(bucket.as_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-    hasher.update(&[match mode {
-        ObjectSearchQueryMode::Local => 1,
-        ObjectSearchQueryMode::DistributedBestEffort => 2,
-        ObjectSearchQueryMode::DistributedStrict => 3,
-    }]);
-    *hasher.finalize().as_bytes()
-}
-
-fn record_object_result(span: &Span, result: &Result<ObjectSearchNodePage, MetadataReadError>) {
-    match result {
-        Ok(page) => {
-            span.record("result", "ok");
-            span.record("hit_count", page.hits.len() as u64);
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-}
-
-fn record_bucket_result(span: &Span, result: &Result<Vec<BucketSearchHit>, MetadataReadError>) {
-    match result {
-        Ok(hits) => {
-            span.record("result", "ok");
-            span.record("hit_count", hits.len() as u64);
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-}
-
-fn record_query_result(span: &Span, result: &Result<MetadataQueryResults, MetadataReadError>) {
-    match result {
-        Ok(result) => {
-            span.record("result", result.kind());
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-}
-
-fn record_search_node_result(
-    span: &Span,
-    result: &Result<(Vec<MetadataSearchHit>, usize), MetadataReadError>,
-) {
-    match result {
-        Ok((hits, _)) => {
-            span.record("result", "ok");
-            span.record("hit_count", hits.len() as u64);
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-}
-
-fn record_preflight_node_result(
-    span: &Span,
-    result: &Result<MetadataReferencePreflightNodeExecution, MetadataReadError>,
-) {
-    match result {
-        Ok(result) => {
-            span.record("result", "ok");
-            span.record("hit_count", result.visible_references.len() as u64);
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-}
-
 #[tracing::instrument(
     name = "metadata.operation.query_distributed",
     level = "debug",
@@ -1947,6 +1854,7 @@ fn record_preflight_node_result(
     )
 )]
 #[allow(clippy::too_many_arguments)]
+
 async fn run_query_distributed(
     context: &DriverContext,
     realm_id: RealmId,
