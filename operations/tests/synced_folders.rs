@@ -28,7 +28,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
+use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};

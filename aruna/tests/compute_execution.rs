@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
+use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::structs::{
     CapturedInput, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, InputMode,
     InputSelection, InputSource, JobId, JobPayload, JobRecord, JobState, OutputDestination,
     OutputSelection, RunCrateStatus, checksum::HASH_BLAKE3,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::NodeId;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::reconcile::ExternalReconciler;

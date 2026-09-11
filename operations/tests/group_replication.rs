@@ -20,7 +20,7 @@ use aruna_operations::placement::{
     PlacementResolutionContext, placement_ref_for_target, resolve_shard_holders,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;

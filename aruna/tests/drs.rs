@@ -3,7 +3,7 @@
 mod shared;
 
 use aruna_core::structs::HashPathIndexKey;
-use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use aruna_operations::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
