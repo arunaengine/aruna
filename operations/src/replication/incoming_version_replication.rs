@@ -5644,7 +5644,8 @@ mod gate_tests {
         let mut operation = governed(&rule).with_gate(gate("eu-west"));
         operation.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion);
 
-        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
+        let document =
+            crate::placement::policy::tests::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
@@ -5652,7 +5653,7 @@ mod gate_tests {
             key: Vec::new().into(),
             value: Some(cached.into()),
         }));
-        operation.step(crate::placement::policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
 
         assert!(rejected(&operation));
     }
