@@ -547,3 +547,137 @@ async fn realm_config_settings_op_alone_creates_config_doc() {
         Some(discovery)
     );
 }
+
+#[tokio::test]
+async fn realm_policies_replicate() {
+    // S2: a policy event replicated from another node must pass the
+    // realm-config storage-apply whitelist and materialize here.
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([57; 32]);
+    let actor = test_actor(
+        9,
+        UserId::local(Ulid::from_parts(1_610, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target.clone(),
+        test_admin_event(
+            Ulid::from_parts(1_611, 1),
+            target.clone(),
+            &actor,
+            1,
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: MetadataReplicationConfig::new(3),
+                discovery: test_discovery(24, "https://policies.example:443"),
+            },
+        ),
+    )
+    .await
+    .expect("settings bootstrap the config doc");
+
+    let policies = vec![aruna_core::request_policy::RequestPolicy {
+        policy_id: Ulid::from_bytes([2; 16]),
+        name: "no-writes".to_string(),
+        kind: aruna_core::request_policy::PolicyKind::Deny,
+        when: None,
+        expression: "permission == 'write'".to_string(),
+        enabled: true,
+    }];
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target.clone(),
+        test_admin_event(
+            Ulid::from_parts(1_612, 1),
+            target.clone(),
+            &actor,
+            2,
+            AdminDocumentOperation::RealmConfigPoliciesSet {
+                policies: policies.clone(),
+            },
+        ),
+    )
+    .await
+    .expect("policy event replicates and applies");
+
+    let config = read_realm_config_doc(&storage, realm_id).await;
+    assert_eq!(config.request_policies, policies);
+}
+
+#[tokio::test]
+async fn replicated_revocation_applies() {
+    // A revocation replicated from another node must pass the realm-config
+    // storage-apply whitelist and deny the token on this node.
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([59; 32]);
+    let actor = test_actor(
+        11,
+        UserId::local(Ulid::from_parts(1_630, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target.clone(),
+        test_admin_event(
+            Ulid::from_parts(1_631, 1),
+            target.clone(),
+            &actor,
+            1,
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: MetadataReplicationConfig::new(3),
+                discovery: test_discovery(25, "https://revocation.example:443"),
+            },
+        ),
+    )
+    .await
+    .expect("settings bootstrap the config doc");
+
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target.clone(),
+        test_admin_event(
+            Ulid::from_parts(1_631, 2),
+            target.clone(),
+            &actor,
+            2,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: actor.node_id,
+                kind: RealmNodeKind::Server,
+            },
+        ),
+    )
+    .await
+    .expect("realm node bootstraps revocation authority");
+
+    let token_hash = aruna_core::auth::bearer_token_hash("replicated-token");
+    let expires_at = unix_timestamp_secs() + 600;
+    for (index, seq) in [(1_632u64, 3u64), (1_633, 4)] {
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(index, 1),
+                target.clone(),
+                &actor,
+                seq,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at,
+                    token_owner: actor.user_id,
+                },
+            ),
+        )
+        .await
+        .expect("revocation replicates and applies");
+    }
+
+    let config = read_realm_config_doc(&storage, realm_id).await;
+    assert!(config.token_revoked(&token_hash, unix_timestamp_secs()));
+    assert_eq!(config.revoked_tokens.len(), 1);
+}
