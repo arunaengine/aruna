@@ -9,10 +9,10 @@ use aruna_operations::metadata::api::{
     MetadataReferencesRequest, MetadataRoCrateExportView, MetadataSearchRequest, query_metadata,
     query_metadata_document, references_metadata, search_metadata,
 };
-use aruna_operations::metadata::create_metadata_document::CreateMetadataDocumentPayload;
+use aruna_operations::metadata::create_document::CreateMetadataDocumentPayload;
 use aruna_operations::metadata::forward::{export_rocrate_routed, update_metadata_document_routed};
 use aruna_operations::metadata::profile_validation::preview_submission;
-use aruna_operations::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;

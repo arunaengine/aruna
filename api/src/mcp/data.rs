@@ -10,15 +10,15 @@ use aruna_core::structs::{
     blob_object_permission_path, key_content_type,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::complete_put;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_objects_v2::{
+use aruna_operations::s3::list_objects::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Object, ListObjectsV2Operation,
 };
 use aruna_operations::s3::put_object::{

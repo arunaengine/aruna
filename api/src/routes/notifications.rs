@@ -25,7 +25,7 @@ use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
 use aruna_operations::notifications::watch::authorization::{
     WatchAuthorization, evaluate_watch_creation, watch_permission_path,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};

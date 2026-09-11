@@ -9,14 +9,14 @@ use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
     VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
 };
-use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use aruna_operations::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::replication::location_summary::{
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::replication::locations::{
     LocationSummaryError, RemoteLocationSummaryOperation,
 };
 use aruna_operations::replication::protocol::LocationSummaryRequest;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;

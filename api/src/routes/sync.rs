@@ -19,8 +19,8 @@ use aruna_operations::replication::queue::{QueueBlobReplicationOperation, relati
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::sync::sync_mirror_repair::{
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::sync::mirror_repair::{
     SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
 };

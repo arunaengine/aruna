@@ -14,7 +14,7 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::{BucketCorsConfiguration, RealmId, RoCrateLimits};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use bytes::Bytes;
 use futures_core::future::BoxFuture;
 use http::{Method, Request, StatusCode, header};

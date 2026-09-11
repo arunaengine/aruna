@@ -10,11 +10,11 @@ use aruna_core::request_policy::{
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::groups::set_group_policies::{
+use aruna_operations::groups::set_policies::{
     SetGroupPoliciesConfig, SetGroupPoliciesError, SetGroupPoliciesOperation,
 };
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::realm::set_realm_policies::{
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::set_policies::{
     SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
 };
 use axum::extract::{Path, Query, State};
@@ -301,7 +301,7 @@ async fn realm_policies(
     .await
     {
         Ok(config) => Ok(config.request_policies),
-        Err(aruna_operations::realm::get_realm_config::GetRealmConfigError::DocumentNotFound) => {
+        Err(aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound) => {
             Ok(Vec::new())
         }
         Err(error) => Err(ServerError::InternalError(error.to_string())),
@@ -1066,7 +1066,7 @@ mod tests {
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_operations::realm::claim_initial_realm_admin::{
+    use aruna_operations::realm::claim_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

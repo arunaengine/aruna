@@ -469,7 +469,7 @@ mod tests {
     };
     use aruna_core::types::UserId;
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::realm::claim_initial_realm_admin::{
+    use aruna_operations::realm::claim_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

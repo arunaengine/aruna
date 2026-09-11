@@ -14,7 +14,7 @@ use aruna_operations::s3::bucket_routing::{
     GetBucketRoutingError, GetBucketRoutingOperation, PutBucketRoutingError,
     PutBucketRoutingOperation,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};

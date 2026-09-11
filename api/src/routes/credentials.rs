@@ -6,14 +6,14 @@ use aruna_core::structs::{
     AuthContext, PathRestriction, Permission, UserAccess, blob_group_permission_path,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::permission_rules::reachable_roots;
-use aruna_operations::s3::create_user_access::{
+use aruna_operations::auth::permission_rules::reachable_roots;
+use aruna_operations::s3::create_access::{
     CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
     DEFAULT_CREDENTIAL_TTL,
 };
-use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
-use aruna_operations::s3::list_user_access::{ListUserAccessInput, ListUserAccessOperation};
-use aruna_operations::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
+use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::list_access::{ListUserAccessInput, ListUserAccessOperation};
+use aruna_operations::s3::revoke_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

@@ -639,7 +639,7 @@ mod test {
     };
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::users::register_or_get_oidc_user::{
+    use aruna_operations::users::oidc_user::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
     };
     use aruna_storage::storage;

@@ -8,11 +8,11 @@ use aruna_core::structs::{
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_storage_purge_job;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::s3::list_multipart_uploads::{
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::list_uploads::{
     ListMultipartUploadsInput, ListMultipartUploadsOperation,
 };
-use aruna_operations::s3::list_object_versions::{
+use aruna_operations::s3::list_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
 use aruna_operations::sync::sync_relationship::{
@@ -516,7 +516,7 @@ fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePur
 
 fn scoped_version_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::list_object_versions::ListObjectVersionsResult,
+    result: aruna_operations::s3::list_versions::ListObjectVersionsResult,
 ) -> (
     Vec<ListObjectVersionsItem>,
     bool,
@@ -543,7 +543,7 @@ fn scoped_version_page(
 
 fn scoped_multipart_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::list_multipart_uploads::ListMultipartUploadsResult,
+    result: aruna_operations::s3::list_uploads::ListMultipartUploadsResult,
 ) -> (
     Vec<aruna_core::structs::MultipartUpload>,
     bool,

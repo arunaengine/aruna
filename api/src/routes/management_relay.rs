@@ -10,7 +10,7 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
