@@ -52,7 +52,7 @@ use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
-use self::query::query_local_graphs;
+use self::query::{query_local_graphs, snapshot_iri_references};
 use self::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
     read_budget, send_export_request, send_request, write_body_at, write_message_at,
@@ -5694,45 +5694,6 @@ async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataR
             "metadata authorization projection disagrees with Craqle graph policy"
         );
     }
-}
-
-fn snapshot_iri_references(
-    node: &CraqleNode,
-    graph: &GraphId,
-) -> Result<Vec<(String, String, String)>, MetadataError> {
-    let snapshot = node
-        .graph_snapshot(graph)
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let orphaned = node
-        .graph_diagnostics(graph)
-        .map_err(|error| MetadataError::Backend(error.to_string()))?
-        .orphaned_entities
-        .into_iter()
-        .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
-        .collect::<HashSet<_>>();
-    let mut references = Vec::new();
-    for quad in snapshot.quads {
-        if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
-            continue;
-        }
-        let subject = match quad.subject.to_term() {
-            Some(Term::NamedNode(node)) => node.as_str().to_string(),
-            Some(Term::BlankNode(node)) => format!("_:{}", node.as_str()),
-            _ => continue,
-        };
-        let Some(predicate) = quad.predicate.to_named_node() else {
-            continue;
-        };
-        let Some(Term::NamedNode(object)) = quad.object.to_term() else {
-            continue;
-        };
-        references.push((
-            subject,
-            predicate.as_str().to_string(),
-            object.as_str().to_string(),
-        ));
-    }
-    Ok(references)
 }
 
 #[tracing::instrument(
