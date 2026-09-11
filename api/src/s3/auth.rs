@@ -228,11 +228,12 @@ impl S3Access for AuthProvider {
 }
 
 /// Listings a member holding only part of a bucket may still run, because their
-/// result is narrowed to that part.
+/// result is narrowed to that part. The location probe leads the listings every
+/// AWS client makes, so it is admitted with them.
 fn is_listing_operation(operation_name: &str) -> bool {
     matches!(
         operation_name,
-        "ListBuckets" | "HeadBucket" | "ListObjects" | "ListObjectsV2"
+        "ListBuckets" | "HeadBucket" | "GetBucketLocation" | "ListObjects" | "ListObjectsV2"
     )
 }
 
