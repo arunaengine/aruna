@@ -593,3 +593,162 @@ async fn realm_assignment_conflicting_add_removes_existing_grant() {
             .contains(&assigned_user_id)
     );
 }
+
+#[tokio::test]
+async fn realm_role_seed_then_assignment_admin_operations_materialize_existing_auth_doc() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([10; 32]);
+    let role_id = Ulid::from_parts(2, 2);
+    let assigned_user_id = UserId::local(Ulid::from_parts(3, 3), realm_id);
+    let actor = Actor {
+        node_id: node(8),
+        user_id: UserId::local(Ulid::from_parts(4, 4), realm_id),
+        realm_id,
+    };
+    let auth_doc = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::from([(
+            role_id,
+            Role {
+                role_id,
+                name: "realm_member".to_string(),
+                permissions: HashMap::from([("/datasets".to_string(), Permission::READ)]),
+                assigned_users: HashSet::new(),
+            },
+        )]),
+        operation_restrictions: HashMap::new(),
+    };
+    storage_batch_write_to(
+        &storage,
+        vec![(
+            AUTH_KEYSPACE.to_string(),
+            (*realm_id.as_bytes()).into(),
+            auth_doc
+                .to_bytes(&actor)
+                .expect("auth doc serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("auth doc writes");
+
+    let target = AdminDocumentTarget::Realm { realm_id };
+    let seed_event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(5, 5),
+        target: target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor: actor.clone(),
+        op: AdminDocumentOperation::RealmRoleAdded { role_id },
+    };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+        seed_event,
+    )
+    .await
+    .expect("role seed applies");
+
+    let add_event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(6, 6),
+        target: target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: 2,
+        observed: AdminDocumentClock::default(),
+        actor: actor.clone(),
+        op: AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+            role_id,
+            user_id: assigned_user_id,
+        },
+    };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+        add_event,
+    )
+    .await
+    .expect("add assignment applies");
+
+    let stored_auth_doc =
+        read_storage_value(&storage, AUTH_KEYSPACE, (*realm_id.as_bytes()).into())
+            .await
+            .expect("auth doc exists");
+    let stored_auth_doc =
+        RealmAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+    assert!(
+        stored_auth_doc.roles[&role_id]
+            .assigned_users
+            .contains(&assigned_user_id)
+    );
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&target),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert!(reducer_state.conflicts.is_empty());
+    assert_eq!(
+        reducer_state.materialized_realm_roles(),
+        BTreeSet::from([role_id])
+    );
+    let assignment_path = realm_role_user_assignment_path(&role_id, &assigned_user_id);
+    assert_eq!(
+        reducer_state
+            .user_subject_ids
+            .get(&assignment_path)
+            .and_then(|version| version.value.clone()),
+        Some(assigned_user_id.to_string())
+    );
+
+    let remove_event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(7, 7),
+        target,
+        origin_node_id: actor.node_id,
+        origin_seq: 3,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op: AdminDocumentOperation::RealmRoleUserAssignmentRemoved {
+            role_id,
+            user_id: assigned_user_id,
+        },
+    };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+        remove_event,
+    )
+    .await
+    .expect("remove assignment applies");
+
+    let stored_auth_doc =
+        read_storage_value(&storage, AUTH_KEYSPACE, (*realm_id.as_bytes()).into())
+            .await
+            .expect("auth doc exists");
+    let stored_auth_doc =
+        RealmAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+    assert!(
+        !stored_auth_doc.roles[&role_id]
+            .assigned_users
+            .contains(&assigned_user_id)
+    );
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&AdminDocumentTarget::Realm { realm_id }),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert_eq!(
+        reducer_state
+            .user_subject_ids
+            .get(&assignment_path)
+            .and_then(|version| version.value.clone()),
+        None
+    );
+}
