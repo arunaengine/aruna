@@ -861,3 +861,83 @@ pub(in crate::document_sync) fn materialize_group_role(
         role.role_id,
     );
 }
+
+pub(in crate::document_sync) fn materialize_realm_authorization_admin_document_operation(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    event: &AdminDocumentEvent,
+) {
+    if let AdminDocumentOperation::RealmRoleCreated { role } = &event.op {
+        materialize_realm_authorization_role(auth_doc, reducer_state, role);
+        return;
+    }
+
+    let (role_id, user_id) = match &event.op {
+        AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
+            (role_id, user_id)
+        }
+        _ => return,
+    };
+    let path = realm_role_user_assignment_path(role_id, user_id);
+    if reducer_state.conflicts.contains_key(&path) {
+        if let Some(role) = auth_doc.roles.get_mut(role_id) {
+            role.assigned_users.remove(user_id);
+        }
+        return;
+    }
+    let Some(role) = auth_doc.roles.get_mut(role_id) else {
+        return;
+    };
+    let assigned = reducer_state
+        .user_subject_ids
+        .get(&path)
+        .and_then(|version| version.value.as_deref())
+        .and_then(|value| UserId::from_string(value).ok())
+        .is_some_and(|materialized_user_id| materialized_user_id == *user_id);
+    if assigned {
+        role.assigned_users.insert(*user_id);
+    } else {
+        role.assigned_users.remove(user_id);
+    }
+}
+
+pub(in crate::document_sync) fn materialize_realm_authorization_role(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    role: &AdminDocumentRoleDefinition,
+) {
+    let role_path = realm_role_path(&role.role_id);
+    if reducer_state.conflicts.contains_key(&role_path)
+        || !reducer_state
+            .materialized_realm_roles()
+            .contains(&role.role_id)
+    {
+        auth_doc.roles.remove(&role.role_id);
+        return;
+    }
+
+    let assigned_users = auth_doc
+        .roles
+        .get(&role.role_id)
+        .map(|role| role.assigned_users.clone())
+        .unwrap_or_default();
+    auth_doc.roles.insert(
+        role.role_id,
+        Role {
+            role_id: role.role_id,
+            name: role.name.clone(),
+            permissions: role
+                .permissions
+                .iter()
+                .map(|(path, permission)| (path.clone(), permission.clone()))
+                .collect(),
+            assigned_users,
+        },
+    );
+    overlay_realm_authorization_role_assignment_reducer_materialization(
+        auth_doc,
+        reducer_state,
+        role.role_id,
+    );
+}
