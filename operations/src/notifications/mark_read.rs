@@ -278,13 +278,13 @@ impl Operation for MarkReadOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::notifications::test_support::{context_with_storage, seed, user};
+    use crate::notifications::tests::fixtures::{context_with_storage, seed, user};
     use aruna_core::keyspaces::NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE;
     use aruna_core::structs::{NotificationClass, notification_inbox_key};
     use aruna_storage::storage::StorageHandle;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {
-        crate::notifications::test_support::record(
+        crate::notifications::tests::fixtures::record(
             recipient,
             NotificationClass::Direct,
             created_at_ms,
