@@ -34,11 +34,10 @@ mod revocation;
 mod targets;
 
 pub use paths::*;
+use paths::{event_observes_dot, operation_paths, role_definition_value};
 pub use placement::*;
 use placement::{candidate_map_value, transition_plan_value, transition_proof_value};
-pub use revocation::{MAX_LIVE_REVOCATIONS_PER_ORIGIN, revoked_token_path, revoked_token_entry};
-use paths::{event_observes_dot, operation_paths, role_definition_value};
-
+pub use revocation::{MAX_LIVE_REVOCATIONS_PER_ORIGIN, revoked_token_entry, revoked_token_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminDocumentApplyStatus {
@@ -156,15 +155,11 @@ pub struct RevocationIndex {
     next_expiry: Option<u64>,
 }
 
-
-
 pub fn decode_admin_document_reducer_state(
     bytes: &[u8],
 ) -> Result<AdminDocumentReducerState, postcard::Error> {
     postcard::from_bytes(bytes)
 }
-
-
 
 impl AdminDocumentReducerState {
     pub fn new(target: AdminDocumentTarget) -> Self {
@@ -1069,10 +1064,6 @@ impl AdminDocumentReducerState {
     }
 }
 
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1117,163 +1108,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use ulid::Ulid;
 
-    fn node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn realm_id_with_seed(seed: u8) -> RealmId {
-        RealmId::from_bytes([seed; 32])
-    }
-
-    fn realm_id() -> RealmId {
-        realm_id_with_seed(9)
-    }
-
-    fn group_id() -> GroupId {
-        Ulid::from_bytes([7u8; 16])
-    }
-
-    fn role_id(seed: u8) -> RoleId {
-        Ulid::from_bytes([seed; 16])
-    }
-
-    fn role_definition(role_id: RoleId, name: &str) -> AdminDocumentRoleDefinition {
-        AdminDocumentRoleDefinition {
-            role_id,
-            name: name.to_string(),
-            permissions: BTreeMap::from([
-                ("/dataset/**".to_string(), Permission::READ),
-                ("/project/admin/**".to_string(), Permission::WRITE),
-            ]),
-        }
-    }
-
-    fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
-        OidcProviderConfig {
-            id: id.to_string(),
-            issuer: format!("https://issuer.example/{issuer_suffix}"),
-            audience: "aruna".to_string(),
-            discovery_url: format!(
-                "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
-            ),
-        }
-    }
-
-    fn user_id_with_seed(seed: u8) -> UserId {
-        UserId::local(Ulid::from_bytes([seed; 16]), realm_id())
-    }
-
-    fn user_id() -> UserId {
-        user_id_with_seed(8)
-    }
-
-    fn actor(origin_node_id: NodeId) -> Actor {
-        Actor {
-            node_id: origin_node_id,
-            user_id: user_id(),
-            realm_id: realm_id(),
-        }
-    }
-
-    fn user_state() -> AdminDocumentReducerState {
-        AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id: user_id() })
-    }
-
-    fn group_state() -> AdminDocumentReducerState {
-        AdminDocumentReducerState::new(AdminDocumentTarget::Group {
-            group_id: group_id(),
-        })
-    }
-
-    fn realm_state() -> AdminDocumentReducerState {
-        AdminDocumentReducerState::new(AdminDocumentTarget::Realm {
-            realm_id: realm_id(),
-        })
-    }
-
-    fn realm_config_state() -> AdminDocumentReducerState {
-        AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig {
-            realm_id: realm_id(),
-        })
-    }
-
-    fn event(
-        event_seed: u8,
-        origin_node_id: NodeId,
-        origin_seq: u64,
-        observed: AdminDocumentClock,
-        op: AdminDocumentOperation,
-    ) -> AdminDocumentEvent {
-        AdminDocumentEvent {
-            event_id: Ulid::from_bytes([event_seed; 16]),
-            target: AdminDocumentTarget::User { user_id: user_id() },
-            origin_node_id,
-            origin_seq,
-            observed,
-            actor: actor(origin_node_id),
-            op,
-        }
-    }
-
-    fn group_event(
-        event_seed: u8,
-        origin_node_id: NodeId,
-        origin_seq: u64,
-        observed: AdminDocumentClock,
-        op: AdminDocumentOperation,
-    ) -> AdminDocumentEvent {
-        AdminDocumentEvent {
-            event_id: Ulid::from_bytes([event_seed; 16]),
-            target: AdminDocumentTarget::Group {
-                group_id: group_id(),
-            },
-            origin_node_id,
-            origin_seq,
-            observed,
-            actor: actor(origin_node_id),
-            op,
-        }
-    }
-
-    fn realm_event(
-        event_seed: u8,
-        origin_node_id: NodeId,
-        origin_seq: u64,
-        observed: AdminDocumentClock,
-        op: AdminDocumentOperation,
-    ) -> AdminDocumentEvent {
-        AdminDocumentEvent {
-            event_id: Ulid::from_bytes([event_seed; 16]),
-            target: AdminDocumentTarget::Realm {
-                realm_id: realm_id(),
-            },
-            origin_node_id,
-            origin_seq,
-            observed,
-            actor: actor(origin_node_id),
-            op,
-        }
-    }
-
-    fn realm_config_event(
-        event_seed: u8,
-        origin_node_id: NodeId,
-        origin_seq: u64,
-        observed: AdminDocumentClock,
-        op: AdminDocumentOperation,
-    ) -> AdminDocumentEvent {
-        AdminDocumentEvent {
-            event_id: Ulid::from_bytes([event_seed; 16]),
-            target: AdminDocumentTarget::RealmConfig {
-                realm_id: realm_id(),
-            },
-            origin_node_id,
-            origin_seq,
-            observed,
-            actor: actor(origin_node_id),
-            op,
-        }
-    }
+    mod fixtures;
+    use fixtures::*;
 
     fn set_attr(event_seed: u8, origin_seed: u8, key: &str, value: &str) -> AdminDocumentEvent {
         event(

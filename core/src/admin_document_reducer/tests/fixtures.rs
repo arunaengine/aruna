@@ -1,0 +1,159 @@
+use super::*;
+
+pub(super) fn node(seed: u8) -> NodeId {
+    iroh::SecretKey::from_bytes(&[seed; 32]).public()
+}
+
+pub(super) fn realm_id_with_seed(seed: u8) -> RealmId {
+    RealmId::from_bytes([seed; 32])
+}
+
+pub(super) fn realm_id() -> RealmId {
+    realm_id_with_seed(9)
+}
+
+pub(super) fn group_id() -> GroupId {
+    Ulid::from_bytes([7u8; 16])
+}
+
+pub(super) fn role_id(seed: u8) -> RoleId {
+    Ulid::from_bytes([seed; 16])
+}
+
+pub(super) fn role_definition(role_id: RoleId, name: &str) -> AdminDocumentRoleDefinition {
+    AdminDocumentRoleDefinition {
+        role_id,
+        name: name.to_string(),
+        permissions: BTreeMap::from([
+            ("/dataset/**".to_string(), Permission::READ),
+            ("/project/admin/**".to_string(), Permission::WRITE),
+        ]),
+    }
+}
+
+pub(super) fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
+    OidcProviderConfig {
+        id: id.to_string(),
+        issuer: format!("https://issuer.example/{issuer_suffix}"),
+        audience: "aruna".to_string(),
+        discovery_url: format!(
+            "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
+        ),
+    }
+}
+
+pub(super) fn user_id_with_seed(seed: u8) -> UserId {
+    UserId::local(Ulid::from_bytes([seed; 16]), realm_id())
+}
+
+pub(super) fn user_id() -> UserId {
+    user_id_with_seed(8)
+}
+
+pub(super) fn actor(origin_node_id: NodeId) -> Actor {
+    Actor {
+        node_id: origin_node_id,
+        user_id: user_id(),
+        realm_id: realm_id(),
+    }
+}
+
+pub(super) fn user_state() -> AdminDocumentReducerState {
+    AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id: user_id() })
+}
+
+pub(super) fn group_state() -> AdminDocumentReducerState {
+    AdminDocumentReducerState::new(AdminDocumentTarget::Group {
+        group_id: group_id(),
+    })
+}
+
+pub(super) fn realm_state() -> AdminDocumentReducerState {
+    AdminDocumentReducerState::new(AdminDocumentTarget::Realm {
+        realm_id: realm_id(),
+    })
+}
+
+pub(super) fn realm_config_state() -> AdminDocumentReducerState {
+    AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    })
+}
+
+pub(super) fn event(
+    event_seed: u8,
+    origin_node_id: NodeId,
+    origin_seq: u64,
+    observed: AdminDocumentClock,
+    op: AdminDocumentOperation,
+) -> AdminDocumentEvent {
+    AdminDocumentEvent {
+        event_id: Ulid::from_bytes([event_seed; 16]),
+        target: AdminDocumentTarget::User { user_id: user_id() },
+        origin_node_id,
+        origin_seq,
+        observed,
+        actor: actor(origin_node_id),
+        op,
+    }
+}
+
+pub(super) fn group_event(
+    event_seed: u8,
+    origin_node_id: NodeId,
+    origin_seq: u64,
+    observed: AdminDocumentClock,
+    op: AdminDocumentOperation,
+) -> AdminDocumentEvent {
+    AdminDocumentEvent {
+        event_id: Ulid::from_bytes([event_seed; 16]),
+        target: AdminDocumentTarget::Group {
+            group_id: group_id(),
+        },
+        origin_node_id,
+        origin_seq,
+        observed,
+        actor: actor(origin_node_id),
+        op,
+    }
+}
+
+pub(super) fn realm_event(
+    event_seed: u8,
+    origin_node_id: NodeId,
+    origin_seq: u64,
+    observed: AdminDocumentClock,
+    op: AdminDocumentOperation,
+) -> AdminDocumentEvent {
+    AdminDocumentEvent {
+        event_id: Ulid::from_bytes([event_seed; 16]),
+        target: AdminDocumentTarget::Realm {
+            realm_id: realm_id(),
+        },
+        origin_node_id,
+        origin_seq,
+        observed,
+        actor: actor(origin_node_id),
+        op,
+    }
+}
+
+pub(super) fn realm_config_event(
+    event_seed: u8,
+    origin_node_id: NodeId,
+    origin_seq: u64,
+    observed: AdminDocumentClock,
+    op: AdminDocumentOperation,
+) -> AdminDocumentEvent {
+    AdminDocumentEvent {
+        event_id: Ulid::from_bytes([event_seed; 16]),
+        target: AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(),
+        },
+        origin_node_id,
+        origin_seq,
+        observed,
+        actor: actor(origin_node_id),
+        op,
+    }
+}
