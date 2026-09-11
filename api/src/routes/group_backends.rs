@@ -801,7 +801,7 @@ mod tests {
         create_group_backend, delete_group_backend, enable_group_backend, list_group_backends,
     };
     use crate::error::ServerError;
-    use crate::routes::storage_routing::tests::setup_state;
+    use crate::routes::storage_routing::tests::fixtures::setup_state;
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
     use std::collections::HashMap;
