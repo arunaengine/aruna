@@ -39,6 +39,7 @@ use thiserror::Error;
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
+pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};
 use self::distributed::{
     object_search_fingerprint, record_object_result, record_preflight_node_result,
 };
@@ -1835,75 +1836,6 @@ pub async fn search_objects(
         omitted_partitions,
         complete,
     })
-}
-
-pub fn aggregate_query_results(
-    results: Vec<MetadataQueryResults>,
-    query_form: MetadataQueryForm,
-    select_limit: Option<usize>,
-) -> Result<MetadataQueryResults, MetadataApiError> {
-    match query_form {
-        MetadataQueryForm::Ask => {
-            Ok(MetadataQueryResults::Boolean(results.into_iter().any(
-                |result| matches!(result, MetadataQueryResults::Boolean(true)),
-            )))
-        }
-        MetadataQueryForm::Select => {
-            let mut seen = HashSet::new();
-            let mut merged = Vec::new();
-            let mut merged_bytes = 32usize;
-            let row_limit = select_limit
-                .unwrap_or(METADATA_QUERY_MAX_ROWS)
-                .min(METADATA_QUERY_MAX_ROWS);
-            if row_limit == 0 {
-                return Ok(MetadataQueryResults::Solutions(Vec::new()));
-            }
-            for result in results {
-                let MetadataQueryResults::Solutions(rows) = result else {
-                    continue;
-                };
-                for row in rows {
-                    let key = serde_json::to_string(&row)
-                        .map_err(|err| MetadataApiError::Internal(err.to_string()))?;
-                    if seen.insert(key) {
-                        merged_bytes = merged_bytes.saturating_add(
-                            serde_json::to_vec(&row)
-                                .map_err(|err| MetadataApiError::Internal(err.to_string()))?
-                                .len()
-                                .saturating_add(1),
-                        );
-                        if merged_bytes > METADATA_QUERY_MAX_RESULT_BYTES {
-                            return Err(MetadataApiError::BadRequest);
-                        }
-                        merged.push(row);
-                        if merged.len() >= row_limit {
-                            return Ok(MetadataQueryResults::Solutions(merged));
-                        }
-                    }
-                }
-            }
-            Ok(MetadataQueryResults::Solutions(merged))
-        }
-    }
-}
-
-pub fn query_select_limit(query: &str) -> Option<usize> {
-    let parsed = spargebra::SparqlParser::new().parse_query(query).ok()?;
-    let spargebra::Query::Select { pattern, .. } = parsed else {
-        return None;
-    };
-    let spargebra::algebra::GraphPattern::Slice { length, .. } = pattern else {
-        return None;
-    };
-    length
-}
-
-pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
-    match spargebra::SparqlParser::new().parse_query(query).ok()? {
-        spargebra::Query::Select { .. } => Some(MetadataQueryForm::Select),
-        spargebra::Query::Ask { .. } => Some(MetadataQueryForm::Ask),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
