@@ -182,7 +182,7 @@ mod tests {
 
     fn cached(policy: &VerifiedPolicy) -> Event {
         let entry = super::super::cache::PolicyCacheEntry::verified(
-            &super::super::tests::signed_document(realm(), policy, 1),
+            &super::super::tests::fixtures::signed_document(realm(), policy, 1),
             10,
         );
         Event::Storage(StorageEvent::ReadResult {
