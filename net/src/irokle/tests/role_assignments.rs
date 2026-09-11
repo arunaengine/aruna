@@ -99,3 +99,161 @@ async fn concurrent_user_subject_claims_converge_and_promote_on_removal() {
         );
     }
 }
+
+#[tokio::test]
+async fn group_role_seed_then_assignment_admin_operations_materialize_existing_auth_doc() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([9; 32]);
+    let group_id = Ulid::from_parts(1, 1);
+    let role_id = Ulid::from_parts(2, 2);
+    let assigned_user_id = UserId::local(Ulid::from_parts(3, 3), realm_id);
+    let actor = Actor {
+        node_id: node(8),
+        user_id: UserId::local(Ulid::from_parts(4, 4), realm_id),
+        realm_id,
+    };
+    let auth_doc = GroupAuthorizationDocument {
+        group_id,
+        policies: Vec::new(),
+        roles: HashMap::from([(
+            role_id,
+            Role {
+                role_id,
+                name: "member".to_string(),
+                permissions: HashMap::from([("/datasets".to_string(), Permission::READ)]),
+                assigned_users: HashSet::new(),
+            },
+        )]),
+    };
+    storage_batch_write_to(
+        &storage,
+        vec![(
+            AUTH_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+            auth_doc
+                .to_bytes(&actor)
+                .expect("auth doc serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("auth doc writes");
+
+    let target = AdminDocumentTarget::Group { group_id };
+    let seed_event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(5, 5),
+        target: target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor: actor.clone(),
+        op: AdminDocumentOperation::GroupRoleAdded { role_id },
+    };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::GroupAuthorization { group_id },
+        seed_event,
+    )
+    .await
+    .expect("role seed applies");
+
+    let add_event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(6, 6),
+        target: target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: 2,
+        observed: AdminDocumentClock::default(),
+        actor: actor.clone(),
+        op: AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+            role_id,
+            user_id: assigned_user_id,
+        },
+    };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::GroupAuthorization { group_id },
+        add_event,
+    )
+    .await
+    .expect("add assignment applies");
+
+    let stored_auth_doc = read_storage_value(&storage, AUTH_KEYSPACE, group_id.to_bytes().into())
+        .await
+        .expect("auth doc exists");
+    let stored_auth_doc =
+        GroupAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+    assert!(
+        stored_auth_doc.roles[&role_id]
+            .assigned_users
+            .contains(&assigned_user_id)
+    );
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&target),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert!(reducer_state.conflicts.is_empty());
+    assert_eq!(
+        reducer_state.materialized_group_roles(),
+        BTreeSet::from([role_id])
+    );
+    let assignment_path = group_role_user_assignment_path(&role_id, &assigned_user_id);
+    assert_eq!(
+        reducer_state
+            .user_subject_ids
+            .get(&assignment_path)
+            .and_then(|version| version.value.clone()),
+        Some(assigned_user_id.to_string())
+    );
+
+    let remove_event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(7, 7),
+        target,
+        origin_node_id: actor.node_id,
+        origin_seq: 3,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op: AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+            role_id,
+            user_id: assigned_user_id,
+        },
+    };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::GroupAuthorization { group_id },
+        remove_event,
+    )
+    .await
+    .expect("remove assignment applies");
+
+    let stored_auth_doc = read_storage_value(&storage, AUTH_KEYSPACE, group_id.to_bytes().into())
+        .await
+        .expect("auth doc exists");
+    let stored_auth_doc =
+        GroupAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+    assert!(
+        !stored_auth_doc.roles[&role_id]
+            .assigned_users
+            .contains(&assigned_user_id)
+    );
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&AdminDocumentTarget::Group { group_id }),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert_eq!(
+        reducer_state
+            .user_subject_ids
+            .get(&assignment_path)
+            .and_then(|version| version.value.clone()),
+        None
+    );
+}
