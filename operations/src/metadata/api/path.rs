@@ -329,3 +329,185 @@ pub(super) fn validate_path_resolution(
     }
     Ok(())
 }
+
+pub(super) fn merge_path_views(
+    expected: &[usize],
+    views: Vec<PathShardView>,
+) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
+    let mut consensus = vec![None; expected.len()];
+    let mut seen = vec![0usize; expected.len()];
+    for mut view in views {
+        let shard = view.shard as usize;
+        if shard >= expected.len() || seen[shard] >= expected[shard] {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        normalize_path_view(&mut view.candidates)?;
+        seen[shard] += 1;
+        match consensus[shard].as_ref() {
+            Some(current) if current != &view.candidates => {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Some(_) => {}
+            None => consensus[shard] = Some(view.candidates),
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (shard, expected) in expected.iter().copied().enumerate() {
+        if expected == 0 || seen[shard] != expected {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        candidates.extend(consensus[shard].take().unwrap_or_default());
+    }
+    Ok(candidates)
+}
+
+pub(super) fn normalize_path_view(candidates: &mut [MetadataPathCandidate]) -> Result<(), MetadataApiError> {
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.claim.document_id,
+            candidate.claim.establishing_event_id,
+        )
+    });
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].claim.document_id == pair[1].claim.document_id)
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(())
+}
+
+pub(super) async fn load_path_holder(
+    context: &DriverContext,
+    group_id: GroupId,
+    document_path: &str,
+    holder: NodeId,
+    auth_token: Option<MetadataAuthToken>,
+    config_digest: [u8; 32],
+    deadline: tokio::time::Instant,
+) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    match tokio::time::timeout_at(
+        deadline,
+        metadata.request_forwarded_write(
+            holder,
+            MetadataTransportMessage::ForwardPathLookup {
+                auth_token,
+                group_id,
+                document_path: document_path.to_string(),
+                config_digest,
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(MetadataTransportMessage::ForwardedPathLookup { result: Ok(result) })) => Ok(result),
+        Ok(Ok(MetadataTransportMessage::ForwardedPathLookup {
+            result: Err(MetadataReadError::Unauthorized),
+        })) => Err(MetadataApiError::Unauthorized),
+        Ok(Ok(MetadataTransportMessage::ForwardedPathLookup {
+            result: Err(MetadataReadError::Forbidden),
+        })) => Err(MetadataApiError::Forbidden),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+pub(crate) async fn local_path_candidates(
+    context: &DriverContext,
+    realm_id: RealmId,
+    group_id: GroupId,
+    document_path: &str,
+    auth: Option<&AuthContext>,
+) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
+    let mut records = load_claim_records(context, realm_id, Some(group_id)).await?;
+    records.retain(|record| record.document_path == document_path);
+    if let Some(net) = context.net_handle.as_ref() {
+        let config = load_realm_config(context, realm_id)
+            .await
+            .ok_or(MetadataApiError::ServiceUnavailable)?;
+        registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
+        records.retain(|record| {
+            holds_placement(&config, &registry_placement(&config, record), net.node_id())
+        });
+    }
+    let permissions = GroupPermissionRules::collect(
+        context,
+        auth.filter(|auth| auth.realm_id == realm_id),
+        records.iter().map(|record| record.group_id),
+    )
+    .await;
+    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
+        context,
+        records
+            .iter()
+            .map(|record| (record.realm_id, record.group_id)),
+    )
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let policy_auth = auth;
+    let mut candidates = records
+        .into_iter()
+        .map(|record| {
+            let document_id = MetaResourceId::from_bytes(record.document_id.to_bytes())
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            let claim = PathClaimRecord {
+                document_id,
+                establishing_event_id: record.establishing_event_id,
+                requested_path: record.document_path.clone(),
+            };
+            let visible = permissions.record_visible(&record)
+                && evaluators
+                    .get(&(record.realm_id, record.group_id))
+                    .is_some_and(|evaluator| {
+                        evaluator
+                            .evaluate(&metadata_read_request(&record.permission_path, policy_auth))
+                            .is_ok()
+                    });
+            let record = visible.then_some(record);
+            Ok(MetadataPathCandidate { claim, record })
+        })
+        .collect::<Result<Vec<_>, MetadataApiError>>()?;
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.claim.document_id,
+            candidate.claim.establishing_event_id,
+        )
+    });
+    Ok(candidates)
+}
+
+pub(super) fn validate_path_candidate(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    group_id: GroupId,
+    document_path: &str,
+    candidate: &MetadataPathCandidate,
+) -> Result<PlacementRef, MetadataApiError> {
+    if candidate.claim.requested_path != document_path {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let placement = registry_placement_for(config, group_id, candidate.claim.document_id.as_ulid());
+    if let Some(record) = candidate.record.as_ref()
+        && (record.realm_id != realm_id
+            || record.group_id != group_id
+            || record.document_id != candidate.claim.document_id.as_ulid()
+            || record.establishing_event_id != candidate.claim.establishing_event_id
+            || record.document_path != document_path
+            || record.graph_iri != MetadataRegistryRecord::graph_iri_for(record.document_id)
+            || record.permission_path
+                != MetadataRegistryRecord::permission_path_for(
+                    &realm_id,
+                    group_id,
+                    document_path,
+                    record.document_id,
+                )
+            || registry_placement(config, record) != placement)
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(placement)
+}
