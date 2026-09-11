@@ -566,7 +566,7 @@ pub(crate) async fn ensure_permission_with(
 /// An infrastructure fault inside the permission check is not a verdict:
 /// exhausted transaction-cleanup capacity stays retryable, every other storage
 /// fault stays internal, and only real denials become `Forbidden`.
-fn map_authorize_error(error: AuthorizeError) -> ServerError {
+pub(crate) fn map_authorize_error(error: AuthorizeError) -> ServerError {
     match error {
         AuthorizeError::Storage(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(

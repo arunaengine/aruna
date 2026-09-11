@@ -29,6 +29,7 @@ use aruna_core::structs::{
     MetadataRegistryRecord, MintPersistentIdSpec, Permission, PersistentIdFailure,
     PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
 };
+use aruna_core::telemetry::time_stage;
 use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
@@ -57,8 +58,8 @@ use crate::metadata::api::{
 };
 use crate::metadata::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentResult, accepted_create_matches, create_metadata_document,
-    mint_forward_document, resolve_metadata_id,
+    CreateMetadataDocumentPayload, CreateMetadataDocumentResult, accepted_create_matches,
+    create_metadata_document, mint_forward_document, mint_local_document, resolve_metadata_id,
 };
 use crate::metadata::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
@@ -79,6 +80,7 @@ use crate::metadata::update_metadata_document::{
     UpdateMetadataDocumentOperation, update_metadata_document,
 };
 use crate::node::node_info::read_node_info_documents;
+use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::selector::select_top_peers;
 use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
@@ -1175,6 +1177,133 @@ pub async fn create_metadata_document_routed(
         ),
         other => Err(unexpected_response(other)),
     }
+}
+
+/// Errors of the shared authorized create flow. Every variant maps onto the
+/// same transport status the former REST-local sequence produced.
+#[derive(Debug, Error)]
+pub enum CreateMetadataAuthorizedError {
+    #[error("metadata document path must not be empty")]
+    EmptyPath,
+    #[error("metadata create is forbidden")]
+    Forbidden,
+    #[error(transparent)]
+    Api(#[from] MetadataApiError),
+    #[error(transparent)]
+    Create(#[from] CreateMetadataDocumentError),
+    #[error(transparent)]
+    Authorize(#[from] AuthorizeError),
+    #[error(transparent)]
+    Write(#[from] MetadataWriteError),
+}
+
+/// Shared metadata create used by REST and MCP: normalize the path, mint the
+/// document id, run the non-user-origin permission checks, route the create to a
+/// holder and emit the post-commit watch event. The caller owns bearer
+/// conversion and the transport status mapping.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_metadata_authorized(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    auth: &AuthContext,
+    extras: PolicyRequestExtras,
+    auth_token: Option<MetadataAuthToken>,
+    group_id: GroupId,
+    path: String,
+    public: bool,
+    payload: CreateMetadataDocumentPayload,
+) -> Result<MetadataRegistryRecord, CreateMetadataAuthorizedError> {
+    let path = MetadataRegistryRecord::normalize_document_path(&path);
+    if path.is_empty() {
+        return Err(CreateMetadataAuthorizedError::EmptyPath);
+    }
+    let user_origin = is_user_origin(context, realm_id, local_node_id).await?;
+    let realm_config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let actor = Actor {
+        node_id: local_node_id,
+        user_id: auth.user_id,
+        realm_id,
+    };
+    let document_id = if user_origin {
+        mint_forward_document(&realm_config, &actor, group_id, &path)?.as_ulid()
+    } else {
+        match mint_local_document(&realm_config, &actor, group_id, &path) {
+            Ok(document_id) => document_id.as_ulid(),
+            Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
+                mint_forward_document(&realm_config, &actor, group_id, &path)?.as_ulid()
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if !user_origin {
+        if auth.realm_id != realm_id {
+            return Err(CreateMetadataAuthorizedError::Forbidden);
+        }
+        time_stage(
+            "permission",
+            authorize(
+                context,
+                realm_id,
+                auth,
+                &format!("/{realm_id}/g/{group_id}/meta/**"),
+                &Permission::WRITE,
+                extras.clone(),
+            ),
+        )
+        .await?;
+        time_stage(
+            "permission",
+            authorize(
+                context,
+                realm_id,
+                auth,
+                &MetadataRegistryRecord::permission_path_for(
+                    &auth.realm_id,
+                    group_id,
+                    &path,
+                    document_id,
+                ),
+                &Permission::WRITE,
+                extras,
+            ),
+        )
+        .await?;
+    }
+    let created = create_metadata_document_routed(
+        CreateMetadataDocumentOperation::new_for_generated_document_id(
+            CreateMetadataDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path: path,
+                public,
+                payload,
+            },
+        ),
+        context.clone(),
+        auth_token,
+    )
+    .await?;
+    let event_id = created.event_id;
+    let record = created.record;
+
+    // Post-commit, best-effort resource-watch emission. A failed emission only
+    // warns and never affects the already-successful create.
+    emit_metadata_created(
+        context,
+        realm_id,
+        auth.user_id,
+        record.group_id,
+        record.document_id,
+        &record.document_path,
+        event_id,
+    )
+    .await;
+
+    Ok(record)
 }
 
 pub async fn update_metadata_document_routed(
