@@ -53,12 +53,14 @@ use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use self::engine::{
-    config_digest_matches, craqle_patch_request, flush_document_sync_journal,
-    flush_metadata_persistence, metadata_effect_defers_persist, metadata_effect_kind,
-    metadata_effect_persists_document_sync, metadata_error_from_craqle, metadata_event_kind,
+    config_digest_matches, craqle_create_request, craqle_fjall_persist_mode, craqle_graph_policy,
+    craqle_patch_request, craqle_request_durability, document_sync_peer_id, effect_graph_iri,
+    flush_document_sync_journal, flush_metadata_persistence, graph_ids, metadata_batch_from_craqle,
+    metadata_effect_defers_persist, metadata_effect_kind, metadata_effect_persists_document_sync,
+    metadata_error_from_craqle, metadata_event_kind, metadata_graph_policy_from_craqle,
     record_craqle_call_result, record_error, record_metadata_query_result_counts,
-    record_metadata_result, schedule_deferred_metadata_persist, upsert_contextual_entity,
-    upsert_data_entity, warn_if_slow_metadata_backend,
+    record_metadata_result, schedule_deferred_metadata_persist, to_craqle_batch,
+    upsert_contextual_entity, upsert_data_entity, warn_if_slow_metadata_backend,
 };
 use self::lifecycle::{
     effect_rejects_deleted_graph, fill_visibility_caches, graph_lifecycle_deleted,
@@ -2811,179 +2813,6 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         record_error(&effect_span, &error.to_string());
     }
     event
-}
-
-fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
-    match effect {
-        MetadataEffect::ValidateCreateCrate { request } => Some(request.graph_iri.clone()),
-        MetadataEffect::ValidateRoCrate { request } => Some(request.graph_iri.clone()),
-        MetadataEffect::CreateCrate { request } => Some(request.graph_iri.clone()),
-        MetadataEffect::ApplyRoCrate { request } => Some(request.graph_iri.clone()),
-        MetadataEffect::UpsertDataEntity { request }
-        | MetadataEffect::UpsertContextualEntity { request } => Some(request.graph_iri.clone()),
-        MetadataEffect::SetGraphPolicy { graph_iri, .. }
-        | MetadataEffect::AddGraphPeer { graph_iri, .. }
-        | MetadataEffect::SyncGraphBestEffort { graph_iri, .. }
-        | MetadataEffect::GetGraphPolicy { graph_iri }
-        | MetadataEffect::ExportRoCrate { graph_iri }
-        | MetadataEffect::ExportRoCrateSummary { graph_iri }
-        | MetadataEffect::DeleteGraph { graph_iri }
-        | MetadataEffect::ContainsGraph { graph_iri }
-        | MetadataEffect::GraphSnapshot { graph_iri }
-        | MetadataEffect::InstallSnapshot { graph_iri, .. }
-        | MetadataEffect::PlanBatch { graph_iri, .. }
-        | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
-        MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
-        MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris
-            .as_ref()
-            .and_then(|graph_iris| graph_iris.first().cloned()),
-        MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris
-            .as_ref()
-            .and_then(|graph_iris| graph_iris.first().cloned()),
-        MetadataEffect::ListGraphs => None,
-    }
-}
-
-fn graph_ids(graph_iris: &[String]) -> Vec<GraphId> {
-    graph_iris
-        .iter()
-        .map(|graph_iri| GraphId::new(graph_iri))
-        .collect()
-}
-
-fn craqle_create_request(request: MetadataCreateCrateRequest) -> CreateCrateRequest {
-    CreateCrateRequest::new(
-        GraphId::new(&request.graph_iri),
-        request.name,
-        request.description,
-        request.date_published,
-        request.license,
-        craqle_graph_policy(request.policy),
-    )
-}
-
-fn craqle_request_durability(durability: MetadataRequestDurability) -> CraqleRequestDurability {
-    match durability {
-        MetadataRequestDurability::Durable => CraqleRequestDurability::Durable,
-        MetadataRequestDurability::WalAlreadyDurable => CraqleRequestDurability::WalAlreadyDurable,
-    }
-}
-
-fn craqle_fjall_persist_mode(policy: FjallPersistPolicy) -> CraqleFjallPersistMode {
-    match policy {
-        FjallPersistPolicy::Buffer => CraqleFjallPersistMode::Buffer,
-        FjallPersistPolicy::SyncAll => CraqleFjallPersistMode::SyncAll,
-    }
-}
-
-fn craqle_graph_policy(policy: MetadataGraphPolicy) -> GraphPolicy {
-    GraphPolicy {
-        public: policy.public,
-        permission_paths: policy.permission_paths,
-    }
-}
-
-fn document_sync_peer_id(node_id: NodeId) -> irokle::PeerId {
-    irokle::PeerId::from_bytes(*node_id.as_bytes())
-}
-
-fn metadata_graph_policy_from_craqle(policy: GraphPolicy) -> MetadataGraphPolicy {
-    MetadataGraphPolicy {
-        public: policy.public,
-        permission_paths: policy.permission_paths,
-    }
-}
-
-fn metadata_dot_from_craqle(dot: craqle::Dot) -> MetadataDot {
-    MetadataDot {
-        actor: *dot.actor.as_bytes(),
-        counter: dot.counter,
-    }
-}
-
-fn metadata_batch_from_craqle(batch: Batch) -> MetadataBatch {
-    MetadataBatch {
-        graph_iri: batch.graph.as_str().to_string(),
-        actor: *batch.actor.as_bytes(),
-        counter: batch.counter,
-        base_clock: batch.base_clock,
-        ops: batch
-            .ops
-            .into_iter()
-            .map(|op| match op {
-                craqle::QuadOp::Add {
-                    subject,
-                    predicate,
-                    object,
-                    dot,
-                } => MetadataQuadOp::Add {
-                    subject: subject.0,
-                    predicate: predicate.0,
-                    object: object.0,
-                    dot: metadata_dot_from_craqle(dot),
-                },
-                craqle::QuadOp::Remove {
-                    subject,
-                    predicate,
-                    object,
-                    witnessed,
-                } => MetadataQuadOp::Remove {
-                    subject: subject.0,
-                    predicate: predicate.0,
-                    object: object.0,
-                    witnessed,
-                },
-            })
-            .collect(),
-        timestamp_millis: batch.timestamp.timestamp_millis(),
-    }
-}
-
-fn to_craqle_batch(batch: &MetadataBatch) -> Result<Batch, CraqleError> {
-    let timestamp =
-        chrono::DateTime::from_timestamp_millis(batch.timestamp_millis).ok_or_else(|| {
-            CraqleError::RoCrate(RoCrateError::InvalidBatch(
-                "batch timestamp is out of range".to_string(),
-            ))
-        })?;
-    Ok(Batch {
-        graph: GraphId::new(&batch.graph_iri),
-        actor: ActorId::from_bytes(batch.actor),
-        counter: batch.counter,
-        base_clock: batch.base_clock.clone(),
-        ops: batch
-            .ops
-            .iter()
-            .map(|op| match op {
-                MetadataQuadOp::Add {
-                    subject,
-                    predicate,
-                    object,
-                    dot,
-                } => craqle::QuadOp::Add {
-                    subject: craqle::EncodedTerm(subject.clone()),
-                    predicate: craqle::EncodedTerm(predicate.clone()),
-                    object: craqle::EncodedTerm(object.clone()),
-                    dot: craqle::Dot {
-                        actor: ActorId::from_bytes(dot.actor),
-                        counter: dot.counter,
-                    },
-                },
-                MetadataQuadOp::Remove {
-                    subject,
-                    predicate,
-                    object,
-                    witnessed,
-                } => craqle::QuadOp::Remove {
-                    subject: craqle::EncodedTerm(subject.clone()),
-                    predicate: craqle::EncodedTerm(predicate.clone()),
-                    object: craqle::EncodedTerm(object.clone()),
-                    witnessed: witnessed.clone(),
-                },
-            })
-            .collect(),
-        timestamp,
-    })
 }
 
 /// Plans `source` against the local graph and publishes it as a batch under
