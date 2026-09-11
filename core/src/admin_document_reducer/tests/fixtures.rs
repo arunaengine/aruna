@@ -157,3 +157,175 @@ pub(super) fn realm_config_event(
         op,
     }
 }
+
+pub(super) fn set_attr(
+    event_seed: u8,
+    origin_seed: u8,
+    key: &str,
+    value: &str,
+) -> AdminDocumentEvent {
+    event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: key.to_string(),
+            value: value.to_string(),
+        },
+    )
+}
+
+pub(super) fn set_name(event_seed: u8, origin_seed: u8, name: &str) -> AdminDocumentEvent {
+    event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserNameSet {
+            name: name.to_string(),
+        },
+    )
+}
+
+pub(super) fn add_subject(event_seed: u8, origin_seed: u8, subject_id: &str) -> AdminDocumentEvent {
+    event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserSubjectIdAdded {
+            subject_id: subject_id.to_string(),
+        },
+    )
+}
+
+pub(super) fn remove_subject(
+    event_seed: u8,
+    origin_seed: u8,
+    subject_id: &str,
+) -> AdminDocumentEvent {
+    event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserSubjectIdRemoved {
+            subject_id: subject_id.to_string(),
+        },
+    )
+}
+
+pub(super) fn create_group(
+    event_seed: u8,
+    origin_seed: u8,
+    display_name: &str,
+    realm_id: RealmId,
+) -> AdminDocumentEvent {
+    group_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::GroupCreated {
+            realm_id,
+            display_name: display_name.to_string(),
+            owner: user_id_with_seed(5),
+        },
+    )
+}
+
+pub(super) fn rename_group(
+    event_seed: u8,
+    origin_seed: u8,
+    origin_seq: u64,
+    display_name: &str,
+) -> AdminDocumentEvent {
+    // Every rename observes the create, so only renames conflict with renames.
+    let mut observed = AdminDocumentClock::default();
+    observed.advance(node(1), 1);
+    if origin_seq > 1 {
+        observed.advance(node(origin_seed), origin_seq - 1);
+    }
+    group_event(
+        event_seed,
+        node(origin_seed),
+        origin_seq,
+        observed,
+        AdminDocumentOperation::GroupDisplayNameSet {
+            display_name: display_name.to_string(),
+        },
+    )
+}
+
+pub(super) fn add_group_role(
+    event_seed: u8,
+    origin_seed: u8,
+    role_id: RoleId,
+) -> AdminDocumentEvent {
+    group_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::GroupRoleAdded { role_id },
+    )
+}
+
+pub(super) fn create_group_role(
+    event_seed: u8,
+    origin_seed: u8,
+    role: AdminDocumentRoleDefinition,
+) -> AdminDocumentEvent {
+    group_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::GroupRoleCreated { role },
+    )
+}
+
+pub(super) fn remove_group_role(
+    event_seed: u8,
+    origin_seed: u8,
+    role_id: RoleId,
+) -> AdminDocumentEvent {
+    group_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::GroupRoleRemoved { role_id },
+    )
+}
+
+pub(super) fn assign_group_role_user(
+    event_seed: u8,
+    origin_seed: u8,
+    role_id: RoleId,
+    user_id: UserId,
+) -> AdminDocumentEvent {
+    group_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+    )
+}
+
+pub(super) fn remove_group_role_user_assignment(
+    event_seed: u8,
+    origin_seed: u8,
+    role_id: RoleId,
+    user_id: UserId,
+) -> AdminDocumentEvent {
+    group_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+    )
+}

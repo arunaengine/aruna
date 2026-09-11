@@ -798,7 +798,6 @@ impl AdminDocumentReducerState {
         version.max(equivalent).or(equivalent)
     }
 
-
     pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
@@ -835,7 +834,11 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_placement_binding(&mut self, event: &AdminDocumentEvent, binding: &PlacementBinding) {
+    pub(super) fn apply_placement_binding(
+        &mut self,
+        event: &AdminDocumentEvent,
+        binding: &PlacementBinding,
+    ) {
         self.apply_immutable_value(
             event,
             placement_binding_path(binding.handle),
@@ -864,7 +867,12 @@ impl AdminDocumentReducerState {
     /// proof. Treating that as a conflict would strand the bucket forever, so
     /// the earliest event wins - deterministic on every replica, whatever order
     /// the two arrived in.
-    pub(super) fn apply_transition_report(&mut self, event: &AdminDocumentEvent, path: String, value: String) {
+    pub(super) fn apply_transition_report(
+        &mut self,
+        event: &AdminDocumentEvent,
+        path: String,
+        value: String,
+    ) {
         let dot = event.dot();
         if let Some(current) = self.user_subject_ids.get(&path)
             && current.dot <= dot
@@ -962,7 +970,6 @@ pub fn band_pool_path(pool_id: Ulid) -> String {
     format!("realm_config.placement.band_pools.{pool_id}")
 }
 
-
 pub(super) fn candidate_map_value(map: &CandidatePlacementMap) -> String {
     serde_json::to_string(map).expect("admin document candidate map serializes")
 }
@@ -1000,7 +1007,6 @@ fn band_pool_value(pool: &BandPool) -> String {
     // for same-key divergence.
     serde_json::to_string(pool).expect("admin document band pool serializes")
 }
-
 
 pub fn realm_config_placement_node_id_from_path(path: &str) -> Option<NodeId> {
     let node_id = path.strip_prefix("realm_config.placement.nodes.")?;
@@ -1083,7 +1089,6 @@ fn transition_part(path: &str) -> Option<(Ulid, TransitionPart)> {
     parts.next().is_none().then_some((transition_id, part))
 }
 
-
 fn placement_entry_from_value(value: &str) -> Option<NodePlacementEntry> {
     serde_json::from_str(value).ok()
 }
@@ -1111,4 +1116,3 @@ fn parse_handle_range(value: &str) -> Option<HandleRange> {
 fn parse_band_pool(value: &str) -> Option<BandPool> {
     serde_json::from_str(value).ok()
 }
-
