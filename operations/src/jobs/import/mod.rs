@@ -1871,7 +1871,7 @@ mod tests {
 
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::insert_job;
-    use crate::staging::test_utils::setup_driver_context;
+    use crate::staging::tests::fixtures::setup_driver_context;
 
     #[test]
     fn target_checks_limits() {

@@ -3150,7 +3150,7 @@ mod tests {
         RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
         read_metadata, rewrite_document, signature_entry, validate_document,
     };
-    use crate::staging::test_utils::setup_driver_context;
+    use crate::staging::tests::fixtures::setup_driver_context;
     use crate::sync::incoming::initialize_net_incoming;
     use aruna_blob::blob::{BlobHandle, BlobHandler};
     use aruna_core::UserId;

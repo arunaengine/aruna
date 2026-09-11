@@ -354,7 +354,7 @@ mod tests {
     }
 
     async fn fixture(anonymous_read: bool) -> Fixture {
-        let staging = crate::staging::test_utils::setup_driver_context().await;
+        let staging = crate::staging::tests::fixtures::setup_driver_context().await;
         let context = staging.driver_context;
         let realm_id = RealmId::from_bytes([61; 32]);
         let owner = UserId::local(Ulid::from_bytes([62; 16]), realm_id);

@@ -16,7 +16,7 @@ use super::archive::{
     signature_entry,
 };
 use super::rewrite::validate_document;
-use crate::staging::test_utils::setup_driver_context;
+use crate::staging::tests::fixtures::setup_driver_context;
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
