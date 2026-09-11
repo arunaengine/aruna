@@ -54,13 +54,14 @@ use ulid::Ulid;
 
 use self::engine::{
     config_digest_matches, craqle_create_request, craqle_fjall_persist_mode, craqle_graph_policy,
-    craqle_patch_request, craqle_request_durability, document_sync_peer_id, effect_graph_iri,
+    craqle_request_durability, document_sync_peer_id, effect_graph_iri,
     flush_document_sync_journal, flush_metadata_persistence, graph_ids, metadata_batch_from_craqle,
     metadata_effect_defers_persist, metadata_effect_kind, metadata_effect_persists_document_sync,
     metadata_error_from_craqle, metadata_event_kind, metadata_graph_policy_from_craqle,
-    record_craqle_call_result, record_error, record_metadata_query_result_counts,
-    record_metadata_result, schedule_deferred_metadata_persist, to_craqle_batch,
-    upsert_contextual_entity, upsert_data_entity, warn_if_slow_metadata_backend,
+    metadata_rocrate_page_from_craqle, plan_batch, record_craqle_call_result, record_error,
+    record_metadata_query_result_counts, record_metadata_result,
+    schedule_deferred_metadata_persist, to_craqle_batch, upsert_contextual_entity,
+    upsert_data_entity, warn_if_slow_metadata_backend,
 };
 use self::lifecycle::{
     effect_rejects_deleted_graph, fill_visibility_caches, graph_lifecycle_deleted,
@@ -2813,93 +2814,6 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         record_error(&effect_span, &error.to_string());
     }
     event
-}
-
-/// Plans `source` against the local graph and publishes it as a batch under
-/// `actor`, witnessing the graph's clock at plan time.
-fn plan_batch(
-    node: &CraqleNode,
-    auth: &AllowAllAuthorizer,
-    graph_iri: &str,
-    actor: [u8; 32],
-    source: &MetadataBatchSource,
-) -> Result<MetadataBatch, CraqleError> {
-    let graph = GraphId::new(graph_iri);
-    // Planning against a graph this node has not materialized yet would omit
-    // the removals the change set needs, so the caller must retry instead.
-    if !node.contains_graph(&graph)? {
-        return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
-            "metadata graph `{graph_iri}` is not materialized yet"
-        ))));
-    }
-    let changes = match source {
-        MetadataBatchSource::ReplaceRoCrate { jsonld } => {
-            node.plan_rocrate_document_checked(auth, &graph, jsonld)?
-        }
-        MetadataBatchSource::UpsertDataEntity { jsonld } => {
-            node.plan_patch_data(auth, &craqle_patch_request(&graph, jsonld)?)?
-        }
-        MetadataBatchSource::UpsertContextualEntity { jsonld } => {
-            node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)?
-        }
-    };
-    let base_clock = node.vector_clock(&graph)?;
-    let batch = Batch::from_changes(
-        graph,
-        ActorId::from_bytes(actor),
-        1,
-        base_clock,
-        changes,
-        chrono::Utc::now(),
-    )
-    .map_err(|error| CraqleError::RoCrate(RoCrateError::InvalidBatch(error.to_string())))?;
-    Ok(metadata_batch_from_craqle(batch))
-}
-
-fn metadata_rocrate_page_from_craqle(page: craqle::RoCratePage) -> MetadataRoCratePage {
-    MetadataRoCratePage {
-        jsonld: page.jsonld,
-        total_data_entities: page.total_data_entities,
-        returned_data_entities: page.returned_data_entities,
-        next_offset: page.next_offset,
-        next_cursor: page.next_cursor,
-    }
-}
-
-fn metadata_search_hit_from_craqle(
-    hit: craqle::SearchHit,
-    record: &MetadataRegistryRecord,
-    properties: &[(String, Term)],
-    query: &str,
-) -> MetadataSearchHit {
-    let title = hit_title(properties, &record.document_path, &hit.subject_iri);
-    let snippet = hit_snippet(properties, query);
-    MetadataSearchHit {
-        document_id: record.document_id.to_string(),
-        group_id: record.group_id.to_string(),
-        document_path: record.document_path.clone(),
-        graph_iri: hit.graph_id,
-        subject_iri: hit.subject_iri,
-        score: hit.score,
-        title,
-        snippet,
-        subject_types: hit_types(properties),
-    }
-}
-
-fn decode_hit_properties(
-    properties: Vec<(craqle::EncodedTerm, craqle::EncodedTerm)>,
-) -> Vec<(String, Term)> {
-    properties
-        .into_iter()
-        .filter_map(|(predicate, object)| {
-            let Some(Term::NamedNode(predicate)) = predicate.to_term() else {
-                return None;
-            };
-            let object = object.to_term()?;
-            Some((predicate.as_str().to_string(), object))
-        })
-        .collect()
 }
 
 #[cfg(test)]
