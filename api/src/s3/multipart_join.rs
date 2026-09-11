@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadResult;
+use aruna_operations::s3::complete_upload::CompleteMultipartUploadResult;
 use aruna_tasks::join_registry::{JoinRegistry, JoinWatch, await_joined};
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use ulid::Ulid;

@@ -16,9 +16,9 @@ use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::session::{
     GetS3SessionOperation, S3SessionError, TouchS3SessionConfig, TouchS3SessionOperation,
 };

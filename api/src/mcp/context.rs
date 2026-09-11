@@ -8,10 +8,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::metadata::stats::count_group_documents_by_purpose;
-use aruna_operations::realm::read_realm_authorization::ReadRealmAuthorizationOperation;
-use aruna_operations::users::read_user_document::{
-    ReadUserDocumentError, ReadUserDocumentOperation,
-};
+use aruna_operations::realm::read_authorization::ReadRealmAuthorizationOperation;
+use aruna_operations::users::read_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;

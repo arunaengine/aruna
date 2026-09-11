@@ -26,7 +26,7 @@ use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
-use aruna_operations::metadata::get_metadata_document::load_metadata_record_by_document;
+use aruna_operations::metadata::get_document::load_metadata_record_by_document;
 
 use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,

@@ -34,7 +34,7 @@ use aruna_operations::metadata::api::{
     references_metadata as run_references_metadata,
     references_preflight as run_references_preflight, search_metadata as run_search_metadata,
 };
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentError, CreateMetadataDocumentPayload,
 };
 use aruna_operations::metadata::forward::{
@@ -46,7 +46,7 @@ use aruna_operations::metadata::forward::{
     profile_validation_status_routed as run_profile_validation_status,
     update_metadata_document_routed as run_update_metadata_document,
 };
-use aruna_operations::metadata::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
+use aruna_operations::metadata::get_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::profile_validation::{
     MetadataProfilePreview, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
     preview_submission as run_preview_submission,
@@ -54,7 +54,7 @@ use aruna_operations::metadata::profile_validation::{
 use aruna_operations::metadata::public_preview::{
     RestrictedFilesPreview, restricted_files as run_restricted_files,
 };
-use aruna_operations::metadata::update_metadata_document::{
+use aruna_operations::metadata::update_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
 use axum::extract::{Path, Query, State};
@@ -3545,6 +3545,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE,
@@ -3563,7 +3564,6 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
         VersionKey,
     };
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::DriverContext;
@@ -3579,7 +3579,7 @@ mod tests {
     use aruna_operations::metadata::repository::{
         write_document_lifecycle_effect, write_graph_lifecycle_effect,
     };
-    use aruna_operations::realm::announce_realm_presence::{
+    use aruna_operations::realm::announce_presence::{
         AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
     };
     use aruna_operations::sync::incoming::initialize_net_incoming;

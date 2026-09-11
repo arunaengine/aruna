@@ -11,39 +11,37 @@ use aruna_core::structs::{
     Role, SessionKind, User,
 };
 use aruna_core::util::unix_timestamp_secs as now_timestamp;
-use aruna_operations::auth::ensure_canonical_user_token_subject::{
+use aruna_operations::auth::token_subject::{
     EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
 };
-use aruna_operations::device::remove_device_node::{
+use aruna_operations::device::remove_node::{
     DeviceEvictionScope, RemoveDeviceNodeConfig, RemoveDeviceNodeError, RemoveDeviceNodeOperation,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::onboarding::consume_onboarding_secret::{
+use aruna_operations::onboarding::consume_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
-use aruna_operations::onboarding::delete_onboarding_secret::{
+use aruna_operations::onboarding::delete_secret::{
     DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
 };
-use aruna_operations::onboarding::inspect_onboarding_secret::{
+use aruna_operations::onboarding::inspect_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
-use aruna_operations::onboarding::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use aruna_operations::realm::read_realm_authorization::{
+use aruna_operations::onboarding::list_secrets::ListOnboardingSecretsOperation;
+use aruna_operations::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::read_authorization::{
     ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
 };
 use aruna_operations::session::{CreateSessionConfig, CreateSessionError, CreateSessionOperation};
-use aruna_operations::users::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
+use aruna_operations::users::get_oidc::{GetOidcUserInput, GetOidcUserOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
-use aruna_operations::users::read_user_document::{
-    ReadUserDocumentError, ReadUserDocumentOperation,
-};
-use aruna_operations::users::register_or_get_oidc_user::{
+use aruna_operations::users::oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
+use aruna_operations::users::read_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::users::update_user::{UpdateUserInput, UpdateUserOperation};
@@ -1811,18 +1809,18 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::onboarding::create_onboarding_secret::{
+    use aruna_operations::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::realm::announce_realm_presence::{
+    use aruna_operations::realm::announce_presence::{
         AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
     };
-    use aruna_operations::realm::claim_initial_realm_admin::{
+    use aruna_operations::realm::claim_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::sync::incoming::initialize_net_incoming;
-    use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+    use aruna_operations::tasks::incoming::initialize_task_incoming;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
@@ -3405,14 +3403,14 @@ mod device_tests {
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId, RealmNodeKind};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::onboarding::create_onboarding_secret::{
+    use aruna_operations::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::realm::claim_initial_realm_admin::{
+    use aruna_operations::realm::claim_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::ensure_realm_config::{
+    use aruna_operations::realm::ensure_config::{
         EnsureRealmConfigConfig, EnsureRealmConfigOperation,
     };
     use aruna_storage::FjallStorage;

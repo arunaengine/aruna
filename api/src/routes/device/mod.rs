@@ -20,7 +20,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, NodeCapabilities};
 use aruna_operations::driver::drive;
-use aruna_operations::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
 
 #[derive(OpenApi)]
 #[openapi(tags((

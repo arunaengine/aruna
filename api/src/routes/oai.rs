@@ -27,7 +27,7 @@ use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
 };
 use aruna_operations::metadata::forward::export_rocrate_routed;
-use aruna_operations::metadata::get_metadata_document::load_metadata_record_by_document;
+use aruna_operations::metadata::get_document::load_metadata_record_by_document;
 use aruna_operations::metadata::visibility_index::{
     VisibilityError, earliest_visible, effective_datestamp, visible_page,
 };

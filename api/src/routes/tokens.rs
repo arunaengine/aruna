@@ -183,7 +183,7 @@ mod tests {
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+    use aruna_operations::realm::get_config::GetRealmConfigOperation;
     use aruna_storage::storage::FjallStorage;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;

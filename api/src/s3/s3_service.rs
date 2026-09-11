@@ -41,25 +41,28 @@ use aruna_operations::driver::{
     DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
 };
 use aruna_operations::metadata::MetadataAuthToken;
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation, complete_put,
 };
-use aruna_operations::s3::abort_multipart_upload::{
+use aruna_operations::s3::abort_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
 use aruna_operations::s3::bucket_cors::{
     DeleteBucketCorsOperation, GetBucketCorsOperation, PutBucketCorsOperation,
 };
-use aruna_operations::s3::complete_multipart_upload::{
+use aruna_operations::s3::complete_upload::{
     CompleteMultipartUploadInput as CMUI, CompleteMultipartUploadOperation,
     CompleteMultipartUploadResult,
 };
 use aruna_operations::s3::copy_object::{
     CopyObjectInput as CopyObjectData, CopySourceConditions, copy_object,
 };
+use aruna_operations::s3::copy_part::{
+    UploadPartCopyInput as UploadPartCopyData, upload_part_copy,
+};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_multipart_upload::{
+use aruna_operations::s3::create_upload::{
     CreateMultipartUploadInput as CMPI, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
@@ -69,35 +72,32 @@ use aruna_operations::s3::delete_object::{
 use aruna_operations::s3::delete_objects::{
     DeleteObjectsEntry, DeleteObjectsInput as DOSI, delete_objects,
 };
-use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
+use aruna_operations::s3::get_attributes::{
+    GetObjectAttributesInput as GOAI, GetObjectAttributesOperation,
+};
+use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{
     GetObjectInput as GOI, GetObjectResult, ObjectRangeRequest, get_object_routed,
 };
-use aruna_operations::s3::get_object_attributes::{
-    GetObjectAttributesInput as GOAI, GetObjectAttributesOperation,
-};
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
-use aruna_operations::s3::list_multipart_uploads::{
-    ListMultipartUploadsInput as LMUI, ListMultipartUploadsOperation,
-};
-use aruna_operations::s3::list_object_versions::{
-    ListObjectVersionsInput as LOVI, ListObjectVersionsItem, ListObjectVersionsOperation,
-};
-use aruna_operations::s3::list_objects_v2::{
+use aruna_operations::s3::list_objects::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
 use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
+use aruna_operations::s3::list_uploads::{
+    ListMultipartUploadsInput as LMUI, ListMultipartUploadsOperation,
+};
+use aruna_operations::s3::list_versions::{
+    ListObjectVersionsInput as LOVI, ListObjectVersionsItem, ListObjectVersionsOperation,
+};
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
-use aruna_operations::s3::refresh_reference_metadata::{
+use aruna_operations::s3::refresh_metadata::{
     QueueReferenceMetadataRefreshOperation, ReferenceMetadataRefresh,
 };
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
-use aruna_operations::s3::upload_part_copy::{
-    UploadPartCopyInput as UploadPartCopyData, upload_part_copy,
-};
-use aruna_operations::sync::sync_mirror_repair::{
+use aruna_operations::sync::mirror_repair::{
     SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile,
 };
@@ -3672,7 +3672,7 @@ mod tests {
     use aruna_operations::replication::queue::{
         LiveReplicationObligationRecord, live_replication_obligation_key,
     };
-    use aruna_operations::s3::refresh_reference_metadata::refresh_reference_metadata;
+    use aruna_operations::s3::refresh_metadata::refresh_reference_metadata;
     use aruna_storage::storage;
     use futures_util::{StreamExt, stream};
     use http::Extensions;

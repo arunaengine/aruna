@@ -7,7 +7,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::blob::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::replication::location_summary::{
+use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,
     RelationshipReplicaNodesOperation, RemoteLocationSummaryOperation,
 };
@@ -18,7 +18,7 @@ use aruna_operations::replication::queue::QueueBlobReplicationOperation;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -819,7 +819,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
-    use aruna_operations::replication::location_summary::LocationSummaryError;
+    use aruna_operations::replication::locations::LocationSummaryError;
     use aruna_operations::replication::protocol::CopyCompliance;
     use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
     use aruna_storage::FjallStorage;

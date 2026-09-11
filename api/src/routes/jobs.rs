@@ -28,7 +28,7 @@ use aruna_operations::jobs::service::{
     read_report_routed,
 };
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -2501,6 +2501,7 @@ pub async fn cancel_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
         ArtifactRef, BackendLocation, BackendRef, ExportOmissionCounts, ExportRoCrateResult,
@@ -2509,7 +2510,6 @@ mod tests {
         JobPayload, JobProgress, JobResultPayload, NodeCapabilities, PathRestriction, Permission,
         RealmId, ReasonCode, RoCrateLimits,
     };
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;

@@ -10,7 +10,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::join_request::{
     GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,
 };
-use aruna_operations::groups::list_join_requests::{
+use aruna_operations::groups::list_requests::{
     ListJoinRequestsError, ListJoinRequestsInput, ListJoinRequestsOperation,
 };
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};

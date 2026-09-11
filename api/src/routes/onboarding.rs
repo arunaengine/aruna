@@ -17,24 +17,24 @@ use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::onboarding::bootstrap_onboarding_finalize::{
+use aruna_operations::onboarding::consume_secret::ConsumeOnboardingSecretError;
+use aruna_operations::onboarding::create_secret::{
+    CreateOnboardingSecretError, CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::delete_secret::{
+    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::finalize_bootstrap::{
     BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
     bootstrap_onboarding_finalize,
 };
-use aruna_operations::onboarding::consume_onboarding_secret::ConsumeOnboardingSecretError;
-use aruna_operations::onboarding::create_onboarding_secret::{
-    CreateOnboardingSecretError, CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-};
-use aruna_operations::onboarding::delete_onboarding_secret::{
-    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
-};
-use aruna_operations::onboarding::inspect_onboarding_secret::{
+use aruna_operations::onboarding::inspect_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
-use aruna_operations::onboarding::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::onboarding::reserve_onboarding_secret::ReserveOnboardingSecretError;
-use aruna_operations::realm::ensure_realm_config::EnsureRealmConfigError;
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::onboarding::list_secrets::ListOnboardingSecretsOperation;
+use aruna_operations::onboarding::reserve_secret::ReserveOnboardingSecretError;
+use aruna_operations::realm::ensure_config::EnsureRealmConfigError;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -1069,7 +1069,6 @@ mod tests {
     };
     use crate::server_state::ServerState;
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -1081,6 +1080,7 @@ mod tests {
         OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord, OnboardingSecretState,
         RequestedOnboardingMode, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
+    use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{
@@ -1089,15 +1089,15 @@ mod tests {
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::onboarding::bootstrap_onboarding_finalize::BootstrapOnboardingFinalizeError;
-    use aruna_operations::onboarding::create_onboarding_secret::{
+    use aruna_operations::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::onboarding::list_onboarding_secrets::ListOnboardingSecretsOperation;
-    use aruna_operations::onboarding::reserve_onboarding_secret::{
+    use aruna_operations::onboarding::finalize_bootstrap::BootstrapOnboardingFinalizeError;
+    use aruna_operations::onboarding::list_secrets::ListOnboardingSecretsOperation;
+    use aruna_operations::onboarding::reserve_secret::{
         ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
     };
-    use aruna_operations::realm::claim_initial_realm_admin::{
+    use aruna_operations::realm::claim_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

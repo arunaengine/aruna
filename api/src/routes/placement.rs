@@ -35,7 +35,7 @@ use aruna_operations::placement::policy::{
 use aruna_operations::s3::bucket_placement::{
     PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::object_placement::{
     ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation,
 };

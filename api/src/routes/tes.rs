@@ -21,7 +21,7 @@ use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_exte
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
 };
-use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
