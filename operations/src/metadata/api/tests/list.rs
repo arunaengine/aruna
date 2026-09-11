@@ -438,3 +438,52 @@ fn fanout_nodes_bounded() {
     assert!(first.contains(&local));
     assert_eq!(first.iter().collect::<HashSet<_>>().len(), first.len());
 }
+
+#[tokio::test]
+async fn hidden_ids_match() {
+    // Missing, private-denied, and policy-denied public ids must all return
+    // NotFound so read-by-id cannot probe existence.
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let stranger = UserId::local(Ulid::generate(), TEST_REALM_ID);
+    write_policy_docs(
+        &test,
+        group_id,
+        user_role(
+            UserId::local(Ulid::generate(), TEST_REALM_ID),
+            HashMap::from([(
+                format!("/{TEST_REALM_ID}/g/{group_id}/**"),
+                Permission::WRITE,
+            )]),
+        ),
+        vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "no-reads".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'read'".to_string(),
+            enabled: true,
+        }],
+    )
+    .await;
+
+    let public = public_record(group_id, Ulid::generate());
+    seed_registry_cache(&test, &public).await;
+    let mut private = public_record(group_id, Ulid::generate());
+    private.public = false;
+    seed_registry_cache(&test, &private).await;
+    let missing = public_record(group_id, Ulid::generate());
+
+    for document_id in [public.document_id, private.document_id, missing.document_id] {
+        let result = get_visible_metadata_document(
+            &test.context,
+            TEST_REALM_ID,
+            GetVisibleMetadataDocumentRequest {
+                document_id,
+                auth: Some(auth_for(stranger)),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(MetadataApiError::NotFound)));
+    }
+}
