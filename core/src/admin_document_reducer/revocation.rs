@@ -475,3 +475,18 @@ impl AdminDocumentReducerState {
         }
     }
 }
+
+pub const MAX_LIVE_REVOCATIONS_PER_ORIGIN: usize = 1024;
+pub fn revoked_token_path(token_hash: &str, expires_at: u64, token_owner: &UserId) -> String {
+    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}.{expires_at}.{token_owner}")
+}
+
+pub fn revoked_token_entry(path: &str) -> Option<(&str, u64, UserId)> {
+    let rest = path.strip_prefix(REALM_CONFIG_REVOKED_TOKENS_PATH)?;
+    let mut parts = rest.strip_prefix('.')?.split('.');
+    let hash = parts.next()?;
+    let expires_at = parts.next()?.parse().ok()?;
+    let token_owner = UserId::from_string(parts.next()?).ok()?;
+    (parts.next().is_none() && valid_token_hash(hash)).then_some((hash, expires_at, token_owner))
+}
+
