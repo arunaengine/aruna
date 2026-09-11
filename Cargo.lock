@@ -1985,7 +1985,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.2.0"
-source = "git+https://github.com/arunaengine/craqle?branch=main#9f1b9e45c5b93d6ea4f8b159166754a7a141700e"
+source = "git+https://github.com/arunaengine/craqle?rev=fb9f16380ed3e4b39d7d6055d416645ce839efac#fb9f16380ed3e4b39d7d6055d416645ce839efac"
 dependencies = [
  "blake3",
  "chrono",
@@ -4026,7 +4026,7 @@ dependencies = [
 [[package]]
 name = "irokle"
 version = "0.1.3"
-source = "git+https://github.com/arunaengine/irokle.git?rev=ebd4abd142f66816a16492c615525809f6c8b663#ebd4abd142f66816a16492c615525809f6c8b663"
+source = "git+https://github.com/arunaengine/irokle.git?rev=59e787058667bb6b400ab01fbd9a1698b88256f5#59e787058667bb6b400ab01fbd9a1698b88256f5"
 dependencies = [
  "blake3",
  "bytes",
@@ -4046,7 +4046,7 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?rev=ebd4abd142f66816a16492c615525809f6c8b663#ebd4abd142f66816a16492c615525809f6c8b663"
+source = "git+https://github.com/arunaengine/irokle.git?rev=59e787058667bb6b400ab01fbd9a1698b88256f5#59e787058667bb6b400ab01fbd9a1698b88256f5"
 dependencies = [
  "proc-macro2",
  "quote",
