@@ -105,26 +105,26 @@ use crate::notifications::watch::interest::{
 };
 use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
-use crate::realm::announce_realm_presence::{
+use crate::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
-use crate::s3::refresh_reference_metadata::{
+use crate::s3::refresh_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
     restore_document_sync_outbox_timers,
+};
+use crate::sync::mirror_repair::{
+    MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
 };
 use crate::sync::shard_placement::{
     DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX,
     SYNC_PLACEMENT_RETRY_AFTER,
-};
-use crate::sync::sync_mirror_repair::{
-    MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
 };
 use crate::tasks::queue_backoff::{queue_retry_after_ms, retry_after_ms};
 use crate::tasks::task_persistence::{
@@ -454,7 +454,7 @@ impl OperationsTaskHandler {
         };
         config
             .and_then(|config| {
-                crate::realm::mutate_realm_placement::node_kind(config, net_handle.node_id())
+                crate::realm::mutate_placement::node_kind(config, net_handle.node_id())
             })
             .is_some_and(|kind| !kind.is_sync_eligible())
     }

@@ -25,14 +25,14 @@ use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     quota_marked_routing, routing_snapshot,
 };
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::store::reserve_output_commits;
-use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
@@ -41,15 +41,15 @@ use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
 };
+use crate::s3::create_access::{CreateUserAccessConfig, CreateUserAccessOperation};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
 use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::delete_object::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
+use crate::s3::list_objects::{ListObjectsV2Input, ListObjectsV2Operation};
 use crate::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };

@@ -2,10 +2,10 @@ use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
 use aruna_core::structs::BindingError;
 
-use crate::metadata::create_metadata_document::CreateMetadataDocumentError;
-use crate::metadata::delete_metadata_document::DeleteMetadataDocumentError;
+use crate::metadata::create_document::CreateMetadataDocumentError;
+use crate::metadata::delete_document::DeleteMetadataDocumentError;
 use crate::metadata::forward::MetadataWriteError;
-use crate::metadata::update_metadata_document::UpdateMetadataDocumentError;
+use crate::metadata::update_document::UpdateMetadataDocumentError;
 
 /// What a job should do about a failed metadata write, shared by every job that
 /// writes through the metadata seam: a document the backend will never accept
@@ -115,8 +115,8 @@ mod tests {
         MetadataProfileValidationSeverity,
     };
 
-    fn handle() -> aruna_core::structured_id::PlacementHandle {
-        aruna_core::structured_id::PlacementHandle::new(1).expect("handle")
+    fn handle() -> aruna_core::identifiers::PlacementHandle {
+        aruna_core::identifiers::PlacementHandle::new(1).expect("handle")
     }
 
     fn violation() -> Vec<MetadataValidationViolation> {
@@ -238,7 +238,7 @@ mod tests {
             )),
             create(CreateMetadataDocumentError::PlacementBinding(
                 BindingError::BucketOutOfRange(
-                    aruna_core::structured_id::BucketId::new(9)
+                    aruna_core::identifiers::BucketId::new(9)
                         .expect("bucket")
                         .in_strategy_range(4)
                         .expect_err("out of range"),

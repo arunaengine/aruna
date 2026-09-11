@@ -18,7 +18,7 @@ use crate::placement::fence;
 use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
-use crate::realm::mutate_realm_placement::{
+use crate::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
     is_management,
 };
@@ -144,7 +144,7 @@ pub async fn process_placement_transitions(
     // leaves it a member only until the grace elapses, so whatever it accepted
     // before the cutover has to reach the topic inside that window.
     if departed {
-        crate::tasks::task_incoming::drive_document_sync_outbox_drain(context.clone()).await;
+        crate::tasks::incoming::drive_document_sync_outbox_drain(context.clone()).await;
     }
     pending
 }
@@ -242,10 +242,10 @@ async fn drain_blocker(
     {
         return Some(DrainBlocker::Eviction);
     }
-    for prefix in crate::sync::document_sync_outbox::outbox_stream_prefixes() {
+    for prefix in crate::sync::document_outbox::outbox_stream_prefixes() {
         let mut start_after: Option<Vec<u8>> = None;
         loop {
-            let batch = match crate::sync::document_sync_outbox::read_outbox_records(
+            let batch = match crate::sync::document_outbox::read_outbox_records(
                 &context.storage_handle,
                 prefix,
                 start_after.take(),
@@ -721,11 +721,11 @@ async fn submit_mutation(
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::admin_document_reducer::{
-        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
-    };
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    };
+    use aruna_core::reducer::{
+        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
     };
     use std::path::Path;
 
@@ -1118,7 +1118,7 @@ mod tests {
             kind: aruna_core::document::DocumentSyncChangeKind::Delete,
             placement,
         };
-        let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
+        let record = crate::sync::document_outbox::new_outbox_record_with_id(
             Ulid::from_bytes([seed; 16]),
             node(1),
             DocumentSyncTarget::MetadataDocumentLifecycle {
@@ -1131,8 +1131,7 @@ mod tests {
         )
         .fenced_at(generation);
         let (key_space, key, value) =
-            crate::sync::document_sync_outbox::outbox_write_entry(&record)
-                .expect("the row encodes");
+            crate::sync::document_outbox::outbox_write_entry(&record).expect("the row encodes");
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1168,7 +1167,7 @@ mod tests {
         );
         assert_eq!(closed_generation(&context, realm_id, &placement).await, 1);
 
-        crate::sync::document_sync_outbox::delete_outbox_records(
+        crate::sync::document_outbox::delete_outbox_records(
             &context.storage_handle,
             vec![predecessor],
         )
