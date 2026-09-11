@@ -1427,3 +1427,174 @@ fn shard_topic_record(origin_seq: u64) -> DocumentSyncOutboxRecord {
         false,
     )
 }
+
+struct BoundaryHarness {
+    _dir: tempfile::TempDir,
+    storage: aruna_storage::StorageHandle,
+    net: NetHandle,
+    task_handle: TaskHandle,
+    handler: OperationsTaskHandler,
+    realm_id: RealmId,
+    appended: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+}
+
+impl BoundaryHarness {
+    async fn new() -> Self {
+        let realm_id = RealmId::from_bytes([45u8; 32]);
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let net = make_net_handle(realm_id, &storage, [45u8; 32]).await;
+        tokio::time::pause();
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let handler =
+            OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
+        Self {
+            _dir: dir,
+            storage,
+            net,
+            task_handle,
+            handler,
+            realm_id,
+            appended: Vec::new(),
+        }
+    }
+
+    fn placed_change(&self) -> DocumentSyncChange {
+        let mut value = change();
+        value.placement = aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_bytes([45; 16]),
+            shard: 1,
+        };
+        value
+    }
+
+    fn record(
+        &self,
+        id: u128,
+        target: DocumentSyncTarget,
+        event: DocumentSyncOutboxEvent,
+    ) -> DocumentSyncOutboxRecord {
+        crate::sync::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, id),
+            node(1),
+            target,
+            Vec::new(),
+            event,
+            aruna_core::structs::PlacementRef::NIL,
+            true,
+        )
+    }
+
+    async fn seed_records(&self) {
+        for id in 1..=3 {
+            let record = self.record(
+                id,
+                target(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: id.to_be_bytes().to_vec(),
+                    change: self.placed_change(),
+                },
+            );
+            write_outbox_record(&self.storage, &record).await;
+        }
+        let initial = self.record(
+            0,
+            DocumentSyncTarget::RealmAuthorization {
+                realm_id: self.realm_id,
+            },
+            DocumentSyncOutboxEvent::Delete { change: change() },
+        );
+        write_outbox_record(&self.storage, &initial).await;
+    }
+
+    async fn append_records(&mut self) {
+        let shared = DocumentSyncTarget::RealmAuthorization {
+            realm_id: self.realm_id,
+        };
+        let topic = shared.sync_topic_id(self.realm_id, &aruna_core::structs::PlacementRef::NIL);
+        self.net
+            .ensure_document_sync_topics(&[topic], Vec::new())
+            .expect("appended topic genesis");
+        let records = [
+            self.record(
+                4,
+                shared,
+                DocumentSyncOutboxEvent::Delete { change: change() },
+            ),
+            self.record(
+                5,
+                target(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: b"appended-upsert".to_vec(),
+                    change: self.placed_change(),
+                },
+            ),
+        ];
+        for record in records {
+            let key = outbox_key(&record).to_vec();
+            write_outbox_record(&self.storage, &record).await;
+            self.appended.push((key, record));
+        }
+    }
+
+    async fn append_later(&mut self) {
+        let record = self.record(
+            6,
+            target(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"appended-later".to_vec(),
+                change: self.placed_change(),
+            },
+        );
+        let key = outbox_key(&record).to_vec();
+        write_outbox_record(&self.storage, &record).await;
+        self.appended.push((key, record));
+    }
+
+    fn assert_rotation(&self, examined: usize, cursor: bool, continuations: u32) {
+        let rotation = self.handler.rotation.lock().expect("rotation lock");
+        assert_eq!(
+            (rotation.totals.examined, rotation.cursor.is_some()),
+            (examined, cursor)
+        );
+        assert_eq!(rotation.continuations, continuations);
+    }
+
+    async fn assert_appends(&self) {
+        for (key, record) in &self.appended {
+            assert_eq!(
+                read_outbox_record(&self.storage, key)
+                    .await
+                    .expect("read appended record"),
+                Some(record.clone())
+            );
+        }
+    }
+
+    async fn finish_retry(self) {
+        let shard_topic = target().sync_topic_id(self.realm_id, &self.placed_change().placement);
+        self.net
+            .ensure_document_sync_topics(&[shard_topic], Vec::new())
+            .expect("blocked head topic genesis");
+        for _ in 0..6 {
+            self.handler.drain_document_sync_outbox().await;
+        }
+        let remaining = read_outbox_records(&self.storage, &[], None, 8)
+            .await
+            .expect("read retried records");
+        assert!(
+            remaining.records.is_empty(),
+            "records across all streams must retry after the rotation closes"
+        );
+        shutdown_net(&self.net).await;
+    }
+}
