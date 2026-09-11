@@ -15,6 +15,9 @@ use crate::executor::config::KubernetesConfig;
 use crate::executor::staging::StageLayout;
 use crate::executor::{digest_pinned, enforced_limit};
 
+/// Cilium-native companion of the `aruna-compute-s3` network policy.
+pub const CILIUM_S3_POLICY: &str = "aruna-compute-s3-ingress";
+
 pub const WORKSPACE_PATH: &str = "/workspace";
 pub const MARKER_PATH: &str = "/aruna-marker/marker";
 pub const SENTINEL_PATH: &str = "/workspace/.aruna-stage";
@@ -430,6 +433,25 @@ pub fn network_policies(config: &KubernetesConfig) -> Result<Vec<NetworkPolicy>,
     }))
     .map_err(manifest_error)?;
     Ok(vec![deny, s3])
+}
+
+/// Cilium classifies pod-to-Ingress traffic as the reserved `ingress` entity,
+/// which no ipBlock rule can match, so the S3 port needs a native rule too.
+pub fn cilium_ingress_policy(config: &KubernetesConfig) -> serde_json::Value {
+    json!({
+        "apiVersion":"cilium.io/v2",
+        "kind":"CiliumNetworkPolicy",
+        "metadata":{"name":CILIUM_S3_POLICY,"namespace":config.namespace},
+        "spec":{
+            "endpointSelector":{"matchLabels":{"aruna-engine.org/network":"s3"}},
+            "egress":[{
+                "toEntities":["ingress"],
+                "toPorts":[{"ports":[
+                    {"port":config.s3_port.to_string(),"protocol":"TCP"}
+                ]}]
+            }]
+        }
+    })
 }
 
 pub fn marker_name(name: &str) -> String {
@@ -976,6 +998,27 @@ mod tests {
             job.spec.unwrap().template.metadata.unwrap().labels.unwrap()["aruna-engine.org/network"],
             "task"
         );
+    }
+
+    #[test]
+    fn builds_cilium_policy() {
+        // Pod to Ingress traffic is the reserved `ingress` entity, which the
+        // Kubernetes policy's CIDR peers can never match.
+        let mut config = config();
+        config.s3_port = 8443;
+
+        let policy = cilium_ingress_policy(&config);
+        let egress = &policy["spec"]["egress"][0];
+
+        assert_eq!(policy["kind"], "CiliumNetworkPolicy");
+        assert_eq!(policy["metadata"]["name"], CILIUM_S3_POLICY);
+        assert_eq!(
+            policy["spec"]["endpointSelector"]["matchLabels"]["aruna-engine.org/network"],
+            "s3"
+        );
+        assert_eq!(egress["toEntities"][0], "ingress");
+        assert_eq!(egress["toPorts"][0]["ports"][0]["port"], "8443");
+        assert_eq!(egress["toPorts"][0]["ports"][0]["protocol"], "TCP");
     }
 
     #[test]

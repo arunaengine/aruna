@@ -31,6 +31,7 @@ use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
     Preconditions,
 };
+use kube::api::{DynamicObject, GroupVersionKind};
 use kube::{Client, ResourceExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -47,9 +48,10 @@ use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, StageMarker, WORKSPACE_PATH, helper_pod, job_manifest, marker_manifest,
-    marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
-    network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
+    CILIUM_S3_POLICY, HELPER_PATH, StageMarker, WORKSPACE_PATH, cilium_ingress_policy, helper_pod,
+    job_manifest, marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest,
+    mount_pvc_manifest, needs_workspace, network_policies, pvc_manifest, secret_manifest,
+    secret_name, workspace_name,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -300,7 +302,41 @@ impl KubernetesBackend {
                 .await
                 .map_err(kube_error)?;
         }
-        Ok(())
+        self.apply_cilium().await
+    }
+
+    /// Opens the S3 port towards the Cilium ingress entity, which no ipBlock
+    /// rule can match. A cluster without the CRD keeps the policies above.
+    async fn apply_cilium(&self) -> Result<(), BackendError> {
+        if self.config.s3_cidrs.is_empty() {
+            return Ok(());
+        }
+        let gvk = GroupVersionKind::gvk("cilium.io", "v2", "CiliumNetworkPolicy");
+        let Ok((resource, _)) = kube::discovery::pinned_kind(&self.client, &gvk).await else {
+            tracing::debug!(
+                namespace = %self.config.namespace,
+                "Cilium network policies are not served by this cluster"
+            );
+            return Ok(());
+        };
+        let policies: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource);
+        let policy = cilium_ingress_policy(&self.config);
+        let params = PatchParams::apply("aruna-compute");
+        match policies
+            .patch(CILIUM_S3_POLICY, &params, &Patch::Apply(&policy))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if api_code(&error) == Some(403) => {
+                tracing::warn!(
+                    namespace = %self.config.namespace,
+                    "The node may not create, get or patch ciliumnetworkpolicies.cilium.io"
+                );
+                Ok(())
+            }
+            Err(error) => Err(kube_error(error)),
+        }
     }
 
     async fn remove_helpers(&self, context: &FenceContext) -> Result<(), BackendError> {
@@ -2770,6 +2806,51 @@ mod tests {
                 .all(|entry| entry.contains("networkpolicies"))
         );
         assert!(patched[1].contains("aruna-compute-s3"));
+    }
+
+    #[tokio::test]
+    async fn patches_cilium_policy() {
+        // Only a Cilium-native policy can name the ingress entity the session
+        // reaches its S3 endpoint through.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record requests")
+                .push(format!("{method} {path}"));
+            if path == "/apis/cilium.io/v2" {
+                return (
+                    200,
+                    json!({
+                        "kind":"APIResourceList","apiVersion":"v1",
+                        "groupVersion":"cilium.io/v2",
+                        "resources":[{
+                            "name":"ciliumnetworkpolicies",
+                            "singularName":"ciliumnetworkpolicy",
+                            "namespaced":true,"kind":"CiliumNetworkPolicy",
+                            "verbs":["create","get","patch"]
+                        }]
+                    }),
+                );
+            }
+            (
+                200,
+                json!({
+                    "apiVersion":"cilium.io/v2","kind":"CiliumNetworkPolicy",
+                    "metadata":{"name":CILIUM_S3_POLICY,"namespace":"compute"}
+                }),
+            )
+        });
+        let mut config = test_config();
+        config.s3_cidrs.push("10.0.0.0/8".to_string());
+        let backend = KubernetesBackend { client, config };
+
+        backend.apply_cilium().await.expect("the policy applies");
+
+        let seen = seen.lock().expect("read requests").clone();
+        assert!(seen.iter().any(|entry| entry
+            == &format!("PATCH /apis/cilium.io/v2/namespaces/compute/ciliumnetworkpolicies/{CILIUM_S3_POLICY}")));
     }
 
     const POD_START: &str = "2027-01-01T00:00:00Z";

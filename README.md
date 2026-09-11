@@ -188,6 +188,14 @@ Kubernetes the Aruna node's controller service account needs the `create` verb o
 the node talks to a session's kernel through an exec into the running pod. The task workload
 service account stays unprivileged, with its token unmounted.
 
+On a Cilium cluster the S3 endpoint often resolves to the ingress load balancer, and Cilium treats
+that traffic as its reserved `ingress` entity, which no `ipBlock` rule matches. The node therefore
+also writes the CiliumNetworkPolicy `aruna-compute-s3-ingress`, so its service account needs
+`create`, `get` and `patch` on `ciliumnetworkpolicies.cilium.io` in the compute namespace. Without
+that permission the node logs a warning and leaves the policy alone; clusters without the CRD skip
+it. DNS egress is allowed by port with no peer, because a node-local resolver runs on a host
+address that is neither a pod nor a CIDR peer.
+
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
 `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.2.0` and `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-deno:0.1.0`.
