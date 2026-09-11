@@ -7452,9 +7452,9 @@ checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "s3s"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe1bd31748cb69848c2cf4028cecdadf5f8299ef3b02a83e21b20e7bda3aba9"
+checksum = "652451a66fefda01a13dc7df24aa2af9e70c7058f98bc08fe2f7c552eaa9f1e3"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -7482,6 +7482,7 @@ dependencies = [
  "numeric_cast",
  "pin-project-lite",
  "quick-xml 0.41.0",
+ "regex",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -7499,6 +7500,7 @@ dependencies = [
  "transform-stream",
  "url",
  "urlencoding",
+ "xxhash-rust",
  "zeroize",
 ]
 

@@ -2556,9 +2556,14 @@ impl S3 for ArunaS3Service {
                     checksum_crc32: encoded.checksum_crc32,
                     checksum_crc32c: encoded.checksum_crc32c,
                     checksum_crc64nvme: encoded.checksum_crc64nvme,
+                    checksum_md5: None,
                     checksum_sha1: encoded.checksum_sha1,
                     checksum_sha256: encoded.checksum_sha256,
+                    checksum_sha512: None,
                     checksum_type: encoded.checksum_type,
+                    checksum_xxhash128: None,
+                    checksum_xxhash3: None,
+                    checksum_xxhash64: None,
                 }
             })
         } else {
@@ -2597,8 +2602,13 @@ impl S3 for ArunaS3Service {
                             checksum_crc32: checksums.checksum_crc32,
                             checksum_crc32c: checksums.checksum_crc32c,
                             checksum_crc64nvme: checksums.checksum_crc64nvme,
+                            checksum_md5: None,
                             checksum_sha1: checksums.checksum_sha1,
                             checksum_sha256: checksums.checksum_sha256,
+                            checksum_sha512: None,
+                            checksum_xxhash128: None,
+                            checksum_xxhash3: None,
+                            checksum_xxhash64: None,
                         }
                     })
                     .collect();
@@ -2793,8 +2803,13 @@ impl S3 for ArunaS3Service {
                     checksum_crc32: checksums.checksum_crc32,
                     checksum_crc32c: checksums.checksum_crc32c,
                     checksum_crc64nvme: checksums.checksum_crc64nvme,
+                    checksum_md5: None,
                     checksum_sha1: checksums.checksum_sha1,
                     checksum_sha256: checksums.checksum_sha256,
+                    checksum_sha512: None,
+                    checksum_xxhash128: None,
+                    checksum_xxhash3: None,
+                    checksum_xxhash64: None,
                 }
             })
             .collect();
