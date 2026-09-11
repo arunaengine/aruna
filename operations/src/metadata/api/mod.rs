@@ -54,9 +54,11 @@ use self::preflight::{
     resolve_preflight_targets,
 };
 pub(crate) use self::read::filter_live_records;
+pub(crate) use self::read::load_record_by_document;
 use self::read::{check_policy_limit, effective_list_limit, load_group_records};
-use self::read::{document_lifecycle_deleted, graph_lifecycle_deleted};
-use self::read::{load_pending_records, merge_pending_metadata_records};
+use self::read::{
+    ensure_record_materialized_for_graph_read, load_pending_records, merge_pending_metadata_records,
+};
 pub use self::read::{
     query_metadata, query_metadata_document, references_metadata, search_metadata,
 };
@@ -1475,124 +1477,6 @@ fn authorized_realm_nodes(
         .into_iter()
         .filter(|node_id| authorized.contains(node_id))
         .collect())
-}
-
-pub(crate) async fn load_record_by_document(
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    match load_metadata_record_by_document(context, document_id).await {
-        Ok(Some(record)) => {
-            filter_live_records(&context.storage_handle, std::slice::from_ref(&record))
-                .await?
-                .into_iter()
-                .next()
-                .ok_or(MetadataApiError::NotFound)
-        }
-        Ok(None) => Err(MetadataApiError::NotFound),
-        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
-        Err(StorageReadError::Conversion(error)) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-    }
-}
-
-async fn load_record_txn(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: TxnId,
-) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    let event = context
-        .storage_handle
-        .send_effect(read_registry_by_document_effect(document_id, Some(txn_id)))
-        .await;
-    match parse_registry_read(event) {
-        Ok(Some(record)) => {
-            if record_deleted_txn(context, &record, txn_id).await? {
-                Err(MetadataApiError::NotFound)
-            } else {
-                Ok(record)
-            }
-        }
-        Ok(None) => Err(MetadataApiError::NotFound),
-        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
-        Err(StorageReadError::Conversion(error)) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-    }
-}
-
-async fn record_deleted_txn(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-    txn_id: TxnId,
-) -> Result<bool, MetadataApiError> {
-    Ok(graph_deleted_txn(context, record, txn_id).await?
-        || document_deleted_txn(context, record, txn_id).await?)
-}
-
-async fn graph_deleted_txn(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-    txn_id: TxnId,
-) -> Result<bool, MetadataApiError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(&record.graph_iri),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => graph_lifecycle_deleted(record, &value),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
-    }
-}
-
-async fn document_deleted_txn(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-    txn_id: TxnId,
-) -> Result<bool, MetadataApiError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_document_lifecycle_key(record.document_id),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => document_lifecycle_deleted(record, &value),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
-    }
-}
-
-async fn ensure_record_materialized_for_graph_read(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Result<(), MetadataApiError> {
-    match is_metadata_record_materialized_for_graph_read(context, record).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(MetadataApiError::ServiceUnavailable),
-        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
-        Err(StorageReadError::Conversion(error)) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-    }
 }
 
 /// The canonical `metadata.read` policy request for one record path and caller,
