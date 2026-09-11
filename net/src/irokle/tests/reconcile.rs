@@ -757,3 +757,87 @@ async fn inbound_checks_grants() {
         }
     );
 }
+
+#[tokio::test]
+async fn inbound_admin_validation_rejects_target_and_malformed_events() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([67; 32]);
+    let actor = test_actor(67, UserId::local(Ulid::generate(), realm_id), realm_id);
+    let user_id = actor.user_id;
+    let other_user = UserId::local(Ulid::generate(), realm_id);
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    storage_batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            DocumentSyncTarget::RealmConfig { realm_id },
+            config.to_bytes(&actor).expect("config serializes").into(),
+        )],
+    )
+    .await
+    .expect("config writes");
+    let target = DocumentSyncTarget::User { user_id };
+    let placement = admin_test_placement();
+    let topic_id = target.sync_topic_id(realm_id, &placement);
+    let publisher = irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id));
+
+    let wrong_target = test_admin_event(
+        Ulid::from_parts(1_620, 1),
+        AdminDocumentTarget::User {
+            user_id: other_user,
+        },
+        &actor,
+        1,
+        AdminDocumentOperation::UserNameSet {
+            name: "wrong".to_string(),
+        },
+    );
+    assert!(matches!(
+        validate_replicated_admin_event(
+            &storage,
+            topic_id,
+            publisher,
+            &target,
+            &wrong_target,
+            realm_id,
+            &placement,
+            &sign_as_origin(&wrong_target, &placement),
+            &mut ConfigValidationCache::default(),
+        )
+        .await
+        .expect("storage succeeds"),
+        AdminEventValidation::Rejected(_)
+    ));
+
+    let malformed = test_admin_event(
+        Ulid::from_parts(1_621, 1),
+        AdminDocumentTarget::User { user_id },
+        &actor,
+        1,
+        AdminDocumentOperation::UserAttributeSet {
+            key: "display name".to_string(),
+            value: "invalid".to_string(),
+        },
+    );
+    assert!(matches!(
+        validate_replicated_admin_event(
+            &storage,
+            topic_id,
+            publisher,
+            &target,
+            &malformed,
+            realm_id,
+            &placement,
+            &sign_as_origin(&malformed, &placement),
+            &mut ConfigValidationCache::default(),
+        )
+        .await
+        .expect("storage succeeds"),
+        AdminEventValidation::Rejected(_)
+    ));
+    assert_eq!(
+        read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into()).await,
+        None,
+        "rejected validation must not mutate storage"
+    );
+}
