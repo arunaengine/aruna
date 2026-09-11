@@ -8,10 +8,10 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::s3::list_multipart_uploads::{
+use crate::s3::list_uploads::{
     ListMultipartUploadsError, ListMultipartUploadsInput, ListMultipartUploadsOperation,
 };
-use crate::s3::list_object_versions::{
+use crate::s3::list_versions::{
     ListObjectVersionsError, ListObjectVersionsInput, ListObjectVersionsItem,
     ListObjectVersionsOperation,
 };

@@ -264,8 +264,8 @@ pub fn spawn_session_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
-    use crate::s3::list_user_access::{ListUserAccessInput, ListUserAccessOperation};
+    use crate::s3::create_access::{CreateUserAccessConfig, CreateUserAccessOperation};
+    use crate::s3::list_access::{ListUserAccessInput, ListUserAccessOperation};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_OWNER_KEYSPACE};
