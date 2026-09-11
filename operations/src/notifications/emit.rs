@@ -170,7 +170,7 @@ pub fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Effect {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::notifications::test_support::{context_with_storage, record, user};
+    use crate::notifications::tests::fixtures::{context_with_storage, record, user};
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::structs::{NotificationClass, notification_outbox_key};

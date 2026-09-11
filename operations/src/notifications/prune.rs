@@ -343,7 +343,7 @@ async fn batch_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::test_support::{context, record, temp_storage, user};
+    use crate::notifications::tests::fixtures::{context, record, temp_storage, user};
     use aruna_core::storage_entries::{
         notification_inbox_update_entry, notification_inbox_write_entries,
     };

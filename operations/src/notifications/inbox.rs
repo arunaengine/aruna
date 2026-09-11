@@ -261,7 +261,7 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::test_support::{record, temp_storage, user};
+    use crate::notifications::tests::fixtures::{record, temp_storage, user};
     use aruna_core::keyspaces::{
         NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     };

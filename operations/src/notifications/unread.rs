@@ -183,12 +183,12 @@ impl Operation for UnreadCountOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::notifications::test_support::{context_with_storage, seed, user};
+    use crate::notifications::tests::fixtures::{context_with_storage, seed, user};
     use aruna_core::structs::NotificationClass;
     use std::collections::VecDeque;
 
     fn record(recipient: UserId, created_at_ms: u64, read: bool) -> NotificationRecord {
-        let mut record = crate::notifications::test_support::record(
+        let mut record = crate::notifications::tests::fixtures::record(
             recipient,
             NotificationClass::Direct,
             created_at_ms,
