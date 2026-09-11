@@ -1892,7 +1892,7 @@ impl OperationsTaskHandler {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataMaterializationQueue,
-                    drain_delay(&result),
+                    restore::drain_delay(&result),
                 )
                 .await;
             }
