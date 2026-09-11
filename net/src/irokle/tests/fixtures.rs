@@ -742,3 +742,107 @@ pub(super) async fn policy_service(
     )
     .expect("document sync service opens")
 }
+
+pub(super) async fn quarantine_rows(storage: &StorageHandle) -> Vec<SyncQuarantineRecord> {
+    match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 256,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values
+            .into_iter()
+            .map(|(_, value)| {
+                SyncQuarantineRecord::from_bytes(value.as_ref()).expect("record decodes")
+            })
+            .collect(),
+        other => panic!("unexpected storage iteration event: {other:?}"),
+    }
+}
+
+pub(super) async fn quarantine_usage(storage: &StorageHandle) -> SyncQuarantineUsage {
+    match read_storage_value(
+        storage,
+        SYNC_QUARANTINE_USAGE_KEYSPACE,
+        ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+    )
+    .await
+    {
+        Some(bytes) => SyncQuarantineUsage::from_bytes(bytes.as_ref()).expect("usage decodes"),
+        None => SyncQuarantineUsage::default(),
+    }
+}
+
+pub(super) async fn write_usage(storage: &StorageHandle, usage: SyncQuarantineUsage) {
+    storage_batch_write_to(
+        storage,
+        vec![(
+            SYNC_QUARANTINE_USAGE_KEYSPACE.to_string(),
+            ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+            ByteView::from(usage.to_bytes().expect("usage serializes")),
+        )],
+    )
+    .await
+    .expect("usage row writes");
+}
+
+pub(super) async fn cursor_advanced(
+    service: &DocumentSyncService,
+    storage: &StorageHandle,
+    topic_id: irokle_crate::TopicId,
+) -> bool {
+    let Some(cursor) = read_test_cursor(storage, topic_id).await else {
+        return false;
+    };
+    let topic_clock = service
+        .node()
+        .storage()
+        .actor_clock(&topic_id)
+        .expect("topic clock");
+    cursor.dominates(&topic_clock)
+}
+
+pub(super) fn quarantined_reason(records: &[SyncQuarantineRecord], event_id: Ulid) -> String {
+    records
+        .iter()
+        .find(|record| record.event_id() == Some(event_id))
+        .unwrap_or_else(|| panic!("event {event_id} is quarantined"))
+        .reason
+        .clone()
+}
+
+pub(super) fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
+    use aruna_core::structs::{AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization};
+
+    NodeInfoDocument {
+        node_id,
+        executors: Vec::new(),
+        labels: BTreeMap::new(),
+        urls: NodeUrls {
+            api: None,
+            s3: None,
+        },
+        utilization: NodeUtilization {
+            storage_bytes_used: 1,
+            documents_held: None,
+            load_permille: None,
+            heartbeat_at_ms: updated_at_ms,
+        },
+        updated_at_ms,
+        epoch: AdvertisementEpoch {
+            membership_generation: 1,
+            publisher_generation: updated_at_ms,
+            observed_at_ms: updated_at_ms,
+        },
+        compute_draining: false,
+        leaving: false,
+        demand: Default::default(),
+        reservation: Default::default(),
+    }
+    .to_bytes()
+    .expect("node info serializes")
+}
