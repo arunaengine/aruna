@@ -246,3 +246,206 @@ pub(in crate::document_sync) fn report_participation(
         ReportParticipation::Foreign
     }
 }
+
+pub(in crate::document_sync) fn validate_config_authority(
+    current_config: Option<&RealmConfigDocument>,
+    event: &AdminDocumentEvent,
+    previous_state: Option<&AdminDocumentReducerState>,
+) -> Result<AdminEventValidation> {
+    let AdminDocumentTarget::RealmConfig { realm_id } = event.target else {
+        return Ok(AdminEventValidation::Rejected(
+            "admin event target is not a realm config".to_string(),
+        ));
+    };
+    if current_config.is_some_and(|config| config.realm_id != realm_id) {
+        return Ok(AdminEventValidation::Rejected(
+            "stored realm config has the wrong realm".to_string(),
+        ));
+    }
+    // Reports are gated on participation whatever the origin's kind: a plan
+    // names its finite holder sets, so nothing outside them may grow state.
+    match report_participation(&event.op, current_config, previous_state) {
+        ReportParticipation::NotReport | ReportParticipation::Participant => {}
+        ReportParticipation::UnknownPlan => {
+            // Same-topic retry only. A participant can report only after
+            // observing the plan, so a plan absent after the buffered run
+            // flushes has no causal evidence and must not park the cursor.
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "transition plan is not yet materialized".to_string(),
+            });
+        }
+        ReportParticipation::Foreign => {
+            return Ok(AdminEventValidation::Rejected(
+                "transition report does not come from a planned participant".to_string(),
+            ));
+        }
+    }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    ) {
+        if !revocation_origin_known(current_config, previous_state, event, realm_id) {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
+                reason: if current_config.is_some() {
+                    "revocation event origin onboarding is not yet materialized"
+                } else {
+                    "current realm config is unavailable"
+                }
+                .to_string(),
+            });
+        }
+        return Ok(AdminEventValidation::Accepted);
+    }
+    // Placement reducer state precedes full config materialization at
+    // bootstrap. Only band and handle checks consult it, so the full-state
+    // overlay is not paid for the other, far more frequent operations.
+    let placement_config = matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+    )
+    .then(|| {
+        let mut placement_config = current_config
+            .cloned()
+            .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
+        if let Some(state) = previous_state {
+            overlay_realm_config_placement_reducer_materialization(&mut placement_config, state, 0);
+        }
+        placement_config
+    });
+    // Band pools form a causal delegation tree; reject a forged or
+    // non-owning issuer, and defer a child until its parent replicates.
+    if let (AdminDocumentOperation::RealmConfigBandPoolAssigned { pool }, Some(placement_config)) =
+        (&event.op, placement_config.as_ref())
+    {
+        match admit_band_pool(&placement_config.band_pools, pool, &event.origin_node_id) {
+            PoolAdmission::Reject => {
+                return Ok(AdminEventValidation::Rejected(
+                    "band pool lineage is invalid".to_string(),
+                ));
+            }
+            PoolAdmission::MissingParent => {
+                return Ok(AdminEventValidation::Deferred {
+                    dependency: None,
+                    reason: "band pool parent is not yet replicated".to_string(),
+                });
+            }
+            PoolAdmission::Accept => {}
+        }
+    }
+    if let (
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+        Some(placement_config),
+    ) = (&event.op, placement_config.as_ref())
+    {
+        let canonical = range.len() == HANDLE_RANGE_SIZE
+            && range
+                .start
+                .checked_sub(FIRST_GRANTABLE_HANDLE)
+                .is_some_and(|offset| offset % HANDLE_RANGE_SIZE == 0)
+            && range.start.checked_add(HANDLE_RANGE_SIZE) == Some(range.end);
+        if !canonical {
+            return Ok(AdminEventValidation::Rejected(
+                "handle grant is not one canonical band".to_string(),
+            ));
+        }
+        let spans = coordinator_spans(&placement_config.band_pools, &event.origin_node_id);
+        if spans.is_empty() {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "coordinator band pool is not yet replicated".to_string(),
+            });
+        }
+        if !spans
+            .iter()
+            .any(|(start, end)| *start <= range.start && range.end <= *end)
+        {
+            return Ok(AdminEventValidation::Rejected(
+                "handle grant lies outside the coordinator band pool".to_string(),
+            ));
+        }
+    }
+    if let Some(config) = current_config {
+        let server_binding = match (
+            configured_node_kind(config, &event.origin_node_id),
+            &event.op,
+        ) {
+            (
+                Some(RealmNodeKind::Server),
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+            ) => {
+                binding.allocated_by == Some(event.origin_node_id)
+                    && binding.has_valid_provenance(&config.handle_range_directory())
+            }
+            _ => false,
+        };
+        // D9: every holder acts. A barrier, proof, or stall names its own origin
+        // and moves no authority on its own, so a holder may emit it.
+        let self_report = matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported { reported_by, .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { reported_by, .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. }
+                if *reported_by == event.origin_node_id
+        ) || matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigTransitionProofSubmitted { proof, .. }
+                if proof.holder == event.origin_node_id
+        );
+        if matches!(
+            configured_node_kind(config, &event.origin_node_id),
+            Some(RealmNodeKind::Management)
+        ) && matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+                if !binding.has_valid_provenance(&config.handle_range_directory())
+        ) {
+            // The granting range event may still be in flight in the same batch
+            // (onboarding writes grant + JobControl binding back to back).
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "placement binding provenance is not yet valid".to_string(),
+            });
+        }
+        return Ok(
+            if matches!(
+                configured_node_kind(config, &event.origin_node_id),
+                Some(RealmNodeKind::Management)
+            ) || server_binding
+                || (self_report && origin_may_publish(config, &event.origin_node_id))
+            {
+                AdminEventValidation::Accepted
+            } else {
+                AdminEventValidation::Rejected(
+                    "event origin is not a current management node".to_string(),
+                )
+            },
+        );
+    }
+
+    let bootstrap = previous_state.is_none()
+        && matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id,
+                kind: RealmNodeKind::Management,
+            } if *node_id == event.origin_node_id
+        );
+    let continuing_bootstrap = previous_state.is_some_and(|state| {
+        state
+            .materialized_realm_config_nodes()
+            .get(&event.origin_node_id)
+            .is_some_and(|kind| matches!(kind, RealmNodeKind::Management))
+    });
+    Ok(if bootstrap || continuing_bootstrap {
+        AdminEventValidation::Accepted
+    } else {
+        AdminEventValidation::Deferred {
+            dependency: None,
+            reason: "realm config bootstrap must begin with a management node ensuring itself"
+                .to_string(),
+        }
+    })
+}
