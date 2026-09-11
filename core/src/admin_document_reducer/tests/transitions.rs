@@ -1,10 +1,10 @@
 use super::*;
 
-pub(super) fn secret(seed: u8) -> iroh::SecretKey {
+fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])
 }
 
-pub(super) fn map_with(epoch: u64, seeds: &[u8]) -> CandidatePlacementMap {
+fn map_with(epoch: u64, seeds: &[u8]) -> CandidatePlacementMap {
     CandidatePlacementMap {
         epoch,
         nodes: seeds
@@ -29,7 +29,7 @@ pub(super) fn map_with(epoch: u64, seeds: &[u8]) -> CandidatePlacementMap {
     }
 }
 
-pub(super) fn transition_strategy() -> PlacementStrategy {
+fn transition_strategy() -> PlacementStrategy {
     PlacementStrategy {
         strategy_id: Ulid::from_bytes([21; 16]),
         name: "moved".to_string(),
@@ -40,7 +40,7 @@ pub(super) fn transition_strategy() -> PlacementStrategy {
     }
 }
 
-pub(super) fn transition_plan(old: &[u8], target: &[u8]) -> TransitionPlan {
+fn transition_plan(old: &[u8], target: &[u8]) -> TransitionPlan {
     let bucket = |bucket: u32| BucketPlan {
         bucket,
         old_holders: old.iter().map(|seed| node(*seed)).collect(),
@@ -59,7 +59,7 @@ pub(super) fn transition_plan(old: &[u8], target: &[u8]) -> TransitionPlan {
 }
 
 /// The digest of the fixture's reduced barrier set (holders 1 and 2).
-pub(super) fn fixture_digest(plan: &TransitionPlan, bucket: u32) -> [u8; 32] {
+fn fixture_digest(plan: &TransitionPlan, bucket: u32) -> [u8; 32] {
     let mut transition = crate::structs::PlacementTransition::new(plan.clone());
     transition.barriers = [1u8, 2]
         .iter()
@@ -72,7 +72,7 @@ pub(super) fn fixture_digest(plan: &TransitionPlan, bucket: u32) -> [u8; 32] {
     transition.barrier_digest(bucket)
 }
 
-pub(super) fn proof_for(plan: &TransitionPlan, bucket: u32, seed: u8) -> CompletionProof {
+fn proof_for(plan: &TransitionPlan, bucket: u32, seed: u8) -> CompletionProof {
     ProofClaim {
         realm_id: realm_id(),
         transition_id: plan.transition_id,
@@ -88,7 +88,7 @@ pub(super) fn proof_for(plan: &TransitionPlan, bucket: u32, seed: u8) -> Complet
 }
 
 /// Publish two maps, activate epoch 1, and start a 1 -> 2 transition.
-pub(super) fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
+fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
     vec![
         realm_config_event(
             40,
@@ -138,7 +138,7 @@ pub(super) fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent
 }
 
 /// Every barrier and proof bucket 0 needs to cut over.
-pub(super) fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
+fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
     let barrier = |seed: u8, event_seed: u8| {
         realm_config_event(
             event_seed,
@@ -169,7 +169,7 @@ pub(super) fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent
     vec![barrier(1, 50), barrier(2, 51), proof(3, 52), proof(4, 53)]
 }
 
-pub(super) fn transition_config(state: &AdminDocumentReducerState) -> RealmConfigDocument {
+fn transition_config(state: &AdminDocumentReducerState) -> RealmConfigDocument {
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
     overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
     config
@@ -545,4 +545,215 @@ fn abort_keeps_cut_buckets() {
             .transition_id,
         None
     );
+}
+
+#[test]
+fn late_proof_completes() {
+    // A proof that lands after the abort completes its bucket anyway:
+    // reduction cannot depend on arrival order, so an abort stops the
+    // executors rather than un-making a hand-off every target proved.
+    let plan = transition_plan(&[1, 2], &[3, 4]);
+    let abort = realm_config_event(
+        81,
+        node(1),
+        6,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigTransitionAborted {
+            transition_id: plan.transition_id,
+        },
+    );
+    let completion = completion_events(&plan);
+    let mut interleaved = realm_config_state();
+    for event in transition_events(&plan)
+        .iter()
+        .chain(completion.iter().take(3))
+        .chain(std::iter::once(&abort))
+        .chain(completion.iter().skip(3))
+    {
+        interleaved.apply(event).unwrap();
+    }
+
+    let config = transition_config(&interleaved);
+    let transition = &config.placement_transitions[0];
+    assert!(matches!(transition.status, TransitionStatus::Aborted));
+    assert!(transition.completion(0).is_some());
+    assert_eq!(
+        config
+            .activation(&plan.strategy_id, 0)
+            .expect("bucket 0")
+            .candidate_map_epoch,
+        2
+    );
+
+    // The bucket the abort caught mid-flight keeps its old activation.
+    assert_eq!(
+        config
+            .activation(&plan.strategy_id, 1)
+            .expect("bucket 1")
+            .candidate_map_epoch,
+        1
+    );
+
+    let mut abort_last = realm_config_state();
+    for event in transition_events(&plan)
+        .iter()
+        .chain(completion.iter())
+        .chain(std::iter::once(&abort))
+    {
+        abort_last.apply(event).unwrap();
+    }
+    assert_eq!(transition_config(&abort_last), config);
+}
+
+#[test]
+fn prune_keeps_advances() {
+    // Dropping a released record must not drop what it moved: activations
+    // are replayed from the whole reduced chain, so a fold that skipped the
+    // pruned record would silently regress the bucket to its old map.
+    let plan = transition_plan(&[1, 2], &[3, 4]);
+    let mut state = realm_config_state();
+    for event in transition_events(&plan)
+        .into_iter()
+        .chain(completion_events(&plan))
+    {
+        state.apply(&event).unwrap();
+    }
+    // Only a record whose every bucket cut over is terminal, so bucket one
+    // has to finish before the release can be observed at all.
+    for (event_seed, seed, op) in [
+        (
+            60u8,
+            1u8,
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                transition_id: plan.transition_id,
+                bucket: 1,
+                reported_by: node(1),
+                frontier: vec![1],
+            },
+        ),
+        (
+            61,
+            2,
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                transition_id: plan.transition_id,
+                bucket: 1,
+                reported_by: node(2),
+                frontier: vec![2],
+            },
+        ),
+        (
+            62,
+            3,
+            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                transition_id: plan.transition_id,
+                strategy_id: plan.strategy_id,
+                proof: proof_for(&plan, 1, 3),
+            },
+        ),
+        (
+            63,
+            4,
+            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                transition_id: plan.transition_id,
+                strategy_id: plan.strategy_id,
+                proof: proof_for(&plan, 1, 4),
+            },
+        ),
+    ] {
+        state
+            .apply(&realm_config_event(
+                event_seed,
+                node(seed),
+                3,
+                AdminDocumentClock::default(),
+                op,
+            ))
+            .unwrap();
+    }
+    // Release additionally needs every departing holder's drain report.
+    for (event_seed, seed, bucket) in [(64u8, 1u8, 0u32), (65, 2, 0), (66, 1, 1), (67, 2, 1)] {
+        state
+            .apply(&realm_config_event(
+                event_seed,
+                node(seed),
+                4 + u64::from(bucket),
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                    transition_id: plan.transition_id,
+                    bucket,
+                    reported_by: node(seed),
+                },
+            ))
+            .unwrap();
+    }
+    let live = transition_config(&state);
+    assert_eq!(live.placement_transitions.len(), 1);
+    assert!(live.placement_transitions[0].is_terminal());
+
+    let mut pruned = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+    overlay_realm_config_placement_reducer_materialization(&mut pruned, &state, u64::MAX);
+    assert!(pruned.placement_transitions.is_empty());
+    assert_eq!(pruned.placement_activations, live.placement_activations);
+
+    // Re-materializing from scratch reproduces the pruned view exactly, so
+    // the record's absence is stable rather than a one-time loss.
+    let mut again = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+    overlay_realm_config_placement_reducer_materialization(&mut again, &state, u64::MAX);
+    assert_eq!(again, pruned);
+    // The bucket that cut over still names its target map, and that map
+    // survives the prune because an activation references it.
+    assert_eq!(
+        pruned
+            .activation(&plan.strategy_id, 0)
+            .expect("bucket 0")
+            .candidate_map_epoch,
+        2
+    );
+    assert!(pruned.candidate_map(2).is_some());
+}
+
+#[test]
+fn drops_unreferenced_maps() {
+    // A map no activation selects from and no retained transition targets
+    // is unreachable - unless it is the newest, which the next transition
+    // would name.
+    let plan = transition_plan(&[1, 2], &[3, 4]);
+    let mut state = realm_config_state();
+    for event in transition_events(&plan) {
+        state.apply(&event).unwrap();
+    }
+    state
+        .apply(&realm_config_event(
+            90,
+            node(1),
+            6,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                map: map_with(3, &[1, 4]),
+            },
+        ))
+        .unwrap();
+
+    let config = transition_config(&state);
+    assert!(config.candidate_map(1).is_some(), "activated");
+    assert!(config.candidate_map(2).is_some(), "targeted in flight");
+    assert!(config.candidate_map(3).is_some(), "newest");
+
+    // Aborting frees the target map: nothing selects from epoch two any more.
+    state
+        .apply(&realm_config_event(
+            91,
+            node(1),
+            7,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTransitionAborted {
+                transition_id: plan.transition_id,
+            },
+        ))
+        .unwrap();
+    let config = transition_config(&state);
+    assert!(config.placement_transitions.is_empty());
+    assert!(config.candidate_map(2).is_none());
+    assert!(config.candidate_map(1).is_some());
+    assert!(config.candidate_map(3).is_some());
 }
