@@ -806,3 +806,181 @@ impl OperationsTaskHandler {
         }
     }
 }
+
+impl OperationsTaskHandler {
+    pub(super) async fn drain_job_queue(&self) {
+        if !self.jobs_runtime.is_started() {
+            return;
+        }
+        let Some(owner_node_id) = self.context.net_handle.as_ref().map(|net| net.node_id()) else {
+            warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
+            self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                .await;
+            return;
+        };
+        let Some(claim_producer) = self.jobs_runtime.claim_producer().await else {
+            return;
+        };
+        // Per class: one aggregate would claim rows of a saturated class only to
+        // release them again on every pass.
+        let budget = JobClassBudget {
+            in_process: self
+                .jobs_runtime
+                .available_slots_for(JobExecutionClass::InProcess),
+            external: self
+                .jobs_runtime
+                .available_slots_for(JobExecutionClass::ExternalAttempt),
+        };
+
+        let reconciler = self.jobs_runtime.reconciler();
+        let result = match process_job_queue_batch(
+            &self.context.storage_handle,
+            owner_node_id,
+            budget,
+            reconciler.as_ref(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to drain job queue");
+                self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                    .await;
+                return;
+            }
+        };
+
+        for record in result.claimed {
+            if self
+                .jobs_runtime
+                .available_slots_for(record.execution_class)
+                == 0
+            {
+                let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+                    warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
+                    continue;
+                };
+                if let Err(error) = release_job(
+                    &self.context.storage_handle,
+                    record.job_id,
+                    token,
+                    unix_timestamp_millis(),
+                )
+                .await
+                {
+                    warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
+                }
+                continue;
+            }
+            self.jobs_runtime.spawn(self.context.clone(), record);
+        }
+        drop(claim_producer);
+
+        // A per-job error stopped the batch after handing off what was claimed; back off
+        // and re-drive the remainder rather than hot-looping on the failure.
+        if result.retry_after_error {
+            self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                .await;
+            return;
+        }
+
+        // Due work left behind by a saturated class: wait for a completion kick, not
+        // a ZERO hot-loop.
+        match result.next_due_after {
+            Some(after) if after.is_zero() && result.deferred_saturated => {
+                self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                    .await;
+            }
+            Some(after) => {
+                self.reschedule_timer(TaskKey::DrainJobQueue, after).await;
+            }
+            None => {}
+        }
+    }
+
+    pub(super) async fn prune_jobs(&self) {
+        let after = match process_job_prune_batch(&self.context).await {
+            Ok(outcome) if outcome.has_more => Duration::ZERO,
+            Ok(outcome) => outcome
+                .next_due_after
+                .unwrap_or(JOB_PRUNE_POLL_AFTER)
+                .min(JOB_PRUNE_POLL_AFTER),
+            Err(error) => {
+                warn!(task_id = ?TaskKey::PruneJobs, error = %error, "Failed to prune jobs");
+                JOB_PRUNE_RETRY_AFTER
+            }
+        };
+        self.reschedule_timer(TaskKey::PruneJobs, after).await;
+    }
+
+    pub(super) async fn drain_blob_cleanup(&self) {
+        let after = match process_cleanup_batch(&self.context).await {
+            Ok(outcome) if outcome.failed > 0 => BLOB_CLEANUP_RETRY,
+            Ok(_) => BLOB_CLEANUP_AFTER,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainBlobCleanupQueue, error = %error, "Failed to drain blob cleanup");
+                BLOB_CLEANUP_RETRY
+            }
+        };
+        // The parts a reclaimed upload frees become cleanup rows, so the sweep
+        // rides the same timer that drains them.
+        if let Err(error) = sweep_stale_uploads(&self.context, unix_timestamp_millis()).await {
+            warn!(task_id = ?TaskKey::DrainBlobCleanupQueue, error = %error, "Failed to sweep stale multipart uploads");
+        }
+        self.reschedule_timer(TaskKey::DrainBlobCleanupQueue, after)
+            .await;
+    }
+
+    pub(super) async fn drain_blob_reclaim(&self) {
+        let key = TaskKey::DrainBlobReclaimQueue;
+        // A failed candidate earns the fast retry, then doubles up to the normal
+        // interval, so a permanently failing one cannot hold a one-minute rescan
+        // of the whole queue forever.
+        let (after, drained) =
+            match process_reclaim_batch(&self.context, self.reclaim_start()).await {
+                Ok(outcome) => {
+                    self.set_reclaim_start(outcome.next_start_after);
+                    match (outcome.capped, outcome.failed) {
+                        (true, _) => {
+                            self.reset_backoff(&key);
+                            (RECLAIM_SWEEP_RETRY, false)
+                        }
+                        (false, 0) => {
+                            self.reset_backoff(&key);
+                            (RECLAIM_SWEEP_AFTER, true)
+                        }
+                        (false, _) => (
+                            self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                            true,
+                        ),
+                    }
+                }
+                Err(error) => {
+                    warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
+                    (
+                        self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                        false,
+                    )
+                }
+            };
+        // Removal walks whole keyspaces too, so it only rides a sweep that
+        // reached the end of the queue, never the fast retries behind a backlog.
+        if drained && let Err(error) = remove_drained_backends(&self.context).await {
+            warn!(error = %error, "Failed to remove drained storage backends");
+        }
+        self.reschedule_timer(key, after).await;
+    }
+
+    pub(super) async fn sweep_hidden_blobs(&self) {
+        let after = match process_hidden_sweep(&self.context).await {
+            Ok(outcome) if outcome.cleanup_pending => HIDDEN_SWEEP_RETRY,
+            Ok(_) => HIDDEN_SWEEP_AFTER,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::SweepHiddenBlobs, error = %error, "Failed to sweep hidden blobs");
+                HIDDEN_SWEEP_RETRY
+            }
+        };
+        self.reschedule_timer(TaskKey::SweepHiddenBlobs, after)
+            .await;
+    }
+}
