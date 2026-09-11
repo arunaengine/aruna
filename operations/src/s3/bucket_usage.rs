@@ -229,6 +229,7 @@ impl Operation for BucketUsageOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::errors::StorageError;
     use aruna_core::events::StorageEvent;
     use ulid::Ulid;
 
@@ -259,5 +260,32 @@ mod tests {
 
         let usage = operation.finalize().expect("the inventory settles");
         assert!(!usage.complete);
+    }
+
+    #[test]
+    fn child_storage_propagates() {
+        // The active list child sees the error; the parent must surface its
+        // typed error and not abort anything a second time.
+        let mut operation = BucketUsageOperation::new(BucketUsageInput {
+            bucket: "data".to_string(),
+            limit: 10,
+        });
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(operation.abort().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(BucketUsageError::Versions(
+                ListObjectVersionsError::StorageError(StorageError::CommitFailed)
+            ))
+        );
     }
 }

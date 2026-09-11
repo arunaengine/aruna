@@ -1349,6 +1349,41 @@ mod test {
         ));
     }
 
+    #[test]
+    fn queued_retries_exhaust() {
+        // Rejected queued rows are re-emitted a bounded number of times; at
+        // exhaustion the pending error surfaces instead of an endless retry.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut op = upload_part_op(backend_id);
+        op.state = UploadPartState::StartTransaction;
+
+        assert!(matches!(
+            op.abort().as_slice(),
+            [Effect::Storage(StorageEffect::Write { .. })]
+        ));
+        assert_eq!(op.state, UploadPartState::QueueCleanupRow);
+
+        for _ in 0..3 {
+            assert!(matches!(
+                op.step(Event::Storage(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                }))
+                .as_slice(),
+                [Effect::Storage(StorageEffect::Write { .. })]
+            ));
+        }
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(op.state, UploadPartState::Error);
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::UploadPartFailed)
+        ));
+    }
+
     fn upload_part_op(backend_id: Ulid) -> UploadPartOperation {
         let mut op = UploadPartOperation::new(UploadPartInput {
             bucket: "mybucket".to_string(),

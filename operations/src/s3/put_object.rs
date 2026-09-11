@@ -2536,6 +2536,50 @@ mod test {
     }
 
     #[test]
+    fn exhausted_keeps_hold() {
+        // Exhausted cleanup retries must not release a reservation whose row was
+        // never accepted; the pending error still fails the request.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+        ));
+        let location = test_location(op.config.user_id);
+        let id = location.ulid;
+        op.cleanup.pending_error = Some(PutObjectError::StorageError(StorageError::Timeout));
+        op.cleanup.set_release(id);
+        op.state = PutObjectState::QueueCleanupRow;
+        assert!(
+            op.cleanup
+                .queue(super::BlobCleanupWork::ReconcileReservation { location })
+                .is_some()
+        );
+
+        for _ in 0..3 {
+            assert!(matches!(
+                op.step(Event::Storage(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                }))
+                .as_slice(),
+                [Effect::Storage(StorageEffect::Write { .. })]
+            ));
+        }
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(op.cleanup.release_id(), Some(id));
+        assert!(op.cleanup.retry(&StorageError::Timeout).is_none());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(PutObjectError::StorageError(StorageError::Timeout))
+        ));
+    }
+
+    #[test]
     fn unknown_keeps_blob() {
         // Only a proven refusal rolls the blob back; every other commit failure
         // may already have committed the version that names these bytes, so the

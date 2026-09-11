@@ -646,6 +646,48 @@ mod tests {
     }
 
     #[test]
+    fn delete_batches_records() {
+        // The abort removes every part row and the upload record in one batch
+        // inside the delete transaction.
+        let mut operation = AbortMultipartUploadOperation::new(input());
+        operation.upload_parts.push(MultipartUploadPart {
+            part_number: 1,
+            location: part_location(),
+            created_at: SystemTime::UNIX_EPOCH,
+        });
+        let txn_id = TxnId::from_bytes([5u8; 16]);
+        operation.txn_id = Some(txn_id);
+
+        let effects = operation.delete_upload_records();
+
+        let [
+            Effect::Storage(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: observed,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected upload records delete, got {effects:?}")
+        };
+        assert_eq!(*observed, Some(txn_id));
+        assert_eq!(deletes.len(), 2);
+        let upload_key = operation.input.upload_id.to_bytes().to_vec();
+        assert!(deletes.iter().any(|(key_space, key)| {
+            key_space == S3_MULTIPART_UPLOAD_KEYSPACE && key.as_ref() == upload_key.as_slice()
+        }));
+        let part_key = MultipartUploadPartKey::new(operation.input.upload_id, 1)
+            .to_bytes()
+            .unwrap();
+        assert!(deletes.iter().any(|(key_space, key)| {
+            key_space == S3_MULTIPART_UPLOAD_PART_KEYSPACE && key.as_ref() == part_key.as_slice()
+        }));
+        assert_eq!(
+            operation.state,
+            AbortMultipartUploadState::DeleteUploadRecords
+        );
+    }
+
+    #[test]
     fn rejects_incomplete() {
         let operation = AbortMultipartUploadOperation::new(input());
 
