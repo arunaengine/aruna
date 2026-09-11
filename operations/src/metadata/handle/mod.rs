@@ -53,7 +53,10 @@ use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use self::query::{query_local_graphs, snapshot_iri_references};
-use self::search::{clamp_remote_search_graph_limit, describe_hit_properties, search_local_graphs};
+use self::search::{
+    AllowedGraphAuthorizer, clamp_remote_search_graph_limit, describe_hit_properties,
+    search_local_graphs,
+};
 use self::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
     read_budget, send_export_request, send_request, write_body_at, write_message_at,
@@ -5698,58 +5701,6 @@ async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataR
     }
 }
 
-struct AllowedGraphAuthorizer {
-    graph_iris: HashSet<String>,
-}
-
-impl CraqleAuthorizer for AllowedGraphAuthorizer {
-    fn authorize(
-        &self,
-        graph: &GraphId,
-        _policy: &GraphPolicy,
-        action: CraqleAction,
-    ) -> Result<(), CraqleAuthError> {
-        if matches!(action, CraqleAction::Read) && self.graph_iris.contains(graph.as_str()) {
-            return Ok(());
-        }
-
-        Err(CraqleAuthError::PermissionDenied {
-            action,
-            graph: graph.as_str().to_string(),
-        })
-    }
-}
-
-/// Lazy counterpart of [`AllowedGraphAuthorizer`], answering craqle per hit.
-/// Craqle's stored policy is ignored on purpose: the registry record, lifecycle
-/// tombstones and collected rules are authoritative, unknown graphs stay invisible.
-struct ScopeAuthorizer<'a> {
-    scope: &'a GraphVisibilityScope,
-    visibility_cache: &'a MetadataVisibilityCache,
-}
-
-impl CraqleAuthorizer for ScopeAuthorizer<'_> {
-    fn authorize(
-        &self,
-        graph: &GraphId,
-        _policy: &GraphPolicy,
-        action: CraqleAction,
-    ) -> Result<(), CraqleAuthError> {
-        if matches!(action, CraqleAction::Read)
-            && self
-                .scope
-                .graph_visible(self.visibility_cache, graph.as_str())
-        {
-            return Ok(());
-        }
-
-        Err(CraqleAuthError::PermissionDenied {
-            action,
-            graph: graph.as_str().to_string(),
-        })
-    }
-}
-
 async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, MetadataError> {
     let records = inner
         .visibility_cache
@@ -6083,7 +6034,7 @@ async fn refresh_lifecycle_visibility_for_records(
 #[cfg(test)]
 mod tests {
     use super::query::parse_metadata_query;
-    use super::search::{HitDescribe, describe_hits_parallel};
+    use super::search::{HitDescribe, ScopeAuthorizer, describe_hits_parallel};
     use super::*;
     use aruna_core::UserId;
     use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
