@@ -5,9 +5,7 @@ use super::{
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{
-    AuthContext, PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session, blob_group_permission_path,
-};
+use aruna_core::structs::{AuthContext, PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::s3::session::{
@@ -89,8 +87,8 @@ pub struct ListS3SessionsResponse {
     summary = "Exchange a bearer token for an S3 session",
     description = r#"Issues a short-lived, node-local S3 session for an explicitly selected group.
 
-**Authentication**: realm bearer token, membership in the requested group, and WRITE under the
-effective token restrictions on that group's data path.
+**Authentication**: realm bearer token, membership in the requested group, and an effective read or
+write scope on that group's data path. A read-only member receives a read-only session.
 
 **Behavior**
 - The group is always taken from `group_id` and is never inferred from membership order.
@@ -134,7 +132,7 @@ effective token restrictions on that group's data path.
         ),
         (status = 400, description = "group_id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or one with no remaining lifetime", body = ErrorResponse),
-        (status = 403, description = "The caller is not a member of the group, or lacks effective WRITE on its data path", body = ErrorResponse)
+        (status = 403, description = "The caller is not a member of the group, or its effective token restrictions leave no allowed scope on the group data path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -388,10 +386,8 @@ async fn session_scope(
     group_id: Ulid,
 ) -> ServerResult<Option<Vec<PathRestriction>>> {
     ensure_membership(state, auth, group_id).await?;
-    let group_root =
-        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let restrictions = build_credential_restrictions(auth, state, group_id, None).await?;
-    authorize_credential_issuance(auth, state, &group_root, restrictions.as_deref()).await?;
+    authorize_credential_issuance(auth, state, group_id, restrictions.as_deref()).await?;
     Ok(restrictions.as_deref().map(serialize_restrictions))
 }
 

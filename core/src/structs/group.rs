@@ -113,6 +113,20 @@ impl GroupAuthorizationDocument {
         }
     }
 
+    /// Permission patterns of every role this user is assigned to, for callers
+    /// that must reason about granted subtrees instead of a single path.
+    pub fn user_permissions(&self, user_id: UserId) -> Vec<(String, Permission)> {
+        self.roles
+            .values()
+            .filter(|role| role.assigned_users.contains(&user_id))
+            .flat_map(|role| {
+                role.permissions
+                    .iter()
+                    .map(|(pattern, permission)| (pattern.clone(), permission.clone()))
+            })
+            .collect()
+    }
+
     pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }

@@ -1,10 +1,12 @@
 use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
+use aruna_core::permission_path::readable_roots;
 use aruna_core::structs::{
     AuthContext, PathRestriction, Permission, UserAccess, blob_group_permission_path,
 };
 use aruna_operations::driver::drive;
+use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::s3::create_user_access::{
     CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
     DEFAULT_CREDENTIAL_TTL,
@@ -281,9 +283,9 @@ pub async fn list_s3_credentials(
     summary = "Create an S3 credential for a group",
     description = r#"Issues an S3 access key and a one-time secret bound to a group, for the calling user.
 
-**Authentication**: realm bearer token with WRITE on the group's data path. A path-restricted token
-may be used: the credential inherits the caller's restrictions narrowed to the group data root and
-can never widen them.
+**Authentication**: realm bearer token with READ or WRITE on the group's data path, or on a part of
+it. A path-restricted token may be used: the credential inherits the caller's restrictions narrowed
+to the group data root and can never widen them.
 
 **Behavior**
 - The credential is always issued to the calling user, so no caller can mint one for somebody else.
@@ -324,7 +326,7 @@ can never widen them.
         ),
         (status = 400, description = "The group id is not a ULID, the lifetime is out of range, or a restriction is malformed or exceeds the count limit", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, the caller lacks WRITE on the group data path, or a restriction reaches outside the group root or the caller's own grant", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, the caller may read no part of the group data path, or a restriction reaches outside the group root or the caller's own grant", body = ErrorResponse),
         (status = 409, description = "The caller already holds 16 active credentials; revoke or let one expire first", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -353,11 +355,10 @@ pub async fn create_s3_credentials(
     {
         return Err(ServerError::BadRequest);
     }
-    let group_root = blob_group_permission_path(realm_id, group_id, state.get_node_id());
     let path_restrictions =
         build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
             .await?;
-    authorize_credential_issuance(&auth, &state, &group_root, path_restrictions.as_deref()).await?;
+    authorize_credential_issuance(&auth, &state, group_id, path_restrictions.as_deref()).await?;
     let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
     if let Some(restrictions) = path_restrictions.as_deref()
         && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()
@@ -681,29 +682,36 @@ fn merge_effective_restrictions(
     }
 }
 
+/// A credential never exceeds the caller's own grant, so any member who may
+/// read part of the group data may take one; only a caller left without an
+/// allowed scope is refused.
 async fn authorize_credential_issuance(
     auth: &AuthContext,
     state: &ServerState,
-    group_root: &str,
+    group_id: Ulid,
     effective_restrictions: Option<&[NormalizedRestriction]>,
 ) -> ServerResult<()> {
+    let group_root =
+        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let effective_auth = AuthContext {
         path_restrictions: effective_restrictions.map(serialize_restrictions),
         ..auth.clone()
     };
 
     let Some(effective_restrictions) = effective_restrictions else {
-        return check_permission(
-            &effective_auth,
-            state,
-            group_root.to_string(),
-            Permission::WRITE,
-        )
-        .await;
+        for permission in [Permission::WRITE, Permission::READ] {
+            match check_permission(&effective_auth, state, group_root.clone(), permission).await {
+                Ok(()) => return Ok(()),
+                Err(ServerError::Forbidden) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        return authorize_group_subpath(&effective_auth, state, group_id, &group_root).await;
     };
 
     for restriction in effective_restrictions {
-        if restriction.permission != Permission::WRITE {
+        if restriction.permission == Permission::DENY {
             continue;
         }
 
@@ -711,7 +719,7 @@ async fn authorize_credential_issuance(
             &effective_auth,
             state,
             restriction.scope.authorization_probe_path(),
-            Permission::WRITE,
+            restriction.permission.clone(),
         )
         .await
         {
@@ -722,6 +730,33 @@ async fn authorize_credential_issuance(
     }
 
     Err(ServerError::Forbidden)
+}
+
+/// Accepts a member whose roles reach only a part of the group data, such as a
+/// single dataset folder, because every S3 request is still authorized against
+/// those roles.
+async fn authorize_group_subpath(
+    auth: &AuthContext,
+    state: &ServerState,
+    group_id: Ulid,
+    group_root: &str,
+) -> ServerResult<()> {
+    let (_, authorization) = drive(
+        GetGroupOperation::new(GetGroupConfig { group_id }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound => ServerError::Forbidden,
+        _ => ServerError::InternalError(error.to_string()),
+    })?;
+
+    let granted = authorization.user_permissions(auth.user_id);
+    if readable_roots(&granted, auth.path_restrictions.as_deref(), group_root).is_empty() {
+        return Err(ServerError::Forbidden);
+    }
+
+    Ok(())
 }
 
 async fn check_permission(
@@ -907,6 +942,216 @@ mod tests {
         .unwrap();
 
         (dir, state, auth, access_key_id)
+    }
+
+    /// Group whose only role for the caller carries the given permissions.
+    async fn scoped_state(
+        permissions: Vec<(String, Permission)>,
+    ) -> (TempDir, Arc<ServerState>, AuthContext, Ulid) {
+        use std::collections::{HashMap, HashSet};
+        let (dir, state, auth) = test_state().await;
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        let actor = Actor {
+            node_id,
+            user_id: auth.user_id,
+            realm_id,
+        };
+        let role_id = Ulid::from_bytes([8u8; 16]);
+        let group_auth = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(
+                role_id,
+                aruna_core::structs::Role {
+                    role_id,
+                    name: "scoped".to_string(),
+                    permissions: permissions.into_iter().collect(),
+                    assigned_users: HashSet::from([auth.user_id]),
+                },
+            )]),
+            policies: Vec::new(),
+        };
+        let group = Group {
+            display_name: "scoped-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: auth.user_id,
+        };
+        for (key_space, key, value) in [
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                    .to_bytes(&actor)
+                    .unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                    .to_bytes(&actor)
+                    .unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            state
+                .get_ctx()
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+
+        (dir, state, auth, group_id)
+    }
+
+    async fn create_credential(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+        group_id: Ulid,
+        path_restrictions: Option<Vec<CreateS3PathRestriction>>,
+    ) -> ServerResult<(StatusCode, Json<CreateS3CredentialsResponse>)> {
+        create_s3_credentials(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(CreateS3CredentialsRequest {
+                group_id: group_id.to_string(),
+                expires_in_seconds: None,
+                path_restrictions,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn viewer_takes_credential() {
+        // Read on the group data root is enough: the credential cannot widen it.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        let (_dir, state, auth, group_id) = scoped_state(vec![(
+            format!("/{realm_id}/g/{group_id}/data/**"),
+            Permission::READ,
+        )])
+        .await;
+
+        let (status, _) = create_credential(&state, &auth, group_id, None)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, Json(response)) = create_credential(
+            &state,
+            &auth,
+            group_id,
+            Some(vec![CreateS3PathRestriction {
+                pattern: "shared/**".to_string(),
+                permission: "READ".to_string(),
+            }]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(!response.access_secret.is_empty());
+    }
+
+    #[tokio::test]
+    async fn viewer_cannot_write() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        let (_dir, state, auth, group_id) = scoped_state(vec![(
+            format!("/{realm_id}/g/{group_id}/data/**"),
+            Permission::READ,
+        )])
+        .await;
+
+        let error = create_credential(
+            &state,
+            &auth,
+            group_id,
+            Some(vec![CreateS3PathRestriction {
+                pattern: "shared/**".to_string(),
+                permission: "WRITE".to_string(),
+            }]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn subpath_takes_credential() {
+        // Read on one folder of the group data is a real grant, so issuance
+        // must not demand write on the whole data root.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let group_root = blob_group_permission_path(realm_id, group_id, node_id);
+        let (_dir, state, auth, group_id) = scoped_state(vec![(
+            format!("{group_root}/study/imaging/**"),
+            Permission::READ,
+        )])
+        .await;
+
+        let (status, _) = create_credential(&state, &auth, group_id, None)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _) = create_credential(
+            &state,
+            &auth,
+            group_id,
+            Some(vec![CreateS3PathRestriction {
+                pattern: "study/imaging/**".to_string(),
+                permission: "READ".to_string(),
+            }]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn outsider_refused() {
+        let (_dir, state, auth, group_id) = scoped_state(vec![(
+            "/other/g/group/data/**".to_string(),
+            Permission::WRITE,
+        )])
+        .await;
+
+        let error = create_credential(&state, &auth, group_id, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::Forbidden));
+
+        let error = create_credential(
+            &state,
+            &auth,
+            group_id,
+            Some(vec![CreateS3PathRestriction {
+                pattern: "study/**".to_string(),
+                permission: "READ".to_string(),
+            }]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Forbidden));
     }
 
     #[tokio::test]
