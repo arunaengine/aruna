@@ -490,3 +490,96 @@ impl MetadataHandle {
         MetadataEvent::GraphSyncScheduled { graph_iri, peers }
     }
 }
+
+async fn graph_lifecycle_record(
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<Option<MetadataGraphLifecycleRecord>, MetadataError> {
+    let event = storage_handle
+        .send_effect(read_graph_lifecycle_effect(graph_iri, None))
+        .await;
+    parse_graph_lifecycle_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => MetadataError::Storage(error),
+        StorageReadError::Conversion(error) => MetadataError::Backend(error.to_string()),
+    })
+}
+
+pub(super) async fn metadata_graph_deleted(
+    inner: Arc<MetadataInner>,
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<bool, MetadataError> {
+    if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
+        return Ok(true);
+    }
+
+    let deleted = graph_lifecycle_deleted(storage_handle, graph_iri).await?;
+    inner
+        .visibility_cache
+        .store_lifecycle_deleted(graph_iri.to_string(), deleted);
+    Ok(deleted)
+}
+
+pub(super) async fn graph_lifecycle_deleted(
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<bool, MetadataError> {
+    Ok(graph_lifecycle_record(storage_handle, graph_iri)
+        .await?
+        .map(|record| record.is_deleted())
+        .unwrap_or(false))
+}
+
+async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<(), MetadataError> {
+    tokio::task::spawn_blocking(move || {
+        node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    .map_err(metadata_error_from_craqle)
+}
+
+async fn contains_local_graph(
+    node: Arc<CraqleNode>,
+    graph_iri: String,
+) -> Result<bool, MetadataError> {
+    tokio::task::spawn_blocking(move || node.contains_graph(&GraphId::new(&graph_iri)))
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+        .map_err(metadata_error_from_craqle)
+}
+
+pub(super) fn metadata_effect_mutates_graph(effect: &MetadataEffect) -> bool {
+    matches!(
+        effect,
+        MetadataEffect::CreateCrate { .. }
+            | MetadataEffect::ApplyRoCrate { .. }
+            | MetadataEffect::UpsertDataEntity { .. }
+            | MetadataEffect::UpsertContextualEntity { .. }
+            | MetadataEffect::SetGraphPolicy { .. }
+            | MetadataEffect::AddGraphPeer { .. }
+            | MetadataEffect::DeleteGraph { .. }
+            | MetadataEffect::InstallSnapshot { .. }
+            | MetadataEffect::MergeBatch { .. }
+    )
+}
+
+pub(super) fn effect_rejects_deleted_graph(effect: &MetadataEffect) -> bool {
+    matches!(
+        effect,
+        MetadataEffect::ValidateCreateCrate { .. }
+            | MetadataEffect::ValidateRoCrate { .. }
+            | MetadataEffect::CreateCrate { .. }
+            | MetadataEffect::ApplyRoCrate { .. }
+            | MetadataEffect::UpsertDataEntity { .. }
+            | MetadataEffect::UpsertContextualEntity { .. }
+            | MetadataEffect::SetGraphPolicy { .. }
+            | MetadataEffect::AddGraphPeer { .. }
+            | MetadataEffect::GetGraphPolicy { .. }
+            | MetadataEffect::ExportRoCrate { .. }
+            | MetadataEffect::ExportRoCrateSummary { .. }
+            | MetadataEffect::ExportRoCratePage { .. }
+            | MetadataEffect::PlanBatch { .. }
+            | MetadataEffect::MergeBatch { .. }
+    )
+}
