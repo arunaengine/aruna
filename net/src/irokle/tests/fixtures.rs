@@ -593,3 +593,32 @@ pub(super) async fn apply_conflicting_user_name_and_attribute(
     }
     actor_a
 }
+
+pub(super) async fn read_document_lifecycle_record(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> MetadataDocumentLifecycleRecord {
+    let value = read_storage_value(
+        storage,
+        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        metadata_document_lifecycle_key(document_id),
+    )
+    .await
+    .expect("lifecycle record exists");
+    postcard::from_bytes(&value).expect("lifecycle record decodes")
+}
+
+pub(super) async fn read_lifecycle_revision(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> DocumentSyncChange {
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let value = read_storage_value(
+        storage,
+        DOCUMENT_SYNC_REVISION_KEYSPACE,
+        document_sync_revision_key(&target),
+    )
+    .await
+    .expect("lifecycle revision exists");
+    postcard::from_bytes(&value).expect("lifecycle revision decodes")
+}

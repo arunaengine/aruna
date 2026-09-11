@@ -4786,35 +4786,6 @@ mod tests {
     const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
         "document_sync::tests::restart::buffered_document_sync_publish_restart_child_process";
 
-    async fn read_document_lifecycle_record(
-        storage: &StorageHandle,
-        document_id: Ulid,
-    ) -> MetadataDocumentLifecycleRecord {
-        let value = read_storage_value(
-            storage,
-            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-            metadata_document_lifecycle_key(document_id),
-        )
-        .await
-        .expect("lifecycle record exists");
-        postcard::from_bytes(&value).expect("lifecycle record decodes")
-    }
-
-    async fn read_lifecycle_revision(
-        storage: &StorageHandle,
-        document_id: Ulid,
-    ) -> DocumentSyncChange {
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-        let value = read_storage_value(
-            storage,
-            DOCUMENT_SYNC_REVISION_KEYSPACE,
-            document_sync_revision_key(&target),
-        )
-        .await
-        .expect("lifecycle revision exists");
-        postcard::from_bytes(&value).expect("lifecycle revision decodes")
-    }
-
     #[tokio::test]
     async fn metadata_registry_upsert_skips_stale_local_record() {
         let (_dir, storage) = test_storage();
