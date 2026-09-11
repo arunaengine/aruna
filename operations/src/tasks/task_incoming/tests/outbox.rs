@@ -771,3 +771,131 @@ async fn blocked_keeps_backoff() {
     );
     shutdown_net(&net).await;
 }
+
+// A full first page of records for a genesis-less shard topic (all deferred)
+// must not starve records for other topics behind it in the FIFO: the drain
+// pages the whole outbox per run, so a later-page record still publishes.
+#[tokio::test(start_paused = true)]
+async fn deferred_head_paginates() {
+    let _clock = freeze_clock();
+    let realm_id = RealmId::from_bytes([44u8; 32]);
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let net = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await
+    .expect("net handle");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+    });
+
+    // Every head-page record targets one shard topic with no local genesis,
+    // so all of them defer.
+    let deferred_change = DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(8, 1),
+            actor: node(1),
+            updated_at_ms: 9,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement: aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_parts(42, 1),
+            shard: 3,
+        },
+    };
+    let deferred_target = DocumentSyncTarget::MetadataRegistry {
+        group_id: Ulid::from_parts(1, 1),
+        document_id: Ulid::from_parts(2, 2),
+    };
+    let mut writes = Vec::with_capacity(OUTBOX_DRAIN_BATCH_SIZE + 1);
+    for index in 0..OUTBOX_DRAIN_BATCH_SIZE {
+        let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, index as u128),
+            node(1),
+            deferred_target.clone(),
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: Vec::new(),
+                change: deferred_change,
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        writes.push(
+            crate::sync::document_sync_outbox::outbox_write_entry(&record).expect("outbox entry"),
+        );
+    }
+
+    // One later origin record for a shared (non-shard) topic, ordered
+    // strictly after the head page, so only pagination reaches it.
+    let publish_record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
+        Ulid::from_parts(2, 0),
+        node(1),
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+        Vec::new(),
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: b"realm-auth".to_vec(),
+            change: change(),
+        },
+        aruna_core::structs::PlacementRef::NIL,
+        true,
+    );
+    let publish_key = outbox_key(&publish_record).to_vec();
+    writes.push(
+        crate::sync::document_sync_outbox::outbox_write_entry(&publish_record).expect("entry"),
+    );
+
+    match storage
+        .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => panic!("unexpected batch write event: {other:?}"),
+    }
+
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    handler.drain_document_sync_outbox().await;
+
+    assert_eq!(
+        read_outbox_record(&storage, &publish_key)
+            .await
+            .expect("read publish record"),
+        None,
+        "the later-page record must publish despite an all-deferred first page"
+    );
+    let remaining = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE + 8)
+        .await
+        .expect("read remaining");
+    assert_eq!(
+        remaining.records.len(),
+        OUTBOX_DRAIN_BATCH_SIZE,
+        "every deferred record is retained for the next run"
+    );
+    assert_eq!(
+        scheduled_after(&task_handle).await,
+        DOCUMENT_SYNC_DEFER_RETRY_AFTER,
+        "an early defer followed by a clean suffix keeps the aggregate retry"
+    );
+
+    shutdown_net(&net).await;
+}
