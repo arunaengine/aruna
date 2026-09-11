@@ -137,10 +137,8 @@ fn parse_hash(hash: &str) -> ServerResult<[u8; 32]> {
         ));
     }
     let mut bytes = [0u8; 32];
-    for (index, slot) in bytes.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&hash[index * 2..index * 2 + 2], 16)
-            .map_err(|_| ServerError::BadRequestReason("blake3 must be hex".to_string()))?;
-    }
+    hex::decode_to_slice(hash, &mut bytes)
+        .map_err(|_| ServerError::BadRequestReason("blake3 must be hex".to_string()))?;
     Ok(bytes)
 }
 
@@ -1115,8 +1113,19 @@ mod tests {
     fn round_trips_hashes() {
         let hash = [0xabu8; 32];
         assert_eq!(parse_hash(&hex_hash(&hash)).unwrap(), hash);
+        assert_eq!(parse_hash(&hex_hash(&hash).to_uppercase()).unwrap(), hash);
         assert!(parse_hash("nothex").is_err());
         assert!(parse_hash(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_hashes() {
+        // A 3-byte scalar keeps the byte length at 64 while breaking char boundaries.
+        let malformed = format!("€{}", "a".repeat(61));
+        assert_eq!(malformed.len(), 64);
+        assert!(parse_hash(&malformed).is_err());
+        assert!(parse_hash(&"a".repeat(62)).is_err());
+        assert!(parse_hash(&"a".repeat(66)).is_err());
     }
 
     #[test]
