@@ -195,3 +195,132 @@ async fn registry_fence_ulid() {
         other => panic!("unexpected stale fence transaction result: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn registry_strategy_fenced() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(2_100, 1);
+    let document_id = Ulid::from_parts(2_101, 1);
+    let mut record = registry_record(
+        group_id,
+        document_id,
+        "datasets/missing-strategy",
+        100,
+        Ulid::from_parts(2_102, 1),
+    );
+    record.placement = PlacementRef {
+        strategy_id: Ulid::from_parts(2_103, 1),
+        shard: 1,
+    };
+    let mut config = RealmConfigDocument::default_for_realm(record.realm_id, Vec::new());
+    config.seed_default_placement();
+    let config_target = DocumentSyncTarget::RealmConfig {
+        realm_id: record.realm_id,
+    };
+    storage_batch_write_to(
+        &storage,
+        vec![(
+            config_target.storage_keyspace().to_string(),
+            config_target.storage_key(),
+            config
+                .to_bytes(&test_actor(
+                    1,
+                    UserId::nil(record.realm_id),
+                    record.realm_id,
+                ))
+                .expect("realm config serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("realm config writes");
+
+    apply_metadata_registry_upsert_to_storage(
+        &storage,
+        record.clone(),
+        postcard::to_allocvec(&record).expect("registry serializes"),
+    )
+    .await
+    .expect("invalid strategy is rejected without wedging reconciliation");
+
+    assert!(
+        read_storage_value(
+            &storage,
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn upsert_keeps_config() {
+    // The placement fence reads the realm config inside its transaction and
+    // must not write it back: an identical write only conflicts the config's
+    // readers, which is how inbound sync used to stall concurrent creates.
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([42; 32]);
+    let group_id = Ulid::from_parts(2_130, 1);
+    let actor = test_actor(1, UserId::nil(realm_id), realm_id);
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    let placement = PlacementRef {
+        strategy_id: config.default_strategy_id.unwrap(),
+        shard: 4,
+    };
+    let document_id = MetaResourceId::from_parts(
+        2_131,
+        PlacementHandle::new(METADATA_HANDLE).unwrap(),
+        BucketId::new(placement.shard as u16).unwrap(),
+        1,
+    )
+    .unwrap()
+    .as_ulid();
+    let mut record = registry_record(
+        group_id,
+        document_id,
+        "datasets/config-untouched",
+        100,
+        Ulid::from_parts(2_132, 1),
+    );
+    record.placement = placement;
+    let config_target = DocumentSyncTarget::RealmConfig {
+        realm_id: record.realm_id,
+    };
+    storage_batch_write_to(
+        &storage,
+        vec![(
+            config_target.storage_keyspace().to_string(),
+            config_target.storage_key(),
+            config
+                .to_bytes(&actor)
+                .expect("realm config serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("realm config writes");
+    let before = storage.snapshot_metrics().requests_total;
+
+    apply_metadata_registry_upsert_to_storage(
+        &storage,
+        record.clone(),
+        postcard::to_allocvec(&record).expect("registry serializes"),
+    )
+    .await
+    .expect("registry upsert applies");
+
+    assert!(
+        read_storage_value(
+            &storage,
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await
+        .is_some(),
+        "the upsert still lands"
+    );
+    assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
+    assert!(storage.snapshot_metrics().requests_total > before);
+}
