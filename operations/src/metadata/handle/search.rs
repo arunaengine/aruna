@@ -477,3 +477,55 @@ pub(super) fn describe_hit_properties(
 pub(super) fn clamp_remote_search_graph_limit(limit: usize) -> usize {
     limit.clamp(1, METADATA_SEARCH_MAX_PAGINATION_DEPTH)
 }
+
+pub(super) struct AllowedGraphAuthorizer {
+    pub(super) graph_iris: HashSet<String>,
+}
+
+impl CraqleAuthorizer for AllowedGraphAuthorizer {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        _policy: &GraphPolicy,
+        action: CraqleAction,
+    ) -> Result<(), CraqleAuthError> {
+        if matches!(action, CraqleAction::Read) && self.graph_iris.contains(graph.as_str()) {
+            return Ok(());
+        }
+
+        Err(CraqleAuthError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_string(),
+        })
+    }
+}
+
+/// Lazy counterpart of [`AllowedGraphAuthorizer`], answering craqle per hit.
+/// Craqle's stored policy is ignored on purpose: the registry record, lifecycle
+/// tombstones and collected rules are authoritative, unknown graphs stay invisible.
+pub(super) struct ScopeAuthorizer<'a> {
+    pub(super) scope: &'a GraphVisibilityScope,
+    pub(super) visibility_cache: &'a MetadataVisibilityCache,
+}
+
+impl CraqleAuthorizer for ScopeAuthorizer<'_> {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        _policy: &GraphPolicy,
+        action: CraqleAction,
+    ) -> Result<(), CraqleAuthError> {
+        if matches!(action, CraqleAction::Read)
+            && self
+                .scope
+                .graph_visible(self.visibility_cache, graph.as_str())
+        {
+            return Ok(());
+        }
+
+        Err(CraqleAuthError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_string(),
+        })
+    }
+}
