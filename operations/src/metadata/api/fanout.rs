@@ -1,3 +1,4 @@
+use super::distributed::record_bucket_result;
 use super::*;
 
 pub(super) fn ensure_supported_query_mode(mode: &Option<MetadataApiQueryMode>) {
