@@ -53,8 +53,8 @@ use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use self::lifecycle::{
-    effect_rejects_deleted_graph, graph_lifecycle_deleted, metadata_effect_mutates_graph,
-    metadata_graph_deleted,
+    effect_rejects_deleted_graph, graph_lifecycle_deleted, list_local_registry_records,
+    list_local_registry_records_for_group, metadata_effect_mutates_graph, metadata_graph_deleted,
 };
 use self::query::{query_local_graphs, snapshot_iri_references};
 use self::search::{
@@ -4344,138 +4344,6 @@ fn decode_hit_properties(
             Some((predicate.as_str().to_string(), object))
         })
         .collect()
-}
-
-#[tracing::instrument(
-    name = "metadata.registry.list_local",
-    level = "debug",
-    skip(inner),
-    fields(
-        cache_hit = field::Empty,
-        stale = field::Empty,
-        record_count = field::Empty,
-        elapsed_ms = field::Empty,
-    )
-)]
-async fn list_local_registry_records(
-    inner: Arc<MetadataInner>,
-) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
-    let started = Instant::now();
-    let span = Span::current();
-    match inner.visibility_cache.registry_records_any() {
-        Some((records, true)) => {
-            span.record("cache_hit", true);
-            span.record("stale", false);
-            span.record("record_count", records.len() as u64);
-            record_elapsed_ms(&span, "elapsed_ms", started);
-            Ok(records)
-        }
-        Some((records, false)) => {
-            // Serve the expired snapshot and refresh in the background so an
-            // expiry never blocks reads on a refill.
-            span.record("cache_hit", true);
-            span.record("stale", true);
-            span.record("record_count", records.len() as u64);
-            record_elapsed_ms(&span, "elapsed_ms", started);
-            spawn_visibility_refill(&inner);
-            Ok(records)
-        }
-        None => {
-            let _fill = inner
-                .visibility_cache
-                .registry_fill
-                .clone()
-                .lock_owned()
-                .await;
-            if let Some((records, true)) = inner.visibility_cache.registry_records_any() {
-                span.record("cache_hit", true);
-                span.record("stale", false);
-                span.record("record_count", records.len() as u64);
-                record_elapsed_ms(&span, "elapsed_ms", started);
-                return Ok(records);
-            }
-            span.record("cache_hit", false);
-            let fill = fill_visibility_caches(&inner).await?;
-            let records = fill.records;
-            span.record("record_count", records.len() as u64);
-            record_elapsed_ms(&span, "elapsed_ms", started);
-            Ok(records)
-        }
-    }
-}
-
-#[tracing::instrument(
-    name = "metadata.registry.list_local_group",
-    level = "debug",
-    skip(inner),
-    fields(
-        group_id = %group_id,
-        cache_hit = field::Empty,
-        stale = field::Empty,
-        record_count = field::Empty,
-        elapsed_ms = field::Empty,
-    )
-)]
-async fn list_local_registry_records_for_group(
-    inner: Arc<MetadataInner>,
-    group_id: GroupId,
-) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
-    let started = Instant::now();
-    let span = Span::current();
-    match inner
-        .visibility_cache
-        .registry_records_for_group_any(group_id)
-    {
-        Some((records, true)) => {
-            span.record("cache_hit", true);
-            span.record("stale", false);
-            span.record("record_count", records.len() as u64);
-            record_elapsed_ms(&span, "elapsed_ms", started);
-            Ok(records)
-        }
-        Some((records, false)) => {
-            // Serve the expired snapshot and refresh in the background so an
-            // expiry never blocks reads on a refill.
-            span.record("cache_hit", true);
-            span.record("stale", true);
-            span.record("record_count", records.len() as u64);
-            record_elapsed_ms(&span, "elapsed_ms", started);
-            spawn_visibility_refill(&inner);
-            Ok(records)
-        }
-        None => {
-            let _fill = inner
-                .visibility_cache
-                .registry_fill
-                .clone()
-                .lock_owned()
-                .await;
-            if let Some((records, true)) = inner
-                .visibility_cache
-                .registry_records_for_group_any(group_id)
-            {
-                span.record("cache_hit", true);
-                span.record("stale", false);
-                span.record("record_count", records.len() as u64);
-                record_elapsed_ms(&span, "elapsed_ms", started);
-                return Ok(records);
-            }
-            span.record("cache_hit", false);
-            let fill = fill_visibility_caches(&inner).await?;
-            let records = if fill.store_accepted {
-                inner
-                    .visibility_cache
-                    .registry_records_for_group_any(group_id)
-                    .map(|(records, _)| records)
-                    .unwrap_or_else(|| registry_records_for_group(&fill.records, group_id))
-            } else {
-                registry_records_for_group(&fill.records, group_id)
-            };
-            span.record("record_count", records.len() as u64);
-            record_elapsed_ms(&span, "elapsed_ms", started);
-            Ok(records)
-        }
-    }
 }
 
 fn spawn_visibility_refill(inner: &Arc<MetadataInner>) {
