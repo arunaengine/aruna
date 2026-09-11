@@ -6,6 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::identifiers::{BucketId, PlacementHandle, StructuredIdGenerator};
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
     METADATA_RAW_BYTES_LIMIT, MetadataCreateCrateRequest, MetadataCreateEventPayload,
@@ -23,7 +24,6 @@ use aruna_core::structs::{
     PlacementScope, PlacementStrategy, RealmConfigDocument, RealmId, WorkspaceMode, pid_dedup_key,
     shard_for_subject,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
 use aruna_core::types::{Effects, GroupId, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{MetaResourceId, StructuredId};
@@ -140,7 +140,7 @@ pub enum CreateMetadataDocumentError {
     PlacementBinding(#[from] BindingError),
     /// The structured-id generator refused to mint under a clock-health fault.
     #[error(transparent)]
-    ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
+    ClockHealth(#[from] aruna_core::identifiers::ClockHealthError),
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]

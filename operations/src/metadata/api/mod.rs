@@ -94,10 +94,10 @@ use super::search_cursor::{
 use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::GroupPermissionRules;
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::list_groups::ListGroupOperation;
-use crate::metadata::get_metadata_document::{
+use crate::metadata::get_document::{
     is_metadata_record_materialized_for_graph_read, load_metadata_record_by_document,
 };
 use crate::metadata::repository::{
@@ -111,9 +111,9 @@ use crate::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
 };
-use crate::realm::get_realm_config::GetRealmConfigOperation;
-use crate::realm::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 use crate::s3::search_objects::{
     ObjectInventoryHit, ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput,
