@@ -167,7 +167,6 @@ impl AdminDocumentReducerState {
             })
     }
 
-
     pub fn materialized_realm_config_oidc_providers(&self) -> BTreeMap<String, OidcProviderConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
@@ -323,7 +322,12 @@ impl AdminDocumentReducerState {
         self.apply_group_field(event, GROUP_OWNER_PATH, Some(owner.to_string()));
     }
 
-    pub(super) fn apply_group_field(&mut self, event: &AdminDocumentEvent, path: &str, value: Option<String>) {
+    pub(super) fn apply_group_field(
+        &mut self,
+        event: &AdminDocumentEvent,
+        path: &str,
+        value: Option<String>,
+    ) {
         let current = self.user_subject_ids.get(path).cloned();
 
         match self.reduce_value(event, path, current, value) {
@@ -336,7 +340,12 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_group_role(&mut self, event: &AdminDocumentEvent, role_id: &RoleId, value: String) {
+    pub(super) fn apply_group_role(
+        &mut self,
+        event: &AdminDocumentEvent,
+        role_id: &RoleId,
+        value: String,
+    ) {
         let path = group_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
@@ -350,7 +359,11 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_group_role_removed(&mut self, event: &AdminDocumentEvent, role_id: &RoleId) {
+    pub(super) fn apply_group_role_removed(
+        &mut self,
+        event: &AdminDocumentEvent,
+        role_id: &RoleId,
+    ) {
         let path = group_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
@@ -386,7 +399,12 @@ impl AdminDocumentReducerState {
 }
 
 impl AdminDocumentReducerState {
-    pub(super) fn apply_realm_role(&mut self, event: &AdminDocumentEvent, role_id: &RoleId, value: String) {
+    pub(super) fn apply_realm_role(
+        &mut self,
+        event: &AdminDocumentEvent,
+        role_id: &RoleId,
+        value: String,
+    ) {
         let path = realm_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 

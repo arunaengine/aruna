@@ -156,7 +156,6 @@ impl RevocationIndex {
 }
 
 impl RevocationIndex {
-
     pub fn origin(&self, token_hash: &str) -> Option<NodeId> {
         self.retained
             .get(token_hash)
@@ -489,4 +488,3 @@ pub fn revoked_token_entry(path: &str) -> Option<(&str, u64, UserId)> {
     let token_owner = UserId::from_string(parts.next()?).ok()?;
     (parts.next().is_none() && valid_token_hash(hash)).then_some((hash, expires_at, token_owner))
 }
-

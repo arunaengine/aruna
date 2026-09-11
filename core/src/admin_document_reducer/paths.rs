@@ -273,7 +273,9 @@ pub(super) fn normalized_strategy_binding(binding: &StrategyBinding) -> Strategy
     }
 }
 
-pub(super) fn metadata_replication_value(metadata_replication: &MetadataReplicationConfig) -> String {
+pub(super) fn metadata_replication_value(
+    metadata_replication: &MetadataReplicationConfig,
+) -> String {
     serde_json::to_string(metadata_replication)
         .expect("admin document metadata replication config serializes")
 }
@@ -286,7 +288,9 @@ pub(super) fn policies_value(policies: &[crate::request_policy::RequestPolicy]) 
     serde_json::to_string(policies).expect("admin document policies serialize")
 }
 
-pub(super) fn policies_from_value(value: &str) -> Option<Vec<crate::request_policy::RequestPolicy>> {
+pub(super) fn policies_from_value(
+    value: &str,
+) -> Option<Vec<crate::request_policy::RequestPolicy>> {
     serde_json::from_str(value).ok()
 }
 
