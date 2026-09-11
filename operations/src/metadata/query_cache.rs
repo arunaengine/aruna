@@ -272,7 +272,7 @@ impl MetadataQueryCache {
             bytes,
         };
         let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
-        if let Some(replaced) = state.entries.put(key, entry) {
+        if let Some((_, replaced)) = state.entries.push(key, entry) {
             state.bytes = state.bytes.saturating_sub(replaced.bytes);
         }
         state.bytes = state.bytes.saturating_add(bytes);
@@ -506,6 +506,28 @@ mod tests {
         assert!(cache.get(&key("q0"), stamp, now).is_none());
         // A result larger than the whole budget is never admitted.
         assert!(!cache.insert(key("huge"), cached(rows(4096)), stamp, 1, now));
+    }
+
+    #[test]
+    fn capacity_evicts_bytes() {
+        let entry_bytes = ENTRY_OVERHEAD + results_bytes(&rows(4));
+        let cache = MetadataQueryCache::with_limits(2, 2 * entry_bytes, TTL);
+        let stamp = cache.stamp(1);
+        let now = Instant::now();
+        for index in 0..3 {
+            assert!(cache.insert(key(&format!("q{index}")), cached(rows(4)), stamp, 1, now));
+        }
+        // The capacity eviction must release the evicted bytes; if they leak,
+        // the byte budget evicts a second, still live entry.
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&key("q0"), stamp, now).is_none());
+        assert!(cache.get(&key("q1"), stamp, now).is_some());
+        assert!(cache.get(&key("q2"), stamp, now).is_some());
+        // Replacing a key subtracts the old entry's bytes exactly once.
+        assert!(cache.insert(key("q1"), cached(rows(4)), stamp, 1, now));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&key("q1"), stamp, now).is_some());
+        assert!(cache.get(&key("q2"), stamp, now).is_some());
     }
 
     #[test]
