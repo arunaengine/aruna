@@ -1,0 +1,204 @@
+use super::*;
+
+pub const USER_NAME_PATH: &str = "user.name";
+pub const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
+pub const GROUP_REALM_ID_PATH: &str = "group.realm_id";
+pub const GROUP_OWNER_PATH: &str = "group.owner";
+pub const GROUP_POLICIES_PATH: &str = "group.policies";
+pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
+    "realm_config.settings.metadata_replication";
+pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
+pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
+pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
+pub const REALM_CONFIG_COMPUTE_PATH: &str = "realm_config.compute";
+pub const REALM_CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
+pub const REALM_CONFIG_DEFAULT_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
+pub const REALM_CONFIG_JOB_FAMILY_PATH: &str = "realm_config.placement.job_family_strategy";
+pub const REALM_CONFIG_REVOKED_TOKENS_PATH: &str = "realm_config.revoked_tokens";
+
+pub(super) fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
+    event.observed.observes(dot)
+        || (event.origin_node_id == dot.origin_node_id && event.origin_seq > dot.origin_seq)
+}
+
+pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
+    match op {
+        AdminDocumentOperation::GroupRoleAdded { role_id }
+        | AdminDocumentOperation::GroupRoleCreated {
+            role: AdminDocumentRoleDefinition { role_id, .. },
+        }
+        | AdminDocumentOperation::GroupRoleRemoved { role_id } => vec![group_role_path(role_id)],
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
+            vec![group_role_user_assignment_path(role_id, user_id)]
+        }
+        AdminDocumentOperation::GroupJoinRequested { request } => {
+            vec![crate::join_request::request_path(request.request_id)]
+        }
+        AdminDocumentOperation::GroupJoinDecided { decision } => {
+            let mut paths = vec![crate::join_request::decision_path(decision.request_id)];
+            paths.extend(
+                decision
+                    .role_ids
+                    .iter()
+                    .map(|role_id| group_role_user_assignment_path(role_id, &decision.user_id)),
+            );
+            paths
+        }
+        AdminDocumentOperation::UserAttributeSet { key, .. }
+        | AdminDocumentOperation::UserAttributeRemoved { key } => vec![user_attribute_path(key)],
+        AdminDocumentOperation::UserNameSet { .. } => vec![USER_NAME_PATH.to_string()],
+        AdminDocumentOperation::UserSubjectIdAdded { subject_id }
+        | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
+            vec![user_subject_id_path(subject_id)]
+        }
+        AdminDocumentOperation::RealmRoleAdded { role_id }
+        | AdminDocumentOperation::RealmRoleCreated {
+            role: AdminDocumentRoleDefinition { role_id, .. },
+        } => vec![realm_role_path(role_id)],
+        AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
+            vec![realm_role_user_assignment_path(role_id, user_id)]
+        }
+        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, .. }
+        | AdminDocumentOperation::RealmConfigNodeRemoved { node_id } => {
+            vec![realm_config_node_path(node_id)]
+        }
+        AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
+            vec![realm_config_oidc_provider_path(&provider.id)]
+        }
+        AdminDocumentOperation::RealmConfigOidcProviderRemoved { provider_id } => {
+            vec![realm_config_oidc_provider_path(provider_id)]
+        }
+        AdminDocumentOperation::RealmConfigSettingsSet { .. } => vec![
+            REALM_CONFIG_METADATA_REPLICATION_PATH.to_string(),
+            REALM_CONFIG_DISCOVERY_PATH.to_string(),
+        ],
+        AdminDocumentOperation::GroupCreated { .. } => vec![
+            GROUP_DISPLAY_NAME_PATH.to_string(),
+            GROUP_REALM_ID_PATH.to_string(),
+            GROUP_OWNER_PATH.to_string(),
+        ],
+        AdminDocumentOperation::GroupDisplayNameSet { .. } => {
+            vec![GROUP_DISPLAY_NAME_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigDescriptionSet { .. } => {
+            vec![REALM_CONFIG_DESCRIPTION_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigQuotaSet { .. } => {
+            vec![REALM_CONFIG_QUOTA_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigComputeSet { .. } => {
+            vec![REALM_CONFIG_COMPUTE_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigPoliciesSet { .. } => {
+            vec![REALM_CONFIG_POLICIES_PATH.to_string()]
+        }
+        AdminDocumentOperation::GroupPoliciesSet { .. } => {
+            vec![GROUP_POLICIES_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
+            vec![realm_config_placement_node_path(&entry.node_id)]
+        }
+        AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id } => {
+            vec![realm_config_placement_node_path(node_id)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } => {
+            vec![realm_config_placement_strategy_path(&strategy.strategy_id)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id } => {
+            vec![realm_config_placement_strategy_path(strategy_id)]
+        }
+        AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
+            vec![REALM_CONFIG_DEFAULT_STRATEGY_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigJobFamilySet { .. } => {
+            vec![REALM_CONFIG_JOB_FAMILY_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => {
+            vec![realm_config_strategy_binding_path(&binding.scope)]
+        }
+        AdminDocumentOperation::RealmConfigStrategyBindingRemoved { scope } => {
+            vec![realm_config_strategy_binding_path(scope)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => {
+            vec![realm_config_placement_override_path(&record.subject)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject } => {
+            vec![realm_config_placement_override_path(subject)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding } => {
+            vec![placement_binding_path(binding.handle)]
+        }
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
+            vec![candidate_map_path(map.epoch)]
+        }
+        AdminDocumentOperation::RealmConfigActivationsInitialized { strategy_id, .. } => {
+            vec![activation_path(strategy_id)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
+            vec![transition_path(&plan.transition_id)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => {
+            vec![transition_barrier_path(transition_id, *bucket, reported_by)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            proof,
+            ..
+        } => {
+            vec![transition_proof_path(
+                transition_id,
+                proof.bucket,
+                &proof.holder,
+            )]
+        }
+        AdminDocumentOperation::RealmConfigTransitionAborted { transition_id } => {
+            vec![transition_abort_path(transition_id)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionBucketForced {
+            transition_id,
+            bucket,
+            ..
+        } => {
+            vec![transition_force_path(transition_id, *bucket)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => {
+            vec![transition_stall_path(transition_id, *bucket, reported_by)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+            transition_id,
+            bucket,
+            reported_by,
+        } => {
+            vec![transition_drain_path(transition_id, *bucket, reported_by)]
+        }
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
+            vec![handle_range_path(range.range_id)]
+        }
+        AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
+            vec![band_pool_path(pool.pool_id)]
+        }
+        AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash,
+            expires_at,
+            token_owner,
+        } => {
+            vec![revoked_token_path(token_hash, *expires_at, token_owner)]
+        }
+    }
+}
+
+pub(super) fn role_definition_value(role: &AdminDocumentRoleDefinition) -> String {
+    serde_json::to_string(role).expect("admin document role definition serializes")
+}
