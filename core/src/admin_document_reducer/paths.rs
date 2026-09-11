@@ -388,3 +388,46 @@ pub fn realm_config_node_id_from_path(path: &str) -> Option<NodeId> {
 pub fn realm_config_oidc_provider_id_from_path(path: &str) -> Option<&str> {
     path.strip_prefix("realm_config.oidc_providers.")
 }
+
+pub(super) fn oidc_provider_from_value(value: &str) -> Option<OidcProviderConfig> {
+    serde_json::from_str(value).ok()
+}
+
+pub(super) fn metadata_replication_from_value(value: &str) -> Option<MetadataReplicationConfig> {
+    serde_json::from_str(value).ok()
+}
+
+pub(super) fn realm_discovery_from_value(value: &str) -> Option<RealmDiscoveryConfig> {
+    serde_json::from_str(value).ok()
+}
+
+/// The compute configuration is stored canonically: link and quota order must
+/// not decide whether two publishers agree.
+pub(super) fn compute_value(compute: &RealmComputeConfig) -> String {
+    serde_json::to_string(&canonical_compute(compute))
+        .expect("admin document compute config serializes")
+}
+
+pub(super) fn canonical_compute(compute: &RealmComputeConfig) -> RealmComputeConfig {
+    let mut compute = compute.clone();
+    compute
+        .links
+        .sort_by(|left, right| (&left.from, &left.to).cmp(&(&right.from, &right.to)));
+    compute.group_quotas.sort_by_key(|entry| entry.group_id);
+    compute
+}
+
+pub(super) fn compute_from_value(value: &str) -> Option<RealmComputeConfig> {
+    serde_json::from_str(value)
+        .ok()
+        .map(|compute| canonical_compute(&compute))
+}
+
+pub(super) fn quota_from_value(value: &str) -> Option<QuotaConfig> {
+    serde_json::from_str(value)
+        .ok()
+        .map(|quota| supported_quota(&quota))
+}
+pub(super) fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
+    serde_json::from_str(value).ok()
+}

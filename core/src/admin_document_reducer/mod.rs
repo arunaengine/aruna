@@ -3106,45 +3106,6 @@ fn transition_part(path: &str) -> Option<(Ulid, TransitionPart)> {
     parts.next().is_none().then_some((transition_id, part))
 }
 
-fn oidc_provider_from_value(value: &str) -> Option<OidcProviderConfig> {
-    serde_json::from_str(value).ok()
-}
-
-fn metadata_replication_from_value(value: &str) -> Option<MetadataReplicationConfig> {
-    serde_json::from_str(value).ok()
-}
-
-fn realm_discovery_from_value(value: &str) -> Option<RealmDiscoveryConfig> {
-    serde_json::from_str(value).ok()
-}
-
-/// The compute configuration is stored canonically: link and quota order must
-/// not decide whether two publishers agree.
-fn compute_value(compute: &RealmComputeConfig) -> String {
-    serde_json::to_string(&canonical_compute(compute))
-        .expect("admin document compute config serializes")
-}
-
-fn canonical_compute(compute: &RealmComputeConfig) -> RealmComputeConfig {
-    let mut compute = compute.clone();
-    compute
-        .links
-        .sort_by(|left, right| (&left.from, &left.to).cmp(&(&right.from, &right.to)));
-    compute.group_quotas.sort_by_key(|entry| entry.group_id);
-    compute
-}
-
-fn compute_from_value(value: &str) -> Option<RealmComputeConfig> {
-    serde_json::from_str(value)
-        .ok()
-        .map(|compute| canonical_compute(&compute))
-}
-
-fn quota_from_value(value: &str) -> Option<QuotaConfig> {
-    serde_json::from_str(value)
-        .ok()
-        .map(|quota| supported_quota(&quota))
-}
 
 fn placement_entry_from_value(value: &str) -> Option<NodePlacementEntry> {
     serde_json::from_str(value).ok()
@@ -3174,9 +3135,6 @@ fn parse_band_pool(value: &str) -> Option<BandPool> {
     serde_json::from_str(value).ok()
 }
 
-fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
-    serde_json::from_str(value).ok()
-}
 
 #[cfg(test)]
 mod tests {
