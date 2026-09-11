@@ -3438,12 +3438,13 @@ mod gate_tests {
         let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
         assert!(!composes(&effects));
 
-        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
+        let document =
+            crate::placement::policy::tests::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(cached.into())));
-        let effects = operation.step(crate::placement::policy::fixtures::authority(realm()));
+        let effects = operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
 
         assert!(!composes(&effects));
         assert_eq!(

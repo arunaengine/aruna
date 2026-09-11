@@ -209,7 +209,7 @@ mod tests {
             ResolveStep::Pending(_)
         ));
         assert!(matches!(
-            resolver.step(super::super::fixtures::authority(realm())),
+            resolver.step(super::super::tests::fixtures::authority(realm())),
             ResolveStep::Pending(_)
         ));
         assert!(matches!(
@@ -217,7 +217,7 @@ mod tests {
             ResolveStep::Pending(_)
         ));
         assert_eq!(
-            resolver.step(super::super::fixtures::authority(realm())),
+            resolver.step(super::super::tests::fixtures::authority(realm())),
             ResolveStep::Done
         );
 
