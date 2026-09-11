@@ -1,4 +1,3 @@
-use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
@@ -10,6 +9,7 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -31,7 +31,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
@@ -384,10 +384,8 @@ impl AddGroupRoleOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -1045,16 +1043,13 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use crate::driver::{DriverContext, drive};
-    use crate::groups::add_group_role::{
+    use crate::groups::add_member::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::groups::add_role::{
         AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation, AddGroupRoleState,
     };
-    use crate::groups::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::{
-        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
-    };
     use aruna_core::admin_documents::{
         AdminDocumentDot, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
@@ -1067,6 +1062,9 @@ pub mod test {
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::{
+        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
+    };
     use aruna_core::storage_entries::{
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
     };
@@ -1557,7 +1555,7 @@ pub mod test {
                 let stored_auth_doc =
                     GroupAuthorizationDocument::from_bytes(auth_write.2.as_ref()).unwrap();
                 let stored_group_doc = Group::from_bytes(group_write.2.as_ref()).unwrap();
-                let reducer_state: aruna_core::admin_document_reducer::AdminDocumentReducerState =
+                let reducer_state: aruna_core::reducer::AdminDocumentReducerState =
                     postcard::from_bytes(reducer_state_write.2.as_ref()).unwrap();
                 assert_eq!(stored_auth_doc, mutated_auth_doc);
                 assert_eq!(stored_group_doc, mutated_group);
