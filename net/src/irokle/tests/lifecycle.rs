@@ -582,3 +582,346 @@ async fn capacity_retains_cursors() {
 
     service.shutdown().await;
 }
+
+#[tokio::test]
+async fn metadata_placement_defers() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([42; 32]);
+    let service = DocumentSyncService::open_with_persist_policy(
+        test_endpoint(76).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        irokle_crate::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+    let local_node = service.local_node_id().expect("local node id");
+    let actor = test_actor(
+        76,
+        UserId::local(Ulid::from_parts(2_110, 1), realm_id),
+        realm_id,
+    );
+    assert_eq!(actor.node_id, local_node);
+
+    let strategy_id = Ulid::from_parts(2_111, 1);
+    let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(local_node, RealmNodeKind::Management);
+    config.placement_bindings.push(PlacementBinding {
+        handle,
+        scope: PlacementScope::Realm(realm_id),
+        document_class: DocumentClass::Metadata,
+        strategy_id,
+        allocator_range_id: None,
+        allocated_by: None,
+        allocated_at_ms: None,
+    });
+    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    storage_batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            config_target.clone(),
+            config
+                .to_bytes(&actor)
+                .expect("realm config serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("realm config writes");
+
+    let strategy = PlacementStrategy {
+        strategy_id,
+        name: "deferred".to_string(),
+        replica_count: Some(1),
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: 64,
+    };
+    let placement = PlacementRef {
+        strategy_id: strategy.strategy_id,
+        shard: 4,
+    };
+    let group_id = Ulid::from_parts(2_112, 1);
+    let document_id = MetaResourceId::from_parts(
+        2_113,
+        handle,
+        BucketId::new(placement.shard as u16).unwrap(),
+        1,
+    )
+    .unwrap()
+    .as_ulid();
+    let create_event_id = Ulid::from_parts(2_114, 1);
+    let mut record = registry_record(
+        group_id,
+        document_id,
+        "datasets/deferred",
+        100,
+        create_event_id,
+    );
+    record.placement = placement;
+    let mut create = metadata_create_event(group_id, document_id, 100, create_event_id, 76);
+    create.record = record.clone();
+    let registry_target = DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    };
+    let create_target = DocumentSyncTarget::MetadataCreateEvent {
+        document_id,
+        event_id: create_event_id,
+    };
+    let update_event_id = Ulid::from_parts(2_118, 1);
+    let mut update = create.clone();
+    update.event_id = update_event_id;
+    update.record.updated_at_ms = 200;
+    update.record.last_event_id = update_event_id;
+    update.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+        jsonld: "{}".to_string(),
+    };
+    update.occurred_at_ms = 200;
+    let update_target = DocumentSyncTarget::MetadataCreateEvent {
+        document_id,
+        event_id: update_event_id,
+    };
+    let metadata_topic = registry_target.sync_topic_id(realm_id, &placement);
+    service
+        .ensure_document_sync_topics(&[metadata_topic], Vec::new())
+        .expect("metadata shard topic genesis");
+    let change = |event_id| DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id,
+            actor: local_node,
+            updated_at_ms: 100,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement,
+    };
+    let published = service
+        .publish_documents(
+            vec![
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::from_parts(2_115, 1),
+                    target: registry_target.clone(),
+                    bytes: postcard::to_allocvec(&record).expect("registry serializes"),
+                    change: change(Ulid::from_parts(2_115, 1)),
+                    allow_genesis: true,
+                },
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::from_parts(2_117, 1),
+                    target: update_target.clone(),
+                    bytes: postcard::to_allocvec(&update).expect("update serializes"),
+                    change: change(Ulid::from_parts(2_117, 1)),
+                    allow_genesis: true,
+                },
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::from_parts(2_116, 1),
+                    target: create_target.clone(),
+                    bytes: postcard::to_allocvec(&create).expect("create serializes"),
+                    change: change(Ulid::from_parts(2_116, 1)),
+                    allow_genesis: true,
+                },
+            ],
+            Vec::new(),
+        )
+        .await;
+    assert!(
+        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        "metadata publish failed: {published:?}"
+    );
+    reset_test_cursor(&service, metadata_topic).await;
+
+    let deferred = service
+        .reconcile_document_topics([metadata_topic])
+        .await
+        .expect("metadata reconciliation defers");
+    assert!(deferred.metadata_create_events.is_empty());
+    assert!(
+        read_storage_value(
+            &storage,
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        read_storage_value(
+            &storage,
+            METADATA_EVENT_LOG_KEYSPACE,
+            metadata_event_log_key(document_id, create_event_id),
+        )
+        .await
+        .is_none()
+    );
+    let deferred_cursor = read_test_cursor(&storage, metadata_topic)
+        .await
+        .unwrap_or_default();
+    let metadata_clock = service
+        .node()
+        .storage()
+        .actor_clock(&metadata_topic)
+        .expect("metadata topic clock");
+    assert!(!deferred_cursor.dominates(&metadata_clock));
+    let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
+        postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                deferred_topics_key(),
+            )
+            .await
+            .expect("deferred topic registry is persisted"),
+        )
+        .expect("deferred topic registry decodes");
+    assert_eq!(
+        deferred_topics
+            .get(&DocumentSyncDependency::PlacementStrategy {
+                realm_id,
+                strategy_id: strategy.strategy_id,
+            })
+            .and_then(|topics| topics.get(&metadata_topic)),
+        Some(&metadata_topic)
+    );
+
+    let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let strategy_event = test_admin_event(
+        Ulid::from_parts(2_120, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &actor,
+        1,
+        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            strategy: strategy.clone(),
+        },
+    );
+    let published = service
+        .publish_documents(
+            vec![DocumentSyncPublish::AdminOperation {
+                target: config_target.clone(),
+                event: Box::new(strategy_event),
+                placement: PlacementRef::NIL,
+                allow_genesis: true,
+                origin_signature: None,
+            }],
+            Vec::new(),
+        )
+        .await;
+    assert!(
+        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        "strategy publish failed: {published:?}"
+    );
+    reset_test_cursor(&service, config_topic).await;
+
+    let applied = service
+        .reconcile_document_topics([config_topic])
+        .await
+        .expect("strategy reconciliation retries metadata");
+    assert!(applied.targets.contains(&registry_target));
+    assert!(applied.targets.contains(&create_target));
+    assert_eq!(applied.metadata_create_events, vec![create.clone()]);
+    assert_registry_record_present(&storage, &record).await;
+    let stored_create = read_storage_value(
+        &storage,
+        METADATA_EVENT_LOG_KEYSPACE,
+        metadata_event_log_key(document_id, create_event_id),
+    )
+    .await
+    .expect("create event exists");
+    assert_eq!(
+        postcard::from_bytes::<MetadataCreateEventRecord>(&stored_create)
+            .expect("create event decodes"),
+        create
+    );
+    let acceptance = read_storage_value(
+        &storage,
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        metadata_create_acceptance_key(document_id),
+    )
+    .await
+    .expect("create acceptance exists");
+    assert_eq!(
+        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance)
+            .expect("create acceptance decodes"),
+        create
+    );
+    let applied_cursor = read_test_cursor(&storage, metadata_topic)
+        .await
+        .unwrap_or_default();
+    assert!(!applied_cursor.dominates(&metadata_clock));
+    let replayed = service
+        .reconcile_document_topics([metadata_topic])
+        .await
+        .expect("metadata update reconciles");
+    assert!(replayed.targets.contains(&update_target));
+    assert!(replayed.metadata_create_events.contains(&update));
+    let applied_cursor = read_test_cursor(&storage, metadata_topic)
+        .await
+        .expect("replayed cursor is stored");
+    assert!(applied_cursor.dominates(&metadata_clock));
+    let acceptance = read_storage_value(
+        &storage,
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        metadata_create_acceptance_key(document_id),
+    )
+    .await
+    .expect("create acceptance remains");
+    assert_eq!(
+        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        create
+    );
+
+    let divergent_id = Ulid::from_parts(2_119, 1);
+    let mut divergent = create.clone();
+    divergent.event_id = divergent_id;
+    divergent.record.establishing_event_id = divergent_id;
+    divergent.record.last_event_id = divergent_id;
+    let divergent_target = DocumentSyncTarget::MetadataCreateEvent {
+        document_id,
+        event_id: divergent_id,
+    };
+    service
+        .publish_documents(
+            vec![DocumentSyncPublish::Upsert {
+                event_id: divergent_id,
+                target: divergent_target,
+                bytes: postcard::to_allocvec(&divergent).expect("create serializes"),
+                change: change(divergent_id),
+                allow_genesis: true,
+            }],
+            Vec::new(),
+        )
+        .await;
+    let rejected = service
+        .reconcile_document_topics([metadata_topic])
+        .await
+        .expect("divergent create is rejected");
+    assert!(rejected.metadata_create_events.is_empty());
+    let acceptance = read_storage_value(
+        &storage,
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        metadata_create_acceptance_key(document_id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        create
+    );
+    let cursor = read_test_cursor(&storage, metadata_topic).await.unwrap();
+    assert!(
+        cursor.dominates(
+            &service
+                .node()
+                .storage()
+                .actor_clock(&metadata_topic)
+                .unwrap()
+        )
+    );
+
+    service.shutdown().await;
+}
