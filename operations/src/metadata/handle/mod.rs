@@ -2819,7 +2819,6 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
 #[cfg(test)]
 mod tests {
     use super::lifecycle::registry_records_for_group;
-    use super::query::parse_metadata_query;
     use super::search::{GraphVisibilityScope, LifecycleVisibility, registry_record_for_graph};
     use super::search::{
         HitDescribe, ScopeAuthorizer, describe_hits_parallel, filter_candidate_records,
@@ -2854,6 +2853,8 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/fixtures/rocrate/roundtrip-1.3.json"
     ));
+
+    mod query;
 
     #[test]
     fn maps_violations() {
@@ -3011,36 +3012,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn body_timeout() {
         assert_timeout(&[0, 0, 0, 0, 8], true).await;
-    }
-
-    #[test]
-    fn metadata_query_validation_allows_common_prefixes_and_rejects_unsafe_forms() {
-        parse_metadata_query("SELECT ?s WHERE { ?s a schema:Dataset }")
-            .expect("common metadata prefixes are available");
-        parse_metadata_query("ASK WHERE { ?s ?p ?o }").expect("ASK is supported");
-
-        for query in [
-            "CONSTRUCT WHERE { ?s ?p ?o }",
-            "INSERT DATA { <urn:s> <urn:p> <urn:o> }",
-            "SELECT * WHERE { SERVICE <https://example.com/sparql> { ?s ?p ?o } }",
-            "SELECT * WHERE { FILTER EXISTS { SERVICE <https://example.com/sparql> { ?s ?p ?o } } }",
-        ] {
-            assert!(
-                matches!(
-                    parse_metadata_query(query),
-                    Err(MetadataError::InvalidInput(_))
-                ),
-                "query should be rejected: {query}"
-            );
-        }
-    }
-
-    #[test]
-    fn metadata_query_validation_rejects_oversize_input() {
-        assert!(matches!(
-            parse_metadata_query(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)),
-            Err(MetadataError::InvalidInput(_))
-        ));
     }
 
     #[test]
