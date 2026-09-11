@@ -189,3 +189,177 @@ async fn realm_config_description_admin_op_materializes_existing_config() {
         Some("Replicated Realm")
     );
 }
+
+#[tokio::test]
+async fn realm_config_placement_admin_ops_materialize_existing_config() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([71; 32]);
+    let actor = test_actor(
+        8,
+        UserId::local(Ulid::from_parts(1_500, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    storage_batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            document_target.clone(),
+            seed_config
+                .to_bytes(&actor)
+                .expect("seed realm config serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("seed realm config writes");
+
+    let entry = NodePlacementEntry {
+        node_id: actor.node_id,
+        location: "eu-west".to_string(),
+        weight: 250,
+        full: false,
+        draining: false,
+        labels: BTreeMap::new(),
+    };
+    let strategy = PlacementStrategy {
+        strategy_id: Ulid::from_parts(1_501, 1),
+        name: "default".to_string(),
+        replica_count: Some(3),
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: 64,
+    };
+    let binding = StrategyBinding {
+        scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+        strategy_id: strategy.strategy_id,
+    };
+    let record = PlacementOverride {
+        subject: b"document-subject".to_vec(),
+        pinned: vec![actor.node_id],
+        excluded: Vec::new(),
+        strategy_id: Some(strategy.strategy_id),
+    };
+
+    for (index, op) in [
+        AdminDocumentOperation::RealmConfigNodePlacementSet {
+            entry: entry.clone(),
+        },
+        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            strategy: strategy.clone(),
+        },
+        AdminDocumentOperation::RealmConfigDefaultStrategySet {
+            strategy_id: strategy.strategy_id,
+        },
+        AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            binding: binding.clone(),
+        },
+        AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+            record: record.clone(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = index as u64 + 1;
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_502 + seq, 1),
+                target.clone(),
+                &actor,
+                seq,
+                op,
+            ),
+        )
+        .await
+        .expect("placement op applies");
+    }
+
+    let config = read_realm_config_doc(&storage, realm_id).await;
+    assert_eq!(config.placement_map, vec![entry]);
+    assert_eq!(config.strategies, vec![strategy.clone()]);
+    assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
+    assert_eq!(config.strategy_bindings, vec![binding]);
+    assert_eq!(config.placement_overrides, vec![record]);
+
+    let state_value = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&target),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&state_value).expect("reducer state decodes");
+    assert_eq!(
+        reducer_state.materialized_realm_config_default_strategy(),
+        Some(strategy.strategy_id)
+    );
+}
+
+#[test]
+fn realm_config_overlay_clears_prior_default_strategy_on_reducer_conflict() {
+    let realm_id = RealmId::from_bytes([73; 32]);
+    let user_id = UserId::local(Ulid::from_parts(1_520, 1), realm_id);
+    let actor_a = test_actor(35, user_id, realm_id);
+    let actor_b = test_actor(36, user_id, realm_id);
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let mut state = AdminDocumentReducerState::new(target.clone());
+    let prior_default = Ulid::from_parts(1_521, 1);
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.default_strategy_id = Some(prior_default);
+
+    let now = unix_timestamp_secs();
+    let index = state.revocation_index(now);
+    overlay_realm_config_reducer_materialization(
+        &mut config,
+        &state,
+        now,
+        unix_timestamp_millis(),
+        Some(&index),
+    );
+    assert_eq!(config.default_strategy_id, None);
+
+    for (event_id, actor, strategy_id) in [
+        (
+            Ulid::from_parts(1_522, 1),
+            &actor_a,
+            Ulid::from_parts(1_523, 1),
+        ),
+        (
+            Ulid::from_parts(1_524, 1),
+            &actor_b,
+            Ulid::from_parts(1_525, 1),
+        ),
+    ] {
+        state
+            .apply(&test_admin_event(
+                event_id,
+                target.clone(),
+                actor,
+                1,
+                AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+            ))
+            .unwrap();
+    }
+
+    assert!(
+        state
+            .conflicts
+            .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+    );
+    assert_eq!(state.materialized_realm_config_default_strategy(), None);
+
+    let index = state.revocation_index(now);
+    overlay_realm_config_reducer_materialization(
+        &mut config,
+        &state,
+        now,
+        unix_timestamp_millis(),
+        Some(&index),
+    );
+    assert_eq!(config.default_strategy_id, None);
+}
