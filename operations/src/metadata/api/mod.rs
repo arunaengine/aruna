@@ -39,6 +39,7 @@ use thiserror::Error;
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
+use self::export::export_rocrate_summary_jsonld;
 pub use self::export::{export_metadata_rocrate, get_visible_metadata_document};
 pub(crate) use self::path::local_path_candidates;
 pub use self::path::{deduplicate_fanout_nodes, document_replica_query_nodes};
@@ -2593,70 +2594,6 @@ fn metadata_record_matches_filters(
 fn metadata_path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
     let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
     crate::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
-}
-
-async fn export_rocrate_jsonld(
-    context: &DriverContext,
-    graph_iri: &str,
-) -> Result<String, MetadataApiError> {
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_jsonld(graph_iri.to_string())
-        .await
-        .map_err(map_metadata_event_error)
-}
-
-/// Summaries are cached per `(graph_iri, cursor)`. The lookup carries no
-/// authorization data because it only runs once `can_read_record` accepted that
-/// record; it MUST NOT be moved above that check.
-async fn export_rocrate_summary_jsonld(
-    context: &DriverContext,
-    graph_iri: &str,
-    cursor: Ulid,
-) -> Result<String, MetadataApiError> {
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    // The handle rejects deleted graphs before every export, so a hit has to
-    // re-check the authoritative lifecycle record itself.
-    if let Some(summary) = summary_cache().get(graph_iri, cursor, Instant::now()) {
-        if !metadata_graph_is_deleted(context, graph_iri).await? {
-            return Ok(summary.to_string());
-        }
-        summary_cache().remove(graph_iri);
-    }
-
-    let summary = handle
-        .export_rocrate_summary_jsonld(graph_iri.to_string())
-        .await
-        .map_err(map_metadata_event_error)?;
-    summary_cache().insert(graph_iri, cursor, &summary, Instant::now());
-    Ok(summary)
-}
-
-async fn export_rocrate_page(
-    context: &DriverContext,
-    graph_iri: &str,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    after: Option<String>,
-) -> Result<MetadataRoCratePage, MetadataApiError> {
-    if offset.is_some() && after.is_some() {
-        return Err(MetadataApiError::BadRequest);
-    }
-    let limit = limit.unwrap_or(100).clamp(1, 1_000);
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_page(graph_iri.to_string(), limit, offset, after)
-        .await
-        .map_err(map_metadata_event_error)
 }
 
 fn map_metadata_event_error(error: MetadataError) -> MetadataApiError {
