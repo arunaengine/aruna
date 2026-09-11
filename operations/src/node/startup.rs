@@ -802,7 +802,7 @@ async fn usage_phase(
 
 /// What a [`restore_shard_subscriptions`] pass touched. The load-bearing
 /// invariant is `shard_topics == held_shards`, i.e. one topic per held shard,
-/// never one per stored document — asserted by the restart-traffic gate.
+/// never one per stored document, as asserted by the restart-traffic gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RestoreShardSummary {
     /// Shards the local node resolves into a holder of.
@@ -956,7 +956,7 @@ pub async fn restore_shard_pass(
     let unresolved_topics = batch.unresolved_topics;
 
     // A withheld genesis (co-holder down or refusing) has no placement record to
-    // drive a re-run, so arm the retry timer here — the reconciler re-probes when
+    // drive a re-run, so arm the retry timer here: the reconciler re-probes when
     // the co-holder returns instead of deferring writes at 1s until restart.
     if !unresolved_topics.is_empty()
         && let Some(task_handle) = context.task_handle.as_ref()

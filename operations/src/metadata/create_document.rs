@@ -842,8 +842,8 @@ fn mint_document_for(
 }
 
 /// Resolves the `(handle, placement)` a create's id must embed. The handle comes
-/// from the pre-provisioned binding for `(scope, Metadata, strategy)` — group
-/// scope preferred, realm scope as fallback — and is never allocated here.
+/// from the pre-provisioned binding for `(scope, Metadata, strategy)` (group
+/// scope preferred, realm scope as fallback), and is never allocated here.
 fn resolve_create_placement(
     config: &RealmConfigDocument,
     actor: &Actor,

@@ -914,7 +914,7 @@ mod test {
             }
         }
 
-        // Verify prefix filtered correctly — all returned keys start with "rare/"
+        // Verify prefix filtered correctly: all returned keys start with "rare/"
         assert!(all_keys.iter().all(|k| k.starts_with("rare/")));
         // And we got the right ones
         let mut sorted = all_keys.clone();
@@ -1178,7 +1178,7 @@ mod test {
             })
             .await;
 
-        // Write version entry (reference — no location)
+        // Write version entry (reference, no location)
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),

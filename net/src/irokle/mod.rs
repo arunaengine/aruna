@@ -244,9 +244,9 @@ impl ShardPublisherPolicy {
 /// rank-0 holder considers creating a fresh one. A genesis may be created only
 /// when every co-holder was reached (`unreachable` empty), none advertised the
 /// topic (`known_by_co_holder`), and every reached co-holder positively
-/// confirmed it unknown (not in `unconfirmed`). An unreachable co-holder — or a
+/// confirmed it unknown (not in `unconfirmed`). An unreachable co-holder, or a
 /// reached one that refused the topic (holds it but the prober may not open it
-/// yet) — might hold a genesis, so creation must be withheld to avoid a fork.
+/// yet), might hold a genesis, so creation must be withheld to avoid a fork.
 #[derive(Clone, Debug, Default)]
 pub struct ShardGenesisProbe {
     /// Probed topics at least one reached co-holder already has a genesis for.
@@ -1098,7 +1098,7 @@ impl DocumentSyncService {
                     bootstrap_cursor_dirty = true;
                     // Join-only: an unknown topic whose genesis is nowhere to be
                     // found yet (e.g. an empty shard whose rank-0 holder has not
-                    // created it) is skipped, not fatal — it arrives via gossip
+                    // created it) is skipped, not fatal: it arrives via gossip
                     // or a later anti-entropy pass.
                     match self.bootstrap_topic_from_peers(topic_id, &peers).await {
                         Ok(()) => topic_ids_out.push(topic_id),
@@ -2172,7 +2172,7 @@ impl DocumentSyncService {
                     // A reached co-holder that neither advertised a topic nor
                     // positively confirmed it unknown refused it: it holds the
                     // genesis but the prober may not open it yet. Withhold, never
-                    // treat as topic-unknown — a fresh genesis would fork.
+                    // treat as topic-unknown: a fresh genesis would fork.
                     for topic in &wanted {
                         if !peer_probe.known.contains(topic)
                             && !peer_probe.confirmed_unknown.contains(topic)
@@ -4722,7 +4722,7 @@ const FANOUT_CURSOR_LEN: usize = irokle_crate::OpId::LEN + std::mem::size_of::<u
 
 /// Per-peer outcome of probing shard topics: which topics the peer holds a
 /// genesis for (`known`) and which it positively confirmed it has none of
-/// (`confirmed_unknown`). A probed topic in neither was refused — the peer holds
+/// (`confirmed_unknown`). A probed topic in neither was refused: the peer holds
 /// it but the prober may not open it yet, so it must not be treated as unknown.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PeerTopicProbe {

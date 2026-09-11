@@ -113,8 +113,8 @@ fn weighted_shares_track_weight_within_band() {
 #[test]
 fn reweight_moves_only_toward_bumped_node() {
     // Bump one of 5 uniform nodes 100 → 150 (total 500 → 550). Its replica-1
-    // share grows from 100/500 to 150/550, and only those keys move — all of
-    // them onto the reweighted node, none reshuffled between the others.
+    // share grows from 100/500 to 150/550, and only those keys move, all of
+    // them onto the reweighted node, with none reshuffled between the others.
     let seeds = [1u8, 2, 3, 4, 5];
     let before = view(&seeds.map(|seed| (seed, 100)));
     let mut after_weights = seeds.map(|seed| (seed, 100));

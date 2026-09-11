@@ -72,8 +72,8 @@ struct OutageFixture {
     seeded: Vec<Vec<u8>>,
 }
 
-// A restart re-announces one topic per held shard plus the fixed shared topics —
-// never one per stored document — and a fresh write still converges to the
+// A restart re-announces one topic per held shard plus the fixed shared topics
+// (never one per stored document), and a fresh write still converges to the
 // restarted node afterwards.
 #[test]
 fn restart_reannounces_held_shard_topics_not_documents() -> Result<(), BoxError> {

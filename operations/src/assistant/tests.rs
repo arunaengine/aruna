@@ -159,7 +159,6 @@ fn is_batch_write(effects: &Effects) -> bool {
     )
 }
 
-/// The start key and limit of a turn iteration.
 fn iter_start(effects: &Effects) -> Option<(Key, usize)> {
     match effects.first() {
         Some(Effect::Storage(StorageEffect::Iter {
