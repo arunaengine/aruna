@@ -1,3 +1,4 @@
+use super::distributed::run_query_distributed;
 use super::fanout::ensure_supported_query_form;
 use super::*;
 use crate::metadata::search_cursor::{
