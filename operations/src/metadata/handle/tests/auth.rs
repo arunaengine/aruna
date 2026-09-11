@@ -211,3 +211,163 @@ async fn bad_bucket_token() {
 
     assert_eq!(auth, Err(MetadataReadError::Unauthorized));
 }
+
+#[tokio::test]
+async fn bucket_realm_mismatch() {
+    // The same valid token authorizes its own realm and is denied for
+    // another one, so the denial is the realm boundary and not a bad token.
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+    let peer = node_id_from_seed(31);
+    let (_dir, storage) = auth_storage();
+    persist_auth_state(
+        &storage,
+        TRUSTED_REALMS_LIST_KEY,
+        &HashSet::from([realm_id]),
+    )
+    .await;
+    persist_realm_config(&storage, realm_id, &[peer]).await;
+    let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
+    let auth_token = MetadataAuthToken::bearer(token).unwrap();
+
+    let allowed = bucket_search_auth(
+        &state,
+        &storage,
+        peer,
+        Some(realm_id),
+        Some(auth_token.clone()),
+    )
+    .await;
+    let denied = bucket_search_auth(
+        &state,
+        &storage,
+        peer,
+        Some(RealmId([21u8; 32])),
+        Some(auth_token),
+    )
+    .await;
+
+    assert_eq!(allowed.map(|auth| auth.realm_id), Ok(realm_id));
+    assert_eq!(denied, Err(MetadataReadError::Forbidden));
+}
+
+#[tokio::test]
+async fn revocation_blind_decode() {
+    // Revoking a token must still decode its claims, while every other
+    // check the validator runs stays in force.
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+    let (_dir, storage) = auth_storage();
+    persist_auth_state(
+        &storage,
+        TRUSTED_REALMS_LIST_KEY,
+        &HashSet::from([realm_id]),
+    )
+    .await;
+    persist_revoked_config(&storage, realm_id, &token).await;
+    let state = MetadataAuthValidationState::new(storage, Some(realm_id));
+
+    assert!(matches!(
+        validate_aruna_bearer_token(&state, &token).await,
+        Err(ArunaBearerTokenError::TokenRevoked)
+    ));
+    let claims = decode_aruna_bearer_token(&RevocationBlindValidation(&state), &token)
+        .await
+        .expect("revoked token still decodes for revocation");
+    assert_eq!(claims.sub, user_id.to_string());
+
+    let (_untrusted_dir, untrusted_storage) = auth_storage();
+    let untrusted = MetadataAuthValidationState::new(untrusted_storage, Some(realm_id));
+    assert!(
+        decode_aruna_bearer_token(&RevocationBlindValidation(&untrusted), &token)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn remote_metadata_auth_peer_gate_rejects_peer_from_wrong_realm() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+    let (_dir, storage) = auth_storage();
+    let wrong_realm_id = RealmId([21u8; 32]);
+    let wrong_realm_peer = node_id_from_seed(22);
+    let auth_realm_peer = node_id_from_seed(23);
+    persist_auth_state(
+        &storage,
+        TRUSTED_REALMS_LIST_KEY,
+        &HashSet::from([realm_id]),
+    )
+    .await;
+    persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
+    persist_realm_config(&storage, realm_id, &[auth_realm_peer]).await;
+    let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
+
+    let error = authorize_remote_metadata_peer(
+        &state,
+        &storage,
+        wrong_realm_peer,
+        Some(wrong_realm_id),
+        Some(MetadataAuthToken::bearer(token).unwrap()),
+        false,
+    )
+    .await
+    .expect_err("wrong realm peer rejected");
+
+    assert_eq!(
+        error,
+        MetadataError::InvalidInput(format!(
+            "remote metadata peer `{wrong_realm_peer}` is not configured in realm `{realm_id}`"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn remote_metadata_auth_peer_gate_allows_anonymous_peer_in_local_realm() {
+    let local_realm_id = RealmId([25u8; 32]);
+    let (_dir, storage) = auth_storage();
+    let local_peer = node_id_from_seed(26);
+    persist_realm_config(&storage, local_realm_id, &[local_peer]).await;
+    let state = MetadataAuthValidationState::new(storage.clone(), Some(local_realm_id));
+
+    let auth = authorize_remote_metadata_peer(
+        &state,
+        &storage,
+        local_peer,
+        Some(local_realm_id),
+        None,
+        false,
+    )
+    .await
+    .expect("anonymous local-realm peer accepted");
+
+    assert_eq!(auth, None);
+}
+
+#[tokio::test]
+async fn remote_metadata_auth_peer_gate_rejects_anonymous_peer_from_wrong_realm() {
+    let local_realm_id = RealmId([27u8; 32]);
+    let wrong_realm_id = RealmId([28u8; 32]);
+    let (_dir, storage) = auth_storage();
+    let wrong_realm_peer = node_id_from_seed(29);
+    persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
+    let state = MetadataAuthValidationState::new(storage.clone(), Some(local_realm_id));
+
+    let error = authorize_remote_metadata_peer(
+        &state,
+        &storage,
+        wrong_realm_peer,
+        Some(local_realm_id),
+        None,
+        false,
+    )
+    .await
+    .expect_err("anonymous wrong-realm peer rejected");
+
+    assert_eq!(
+        error,
+        MetadataError::InvalidInput(format!(
+            "remote metadata peer `{wrong_realm_peer}` is not configured in realm `{local_realm_id}`"
+        ))
+    );
+}
