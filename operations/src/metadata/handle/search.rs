@@ -1,3 +1,4 @@
+use super::engine::{decode_hit_properties, metadata_search_hit_from_craqle};
 use super::lifecycle::{list_deleted_graph_iris, list_registry_records_for_local_read};
 use super::*;
 
