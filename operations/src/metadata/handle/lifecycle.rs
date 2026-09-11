@@ -790,3 +790,93 @@ pub(super) async fn list_group_records(
             .collect(),
     ))
 }
+
+#[tracing::instrument(
+    name = "metadata.visibility.fill",
+    level = "debug",
+    skip(inner),
+    fields(
+        registry_pages = field::Empty,
+        lifecycle_pages = field::Empty,
+        record_count = field::Empty,
+        deleted_count = field::Empty,
+        store_accepted = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+pub(super) async fn fill_visibility_caches(
+    inner: &Arc<MetadataInner>,
+) -> Result<VisibilityFillResult, MetadataError> {
+    let started = Instant::now();
+    let span = Span::current();
+    let fill_generation = inner.visibility_cache.current_generation();
+
+    let mut records = Vec::new();
+    let mut start_after = None;
+    let mut registry_pages = 0usize;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: METADATA_INDEX_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit: METADATA_REGISTRY_CANDIDATE_LIMIT
+                    .saturating_sub(records.len())
+                    .saturating_add(1),
+                txn_id: None,
+            }))
+            .await;
+        let (mut page, next_start_after) = parse_registry_iter(event).map_err(|error| {
+            MetadataError::Backend(format!("metadata registry iteration failed: {error:?}"))
+        })?;
+        registry_pages += 1;
+        if records.len().saturating_add(page.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
+        }
+        records.append(&mut page);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+    span.record("registry_pages", registry_pages as u64);
+    span.record("record_count", records.len() as u64);
+    // The registry keyspace iterates in (group, document) order; snapshot
+    // consumers binary-search by document id (registry_record_for_graph).
+    records.sort_unstable_by_key(|record| record.document_id);
+
+    // Lifecycle records are deletion tombstones, so one keyspace sweep
+    // refreshes the deleted-state of every registry graph without per-graph
+    // point reads.
+    let (deleted_graphs, lifecycle_pages) =
+        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    span.record("lifecycle_pages", lifecycle_pages as u64);
+    span.record("deleted_count", deleted_graphs.len() as u64);
+
+    let lifecycle_entries = records
+        .iter()
+        .map(|record| {
+            (
+                record.graph_iri.clone(),
+                deleted_graphs.contains(&record.graph_iri),
+            )
+        })
+        .collect::<Vec<_>>();
+    records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
+    let records = Arc::new(records);
+    warn_unprojected_graphs(inner.clone(), records.as_ref()).await;
+    let store_accepted = inner.visibility_cache.store_visibility_fill(
+        records.clone(),
+        lifecycle_entries,
+        fill_generation,
+    );
+    span.record("store_accepted", store_accepted);
+    record_elapsed_ms(&span, "elapsed_ms", started);
+    Ok(VisibilityFillResult {
+        records,
+        store_accepted,
+    })
+}
