@@ -55,6 +55,7 @@ use self::preflight::{
 };
 pub(crate) use self::read::filter_live_records;
 use self::read::{check_policy_limit, effective_list_limit, load_group_records};
+use self::read::{document_lifecycle_deleted, graph_lifecycle_deleted};
 pub use self::read::{
     query_metadata, query_metadata_document, references_metadata, search_metadata,
 };
@@ -1473,97 +1474,6 @@ fn authorized_realm_nodes(
         .into_iter()
         .filter(|node_id| authorized.contains(node_id))
         .collect())
-}
-
-fn graph_lifecycle_deleted(
-    record: &MetadataRegistryRecord,
-    value: &[u8],
-) -> Result<bool, MetadataApiError> {
-    let lifecycle: MetadataGraphLifecycleRecord = postcard::from_bytes(value)
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    if lifecycle.graph_iri != record.graph_iri
-        || lifecycle.realm_id != record.realm_id
-        || lifecycle.group_id != record.group_id
-        || lifecycle.document_id != record.document_id
-    {
-        return Err(MetadataApiError::Internal(
-            "metadata graph lifecycle record mismatch".to_string(),
-        ));
-    }
-    Ok(lifecycle.is_deleted())
-}
-
-fn document_lifecycle_deleted(
-    record: &MetadataRegistryRecord,
-    value: &[u8],
-) -> Result<bool, MetadataApiError> {
-    let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(value)
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let matches = match &lifecycle {
-        MetadataDocumentLifecycleRecord::Upsert { event } => {
-            event.record.document_id == record.document_id
-                && event.record.graph_iri == record.graph_iri
-                && event.record.realm_id == record.realm_id
-                && event.record.group_id == record.group_id
-        }
-        MetadataDocumentLifecycleRecord::Delete { event } => {
-            event.tombstone.document_id == record.document_id
-                && event.tombstone.graph_iri == record.graph_iri
-                && event.tombstone.realm_id == record.realm_id
-                && event.tombstone.group_id == record.group_id
-        }
-    };
-    if !matches {
-        return Err(MetadataApiError::Internal(
-            "metadata document lifecycle record mismatch".to_string(),
-        ));
-    }
-    Ok(matches!(
-        lifecycle,
-        MetadataDocumentLifecycleRecord::Delete { .. }
-    ))
-}
-
-async fn load_claim_records(
-    context: &DriverContext,
-    realm_id: RealmId,
-    group_id: Option<GroupId>,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let group_ids = check_policy_limit(match group_id {
-        Some(group_id) => vec![group_id],
-        None => drive(
-            ListGroupOperation::with_pagination(METADATA_REGISTRY_CANDIDATE_LIMIT + 1, 0),
-            context,
-        )
-        .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-        .into_iter()
-        .map(|group| group.group_id)
-        .collect(),
-    })?;
-    let mut pending =
-        load_pending_records(context, group_id, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
-    let mut records = Vec::new();
-    for group_id in group_ids {
-        let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
-        let mut group_records = load_group_records(context, group_id, remaining).await?;
-        if let Some(pending_records) = pending.remove(&group_id) {
-            merge_pending_metadata_records(&mut group_records, pending_records);
-            if group_records.len() > remaining {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-        }
-        group_records.sort_by_key(|record| record.document_id);
-        records.extend(group_records);
-    }
-    for pending_records in pending.into_values() {
-        if records.len().saturating_add(pending_records.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        records.extend(pending_records);
-    }
-    records.retain(|record| record.realm_id == realm_id);
-    Ok(records)
 }
 
 async fn load_pending_records(
