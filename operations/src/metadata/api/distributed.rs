@@ -123,7 +123,6 @@ pub(super) fn record_preflight_node_result(
     )
 )]
 #[allow(clippy::too_many_arguments)]
-
 pub(super) async fn run_query_distributed(
     context: &DriverContext,
     realm_id: RealmId,

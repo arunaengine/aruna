@@ -1850,6 +1850,12 @@ fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::retryable(message.into()))
 }
 
+/// A node that cannot build a destination gate is retryable: the transition it
+/// is in ends on its own, and the import resumes from its checkpoint.
+fn classify_gate(error: GateContextError) -> ImportFailure {
+    ImportFailure::Retryable(error.to_string())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) mod fixtures;
@@ -2112,10 +2118,4 @@ pub(crate) mod tests {
             Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty()
         ));
     }
-}
-
-/// A node that cannot build a destination gate is retryable: the transition it
-/// is in ends on its own, and the import resumes from its checkpoint.
-fn classify_gate(error: GateContextError) -> ImportFailure {
-    ImportFailure::Retryable(error.to_string())
 }
