@@ -106,3 +106,142 @@ pub(super) fn run_document_sync_restart_child(root: &Path) {
 
     assert!(status.success(), "restart child process failed: {status}");
 }
+
+pub(super) async fn write_registry_record(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+) {
+    let event = storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes: metadata_registry_write_entries(record).expect("registry entries build"),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+}
+
+pub(super) async fn read_storage_value(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: ByteView,
+) -> Option<Value> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        other => panic!("unexpected storage read event: {other:?}"),
+    }
+}
+
+/// Drops a topic's applied-ops cursor so the next reconcile replays it from
+/// the start, whatever lineage the stored cursor carried.
+pub(super) async fn reset_test_cursor(
+    service: &DocumentSyncService,
+    topic_id: irokle_crate::TopicId,
+) {
+    match service
+        .storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            key: topic_cursor_key(topic_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+        other => panic!("unexpected cursor delete event: {other:?}"),
+    }
+}
+
+pub(super) async fn read_test_cursor(
+    storage: &StorageHandle,
+    topic_id: irokle_crate::TopicId,
+) -> Option<irokle_crate::ActorClock> {
+    let bytes = read_storage_value(
+        storage,
+        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        topic_cursor_key(topic_id),
+    )
+    .await?;
+    Some(
+        postcard::from_bytes::<AppliedCursor>(&bytes)
+            .expect("cursor decodes")
+            .clock,
+    )
+}
+
+pub(super) fn test_actor(seed: u8, user_id: UserId, realm_id: RealmId) -> Actor {
+    Actor {
+        node_id: node(seed),
+        user_id,
+        realm_id,
+    }
+}
+
+pub(super) fn test_role(role_id: Ulid, assigned_users: impl IntoIterator<Item = UserId>) -> Role {
+    Role {
+        role_id,
+        name: "member".to_string(),
+        permissions: HashMap::from([("/datasets".to_string(), Permission::READ)]),
+        assigned_users: assigned_users.into_iter().collect(),
+    }
+}
+
+pub(super) fn test_admin_role_definition(
+    role_id: Ulid,
+    name: &str,
+    path: &str,
+    permission: Permission,
+) -> AdminDocumentRoleDefinition {
+    AdminDocumentRoleDefinition {
+        role_id,
+        name: name.to_string(),
+        permissions: BTreeMap::from([(path.to_string(), permission)]),
+    }
+}
+
+pub(super) fn admin_test_placement() -> PlacementRef {
+    PlacementRef {
+        strategy_id: Ulid::from_parts(9_990, 1),
+        shard: 0,
+    }
+}
+
+/// Signs an event as its origin. Test node keys are `[seed; 32]`, so the
+/// origin's secret is recoverable from its public id.
+pub(super) fn sign_as_origin(
+    event: &AdminDocumentEvent,
+    placement: &PlacementRef,
+) -> iroh::Signature {
+    (0u8..=255)
+        .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
+        .find(|key| key.public() == event.origin_node_id)
+        .expect("test origin key")
+        .sign(&event.signing_bytes(placement).expect("event serializes"))
+}
+
+pub(super) fn test_admin_event(
+    event_id: Ulid,
+    target: AdminDocumentTarget,
+    actor: &Actor,
+    origin_seq: u64,
+    op: AdminDocumentOperation,
+) -> AdminDocumentEvent {
+    AdminDocumentEvent {
+        event_id,
+        target,
+        origin_node_id: actor.node_id,
+        origin_seq,
+        observed: AdminDocumentClock::default(),
+        actor: actor.clone(),
+        op,
+    }
+}
