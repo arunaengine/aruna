@@ -622,3 +622,123 @@ pub(super) async fn read_lifecycle_revision(
     .expect("lifecycle revision exists");
     postcard::from_bytes(&value).expect("lifecycle revision decodes")
 }
+
+/// The user every policy fixture publishes under.
+pub(super) fn policy_admin(realm_id: RealmId) -> UserId {
+    UserId::local(Ulid::from_bytes([4u8; 16]), realm_id)
+}
+
+/// One authentic publication of `policy` by node `seed`.
+pub(super) fn signed_policy_document(
+    realm_id: RealmId,
+    policy: &aruna_core::structs::VerifiedPolicy,
+    seed: u8,
+) -> PlacementPolicyDocument {
+    let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+    let publication = aruna_core::structs::PolicyPublicationClaim::new(
+        realm_id,
+        policy,
+        secret.public(),
+        policy_admin(realm_id),
+        Ulid::from_bytes([5u8; 16]),
+        9,
+        [0u8; 32],
+    )
+    .sign(&secret);
+    PlacementPolicyDocument::new(realm_id, policy, publication)
+}
+
+/// Realm view a policy publication is verified against: the publisher is a
+/// server node and the admin user holds realm-configuration write.
+pub(super) fn policy_realm_view(
+    realm_id: RealmId,
+) -> (RealmConfigDocument, RealmAuthorizationDocument) {
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+    config.seed_default_placement();
+    for seed in 1..=4u8 {
+        config.ensure_node(node(seed), RealmNodeKind::Server);
+    }
+    let role = Role {
+        role_id: Ulid::from_bytes([1u8; 16]),
+        name: "realm_admin".to_string(),
+        permissions: HashMap::from([(
+            format!("/{realm_id}/admin/**"),
+            aruna_core::structs::Permission::WRITE,
+        )]),
+        assigned_users: HashSet::from([policy_admin(realm_id)]),
+    };
+    let auth = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::from([(role.role_id, role)]),
+        operation_restrictions: HashMap::new(),
+    };
+    (config, auth)
+}
+
+pub(super) async fn write_realm_view(
+    storage: &StorageHandle,
+    config: &RealmConfigDocument,
+    auth: &RealmAuthorizationDocument,
+) {
+    let actor = aruna_core::structs::Actor {
+        node_id: node(1),
+        user_id: policy_admin(config.realm_id),
+        realm_id: config.realm_id,
+    };
+    let config_target = DocumentSyncTarget::RealmConfig {
+        realm_id: config.realm_id,
+    };
+    let auth_target = DocumentSyncTarget::RealmAuthorization {
+        realm_id: config.realm_id,
+    };
+    let writes = vec![
+        (
+            config_target.storage_keyspace().to_string(),
+            config_target.storage_key(),
+            Value::from(config.to_bytes(&actor).expect("config encodes")),
+        ),
+        (
+            auth_target.storage_keyspace().to_string(),
+            auth_target.storage_key(),
+            Value::from(auth.to_bytes(&actor).expect("authorization encodes")),
+        ),
+    ];
+    storage_batch_write_to(storage, writes)
+        .await
+        .expect("realm view is stored");
+}
+
+pub(super) fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::VerifiedPolicy {
+    use aruna_core::structs::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
+
+    let policy = PlacementPolicy::new(
+        policy_id,
+        "residency".to_string(),
+        vec![PlacementSelector {
+            node_id: None,
+            location: Some("eu-west".to_string()),
+            labels: Vec::new(),
+            executor_kind: None,
+        }],
+    )
+    .expect("policy is valid");
+    VerifiedPolicy::verify(policy).expect("policy verifies")
+}
+
+pub(super) async fn policy_service(
+    realm_id: RealmId,
+    storage: StorageHandle,
+    root: &Path,
+) -> DocumentSyncService {
+    DocumentSyncService::open_with_persist_policy(
+        test_endpoint(31).await,
+        storage,
+        root.join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        irokle_crate::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens")
+}
