@@ -1019,3 +1019,190 @@ async fn rotation_streak() {
     );
     shutdown_net(&net).await;
 }
+
+// A realm-config change originated locally lands only in the outbox; draining
+// it must kick the placement reconciler so this rank-0 node creates its shard
+// topic geneses without waiting for a restart.
+#[tokio::test]
+async fn draining_a_local_realm_config_change_creates_rank0_shard_topics() {
+    let realm_id = RealmId::from_bytes([61u8; 32]);
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let net = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await
+    .expect("net handle");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+    });
+
+    // Install the config so this sole node is rank-0 of every shard, but do
+    // not run the placement reconciler yet.
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    config.ensure_node(net.node_id(), RealmNodeKind::Management);
+    let actor = Actor {
+        node_id: net.node_id(),
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    match storage
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*realm_id.as_bytes()).into(),
+            value: config.to_bytes(&actor).expect("config bytes").into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected realm config write: {other:?}"),
+    }
+    net.refresh_realm_peers_from_document(&config)
+        .await
+        .expect("refresh peers");
+
+    initialize_task_incoming(context.clone(), task_handle.clone(), JobsRuntime::new()).await;
+
+    let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
+    let topic = aruna_core::document::shard_topic_id(
+        realm_id,
+        &aruna_core::structs::PlacementRef {
+            strategy_id,
+            shard: 0,
+        },
+    );
+    assert!(
+        !net.document_sync_topic_exists(topic).unwrap_or(false),
+        "the rank-0 shard topic must not exist before the config change is drained"
+    );
+
+    let record = crate::sync::document_sync_outbox::new_outbox_record(
+        net.node_id(),
+        DocumentSyncTarget::RealmConfig { realm_id },
+        Vec::new(),
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: b"config".to_vec(),
+            change: change(),
+        },
+        aruna_core::structs::PlacementRef::NIL,
+        true,
+    );
+    write_outbox_record(&storage, &record).await;
+    task_handle
+        .send_effect(crate::sync::document_sync_outbox::schedule_outbox_drain_effect())
+        .await;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if net.document_sync_topic_exists(topic).unwrap_or(false) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rank-0 shard topic was not created after the local config change drained"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    net.shutdown().await;
+}
+
+struct ConfigHarness {
+    _dir: tempfile::TempDir,
+    storage: aruna_storage::StorageHandle,
+    net: NetHandle,
+    handler: OperationsTaskHandler,
+    config: RealmConfigDocument,
+    realm_id: RealmId,
+    placement: aruna_core::structs::PlacementRef,
+    shard_target: DocumentSyncTarget,
+}
+
+async fn config_setup() -> ConfigHarness {
+    let realm_id = RealmId::from_bytes([47u8; 32]);
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let net = make_net_handle(realm_id, &storage, [47u8; 32]).await;
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    write_realm_config(&storage, realm_id, &config, net.node_id()).await;
+    let placement = aruna_core::structs::PlacementRef {
+        strategy_id: config.strategies[0].strategy_id,
+        shard: 0,
+    };
+    let shared_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let shard_target = DocumentSyncTarget::MetadataRegistry {
+        group_id: Ulid::from_parts(7, 1),
+        document_id: Ulid::from_parts(8, 1),
+    };
+    let shared_topic =
+        shared_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+    net.ensure_document_sync_topics(&[shared_topic], Vec::new())
+        .expect("shared topic genesis");
+    let mut shard_change = change();
+    shard_change.placement = placement;
+    let shared = crate::sync::document_sync_outbox::new_outbox_record_with_id(
+        Ulid::from_parts(1, 1),
+        node(1),
+        shared_target,
+        Vec::new(),
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: b"shared".to_vec(),
+            change: change(),
+        },
+        aruna_core::structs::PlacementRef::NIL,
+        true,
+    );
+    let shard = crate::sync::document_sync_outbox::new_outbox_record_with_id(
+        Ulid::from_parts(1, 2),
+        node(1),
+        shard_target.clone(),
+        Vec::new(),
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: b"shard".to_vec(),
+            change: shard_change,
+        },
+        placement,
+        true,
+    );
+    write_outbox_record(&storage, &shared).await;
+    write_outbox_record(&storage, &shard).await;
+
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    });
+    let handler =
+        OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 2);
+    ConfigHarness {
+        _dir: temp_dir,
+        storage,
+        net,
+        handler,
+        config,
+        realm_id,
+        placement,
+        shard_target,
+    }
+}
