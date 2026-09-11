@@ -944,13 +944,6 @@ impl DocumentSyncService {
         Ok(touched_topics)
     }
 
-    pub async fn reconcile_document_sync_topics(
-        &self,
-        topic_ids: Vec<irokle_crate::TopicId>,
-    ) -> Result<DocumentSyncReconcileResult> {
-        self.reconcile_document_topics(topic_ids).await
-    }
-
     pub async fn publish_documents(
         &self,
         documents: Vec<DocumentSyncPublish>,
@@ -2326,23 +2319,6 @@ impl DocumentSyncService {
             }
         }
         Ok(())
-    }
-
-    async fn reconcile_documents(&self) -> Result<DocumentSyncReconcileResult> {
-        let topics = self.document_topic_ids()?;
-        self.reconcile_document_topics(topics).await
-    }
-
-    fn document_topic_ids(&self) -> Result<Vec<irokle_crate::TopicId>> {
-        let topics = self
-            .node
-            .list_topics()
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        Ok(topics
-            .into_iter()
-            .filter(|topic| topic.event_type_id == DocumentSyncEvent::TYPE_ID)
-            .map(|topic| topic.topic_id)
-            .collect())
     }
 
     async fn reconcile_document_topics(
