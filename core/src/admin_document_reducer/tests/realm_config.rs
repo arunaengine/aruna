@@ -428,3 +428,196 @@ fn keeps_device_cap() {
         .value = Some(serde_json::to_string(&quota).unwrap());
     assert_eq!(state.materialized_realm_config_quota(), Some(expected));
 }
+
+#[test]
+fn realm_config_quota_override_order_is_canonical_for_conflict_detection() {
+    let group_a = Ulid::from_bytes([1; 16]);
+    let group_b = Ulid::from_bytes([2; 16]);
+    let user_a = user_id_with_seed(3);
+    let user_b = user_id_with_seed(4);
+    let expected = QuotaConfig {
+        default_group_quota_bytes: Some(1_000),
+        grace_factor_percent: 125,
+        warn_threshold_percent: 80,
+        group_overrides: vec![
+            GroupQuotaOverride {
+                group_id: group_a,
+                quota_bytes: Some(500),
+                grace_factor_percent: None,
+            },
+            GroupQuotaOverride {
+                group_id: group_b,
+                quota_bytes: Some(750),
+                grace_factor_percent: Some(150),
+            },
+        ],
+        max_groups_per_user: Some(4),
+        user_group_cap_overrides: vec![
+            UserGroupCapOverride {
+                user_id: user_a,
+                max_groups: Some(2),
+            },
+            UserGroupCapOverride {
+                user_id: user_b,
+                max_groups: Some(3),
+            },
+        ],
+        max_devices_per_user: Some(6),
+        ..QuotaConfig::default()
+    };
+    let reordered = QuotaConfig {
+        group_overrides: expected.group_overrides.iter().cloned().rev().collect(),
+        user_group_cap_overrides: expected
+            .user_group_cap_overrides
+            .iter()
+            .cloned()
+            .rev()
+            .collect(),
+        max_devices_per_user: Some(6),
+        ..expected.clone()
+    };
+
+    let first = realm_config_event(
+        1,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigQuotaSet {
+            quota: expected.clone(),
+        },
+    );
+    let second = realm_config_event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigQuotaSet { quota: reordered },
+    );
+
+    let mut state = realm_config_state();
+    state.apply(&first).unwrap();
+    state.apply(&second).unwrap();
+
+    assert!(state.conflicts.is_empty());
+    assert_eq!(
+        state.materialized_realm_config_quota(),
+        Some(expected.clone())
+    );
+
+    let stored_value = state
+        .user_subject_ids
+        .get(REALM_CONFIG_QUOTA_PATH)
+        .and_then(|version| version.value.as_deref())
+        .expect("quota reducer value exists");
+    let stored_quota: QuotaConfig = serde_json::from_str(stored_value).unwrap();
+    assert_eq!(stored_quota, expected);
+}
+
+#[test]
+fn realm_config_settings_metadata_conflict_withholds_only_metadata_replication() {
+    let mut state = realm_config_state();
+    let first_metadata = MetadataReplicationConfig::new(3);
+    let second_metadata = MetadataReplicationConfig::new(5);
+    let discovery = RealmDiscoveryConfig::Dynamic {
+        methods: Vec::new(),
+    };
+    let first_value = metadata_replication_value(&first_metadata);
+    let second_value = metadata_replication_value(&second_metadata);
+
+    state
+        .apply(&set_realm_config_settings(
+            1,
+            1,
+            first_metadata,
+            discovery.clone(),
+        ))
+        .unwrap();
+    state
+        .apply(&set_realm_config_settings(
+            2,
+            2,
+            second_metadata,
+            discovery.clone(),
+        ))
+        .unwrap();
+
+    assert_eq!(state.materialized_realm_config_metadata_replication(), None);
+    assert_eq!(state.materialized_realm_config_discovery(), Some(discovery));
+    assert!(!state.conflicts.contains_key(REALM_CONFIG_DISCOVERY_PATH));
+    let conflict = state
+        .conflicts
+        .get(REALM_CONFIG_METADATA_REPLICATION_PATH)
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+    );
+}
+
+#[test]
+fn realm_config_settings_discovery_conflict_withholds_only_discovery() {
+    let mut state = realm_config_state();
+    let metadata_replication = MetadataReplicationConfig::new(3);
+    let first_discovery = RealmDiscoveryConfig::Static {
+        endpoints: Vec::new(),
+    };
+    let second_discovery = RealmDiscoveryConfig::Dynamic {
+        methods: Vec::new(),
+    };
+    let first_value = realm_discovery_value(&first_discovery);
+    let second_value = realm_discovery_value(&second_discovery);
+
+    state
+        .apply(&set_realm_config_settings(
+            1,
+            1,
+            metadata_replication.clone(),
+            first_discovery,
+        ))
+        .unwrap();
+    state
+        .apply(&set_realm_config_settings(
+            2,
+            2,
+            metadata_replication.clone(),
+            second_discovery,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_realm_config_metadata_replication(),
+        Some(metadata_replication)
+    );
+    assert_eq!(state.materialized_realm_config_discovery(), None);
+    assert!(
+        !state
+            .conflicts
+            .contains_key(REALM_CONFIG_METADATA_REPLICATION_PATH)
+    );
+    let conflict = state
+        .conflicts
+        .get(REALM_CONFIG_DISCOVERY_PATH)
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+    );
+}
