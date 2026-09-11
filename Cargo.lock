@@ -702,7 +702,7 @@ checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1489,7 +1489,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1513,7 +1513,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1788,7 +1788,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1984,8 +1984,8 @@ dependencies = [
 
 [[package]]
 name = "craqle"
-version = "0.2.0"
-source = "git+https://github.com/arunaengine/craqle?rev=fb9f16380ed3e4b39d7d6055d416645ce839efac#fb9f16380ed3e4b39d7d6055d416645ce839efac"
+version = "0.2.1"
+source = "git+https://github.com/arunaengine/craqle?rev=67a3eba114c3e5321bd94b09f2df99219c2e0b96#67a3eba114c3e5321bd94b09f2df99219c2e0b96"
 dependencies = [
  "blake3",
  "chrono",
@@ -2287,7 +2287,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -2298,7 +2298,7 @@ checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
 dependencies = [
  "darling_core",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -2338,7 +2338,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.4",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2523,7 +2523,7 @@ checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -2658,6 +2658,9 @@ name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "elliptic-curve"
@@ -2718,7 +2721,7 @@ checksum = "0590c4a94da3372e83493b956755a6e2266830b6e4e3b101afe66e3f39477b91"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -2738,7 +2741,7 @@ checksum = "a65863d15a4ce2888bd2f0f543cc963d3879c3a022c8ee43f6141d479a3ac815"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -3030,7 +3033,7 @@ checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -3762,6 +3765,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4025,8 +4047,8 @@ dependencies = [
 
 [[package]]
 name = "irokle"
-version = "0.1.3"
-source = "git+https://github.com/arunaengine/irokle.git?rev=59e787058667bb6b400ab01fbd9a1698b88256f5#59e787058667bb6b400ab01fbd9a1698b88256f5"
+version = "0.1.4"
+source = "git+https://github.com/arunaengine/irokle.git?rev=dcce9593adf21b14c8c8214c7ad7c180777be303#dcce9593adf21b14c8c8214c7ad7c180777be303"
 dependencies = [
  "blake3",
  "bytes",
@@ -4046,11 +4068,11 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?rev=59e787058667bb6b400ab01fbd9a1698b88256f5#59e787058667bb6b400ab01fbd9a1698b88256f5"
+source = "git+https://github.com/arunaengine/irokle.git?rev=dcce9593adf21b14c8c8214c7ad7c180777be303#dcce9593adf21b14c8c8214c7ad7c180777be303"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -5671,7 +5693,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "oxhttp",
- "oxiri",
+ "oxiri 0.2.11",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
@@ -5700,13 +5722,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54b4ed3a7192fa19f5f48f99871f2755047fabefd7f222f12a1df1773796a102"
 
 [[package]]
+name = "oxiri"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b6bd0ef560f078e41ce2ebf370cce217e7fb2c3695ffa87541151c9de94e83a"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "oxjsonld"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a3e89e005662e60327027f45ec7cefd0472404e01831b5d83a3ac522cfabe0"
 dependencies = [
  "json-event-parser",
- "oxiri",
+ "oxiri 0.2.11",
  "oxrdf",
  "ryu-js",
  "thiserror 2.0.20",
@@ -5720,7 +5751,7 @@ checksum = "4be15186205eb60ddbdc2fb47cb25df472c7f399bbe119b68c0972b6b6dd46ea"
 dependencies = [
  "hex",
  "oxilangtag",
- "oxiri",
+ "oxiri 0.2.11",
  "oxsdatatypes",
  "rand 0.9.5",
  "serde",
@@ -5748,7 +5779,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71853d12051879f3e424c6864e978f5f5cbecd8e86a9817adbccaefccac9d61d"
 dependencies = [
  "oxilangtag",
- "oxiri",
+ "oxiri 0.2.11",
  "oxrdf",
  "quick-xml 0.37.5",
  "thiserror 2.0.20",
@@ -5771,7 +5802,7 @@ checksum = "b1d0fe19fa62a6a102f85b052bbd86e3cdc3360cd6a338d01bab1a6743bf1d8e"
 dependencies = [
  "memchr",
  "oxilangtag",
- "oxiri",
+ "oxiri 0.2.11",
  "oxrdf",
  "thiserror 2.0.20",
 ]
@@ -6268,9 +6299,9 @@ dependencies = [
 
 [[package]]
 name = "prefixmap"
-version = "0.3.10"
+version = "0.3.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ad8bdda04fc975f90c1c223aedd8ee8d7dcfb6bc9d5e5a36bcbd8eed0133eea"
+checksum = "d419af1ed828277f1f41d56ae4b794f8e720e0414420a0b2b4182461ce681e54"
 dependencies = [
  "colored",
  "indexmap",
@@ -6287,7 +6318,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
 dependencies = [
  "proc-macro2",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -6790,7 +6821,7 @@ checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -7127,7 +7158,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_json",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -7174,9 +7205,9 @@ dependencies = [
 
 [[package]]
 name = "rudof_config"
-version = "0.3.16"
+version = "0.3.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06182074ece9a28169eca164273d26df6fea8a760d4b82a017738cf6dc309549"
+checksum = "071940f649dc18b8e5fc79b6e7c64cad69858fb606bdf3e341230dca9691b21c"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -7186,13 +7217,14 @@ dependencies = [
 
 [[package]]
 name = "rudof_iri"
-version = "0.3.10"
+version = "0.3.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71ad494fd6cb6e53320b6c06e760ab403465331b1f790d40bb280afae7427587"
+checksum = "0ed989b455d11bc8e3b28ea01414c1748f270747329cb23ad86961bda45df8fe"
 dependencies = [
  "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "indexmap",
- "oxiri",
+ "oxiri 0.3.1",
  "oxrdf",
  "proptest",
  "reqwest 0.12.28",
@@ -7203,18 +7235,19 @@ dependencies = [
 
 [[package]]
 name = "rudof_rdf"
-version = "0.3.10"
+version = "0.3.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d670212065352d56fcd1211cf0b301663a34cc7be92a160e57b075823c461cdc"
+checksum = "01db71de7b7498bd0a50993cabbf428a4d88fd7e568c05011dcd742f75d43719"
 dependencies = [
  "colored",
  "const_format",
  "csv",
  "getrandom 0.3.4",
+ "include_dir",
  "once_cell",
  "oxigraph",
  "oxilangtag",
- "oxiri",
+ "oxiri 0.3.1",
  "oxjsonld",
  "oxrdf",
  "oxrdfio",
@@ -7226,6 +7259,7 @@ dependencies = [
  "regex",
  "rudof_config",
  "rudof_iri",
+ "rudof_viz",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -7235,6 +7269,26 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "url",
+]
+
+[[package]]
+name = "rudof_typing"
+version = "0.3.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73a8ac577b3711eceb0601db9343a1699b8aa580290215da0865e72bd2c7dca6"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "rudof_viz"
+version = "0.3.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1d161d194d35b2655cdab38a55fda780147465d2fcc7dc6e5ceb30f9b32829a"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7554,7 +7608,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -7722,7 +7776,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -7733,7 +7787,7 @@ checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -7768,7 +7822,7 @@ checksum = "8d3b1629de253c70a0508c3899572da79ca359fdab27c7920ff00406df418906"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -7865,12 +7919,13 @@ dependencies = [
 
 [[package]]
 name = "shacl"
-version = "0.3.10"
+version = "0.3.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "337c3c63507861b5636903053f601e510a2ce409c5895aa895f9d7023697f516"
+checksum = "04db282af6708ea9cf3692e7c455ad89ce866c5a3390bebbff4cd2c146c9fbff"
 dependencies = [
  "anyhow",
  "dashmap",
+ "either",
  "indoc",
  "itertools",
  "petgraph 0.8.3",
@@ -7879,6 +7934,7 @@ dependencies = [
  "rudof_config",
  "rudof_iri",
  "rudof_rdf",
+ "rudof_typing",
  "rust_decimal",
  "serde",
  "thiserror 2.0.20",
@@ -8038,7 +8094,7 @@ dependencies = [
  "hex",
  "json-event-parser",
  "md-5",
- "oxiri",
+ "oxiri 0.2.11",
  "oxrdf",
  "oxsdatatypes",
  "rand 0.9.5",
@@ -8059,7 +8115,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef3c186ffb9bf2dde7c5edd5528583f309fcb819b5773cf0e313194a990304f"
 dependencies = [
  "oxilangtag",
- "oxiri",
+ "oxiri 0.2.11",
  "oxrdf",
  "peg",
  "rand 0.9.5",
@@ -8218,9 +8274,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.4"
+version = "3.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8321,9 +8377,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07"
+checksum = "861facfabd71044968f364837f9a083b56464ba5a59079f88706ee5c451ca069"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -8544,7 +8600,7 @@ checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -8647,7 +8703,7 @@ checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -9097,7 +9153,7 @@ checksum = "f153acc4e99a5f2a5aefa09fb078be54e26271b2813f6041200b224c098d8328"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -10023,7 +10079,7 @@ checksum = "34df6fc39dbd26ddc9c10e6a2984476e13acce22e64e4487636ef494369225da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.5",
 ]
 
 [[package]]
