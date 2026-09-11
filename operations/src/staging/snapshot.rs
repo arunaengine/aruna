@@ -221,7 +221,7 @@ async fn read_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::staging::test_utils::{
+    use crate::staging::tests::fixtures::{
         create_http_connector, create_test_bucket, setup_driver_context,
     };
     use axum::Router;

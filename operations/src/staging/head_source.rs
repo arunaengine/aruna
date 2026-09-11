@@ -189,7 +189,7 @@ impl Operation for HeadStagingSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::staging::test_utils::{create_http_connector, setup_driver_context};
+    use crate::staging::tests::fixtures::{create_http_connector, setup_driver_context};
     use aruna_core::structs::{ResolvedSourceAccess, ResolvedSourceConnector, SourceConnectorKind};
     use std::collections::HashMap;
     use std::time::SystemTime;

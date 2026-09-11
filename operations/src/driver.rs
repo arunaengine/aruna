@@ -3147,7 +3147,7 @@ mod test {
 #[cfg(test)]
 mod routing_tests {
     use super::{DriverContext, bucket_snapshot, routing_snapshot};
-    use crate::staging::test_utils::setup_driver_context;
+    use crate::staging::tests::fixtures::setup_driver_context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::GROUP_STORAGE_ROUTING_KEYSPACE;
