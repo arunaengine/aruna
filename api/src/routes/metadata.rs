@@ -3537,7 +3537,7 @@ pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitRespons
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::test_support::{
+    use crate::routes::tests::fixtures::{
         seed_group_docs, seed_realm_auth, test_context, test_state, test_storage,
     };
     use aruna_core::keys::generate_signing_key;

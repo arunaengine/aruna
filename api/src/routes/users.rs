@@ -3311,7 +3311,7 @@ mod tests {
 mod resolve_tests {
     use super::{ResolveUsersRequest, resolve_users};
     use crate::error::ServerError;
-    use crate::routes::test_support::{test_context, test_state, test_storage};
+    use crate::routes::tests::fixtures::{test_context, test_state, test_storage};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;

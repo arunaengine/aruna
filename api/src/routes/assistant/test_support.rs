@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::routes::test_support::{test_context, test_state, test_storage};
+use crate::routes::tests::fixtures::{test_context, test_state, test_storage};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
 use aruna_core::types::UserId;

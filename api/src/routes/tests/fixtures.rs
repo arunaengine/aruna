@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::server_state::ServerState;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -17,13 +15,13 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-pub(super) fn test_storage() -> (TempDir, StorageHandle) {
+pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let directory = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     (directory, storage)
 }
 
-pub(super) fn test_context(storage: StorageHandle) -> DriverContext {
+pub(crate) fn test_context(storage: StorageHandle) -> DriverContext {
     DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -34,7 +32,7 @@ pub(super) fn test_context(storage: StorageHandle) -> DriverContext {
     }
 }
 
-pub(super) async fn test_state(
+pub(crate) async fn test_state(
     context: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: NodeId,
@@ -52,7 +50,7 @@ pub(super) async fn test_state(
     .await
 }
 
-pub(super) async fn write_doc(
+pub(crate) async fn write_doc(
     context: &Arc<DriverContext>,
     key_space: &str,
     key: ByteView,
@@ -73,7 +71,7 @@ pub(super) async fn write_doc(
     ));
 }
 
-pub(super) async fn seed_realm_auth(
+pub(crate) async fn seed_realm_auth(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     actor: &Actor,
@@ -90,7 +88,7 @@ pub(super) async fn seed_realm_auth(
     .await;
 }
 
-pub(super) async fn seed_realm_config(
+pub(crate) async fn seed_realm_config(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     actor: &Actor,
@@ -107,7 +105,7 @@ pub(super) async fn seed_realm_config(
     .await;
 }
 
-pub(super) async fn seed_group_docs(
+pub(crate) async fn seed_group_docs(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     actor: &Actor,
