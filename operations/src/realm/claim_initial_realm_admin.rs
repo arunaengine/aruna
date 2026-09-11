@@ -19,7 +19,6 @@ use aruna_core::types::{Effects, Key, KeySpace, RoleId, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::sync::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
@@ -510,8 +509,7 @@ fn apply_admin_reducer_updates(
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
     let mut admin_events = Vec::new();
     if should_seed_realm_admin_role(state, role.role_id) {
-        let event = apply_admin_reducer_operation(
-            state,
+        let event = state.apply_operation(
             actor,
             AdminDocumentOperation::RealmRoleCreated {
                 role: AdminDocumentRoleDefinition::from(role),
@@ -519,8 +517,7 @@ fn apply_admin_reducer_updates(
         )?;
         admin_events.push(event);
     }
-    let event = apply_admin_reducer_operation(
-        state,
+    let event = state.apply_operation(
         actor,
         AdminDocumentOperation::RealmRoleUserAssignmentAdded {
             role_id: role.role_id,
@@ -539,25 +536,6 @@ fn should_seed_realm_admin_role(state: &AdminDocumentReducerState, role_id: Role
 
 fn realm_role_path(role_id: RoleId) -> String {
     format!("realm.roles.{role_id}")
-}
-
-fn apply_admin_reducer_operation(
-    state: &mut AdminDocumentReducerState,
-    actor: &Actor,
-    op: AdminDocumentOperation,
-) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
-    let observed = state.clock.clone();
-    let event = AdminDocumentEvent {
-        event_id: Ulid::generate(),
-        target: state.target.clone(),
-        origin_node_id: actor.node_id,
-        origin_seq: observed.sequence_for(&actor.node_id) + 1,
-        observed,
-        actor: actor.clone(),
-        op,
-    };
-    state.apply(&event)?;
-    Ok(event)
 }
 
 fn materialize_realm_admin_assignment(
