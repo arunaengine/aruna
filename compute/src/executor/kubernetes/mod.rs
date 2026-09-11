@@ -32,6 +32,7 @@ use kube::api::{
     Preconditions,
 };
 use kube::api::{DynamicObject, GroupVersionKind};
+use kube::discovery::Scope;
 use kube::{Client, ResourceExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -48,9 +49,9 @@ use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 mod manifest;
 
 use manifest::{
-    CILIUM_S3_POLICY, HELPER_PATH, StageMarker, WORKSPACE_PATH, cilium_ingress_policy, helper_pod,
-    job_manifest, marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest,
-    mount_pvc_manifest, needs_workspace, network_policies, pvc_manifest, secret_manifest,
+    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, helper_pod, job_manifest,
+    marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest,
+    needs_workspace, network_policies, policy_manifests, pvc_manifest, secret_manifest,
     secret_name, workspace_name,
 };
 
@@ -74,6 +75,7 @@ const MAX_TERMINATION_DETAIL: usize = 2048;
 pub struct KubernetesBackend {
     client: Client,
     config: KubernetesConfig,
+    policies: Vec<PolicyManifest>,
 }
 
 impl KubernetesBackend {
@@ -84,7 +86,12 @@ impl KubernetesBackend {
 
     pub fn from_client(client: Client, config: KubernetesConfig) -> Result<Self, BackendError> {
         validate_config(&config)?;
-        Ok(Self { client, config })
+        let policies = policy_manifests(&config)?;
+        Ok(Self {
+            client,
+            config,
+            policies,
+        })
     }
 
     pub fn config(&self) -> &KubernetesConfig {
@@ -302,41 +309,49 @@ impl KubernetesBackend {
                 .await
                 .map_err(kube_error)?;
         }
-        self.apply_cilium().await
+        self.apply_manifests().await
     }
 
-    /// Opens the S3 port towards the Cilium ingress entity, which no ipBlock
-    /// rule can match. A cluster without the CRD keeps the policies above.
-    async fn apply_cilium(&self) -> Result<(), BackendError> {
-        if self.config.s3_cidrs.is_empty() {
-            return Ok(());
-        }
-        let gvk = GroupVersionKind::gvk("cilium.io", "v2", "CiliumNetworkPolicy");
-        let Ok((resource, _)) = kube::discovery::pinned_kind(&self.client, &gvk).await else {
-            tracing::debug!(
-                namespace = %self.config.namespace,
-                "Cilium network policies are not served by this cluster"
-            );
-            return Ok(());
-        };
-        let policies: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource);
-        let policy = cilium_ingress_policy(&self.config);
-        let params = PatchParams::apply("aruna-compute");
-        match policies
-            .patch(CILIUM_S3_POLICY, &params, &Patch::Apply(&policy))
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) if api_code(&error) == Some(403) => {
-                tracing::warn!(
-                    namespace = %self.config.namespace,
-                    "The node may not create, get or patch ciliumnetworkpolicies.cilium.io"
-                );
-                Ok(())
+    /// Applies the operator's own manifests in the compute namespace. The
+    /// operator listed them deliberately, so an unknown kind is an error.
+    async fn apply_manifests(&self) -> Result<(), BackendError> {
+        let params = PatchParams::apply("aruna-compute").force();
+        for manifest in &self.policies {
+            let source = manifest.source.display();
+            let gvk = manifest
+                .object
+                .types
+                .as_ref()
+                .and_then(|types| GroupVersionKind::try_from(types).ok())
+                .ok_or_else(|| {
+                    BackendError::InvalidSpec(format!("policy manifest `{source}` has no kind"))
+                })?;
+            let (resource, capabilities) = kube::discovery::pinned_kind(&self.client, &gvk)
+                .await
+                .map_err(|error| {
+                BackendError::Api(format!(
+                    "policy manifest `{source}` kind {} is not served: {error}",
+                    gvk.kind
+                ))
+            })?;
+            if capabilities.scope != Scope::Namespaced {
+                return Err(BackendError::InvalidSpec(format!(
+                    "policy manifest `{source}` kind {} is not namespaced",
+                    gvk.kind
+                )));
             }
-            Err(error) => Err(kube_error(error)),
+            let objects: Api<DynamicObject> =
+                Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource);
+            objects
+                .patch(
+                    &manifest.object.name_any(),
+                    &params,
+                    &Patch::Apply(&manifest.object),
+                )
+                .await
+                .map_err(kube_error)?;
         }
+        Ok(())
     }
 
     async fn remove_helpers(&self, context: &FenceContext) -> Result<(), BackendError> {
@@ -2460,6 +2475,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: fake_client(|_, _| (404, status_json(404))),
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let evidence = backend
@@ -2517,6 +2533,7 @@ mod tests {
         let backend = KubernetesBackend {
             client,
             config: test_config(),
+            policies: Vec::new(),
         };
 
         backend.cleanup(&context()).await.unwrap();
@@ -2557,6 +2574,7 @@ mod tests {
         let backend = KubernetesBackend {
             client,
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let evidence = backend.cancel(&context()).await.unwrap();
@@ -2631,6 +2649,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: fake_client(|_, _| (404, status_json(404))),
             config: test_config(),
+            policies: Vec::new(),
         };
         let cancel = CancellationToken::new();
 
@@ -2723,6 +2742,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: probe_client(disabled.clone()),
             config: test_config(),
+            policies: Vec::new(),
         };
         backend.health().await.unwrap();
         assert!(
@@ -2739,6 +2759,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: probe_client(enabled.clone()),
             config,
+            policies: Vec::new(),
         };
         backend.health().await.unwrap();
         assert!(
@@ -2757,6 +2778,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: fake_client(|_, _| (200, json!({}))),
             config: test_config(),
+            policies: Vec::new(),
         };
         assert!(!backend.capabilities().session);
 
@@ -2765,6 +2787,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: fake_client(|_, _| (200, json!({}))),
             config,
+            policies: Vec::new(),
         };
         assert!(backend.capabilities().session);
     }
@@ -2790,7 +2813,11 @@ mod tests {
         });
         let mut config = test_config();
         config.s3_cidrs.push("10.0.0.0/8".to_string());
-        let backend = KubernetesBackend { client, config };
+        let backend = KubernetesBackend {
+            client,
+            config,
+            policies: Vec::new(),
+        };
 
         backend.apply_network().await.expect("the policies apply");
 
@@ -2809,9 +2836,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patches_cilium_policy() {
-        // Only a Cilium-native policy can name the ingress entity the session
-        // reaches its S3 endpoint through.
+    async fn patches_policy_manifest() {
+        // The kind comes from discovery, so the apply must reach the plural
+        // path of the operator's own kind in the compute namespace.
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
         let client = fake_client(move |method, path| {
@@ -2838,19 +2865,32 @@ mod tests {
                 200,
                 json!({
                     "apiVersion":"cilium.io/v2","kind":"CiliumNetworkPolicy",
-                    "metadata":{"name":CILIUM_S3_POLICY,"namespace":"compute"}
+                    "metadata":{"name":"s3-ingress","namespace":"compute"}
                 }),
             )
         });
-        let mut config = test_config();
-        config.s3_cidrs.push("10.0.0.0/8".to_string());
-        let backend = KubernetesBackend { client, config };
+        let object = serde_json::from_value(json!({
+            "apiVersion":"cilium.io/v2","kind":"CiliumNetworkPolicy",
+            "metadata":{"name":"s3-ingress","namespace":"compute"}
+        }))
+        .expect("build the manifest");
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+            policies: vec![PolicyManifest {
+                source: std::path::PathBuf::from("policies.yaml"),
+                object,
+            }],
+        };
 
-        backend.apply_cilium().await.expect("the policy applies");
+        backend
+            .apply_manifests()
+            .await
+            .expect("the manifest applies");
 
         let seen = seen.lock().expect("read requests").clone();
         assert!(seen.iter().any(|entry| entry
-            == &format!("PATCH /apis/cilium.io/v2/namespaces/compute/ciliumnetworkpolicies/{CILIUM_S3_POLICY}")));
+            == "PATCH /apis/cilium.io/v2/namespaces/compute/ciliumnetworkpolicies/s3-ingress"));
     }
 
     const POD_START: &str = "2027-01-01T00:00:00Z";
@@ -3022,6 +3062,7 @@ mod tests {
         let backend = KubernetesBackend {
             client,
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let status = backend.status(&context()).await.unwrap();
@@ -3057,6 +3098,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: stuck_client(),
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let status = backend.status(&context()).await.unwrap();
@@ -3076,6 +3118,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: stuck_client(),
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let tails = backend

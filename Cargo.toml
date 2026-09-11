@@ -161,6 +161,7 @@ k8s-openapi = { version = "0.28", features = ["v1_32"] }
 s3s = "0.14.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
+serde_yaml = "0.9.34"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.2"

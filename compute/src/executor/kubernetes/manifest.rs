@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
     BackendError, FenceContext, NetworkAccess, StagingMode, TaskSpec, normalize_container_path,
@@ -7,6 +7,7 @@ use aruna_core::compute::{
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use kube::api::DynamicObject;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -14,9 +15,6 @@ use super::{EPOCH_ANNOTATION, GENERATION_ANNOTATION, ROLE_LABEL, STATE_ANNOTATIO
 use crate::executor::config::KubernetesConfig;
 use crate::executor::staging::StageLayout;
 use crate::executor::{digest_pinned, enforced_limit};
-
-/// Cilium-native companion of the `aruna-compute-s3` network policy.
-pub const CILIUM_S3_POLICY: &str = "aruna-compute-s3-ingress";
 
 pub const WORKSPACE_PATH: &str = "/workspace";
 pub const MARKER_PATH: &str = "/aruna-marker/marker";
@@ -435,23 +433,83 @@ pub fn network_policies(config: &KubernetesConfig) -> Result<Vec<NetworkPolicy>,
     Ok(vec![deny, s3])
 }
 
-/// Cilium classifies pod-to-Ingress traffic as the reserved `ingress` entity,
-/// which no ipBlock rule can match, so the S3 port needs a native rule too.
-pub fn cilium_ingress_policy(config: &KubernetesConfig) -> serde_json::Value {
-    json!({
-        "apiVersion":"cilium.io/v2",
-        "kind":"CiliumNetworkPolicy",
-        "metadata":{"name":CILIUM_S3_POLICY,"namespace":config.namespace},
-        "spec":{
-            "endpointSelector":{"matchLabels":{"aruna-engine.org/network":"s3"}},
-            "egress":[{
-                "toEntities":["ingress"],
-                "toPorts":[{"ports":[
-                    {"port":config.s3_port.to_string(),"protocol":"TCP"}
-                ]}]
-            }]
+/// An operator manifest with the file it was read from, so a later discovery
+/// or apply failure can name that file.
+#[derive(Clone, Debug)]
+pub struct PolicyManifest {
+    pub source: PathBuf,
+    pub object: DynamicObject,
+}
+
+/// Reads the configured manifest files, including multi-document files. The
+/// node applies these objects itself, so a broken document is refused here.
+pub fn policy_manifests(config: &KubernetesConfig) -> Result<Vec<PolicyManifest>, BackendError> {
+    let mut manifests = Vec::new();
+    for path in &config.policy_manifests {
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            BackendError::InvalidSpec(format!(
+                "policy manifest `{}` is unreadable: {error}",
+                path.display()
+            ))
+        })?;
+        for (index, document) in serde_yaml::Deserializer::from_str(&text).enumerate() {
+            let value = serde_json::Value::deserialize(document)
+                .map_err(|error| policy_error(path, index, &error.to_string()))?;
+            if value.is_null() {
+                continue;
+            }
+            manifests.push(PolicyManifest {
+                source: path.clone(),
+                object: policy_object(config, path, index, value)?,
+            });
         }
-    })
+    }
+    Ok(manifests)
+}
+
+/// Namespaced objects only: the node applies them in its compute namespace.
+fn policy_object(
+    config: &KubernetesConfig,
+    path: &Path,
+    index: usize,
+    mut value: serde_json::Value,
+) -> Result<DynamicObject, BackendError> {
+    for field in ["apiVersion", "kind"] {
+        if named_field(&value, field).is_none() {
+            return Err(policy_error(path, index, &format!("has no {field}")));
+        }
+    }
+    if named_field(&value["metadata"], "name").is_none() {
+        return Err(policy_error(path, index, "has no metadata.name"));
+    }
+    match value["metadata"].get("namespace") {
+        None | Some(serde_json::Value::Null) => {
+            value["metadata"]["namespace"] = json!(config.namespace);
+        }
+        Some(namespace) if namespace.as_str() == Some(config.namespace.as_str()) => {}
+        Some(_) => {
+            return Err(policy_error(
+                path,
+                index,
+                &format!("is not in namespace `{}`", config.namespace),
+            ));
+        }
+    }
+    serde_json::from_value(value).map_err(|error| policy_error(path, index, &error.to_string()))
+}
+
+fn named_field<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn policy_error(path: &Path, index: usize, detail: &str) -> BackendError {
+    BackendError::InvalidSpec(format!(
+        "policy manifest `{}` document {index} {detail}",
+        path.display()
+    ))
 }
 
 pub fn marker_name(name: &str) -> String {
@@ -1001,27 +1059,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_cilium_policy() {
-        // Pod to Ingress traffic is the reserved `ingress` entity, which the
-        // Kubernetes policy's CIDR peers can never match.
-        let mut config = config();
-        config.s3_port = 8443;
-
-        let policy = cilium_ingress_policy(&config);
-        let egress = &policy["spec"]["egress"][0];
-
-        assert_eq!(policy["kind"], "CiliumNetworkPolicy");
-        assert_eq!(policy["metadata"]["name"], CILIUM_S3_POLICY);
-        assert_eq!(
-            policy["spec"]["endpointSelector"]["matchLabels"]["aruna-engine.org/network"],
-            "s3"
-        );
-        assert_eq!(egress["toEntities"][0], "ingress");
-        assert_eq!(egress["toPorts"][0]["ports"][0]["port"], "8443");
-        assert_eq!(egress["toPorts"][0]["ports"][0]["protocol"], "TCP");
-    }
-
-    #[test]
     fn allows_dns_by_port() {
         // A host-network resolver such as node-local DNS is neither a kube-system
         // pod nor a CIDR peer under Cilium, so the DNS rule carries no peer.
@@ -1040,5 +1077,94 @@ mod tests {
         assert_eq!(dns["ports"][0]["port"], 53);
         assert_eq!(dns["ports"][1]["protocol"], "TCP");
         assert_eq!(dns["ports"][1]["port"], 53);
+    }
+
+    fn policy_file(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("write manifest");
+        path
+    }
+
+    #[test]
+    fn loads_policy_documents() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = policy_file(
+            dir.path(),
+            "policies.yaml",
+            "---\napiVersion: cilium.io/v2\nkind: CiliumNetworkPolicy\nmetadata:\n  name: s3-ingress\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: extra\n  namespace: compute\n",
+        );
+        let mut config = config();
+        config.policy_manifests = vec![path.clone()];
+
+        let manifests = policy_manifests(&config).expect("the documents load");
+
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].source, path);
+        assert_eq!(
+            manifests[0].object.types.as_ref().expect("types").kind,
+            "CiliumNetworkPolicy"
+        );
+        assert_eq!(
+            manifests[0].object.metadata.namespace.as_deref(),
+            Some("compute")
+        );
+        assert_eq!(manifests[1].object.metadata.name.as_deref(), Some("extra"));
+    }
+
+    #[test]
+    fn refuses_foreign_namespace() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = policy_file(
+            dir.path(),
+            "foreign.yaml",
+            "apiVersion: cilium.io/v2\nkind: CiliumNetworkPolicy\nmetadata:\n  name: s3\n  namespace: other\n",
+        );
+        let mut config = config();
+        config.policy_manifests = vec![path];
+
+        let error = policy_manifests(&config).expect_err("a foreign namespace is refused");
+
+        let message = error.to_string();
+        assert!(message.contains("foreign.yaml"), "{message}");
+        assert!(message.contains("document 0"), "{message}");
+        assert!(message.contains("namespace `compute`"), "{message}");
+    }
+
+    #[test]
+    fn refuses_broken_document() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing_kind = policy_file(
+            dir.path(),
+            "kindless.yaml",
+            "apiVersion: cilium.io/v2\nmetadata:\n  name: s3\n",
+        );
+        let missing_name = policy_file(
+            dir.path(),
+            "nameless.yaml",
+            "apiVersion: cilium.io/v2\nkind: CiliumNetworkPolicy\nmetadata: {}\n",
+        );
+        let mut config = config();
+        config.policy_manifests = vec![missing_kind];
+        let kind_error =
+            policy_manifests(&config).expect_err("a document without a kind is refused");
+        config.policy_manifests = vec![missing_name];
+        let name_error =
+            policy_manifests(&config).expect_err("a document without a name is refused");
+
+        let kind_error = kind_error.to_string();
+        let name_error = name_error.to_string();
+        assert!(kind_error.contains("kindless.yaml") && kind_error.contains("has no kind"));
+        assert!(name_error.contains("nameless.yaml") && name_error.contains("metadata.name"));
+    }
+
+    #[test]
+    fn refuses_unreadable_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut config = config();
+        config.policy_manifests = vec![dir.path().join("missing.yaml")];
+
+        let error = policy_manifests(&config).expect_err("a missing file is refused");
+
+        assert!(error.to_string().contains("missing.yaml"), "{error}");
     }
 }

@@ -1422,6 +1422,11 @@ async fn build_kubernetes(
         workspace.as_deref(),
     )?;
     let s3_mount_driver = read_mount_driver();
+    let policy_manifests = dotenvy::var("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS")
+        .ok()
+        .map(|value| policy_paths(&value))
+        .transpose()?
+        .unwrap_or_default();
     let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
         aruna_compute::KubernetesConfig {
             namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
@@ -1432,6 +1437,7 @@ async fn build_kubernetes(
             s3_cidrs,
             s3_port,
             s3_mount_driver,
+            policy_manifests,
             service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
                 .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
             execution_location: dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
@@ -1475,6 +1481,46 @@ fn env_true(name: &str) -> bool {
     dotenvy::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+/// Expands a comma-separated list of manifest files and directories. A
+/// directory contributes its YAML files in name order.
+#[cfg(feature = "kubernetes")]
+fn policy_paths(value: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths = Vec::new();
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let path = std::path::PathBuf::from(entry);
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}` is unreadable: {error}")
+        })?;
+        if !metadata.is_dir() {
+            paths.push(path);
+            continue;
+        }
+        let mut found = Vec::new();
+        for file in std::fs::read_dir(&path).map_err(|error| {
+            format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}` is unreadable: {error}")
+        })? {
+            let file = file
+                .map_err(|error| {
+                    format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}`: {error}")
+                })?
+                .path();
+            if file
+                .extension()
+                .is_some_and(|suffix| suffix == "yaml" || suffix == "yml")
+            {
+                found.push(file);
+            }
+        }
+        found.sort();
+        paths.append(&mut found);
+    }
+    Ok(paths)
 }
 
 #[cfg(feature = "kubernetes")]
@@ -1920,6 +1966,25 @@ mod tests {
         assert!(parse_s3_cidrs("10.0.0.0/33").is_err());
         assert!(parse_s3_cidrs("2001:db8::/129").is_err());
         assert!(parse_s3_cidrs("invalid/8").is_err());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn expands_policy_paths() {
+        let dir = tempdir().expect("temp dir");
+        for name in ["b.yaml", "a.yml", "notes.txt"] {
+            std::fs::write(dir.path().join(name), "").expect("write entry");
+        }
+        let single = dir.path().join("b.yaml");
+
+        let paths = policy_paths(&format!(" {}, {} ", dir.path().display(), single.display()))
+            .expect("the paths expand");
+
+        assert_eq!(
+            paths,
+            [dir.path().join("a.yml"), dir.path().join("b.yaml"), single]
+        );
+        assert!(policy_paths(&dir.path().join("missing").display().to_string()).is_err());
     }
 
     #[tokio::test]
