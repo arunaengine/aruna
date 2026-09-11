@@ -55,7 +55,7 @@ use ulid::Ulid;
 use self::query::{query_local_graphs, snapshot_iri_references};
 use self::search::{
     AllowedGraphAuthorizer, clamp_remote_search_graph_limit, describe_hit_properties,
-    search_local_graphs,
+    list_visible_graphs, search_local_graphs, select_authorized_graphs,
 };
 use self::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
@@ -5701,159 +5701,6 @@ async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataR
     }
 }
 
-async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, MetadataError> {
-    let records = inner
-        .visibility_cache
-        .registry_records_any()
-        .map(|(records, _)| records)
-        .ok_or_else(|| {
-            MetadataError::Backend("metadata registry snapshot unavailable".to_string())
-        })?;
-    let records = super::api::filter_live_records(&inner.storage_handle, records.as_ref())
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    Ok(records.into_iter().map(|record| record.graph_iri).collect())
-}
-
-async fn select_authorized_graphs(
-    inner: Arc<MetadataInner>,
-    auth_context: Option<AuthContext>,
-    records: Arc<Vec<MetadataRegistryRecord>>,
-    graph_filter: Option<Vec<String>>,
-) -> Result<Vec<String>, MetadataError> {
-    Ok(
-        select_authorized_records(inner, auth_context, records, graph_filter, None)
-            .await?
-            .into_iter()
-            .map(|record| record.graph_iri)
-            .collect(),
-    )
-}
-
-#[tracing::instrument(
-    name = "metadata.authorization.select_records",
-    level = "debug",
-    skip(inner, auth_context, records, graph_filter),
-    fields(
-        record_count = records.len() as u64,
-        graph_filter_count = graph_filter.as_ref().map_or(0, Vec::len) as u64,
-        visible_count = field::Empty,
-        deleted_count = field::Empty,
-        filtered_count = field::Empty,
-        lifecycle_cache_hits = field::Empty,
-        lifecycle_cache_misses = field::Empty,
-        lifecycle_reads = field::Empty,
-        public_count = field::Empty,
-        private_checked_count = field::Empty,
-        denied_count = field::Empty,
-        elapsed_ms = field::Empty,
-    )
-)]
-async fn select_authorized_records(
-    inner: Arc<MetadataInner>,
-    auth_context: Option<AuthContext>,
-    records: Arc<Vec<MetadataRegistryRecord>>,
-    graph_filter: Option<Vec<String>>,
-    group_id: Option<GroupId>,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
-    let span = Span::current();
-    let started = Instant::now();
-    let allowed_graphs = graph_filter.map(|graphs| graphs.into_iter().collect::<HashSet<_>>());
-    let record_count = records.len();
-    // Filtering first keeps the scope resolution to the groups and lifecycle
-    // entries a filtered request can still see.
-    let candidates = filter_candidate_records(records, allowed_graphs.as_ref(), group_id);
-    let filtered_count = record_count - candidates.len();
-
-    // Boxed so the read paths that already resolve a scope do not nest this
-    // future again: the combined depth exceeds the auto-trait recursion limit.
-    let scope = resolve_graph_visibility_scope(&inner, auth_context, candidates)
-        .boxed()
-        .await?;
-    let selection = select_visible_records(&scope, &inner.visibility_cache);
-    let evaluated = scope.records.len() as u64;
-    // Lifecycle is resolved once per request, so the cache counters report how
-    // the whole request was decided instead of per-record point reads.
-    let lifecycle_cached = matches!(&scope.lifecycle_visibility, LifecycleVisibility::Cache(_));
-    span.record("visible_count", selection.visible.len() as u64);
-    span.record("deleted_count", selection.deleted as u64);
-    span.record("filtered_count", filtered_count as u64);
-    span.record(
-        "lifecycle_cache_hits",
-        if lifecycle_cached { evaluated } else { 0 },
-    );
-    span.record(
-        "lifecycle_cache_misses",
-        if lifecycle_cached { 0 } else { evaluated },
-    );
-    span.record("lifecycle_reads", 1u64);
-    span.record("public_count", selection.public as u64);
-    span.record("private_checked_count", selection.private as u64);
-    span.record("denied_count", selection.denied as u64);
-    record_elapsed_ms(&span, "elapsed_ms", started);
-    Ok(selection.visible)
-}
-
-fn filter_candidate_records(
-    records: Arc<Vec<MetadataRegistryRecord>>,
-    allowed_graphs: Option<&HashSet<String>>,
-    group_id: Option<GroupId>,
-) -> Arc<Vec<MetadataRegistryRecord>> {
-    if allowed_graphs.is_none() && group_id.is_none() {
-        return records;
-    }
-    Arc::new(
-        records
-            .iter()
-            .filter(|record| {
-                allowed_graphs.is_none_or(|graphs| graphs.contains(&record.graph_iri))
-                    && group_id.is_none_or(|group_id| record.group_id == group_id)
-            })
-            .cloned()
-            .collect(),
-    )
-}
-
-struct RecordSelection {
-    visible: Vec<MetadataRegistryRecord>,
-    deleted: usize,
-    public: usize,
-    private: usize,
-    denied: usize,
-}
-
-// In-memory counterpart of the lazy scope decision: every record is decided
-// against the already resolved lifecycle snapshot and group rules.
-fn select_visible_records(
-    scope: &GraphVisibilityScope,
-    visibility_cache: &MetadataVisibilityCache,
-) -> RecordSelection {
-    let mut selection = RecordSelection {
-        visible: Vec::new(),
-        deleted: 0,
-        public: 0,
-        private: 0,
-        denied: 0,
-    };
-    for record in scope.records.iter() {
-        if scope.record_deleted(visibility_cache, &record.graph_iri) {
-            selection.deleted += 1;
-            continue;
-        }
-        if record.public {
-            selection.public += 1;
-        } else {
-            selection.private += 1;
-        }
-        if scope.permissions.record_visible(record) {
-            selection.visible.push(record.clone());
-        } else {
-            selection.denied += 1;
-        }
-    }
-    selection
-}
-
 // All-metadata reads defer per-graph authorization to evaluation time: the
 // scope is resolved once per query (O(caller's groups)) and the per-graph
 // decision is a cheap synchronous lookup that craqle memoizes per query.
@@ -6034,7 +5881,10 @@ async fn refresh_lifecycle_visibility_for_records(
 #[cfg(test)]
 mod tests {
     use super::query::parse_metadata_query;
-    use super::search::{HitDescribe, ScopeAuthorizer, describe_hits_parallel};
+    use super::search::{
+        HitDescribe, ScopeAuthorizer, describe_hits_parallel, filter_candidate_records,
+        select_visible_records,
+    };
     use super::*;
     use aruna_core::UserId;
     use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
