@@ -774,7 +774,7 @@ impl Operation for LocationSummaryOperation {
 #[cfg(test)]
 mod tests {
     use super::{LocationSummaryError, LocationSummaryOperation};
-    use crate::replication::location_summary::fixtures::{node_id, realm_id, request};
+    use crate::replication::location_summary::tests::fixtures::{node_id, realm_id, request};
     use crate::replication::protocol::{CopyCompliance, LocationCopyStorage};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
