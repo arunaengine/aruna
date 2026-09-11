@@ -511,3 +511,112 @@ pub(super) fn validate_path_candidate(
     }
     Ok(placement)
 }
+
+/// Nodes a document query fans out to: the live holders of the bucket the
+/// document was created into, not the holder set stamped at event time (which a
+/// rebalance leaves stale).
+pub fn document_replica_query_nodes(
+    config: Option<&RealmConfigDocument>,
+    record: &MetadataRegistryRecord,
+    local_node_id: NodeId,
+) -> Vec<NodeId> {
+    let holders = config
+        .map(|config| resolve_shard_holders(config, &record.placement))
+        .unwrap_or_default();
+    let nodes = deduplicate_fanout_nodes(holders);
+    if nodes.is_empty() {
+        vec![local_node_id]
+    } else {
+        nodes
+    }
+}
+
+pub fn deduplicate_fanout_nodes(nodes: Vec<NodeId>) -> Vec<NodeId> {
+    let mut seen = HashSet::with_capacity(nodes.len());
+    nodes
+        .into_iter()
+        .filter(|node_id| seen.insert(*node_id))
+        .collect()
+}
+
+pub(super) fn select_fanout_nodes(nodes: &[NodeId], local_node_id: NodeId, subject: &[u8]) -> Vec<NodeId> {
+    let mut ranked = select_top_peers(
+        nodes
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != local_node_id),
+        subject,
+        METADATA_DISTRIBUTED_QUERY_MAX_NODES,
+        |_| {},
+    );
+    if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+        ranked.push(local_node_id);
+    } else if !ranked.is_empty() {
+        ranked.pop();
+        ranked.push(local_node_id);
+    }
+    ranked.sort_unstable_by(|left, right| {
+        peer_rank(subject, *left)
+            .cmp(&peer_rank(subject, *right))
+            .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+    });
+    ranked
+}
+
+pub(super) fn reduce_path_candidates(
+    candidates: Vec<MetadataPathCandidate>,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let claims = candidates
+        .iter()
+        .map(|candidate| candidate.claim.clone())
+        .collect::<Vec<_>>();
+    let resolution =
+        aruna_core::structs::resolve_path_claim(&claims).ok_or(MetadataApiError::NotFound)?;
+    let winner = candidates
+        .iter()
+        .filter(|candidate| candidate.claim == resolution.winner)
+        .find_map(|candidate| candidate.record.clone())
+        .ok_or(MetadataApiError::NotFound)?;
+    let winner = sanitize_path_winner(winner)?;
+    let conflicts = resolution
+        .conflicts
+        .iter()
+        .filter_map(|claim| {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.claim == *claim)
+                .find_map(|candidate| candidate.record.as_ref())
+                .map(|record| record.document_id)
+        })
+        .collect::<Vec<_>>();
+    Ok(MetadataPathLookupResult { winner, conflicts })
+}
+
+pub(super) fn sanitize_path_winner(
+    record: MetadataRegistryRecord,
+) -> Result<MetadataPathWinner, MetadataApiError> {
+    MetaResourceId::from_bytes(record.document_id.to_bytes())
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(record.document_id)
+        || record.permission_path
+            != MetadataRegistryRecord::permission_path_for(
+                &record.realm_id,
+                record.group_id,
+                &record.document_path,
+                record.document_id,
+            )
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(MetadataPathWinner {
+        realm_id: record.realm_id,
+        group_id: record.group_id,
+        document_id: record.document_id,
+        document_path: record.document_path,
+        graph_iri: record.graph_iri,
+        public: record.public,
+        replicas: record.holder_node_ids.len(),
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+    })
+}
