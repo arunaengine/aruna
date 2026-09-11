@@ -1001,3 +1001,114 @@ fn band_pool_value(pool: &BandPool) -> String {
     serde_json::to_string(pool).expect("admin document band pool serializes")
 }
 
+
+pub fn realm_config_placement_node_id_from_path(path: &str) -> Option<NodeId> {
+    let node_id = path.strip_prefix("realm_config.placement.nodes.")?;
+    NodeId::from_str(node_id).ok()
+}
+
+pub fn realm_config_placement_strategy_id_from_path(path: &str) -> Option<Ulid> {
+    let strategy_id = path.strip_prefix("realm_config.placement.strategies.")?;
+    Ulid::from_string(strategy_id).ok()
+}
+
+pub fn realm_config_strategy_binding_scope_key_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("realm_config.placement.bindings.")
+}
+
+pub fn realm_config_placement_override_subject_key_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("realm_config.placement.overrides.")
+}
+
+pub fn placement_binding_handle(path: &str) -> Option<PlacementHandle> {
+    let handle = path.strip_prefix("realm_config.placement.placement_bindings.")?;
+    PlacementHandle::new(handle.parse().ok()?).ok()
+}
+
+pub fn band_pool_id(path: &str) -> Option<Ulid> {
+    let pool_id = path.strip_prefix("realm_config.placement.band_pools.")?;
+    Ulid::from_string(pool_id).ok()
+}
+
+pub fn handle_range_id(path: &str) -> Option<Ulid> {
+    let range_id = path.strip_prefix("realm_config.placement.handle_ranges.")?;
+    Ulid::from_string(range_id).ok()
+}
+
+fn candidate_map_epoch(path: &str) -> Option<u64> {
+    path.strip_prefix("realm_config.placement.candidate_maps.")?
+        .parse()
+        .ok()
+}
+
+fn activation_strategy(path: &str) -> Option<Ulid> {
+    let strategy_id = path.strip_prefix("realm_config.placement.activations.")?;
+    Ulid::from_string(strategy_id).ok()
+}
+
+/// Which part of a transition record a reducer path addresses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransitionPart {
+    Plan,
+    Aborted,
+    Barrier(u32, NodeId),
+    Proof(u32, NodeId),
+    Forced(u32),
+    Stall(u32, NodeId),
+    Drain(u32, NodeId),
+}
+
+fn transition_part(path: &str) -> Option<(Ulid, TransitionPart)> {
+    let rest = path.strip_prefix("realm_config.placement.transitions.")?;
+    let mut parts = rest.split('.');
+    let transition_id = Ulid::from_string(parts.next()?).ok()?;
+    let part = match (parts.next(), parts.next(), parts.next()) {
+        (None, _, _) => TransitionPart::Plan,
+        (Some("aborted"), None, None) => TransitionPart::Aborted,
+        (Some("forced"), Some(bucket), None) => TransitionPart::Forced(bucket.parse().ok()?),
+        (Some("barriers"), Some(bucket), Some(node)) => {
+            TransitionPart::Barrier(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        (Some("proofs"), Some(bucket), Some(node)) => {
+            TransitionPart::Proof(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        (Some("stalls"), Some(bucket), Some(node)) => {
+            TransitionPart::Stall(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        (Some("drained"), Some(bucket), Some(node)) => {
+            TransitionPart::Drain(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        _ => return None,
+    };
+    parts.next().is_none().then_some((transition_id, part))
+}
+
+
+fn placement_entry_from_value(value: &str) -> Option<NodePlacementEntry> {
+    serde_json::from_str(value).ok()
+}
+
+fn placement_strategy_from_value(value: &str) -> Option<PlacementStrategy> {
+    serde_json::from_str(value).ok()
+}
+
+fn strategy_binding_from_value(value: &str) -> Option<StrategyBinding> {
+    serde_json::from_str(value).ok()
+}
+
+fn placement_override_from_value(value: &str) -> Option<PlacementOverride> {
+    serde_json::from_str(value).ok()
+}
+
+fn parse_placement_binding(value: &str) -> Option<PlacementBinding> {
+    serde_json::from_str(value).ok()
+}
+
+fn parse_handle_range(value: &str) -> Option<HandleRange> {
+    serde_json::from_str(value).ok()
+}
+
+fn parse_band_pool(value: &str) -> Option<BandPool> {
+    serde_json::from_str(value).ok()
+}
+
