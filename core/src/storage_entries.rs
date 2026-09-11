@@ -803,16 +803,17 @@ pub fn stale_admin_document_conflict_delete_entries(
 pub fn metadata_registry_write_entries(
     record: &MetadataRegistryRecord,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    let record_bytes: ByteView = postcard::to_allocvec(record)?.into();
     Ok(vec![
         (
             METADATA_INDEX_KEYSPACE.to_string(),
             metadata_registry_key(record.group_id, record.document_id),
-            postcard::to_allocvec(record)?.into(),
+            record_bytes.clone(),
         ),
         (
             METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
             metadata_document_key(record.document_id),
-            postcard::to_allocvec(record)?.into(),
+            record_bytes,
         ),
         (
             METADATA_HOLDERS_KEYSPACE.to_string(),
@@ -864,10 +865,11 @@ mod tests {
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
         admin_document_reducer_state_write_entry, document_sync_conflict_key,
         document_sync_conflict_write_entry, document_sync_revision_key,
-        document_sync_revision_write_entry, graph_revision_change, metadata_iri_reference_key,
-        metadata_iri_reference_prefix, metadata_iri_reference_write_entry, shard_manifest_key,
-        shard_manifest_prefix, shard_manifest_write_entry,
-        stale_admin_document_conflict_delete_entries,
+        document_sync_revision_write_entry, graph_revision_change, metadata_document_key,
+        metadata_iri_reference_key, metadata_iri_reference_prefix,
+        metadata_iri_reference_write_entry, metadata_registry_key, metadata_registry_write_entries,
+        shard_manifest_key, shard_manifest_prefix, shard_manifest_write_entry,
+        stale_admin_document_conflict_delete_entries, updated_index_key,
     };
     use crate::admin_document_reducer::{
         AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
@@ -882,10 +884,12 @@ mod tests {
     use crate::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
         DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
-        METADATA_IRI_REFERENCE_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_UPDATED_INDEX_KEYSPACE,
+        SHARD_MANIFEST_KEYSPACE,
     };
     use crate::metadata::{MetadataGraphLifecycleRecord, MetadataIriReferenceIndexRecord};
-    use crate::structs::{PlacementRef, RealmId};
+    use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
 
     fn node(seed: u8) -> NodeId {
@@ -1400,5 +1404,66 @@ mod tests {
             )]
         );
         assert!(stale_admin_document_conflict_delete_entries(None, Some(&current)).is_empty());
+    }
+
+    fn registry_record() -> MetadataRegistryRecord {
+        let realm_id = realm_id(1);
+        let group_id = Ulid::from_bytes([2; 16]);
+        let document_id = Ulid::from_bytes([3; 16]);
+        MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: "datasets/registry".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "datasets/registry",
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: vec![node(4), node(5)],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: Ulid::from_bytes([6; 16]),
+            last_event_id: Ulid::from_bytes([7; 16]),
+        }
+    }
+
+    #[test]
+    fn registry_bytes_reused() {
+        let record = registry_record();
+        let entries = metadata_registry_write_entries(&record).unwrap();
+        let encoded = postcard::to_allocvec(&record).unwrap();
+
+        let keyspaces: Vec<&str> = entries
+            .iter()
+            .map(|(key_space, _, _)| key_space.as_str())
+            .collect();
+        assert_eq!(
+            keyspaces,
+            vec![
+                METADATA_INDEX_KEYSPACE,
+                METADATA_DOCUMENT_INDEX_KEYSPACE,
+                METADATA_HOLDERS_KEYSPACE,
+                METADATA_UPDATED_INDEX_KEYSPACE,
+            ]
+        );
+        let registry_key = metadata_registry_key(record.group_id, record.document_id);
+        assert_eq!(entries[0].1, registry_key);
+        assert_eq!(entries[1].1, metadata_document_key(record.document_id));
+        assert_eq!(entries[2].1, registry_key);
+        assert_eq!(
+            entries[3].1,
+            updated_index_key(record.updated_at_ms, record.document_id)
+        );
+        assert_eq!(entries[0].2.as_ref(), encoded.as_slice());
+        assert_eq!(entries[1].2, entries[0].2);
+        assert_eq!(entries[0].2.as_ref(), entries[1].2.as_ref());
+        let holders: Vec<NodeId> = postcard::from_bytes(entries[2].2.as_ref()).unwrap();
+        assert_eq!(holders, record.holder_node_ids);
+        assert!(entries[3].2.is_empty());
     }
 }

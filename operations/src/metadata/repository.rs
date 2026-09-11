@@ -21,7 +21,7 @@ pub use aruna_core::storage_entries::{
     metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
     metadata_materialization_job_write_entry, metadata_materialization_status_key,
     metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
-    shard_manifest_write_entry, updated_index_entry,
+    metadata_registry_write_entries, shard_manifest_write_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -221,66 +221,29 @@ pub fn create_records_and_outbox_write_entries(
     audit_id: Ulid,
     outbox: Option<&DocumentSyncOutboxRecord>,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    let mut writes = vec![
-        (
-            METADATA_INDEX_KEYSPACE.to_string(),
-            metadata_registry_key(record.group_id, record.document_id),
-            postcard::to_allocvec(record)?.into(),
-        ),
-        (
-            METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
-            metadata_document_key(record.document_id),
-            postcard::to_allocvec(record)?.into(),
-        ),
-        (
-            METADATA_HOLDERS_KEYSPACE.to_string(),
-            metadata_registry_key(record.group_id, record.document_id),
-            postcard::to_allocvec(&record.holder_node_ids)?.into(),
-        ),
-        updated_index_entry(record),
-        (
-            METADATA_AUDIT_KEYSPACE.to_string(),
-            metadata_audit_key(record.group_id, record.document_id, audit_id),
-            postcard::to_allocvec(audit)?.into(),
-        ),
-    ];
+    let mut writes = metadata_registry_write_entries(record)?;
+    writes.push((
+        METADATA_AUDIT_KEYSPACE.to_string(),
+        metadata_audit_key(record.group_id, record.document_id, audit_id),
+        postcard::to_allocvec(audit)?.into(),
+    ));
     if let Some(outbox) = outbox {
         writes.push(crate::sync::document_sync_outbox::outbox_write_entry(
             outbox,
         )?);
-        if let Some(revision) = document_lifecycle_revision_from_outbox(outbox)? {
-            writes.push(revision);
-        }
-        if let Some(manifest) = document_lifecycle_manifest_from_outbox(outbox)? {
-            writes.push(manifest);
+        if let Some((lifecycle, change)) = outbox_document_lifecycle_upsert(outbox)? {
+            writes.push(metadata_document_lifecycle_revision_write_entry(
+                &lifecycle,
+                outbox.node_id,
+                change.placement,
+            )?);
+            if let Some(manifest) = shard_manifest_write_entry(&outbox.target, &change)? {
+                writes.push(manifest);
+            }
         }
     }
 
     Ok(writes)
-}
-
-fn document_lifecycle_revision_from_outbox(
-    outbox: &DocumentSyncOutboxRecord,
-) -> Result<Option<(String, ByteView, ByteView)>, ConversionError> {
-    let Some((lifecycle, change)) = outbox_document_lifecycle_upsert(outbox)? else {
-        return Ok(None);
-    };
-    // Mirror the outbox envelope's placement into the revision sidecar so the
-    // same document carries the same reference locally and on the wire.
-    Ok(Some(metadata_document_lifecycle_revision_write_entry(
-        &lifecycle,
-        outbox.node_id,
-        change.placement,
-    )?))
-}
-
-fn document_lifecycle_manifest_from_outbox(
-    outbox: &DocumentSyncOutboxRecord,
-) -> Result<Option<(String, ByteView, ByteView)>, ConversionError> {
-    let Some((_, change)) = outbox_document_lifecycle_upsert(outbox)? else {
-        return Ok(None);
-    };
-    shard_manifest_write_entry(&outbox.target, &change)
 }
 
 fn outbox_document_lifecycle_upsert(
@@ -409,5 +372,203 @@ pub async fn delete_index_keys(
         _ => Err(StorageReadError::Storage(
             aruna_core::errors::StorageError::WriteError("unexpected event".to_string()),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::projector::create_event_outbox_record;
+    use crate::sync::document_sync_outbox::outbox_key;
+    use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
+    use aruna_core::keyspaces::{
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
+        METADATA_UPDATED_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    };
+    use aruna_core::metadata::MetadataCreateEventPayload;
+    use aruna_core::storage_entries::{
+        document_sync_revision_key, shard_manifest_key, updated_index_key,
+    };
+    use aruna_core::structs::{MetadataAuditOperation, PlacementRef, RealmId};
+
+    fn node(seed: u8) -> NodeId {
+        NodeId::from_bytes(&[seed; 32]).expect("node id")
+    }
+
+    fn outbox_fixture() -> (
+        MetadataRegistryRecord,
+        MetadataAuditRecord,
+        DocumentSyncOutboxRecord,
+    ) {
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let group_id = Ulid::from_bytes([4; 16]);
+        let document_id = Ulid::from_bytes([5; 16]);
+        let event_id = Ulid::from_bytes([6; 16]);
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([7; 16]),
+            shard: 3,
+        };
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: "datasets/outbox-batch".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "datasets/outbox-batch",
+                document_id,
+            ),
+            placement,
+            holder_node_ids: vec![node(1)],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: event_id,
+            last_event_id: event_id,
+        };
+        let audit = MetadataAuditRecord {
+            realm_id,
+            group_id,
+            document_id,
+            graph_iri: record.graph_iri.clone(),
+            user_id: Default::default(),
+            node_id: node(1),
+            operation: MetadataAuditOperation::Create,
+            occurred_at_ms: 2,
+            details: None,
+        };
+        let create_event = MetadataCreateEventRecord {
+            event_id,
+            record: record.clone(),
+            user_id: Default::default(),
+            node_id: node(1),
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: "Outbox Batch".to_string(),
+                description: "Repository batch regression".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: None,
+            },
+            occurred_at_ms: 2,
+        };
+        (
+            record,
+            audit,
+            create_event_outbox_record(&create_event, None, false),
+        )
+    }
+
+    fn batch_entries(
+        record: &MetadataRegistryRecord,
+        audit: &MetadataAuditRecord,
+        audit_id: Ulid,
+        outbox: &DocumentSyncOutboxRecord,
+    ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
+        create_records_and_outbox_write_entries(record, audit, audit_id, Some(outbox))
+    }
+
+    fn batch_effect(
+        record: &MetadataRegistryRecord,
+        audit: &MetadataAuditRecord,
+        audit_id: Ulid,
+        outbox: &DocumentSyncOutboxRecord,
+        txn_id: Option<TxnId>,
+    ) -> Result<Effect, ConversionError> {
+        write_create_records_and_outbox_effect(record, audit, audit_id, Some(outbox), txn_id)
+    }
+
+    fn batch_parts(effect: Effect) -> (Vec<(String, ByteView, ByteView)>, Option<TxnId>) {
+        let Effect::Storage(StorageEffect::BatchWrite { writes, txn_id }) = effect else {
+            panic!("expected one batch write");
+        };
+        (writes, txn_id)
+    }
+
+    fn keys(writes: &[(String, ByteView, ByteView)]) -> Vec<(String, ByteView)> {
+        writes
+            .iter()
+            .map(|(key_space, key, _)| (key_space.clone(), key.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn upsert_outbox_batch() -> Result<(), ConversionError> {
+        let (record, audit, outbox) = outbox_fixture();
+        let audit_id = Ulid::from_bytes([9; 16]);
+        let txn_id = TxnId::from_bytes([10; 16]);
+        let writes = batch_entries(&record, &audit, audit_id, &outbox)?;
+        let registry_key = metadata_registry_key(record.group_id, record.document_id);
+        let document_key = metadata_document_key(record.document_id);
+        let updated_key = updated_index_key(record.updated_at_ms, record.document_id);
+        let audit_key = metadata_audit_key(record.group_id, record.document_id, audit_id);
+        let outbox_row_key = outbox_key(&outbox);
+        let revision_key = document_sync_revision_key(&outbox.target);
+        let manifest_key = shard_manifest_key(&outbox.placement, &outbox.target);
+        let expected = vec![
+            (METADATA_INDEX_KEYSPACE.to_string(), registry_key.clone()),
+            (METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(), document_key),
+            (METADATA_HOLDERS_KEYSPACE.to_string(), registry_key),
+            (METADATA_UPDATED_INDEX_KEYSPACE.to_string(), updated_key),
+            (METADATA_AUDIT_KEYSPACE.to_string(), audit_key),
+            (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_row_key),
+            (DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(), revision_key),
+            (SHARD_MANIFEST_KEYSPACE.to_string(), manifest_key),
+        ];
+
+        assert_eq!(keys(&writes), expected);
+        assert_eq!(writes[0].2, writes[1].2);
+        let record_bytes = ByteView::from(postcard::to_allocvec(&record)?);
+        assert_eq!(writes[0].2, record_bytes);
+
+        let effect = batch_effect(&record, &audit, audit_id, &outbox, Some(txn_id))?;
+        let (effect_writes, effect_txn) = batch_parts(effect);
+
+        assert_eq!(effect_txn, Some(txn_id));
+        assert_eq!(effect_writes, writes);
+        Ok(())
+    }
+
+    #[test]
+    fn delete_outbox_batch() -> Result<(), ConversionError> {
+        let (record, audit, outbox) = outbox_fixture();
+        let audit_id = Ulid::from_bytes([11; 16]);
+        let DocumentSyncOutboxEvent::Upsert { change, .. } = &outbox.event else {
+            panic!("fixture outbox is an upsert");
+        };
+        let change = *change;
+        let delete = DocumentSyncOutboxRecord {
+            event: DocumentSyncOutboxEvent::Delete {
+                change: DocumentSyncChange {
+                    kind: DocumentSyncChangeKind::Delete,
+                    ..change
+                },
+            },
+            ..outbox
+        };
+        let writes = batch_entries(&record, &audit, audit_id, &delete)?;
+        let registry_key = metadata_registry_key(record.group_id, record.document_id);
+        let document_key = metadata_document_key(record.document_id);
+        let updated_key = updated_index_key(record.updated_at_ms, record.document_id);
+        let audit_key = metadata_audit_key(record.group_id, record.document_id, audit_id);
+        let expected = vec![
+            (METADATA_INDEX_KEYSPACE.to_string(), registry_key.clone()),
+            (METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(), document_key),
+            (METADATA_HOLDERS_KEYSPACE.to_string(), registry_key),
+            (METADATA_UPDATED_INDEX_KEYSPACE.to_string(), updated_key),
+            (METADATA_AUDIT_KEYSPACE.to_string(), audit_key),
+            (
+                DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                outbox_key(&delete),
+            ),
+        ];
+
+        assert_eq!(writes.len(), 6);
+        assert_eq!(keys(&writes), expected);
+        for (key_space, _, _) in &writes {
+            assert_ne!(key_space.as_str(), DOCUMENT_SYNC_REVISION_KEYSPACE);
+            assert_ne!(key_space.as_str(), SHARD_MANIFEST_KEYSPACE);
+        }
+        Ok(())
     }
 }
