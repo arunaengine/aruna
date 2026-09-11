@@ -79,7 +79,6 @@ enum RevokeTokenState {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         revocation_index: RevocationIndex,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
         pending_deletes: Vec<(KeySpace, Key)>,
@@ -89,7 +88,6 @@ enum RevokeTokenState {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         revocation_index: RevocationIndex,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
         pending_deletes: Vec<(KeySpace, Key)>,
@@ -101,7 +99,6 @@ enum RevokeTokenState {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         revocation_index: RevocationIndex,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
     },
@@ -242,7 +239,6 @@ impl RevokeTokenOperation {
             .filter(|entry| revocation_live(entry.expires_at, self.config.now))
             .map(|entry| (entry.token_hash.clone(), entry.expires_at))
             .collect::<BTreeMap<_, _>>();
-        let stale_conflict_deletes = Vec::new();
         let canonical_changed = previous_reducer_state.is_none()
             || reducer_state.revocation_floor < self.config.now
             || document_materialized != materialized;
@@ -253,7 +249,6 @@ impl RevokeTokenOperation {
             document,
             reducer_state,
             revocation_index,
-            stale_conflict_deletes,
             apply_event,
             canonical_changed,
         )
@@ -264,7 +259,6 @@ impl RevokeTokenOperation {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         revocation_index: RevocationIndex,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
     ) -> Result<Effects, RevokeTokenError> {
@@ -275,7 +269,6 @@ impl RevokeTokenOperation {
             document,
             reducer_state,
             revocation_index,
-            stale_conflict_deletes,
             apply_event,
             write_canonical,
             pending_deletes: Vec::new(),
@@ -386,7 +379,6 @@ impl RevokeTokenOperation {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         revocation_index: RevocationIndex,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
         mut pending_deletes: Vec<(KeySpace, Key)>,
@@ -430,7 +422,6 @@ impl RevokeTokenOperation {
                     document,
                     reducer_state,
                     revocation_index,
-                    stale_conflict_deletes,
                     false,
                     true,
                 );
@@ -439,7 +430,6 @@ impl RevokeTokenOperation {
                 document,
                 reducer_state,
                 revocation_index,
-                stale_conflict_deletes,
                 apply_event: false,
                 write_canonical: true,
             };
@@ -457,7 +447,6 @@ impl RevokeTokenOperation {
                 document,
                 reducer_state,
                 revocation_index,
-                stale_conflict_deletes,
                 apply_event,
                 write_canonical,
             );
@@ -470,7 +459,6 @@ impl RevokeTokenOperation {
             document,
             reducer_state,
             revocation_index,
-            stale_conflict_deletes,
             apply_event,
             write_canonical,
         };
@@ -485,18 +473,11 @@ impl RevokeTokenOperation {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         revocation_index: RevocationIndex,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
     ) -> Result<Effects, RevokeTokenError> {
         if apply_event || write_canonical {
-            self.emit_write(
-                document,
-                reducer_state,
-                revocation_index,
-                stale_conflict_deletes,
-                apply_event,
-            )
+            self.emit_write(document, reducer_state, revocation_index, apply_event)
         } else {
             Ok(self.emit_commit_noop(document))
         }
@@ -507,7 +488,6 @@ impl RevokeTokenOperation {
         mut document: RealmConfigDocument,
         mut reducer_state: AdminDocumentReducerState,
         mut revocation_index: RevocationIndex,
-        _stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
     ) -> Result<Effects, RevokeTokenError> {
         let Some(txn_id) = self.txn_id else {
@@ -658,7 +638,6 @@ impl Operation for RevokeTokenOperation {
                 document,
                 reducer_state,
                 revocation_index,
-                stale_conflict_deletes,
                 apply_event,
                 write_canonical,
                 pending_deletes,
@@ -673,7 +652,6 @@ impl Operation for RevokeTokenOperation {
                             document,
                             reducer_state,
                             revocation_index,
-                            stale_conflict_deletes,
                             apply_event,
                             write_canonical,
                             pending_deletes,
@@ -696,7 +674,6 @@ impl Operation for RevokeTokenOperation {
                         document,
                         reducer_state,
                         revocation_index,
-                        stale_conflict_deletes,
                         apply_event,
                         write_canonical,
                         pending_deletes,
@@ -718,7 +695,6 @@ impl Operation for RevokeTokenOperation {
                 document,
                 reducer_state,
                 revocation_index,
-                stale_conflict_deletes,
                 apply_event,
                 write_canonical,
                 mut pending_deletes,
@@ -743,7 +719,6 @@ impl Operation for RevokeTokenOperation {
                             document,
                             reducer_state,
                             revocation_index,
-                            stale_conflict_deletes,
                             apply_event,
                             write_canonical,
                             pending_deletes,
@@ -761,7 +736,6 @@ impl Operation for RevokeTokenOperation {
                             document,
                             reducer_state,
                             revocation_index,
-                            stale_conflict_deletes,
                             apply_event,
                             write_canonical,
                             pending_deletes,
@@ -781,7 +755,6 @@ impl Operation for RevokeTokenOperation {
                 document,
                 reducer_state,
                 revocation_index,
-                stale_conflict_deletes,
                 apply_event,
                 write_canonical,
             } => match event {
@@ -790,7 +763,6 @@ impl Operation for RevokeTokenOperation {
                         document,
                         reducer_state,
                         revocation_index,
-                        stale_conflict_deletes,
                         apply_event,
                         write_canonical,
                     ) {
