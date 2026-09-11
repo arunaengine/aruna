@@ -2615,7 +2615,7 @@ mod test {
     }
 
     // CAS guard: if the head advanced under a drifted read (a concurrent reader
-    // already wrote the successor), this read must not write a second one — it
+    // already wrote the successor), this read must not write a second one; it
     // aborts and restarts against the winner.
     #[test]
     fn advance_conflict_restarts() {

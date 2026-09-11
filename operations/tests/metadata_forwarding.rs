@@ -481,7 +481,7 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
 /// stays in the outbox, retried and loud, instead of being deleted after the
 /// caller was told the group exists. Creating groups from a User node needs a
 /// signed-origin admin path in the net layer; until then this test pins the
-/// invariant that matters — the write is never thrown away.
+/// invariant that matters: the write is never thrown away.
 #[tokio::test]
 async fn user_node_group_survives() -> Result<(), Box<dyn std::error::Error>> {
     let realm = Realm::new();
@@ -542,7 +542,7 @@ async fn outbox_len(node: &TestNode) -> Result<usize, Box<dyn std::error::Error>
 /// down after the first create forces the retry onto a co-holder that never
 /// created the document itself but received it by sync; it must replay the record
 /// rather than fork a second one onto another topic. Node count is beside the
-/// point — skipping rank-0 is what makes the holder differ — so this stays at the
+/// point: skipping rank-0 is what makes the holder differ, so this stays at the
 /// minimum realm that leaves a holder to fail over to.
 #[tokio::test]
 async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {

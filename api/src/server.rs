@@ -19,7 +19,7 @@ pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
 // Backstop only, far above any legitimate request: the interactive bounds live
 // in the discovery/fanout/open_stream deadlines. This catches handler paths
 // that would otherwise hold the connection for unbounded peer I/O. Streaming
-// response bodies (SSE, archive downloads) are not covered — the layer bounds
+// response bodies (SSE, archive downloads) are not covered: the layer bounds
 // the time to produce the response, not the body. Routes that read the request
 // body inside the handler are exempt, see TIMEOUT_EXEMPT_ROUTES.
 const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);

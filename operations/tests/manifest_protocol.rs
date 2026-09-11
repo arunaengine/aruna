@@ -194,7 +194,7 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
 }
 
 // Two genesis-less holders compute the SAME (non-zero) empty fingerprint, so
-// their digests match — exactly the condition that would falsely certify
+// their digests match: exactly the condition that would falsely certify
 // convergence. Verification must still refuse to mark the shard verified,
 // because neither has a local genesis.
 #[tokio::test]

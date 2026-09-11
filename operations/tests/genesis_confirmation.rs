@@ -92,8 +92,8 @@ async fn reachable_topicless_co_holder_lets_rank0_create_the_genesis()
     Ok(())
 }
 
-// An unreachable co-holder might hold a genesis, so creation is withheld — and,
-// crucially, withholding schedules a SyncPlacements retry so a returning
+// An unreachable co-holder might hold a genesis, so creation is withheld.
+// Withholding schedules a SyncPlacements retry, so a returning
 // co-holder re-runs the reconciler on its own (no placement record exists to
 // drive it). The retry is driven here through the real task handler rather than
 // by re-running the reconciler by hand, which is what masked the liveness gap.
@@ -121,7 +121,7 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
 
     // The co-holder returns; the scheduled retry is fired immediately (instead of
     // after the 30s production delay) through the task handler. The test never
-    // calls process_shard_placements itself past this point — convergence proves
+    // calls process_shard_placements itself past this point; convergence proves
     // the armed retry, not a hand-driven loop, re-creates the genesis.
     mesh_nodes(&nodes).await;
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(

@@ -482,7 +482,7 @@ impl DocumentSyncTarget {
     /// user, metadata) derive one topic per `(strategy, shard)` from the
     /// placement; shared realm-scoped targets keep their per-domain topic and
     /// ignore the placement. A NIL placement on a shard-classed target is a bug
-    /// (the emitter failed to stamp a real ref) — it is asserted in debug and
+    /// (the emitter failed to stamp a real ref); it is asserted in debug and
     /// warned in release, never silently accepted.
     pub fn sync_topic_id(&self, realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
         if self.uses_shard_topic() {

@@ -269,8 +269,8 @@ impl QuotaConfig {
     }
 
     /// Resolves the effective pre-grace quota (in bytes) for a group: the group
-    /// override's `quota_bytes` when an override exists — an existing override
-    /// with `quota_bytes: None` means the group is explicitly unlimited — else
+    /// override's `quota_bytes` when an override exists (an override with
+    /// `quota_bytes: None` makes the group explicitly unlimited), else
     /// the realm `default_group_quota_bytes`. `None` means unlimited.
     pub fn effective_group_quota_bytes(&self, group_id: &GroupId) -> Option<u64> {
         match self
@@ -287,8 +287,8 @@ impl QuotaConfig {
     /// may reach before writes are rejected: the effective quota
     /// (`effective_group_quota_bytes`) scaled by the effective grace factor (group
     /// override if present, else the global `grace_factor_percent`). Returns
-    /// `None` when no quota applies — an existing override with `quota_bytes: None`
-    /// or no override and no `default_group_quota_bytes` — i.e. the group is
+    /// `None` when no quota applies (an existing override with `quota_bytes: None`,
+    /// or no override and no `default_group_quota_bytes`), i.e. the group is
     /// unlimited and no gate is enforced.
     pub fn effective_group_ceiling(&self, group_id: &GroupId) -> Option<u64> {
         let over = self
@@ -515,8 +515,8 @@ impl RealmConfigDocument {
     ///
     /// Group, user and metadata-registry documents are bound to `everywhere`
     /// (`replica_count: None`, i.e. every sync-eligible node) rather than to the
-    /// capped default. They are control documents — O(groups + users), not
-    /// O(documents) — and the permission system structurally requires them
+    /// capped default. They are control documents (O(groups + users), not
+    /// O(documents)), and the permission system structurally requires them
     /// locally: `CheckPermissionsOperation` reads the group authorization
     /// document from the local `AUTH_KEYSPACE` and hard-fails when it is absent,
     /// so a node outside a group's replica set could not authorize any request
