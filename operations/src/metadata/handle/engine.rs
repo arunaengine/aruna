@@ -993,3 +993,200 @@ fn looks_like_identifier(value: &str) -> bool {
         || value.contains("://")
         || (value.contains(':') && !value.contains(' '))
 }
+
+pub(super) fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
+    match error {
+        CraqleError::RoCrate(rocrate_error) => match rocrate_error {
+            RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
+                metadata_violations(violations)
+            }
+            RoCrateError::Json(_) | RoCrateError::JsonLd(_) => {
+                MetadataError::InvalidInput(rocrate_error.to_string())
+            }
+            RoCrateError::InvalidGraph(_)
+            | RoCrateError::EntityNotFound(_)
+            | RoCrateError::UnsupportedJsonLd(_)
+            | RoCrateError::UnsupportedTerm(_)
+            | RoCrateError::InvalidBatch(_) => {
+                MetadataError::InvalidInput(rocrate_error.to_string())
+            }
+            other => MetadataError::Backend(other.to_string()),
+        },
+        CraqleError::SyncInputRejected(message) => MetadataError::InvalidInput(message),
+        CraqleError::MultiGraphUpdateUnsupported => {
+            MetadataError::InvalidInput("unsupported update across multiple graphs".to_string())
+        }
+        CraqleError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
+            metadata_violations(violations)
+        }
+        // Backend infrastructure, not the document: an apply that fails on disk
+        // or in the search worker must keep retrying instead of being parked.
+        error @ (CraqleError::Io(_) | CraqleError::Store(_) | CraqleError::SearchWorker(_)) => {
+            MetadataError::Persist(error.to_string())
+        }
+        other => MetadataError::Backend(other.to_string()),
+    }
+}
+
+fn metadata_violations(violations: Vec<craqle::CrateViolation>) -> MetadataError {
+    MetadataError::Validation(
+        violations
+            .into_iter()
+            .map(|violation| MetadataValidationViolation {
+                code: violation.code.to_string(),
+                message: violation.message,
+                pointer: violation.pointer,
+                entity_id: violation.entity_id,
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn record_error(span: &Span, error: &str) {
+    span.record("result", "error");
+    span.record("error", field::display(error));
+    span.record("otel.status_code", "ERROR");
+    span.record("otel.status_description", field::display(error));
+}
+
+pub(super) fn warn_if_slow_metadata_backend(
+    operation: &'static str,
+    graph_iri: Option<&str>,
+    duration: Duration,
+) {
+    CRAQLE_LATENCY.record(operation, duration);
+    if duration >= SLOW_METADATA_BACKEND_THRESHOLD {
+        warn!(
+            event = "metadata.backend.slow_call",
+            operation,
+            graph_iri = graph_iri.unwrap_or("<none>"),
+            duration_ms = duration_ms(duration),
+            threshold_ms = duration_ms(SLOW_METADATA_BACKEND_THRESHOLD),
+            "Slow metadata backend call"
+        );
+    }
+}
+
+pub(super) fn record_craqle_call_result<T>(
+    span: &Span,
+    operation: &'static str,
+    graph_iri: Option<&str>,
+    started: Instant,
+    result: &Result<T, CraqleError>,
+) {
+    let duration = started.elapsed();
+    record_duration_ms(span, "elapsed_ms", duration);
+    match result {
+        Ok(_) => {
+            span.record("result", "ok");
+            span.record("otel.status_code", "OK");
+        }
+        Err(error) => record_error(span, &error.to_string()),
+    }
+    warn_if_slow_metadata_backend(operation, graph_iri, duration);
+}
+
+pub(super) fn record_metadata_result(
+    span: &Span,
+    operation: &'static str,
+    graph_iri: Option<&str>,
+    started: Instant,
+    result: &Result<MetadataEvent, CraqleError>,
+) {
+    record_craqle_call_result(span, operation, graph_iri, started, result);
+}
+
+pub(super) fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
+    match effect {
+        MetadataEffect::ValidateCreateCrate { .. } => "validate_create_crate",
+        MetadataEffect::ValidateRoCrate { .. } => "validate_rocrate",
+        MetadataEffect::CreateCrate { .. } => "create_crate",
+        MetadataEffect::ApplyRoCrate { .. } => "apply_rocrate",
+        MetadataEffect::UpsertDataEntity { .. } => "upsert_data_entity",
+        MetadataEffect::UpsertContextualEntity { .. } => "upsert_contextual_entity",
+        MetadataEffect::SetGraphPolicy { .. } => "set_graph_policy",
+        MetadataEffect::AddGraphPeer { .. } => "add_graph_peer",
+        MetadataEffect::SyncGraphBestEffort { .. } => "sync_graph_best_effort",
+        MetadataEffect::GetGraphPolicy { .. } => "get_graph_policy",
+        MetadataEffect::ExportRoCrate { .. } => "export_rocrate",
+        MetadataEffect::ExportRoCrateSummary { .. } => "export_rocrate_summary",
+        MetadataEffect::ExportRoCratePage { .. } => "export_rocrate_page",
+        MetadataEffect::SearchGraphs { .. } => "search_graphs",
+        MetadataEffect::QueryGraphs { .. } => "query_graphs",
+        MetadataEffect::DeleteGraph { .. } => "delete_graph",
+        MetadataEffect::ListGraphs => "list_graphs",
+        MetadataEffect::ContainsGraph { .. } => "contains_graph",
+        MetadataEffect::PlanBatch { .. } => "plan_batch",
+        MetadataEffect::MergeBatch { .. } => "merge_batch",
+        MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
+        MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
+    }
+}
+
+pub(super) fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
+    match event {
+        MetadataEvent::ValidationResult { .. } => "validation_result",
+        MetadataEvent::CreateCrateResult { .. } => "create_crate_result",
+        MetadataEvent::ApplyRoCrateResult { .. } => "apply_rocrate_result",
+        MetadataEvent::EntityUpsertResult { .. } => "entity_upsert_result",
+        MetadataEvent::GraphPolicySet { .. } => "graph_policy_set",
+        MetadataEvent::GraphPeerAdded { .. } => "graph_peer_added",
+        MetadataEvent::GraphSyncScheduled { .. } => "graph_sync_scheduled",
+        MetadataEvent::GraphPolicyResult { .. } => "graph_policy_result",
+        MetadataEvent::RoCrateExportResult { .. } => "rocrate_export_result",
+        MetadataEvent::RoCrateSummaryResult { .. } => "rocrate_summary_result",
+        MetadataEvent::RoCratePageResult { .. } => "rocrate_page_result",
+        MetadataEvent::SearchResult { .. } => "search_result",
+        MetadataEvent::QueryResult { .. } => "query_result",
+        MetadataEvent::GraphDeleted { .. } => "graph_deleted",
+        MetadataEvent::GraphListResult { .. } => "graph_list_result",
+        MetadataEvent::ContainsGraphResult { .. } => "contains_graph_result",
+        MetadataEvent::BatchPlanned { .. } => "batch_planned",
+        MetadataEvent::BatchMerged { .. } => "batch_merged",
+        MetadataEvent::GraphSnapshotResult { .. } => "graph_snapshot_result",
+        MetadataEvent::SnapshotInstalled { .. } => "snapshot_installed",
+        MetadataEvent::Error { .. } => "error",
+    }
+}
+
+pub(super) fn record_metadata_query_result_counts(span: &Span, results: &MetadataQueryResults) {
+    match results {
+        MetadataQueryResults::Solutions(rows) => {
+            span.record("row_count", rows.len() as u64);
+        }
+        MetadataQueryResults::Boolean(_) => {
+            span.record("row_count", 1u64);
+        }
+        MetadataQueryResults::Graph(triples) => {
+            span.record("triple_count", triples.len() as u64);
+        }
+    }
+}
+
+pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
+    match error {
+        MetadataError::GraphNotFound => MetadataReadError::NotFound,
+        MetadataError::InvalidInput(_)
+        | MetadataError::ChannelClosed
+        | MetadataError::InvalidEffect
+        | MetadataError::HandleMissing
+        | MetadataError::TaskJoin(_)
+        | MetadataError::Validation(_)
+        | MetadataError::ProfileValidation(_)
+        | MetadataError::Persist(_)
+        | MetadataError::Storage(_)
+        | MetadataError::Backend(_) => MetadataReadError::Unavailable,
+    }
+}
+
+pub(super) async fn config_digest_matches(
+    context: &DriverContext,
+    realm_id: RealmId,
+    expected: &[u8; 32],
+) -> bool {
+    super::super::api::load_realm_config(context, realm_id)
+        .await
+        .and_then(|config| config.digest().ok())
+        .as_ref()
+        == Some(expected)
+}
