@@ -697,3 +697,156 @@ impl OperationsTaskHandler {
         records
     }
 }
+
+impl OperationsTaskHandler {
+    async fn publish_drain_batches(
+        &self,
+        retry_key: &TaskKey,
+        net_handle: &aruna_net::NetHandle,
+        subbatches: Vec<DrainSubBatch>,
+    ) -> (Duration, DrainSyncOutcome) {
+        let mut publish_elapsed = Duration::ZERO;
+        let mut outcome = DrainSyncOutcome::default();
+        let mut awaiting_sync: Option<DrainSubBatch> = None;
+        for mut subbatch in subbatches {
+            let documents = std::mem::take(&mut subbatch.documents);
+            let peers = subbatch.peers.clone();
+            let (batch_topics, batch_origins) = subbatch.ordering_domains();
+            let publish = async {
+                let publish_started = Instant::now();
+                let event = net_handle
+                    .send_effect(Effect::Net(NetEffect::DocumentSync(
+                        DocumentSyncEffect::PublishDocuments { documents, peers },
+                    )))
+                    .await;
+                (event, publish_started.elapsed())
+            };
+            let ((publish_event, publish_time), sync_outcome) = tokio::join!(
+                publish,
+                self.sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
+            );
+            publish_elapsed += publish_time;
+            outcome.merge(sync_outcome);
+            match publish_event {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+                    ..
+                })) => awaiting_sync = Some(subbatch),
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                        published_indices,
+                        retry_indices,
+                        error,
+                    },
+                )) => {
+                    warn!(
+                        task_id = ?retry_key,
+                        published = published_indices.len(),
+                        retry = retry_indices.len(),
+                        error = %error,
+                        "Partially created local document sync batch"
+                    );
+                    outcome.retry_needed = true;
+                    if let Some(retried) = subbatch.sync_subset(&retry_indices) {
+                        let (topics, origins) = retried.ordering_domains();
+                        outcome.blocked_topics.extend(topics);
+                        outcome.blocked_origins.extend(origins);
+                    } else {
+                        outcome.blocked_topics.extend(batch_topics.iter().copied());
+                        outcome
+                            .blocked_origins
+                            .extend(batch_origins.iter().copied());
+                    }
+                    match subbatch.sync_subset(&published_indices) {
+                        Some(published) if !published.record_keys.is_empty() => {
+                            awaiting_sync = Some(published);
+                        }
+                        Some(_) => {}
+                        None => {
+                            warn!(task_id = ?retry_key, "Invalid partial document publish indices");
+                        }
+                    }
+                }
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                    error, ..
+                })) => {
+                    warn!(task_id = ?retry_key, error = %error, "Failed to create local document sync batch");
+                    outcome.retry_needed = true;
+                    outcome.blocked_topics.extend(batch_topics.iter().copied());
+                    outcome
+                        .blocked_origins
+                        .extend(batch_origins.iter().copied());
+                }
+                Event::Net(NetEvent::Error(error)) => {
+                    warn!(task_id = ?retry_key, error = ?error, "Failed to create local document sync batch");
+                    outcome.retry_needed = true;
+                    outcome.blocked_topics.extend(batch_topics.iter().copied());
+                    outcome
+                        .blocked_origins
+                        .extend(batch_origins.iter().copied());
+                }
+                other => {
+                    warn!(task_id = ?retry_key, event = ?other, "Unexpected local document sync batch result");
+                    outcome.retry_needed = true;
+                    outcome.blocked_topics.extend(batch_topics.iter().copied());
+                    outcome
+                        .blocked_origins
+                        .extend(batch_origins.iter().copied());
+                }
+            }
+        }
+        let sync_outcome = self
+            .sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
+            .await;
+        outcome.merge(sync_outcome);
+        (publish_elapsed, outcome)
+    }
+}
+
+impl OperationsTaskHandler {
+    fn build_drain_batches(records: Vec<DrainRecord>) -> (usize, Vec<DrainSubBatch>) {
+        let mut publish_groups: BTreeMap<
+            Vec<aruna_core::NodeId>,
+            (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
+        > = BTreeMap::new();
+        for (record_key, record, topic) in records {
+            let origin = admin_origin(&record);
+            let document = document_publish_from_outbox(
+                record.outbox_id,
+                record.target.clone(),
+                record.event,
+                record.placement,
+                record.allow_genesis,
+            );
+            let mut peer_key = record.peers.clone();
+            crate::sync::shard_placement::sort_node_ids(&mut peer_key);
+            let (peers, subbatches) = publish_groups
+                .entry(peer_key)
+                .or_insert_with(|| (record.peers.clone(), Vec::new()));
+            if subbatches
+                .last()
+                .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
+            {
+                subbatches.push(DrainSubBatch {
+                    peers: peers.clone(),
+                    documents: Vec::new(),
+                    topics: Vec::new(),
+                    origins: Vec::new(),
+                    targets: Vec::new(),
+                    record_keys: Vec::new(),
+                });
+            }
+            let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
+            subbatch.documents.push(document);
+            subbatch.topics.push(topic);
+            subbatch.origins.push(origin);
+            subbatch.targets.push(record.target);
+            subbatch.record_keys.push(record_key);
+        }
+        let groups = publish_groups.len();
+        let subbatches = publish_groups
+            .into_values()
+            .flat_map(|(_, subbatches)| subbatches)
+            .collect();
+        (groups, subbatches)
+    }
+}
