@@ -846,7 +846,11 @@ pub async fn stage_inputs(
             }
         }
     }
-    session.touch();
+    // A call that staged nothing made no progress, so it must not keep the
+    // session alive.
+    if !staged.is_empty() {
+        session.touch();
+    }
     inputs_outcome(staged, failed, refusal)
 }
 
@@ -1698,11 +1702,14 @@ mod tests {
     #[tokio::test]
     async fn keeps_refusal_reason() {
         // Nothing landed, so the caller keeps the coded refusal instead of a
-        // 202 that claims a partial result.
+        // 202 that claims a partial result, and the session is not kept alive.
         let owner = user(2);
         let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let session = registry_session(&state, job_id).expect("session is live");
+        let quiet = session.snapshot().last_event_id;
+
         let response = stage_inputs(
-            State(state),
+            State(state.clone()),
             Extension(auth_for(owner)),
             Path(job_id.to_string()),
             Json(SessionInputsRequest {
@@ -1710,7 +1717,9 @@ mod tests {
             }),
         )
         .await;
+
         assert!(matches!(response, Err(ServerError::NotFound)));
+        assert_eq!(session.snapshot().last_event_id, quiet);
     }
 
     #[tokio::test]
