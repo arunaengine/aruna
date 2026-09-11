@@ -1,3 +1,4 @@
+use super::list::{auth_for, user_role, write_policy_docs};
 use super::*;
 
 // Fan-out follows the live holders of the stored bucket; the event-time
