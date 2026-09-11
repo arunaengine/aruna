@@ -214,15 +214,23 @@ struct Compactor {
     sender: Option<std::sync::mpsc::Sender<CompactionJob>>,
     thread: Option<thread::JoinHandle<()>>,
     active: Arc<Mutex<HashSet<String>>>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl Compactor {
     fn spawn() -> Self {
         let (sender, receiver) = std::sync::mpsc::channel::<CompactionJob>();
         let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let stopping = Arc::new(AtomicBool::new(false));
         let running = active.clone();
+        let stop = stopping.clone();
         let thread = thread::spawn(move || {
+            // A queued job holds a keyspace handle, so the backlog is dropped
+            // on shutdown instead of keeping the database open job by job.
             while let Ok(job) = receiver.recv() {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 run_compaction(job, &running);
             }
         });
@@ -230,6 +238,7 @@ impl Compactor {
             sender: Some(sender),
             thread: Some(thread),
             active,
+            stopping,
         }
     }
 
@@ -271,6 +280,7 @@ impl Compactor {
 
     /// Waits for a running compaction so no keyspace handle outlives the store.
     fn shutdown(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         self.sender = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -4083,6 +4093,7 @@ mod tests {
             sender: None,
             thread: None,
             active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -5664,6 +5675,7 @@ mod tests {
             sender: Some(sender),
             thread: None,
             active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         receiver
     }
@@ -5774,9 +5786,9 @@ mod tests {
             })
             .expect("next job is queued");
         drop(sender);
-        compactor.shutdown();
 
         finished.recv().expect("the thread ran the next job");
+        compactor.shutdown();
         assert!(
             compactor
                 .active
@@ -5784,6 +5796,41 @@ mod tests {
                 .expect("compaction mutex")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn shutdown_drops_backlog() {
+        // A job queued behind a running one must not keep the database open.
+        let mut compactor = super::Compactor::spawn();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let (ran, second) = std::sync::mpsc::channel::<()>();
+        let sender = compactor.sender.clone().expect("compactor accepts jobs");
+        sender
+            .send(super::CompactionJob {
+                key_space: "first".to_string(),
+                deletes: 1,
+                run: Box::new(move || {
+                    blocked.recv().expect("test releases the first job");
+                    Ok(())
+                }),
+            })
+            .expect("first job is queued");
+        sender
+            .send(super::CompactionJob {
+                key_space: "second".to_string(),
+                deletes: 1,
+                run: Box::new(move || {
+                    ran.send(()).expect("test observes the second job");
+                    Ok(())
+                }),
+            })
+            .expect("second job is queued");
+        drop(sender);
+
+        compactor.stopping.store(true, Ordering::Release);
+        release.send(()).expect("first job is released");
+        compactor.shutdown();
+        assert!(second.try_recv().is_err(), "the backlog ran after shutdown");
     }
 
     #[test]
