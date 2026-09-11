@@ -43,6 +43,7 @@ use self::export::export_rocrate_summary_jsonld;
 pub use self::export::{export_metadata_rocrate, get_visible_metadata_document};
 pub use self::fanout::forwarded_bearer;
 pub(crate) use self::fanout::graph_pattern_contains_service;
+pub use self::fanout::search_buckets_distributed;
 use self::fanout::{
     MetadataFanoutOperation, MetadataNodeCall, distributed_query_is_union_safe, fanout_bearer,
     metadata_node_call, run_metadata_fanout,
@@ -1514,84 +1515,6 @@ fn map_read_error(error: MetadataReadError) -> MetadataApiError {
 
 fn map_metadata_internal_error(error: MetadataError) -> MetadataApiError {
     MetadataApiError::Internal(error.to_string())
-}
-
-pub async fn search_buckets_distributed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    request: BucketSearchRequest,
-) -> Result<BucketSearchExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
-    let limit = request.limit.clamp(1, 50);
-    let subject = query_fingerprint(
-        &request.query,
-        None,
-        Some(MetadataApiQueryMode::Distributed),
-        None,
-        None,
-    );
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
-    let local_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
-        (
-            context.clone(),
-            request.auth,
-            realm_id,
-            request.query.clone(),
-            limit,
-        ),
-        |(context, auth, realm_id, query, limit), node_id| async move {
-            search_local_buckets(
-                &context,
-                SearchBucketsInput {
-                    auth,
-                    realm_id,
-                    node_id,
-                    query,
-                    limit,
-                    start_after: None,
-                },
-            )
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)
-        },
-    );
-    let remote_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
-        (handle, remote_auth_token, request.query, limit),
-        |(handle, auth_token, query, limit), node_id| async move {
-            handle
-                .request_bucket_search(node_id, auth_token, query, limit)
-                .await
-        },
-    );
-    let (parts, fanout_stats) = run_metadata_fanout(
-        context,
-        realm_id,
-        local_node_id,
-        MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
-            request.target_nodes,
-            true,
-        )
-        .with_subject(subject)
-        .with_deadline(deadline),
-        MetadataFanoutOperation::BucketSearch,
-        local_call,
-        remote_call,
-        record_bucket_result,
-        map_read_error,
-    )
-    .await?;
-    let mut hits = parts
-        .into_iter()
-        .flat_map(|(_, hits)| hits)
-        .collect::<Vec<_>>();
-    hits.truncate(limit);
-    Ok(BucketSearchExecution { hits, fanout_stats })
 }
 
 pub async fn search_objects(
