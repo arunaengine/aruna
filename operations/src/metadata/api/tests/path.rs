@@ -187,3 +187,170 @@ fn winner_wire_sanitized() {
             .any(|window| window == permission_path.as_bytes())
     );
 }
+
+fn path_config(
+    nodes: u8,
+    shard_count: u32,
+    replica_count: Option<u32>,
+) -> (RealmConfigDocument, Ulid) {
+    let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 3);
+    let strategy = aruna_core::structs::PlacementStrategy {
+        strategy_id: Ulid::from_bytes([5u8; 16]),
+        name: "metadata-registry".to_string(),
+        replica_count,
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count,
+    };
+    config.default_strategy_id = Some(strategy.strategy_id);
+    config.strategies = vec![strategy.clone()];
+    for seed in 1..=nodes {
+        config.ensure_node(
+            iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            RealmNodeKind::Server,
+        );
+    }
+    (config, strategy.strategy_id)
+}
+
+fn holder_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(30)
+}
+
+#[tokio::test]
+async fn shard_counts_match() {
+    // The reported replica count per shard is what the merge waits for, so
+    // it must equal the holders the selection actually dispatches to.
+    let (config, strategy_id) = path_config(6, 8, Some(2));
+    let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+
+    let (selections, replica_counts) = select_path_holders(
+        &config,
+        TEST_REALM_ID,
+        Ulid::from_parts(0, 1),
+        "datasets/lookup",
+        strategy_id,
+        8,
+        Some(2),
+        local,
+        holder_deadline(),
+    )
+    .expect("holder selection succeeds");
+
+    assert_eq!(replica_counts.len(), 8);
+    assert!(selections.len() <= METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    for (shard, expected) in replica_counts.iter().copied().enumerate() {
+        let dispatched = selections
+            .iter()
+            .filter(|selection| selection.shards.contains(&(shard as u32)))
+            .count();
+        assert_eq!(expected, dispatched);
+        assert!(expected > 0);
+    }
+}
+
+#[tokio::test]
+async fn everywhere_covers_shards() {
+    // An everywhere strategy places every holder on every shard, so each
+    // selection must answer for all of them.
+    let (config, strategy_id) = path_config(4, 8, None);
+    let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+
+    let (selections, replica_counts) = select_path_holders(
+        &config,
+        TEST_REALM_ID,
+        Ulid::from_parts(0, 1),
+        "datasets/lookup",
+        strategy_id,
+        8,
+        None,
+        local,
+        holder_deadline(),
+    )
+    .expect("holder selection succeeds");
+
+    assert_eq!(selections.len(), 4);
+    assert_eq!(replica_counts, vec![4; 8]);
+    for selection in &selections {
+        assert_eq!(selection.shards, (0..8).collect::<Vec<_>>());
+    }
+}
+
+#[tokio::test]
+async fn capped_shard_rejected() {
+    // More shard holders than the fan-out cap leaves shards with nobody to
+    // ask; the lookup must fail instead of resolving from the rest.
+    let (config, strategy_id) = path_config(200, 64, Some(1));
+    let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+
+    let result = select_path_holders(
+        &config,
+        TEST_REALM_ID,
+        Ulid::from_parts(0, 1),
+        "datasets/lookup",
+        strategy_id,
+        64,
+        Some(1),
+        local,
+        holder_deadline(),
+    );
+
+    assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+}
+
+#[test]
+fn divergent_paths_fail() {
+    // Two peers that resolved the same path differently must not be
+    // reduced to one of the two answers.
+    let winner = sanitize_path_winner(public_record(Ulid::generate(), Ulid::generate()))
+        .expect("valid path winner");
+    let result = MetadataPathLookupResult {
+        winner,
+        conflicts: Vec::new(),
+    };
+
+    let resolved = reduce_path_response(Some(result.clone()), None, false, false, false)
+        .expect("a single agreeing answer resolves");
+    assert_eq!(resolved.winner, result.winner);
+    assert!(matches!(
+        reduce_path_response(Some(result), None, true, false, false),
+        Err(MetadataApiError::ServiceUnavailable)
+    ));
+    assert!(matches!(
+        reduce_path_response(None, None, false, true, false),
+        Err(MetadataApiError::NotFound)
+    ));
+    assert!(matches!(
+        reduce_path_response(None, None, false, false, false),
+        Err(MetadataApiError::ServiceUnavailable)
+    ));
+}
+
+#[test]
+fn path_denial_wins() {
+    let record = public_record(Ulid::generate(), Ulid::generate());
+    let result = MetadataPathLookupResult {
+        winner: sanitize_path_winner(record).expect("valid path winner"),
+        conflicts: Vec::new(),
+    };
+
+    assert!(matches!(
+        reduce_path_response(
+            Some(result.clone()),
+            Some(MetadataReadError::Forbidden),
+            false,
+            false,
+            false,
+        ),
+        Err(MetadataApiError::Forbidden)
+    ));
+    assert!(matches!(
+        reduce_path_response(Some(result.clone()), None, false, true, false),
+        Err(MetadataApiError::ServiceUnavailable)
+    ));
+
+    assert!(matches!(
+        reduce_path_response(Some(result), None, false, false, true,),
+        Err(MetadataApiError::ServiceUnavailable)
+    ));
+}
