@@ -1,3 +1,4 @@
+use super::engine::sync_graph_once;
 use super::*;
 
 impl MetadataVisibilityCache {
