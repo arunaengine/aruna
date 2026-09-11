@@ -1,5 +1,5 @@
-use crate::admin_document_reducer::AdminDocumentReducerState;
 use crate::admin_documents::AdminDocumentTarget;
+use crate::reducer::AdminDocumentReducerState;
 use crate::types::{GroupId, RoleId, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

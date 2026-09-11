@@ -1,7 +1,8 @@
 use crate::NodeId;
-use crate::admin_document_reducer::{AdminDocumentReducerState, RevocationIndex};
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
+use crate::identifiers::{PlacementHandle, StructuredId};
+use crate::reducer::{AdminDocumentReducerState, RevocationIndex};
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
     Actor, BandPool, BindingDirectory, BindingError, BindingScope, CandidateMapNode,
@@ -12,7 +13,6 @@ use crate::structs::{
     PlacementTransition, SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start,
     shard_for_subject,
 };
-use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -1118,9 +1118,9 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 #[cfg(test)]
 mod test {
     use crate::NodeId;
-    use crate::admin_document_reducer::AdminDocumentReducerState;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::auth::REVOCATION_GRACE_SECS;
+    use crate::reducer::AdminDocumentReducerState;
     use crate::request_policy::{PolicyKind, RequestPolicy};
     use crate::structs::{
         Actor, BindingScope, CandidatePlacementMap, DocumentClass, DynamicDiscoveryMethod,
@@ -1855,11 +1855,11 @@ mod test {
     fn owner_survives_rebalance() {
         // The derived owner is a pure function of band + binding; arbitrary
         // placement-map, strategy, and override changes never move it.
+        use crate::identifiers::{BucketId, PlacementHandle};
         use crate::structs::{
             DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, JobId,
             JobOwnerError, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
         };
-        use crate::structured_id::{BucketId, PlacementHandle};
 
         fn node_id(seed: u8) -> NodeId {
             iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -1942,8 +1942,8 @@ mod test {
 
     #[test]
     fn directory_rebuilds_state() {
+        use crate::identifiers::PlacementHandle;
         use crate::structs::{DocumentClass, HandleRange, PlacementBinding, PlacementScope};
-        use crate::structured_id::PlacementHandle;
 
         let owner = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let range_id = Ulid::from_bytes([8; 16]);

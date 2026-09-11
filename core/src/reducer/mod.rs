@@ -13,6 +13,7 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
+use crate::identifiers::PlacementHandle;
 use crate::structs::{
     Actor, BandPool, BindingScope, BucketBarrier, BucketCompletion, BucketForceFinalize,
     CandidatePlacementMap, CompletionProof, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
@@ -22,9 +23,8 @@ use crate::structs::{
     RealmDiscoveryConfig, RealmId, RealmNodeKind, StallReport, StrategyBinding, TransitionPlan,
     TransitionStatus, reserved_label,
 };
-use crate::structured_id::PlacementHandle;
 use crate::types::{RoleId, UserId};
-use crate::user_update_validation::{
+use crate::user_validation::{
     UserAttributeValidationError, validate_user_attribute_key, validate_user_attribute_value,
 };
 

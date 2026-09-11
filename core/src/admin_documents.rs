@@ -306,13 +306,13 @@ pub enum AdminDocumentOperation {
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
+    use crate::identifiers::PlacementHandle;
     use crate::structs::{
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
         PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, QuotaConfig,
         RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
-    use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
