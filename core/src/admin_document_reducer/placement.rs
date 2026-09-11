@@ -418,3 +418,176 @@ fn repair_realm_config_placement_references(config: &mut RealmConfigDocument) {
         }
     }
 }
+
+impl AdminDocumentReducerState {
+    pub fn materialized_realm_config_nodes(&self) -> BTreeMap<NodeId, RealmNodeKind> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let node_id = realm_config_node_id_from_path(path)?;
+                let kind = version
+                    .value
+                    .as_deref()
+                    .and_then(realm_node_kind_from_value)?;
+                Some((node_id, kind))
+            })
+            .collect()
+    }
+
+    /// Nodes whose membership path reduced to no value. The overlays need them
+    /// because a stored configuration still carries the earlier membership.
+    pub fn removed_config_nodes(&self) -> BTreeSet<NodeId> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeSet::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter(|(_, version)| version.value.is_none())
+            .filter_map(|(path, _)| realm_config_node_id_from_path(path))
+            .collect()
+    }
+    pub fn materialized_realm_config_placement_map(&self) -> BTreeMap<NodeId, NodePlacementEntry> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let node_id = realm_config_placement_node_id_from_path(path)?;
+                let entry = version
+                    .value
+                    .as_deref()
+                    .and_then(placement_entry_from_value)?;
+
+                (entry.node_id == node_id).then_some((node_id, entry))
+            })
+            .collect()
+    }
+
+    pub fn materialized_realm_config_placement_strategies(
+        &self,
+    ) -> BTreeMap<Ulid, PlacementStrategy> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let strategy_id = realm_config_placement_strategy_id_from_path(path)?;
+                let strategy = version
+                    .value
+                    .as_deref()
+                    .and_then(placement_strategy_from_value)?;
+
+                (strategy.strategy_id == strategy_id).then_some((strategy_id, strategy))
+            })
+            .collect()
+    }
+
+    pub fn materialized_realm_config_default_strategy(&self) -> Option<Ulid> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| Ulid::from_string(value).ok())
+    }
+
+    /// The stored submission-family strategy. A conflicted or nil value
+    /// materializes as `None`, which every derivation refuses.
+    pub fn materialized_family_strategy(&self) -> Option<Ulid> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_JOB_FAMILY_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| Ulid::from_string(value).ok())
+            .filter(|strategy_id| !strategy_id.is_nil())
+    }
+
+    pub fn materialized_realm_config_strategy_bindings(&self) -> BTreeMap<String, StrategyBinding> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let scope_key = realm_config_strategy_binding_scope_key_from_path(path)?;
+                let binding = version
+                    .value
+                    .as_deref()
+                    .and_then(strategy_binding_from_value)
+                    .map(|binding| normalized_strategy_binding(&binding))?;
+
+                let canonical_scope_key = binding_scope_key(&binding.scope);
+                (canonical_scope_key == scope_key).then_some((canonical_scope_key, binding))
+            })
+            .collect()
+    }
+
+    pub fn materialized_realm_config_placement_overrides(
+        &self,
+    ) -> BTreeMap<String, PlacementOverride> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let subject_key = realm_config_placement_override_subject_key_from_path(path)?;
+                let record = version
+                    .value
+                    .as_deref()
+                    .and_then(placement_override_from_value)?;
+
+                (hex::encode(&record.subject) == subject_key)
+                    .then(|| (subject_key.to_string(), record))
+            })
+            .collect()
+    }
+
+    pub fn materialized_placement_bindings(&self) -> BTreeMap<PlacementHandle, PlacementBinding> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let handle = placement_binding_handle(path)?;
+                let binding = version.value.as_deref().and_then(parse_placement_binding)?;
+
+                (binding.handle == handle).then_some((handle, binding))
+            })
+            .collect()
+    }
+
+    pub fn materialized_handle_ranges(&self) -> BTreeMap<Ulid, HandleRange> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let range_id = handle_range_id(path)?;
+                let range = version.value.as_deref().and_then(parse_handle_range)?;
+
+                (range.range_id == range_id).then_some((range_id, range))
+            })
+            .collect()
+    }
+}
