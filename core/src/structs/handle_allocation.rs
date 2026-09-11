@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::identifiers::PlacementHandle;
 use crate::structs::{FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange};
-use crate::structured_id::PlacementHandle;
 
 /// The derived view over the replicated handle-range set. Overlapping grants —
 /// or two distinct values re-using one `range_id` — are retained as conflicted
