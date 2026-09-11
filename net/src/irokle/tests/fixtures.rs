@@ -401,3 +401,100 @@ pub(super) async fn assert_registry_record_present(
     assert_eq!(document_index, *record);
     assert_eq!(holders, record.holder_node_ids);
 }
+
+pub(super) async fn assert_registry_record_deleted(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+) {
+    assert!(
+        read_storage_value(
+            storage,
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        read_storage_value(
+            storage,
+            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            metadata_document_key(document_id),
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        read_storage_value(
+            storage,
+            METADATA_HOLDERS_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await
+        .is_none()
+    );
+}
+
+pub(super) fn metadata_create_event(
+    group_id: Ulid,
+    document_id: Ulid,
+    updated_at_ms: u64,
+    event_id: Ulid,
+    actor_seed: u8,
+) -> MetadataCreateEventRecord {
+    let realm_id = RealmId::from_bytes([42; 32]);
+    MetadataCreateEventRecord {
+        event_id,
+        record: registry_record(
+            group_id,
+            document_id,
+            "datasets/lifecycle",
+            updated_at_ms,
+            event_id,
+        ),
+        user_id: UserId::local(Ulid::from_parts(90, 1), realm_id),
+        node_id: node(actor_seed),
+        payload: MetadataCreateEventPayload::Scaffold {
+            name: "Lifecycle".to_string(),
+            description: "Lifecycle event".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+        },
+        occurred_at_ms: updated_at_ms,
+    }
+}
+
+pub(super) fn metadata_delete_lifecycle(
+    group_id: Ulid,
+    document_id: Ulid,
+    updated_at_ms: u64,
+    event_id: Ulid,
+    deleted_after_event_id: Ulid,
+) -> MetadataDocumentLifecycleRecord {
+    let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+    MetadataDocumentLifecycleRecord::Delete {
+        event: MetadataDocumentDeleteRecord {
+            event_id,
+            tombstone: MetadataGraphLifecycleRecord::deleted(
+                graph_iri,
+                RealmId::from_bytes([42; 32]),
+                group_id,
+                document_id,
+                updated_at_ms,
+            ),
+            deleted_after_event_id,
+        },
+    }
+}
+
+pub(super) fn metadata_lifecycle_change(
+    lifecycle: &MetadataDocumentLifecycleRecord,
+    actor: NodeId,
+) -> DocumentSyncChange {
+    aruna_core::storage_entries::metadata_document_lifecycle_revision_change(
+        lifecycle,
+        actor,
+        aruna_core::structs::PlacementRef::NIL,
+    )
+}
