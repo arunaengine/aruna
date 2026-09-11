@@ -452,9 +452,9 @@ pub fn policy_manifests(config: &KubernetesConfig) -> Result<Vec<PolicyManifest>
                 path.display()
             ))
         })?;
-        for (index, document) in serde_yaml::Deserializer::from_str(&text).enumerate() {
-            let value = serde_json::Value::deserialize(document)
-                .map_err(|error| policy_error(path, index, &error.to_string()))?;
+        let documents: Vec<serde_json::Value> = serde_saphyr::from_multiple(&text)
+            .map_err(|error| policy_error(path, 0, &error.to_string()))?;
+        for (index, value) in documents.into_iter().enumerate() {
             if value.is_null() {
                 continue;
             }
