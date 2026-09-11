@@ -2845,7 +2845,7 @@ mod tests {
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
     use tokio::io::AsyncWriteExt;
-    use visibility::{group_record, read_rules, registry_record};
+    use visibility::{filled_cache, group_record, read_rules, registry_record};
 
     const ROCRATE_12: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
