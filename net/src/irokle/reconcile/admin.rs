@@ -520,3 +520,238 @@ pub(in crate::document_sync) async fn flush_config_run(
     }
     Ok(())
 }
+
+/// Applies a run of coalescible realm-config events in one transaction. A
+/// realm-scale transition replicates hundreds of barrier and proof values;
+/// decoding and rewriting the reducer state per event is quadratic and stalls
+/// every later document behind the batch, so the run pays for state, document,
+/// materialization, and commit once.
+pub(in crate::document_sync) async fn apply_config_events(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    events: Vec<AdminDocumentEvent>,
+) -> Result<()> {
+    let DocumentSyncTarget::RealmConfig { realm_id } = document_target.clone() else {
+        return Err(NetError::Bootstrap(
+            "realm config admin operation sync only supports realm config targets".to_string(),
+        ));
+    };
+    for event in &events {
+        let AdminDocumentTarget::RealmConfig {
+            realm_id: event_realm_id,
+        } = event.target
+        else {
+            return Err(NetError::Bootstrap(
+                "admin document operation payload target is not a realm config".to_string(),
+            ));
+        };
+        if event_realm_id != realm_id {
+            return Err(NetError::Bootstrap(format!(
+                "replicated realm config admin operation target {realm_id} does not match payload realm id {event_realm_id}"
+            )));
+        }
+        if !coalescible_config_op(&event.op) {
+            return Err(NetError::Bootstrap(
+                "realm config event run only supports transition updates".to_string(),
+            ));
+        }
+        if event.origin_node_id != event.actor.node_id
+            || event.actor.realm_id != realm_id
+            || event.actor.user_id.realm_id != realm_id
+        {
+            return Err(NetError::Bootstrap(
+                "realm config event actor and origin do not match the target realm".to_string(),
+            ));
+        }
+    }
+    let Some(actor) = events.last().map(|event| event.actor.clone()) else {
+        return Ok(());
+    };
+
+    // A transient SSI conflict must never become stream-fatal: an aborted
+    // inbound apply leaves ops without meta and wedges the topic. Local
+    // interleavings are finite, so retry with yields; the bound stays a
+    // safety valve against a genuine livelock.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
+        let raw_now = unix_timestamp_secs();
+        let txn_id = start_storage_transaction(storage).await?;
+        let previous_state = match storage_read_from_transaction(
+            storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id }),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| decode_admin_document_reducer_state(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        let previous_config = match storage_read_from_transaction(
+            storage,
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+
+        let effective_now = previous_state
+            .as_ref()
+            .map_or(raw_now, |state| state.revocation_floor.max(raw_now));
+        let mut reducer_state = previous_state.clone().unwrap_or_else(|| {
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id })
+        });
+        for event in &events {
+            if let Err(error) = reducer_state.apply(event) {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        }
+        reducer_state.advance_revocation_floor(effective_now);
+        let needs_index = needs_revocation_index(
+            false,
+            previous_config.is_some(),
+            &reducer_state,
+            effective_now,
+        );
+        let mut revocation_index =
+            needs_index.then(|| reducer_state.revocation_index(effective_now));
+        if let Some(index) = revocation_index.as_mut() {
+            index.compact(&mut reducer_state);
+        }
+
+        let (config, config_changed) = match previous_config {
+            Some(mut config) => {
+                if config.realm_id != realm_id {
+                    return Err(
+                        abort_error(
+                            storage,
+                            txn_id,
+                            NetError::Bootstrap(format!(
+                                "stored realm config document id {realm_id} does not match payload realm id {}",
+                                config.realm_id
+                            )),
+                        )
+                        .await,
+                    );
+                }
+                let before = config.clone();
+                overlay_realm_config_reducer_materialization(
+                    &mut config,
+                    &reducer_state,
+                    effective_now,
+                    unix_timestamp_millis(),
+                    revocation_index.as_ref(),
+                );
+                let changed = config != before;
+                (Some(config), changed)
+            }
+            None => {
+                let config = realm_config_from_reducer_materialization(
+                    realm_id,
+                    &reducer_state,
+                    effective_now,
+                    unix_timestamp_millis(),
+                    revocation_index.as_ref(),
+                );
+                let changed = config.is_some();
+                (config, changed)
+            }
+        };
+        if previous_state
+            .as_ref()
+            .is_some_and(|previous| previous == &reducer_state)
+            && !config_changed
+        {
+            abort_txn(storage, txn_id).await?;
+            return Ok(());
+        }
+
+        let mut writes = Vec::new();
+        if config_changed && let Some(config) = config {
+            let bytes = match config.to_bytes(&actor) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.push((
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+                bytes.into(),
+            ));
+        }
+        let reducer_write = match admin_document_reducer_state_write_entry(&reducer_state) {
+            Ok(write) => write,
+            Err(error) => {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        };
+        writes.push(reducer_write);
+        if previous_state
+            .as_ref()
+            .is_none_or(|previous| previous.conflicts != reducer_state.conflicts)
+        {
+            let conflict_writes = match admin_document_conflict_write_entries(&reducer_state) {
+                Ok(writes) => writes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.extend(conflict_writes);
+        }
+
+        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
+            previous_state.as_ref(),
+            Some(&reducer_state),
+        );
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            stale_conflict_deletes,
+            writes,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
+                abort_txn(storage, txn_id).await?;
+            }
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+    }
+    Err(NetError::Dht(
+        "realm config admin operation conflict retries exhausted".to_string(),
+    ))
+}
