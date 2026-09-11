@@ -364,3 +364,42 @@ fn ensure_metadata_query_not_cancelled(
 fn invalid_snapshot_term(term: &str) -> MetadataError {
     MetadataError::Backend(format!("invalid RDF term in metadata snapshot: {term}"))
 }
+
+pub(super) fn snapshot_iri_references(
+    node: &CraqleNode,
+    graph: &GraphId,
+) -> Result<Vec<(String, String, String)>, MetadataError> {
+    let snapshot = node
+        .graph_snapshot(graph)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let orphaned = node
+        .graph_diagnostics(graph)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?
+        .orphaned_entities
+        .into_iter()
+        .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
+        .collect::<HashSet<_>>();
+    let mut references = Vec::new();
+    for quad in snapshot.quads {
+        if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
+            continue;
+        }
+        let subject = match quad.subject.to_term() {
+            Some(Term::NamedNode(node)) => node.as_str().to_string(),
+            Some(Term::BlankNode(node)) => format!("_:{}", node.as_str()),
+            _ => continue,
+        };
+        let Some(predicate) = quad.predicate.to_named_node() else {
+            continue;
+        };
+        let Some(Term::NamedNode(object)) = quad.object.to_term() else {
+            continue;
+        };
+        references.push((
+            subject,
+            predicate.as_str().to_string(),
+            object.as_str().to_string(),
+        ));
+    }
+    Ok(references)
+}
