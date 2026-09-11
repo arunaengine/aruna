@@ -612,6 +612,17 @@ fn screens_session_support() {
     capable.capability.session = true;
     let outcome = plan(&plan_request, vec![capable], &config(Vec::new()));
     assert!(outcome.selected.is_some());
+
+    // An open-network session needs no S3 reachability of its own, so a
+    // backend without the capability may still take it.
+    let mut open = plan_request.clone();
+    open.network = NetworkAccess::Open;
+    let outcome = plan(
+        &open,
+        vec![candidate(target, "docker")],
+        &config(Vec::new()),
+    );
+    assert!(outcome.selected.is_some());
 }
 
 #[test]

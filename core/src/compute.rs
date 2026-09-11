@@ -86,7 +86,8 @@ pub struct ExecutorCapability {
     /// The backend proves worker placement and enforces network isolation,
     /// which protected data requires before open networking is allowed.
     pub network_policy: bool,
-    /// The backend can open a session channel and reach S3 for one.
+    /// The backend can open a session channel that reaches S3 without the open
+    /// network.
     #[serde(default)]
     pub session: bool,
     /// Execution site this backend runs on, carrying its own generation.
