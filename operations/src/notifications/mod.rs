@@ -11,6 +11,6 @@ pub mod protocol;
 pub mod prune;
 pub mod routing;
 #[cfg(test)]
-mod test_support;
+mod tests;
 pub mod unread;
 pub mod watch;

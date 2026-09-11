@@ -786,7 +786,7 @@ async fn abort_and_classify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::test_support::{context, temp_storage, user};
+    use crate::notifications::tests::fixtures::{context, temp_storage, user};
     use aruna_core::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{

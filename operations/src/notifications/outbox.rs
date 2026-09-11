@@ -179,7 +179,7 @@ async fn restore_notification_outbox_timer_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::test_support::{record, temp_storage, user};
+    use crate::notifications::tests::fixtures::{record, temp_storage, user};
     use aruna_core::structs::{NotificationClass, notification_outbox_key};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
