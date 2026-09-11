@@ -1487,3 +1487,39 @@ async fn metadata_lifecycle_delete_skips_stale_and_equal_sidecars() {
     let revision = read_lifecycle_revision(&storage, document_id).await;
     assert_eq!(revision, local_change);
 }
+
+#[test]
+fn metadata_document_delete_write_entries_include_prune_job() {
+    let document_id = Ulid::from_parts(10, 1);
+    let tombstone = MetadataGraphLifecycleRecord::deleted(
+        "urn:graph:deleted".to_string(),
+        RealmId::from_bytes([1; 32]),
+        Ulid::from_parts(11, 1),
+        document_id,
+        12,
+    );
+    let record = MetadataDocumentDeleteRecord {
+        event_id: Ulid::from_parts(13, 1),
+        tombstone: tombstone.clone(),
+        deleted_after_event_id: Ulid::from_parts(9, 1),
+    };
+
+    let entries = metadata_document_delete_write_entries(&record).expect("entries build");
+
+    let prune_jobs = entries
+        .iter()
+        .filter(|(keyspace, _, _)| keyspace == METADATA_GRAPH_PRUNE_JOB_KEYSPACE)
+        .map(|(_, _, value)| {
+            postcard::from_bytes::<MetadataGraphPruneJobRecord>(value.as_ref())
+                .expect("prune job decodes")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prune_jobs.len(), 1);
+    assert_eq!(prune_jobs[0].graph_iri, tombstone.graph_iri);
+    assert_eq!(prune_jobs[0].attempts, 0);
+    assert!(prune_jobs[0].last_error.is_none());
+}
+
+// A publisher that is not the document's origin (allow_genesis=false) must not
+// mint a missing topic's genesis: it gets a retryable error and no topic is
+// created. The origin (allow_genesis=true) creates the topic and publishes.
