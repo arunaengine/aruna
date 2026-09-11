@@ -52,7 +52,7 @@ fn allowed_publish_use(publish_use: &PublishUse) -> bool {
         "operations/src/tasks/task_incoming/outbox.rs" => {
             publish_use.function.as_deref() == Some("document_publish_from_outbox")
         }
-        "net/src/irokle.rs" => {
+        "net/src/irokle/mod.rs" => {
             matches!(
                 (publish_use.function.as_deref(), publish_use.text.as_str()),
                 (
@@ -114,6 +114,13 @@ fn scan_file(workspace_root: &Path, path: &Path) -> Vec<PublishUse> {
         .unwrap_or_else(|err| panic!("failed to make {path:?} relative: {err}"))
         .to_string_lossy()
         .replace('\\', "/");
+
+    if relative_path
+        .split('/')
+        .any(|segment| segment == "tests" || segment == "tests.rs")
+    {
+        return Vec::new();
+    }
 
     let mut matches = Vec::new();
     let mut pending_cfg_test = false;
