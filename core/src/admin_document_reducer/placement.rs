@@ -356,7 +356,7 @@ fn retain_referenced_maps(config: &mut RealmConfigDocument) {
         .retain(|map| referenced.contains(&map.epoch));
 }
 
-pub(super) fn order_by_bucket_and_node(left: &BucketBarrier, right: &BucketBarrier) -> Ordering {
+fn order_by_bucket_and_node(left: &BucketBarrier, right: &BucketBarrier) -> Ordering {
     left.bucket.cmp(&right.bucket).then_with(|| {
         left.reported_by
             .as_bytes()
@@ -364,13 +364,13 @@ pub(super) fn order_by_bucket_and_node(left: &BucketBarrier, right: &BucketBarri
     })
 }
 
-pub(super) fn order_proofs(left: &CompletionProof, right: &CompletionProof) -> Ordering {
+fn order_proofs(left: &CompletionProof, right: &CompletionProof) -> Ordering {
     left.bucket
         .cmp(&right.bucket)
         .then_with(|| left.holder.as_bytes().cmp(right.holder.as_bytes()))
 }
 
-pub(super) fn order_stalls(left: &StallReport, right: &StallReport) -> Ordering {
+fn order_stalls(left: &StallReport, right: &StallReport) -> Ordering {
     left.bucket.cmp(&right.bucket).then_with(|| {
         left.reported_by
             .as_bytes()
@@ -587,6 +587,230 @@ impl AdminDocumentReducerState {
                 let range = version.value.as_deref().and_then(parse_handle_range)?;
 
                 (range.range_id == range_id).then_some((range_id, range))
+            })
+            .collect()
+    }
+}
+
+impl AdminDocumentReducerState {
+    pub fn materialized_candidate_maps(&self) -> BTreeMap<u64, CandidatePlacementMap> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let epoch = candidate_map_epoch(path)?;
+                let map = version
+                    .value
+                    .as_deref()
+                    .and_then(candidate_map_from_value)?;
+
+                (map.epoch == epoch).then_some((epoch, map))
+            })
+            .collect()
+    }
+
+    /// Map epoch each strategy's buckets were activated at. Per-bucket
+    /// activations are derived from it plus the reduced transitions.
+    pub fn materialized_activation_epochs(&self) -> BTreeMap<Ulid, u64> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let strategy_id = activation_strategy(path)?;
+                let epoch = version.value.as_deref()?.parse().ok()?;
+
+                Some((strategy_id, epoch))
+            })
+            .collect()
+    }
+
+    pub fn materialized_transition_plans(&self) -> BTreeMap<Ulid, TransitionPlan> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let (transition_id, TransitionPart::Plan) = transition_part(path)? else {
+                    return None;
+                };
+                let plan = version
+                    .value
+                    .as_deref()
+                    .and_then(transition_plan_from_value)?;
+
+                (plan.transition_id == transition_id).then_some((transition_id, plan))
+            })
+            .collect()
+    }
+
+    /// Assembles each transition from its plan plus the reduced barrier, proof,
+    /// force, and stall sets. Entries that do not match their own path, the
+    /// plan's strategy, or a planned bucket are dropped.
+    pub fn materialized_transitions(&self) -> Vec<PlacementTransition> {
+        let mut transitions: BTreeMap<Ulid, PlacementTransition> = self
+            .materialized_transition_plans()
+            .into_iter()
+            .map(|(transition_id, plan)| (transition_id, PlacementTransition::new(plan)))
+            .collect();
+
+        for (path, version) in &self.user_subject_ids {
+            let Some((transition_id, part)) = transition_part(path) else {
+                continue;
+            };
+            let Some(transition) = transitions.get_mut(&transition_id) else {
+                continue;
+            };
+            let Some(value) = version.value.as_deref() else {
+                continue;
+            };
+            match part {
+                TransitionPart::Plan => {}
+                TransitionPart::Aborted => transition.status = TransitionStatus::Aborted,
+                TransitionPart::Barrier(bucket, reported_by) => {
+                    // Only planned old holders fence; a foreign report never
+                    // enters the record or the digest proofs commit to.
+                    if let Ok(frontier) = hex::decode(value)
+                        && transition
+                            .plan
+                            .bucket_plan(bucket)
+                            .is_some_and(|plan| plan.old_holders.contains(&reported_by))
+                    {
+                        transition.barriers.push(BucketBarrier {
+                            bucket,
+                            reported_by,
+                            frontier,
+                        });
+                    }
+                }
+                TransitionPart::Proof(bucket, holder) => {
+                    let Some((strategy_id, proof)) = transition_proof_from_value(value) else {
+                        continue;
+                    };
+                    // A proof from outside the planned target set never enters
+                    // the record; the tuple predicate rejects the rest lazily.
+                    if strategy_id == transition.plan.strategy_id
+                        && proof.bucket == bucket
+                        && proof.holder == holder
+                        && transition
+                            .plan
+                            .bucket_plan(bucket)
+                            .is_some_and(|plan| plan.target_holders.contains(&holder))
+                    {
+                        transition.proofs.push(proof);
+                    }
+                }
+                TransitionPart::Forced(bucket) => {
+                    if transition.plan.covers(bucket) {
+                        transition.forced.push(BucketForceFinalize {
+                            bucket,
+                            at_risk_report: value.to_string(),
+                        });
+                    }
+                }
+                TransitionPart::Stall(bucket, reported_by) => {
+                    if transition.plan.bucket_plan(bucket).is_some_and(|plan| {
+                        plan.old_holders.contains(&reported_by)
+                            || plan.target_holders.contains(&reported_by)
+                    }) {
+                        transition.stalls.push(StallReport {
+                            bucket,
+                            reported_by,
+                            reason: value.to_string(),
+                        });
+                    }
+                }
+                TransitionPart::Drain(bucket, reported_by) => {
+                    // Only a departing old holder owes (or may end) retention.
+                    if transition.plan.bucket_plan(bucket).is_some_and(|plan| {
+                        plan.old_holders.contains(&reported_by)
+                            && !plan.target_holders.contains(&reported_by)
+                    }) {
+                        transition.drained.push(crate::structs::BucketDrain {
+                            bucket,
+                            reported_by,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut assembled: Vec<PlacementTransition> = transitions.into_values().collect();
+        for transition in assembled.iter_mut() {
+            transition.barriers.sort_by(order_by_bucket_and_node);
+            transition.proofs.sort_by(order_proofs);
+            transition.forced.sort_by_key(|entry| entry.bucket);
+            transition.stalls.sort_by(order_stalls);
+            transition.drained.sort_by(|left, right| {
+                left.bucket.cmp(&right.bucket).then_with(|| {
+                    left.reported_by
+                        .as_bytes()
+                        .cmp(right.reported_by.as_bytes())
+                })
+            });
+            transition.completed = transition
+                .plan
+                .buckets
+                .iter()
+                .filter(|plan| transition.bucket_ready(plan.bucket))
+                .map(|plan| BucketCompletion {
+                    bucket: plan.bucket,
+                    completed_at_ms: self.proof_timestamp(transition, plan.bucket),
+                })
+                .collect();
+        }
+        assembled
+    }
+
+    /// Completion time of a bucket: the newest carried event timestamp among
+    /// its proofs. Carried data, so every replica derives the same instant
+    /// without consulting a local clock.
+    fn proof_timestamp(&self, transition: &PlacementTransition, bucket: u32) -> u64 {
+        transition
+            .plan
+            .bucket_plan(bucket)
+            .into_iter()
+            .flat_map(|plan| plan.target_holders.iter())
+            .map(|holder| transition_proof_path(&transition.plan.transition_id, bucket, holder))
+            .filter_map(|path| self.path_timestamp(&path))
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// Newest event timestamp recorded for a path, across its version dot and
+    /// any equivalent-value dots.
+    fn path_timestamp(&self, path: &str) -> Option<u64> {
+        let version = self
+            .user_subject_ids
+            .get(path)
+            .map(|version| version.dot.event_id.timestamp_ms());
+        let equivalent = self
+            .equivalent_value_dots
+            .get(path)
+            .and_then(|dots| dots.iter().map(|dot| dot.event_id.timestamp_ms()).max());
+        version.max(equivalent).or(equivalent)
+    }
+
+
+    pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let pool_id = band_pool_id(path)?;
+                let pool = version.value.as_deref().and_then(parse_band_pool)?;
+
+                (pool.pool_id == pool_id).then_some((pool_id, pool))
             })
             .collect()
     }
