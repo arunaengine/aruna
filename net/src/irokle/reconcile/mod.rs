@@ -465,3 +465,96 @@ impl DocumentSyncService {
         })
     }
 }
+
+pub(in crate::document_sync) fn satisfied_document_sync_dependencies(
+    target: &DocumentSyncTarget,
+    event: &AdminDocumentEvent,
+) -> Vec<DocumentSyncDependency> {
+    let mut dependencies = Vec::new();
+    match target {
+        DocumentSyncTarget::RealmConfig { realm_id } => {
+            dependencies.push(DocumentSyncDependency::RealmConfig(*realm_id));
+            if let AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } =
+                &event.op
+            {
+                dependencies.push(DocumentSyncDependency::PlacementStrategy {
+                    realm_id: *realm_id,
+                    strategy_id: strategy.strategy_id,
+                });
+            }
+        }
+        DocumentSyncTarget::RealmAuthorization { realm_id } => {
+            dependencies.push(DocumentSyncDependency::RealmAuthorization(*realm_id));
+        }
+        DocumentSyncTarget::GroupAuthorization { group_id } => {
+            dependencies.push(DocumentSyncDependency::GroupAuthorization(*group_id));
+        }
+        _ => {}
+    }
+    dependencies
+}
+
+pub(in crate::document_sync) async fn document_sync_dependency_available(
+    storage: &StorageHandle,
+    dependency: DocumentSyncDependency,
+) -> Result<bool> {
+    match dependency {
+        DocumentSyncDependency::RealmConfig(realm_id) => {
+            Ok(read_admin_realm_config(storage, realm_id).await?.is_some())
+        }
+        DocumentSyncDependency::RealmAuthorization(realm_id) => {
+            Ok(read_admin_realm_authorization(storage, realm_id)
+                .await?
+                .is_some())
+        }
+        DocumentSyncDependency::PlacementStrategy {
+            realm_id,
+            strategy_id,
+        } => Ok(read_admin_realm_config(storage, realm_id)
+            .await?
+            .is_some_and(|config| {
+                config.realm_id == realm_id && config.strategy(&strategy_id).is_some()
+            })),
+        DocumentSyncDependency::GroupAuthorization(group_id) => {
+            Ok(read_group_authorization(storage, group_id).await?.is_some())
+        }
+    }
+}
+
+pub(in crate::document_sync) fn register_deferred_topic(
+    deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
+    dependency: DocumentSyncDependency,
+    topic_id: irokle_crate::TopicId,
+) -> DeferredTopicRegistrationOutcome {
+    if deferred_topics
+        .get(&dependency)
+        .is_some_and(|topics| topics.contains(&topic_id))
+    {
+        return DeferredTopicRegistrationOutcome::AlreadyRegistered;
+    }
+    let total_topics = deferred_topics.values().map(BTreeSet::len).sum::<usize>();
+    let dependency_topics = deferred_topics
+        .get(&dependency)
+        .map(BTreeSet::len)
+        .unwrap_or_default();
+    if total_topics >= MAX_DEFERRED_TOPICS
+        || dependency_topics >= MAX_DEFERRED_TOPICS_PER_DEPENDENCY
+    {
+        return DeferredTopicRegistrationOutcome::CapacityExceeded;
+    }
+    deferred_topics
+        .entry(dependency)
+        .or_default()
+        .insert(topic_id);
+    DeferredTopicRegistrationOutcome::Inserted
+}
+
+pub(in crate::document_sync) fn remove_deferred_topic(
+    deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
+    topic_id: irokle_crate::TopicId,
+) {
+    for topics in deferred_topics.values_mut() {
+        topics.remove(&topic_id);
+    }
+    deferred_topics.retain(|_, topics| !topics.is_empty());
+}
