@@ -6183,31 +6183,6 @@ async fn apply_watch_subscription_change_to_storage(
     ))
 }
 
-fn metadata_document_delete_write_entries(
-    record: &MetadataDocumentDeleteRecord,
-) -> Result<Vec<(String, ByteView, Value)>> {
-    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
-        event: record.clone(),
-    };
-    let mut entries = vec![
-        metadata_document_lifecycle_write_entry(&lifecycle)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-        metadata_graph_lifecycle_write_entry(&record.tombstone)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    ];
-    if record.tombstone.is_deleted() {
-        let job = MetadataGraphPruneJobRecord::new(
-            record.tombstone.graph_iri.clone(),
-            unix_timestamp_millis(),
-        );
-        entries.push(
-            metadata_graph_prune_job_write_entry(&job)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-        );
-    }
-    Ok(entries)
-}
-
 fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
 }
