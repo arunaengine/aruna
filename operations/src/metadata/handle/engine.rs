@@ -843,3 +843,153 @@ fn number_literal(number: &serde_json::Number) -> Term {
         NamedNode::new_unchecked(datatype),
     ))
 }
+
+fn value_object_term(object: &serde_json::Map<String, Value>) -> Result<Term, CraqleError> {
+    let value = object
+        .get("@value")
+        .or_else(|| object.get("value"))
+        .ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                "value object missing `@value`".to_string(),
+            ))
+        })?;
+    let language = object
+        .get("@language")
+        .or_else(|| object.get("language"))
+        .and_then(Value::as_str);
+    let datatype = object
+        .get("@type")
+        .or_else(|| object.get("type"))
+        .and_then(Value::as_str);
+
+    match value {
+        Value::String(text) => {
+            if let Some(language) = language {
+                Ok(Term::Literal(
+                    Literal::new_language_tagged_literal_unchecked(text, language),
+                ))
+            } else if let Some(datatype) = datatype {
+                Ok(Term::Literal(Literal::new_typed_literal(
+                    text.clone(),
+                    datatype_named_node(datatype)?,
+                )))
+            } else {
+                Ok(Term::Literal(Literal::new_simple_literal(text)))
+            }
+        }
+        Value::Bool(boolean) => Ok(Term::Literal(Literal::new_typed_literal(
+            boolean.to_string(),
+            datatype
+                .map(datatype_named_node)
+                .transpose()?
+                .unwrap_or_else(|| {
+                    NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#boolean")
+                }),
+        ))),
+        Value::Number(number) => Ok(Term::Literal(Literal::new_typed_literal(
+            number.to_string(),
+            datatype
+                .map(datatype_named_node)
+                .transpose()?
+                .unwrap_or_else(|| {
+                    if number.as_i64().is_some() || number.as_u64().is_some() {
+                        NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer")
+                    } else {
+                        NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#double")
+                    }
+                }),
+        ))),
+        Value::Null => Ok(Term::Literal(Literal::new_simple_literal(""))),
+        Value::Array(_) | Value::Object(_) => Err(CraqleError::RoCrate(
+            RoCrateError::UnsupportedJsonLd("value object `@value` must be scalar".to_string()),
+        )),
+    }
+}
+
+fn datatype_named_node(datatype: &str) -> Result<NamedNode, CraqleError> {
+    if datatype.starts_with("http://") || datatype.starts_with("https://") {
+        Ok(NamedNode::new_unchecked(datatype))
+    } else {
+        expand_known_compact_iri(datatype)
+    }
+}
+
+fn expand_known_compact_iri(value: &str) -> Result<NamedNode, CraqleError> {
+    if let Some(local) = value.strip_prefix("schema:") {
+        Ok(NamedNode::new_unchecked(format!(
+            "http://schema.org/{local}"
+        )))
+    } else if let Some(local) = value.strip_prefix("rdf:") {
+        Ok(NamedNode::new_unchecked(format!(
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#{local}"
+        )))
+    } else if let Some(local) = value.strip_prefix("rdfs:") {
+        Ok(NamedNode::new_unchecked(format!(
+            "http://www.w3.org/2000/01/rdf-schema#{local}"
+        )))
+    } else {
+        Err(CraqleError::RoCrate(RoCrateError::UnsupportedTerm(
+            value.to_string(),
+        )))
+    }
+}
+
+fn normalize_property(property: &str) -> String {
+    property
+        .strip_prefix("schema:")
+        .or_else(|| property.strip_prefix("http://schema.org/"))
+        .or_else(|| property.strip_prefix("https://schema.org/"))
+        .map(str::to_string)
+        .unwrap_or_else(|| property.to_string())
+}
+
+fn normalize_term(term: &str) -> String {
+    normalize_property(term)
+}
+
+fn normalize_entity_id(id: &str) -> String {
+    if id == "ro-crate-metadata.json"
+        || id.starts_with("./")
+        || id.starts_with("../")
+        || id.starts_with('#')
+        || id.starts_with("_:")
+        || id.contains("://")
+        || (id.contains(':') && !id.contains('/'))
+    {
+        id.to_string()
+    } else {
+        format!("./{id}")
+    }
+}
+
+fn property_expects_identifier(property: &str) -> bool {
+    matches!(property, "license" | "about" | "conformsTo")
+}
+
+fn is_reference_object(object: &serde_json::Map<String, Value>) -> bool {
+    let has_identifier = object.contains_key("@id") || object.contains_key("id");
+    has_identifier
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "@id" | "id" | "@type" | "type"))
+}
+
+fn is_value_object(object: &serde_json::Map<String, Value>) -> bool {
+    let has_value = object.contains_key("@value") || object.contains_key("value");
+    has_value
+        && object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "@value" | "value" | "@type" | "type" | "@language" | "language"
+            )
+        })
+}
+
+fn looks_like_identifier(value: &str) -> bool {
+    value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('#')
+        || value.starts_with("_:")
+        || value.contains("://")
+        || (value.contains(':') && !value.contains(' '))
+}
