@@ -903,7 +903,7 @@ impl OperationsTaskHandler {
         };
 
         let realm_id = *net_handle.realm_id();
-        let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
+        let realm_config = outbox::load_realm_config_for_drain(&self.context, realm_id).await;
 
         let rotation = self.take_rotation();
         let Some(rotation) = self.open_rotation(&retry_key, rotation).await else {
@@ -1020,7 +1020,7 @@ impl OperationsTaskHandler {
                 invocation.config_drained |=
                     matches!(record.target, DocumentSyncTarget::RealmConfig { .. });
                 record.placement =
-                    resolve_publish_placement(config, &record.target, record.placement);
+                    outbox::resolve_publish_placement(config, &record.target, record.placement);
                 let topic = record.target.sync_topic_id(realm_id, &record.placement);
                 (record_key, record, topic)
             })
@@ -1187,7 +1187,7 @@ impl OperationsTaskHandler {
         > = BTreeMap::new();
         for (record_key, record, topic) in records {
             let origin = admin_origin(&record);
-            let document = document_publish_from_outbox(
+            let document = outbox::document_publish_from_outbox(
                 record.outbox_id,
                 record.target.clone(),
                 record.event,
