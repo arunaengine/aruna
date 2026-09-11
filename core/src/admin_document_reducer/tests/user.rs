@@ -365,3 +365,205 @@ fn same_origin_out_of_order_same_field_is_stale_and_duplicate_replay_is_idempote
     );
     assert!(newer_first.conflicts.is_empty());
 }
+
+#[test]
+fn newer_same_origin_value_replaces_its_older_conflict_value_in_any_order() {
+    let first_origin = node(1);
+    let concurrent_origin = node(2);
+    let older = event(
+        1,
+        first_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "physics".to_string(),
+        },
+    );
+    let concurrent = event(
+        2,
+        concurrent_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "chemistry".to_string(),
+        },
+    );
+    let newer = event(
+        3,
+        first_origin,
+        2,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "biology".to_string(),
+        },
+    );
+
+    let mut conflict_first = user_state();
+    conflict_first.apply(&older).unwrap();
+    conflict_first.apply(&concurrent).unwrap();
+    conflict_first.apply(&newer).unwrap();
+
+    let mut newer_first = user_state();
+    newer_first.apply(&older).unwrap();
+    newer_first.apply(&newer).unwrap();
+    newer_first.apply(&concurrent).unwrap();
+
+    assert_eq!(conflict_first, newer_first);
+    let conflict = conflict_first
+        .conflicts
+        .get("user.attributes.department")
+        .expect("newer and concurrent values conflict");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(conflict.values.iter().all(|value| value.dot != older.dot()));
+}
+
+#[test]
+fn same_origin_out_of_order_multi_field_operation_is_atomically_stale() {
+    let origin = node(1);
+    let older = realm_config_event(
+        1,
+        origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigSettingsSet {
+            metadata_replication: MetadataReplicationConfig::new(3),
+            discovery: RealmDiscoveryConfig::Static {
+                endpoints: Vec::new(),
+            },
+        },
+    );
+    let newer_metadata = MetadataReplicationConfig::new(5);
+    let newer_discovery = RealmDiscoveryConfig::Dynamic {
+        methods: Vec::new(),
+    };
+    let newer = realm_config_event(
+        2,
+        origin,
+        2,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigSettingsSet {
+            metadata_replication: newer_metadata.clone(),
+            discovery: newer_discovery.clone(),
+        },
+    );
+
+    let mut newer_first = realm_config_state();
+    newer_first.apply(&newer).unwrap();
+    assert_eq!(
+        newer_first.apply(&older),
+        Ok(AdminDocumentApplyStatus::StaleOriginSequence)
+    );
+
+    let mut older_first = realm_config_state();
+    older_first.apply(&older).unwrap();
+    older_first.apply(&newer).unwrap();
+
+    assert_eq!(newer_first, older_first);
+    assert_eq!(
+        newer_first.materialized_realm_config_metadata_replication(),
+        Some(newer_metadata)
+    );
+    assert_eq!(
+        newer_first.materialized_realm_config_discovery(),
+        Some(newer_discovery)
+    );
+    assert!(newer_first.conflicts.is_empty());
+}
+
+#[test]
+fn observed_sequential_user_attribute_update_replaces_prior_value() {
+    let mut state = user_state();
+    let first_origin = node(1);
+    let first = event(
+        1,
+        first_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "physics".to_string(),
+        },
+    );
+    let second = event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default().with_observed(first_origin, 1),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "biology".to_string(),
+        },
+    );
+
+    state.apply(&first).unwrap();
+    state.apply(&second).unwrap();
+
+    assert_eq!(
+        state
+            .materialized_user_attributes()
+            .get("department")
+            .map(String::as_str),
+        Some("biology")
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn observed_name_update_replaces_prior_name() {
+    let mut state = user_state();
+    let first_origin = node(1);
+    let first = event(
+        1,
+        first_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserNameSet {
+            name: "Alice".to_string(),
+        },
+    );
+    let second = event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default().with_observed(first_origin, 1),
+        AdminDocumentOperation::UserNameSet {
+            name: "Bob".to_string(),
+        },
+    );
+
+    state.apply(&first).unwrap();
+    state.apply(&second).unwrap();
+
+    assert_eq!(state.materialized_user_name().as_deref(), Some("Bob"));
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn concurrent_name_conflict_is_recorded() {
+    let mut state = user_state();
+
+    state.apply(&set_name(1, 1, "Alice")).unwrap();
+    state.apply(&set_name(2, 2, "Bob")).unwrap();
+
+    assert_eq!(state.materialized_user_name(), None);
+    let conflict = state
+        .conflicts
+        .get(USER_NAME_PATH)
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some("Alice"))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some("Bob"))
+    );
+}
