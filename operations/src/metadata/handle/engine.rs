@@ -1464,3 +1464,90 @@ pub(super) fn to_craqle_batch(batch: &MetadataBatch) -> Result<Batch, CraqleErro
         timestamp,
     })
 }
+
+/// Plans `source` against the local graph and publishes it as a batch under
+/// `actor`, witnessing the graph's clock at plan time.
+pub(super) fn plan_batch(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    graph_iri: &str,
+    actor: [u8; 32],
+    source: &MetadataBatchSource,
+) -> Result<MetadataBatch, CraqleError> {
+    let graph = GraphId::new(graph_iri);
+    // Planning against a graph this node has not materialized yet would omit
+    // the removals the change set needs, so the caller must retry instead.
+    if !node.contains_graph(&graph)? {
+        return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
+            "metadata graph `{graph_iri}` is not materialized yet"
+        ))));
+    }
+    let changes = match source {
+        MetadataBatchSource::ReplaceRoCrate { jsonld } => {
+            node.plan_rocrate_document_checked(auth, &graph, jsonld)?
+        }
+        MetadataBatchSource::UpsertDataEntity { jsonld } => {
+            node.plan_patch_data(auth, &craqle_patch_request(&graph, jsonld)?)?
+        }
+        MetadataBatchSource::UpsertContextualEntity { jsonld } => {
+            node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)?
+        }
+    };
+    let base_clock = node.vector_clock(&graph)?;
+    let batch = Batch::from_changes(
+        graph,
+        ActorId::from_bytes(actor),
+        1,
+        base_clock,
+        changes,
+        chrono::Utc::now(),
+    )
+    .map_err(|error| CraqleError::RoCrate(RoCrateError::InvalidBatch(error.to_string())))?;
+    Ok(metadata_batch_from_craqle(batch))
+}
+
+pub(super) fn metadata_rocrate_page_from_craqle(page: craqle::RoCratePage) -> MetadataRoCratePage {
+    MetadataRoCratePage {
+        jsonld: page.jsonld,
+        total_data_entities: page.total_data_entities,
+        returned_data_entities: page.returned_data_entities,
+        next_offset: page.next_offset,
+        next_cursor: page.next_cursor,
+    }
+}
+
+pub(super) fn metadata_search_hit_from_craqle(
+    hit: craqle::SearchHit,
+    record: &MetadataRegistryRecord,
+    properties: &[(String, Term)],
+    query: &str,
+) -> MetadataSearchHit {
+    let title = hit_title(properties, &record.document_path, &hit.subject_iri);
+    let snippet = hit_snippet(properties, query);
+    MetadataSearchHit {
+        document_id: record.document_id.to_string(),
+        group_id: record.group_id.to_string(),
+        document_path: record.document_path.clone(),
+        graph_iri: hit.graph_id,
+        subject_iri: hit.subject_iri,
+        score: hit.score,
+        title,
+        snippet,
+        subject_types: hit_types(properties),
+    }
+}
+
+pub(super) fn decode_hit_properties(
+    properties: Vec<(craqle::EncodedTerm, craqle::EncodedTerm)>,
+) -> Vec<(String, Term)> {
+    properties
+        .into_iter()
+        .filter_map(|(predicate, object)| {
+            let Some(Term::NamedNode(predicate)) = predicate.to_term() else {
+                return None;
+            };
+            let object = object.to_term()?;
+            Some((predicate.as_str().to_string(), object))
+        })
+        .collect()
+}
