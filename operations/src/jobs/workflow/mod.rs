@@ -2264,8 +2264,7 @@ mod tests {
     use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
-        ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination,
-        OutputSelection, RealmId,
+        FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination, OutputSelection, RealmId,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
@@ -2276,6 +2275,10 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::Notify;
     use ulid::Ulid;
+
+    pub(crate) mod fixtures;
+
+    use self::fixtures::{execution_spec, node_id};
 
     fn job_id() -> JobId {
         crate::jobs::submit::mint_job_id(
@@ -2421,12 +2424,6 @@ mod tests {
         }
     }
 
-    pub(super) fn node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&bytes).public()
-    }
-
     fn fence(attempt: &AttemptRef) -> FenceContext {
         FenceContext {
             attempt: attempt.clone(),
@@ -2444,33 +2441,6 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         })
-    }
-
-    pub(super) fn execution_spec() -> ExecutionSpec {
-        ExecutionSpec {
-            group_id: Ulid::from_bytes([3u8; 16]),
-            name: None,
-            description: None,
-            tags: Default::default(),
-            image: "alpine:3".to_string(),
-            entrypoint: None,
-            command: vec!["true".to_string()],
-            workdir: None,
-            env: Default::default(),
-            resources: ComputeResources {
-                cpu_cores: None,
-                ram_bytes: None,
-                disk_bytes: None,
-                max_walltime_ms: None,
-                preemptible: false,
-            },
-            executor_constraint: None,
-            inputs: Vec::new(),
-            file_outputs: Vec::new(),
-            workspace_outputs: Vec::new(),
-            output_prefixes: Vec::new(),
-            collision_policy: Default::default(),
-        }
     }
 
     #[test]
