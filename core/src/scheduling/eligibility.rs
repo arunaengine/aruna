@@ -22,6 +22,8 @@ pub enum RejectionVerdict {
     SubjectDrift,
     ExecutorKind,
     Staging,
+    /// The backend runs no interactive session, or cannot reach S3 for one.
+    Session,
     RequiredLabels,
     Resources,
     /// Protected data with open networking on a site that enforces none.
@@ -76,6 +78,7 @@ impl RejectionVerdict {
             RejectionVerdict::SubjectDrift => "advertisement does not match its digest".to_string(),
             RejectionVerdict::ExecutorKind => "no executor of that kind".to_string(),
             RejectionVerdict::Staging => "staging mode is not supported".to_string(),
+            RejectionVerdict::Session => "sessions do not run here".to_string(),
             RejectionVerdict::RequiredLabels => "a required label is missing".to_string(),
             RejectionVerdict::Resources => "not enough resources".to_string(),
             RejectionVerdict::OpenNetwork => "open network is not allowed here".to_string(),
@@ -115,6 +118,9 @@ pub fn screen(request: &PlanRequest, candidate: &TargetCandidate) -> Option<Reje
     }
     if !candidate.capability.supports(request.staging) {
         return Some(RejectionVerdict::Staging);
+    }
+    if request.session && !candidate.capability.session {
+        return Some(RejectionVerdict::Session);
     }
     if !labels_match(request, &candidate.capability.subject) {
         return Some(RejectionVerdict::RequiredLabels);

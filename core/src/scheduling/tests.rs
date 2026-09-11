@@ -99,6 +99,7 @@ pub(crate) fn request(inputs: Vec<ResolvedInput>) -> PlanRequest {
         required_labels: Vec::new(),
         staging: StagingMode::Files,
         network: NetworkAccess::Isolated,
+        session: false,
         inputs,
         output_policies: Vec::new(),
         policies: BTreeMap::new(),
@@ -589,6 +590,28 @@ fn filters_request_constraints() {
         verdict(&plan(&labelled, scan, &config(Vec::new())), node(2)),
         RejectionVerdict::RequiredLabels
     );
+}
+
+#[test]
+fn screens_session_support() {
+    // A session needs a backend that can open a channel to the attempt, so a
+    // site without one must leave the scan instead of taking the job.
+    let target = node(2);
+    let mut plan_request = request(Vec::new());
+    plan_request.session = true;
+
+    let outcome = plan(
+        &plan_request,
+        vec![candidate(target, "docker")],
+        &config(Vec::new()),
+    );
+    assert!(outcome.selected.is_none());
+    assert_eq!(verdict(&outcome, target), RejectionVerdict::Session);
+
+    let mut capable = candidate(target, "docker");
+    capable.capability.session = true;
+    let outcome = plan(&plan_request, vec![capable], &config(Vec::new()));
+    assert!(outcome.selected.is_some());
 }
 
 #[test]

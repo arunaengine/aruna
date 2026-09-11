@@ -850,7 +850,7 @@ impl ExecutorBackend for KubernetesBackend {
             local_site: false,
             worker_site,
             limits: self.config.envelope,
-            session: true,
+            session: !self.config.s3_cidrs.is_empty(),
         }
     }
 
@@ -2710,6 +2710,25 @@ mod tests {
                 .iter()
                 .any(|path| path.contains("csidrivers"))
         );
+    }
+
+    #[tokio::test]
+    async fn advertises_session_egress() {
+        // Without S3 CIDRs an isolated session is refused at submit, so the
+        // node must not advertise one the planner could still pick.
+        let backend = KubernetesBackend {
+            client: fake_client(|_, _| (200, json!({}))),
+            config: test_config(),
+        };
+        assert!(!backend.capabilities().session);
+
+        let mut config = test_config();
+        config.s3_cidrs.push("10.0.0.0/8".to_string());
+        let backend = KubernetesBackend {
+            client: fake_client(|_, _| (200, json!({}))),
+            config,
+        };
+        assert!(backend.capabilities().session);
     }
 
     const POD_START: &str = "2027-01-01T00:00:00Z";
