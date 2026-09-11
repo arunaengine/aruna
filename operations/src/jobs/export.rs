@@ -3177,11 +3177,11 @@ mod tests {
     const FIXTURE_BYTES: &[u8] = b"duplicate fixture payload";
     const ROCRATE_12: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/fixtures/rocrate/roundtrip-1.2.json"
+        "/tests/fixtures/data/rocrate/roundtrip-1.2.json"
     ));
     const ROCRATE_13: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/fixtures/rocrate/roundtrip-1.3.json"
+        "/tests/fixtures/data/rocrate/roundtrip-1.3.json"
     ));
 
     struct SparseWriter {
