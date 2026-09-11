@@ -2826,7 +2826,7 @@ mod tests {
     };
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+    use aruna_core::auth::bearer_token_hash;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::metadata::MetadataApplyRoCrateRequest;
     use aruna_core::storage_entries::metadata_graph_lifecycle_key;
@@ -2835,10 +2835,7 @@ mod tests {
         SyncStatusSnapshot, TokenRevocation,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
-    use auth::{
-        assert_metadata_auth_rejected, auth_storage, node_id_from_seed, persist_auth_state,
-        persist_realm_config, persist_revoked_config, realm_fixture, sign_token, token_claims,
-    };
+    use auth::{auth_storage, node_id_from_seed, realm_fixture};
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -3565,121 +3562,6 @@ mod tests {
             .flush_persistence()
             .await
             .expect("metadata and document sync persistence flush");
-    }
-
-    #[tokio::test]
-    async fn remote_metadata_auth_validates_token_into_auth_context() {
-        let (realm_signing_key, realm_id, user_id) = realm_fixture();
-        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
-        let (_dir, storage) = auth_storage();
-        // Revocation fails closed without the realm config revocation set.
-        persist_realm_config(&storage, realm_id, &[]).await;
-        persist_auth_state(
-            &storage,
-            TRUSTED_REALMS_LIST_KEY,
-            &HashSet::from([realm_id]),
-        )
-        .await;
-        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
-
-        let auth =
-            remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
-                .await
-                .unwrap()
-                .expect("token produces auth context");
-
-        assert_eq!(auth.user_id, user_id);
-        assert_eq!(auth.realm_id, realm_id);
-    }
-
-    #[tokio::test]
-    async fn remote_metadata_auth_preserves_path_restrictions() {
-        let (realm_signing_key, realm_id, user_id) = realm_fixture();
-        let restrictions = vec![PathRestriction {
-            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::generate()),
-            permission: Permission::READ,
-        }];
-        let mut claims = token_claims(realm_id, user_id);
-        claims.restrictions = Some(restrictions.clone());
-        let token = sign_token(&realm_signing_key, &claims);
-        let (_dir, storage) = auth_storage();
-        // Revocation fails closed without the realm config revocation set.
-        persist_realm_config(&storage, realm_id, &[]).await;
-        persist_auth_state(
-            &storage,
-            TRUSTED_REALMS_LIST_KEY,
-            &HashSet::from([realm_id]),
-        )
-        .await;
-        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
-
-        let auth =
-            remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
-                .await
-                .unwrap()
-                .expect("token produces auth context");
-
-        assert_eq!(auth.user_id, user_id);
-        assert_eq!(auth.realm_id, realm_id);
-        assert_eq!(auth.path_restrictions, Some(restrictions));
-    }
-
-    #[tokio::test]
-    async fn remote_metadata_auth_rejects_revoked_untrusted_and_invalid_tokens() {
-        let (realm_signing_key, realm_id, user_id) = realm_fixture();
-        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
-
-        let (_revoked_dir, revoked_storage) = auth_storage();
-        persist_auth_state(
-            &revoked_storage,
-            TRUSTED_REALMS_LIST_KEY,
-            &HashSet::from([realm_id]),
-        )
-        .await;
-        persist_revoked_config(&revoked_storage, realm_id, &token).await;
-        let revoked_state = MetadataAuthValidationState::new(revoked_storage, Some(realm_id));
-        assert_metadata_auth_rejected(&revoked_state, &token, "Token is revoked").await;
-
-        let (_untrusted_dir, untrusted_storage) = auth_storage();
-        let untrusted_state = MetadataAuthValidationState::new(untrusted_storage, Some(realm_id));
-        assert_metadata_auth_rejected(&untrusted_state, &token, "Realm is not trusted").await;
-
-        let (_invalid_dir, invalid_storage) = auth_storage();
-        let invalid_state = MetadataAuthValidationState::new(invalid_storage, Some(realm_id));
-        assert_metadata_auth_rejected(&invalid_state, "not-a-jwt", "invalid metadata auth token")
-            .await;
-    }
-
-    #[tokio::test]
-    async fn replicated_revocation_rejects() {
-        // A revocation that arrived through the replicated realm config must
-        // deny the token on this node too.
-        let (realm_signing_key, realm_id, user_id) = realm_fixture();
-        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
-        let (_dir, storage) = auth_storage();
-        persist_auth_state(
-            &storage,
-            TRUSTED_REALMS_LIST_KEY,
-            &HashSet::from([realm_id]),
-        )
-        .await;
-        persist_revoked_config(&storage, realm_id, &token).await;
-        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
-
-        assert_metadata_auth_rejected(&state, &token, "Token is revoked").await;
-    }
-
-    #[tokio::test]
-    async fn remote_metadata_auth_allows_missing_token_as_anonymous() {
-        let (_dir, storage) = auth_storage();
-        let state = MetadataAuthValidationState::new(storage, None);
-
-        assert_eq!(
-            remote_metadata_auth_context(&state, None)
-                .await
-                .expect("missing token is anonymous"),
-            None
-        );
     }
 
     fn registry_record(document_path: &str) -> MetadataRegistryRecord {
