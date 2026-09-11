@@ -3,13 +3,8 @@ use super::outbox::partition_drain_records;
 use super::restore::drain_delay;
 use super::*;
 use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, read_job_record};
-use crate::sync::document_sync_outbox::{
-    outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
-};
-use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
-    DocumentSyncRevision,
-};
+use crate::sync::document_sync_outbox::{outbox_key, read_outbox_record, write_outbox_effect};
+use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
     METADATA_GRAPH_PRUNE_JOB_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, TASK_TIMER_KEYSPACE,
 };
