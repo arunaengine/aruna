@@ -370,3 +370,162 @@ async fn replicated_role_confined() {
     .expect("validation runs");
     assert!(matches!(outcome, AdminEventValidation::Rejected(_)));
 }
+
+#[tokio::test]
+async fn group_role_create_admin_operation_updates_existing_group_roles() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([27; 32]);
+    let group_id = Ulid::from_parts(160, 1);
+    let existing_role_id = Ulid::from_parts(161, 1);
+    let role_id = Ulid::from_parts(162, 1);
+    let conflicted_role_id = Ulid::from_parts(163, 1);
+    let actor = test_actor(
+        8,
+        UserId::local(Ulid::from_parts(164, 1), realm_id),
+        realm_id,
+    );
+    let group = Group {
+        display_name: "Durable group".to_string(),
+        group_id,
+        realm_id,
+        owner: actor.user_id,
+        roles: HashSet::from([existing_role_id, conflicted_role_id]),
+    };
+    storage_batch_write_to(
+        &storage,
+        vec![(
+            GROUP_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).expect("group serializes").into(),
+        )],
+    )
+    .await
+    .expect("group writes");
+
+    let target = AdminDocumentTarget::Group { group_id };
+    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target.clone(),
+        test_admin_event(
+            Ulid::from_parts(165, 1),
+            target.clone(),
+            &actor,
+            1,
+            AdminDocumentOperation::GroupRoleCreated {
+                role: test_admin_role_definition(
+                    role_id,
+                    "Reduced group role",
+                    "/group/reduced/**",
+                    Permission::WRITE,
+                ),
+            },
+        ),
+    )
+    .await
+    .expect("role create applies");
+
+    let conflict_actor_a = test_actor(
+        9,
+        UserId::local(Ulid::from_parts(166, 1), realm_id),
+        realm_id,
+    );
+    let conflict_actor_b = test_actor(
+        10,
+        UserId::local(Ulid::from_parts(167, 1), realm_id),
+        realm_id,
+    );
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target.clone(),
+        test_admin_event(
+            Ulid::from_parts(168, 1),
+            target.clone(),
+            &conflict_actor_a,
+            1,
+            AdminDocumentOperation::GroupRoleCreated {
+                role: test_admin_role_definition(
+                    conflicted_role_id,
+                    "First conflicted role",
+                    "/group/conflict-a/**",
+                    Permission::READ,
+                ),
+            },
+        ),
+    )
+    .await
+    .expect("first conflict role applies");
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target,
+        test_admin_event(
+            Ulid::from_parts(169, 1),
+            target,
+            &conflict_actor_b,
+            1,
+            AdminDocumentOperation::GroupRoleCreated {
+                role: test_admin_role_definition(
+                    conflicted_role_id,
+                    "Second conflicted role",
+                    "/group/conflict-b/**",
+                    Permission::WRITE,
+                ),
+            },
+        ),
+    )
+    .await
+    .expect("second conflict role applies");
+
+    let stored_group = read_group_doc(&storage, group_id).await;
+    assert_eq!(stored_group.display_name, group.display_name);
+    assert_eq!(stored_group.realm_id, realm_id);
+    assert_eq!(
+        stored_group.roles,
+        HashSet::from([existing_role_id, role_id])
+    );
+}
+
+#[tokio::test]
+async fn group_role_create_admin_operation_does_not_create_missing_group() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([28; 32]);
+    let group_id = Ulid::from_parts(170, 1);
+    let role_id = Ulid::from_parts(171, 1);
+    let actor = test_actor(
+        8,
+        UserId::local(Ulid::from_parts(172, 1), realm_id),
+        realm_id,
+    );
+
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::GroupAuthorization { group_id },
+        test_admin_event(
+            Ulid::from_parts(173, 1),
+            AdminDocumentTarget::Group { group_id },
+            &actor,
+            1,
+            AdminDocumentOperation::GroupRoleCreated {
+                role: test_admin_role_definition(
+                    role_id,
+                    "Reduced group role",
+                    "/group/reduced/**",
+                    Permission::WRITE,
+                ),
+            },
+        ),
+    )
+    .await
+    .expect("role create applies");
+
+    assert_eq!(
+        read_storage_value(&storage, GROUP_KEYSPACE, group_id.to_bytes().into()).await,
+        None
+    );
+    assert!(
+        read_group_auth_doc(&storage, group_id)
+            .await
+            .roles
+            .contains_key(&role_id)
+    );
+}
