@@ -307,3 +307,196 @@ pub(super) async fn read_preflight_row(
         _ => Err(MetadataApiError::ServiceUnavailable),
     }
 }
+
+pub(super) fn add_location_iris(iris: &mut Vec<String>, s3_endpoint: Option<&str>, bucket: &str, key: &str) {
+    iris.push(format!("s3://{bucket}/{key}"));
+    if let Some(endpoint) = s3_endpoint.filter(|endpoint| !endpoint.is_empty()) {
+        iris.push(format!("{}/{bucket}/{key}", endpoint.trim_end_matches('/')));
+    }
+}
+
+pub(crate) async fn references_preflight_local(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    auth: Option<AuthContext>,
+    mut request: MetadataReferencePreflightNodeRequest,
+    s3_endpoint: Option<String>,
+) -> Result<MetadataReferencePreflightNodeExecution, MetadataApiError> {
+    if request.targets.len() > METADATA_PREFLIGHT_MAX_TARGET_VERSIONS
+        || request.limit == 0
+        || request.limit > METADATA_SEARCH_MAX_PAGINATION_DEPTH
+    {
+        return Err(MetadataApiError::BadRequest);
+    }
+    let auth = auth.ok_or(MetadataApiError::Unauthorized)?;
+    if auth.realm_id != realm_id {
+        return Err(MetadataApiError::Forbidden);
+    }
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    let registry = handle
+        .list_cached_registry_records()
+        .await
+        .map_err(map_metadata_internal_error)?;
+    let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
+    let freshness =
+        crate::metadata::iri_index::iri_index_freshness(&context.storage_handle, registry.as_ref())
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let pending_for_realm = load_pending_records(context, None, METADATA_REGISTRY_CANDIDATE_LIMIT)
+        .await?
+        .into_values()
+        .flatten()
+        .any(|record| record.realm_id == realm_id);
+    let index_state = match (freshness.state, pending_for_realm) {
+        (crate::metadata::iri_index::IriIndexFreshnessState::Current, false) => {
+            MetadataPreflightIndexState::Current
+        }
+        (crate::metadata::iri_index::IriIndexFreshnessState::Current, true)
+        | (crate::metadata::iri_index::IriIndexFreshnessState::Pending, _) => {
+            MetadataPreflightIndexState::Pending
+        }
+        (crate::metadata::iri_index::IriIndexFreshnessState::Failed, false) => {
+            MetadataPreflightIndexState::Failed
+        }
+        (crate::metadata::iri_index::IriIndexFreshnessState::Failed, true)
+        | (crate::metadata::iri_index::IriIndexFreshnessState::Mixed, _) => {
+            MetadataPreflightIndexState::Mixed
+        }
+    };
+
+    let mut iri_targets = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut target_locations = BTreeMap::<String, (bool, bool)>::new();
+    let mut aliases_seen = false;
+    for target in request.targets.iter_mut() {
+        let mut local_aliases = drive(
+            ResolveBlobPermissionPathsOperation::new(target.content_hash),
+            context,
+        )
+        .await
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        local_aliases.retain(|alias| alias.realm_id == realm_id && alias.node_id == local_node_id);
+        aliases_seen |= !local_aliases.is_empty();
+        let mut found = false;
+        let mut remaining = false;
+        for alias in local_aliases {
+            found = true;
+            let location = MetadataPreflightLocation {
+                node_id: alias.node_id,
+                bucket: alias.bucket.clone(),
+                key: alias.key.clone(),
+                version_id: alias.version_id,
+            };
+            let removed = target.remove_all_resolvable_locations
+                || target.removed_locations.contains(&location);
+            remaining |= !removed;
+            add_location_iris(
+                &mut target.queried_iris,
+                s3_endpoint.as_deref(),
+                &alias.bucket,
+                &alias.key,
+            );
+        }
+        target.queried_iris.sort();
+        target.queried_iris.dedup();
+        for iri in &target.queried_iris {
+            iri_targets
+                .entry(iri.clone())
+                .or_default()
+                .insert(target.content_w3id.clone());
+        }
+        target_locations.insert(target.content_w3id.clone(), (found, remaining));
+    }
+    let object_iris = iri_targets.keys().cloned().collect::<BTreeSet<_>>();
+    let backlinks = crate::metadata::iri_index::lookup_iri_backlinks_for_objects(
+        &context.storage_handle,
+        registry.as_ref(),
+        &object_iris,
+    )
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let registry_by_id = registry
+        .iter()
+        .map(|record| (record.document_id, record))
+        .collect::<HashMap<_, _>>();
+    let mut readable = HashMap::<Ulid, bool>::new();
+    let mut titles = HashMap::<Ulid, String>::new();
+    let mut hidden = BTreeSet::<String>::new();
+    let mut visible = BTreeMap::<(String, Ulid), MetadataPreflightVisibleReference>::new();
+    for (iri, iri_backlinks) in backlinks {
+        let Some(content_w3ids) = iri_targets.get(&iri) else {
+            continue;
+        };
+        for backlink in iri_backlinks {
+            let Some(record) = registry_by_id.get(&backlink.document_id) else {
+                continue;
+            };
+            let allowed = match readable.get(&record.document_id) {
+                Some(allowed) => *allowed,
+                None => {
+                    let allowed = can_read_record(context, realm_id, Some(&auth), record).await?;
+                    readable.insert(record.document_id, allowed);
+                    allowed
+                }
+            };
+            for content_w3id in content_w3ids {
+                if !allowed {
+                    hidden.insert(content_w3id.clone());
+                    continue;
+                }
+                let visible_key = (content_w3id.clone(), record.document_id);
+                if visible.contains_key(&visible_key) || visible.len() > request.limit {
+                    continue;
+                }
+                let title = match titles.get(&record.document_id) {
+                    Some(title) => title.clone(),
+                    None => {
+                        let title = reference_document_title(context, record)
+                            .await
+                            .unwrap_or_else(|| record.document_path.clone());
+                        titles.insert(record.document_id, title.clone());
+                        title
+                    }
+                };
+                visible
+                    .entry(visible_key)
+                    .or_insert(MetadataPreflightVisibleReference {
+                        content_w3id: content_w3id.clone(),
+                        document_id: record.document_id.to_string(),
+                        title,
+                    });
+            }
+        }
+    }
+    let saturated = visible.len() > request.limit;
+    let visible_references = visible.into_values().take(request.limit).collect();
+    let targets = request
+        .targets
+        .into_iter()
+        .map(|target| {
+            let (resolvable_location_found, resolvable_location_after_operation) = target_locations
+                .remove(&target.content_w3id)
+                .unwrap_or((false, false));
+            MetadataReferencePreflightNodeTarget {
+                hidden_references_exist: hidden.contains(&target.content_w3id),
+                content_w3id: target.content_w3id,
+                resolvable_location_found,
+                resolvable_location_after_operation,
+            }
+        })
+        .collect();
+    Ok(MetadataReferencePreflightNodeExecution {
+        visible_references,
+        targets,
+        freshness: MetadataPreflightNodeFreshness {
+            node_id: local_node_id,
+            index_state,
+            oldest_status_updated_at_ms: freshness.oldest_status_updated_at_ms,
+        },
+        path_style_endpoint_available: s3_endpoint.is_some() || !aliases_seen,
+        saturated,
+    })
+}
