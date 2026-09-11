@@ -880,3 +880,124 @@ impl AdminDocumentReducerState {
         );
     }
 }
+
+pub fn realm_config_placement_node_path(node_id: &NodeId) -> String {
+    format!("realm_config.placement.nodes.{node_id}")
+}
+
+pub fn realm_config_placement_strategy_path(strategy_id: &Ulid) -> String {
+    format!("realm_config.placement.strategies.{strategy_id}")
+}
+
+pub fn realm_config_strategy_binding_path(scope: &BindingScope) -> String {
+    format!(
+        "realm_config.placement.bindings.{}",
+        binding_scope_key(scope)
+    )
+}
+
+pub fn realm_config_placement_override_path(subject: &[u8]) -> String {
+    format!("realm_config.placement.overrides.{}", hex::encode(subject))
+}
+
+pub fn placement_binding_path(handle: PlacementHandle) -> String {
+    format!("realm_config.placement.placement_bindings.{}", handle.get())
+}
+
+pub fn candidate_map_path(epoch: u64) -> String {
+    format!("realm_config.placement.candidate_maps.{epoch}")
+}
+
+/// One path per strategy: the map epoch its buckets were activated at. The
+/// per-bucket activation is derived from it plus the reduced transitions.
+pub fn activation_path(strategy_id: &Ulid) -> String {
+    format!("realm_config.placement.activations.{strategy_id}")
+}
+
+pub fn transition_path(transition_id: &Ulid) -> String {
+    format!("realm_config.placement.transitions.{transition_id}")
+}
+
+pub fn transition_abort_path(transition_id: &Ulid) -> String {
+    format!("{}.aborted", transition_path(transition_id))
+}
+
+pub fn transition_barrier_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.barriers.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
+}
+
+pub fn transition_proof_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.proofs.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
+}
+
+pub fn transition_force_path(transition_id: &Ulid, bucket: u32) -> String {
+    format!("{}.forced.{bucket}", transition_path(transition_id))
+}
+
+pub fn transition_stall_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.stalls.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
+}
+
+pub fn transition_drain_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.drained.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
+}
+
+pub fn handle_range_path(range_id: Ulid) -> String {
+    format!("realm_config.placement.handle_ranges.{range_id}")
+}
+
+pub fn band_pool_path(pool_id: Ulid) -> String {
+    format!("realm_config.placement.band_pools.{pool_id}")
+}
+
+
+pub(super) fn candidate_map_value(map: &CandidatePlacementMap) -> String {
+    serde_json::to_string(map).expect("admin document candidate map serializes")
+}
+
+pub(super) fn transition_plan_value(plan: &TransitionPlan) -> String {
+    serde_json::to_string(plan).expect("admin document transition plan serializes")
+}
+
+/// The strategy the proof was signed for rides with it, so materialization can
+/// reject a proof aimed at a different strategy than the plan names.
+pub(super) fn transition_proof_value(strategy_id: &Ulid, proof: &CompletionProof) -> String {
+    serde_json::to_string(&(strategy_id, proof)).expect("admin document proof serializes")
+}
+
+fn candidate_map_from_value(value: &str) -> Option<CandidatePlacementMap> {
+    serde_json::from_str(value).ok()
+}
+
+fn transition_plan_from_value(value: &str) -> Option<TransitionPlan> {
+    serde_json::from_str(value).ok()
+}
+
+fn transition_proof_from_value(value: &str) -> Option<(Ulid, CompletionProof)> {
+    serde_json::from_str(value).ok()
+}
+
+fn handle_range_value(range: &HandleRange) -> String {
+    // A handle range carries no provenance to normalize away: the whole record
+    // (id, owner, bounds) is the identity compared for same-key divergence.
+    serde_json::to_string(range).expect("admin document handle range serializes")
+}
+
+fn band_pool_value(pool: &BandPool) -> String {
+    // The whole record (id, lineage, owner, bounds) is the identity compared
+    // for same-key divergence.
+    serde_json::to_string(pool).expect("admin document band pool serializes")
+}
+
