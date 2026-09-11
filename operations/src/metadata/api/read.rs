@@ -1,4 +1,7 @@
 use super::*;
+use crate::metadata::search_cursor::{
+    METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
+};
 
 pub async fn query_metadata_document(
     context: &DriverContext,
@@ -312,7 +315,3 @@ pub async fn search_metadata(
         fanout_stats,
     })
 }
-
-/// Backlink lookup: scans the local IRI reference index for documents naming
-/// `iri` as an object, joins and filters by read access. Empty scans for known
-/// graph IRIs or `resolve` return one predicate-less summary. Local-node-only in v1.
