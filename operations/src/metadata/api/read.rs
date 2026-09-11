@@ -945,3 +945,188 @@ pub(super) async fn ensure_record_materialized_for_graph_read(
         }
     }
 }
+
+/// The canonical `metadata.read` policy request for one record path and caller,
+/// shared by the single-record and bulk visibility seams.
+pub(crate) fn metadata_read_request(
+    permission_path: &str,
+    auth: Option<&AuthContext>,
+) -> aruna_core::request_policy::PolicyRequest {
+    crate::auth::request_policy::policy_request_with(
+        permission_path,
+        &Permission::READ,
+        auth,
+        crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+    )
+}
+
+pub(crate) async fn ensure_record_readable(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: Option<&AuthContext>,
+    record: &MetadataRegistryRecord,
+    txn_id: Option<TxnId>,
+) -> Result<(), MetadataApiError> {
+    if record.public {
+        // A policy denial on a found public record must read as NotFound, matching
+        // the private-denied path, so read-by-id is not an existence oracle.
+        let request = crate::auth::request_policy::policy_request_with(
+            &record.permission_path,
+            &Permission::READ,
+            auth,
+            crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+        );
+        let result = match txn_id {
+            Some(txn_id) => crate::auth::request_policy::PolicyEvaluator::load_with_txn(
+                context,
+                realm_id,
+                record.group_id,
+                txn_id,
+            )
+            .await
+            .and_then(|evaluator| evaluator.evaluate(&request)),
+            None => {
+                crate::auth::request_policy::enforce_policies(context, realm_id, &request).await
+            }
+        };
+        return result.map_err(|_| MetadataApiError::NotFound);
+    }
+    // Read-by-id must not distinguish an unreadable record from an absent one:
+    // present-but-unreadable, including anonymous callers, maps to NotFound so
+    // existence cannot be probed (anonymous returns NotFound, never 401).
+    let Some(auth) = auth.cloned() else {
+        return Err(MetadataApiError::NotFound);
+    };
+    match ensure_permission(
+        context,
+        realm_id,
+        auth,
+        record.group_id,
+        record.permission_path.clone(),
+        Permission::READ,
+        txn_id,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(MetadataApiError::Forbidden | MetadataApiError::Unauthorized) => {
+            Err(MetadataApiError::NotFound)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+pub(crate) async fn can_read_record(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: Option<&AuthContext>,
+    record: &MetadataRegistryRecord,
+) -> Result<bool, MetadataApiError> {
+    if record.public {
+        let allowed = crate::auth::request_policy::enforce_policies(
+            context,
+            realm_id,
+            &crate::auth::request_policy::policy_request_with(
+                &record.permission_path,
+                &Permission::READ,
+                auth,
+                crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+            ),
+        )
+        .await
+        .is_ok();
+        return Ok(allowed);
+    }
+    let Some(auth) = auth.cloned() else {
+        return Ok(false);
+    };
+    if auth.realm_id != realm_id {
+        return Ok(false);
+    }
+
+    match aruna_core::telemetry::time_stage(
+        "permission",
+        crate::auth::request_authorization::authorize(
+            context,
+            realm_id,
+            &auth,
+            &record.permission_path,
+            &Permission::READ,
+            crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+        ),
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+pub(super) async fn ensure_permission(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: AuthContext,
+    group_id: GroupId,
+    path: String,
+    required_permission: Permission,
+    txn_id: Option<TxnId>,
+) -> Result<(), MetadataApiError> {
+    if auth.realm_id != realm_id {
+        return Err(MetadataApiError::Forbidden);
+    }
+    let config = CheckPermissionsConfig {
+        auth_context: auth.clone(),
+        path: path.clone(),
+        required_permission: required_permission.clone(),
+    };
+    let operation = match txn_id {
+        Some(txn_id) => CheckPermissionsOperation::new_with_txn(config, txn_id),
+        None => CheckPermissionsOperation::new(config),
+    };
+    let allowed = aruna_core::telemetry::time_stage("permission", drive(operation, context))
+        .await
+        .map_err(|err| match err {
+            AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::AuthDocNotFound => MetadataApiError::Forbidden,
+            _ => MetadataApiError::Internal(err.to_string()),
+        })?;
+    if !allowed {
+        return Err(MetadataApiError::Forbidden);
+    }
+    // Policies must see the permission the RBAC check enforced; a fixed read
+    // would let a write-deny policy pass unevaluated.
+    let request = crate::auth::request_policy::policy_request_with(
+        &path,
+        &required_permission,
+        Some(&auth),
+        crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+    );
+    match txn_id {
+        Some(txn_id) => crate::auth::request_policy::PolicyEvaluator::load_with_txn(
+            context, realm_id, group_id, txn_id,
+        )
+        .await
+        .and_then(|evaluator| evaluator.evaluate(&request))
+        .map_err(|_| MetadataApiError::Forbidden)?,
+        None => crate::auth::request_policy::enforce_policies(context, realm_id, &request)
+            .await
+            .map_err(|_| MetadataApiError::Forbidden)?,
+    }
+    Ok(())
+}
+
+pub(super) fn metadata_record_matches_filters(
+    record: &MetadataRegistryRecord,
+    path_prefix: Option<&str>,
+) -> bool {
+    path_prefix
+        .map(|path_prefix| metadata_path_matches_prefix(&record.document_path, path_prefix))
+        .unwrap_or(true)
+}
+
+fn metadata_path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
+    let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
+    crate::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
+}
