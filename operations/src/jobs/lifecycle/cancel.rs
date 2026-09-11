@@ -9,9 +9,10 @@
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::structs::{
-    AuthContext, CancelAuthority, JobCancelRecord, JobFamilyRecord, JobId, JobRecordEnvelope,
-    LogicalJobSpec, Permission, blob_group_permission_path,
+    AuthContext, CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
+    JobRecordEnvelope, JobRecordKind, LogicalJobSpec, Permission, blob_group_permission_path,
 };
+use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -21,7 +22,11 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::protocol::send_job_request;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::{
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
+};
+use crate::jobs::service::kick_drain;
+use crate::jobs::store::{CancelRequestOutcome, JobMutationError, set_cancel_requested};
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::load_realm_config;
 use crate::request_authorization::authorize;
@@ -35,11 +40,11 @@ pub async fn cancel_family(
     job_id: JobId,
     auth_token: Option<MetadataAuthToken>,
 ) -> Option<Result<(), JobRouteError>> {
-    match family_of_alias(context, job_id).await {
-        Ok(Some(_)) => {}
+    let family = match family_of_alias(context, job_id).await {
+        Ok(Some(family)) => family,
         Ok(None) => return None,
         Err(error) => return Some(Err(error)),
-    }
+    };
     let (projected, spec) = match family_projection(context, job_id).await {
         Ok(Some(projected)) => projected,
         Ok(None) => return None,
@@ -61,6 +66,7 @@ pub async fn cancel_family(
     if let Err(error) = publish_cancel(context, &spec, auth, authority).await {
         return Some(Err(error));
     }
+    cancel_local_runs(context, family).await;
     // Every known active execution is asked to stop; a partitioned one may
     // still finish and stays visible as a late completion.
     if let Some(auth_token) = auth_token {
@@ -218,6 +224,7 @@ async fn stop_execution(
     job_id: JobId,
     auth_token: &MetadataAuthToken,
 ) {
+    // A local execution has no network cancel: `cancel_local_runs` flagged it.
     if context
         .net_handle
         .as_ref()
@@ -231,5 +238,57 @@ async fn stop_execution(
     };
     if let Err(error) = send_job_request(context, executor, request).await {
         warn!(peer = %executor, error = %error, "Cancel delivery to an executor failed");
+    }
+}
+
+/// Stops every physical execution of one family this node runs. The replicated
+/// record reaches no local attempt by itself, so each local row is flagged here
+/// and the drain is woken once.
+pub(crate) async fn cancel_local_runs(context: &DriverContext, family: JobFamilyId) {
+    let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        return;
+    };
+    let receipts = match load_kind_complete(context, family, JobRecordKind::Receipt).await {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            warn!(error = %error, "Family receipts unreadable for a local cancel");
+            return;
+        }
+    };
+    let mut flagged = false;
+    for physical in local_physical_jobs(&receipts, local) {
+        flagged |= flag_local_run(context, physical).await;
+    }
+    if flagged {
+        kick_drain(context).await;
+    }
+}
+
+/// Physical rows of the executions this node signed a receipt for.
+fn local_physical_jobs(receipts: &[JobRecordEnvelope], local: NodeId) -> Vec<JobId> {
+    receipts
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Receipt(receipt) if receipt.executor_node_id == local => {
+                Some(receipt.physical_job_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Requests cancellation of one local physical row. A settled or pruned row is
+/// a no-op, and a repeated request leaves the stored record untouched.
+async fn flag_local_run(context: &DriverContext, physical: JobId) -> bool {
+    match set_cancel_requested(&context.storage_handle, physical, unix_timestamp_millis()).await {
+        Ok(CancelRequestOutcome::Cancelled(_) | CancelRequestOutcome::Flagged(_)) => {
+            debug!(job_id = %physical, "Local execution cancelled by its family");
+            true
+        }
+        Ok(CancelRequestOutcome::AlreadyTerminal(_)) | Err(JobMutationError::NotFound) => false,
+        Err(error) => {
+            warn!(job_id = %physical, error = %error, "Local execution cancel flag failed");
+            false
+        }
     }
 }
