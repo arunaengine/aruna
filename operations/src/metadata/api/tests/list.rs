@@ -1,3 +1,4 @@
+use super::export::{seed_registry_cache, write_entry, write_pending_marker};
 use super::*;
 
 #[tokio::test]
