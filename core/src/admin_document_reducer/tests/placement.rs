@@ -564,3 +564,172 @@ fn realm_config_placement_strategy_rejects_zero_replica_count() {
     );
     assert_eq!(state, before);
 }
+
+#[test]
+fn realm_config_placement_strategy_accepts_max_shard_count() {
+    let mut state = realm_config_state();
+    let strategy_id = Ulid::from_bytes([4; 16]);
+    let mut strategy = placement_strategy(strategy_id, Some(3));
+    strategy.shard_count = MAX_PLACEMENT_SHARD_COUNT;
+
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_realm_config_placement_strategies(),
+        BTreeMap::from([(strategy_id, strategy)])
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn realm_config_placement_strategy_rejects_shard_count_above_max() {
+    let mut state = realm_config_state();
+    let before = state.clone();
+    let mut strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
+    strategy.shard_count = MAX_PLACEMENT_SHARD_COUNT * 2;
+
+    assert_eq!(
+        state.apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
+        )),
+        Err(AdminDocumentReducerError::InvalidPlacementShardCount)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn realm_config_placement_strategy_rejects_zero_and_non_power_of_two_shard_count() {
+    let mut state = realm_config_state();
+    let before = state.clone();
+
+    for bad in [0u32, 3, 63] {
+        let mut strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
+        strategy.shard_count = bad;
+        assert_eq!(
+            state.apply(&realm_config_event(
+                1,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
+            )),
+            Err(AdminDocumentReducerError::InvalidPlacementShardCount),
+            "shard_count {bad} must be rejected"
+        );
+        assert_eq!(state, before);
+    }
+}
+
+#[test]
+fn realm_config_default_strategy_materializes() {
+    let mut state = realm_config_state();
+    let strategy_id = Ulid::from_bytes([4; 16]);
+    upsert_placement_strategy(&mut state, 9, 9, strategy_id);
+
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_realm_config_default_strategy(),
+        Some(strategy_id)
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn family_survives_rebuild() {
+    // A reducer-only rebuild must reproduce the stored family strategy
+    // instead of resetting it to the nil placeholder.
+    let mut state = realm_config_state();
+    let strategy_id = Ulid::from_bytes([4; 16]);
+    upsert_placement_strategy(&mut state, 9, 9, strategy_id);
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
+        ))
+        .unwrap();
+
+    assert_eq!(state.materialized_family_strategy(), Some(strategy_id));
+    let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    assert_eq!(config.job_family_strategy_id, strategy_id);
+    assert!(config.strategy(&strategy_id).is_some());
+}
+
+#[test]
+fn rejects_family_mutation() {
+    let mut state = realm_config_state();
+    let strategy_id = Ulid::from_bytes([4; 16]);
+    upsert_placement_strategy(&mut state, 9, 9, strategy_id);
+    assert_eq!(
+        state.apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigJobFamilySet {
+                strategy_id: Ulid::nil()
+            },
+        )),
+        Err(AdminDocumentReducerError::NilJobFamily)
+    );
+    state
+        .apply(&realm_config_event(
+            2,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
+        ))
+        .unwrap();
+    let stored = state.clone();
+
+    assert_eq!(
+        state.apply(&realm_config_event(
+            3,
+            node(1),
+            2,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigJobFamilySet {
+                strategy_id: Ulid::from_bytes([5; 16])
+            },
+        )),
+        Err(AdminDocumentReducerError::JobFamilyChanged)
+    );
+    assert_eq!(
+        state.apply(&realm_config_event(
+            4,
+            node(1),
+            2,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
+        )),
+        Err(AdminDocumentReducerError::JobFamilyRemoved)
+    );
+    assert_eq!(state, stored);
+}
