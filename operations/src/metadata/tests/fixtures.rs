@@ -1,11 +1,9 @@
-#![cfg(test)]
-
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 
-pub(super) async fn write_entries(
+pub(crate) async fn write_entries(
     storage: &StorageHandle,
     writes: Vec<(String, ByteView, ByteView)>,
 ) {
@@ -21,7 +19,7 @@ pub(super) async fn write_entries(
     }
 }
 
-pub(super) async fn storage_key_exists(
+pub(crate) async fn storage_key_exists(
     storage: &StorageHandle,
     key_space: &str,
     key: Vec<u8>,
