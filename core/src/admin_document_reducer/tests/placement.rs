@@ -1071,3 +1071,158 @@ fn realm_config_placement_override_removed(event_seed: u8, subject: Vec<u8>) -> 
         AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject },
     )
 }
+
+#[test]
+fn placement_op_is_rejected_for_non_realm_config_target() {
+    let mut state = user_state();
+    let before = state.clone();
+    let event = event(
+        1,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigDefaultStrategySet {
+            strategy_id: Ulid::from_bytes([4; 16]),
+        },
+    );
+
+    assert_eq!(
+        state.apply(&event),
+        Err(AdminDocumentReducerError::UnsupportedTarget)
+    );
+    assert_eq!(state, before);
+}
+
+pub(super) fn placement_binding(handle: u32, strategy_seed: u8) -> PlacementBinding {
+    PlacementBinding {
+        handle: PlacementHandle::new(handle).unwrap(),
+        scope: PlacementScope::Realm(realm_id()),
+        document_class: DocumentClass::MetadataRegistry,
+        strategy_id: Ulid::from_bytes([strategy_seed; 16]),
+        allocator_range_id: None,
+        allocated_by: None,
+        allocated_at_ms: None,
+    }
+}
+
+pub(super) fn append_placement_binding(
+    event_seed: u8,
+    origin_seed: u8,
+    binding: PlacementBinding,
+) -> AdminDocumentEvent {
+    realm_config_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+    )
+}
+
+pub(super) fn handle_range(range_seed: u8, owner: NodeId, start: u32, end: u32) -> HandleRange {
+    HandleRange {
+        range_id: Ulid::from_bytes([range_seed; 16]),
+        owner,
+        start,
+        end,
+    }
+}
+
+pub(super) fn grant_handle_range(
+    event_seed: u8,
+    origin_seed: u8,
+    range: HandleRange,
+) -> AdminDocumentEvent {
+    realm_config_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+    )
+}
+
+#[test]
+fn grants_replicate_usable() {
+    let owner = node(3);
+    let first = grant_handle_range(1, 1, handle_range(10, owner, FIRST_GRANTABLE_HANDLE, 1027));
+    let second = grant_handle_range(2, 2, handle_range(20, owner, 1027, 2051));
+
+    let mut state = realm_config_state();
+    state.apply(&first).unwrap();
+    state.apply(&second).unwrap();
+    assert!(state.conflicts.is_empty());
+    assert_eq!(state.materialized_handle_ranges().len(), 2);
+
+    let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    let directory = config.handle_range_directory();
+    assert_eq!(directory.conflicts(), 0);
+    assert_eq!(directory.granted_to(&owner).len(), 2);
+    assert_eq!(
+        directory.free_band_in(&[(
+            FIRST_GRANTABLE_HANDLE,
+            crate::structs::band_start(crate::structs::HANDLE_BANDS)
+        )]),
+        Some((2051, 3075))
+    );
+}
+
+#[test]
+fn malformed_range_rejected() {
+    let event = grant_handle_range(1, 1, handle_range(10, node(3), 1, 1025));
+    let mut state = realm_config_state();
+
+    assert_eq!(
+        state.apply(&event),
+        Err(AdminDocumentReducerError::InvalidHandleRange)
+    );
+}
+
+#[test]
+fn overlap_conflicts_converge() {
+    let owner = node(3);
+    let first = grant_handle_range(1, 1, handle_range(10, owner, FIRST_GRANTABLE_HANDLE, 1027));
+    let second = grant_handle_range(2, 2, handle_range(20, owner, 512, 2049));
+
+    let mut left = realm_config_state();
+    left.apply(&first).unwrap();
+    left.apply(&second).unwrap();
+
+    let mut right = realm_config_state();
+    right.apply(&second).unwrap();
+    right.apply(&first).unwrap();
+
+    // Distinct ids retain separate paths; the derived directory catches overlap.
+    assert!(left.conflicts.is_empty());
+    assert_eq!(left.conflicts, right.conflicts);
+    for range_seed in [10u8, 20] {
+        let path = handle_range_path(Ulid::from_bytes([range_seed; 16]));
+        assert!(left.user_subject_ids.contains_key(&path));
+    }
+    assert_eq!(left.materialized_handle_ranges().len(), 2);
+
+    for state in [&left, &right] {
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
+        assert_eq!(config.placement_handle_ranges.len(), 2);
+        let directory = config.handle_range_directory();
+        assert_eq!(directory.conflicts(), 2);
+        assert!(directory.granted_to(&owner).is_empty());
+    }
+}
+
+#[test]
+fn binding_paths_disjoint() {
+    let handle = PlacementHandle::new(42).unwrap();
+    let path = placement_binding_path(handle);
+    assert_eq!(path, "realm_config.placement.placement_bindings.42");
+    assert_eq!(placement_binding_handle(&path), Some(handle));
+    // The two placement-binding namespaces must not parse each other's paths.
+    assert_eq!(
+        realm_config_strategy_binding_scope_key_from_path(&path),
+        None
+    );
+    let strategy_path = realm_config_strategy_binding_path(&BindingScope::Realm);
+    assert_eq!(placement_binding_handle(&strategy_path), None);
+}
