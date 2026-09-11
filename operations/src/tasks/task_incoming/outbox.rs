@@ -301,3 +301,220 @@ pub(super) fn admin_origin(record: &DocumentSyncOutboxRecord) -> Option<aruna_co
         _ => None,
     }
 }
+
+impl OperationsTaskHandler {
+    async fn read_drain_page(
+        &self,
+        retry_key: &TaskKey,
+        rotation: &OutboxRotation,
+        invocation: &mut DrainInvocation,
+    ) -> DrainPage {
+        let page_limit = OUTBOX_DRAIN_BATCH_SIZE.min(
+            self.outbox_limits
+                .records
+                .saturating_sub(invocation.records),
+        );
+        let scan_started = Instant::now();
+        let mut batch = match read_outbox_records(
+            &self.context.storage_handle,
+            &[],
+            invocation.cursor.clone(),
+            page_limit,
+        )
+        .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                warn!(task_id = ?retry_key, error = %error, "Failed to read document sync outbox record");
+                invocation.read_failed = true;
+                return DrainPage::Stop;
+            }
+        };
+        invocation.scan_elapsed += scan_started.elapsed();
+        let has_more = batch.has_more;
+        invocation.cursor = batch.next_start_after;
+        let boundary_reached = rotation.at_end(invocation.cursor.as_deref());
+        batch.records.retain(|(key, _)| rotation.admits(key));
+        if !batch.records.is_empty() {
+            return DrainPage::Records {
+                records: batch.records,
+                has_more,
+                boundary_reached,
+            };
+        }
+        if boundary_reached || !has_more {
+            invocation.reached_end = true;
+            DrainPage::Stop
+        } else if invocation.cursor.is_some() {
+            DrainPage::Skip
+        } else {
+            invocation.reached_end = true;
+            DrainPage::Stop
+        }
+    }
+}
+
+impl OperationsTaskHandler {
+    async fn run_drain(&self) {
+        let retry_key = TaskKey::DrainDocumentSyncOutbox;
+        let drain_started = Instant::now();
+
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!(task_id = ?retry_key, "Cannot drain document sync outbox without net handle");
+            self.reschedule_with_backoff(retry_key).await;
+            return;
+        };
+
+        let realm_id = *net_handle.realm_id();
+        let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
+
+        let rotation = self.take_rotation();
+        let Some(rotation) = self.open_rotation(&retry_key, rotation).await else {
+            return;
+        };
+        let mut invocation = DrainInvocation::new(&rotation);
+        loop {
+            if invocation.records >= self.outbox_limits.records
+                || invocation.pages >= self.outbox_limits.pages
+            {
+                break;
+            }
+            match self
+                .read_drain_page(&retry_key, &rotation, &mut invocation)
+                .await
+            {
+                DrainPage::Records {
+                    records,
+                    has_more,
+                    boundary_reached,
+                } => {
+                    self.process_drain_page(
+                        &retry_key,
+                        net_handle,
+                        realm_config.as_ref(),
+                        realm_id,
+                        records,
+                        &mut invocation,
+                    )
+                    .await;
+                    if boundary_reached || !has_more {
+                        invocation.reached_end = true;
+                        break;
+                    }
+                }
+                DrainPage::Skip => continue,
+                DrainPage::Stop => break,
+            }
+        }
+
+        self.finish_drain_invocation(
+            retry_key,
+            net_handle,
+            realm_id,
+            rotation,
+            invocation,
+            drain_started,
+        )
+        .await;
+    }
+}
+
+impl OperationsTaskHandler {
+    /// Runs one bounded invocation of the open rotation, then continues, yields
+    /// through the timer, or closes it. No record is ever deleted, truncated, or
+    /// overwritten to satisfy a bound.
+    pub(super) async fn drain_document_sync_outbox(&self) {
+        let _drain = self.drain_guard.lock().await;
+        #[cfg(debug_assertions)]
+        if let Some(barrier) = OutboxBarrier::new() {
+            barrier.wait_start().await;
+        }
+
+        self.run_drain().await;
+    }
+}
+
+impl OperationsTaskHandler {
+    pub(super) async fn close_rotation(&self, retry_key: TaskKey, mut rotation: OutboxRotation) {
+        let closed = rotation.close();
+        self.store_rotation(rotation);
+        if closed.examined > 0 {
+            info!(
+                event = "pipeline.drain.rotation",
+                examined = closed.examined,
+                deleted = closed.deleted,
+                deferred = closed.deferred,
+                undeliverable = closed.undeliverable,
+                retry_invocations = closed.retry_invocations,
+                invocations = closed.invocations,
+                "Document sync outbox rotation complete"
+            );
+        }
+
+        if closed.retry_invocations > 0 {
+            if closed.deleted > 0 {
+                self.reset_backoff(&retry_key);
+            }
+            self.reschedule_with_backoff(retry_key).await;
+        } else if closed.deferred > 0 {
+            if closed.deleted > 0 {
+                self.reset_backoff(&retry_key);
+            }
+            self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
+                .await;
+        } else {
+            self.reset_backoff(&retry_key);
+        }
+    }
+}
+
+impl OperationsTaskHandler {
+    pub(super) async fn open_rotation(
+        &self,
+        retry_key: &TaskKey,
+        mut rotation: OutboxRotation,
+    ) -> Option<OutboxRotation> {
+        if rotation.boundary.is_none() {
+            match read_outbox_tails(&self.context.storage_handle).await {
+                Ok(boundaries) if boundaries.is_empty() => {
+                    self.reset_backoff(retry_key);
+                    return None;
+                }
+                Ok(boundaries) => {
+                    rotation.boundary = boundaries.iter().map(|(_, key)| key).max().cloned();
+                    rotation.stream_boundaries = boundaries;
+                }
+                Err(error) => {
+                    warn!(task_id = ?retry_key, %error, "Failed to open document sync outbox rotation");
+                    self.store_rotation(rotation);
+                    self.reschedule_with_backoff(retry_key.clone()).await;
+                    return None;
+                }
+            }
+        }
+        debug_assert!(rotation.boundary.is_some());
+        Some(rotation)
+    }
+}
+
+impl OperationsTaskHandler {
+    fn store_rotation(&self, rotation: OutboxRotation) {
+        *self
+            .rotation
+            .lock()
+            .expect("outbox rotation mutex poisoned") = rotation;
+    }
+}
+
+impl OperationsTaskHandler {
+    /// Takes the open rotation, leaving a fresh one for a concurrent
+    /// invocation.
+    fn take_rotation(&self) -> OutboxRotation {
+        std::mem::take(
+            &mut *self
+                .rotation
+                .lock()
+                .expect("outbox rotation mutex poisoned"),
+        )
+    }
+}
