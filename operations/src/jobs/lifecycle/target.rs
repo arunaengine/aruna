@@ -21,11 +21,11 @@ use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, N
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::{
-    AuthContext, CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord,
-    JobPayload, JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    Permission, PhysicalExecutionState, PlacementDecision, PlacementPolicyRef, PlacementSubject,
-    PolicyResolution, RealmConfigDocument, WorkspaceMode, blob_group_permission_path,
-    evaluate_placement,
+    AuthContext, CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobId,
+    JobPayload, JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent,
+    LogicalJobSpec, Permission, PhysicalExecutionState, PlacementDecision, PlacementPolicyRef,
+    PlacementSubject, PolicyResolution, RealmConfigDocument, WorkspaceMode,
+    blob_group_permission_path, evaluate_placement,
 };
 use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
+use super::cancel::cancel_local_run;
 use super::ids::{self, workspace_of};
 use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
@@ -298,10 +299,27 @@ pub(crate) async fn commit_receipt(
     intent: &LaunchIntent,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
     let ctx: &DriverContext = context.as_ref();
-    commit_with(context, config, intent, move |config| {
+    let job_id = config.job_id;
+    let committed = commit_with(context, config, intent, move |config| {
         drive(ReserveExecutionOperation::new(config), ctx)
     })
-    .await
+    .await;
+    if matches!(committed, Some(Ok(_))) {
+        apply_late_cancel(context, intent, job_id).await;
+    }
+    committed
+}
+
+/// A cancel admitted while this launch was being decided reached the family
+/// before the receipt existed, so the row it just minted is flagged here.
+async fn apply_late_cancel(context: &Arc<DriverContext>, intent: &LaunchIntent, job_id: JobId) {
+    let family = intent.family();
+    let Some(records) = family_records(context, family).await else {
+        return;
+    };
+    if cancelled(family, &records) {
+        cancel_local_run(context.as_ref(), job_id).await;
+    }
 }
 
 /// What one reservation attempt decided, and what it proves about the writes it

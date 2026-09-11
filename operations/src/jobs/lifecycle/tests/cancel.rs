@@ -4,12 +4,14 @@
 use std::sync::Arc;
 
 use aruna_core::effects::JobRecordFrame;
-use aruna_core::structs::{AuthContext, JobFamilyRecord, JobState};
+use aruna_core::structs::{AuthContext, JobFamilyRecord, JobId, JobState};
 use aruna_core::types::UserId;
 
+use super::admission_race::{config, envelope, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::cancel::cancel_family;
+use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::records::tests::fixture::{Family, REALM, user};
 use crate::jobs::records::transport::serve_job_record;
 use crate::jobs::store::read_job_record;
@@ -86,16 +88,8 @@ async fn repeated_cancel_is_quiet() {
     assert!(second.cancel_requested);
 }
 
-#[tokio::test]
-async fn admitted_cancel_stops_local() {
-    // The record arrives after this node already admitted the execution, so
-    // admission itself has to apply it to the row that is already running.
-    let family = Family::new([43u8; 32]);
-    let (_dir, ctx) = node_context(&family, &family.target).await;
-    let receipt = seed_family(&ctx, &family).await;
-    reserve_execution(&ctx, &family, &receipt).await;
-    assert!(!flagged(&ctx).await);
-    let ctx = Arc::new(ctx);
+/// Delivers a signed cancel record the way replication does.
+async fn admit_cancel(ctx: &Arc<DriverContext>, family: &Family) {
     let record = JobRecordFrame::new(family.sign(
         &family.holder,
         JobFamilyRecord::Cancel(family.cancel(&family.spec())),
@@ -103,7 +97,7 @@ async fn admitted_cancel_stops_local() {
     .expect("bounded record");
 
     let reply = serve_job_record(
-        &ctx,
+        ctx,
         family.holder.public(),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
@@ -116,7 +110,44 @@ async fn admitted_cancel_stops_local() {
         reply,
         MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) }
     ));
+}
+
+#[tokio::test]
+async fn admitted_cancel_stops_local() {
+    // The record arrives after this node already admitted the execution, so
+    // admission itself has to apply it to the row that is already running.
+    let family = Family::new([43u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let receipt = seed_family(&ctx, &family).await;
+    reserve_execution(&ctx, &family, &receipt).await;
+    assert!(!flagged(&ctx).await);
+    let ctx = Arc::new(ctx);
+
+    admit_cancel(&ctx, &family).await;
+
     assert!(flagged(&ctx).await);
+}
+
+#[tokio::test]
+async fn late_cancel_flags_launch() {
+    // The cancel is admitted while the launch is still being decided, so it
+    // finds no receipt to stop; the committed launch must flag its own row.
+    let family = Family::new([45u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let (launch, _) = seed(&ctx, &family).await;
+    let ctx = Arc::new(ctx);
+    admit_cancel(&ctx, &family).await;
+
+    commit_receipt(&ctx, config(&family, &launch, 1, envelope(4)), &launch)
+        .await
+        .expect("commit decides")
+        .expect("receipt commits");
+
+    let record = read_job_record(&ctx.storage_handle, JobId::from_bytes([1u8; 16]), None)
+        .await
+        .expect("physical row read")
+        .expect("physical row exists");
+    assert!(record.cancel_requested);
 }
 
 #[tokio::test]

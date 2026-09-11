@@ -277,6 +277,14 @@ fn local_physical_jobs(receipts: &[JobRecordEnvelope], local: NodeId) -> Vec<Job
         .collect()
 }
 
+/// Cancels one local row whose launch committed while the family was already
+/// cancelled, waking the drain so the row never starts.
+pub(crate) async fn cancel_local_run(context: &DriverContext, physical: JobId) {
+    if flag_local_run(context, physical).await {
+        kick_drain(context).await;
+    }
+}
+
 /// Requests cancellation of one local physical row. A settled or pruned row is
 /// a no-op, and a repeated request leaves the stored record untouched.
 async fn flag_local_run(context: &DriverContext, physical: JobId) -> bool {
