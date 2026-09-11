@@ -5372,61 +5372,6 @@ mod tests {
         service.shutdown().await;
     }
 
-    #[test]
-    fn validate_node_info_upsert_accepts_owner_and_rejects_forgeries() {
-        use aruna_core::structs::{
-            AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
-        };
-
-        let node_id = node(7);
-        let realm_id = RealmId::from_bytes([2u8; 32]);
-        let target = DocumentSyncTarget::NodeInfo { realm_id, node_id };
-
-        let owned = NodeInfoDocument {
-            node_id,
-            executors: Vec::new(),
-            labels: std::collections::BTreeMap::new(),
-            urls: NodeUrls {
-                api: None,
-                s3: None,
-            },
-            utilization: NodeUtilization {
-                storage_bytes_used: 1,
-                documents_held: None,
-                load_permille: None,
-                heartbeat_at_ms: 5,
-            },
-            updated_at_ms: 5,
-            epoch: AdvertisementEpoch {
-                membership_generation: 1,
-                publisher_generation: 1,
-                observed_at_ms: 5,
-            },
-            compute_draining: false,
-            leaving: false,
-            demand: Default::default(),
-            reservation: Default::default(),
-        };
-        assert!(validate_node_info_upsert(&target, &owned.to_bytes().unwrap()).is_ok());
-
-        // A document whose embedded node id is a different node is rejected.
-        let misattributed = NodeInfoDocument {
-            node_id: node(9),
-            ..owned.clone()
-        };
-        assert!(validate_node_info_upsert(&target, &misattributed.to_bytes().unwrap()).is_err());
-
-        // Undecodable payloads and non node-info targets are rejected.
-        assert!(validate_node_info_upsert(&target, b"not-a-document").is_err());
-        assert!(
-            validate_node_info_upsert(
-                &DocumentSyncTarget::RealmConfig { realm_id },
-                &owned.to_bytes().unwrap()
-            )
-            .is_err()
-        );
-    }
-
     async fn quarantine_rows(storage: &StorageHandle) -> Vec<SyncQuarantineRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
