@@ -202,3 +202,124 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
 pub(super) fn role_definition_value(role: &AdminDocumentRoleDefinition) -> String {
     serde_json::to_string(role).expect("admin document role definition serializes")
 }
+
+pub fn user_attribute_path(key: &str) -> String {
+    format!("user.attributes.{key}")
+}
+
+pub fn user_subject_id_path(subject_id: &str) -> String {
+    format!("user.subject_ids.{subject_id}")
+}
+
+pub fn group_role_path(role_id: &RoleId) -> String {
+    format!("group.roles.{role_id}")
+}
+
+pub fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+    format!("group.roles.{role_id}.assigned_users.{user_id}")
+}
+
+pub fn realm_role_path(role_id: &RoleId) -> String {
+    format!("realm.roles.{role_id}")
+}
+
+pub fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+    format!("realm.roles.{role_id}.assigned_users.{user_id}")
+}
+
+pub fn realm_config_node_path(node_id: &NodeId) -> String {
+    format!("realm_config.nodes.{node_id}")
+}
+
+pub fn realm_config_oidc_provider_path(provider_id: &str) -> String {
+    format!("realm_config.oidc_providers.{provider_id}")
+}
+pub fn binding_scope_key(scope: &BindingScope) -> String {
+    match scope {
+        BindingScope::Realm => "realm".to_string(),
+        BindingScope::Group(group_id) => format!("group:{group_id}"),
+        BindingScope::Class(class) => match class {
+            DocumentClass::Admin => "class:admin",
+            DocumentClass::Group => "class:group",
+            DocumentClass::User => "class:user",
+            DocumentClass::Metadata => "class:metadata",
+            DocumentClass::MetadataRegistry => "class:metadata_registry",
+            DocumentClass::JobControl => "class:job_control",
+            DocumentClass::PlacementPolicy => "class:placement_policy",
+        }
+        .to_string(),
+        BindingScope::MetadataPathPrefix(prefix) => format!(
+            "metadata_path_prefix:{}",
+            MetadataRegistryRecord::normalize_document_path(prefix)
+        ),
+    }
+}
+
+pub(super) fn normalized_binding_scope(scope: &BindingScope) -> BindingScope {
+    match scope {
+        BindingScope::MetadataPathPrefix(prefix) => BindingScope::MetadataPathPrefix(
+            MetadataRegistryRecord::normalize_document_path(prefix),
+        ),
+        BindingScope::Realm => BindingScope::Realm,
+        BindingScope::Group(group_id) => BindingScope::Group(*group_id),
+        BindingScope::Class(class) => BindingScope::Class(*class),
+    }
+}
+
+pub(super) fn normalized_strategy_binding(binding: &StrategyBinding) -> StrategyBinding {
+    StrategyBinding {
+        scope: normalized_binding_scope(&binding.scope),
+        strategy_id: binding.strategy_id,
+    }
+}
+
+pub(super) fn metadata_replication_value(metadata_replication: &MetadataReplicationConfig) -> String {
+    serde_json::to_string(metadata_replication)
+        .expect("admin document metadata replication config serializes")
+}
+
+pub(super) fn realm_discovery_value(discovery: &RealmDiscoveryConfig) -> String {
+    serde_json::to_string(discovery).expect("admin document realm discovery config serializes")
+}
+
+pub(super) fn policies_value(policies: &[crate::request_policy::RequestPolicy]) -> String {
+    serde_json::to_string(policies).expect("admin document policies serialize")
+}
+
+pub(super) fn policies_from_value(value: &str) -> Option<Vec<crate::request_policy::RequestPolicy>> {
+    serde_json::from_str(value).ok()
+}
+
+pub(super) fn quota_value(quota: &QuotaConfig) -> String {
+    serde_json::to_string(&supported_quota(quota)).expect("admin document quota config serializes")
+}
+
+pub(super) fn supported_quota(quota: &QuotaConfig) -> QuotaConfig {
+    let mut quota = quota.clone();
+    quota.group_overrides.sort_by_key(|over| over.group_id);
+    quota
+        .user_group_cap_overrides
+        .sort_by_key(|over| over.user_id);
+    quota
+}
+
+pub(super) fn placement_entry_value(entry: &NodePlacementEntry) -> String {
+    serde_json::to_string(entry).expect("admin document placement entry serializes")
+}
+
+pub(super) fn placement_strategy_value(strategy: &PlacementStrategy) -> String {
+    serde_json::to_string(strategy).expect("admin document placement strategy serializes")
+}
+
+pub(super) fn strategy_binding_value(binding: &StrategyBinding) -> String {
+    serde_json::to_string(&normalized_strategy_binding(binding))
+        .expect("admin document strategy binding serializes")
+}
+
+pub(super) fn placement_override_value(record: &PlacementOverride) -> String {
+    serde_json::to_string(record).expect("admin document placement override serializes")
+}
+
+pub(super) fn placement_binding_value(binding: &PlacementBinding) -> String {
+    serde_json::to_string(binding).expect("admin document placement binding serializes")
+}
