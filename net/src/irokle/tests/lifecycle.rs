@@ -1136,3 +1136,148 @@ async fn metadata_graph_lifecycle_delete_skips_newer_live_registry_record() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn metadata_graph_lifecycle_delete_applies_with_matching_document_lifecycle_tombstone() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(80, 1);
+    let document_id = Ulid::from_parts(81, 1);
+    let record = registry_record(
+        group_id,
+        document_id,
+        "datasets/graph-deleted",
+        100,
+        Ulid::from_parts(82, 1),
+    );
+    write_registry_record(&storage, &record).await;
+    let delete_lifecycle = metadata_delete_lifecycle(
+        group_id,
+        document_id,
+        200,
+        Ulid::from_parts(83, 1),
+        record.last_event_id,
+    );
+    write_document_lifecycle_record(&storage, &delete_lifecycle).await;
+    let MetadataDocumentLifecycleRecord::Delete { event } = delete_lifecycle else {
+        unreachable!("delete lifecycle helper returns delete records")
+    };
+    let graph = event.tombstone;
+
+    assert!(
+        apply_metadata_graph_lifecycle_to_storage(
+            &storage,
+            &graph,
+            postcard::to_allocvec(&graph).expect("graph lifecycle serializes"),
+        )
+        .await
+        .expect("graph lifecycle delete applies")
+    );
+
+    assert_eq!(
+        read_graph_lifecycle_record(&storage, &graph.graph_iri).await,
+        Some(graph.clone())
+    );
+    assert_registry_record_deleted(&storage, group_id, document_id).await;
+}
+
+#[tokio::test]
+async fn metadata_registry_delete_skips_without_lifecycle_tombstone() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(30, 1);
+    let document_id = Ulid::from_parts(31, 1);
+    let record = registry_record(
+        group_id,
+        document_id,
+        "datasets/kept",
+        100,
+        Ulid::from_parts(32, 1),
+    );
+    write_registry_record(&storage, &record).await;
+
+    delete_registry_record(&storage, group_id, document_id)
+        .await
+        .expect("registry delete skips without tombstone");
+
+    let primary = read_registry_record(
+        &storage,
+        METADATA_INDEX_KEYSPACE,
+        metadata_registry_key(group_id, document_id),
+    )
+    .await;
+    let document_index = read_registry_record(
+        &storage,
+        METADATA_DOCUMENT_INDEX_KEYSPACE,
+        metadata_document_key(document_id),
+    )
+    .await;
+    let holder_value = read_storage_value(
+        &storage,
+        METADATA_HOLDERS_KEYSPACE,
+        metadata_registry_key(group_id, document_id),
+    )
+    .await
+    .expect("holder index exists");
+    let holders: Vec<NodeId> = postcard::from_bytes(&holder_value).expect("holders decode");
+
+    assert_eq!(primary, record);
+    assert_eq!(document_index, record);
+    assert_eq!(holders, record.holder_node_ids);
+}
+
+#[tokio::test]
+async fn metadata_lifecycle_upsert_preserves_revision_and_replays_idempotently() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(1, 1);
+    let document_id = Ulid::from_parts(2, 2);
+    let event_id = Ulid::from_parts(3, 3);
+    let event = metadata_create_event(group_id, document_id, 100, event_id, 7);
+    let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        event: Box::new(event.clone()),
+    };
+    let placement = aruna_core::structs::PlacementRef {
+        strategy_id: Ulid::from_parts(4, 4),
+        shard: 3,
+    };
+    let change = aruna_core::storage_entries::metadata_document_lifecycle_revision_change(
+        &lifecycle,
+        node(9),
+        placement,
+    );
+
+    assert!(
+        apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, change)
+            .await
+            .expect("upsert lifecycle applies")
+    );
+    assert!(
+        !apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, change)
+            .await
+            .expect("equal upsert lifecycle is idempotent")
+    );
+
+    let stored_event = read_storage_value(
+        &storage,
+        METADATA_EVENT_LOG_KEYSPACE,
+        metadata_event_log_key(document_id, event_id),
+    )
+    .await
+    .expect("event log record exists");
+    assert_eq!(
+        postcard::from_bytes::<MetadataCreateEventRecord>(&stored_event)
+            .expect("event log record decodes"),
+        event
+    );
+    let revision = read_lifecycle_revision(&storage, document_id).await;
+    assert_eq!(revision, change);
+    let acceptance = read_storage_value(
+        &storage,
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        metadata_create_acceptance_key(document_id),
+    )
+    .await
+    .expect("create acceptance exists");
+    assert_eq!(
+        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        event
+    );
+}
