@@ -684,3 +684,184 @@ pub(super) fn select_visible_records(
     }
     selection
 }
+
+// All-metadata reads defer per-graph authorization to evaluation time: the
+// scope is resolved once per query (O(caller's groups)) and the per-graph
+// decision is a cheap synchronous lookup that craqle memoizes per query.
+pub(super) enum LocalReadScope<T> {
+    Eager(T),
+    Lazy(GraphVisibilityScope),
+}
+
+pub(super) struct GraphVisibilityScope {
+    pub(super) records: Arc<Vec<MetadataRegistryRecord>>,
+    pub(super) permissions: GroupPermissionRules,
+    pub(super) lifecycle_visibility: LifecycleVisibility,
+}
+
+pub(super) enum LifecycleVisibility {
+    Cache(HashSet<String>),
+    FreshDeletedGraphs(HashSet<String>),
+}
+
+impl GraphVisibilityScope {
+    fn record_for_graph(&self, graph_iri: &str) -> Option<&MetadataRegistryRecord> {
+        registry_record_for_graph(&self.records, graph_iri)
+    }
+
+    // A tombstone in the request's own snapshot or in the cache hides the graph.
+    fn record_deleted(&self, visibility_cache: &MetadataVisibilityCache, graph_iri: &str) -> bool {
+        if matches!(
+            visibility_cache.lifecycle_deleted_any(graph_iri),
+            Some((true, _))
+        ) {
+            return true;
+        }
+        match &self.lifecycle_visibility {
+            LifecycleVisibility::Cache(deleted_graphs)
+            | LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
+                deleted_graphs.contains(graph_iri)
+            }
+        }
+    }
+
+    fn record_visible(
+        &self,
+        visibility_cache: &MetadataVisibilityCache,
+        record: &MetadataRegistryRecord,
+    ) -> bool {
+        // Rules are collected per group, but every record is decided on its own
+        // permission path, so per-document grants and denials agree with the
+        // decision `can_read_record` makes for the same caller and record.
+        !self.record_deleted(visibility_cache, &record.graph_iri)
+            && self.permissions.record_visible(record)
+    }
+
+    // Digest of every graph this scope may evaluate, in registry order.
+    pub(super) fn visible_digest(&self, visibility_cache: &MetadataVisibilityCache) -> [u8; 32] {
+        let mut digest = ScopeDigest::default();
+        for record in self.records.iter() {
+            if self.record_visible(visibility_cache, record) {
+                digest.push(&record.graph_iri);
+            }
+        }
+        digest.finish()
+    }
+
+    // Graphs without a registry record stay invisible (fail closed).
+    pub(super) fn graph_visible(
+        &self,
+        visibility_cache: &MetadataVisibilityCache,
+        graph_iri: &str,
+    ) -> bool {
+        self.record_for_graph(graph_iri)
+            .is_some_and(|record| self.record_visible(visibility_cache, record))
+    }
+}
+
+// Canonical graph IRIs embed the document id (graph_iri_for), enabling an
+// O(log n) lookup in the document-id-ordered snapshot; non-canonical IRIs
+// fall back to a scan.
+pub(super) fn registry_record_for_graph<'a>(
+    records: &'a [MetadataRegistryRecord],
+    graph_iri: &str,
+) -> Option<&'a MetadataRegistryRecord> {
+    if let Some(document_id) = graph_iri
+        .rsplit('/')
+        .next()
+        .and_then(|tail| Ulid::from_string(tail).ok())
+        && let Ok(index) = records.binary_search_by(|record| record.document_id.cmp(&document_id))
+        && records[index].graph_iri == graph_iri
+    {
+        return Some(&records[index]);
+    }
+    records.iter().find(|record| record.graph_iri == graph_iri)
+}
+
+pub(super) async fn resolve_graph_visibility_scope(
+    inner: &Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
+) -> Result<GraphVisibilityScope, MetadataError> {
+    let lifecycle_refresh = refresh_lifecycle_visibility_for_records(inner, &records).await?;
+    let lifecycle_visibility = if lifecycle_refresh.store_accepted {
+        LifecycleVisibility::Cache(lifecycle_refresh.deleted_graphs)
+    } else {
+        LifecycleVisibility::FreshDeletedGraphs(lifecycle_refresh.deleted_graphs)
+    };
+    let auth_realm = auth_context.as_ref().map(|auth| auth.realm_id);
+    let context = DriverContext {
+        storage_handle: inner.storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let permissions = GroupPermissionRules::collect(
+        &context,
+        auth_context.as_ref(),
+        records
+            .iter()
+            .filter(|record| Some(record.realm_id) == auth_realm)
+            .map(|record| record.group_id),
+    )
+    .await;
+    // RBAC/public visibility is additionally constrained by the metadata.read
+    // request policies; a policy-denied record is dropped from the scope so the
+    // eager and lazy (SPARQL) paths both fail closed on it.
+    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
+        &context,
+        records
+            .iter()
+            .map(|record| (record.realm_id, record.group_id)),
+    )
+    .await
+    .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let policy_auth = auth_context.as_ref();
+    let records = Arc::new(
+        records
+            .iter()
+            .filter(|record| {
+                evaluators
+                    .get(&(record.realm_id, record.group_id))
+                    .is_some_and(|evaluator| {
+                        evaluator
+                            .evaluate(&crate::metadata::api::metadata_read_request(
+                                &record.permission_path,
+                                policy_auth,
+                            ))
+                            .is_ok()
+                    })
+            })
+            .cloned()
+            .collect(),
+    );
+    Ok(GraphVisibilityScope {
+        records,
+        permissions,
+        lifecycle_visibility,
+    })
+}
+
+async fn refresh_lifecycle_visibility_for_records(
+    inner: &Arc<MetadataInner>,
+    records: &[MetadataRegistryRecord],
+) -> Result<LifecycleVisibilityRefresh, MetadataError> {
+    let fill_generation = inner.visibility_cache.current_generation();
+    let (deleted_graphs, _) =
+        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    let store_accepted = inner.visibility_cache.refresh_lifecycle_deleted_if_current(
+        records.iter().map(|record| {
+            (
+                record.graph_iri.clone(),
+                deleted_graphs.contains(&record.graph_iri),
+            )
+        }),
+        fill_generation,
+    );
+    Ok(LifecycleVisibilityRefresh {
+        deleted_graphs,
+        store_accepted,
+    })
+}
