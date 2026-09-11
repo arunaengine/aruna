@@ -498,3 +498,33 @@ pub(super) fn metadata_lifecycle_change(
         aruna_core::structs::PlacementRef::NIL,
     )
 }
+
+pub(super) fn registry_record(
+    group_id: Ulid,
+    document_id: Ulid,
+    document_path: &str,
+    updated_at_ms: u64,
+    last_event_id: Ulid,
+) -> MetadataRegistryRecord {
+    let realm_id = RealmId::from_bytes([42; 32]);
+    MetadataRegistryRecord {
+        realm_id,
+        group_id,
+        document_id,
+        document_path: document_path.to_string(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+        public: true,
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &realm_id,
+            group_id,
+            document_path,
+            document_id,
+        ),
+        placement: PlacementRef::NIL,
+        holder_node_ids: vec![node(1)],
+        created_at_ms: 1,
+        updated_at_ms,
+        establishing_event_id: last_event_id,
+        last_event_id,
+    }
+}
