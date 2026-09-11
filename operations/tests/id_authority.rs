@@ -143,7 +143,7 @@ async fn withdraw_precedes_mint() -> TestResult<()> {
 
 /// Deleting the document withdraws its mapping inside the transaction that
 /// removes the registry row, and the mapping outlives that row so the PID stays a
-/// 410 — including on an authority that has only the delete, not the tombstone.
+/// 410, even on an authority that has only the delete and not the tombstone.
 #[tokio::test]
 async fn delete_withdraws_mapping() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -338,7 +338,7 @@ async fn authority_loss_unavailable() -> TestResult<()> {
 /// Two authorized users minting the same document through two ingress nodes get
 /// one job on one owner. A node-local dedup row would let alternating ingress
 /// open a job each, and the handle each caller receives must be readable by that
-/// caller — an owner-scoped id its holder cannot inspect is not a handle.
+/// caller: an owner-scoped id its holder cannot inspect is not a handle.
 #[tokio::test]
 async fn mint_dedups_ingress() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;

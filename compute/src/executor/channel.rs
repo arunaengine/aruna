@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use futures_util::Stream;
 use tokio::sync::mpsc;
 
-/// `mpsc::Receiver` as a `Stream`; carries transfer chunks across task borders.
+/// Carries transfer chunks across task borders.
 pub(crate) struct ChannelStream<T>(pub(crate) mpsc::Receiver<T>);
 
 impl<T> Stream for ChannelStream<T> {

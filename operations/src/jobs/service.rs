@@ -643,7 +643,7 @@ pub(crate) async fn local_status(
 }
 
 /// The caller's own job, or the PID mint job it joined. A joined job is served as
-/// the caller's own — the record is rewritten onto the caller — so the handle the
+/// the caller's own (its record is rewritten onto the caller), so the handle the
 /// mint route returned is inspectable without disclosing the first submitter.
 async fn readable_job(
     context: &DriverContext,

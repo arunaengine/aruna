@@ -30,8 +30,8 @@ impl DocumentSyncService {
     /// the shard until they have flushed (flush-then-leave): they stay members and
     /// accepted publishers even though they are not canonical holders, so a
     /// removal never cuts off an in-flight flush. They rejoin neither the missing
-    /// nor the local-holder computation — only a canonical holder may mint or top
-    /// up membership — so a true non-holder is never added (DECISIONS D11).
+    /// nor the local-holder computation: only a canonical holder may mint or top
+    /// up membership, so a true non-holder is never added (DECISIONS D11).
     pub async fn reconcile_shard_membership(
         &self,
         topics: &[irokle_crate::TopicId],

@@ -229,7 +229,7 @@ mod test {
             .await
         );
 
-        // Authenticated strangers inherit public grants — signed access is
+        // Authenticated strangers inherit public grants; signed access is
         // never weaker than unsigned access.
         let stranger = AuthContext {
             user_id: UserId::local(Ulid::generate(), realm_id),

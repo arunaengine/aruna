@@ -338,8 +338,8 @@ fn map_offered_error(error: OfferedDirectoryError) -> s3s::S3Error {
 
 impl AuthProvider {
     /// Anonymous access: object bytes only, addressed to a concrete object, and
-    /// allowed only when a public role — one assigned to the Everyone principal
-    /// — grants READ on the object permission path. The bucket's own group
+    /// allowed only when a public role (one assigned to the Everyone principal)
+    /// grants READ on the object permission path. The bucket's own group
     /// scopes that path, so the authenticated flow's group-ownership check has
     /// no analogue here.
     async fn check_anonymous(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
@@ -382,7 +382,7 @@ impl AuthProvider {
 
         // Handlers read UserAccess/BucketInfo from the request extensions;
         // hand them the Everyone principal scoped to the bucket's group. The
-        // key/secret fields are blank — nothing downstream signs with them —
+        // key/secret fields are blank, nothing downstream signs with them,
         // and expiry is irrelevant because this access was just checked.
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(bucket_info);

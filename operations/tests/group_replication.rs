@@ -62,13 +62,13 @@ async fn group_creation_replicates_to_all_realm_nodes() -> Result<(), Box<dyn st
 }
 
 /// Five nodes at replication factor three, so a replica-capped bucket leaves real
-/// non-holders — the three- and four-node fixtures cannot see this class of bug,
+/// non-holders; the three- and four-node fixtures cannot see this class of bug,
 /// since there every node holds every bucket. The group is created on a node that
 /// holds none of the group id's bucket under the realm's capped default strategy:
 /// binding the group class to that strategy would leave the create unpublishable
 /// (its shard topic cannot exist locally), the outbox record undeliverable, and
 /// the group silently lost after an HTTP 200. Binding the class to `everywhere`
-/// instead is what makes this converge — including the authorization document,
+/// instead is what makes this converge, including the authorization document,
 /// which `CheckPermissionsOperation` reads from the local `AUTH_KEYSPACE` and
 /// hard-fails without.
 #[tokio::test]

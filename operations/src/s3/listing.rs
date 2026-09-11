@@ -65,7 +65,6 @@ impl PrefixPage {
         std::mem::take(&mut self.prefixes)
     }
 
-    /// Records the group a continuation marker already covers.
     pub(crate) fn set_resume(&mut self, group: Option<String>) {
         self.resume = group;
     }

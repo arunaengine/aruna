@@ -6,11 +6,9 @@ const ROUTES_DIR: &str = "src/routes";
 const METHODS: &[&str] = &[
     "any", "delete", "get", "head", "options", "patch", "post", "put", "trace",
 ];
-/// REST authorization boundaries. `ensure_permission` also matches
-/// `ensure_permission_with` and the `metadata` module wrapper around it;
-/// `require_owner` is the user-node device plane's owner gate; the operations
-/// metadata create entry point runs the single `authorize` boundary inside
-/// `aruna-operations`, which this scanner cannot follow.
+/// REST authorization boundaries: `ensure_permission` and its
+/// `ensure_permission_with` / metadata wrapper, `require_owner` for the
+/// user-node device plane, and the operations `authorize` entry point.
 const BOUNDARY: &[&str] = &[
     "create_metadata_authorized",
     "ensure_permission",
@@ -817,10 +815,9 @@ fn fn_bodies(source: &str) -> BTreeMap<String, String> {
     bodies
 }
 
-/// Maps idents imported from another route module back to that module, so a
-/// shared helper or a handler re-exported through `mod.rs` resolves across
-/// files. Absolute, `super::`, `self::` and sibling paths are resolved against
-/// the real module key set.
+/// Maps idents imported from another route module back to that module so
+/// shared helpers and re-exports through `mod.rs` resolve across files.
+/// Absolute, `super::`, `self::` and sibling paths use the real key set.
 fn route_imports(source: &str, module: &str, keys: &BTreeSet<String>) -> BTreeMap<String, String> {
     let mut imports = BTreeMap::new();
 

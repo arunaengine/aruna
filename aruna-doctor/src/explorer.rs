@@ -2114,8 +2114,8 @@ mod tests {
             .into_iter()
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
-        // The catalog is the expectation: every key it names except the three
-        // created above must be reported missing.
+        // The catalog plus the three bulk/mutation policy keyspaces is the
+        // expectation; the created group keyspace is excluded.
         let mut expected_missing = KEYSPACE_CATALOG
             .iter()
             .copied()

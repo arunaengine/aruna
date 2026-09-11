@@ -391,7 +391,7 @@ impl QuotaGate {
             ) => {
                 for (key, value) in values {
                     // Skip our own snapshot: the live local counter already accounts
-                    // for it. Mirror `sum_remote_snapshots` — never trust a snapshot
+                    // for it. Mirror `sum_remote_snapshots`: never trust a snapshot
                     // whose embedded node id disagrees with its storage key.
                     let key_node_id = node_usage_key_node_id(key.as_ref());
                     if key_node_id == Some(self.local_node_id) {

@@ -18,7 +18,7 @@ const PUBLIC_BODY: &[u8] = b"public profile artifact bytes";
 const PRIVATE_BODY: &[u8] = b"private bytes";
 
 /// A public role (assigned to the Everyone principal via `public: true`)
-/// grants anonymous READ on exactly the paths it names — S3 GETs and DRS
+/// grants anonymous READ on exactly the paths it names: S3 GETs and DRS
 /// lookups/downloads succeed without credentials, while writes and everything
 /// outside the granted path stay denied.
 #[tokio::test]
@@ -192,7 +192,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             "anonymous bucket listing must stay denied even when object GET is public"
         );
 
-        // Anonymous writes stay denied — public roles never grant more than
+        // Anonymous writes stay denied; public roles never grant more than
         // the anonymous read path allows.
         let put = http
             .put(&object_url)

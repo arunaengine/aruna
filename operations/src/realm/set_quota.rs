@@ -183,7 +183,7 @@ impl SetRealmQuotaOperation {
             },
         )?;
         // Derive the stored quota from the reducer's materialized state so this path
-        // agrees with the replicated overlay in net/src/irokle.rs: when the quota path
+        // agrees with the replicated overlay in net::irokle: when the quota path
         // is conflicted, both leave the previously stored quota in place.
         apply_reducer_quota(&mut document, &reducer_state);
 

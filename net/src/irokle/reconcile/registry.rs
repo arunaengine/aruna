@@ -378,7 +378,7 @@ pub(in crate::irokle) async fn apply_metadata_document_lifecycle_to_storage(
 /// Fold a replicated PID mapping into the local row inside one transaction, with
 /// its sync sidecar and shard-manifest entry. The merge is monotone and derived
 /// entirely from the two rows, so replay, reordering, and a frozen holder catching
-/// up all converge on the same state and the same manifest revision — and an
+/// up all converge on the same state and the same manifest revision, and an
 /// Active row can never overwrite a local Withdrawn tombstone.
 ///
 /// The same transaction fences the stamped placement against the one the
