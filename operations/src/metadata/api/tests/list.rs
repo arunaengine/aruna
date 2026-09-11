@@ -182,3 +182,152 @@ async fn pending_scan_capped() {
     assert_eq!(within.get(&group_id).map(Vec::len), Some(2));
     assert!(matches!(over, Err(MetadataApiError::ServiceUnavailable)));
 }
+
+// The page window must not truncate the estimate, and paging must not move it.
+#[tokio::test]
+async fn estimate_beyond_page() {
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let seeded = METADATA_ESTIMATE_MIN_LIMIT + 2;
+    for _ in 0..seeded {
+        seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
+    }
+
+    let page = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(page.documents.len(), METADATA_ESTIMATE_MIN_LIMIT);
+    assert_eq!(page.total_returned, METADATA_ESTIMATE_MIN_LIMIT);
+    assert_eq!(page.total_estimate, Some(seeded));
+
+    let tail = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+            offset: Some(seeded - 1),
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(tail.documents.len(), 1);
+    assert_eq!(tail.total_estimate, Some(seeded));
+}
+
+// A targeted lookup must not pay for the realm-wide estimate scan, and
+// must report the estimate as absent rather than as a truncated count.
+#[tokio::test]
+async fn lookup_omits_estimate() {
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    for _ in 0..3 {
+        seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
+    }
+
+    let lookup = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(lookup.total_returned, 3);
+    assert_eq!(lookup.total_estimate, None);
+
+    let browse = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(browse.total_estimate, Some(3));
+}
+
+// Anonymous callers collect no rules, so only public records count.
+#[tokio::test]
+async fn estimate_skips_private() {
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let readable = public_record(group_id, Ulid::generate());
+    seed_registry_cache(&test, &readable).await;
+    let mut private = public_record(group_id, Ulid::generate());
+    private.public = false;
+    seed_registry_cache(&test, &private).await;
+
+    let result = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        summary_request(group_id, false),
+    )
+    .await
+    .expect("listing succeeds");
+
+    assert_eq!(result.documents.len(), 1);
+    assert_eq!(result.documents[0].record.document_id, readable.document_id);
+    assert_eq!(result.total_estimate, Some(1));
+}
+
+#[tokio::test]
+async fn cross_shard_unknown() {
+    // Local listings cannot resolve claims that may live on another registry shard.
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 3);
+    config.seed_default_placement();
+    let mut first = public_record(group_id, Ulid::generate());
+    let first_shard = registry_placement(&config, &first).shard;
+    let mut second = loop {
+        let candidate = public_record(group_id, Ulid::generate());
+        if registry_placement(&config, &candidate).shard != first_shard {
+            break candidate;
+        }
+    };
+    second.document_path = first.document_path.clone();
+    second.permission_path = MetadataRegistryRecord::permission_path_for(
+        &TEST_REALM_ID,
+        group_id,
+        &second.document_path,
+        second.document_id,
+    );
+    let claims = [&first, &second]
+        .into_iter()
+        .map(|record| PathClaimRecord {
+            document_id: MetaResourceId::from_bytes(record.document_id.to_bytes()).unwrap(),
+            establishing_event_id: record.establishing_event_id,
+            requested_path: record.document_path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let resolution = aruna_core::structs::resolve_path_claim(&claims).unwrap();
+    let winner_id = resolution.winner.document_id.as_ulid();
+    let loser_id = resolution.conflicts[0].document_id.as_ulid();
+    first.public = first.document_id == loser_id;
+    second.public = second.document_id == loser_id;
+    seed_registry_cache(&test, &first).await;
+    seed_registry_cache(&test, &second).await;
+
+    let listed = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        summary_request(group_id, false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed.documents.len(), 1);
+    assert_eq!(listed.documents[0].record.document_id, loser_id);
+    assert_ne!(winner_id, loser_id);
+}
