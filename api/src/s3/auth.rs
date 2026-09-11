@@ -1,4 +1,5 @@
 use super::s3_server::S3OpLabel;
+use super::scope::resolve_scope;
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
@@ -27,6 +28,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tracing::debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Access {
@@ -178,7 +180,7 @@ impl S3Access for AuthProvider {
         // the handler against one loaded policy set. Prior credential, issuer, expiry,
         // revocation, and ownership checks keep anonymous/cross-group requests fail-closed.
         if cx.s3_op().name() != "DeleteObjects" {
-            authorize(
+            match authorize(
                 self.driver_ctx.as_ref(),
                 self.realm_id,
                 &auth_context,
@@ -187,7 +189,14 @@ impl S3Access for AuthProvider {
                 extras.clone(),
             )
             .await
-            .map_err(map_authorize_error)?;
+            {
+                Ok(()) => {}
+                Err(AuthorizeError::PermissionDenied) if is_listing_operation(&operation_name) => {
+                    self.admit_subpath_listing(cx, &user_access, &path, &operation_name)
+                        .await?;
+                }
+                Err(error) => return Err(map_authorize_error(error)),
+            }
         }
 
         if let Some(token_hash) = session_token_hash {
@@ -208,6 +217,15 @@ impl S3Access for AuthProvider {
         cx.extensions_mut().insert(user_access);
         Ok(())
     }
+}
+
+/// Listings a member holding only part of a bucket may still run, because their
+/// result is narrowed to that part.
+fn is_listing_operation(operation_name: &str) -> bool {
+    matches!(
+        operation_name,
+        "ListBuckets" | "HeadBucket" | "ListObjects" | "ListObjectsV2"
+    )
 }
 
 /// Maps an authorization failure to an S3 error, keeping RBAC and policy denials
@@ -559,6 +577,37 @@ impl AuthProvider {
             },
             auth_context,
         ))
+    }
+
+    /// Admits a listing whose caller reaches only part of the requested path,
+    /// and hands the resolved scope to the handler so the page stays inside it.
+    /// A caller without any such scope keeps the ordinary denial.
+    async fn admit_subpath_listing(
+        &self,
+        cx: &mut S3AccessContext<'_>,
+        user_access: &UserAccess,
+        path: &str,
+        operation_name: &str,
+    ) -> S3Result<()> {
+        let has_bucket = cx.s3_path().get_bucket_name().is_some();
+        let group_id = cx
+            .extensions_mut()
+            .get::<BucketInfo>()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+        let scope = resolve_scope(self.driver_ctx.as_ref(), user_access, group_id, path).await?;
+        if scope.is_empty() {
+            return Err(map_authorize_error(AuthorizeError::PermissionDenied));
+        }
+
+        debug!(
+            operation = operation_name,
+            "Narrowing listing to the caller's permitted subpaths"
+        );
+        if has_bucket {
+            cx.extensions_mut().insert(scope);
+        }
+        Ok(())
     }
 
     fn group_data_path(&self, group_id: ulid::Ulid) -> String {

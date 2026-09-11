@@ -13,6 +13,7 @@ use crate::s3::multipart_join::{
     CompletionFailure, CompletionRegistry, await_completion, completion_registry,
 };
 use crate::s3::s3_server::DeleteObjectsBody;
+use crate::s3::scope::{SubpathScope, resolve_scope};
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
     multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source,
@@ -324,7 +325,15 @@ impl ArunaS3Service {
                 Err(s3_error!(InternalError, "{}", message))
             }
             Err(error @ AuthorizeError::Storage(_)) => Err(map_authorize_error(error)),
-            Err(_) => Ok(false),
+            // A member whose roles reach only a folder inside this bucket still
+            // owns the bucket holding it, so it stays visible.
+            Err(_) => {
+                Ok(
+                    !resolve_scope(&self.state, user_access, bucket_info.group_id, &bucket_path)
+                        .await?
+                        .is_empty(),
+                )
+            }
         }
     }
 
@@ -946,6 +955,7 @@ impl ArunaS3Service {
         input: LOV2I,
         owner: Option<Owner>,
         url_encoded: bool,
+        scope: Option<&SubpathScope>,
     ) -> S3Result<ObjectListingPage> {
         let result = drive(ListObjectsV2Operation::new(input), &self.state)
             .await
@@ -961,9 +971,12 @@ impl ArunaS3Service {
             }
         };
 
+        // A page narrowed to the caller's subpaths may come back shorter; the
+        // continuation token still describes the underlying listing.
         let contents: Vec<Object> = result
             .objects
             .into_iter()
+            .filter(|object| scope.is_none_or(|scope| scope.allows_key(&object.head.key)))
             .map(|object| {
                 let response_fields = self.build_object_response_fields(
                     object.location.as_ref(),
@@ -985,6 +998,7 @@ impl ArunaS3Service {
         let common_prefixes: Vec<CommonPrefix> = result
             .common_prefixes
             .into_iter()
+            .filter(|prefix| scope.is_none_or(|scope| scope.allows_prefix(prefix)))
             .map(|prefix| CommonPrefix {
                 prefix: Some(encode_field(prefix)),
             })
@@ -996,6 +1010,25 @@ impl ArunaS3Service {
             continuation_token: result.continuation_token,
         })
     }
+}
+
+/// The narrowed read scope of a listing, resolved by the access hook. A prefix
+/// that overlaps no allowed subpath is refused, and a caller who may read the
+/// whole bucket needs no filtering.
+fn listing_scope(
+    extensions: &http::Extensions,
+    prefix: Option<&str>,
+) -> S3Result<Option<SubpathScope>> {
+    let Some(scope) = extensions.get::<SubpathScope>().cloned() else {
+        return Ok(None);
+    };
+    if scope.covers_all() {
+        return Ok(None);
+    }
+    if !scope.allows_prefix(prefix.unwrap_or_default()) {
+        return Err(s3_error!(AccessDenied, "Permission denied"));
+    }
+    Ok(Some(scope))
 }
 
 /// One page of a shared object listing before protocol-specific mapping.
@@ -1388,6 +1421,7 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let scope = listing_scope(&req.extensions, req.input.prefix.as_deref())?;
         let requested_continuation_token = req.input.continuation_token.clone();
         let continuation_token = Self::decode_list_objects_v2_continuation_token(
             requested_continuation_token.as_deref(),
@@ -1438,6 +1472,7 @@ impl S3 for ArunaS3Service {
                 },
                 owner,
                 url_encoded,
+                scope.as_ref(),
             )
             .await?;
 
@@ -1486,6 +1521,7 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let scope = listing_scope(&req.extensions, req.input.prefix.as_deref())?;
         let max_keys = match req.input.max_keys {
             None => ListObjectsV2Operation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
@@ -1543,6 +1579,7 @@ impl S3 for ArunaS3Service {
                 },
                 owner,
                 url_encoded,
+                scope.as_ref(),
             )
             .await?;
 
@@ -4649,6 +4686,243 @@ mod tests {
             .into_iter()
             .filter_map(|bucket| bucket.name)
             .collect()
+    }
+
+    /// A node whose caller holds one role granting read on `study/imaging`
+    /// only, with a second bucket and sibling keys the role never reaches.
+    async fn subpath_node() -> (TempDir, ArunaS3Service, UserAccess, Ulid) {
+        use std::collections::{HashMap, HashSet};
+        let realm_id = RealmId([51u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[51u8; 32]).public();
+        let (storage_dir, service) = parser_service(realm_id, node_id);
+        let group_id = Ulid::generate();
+        let user_access = test_user_access(group_id, realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        let role_id = Ulid::generate();
+        let group_auth = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(
+                role_id,
+                aruna_core::structs::Role {
+                    role_id,
+                    name: "imaging-reader".to_string(),
+                    permissions: HashMap::from([(
+                        format!(
+                            "{}/imaging/**",
+                            blob_bucket_permission_path(realm_id, group_id, node_id, "study")
+                        ),
+                        Permission::READ,
+                    )]),
+                    assigned_users: HashSet::from([user_access.user_identity]),
+                },
+            )]),
+            policies: Vec::new(),
+        };
+        let group = aruna_core::structs::Group {
+            display_name: "imaging".to_string(),
+            group_id,
+            realm_id,
+            owner: user_access.user_identity,
+            roles: group_auth.roles.keys().copied().collect(),
+        };
+        write_realm_config(&service.state.storage_handle, realm_id, &actor).await;
+        write_storage_value(
+            &service.state.storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &service.state.storage_handle,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &service.state.storage_handle,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        for bucket in ["study", "other"] {
+            write_storage_value(
+                &service.state.storage_handle,
+                S3_BUCKET_KEYSPACE,
+                bucket.as_bytes().to_vec(),
+                test_bucket_info(group_id, user_access.user_identity)
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .await;
+        }
+        seed_materialized_keys(
+            &service.state.storage_handle,
+            "study",
+            &[
+                "imaging/scan-a",
+                "imaging/scan-b",
+                "sequencing/reads",
+                "notes.txt",
+            ],
+            user_access.user_identity,
+            UNIX_EPOCH,
+        )
+        .await;
+
+        (storage_dir, service, user_access, group_id)
+    }
+
+    async fn subpath_request(
+        service: &ArunaS3Service,
+        user_access: &UserAccess,
+        group_id: Ulid,
+        prefix: Option<&str>,
+    ) -> S3Request<ListObjectsV2Input> {
+        let scope = resolve_scope(
+            &service.state,
+            user_access,
+            group_id,
+            &blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
+        )
+        .await
+        .unwrap();
+        assert!(!scope.is_empty());
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access.clone());
+        extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+        extensions.insert(scope);
+        test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                bucket: "study".to_string(),
+                delimiter: Some("/".to_string()),
+                max_keys: Some(10),
+                prefix: prefix.map(str::to_string),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn subpath_sees_bucket() {
+        // Only the bucket holding the granted folder may appear.
+        let (_storage_dir, service, user_access, _group_id) = subpath_node().await;
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access);
+        extensions.insert(PolicyRequestExtras::operation("s3.ListBuckets"));
+        let request = S3Request {
+            input: ListBucketsInput::default(),
+            method: Method::GET,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let response = service.list_buckets(request).await.unwrap();
+        let buckets: Vec<String> = response
+            .output
+            .buckets
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|bucket| bucket.name)
+            .collect();
+        assert_eq!(buckets, vec!["study"]);
+    }
+
+    #[tokio::test]
+    async fn subpath_hides_siblings() {
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+
+        let request = subpath_request(&service, &user_access, group_id, None).await;
+        let output = service.list_objects_v2(request).await.unwrap().output;
+        let prefixes: Vec<String> = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+        assert_eq!(prefixes, vec!["imaging/"]);
+        assert!(output.contents.unwrap_or_default().is_empty());
+        assert_eq!(output.is_truncated, Some(false));
+
+        let request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
+        let output = service.list_objects_v2(request).await.unwrap().output;
+        let keys: Vec<String> = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(keys, vec!["imaging/scan-a", "imaging/scan-b"]);
+    }
+
+    #[tokio::test]
+    async fn subpath_refuses_sibling() {
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+
+        let request = subpath_request(&service, &user_access, group_id, Some("sequencing/")).await;
+        let error = service.list_objects_v2(request).await.unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn object_path_decides() {
+        // Object reads stay authorized at their own path, inside and outside
+        // the granted folder.
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        let auth_context = AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: service.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let object_path = |key: &str| {
+            aruna_core::structs::blob_object_permission_path(
+                service.realm_id,
+                group_id,
+                service.node_id,
+                "study",
+                key,
+            )
+        };
+
+        assert!(
+            authorize(
+                &service.state,
+                service.realm_id,
+                &auth_context,
+                &object_path("imaging/scan-a"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject"),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            authorize(
+                &service.state,
+                service.realm_id,
+                &auth_context,
+                &object_path("sequencing/reads"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject"),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

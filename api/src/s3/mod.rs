@@ -5,4 +5,5 @@ mod error;
 pub mod multipart_join;
 pub mod s3_server;
 pub mod s3_service;
+mod scope;
 pub mod util;
