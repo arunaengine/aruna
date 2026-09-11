@@ -20,8 +20,8 @@ use tracing::{Instrument, Span, field, info_span, trace, warn};
 
 use crate::connection_pool::{ConnectionLease, ConnectionPool};
 use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
-use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
+use crate::irokle::DocumentSyncService;
 use crate::telemetry::{
     duration_ms, record_duration_ms, warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
 };

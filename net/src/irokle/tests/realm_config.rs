@@ -2510,7 +2510,7 @@ async fn concurrent_realm_config_oidc_provider_conflict_withholds_provider() {
     let providers = realm_config_oidc_providers(&config);
     assert!(!providers.contains_key("default"));
     assert_eq!(providers.get("untouched"), Some(&untouched));
-    let path = aruna_core::admin_document_reducer::realm_config_oidc_provider_path("default");
+    let path = aruna_core::reducer::realm_config_oidc_provider_path("default");
     assert!(
         read_storage_value(
             &storage,

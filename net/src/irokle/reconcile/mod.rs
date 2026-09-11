@@ -7,13 +7,13 @@ mod materialize;
 mod registry;
 mod validate;
 
-pub(in crate::document_sync) use self::admin::*;
+pub(in crate::irokle) use self::admin::*;
 #[cfg(test)]
-pub(in crate::document_sync) use self::apply::*;
-pub(in crate::document_sync) use self::cursor::*;
-pub(in crate::document_sync) use self::materialize::*;
-pub(in crate::document_sync) use self::registry::*;
-pub(in crate::document_sync) use self::validate::*;
+pub(in crate::irokle) use self::apply::*;
+pub(in crate::irokle) use self::cursor::*;
+pub(in crate::irokle) use self::materialize::*;
+pub(in crate::irokle) use self::registry::*;
+pub(in crate::irokle) use self::validate::*;
 
 impl DocumentSyncService {
     /// Reconciles shard-only topic membership to the authoritative current
@@ -192,16 +192,14 @@ impl DocumentSyncService {
         self.reconcile_document_topics(topic_ids).await
     }
 
-    pub(in crate::document_sync) async fn reconcile_documents(
+    pub(in crate::irokle) async fn reconcile_documents(
         &self,
     ) -> Result<DocumentSyncReconcileResult> {
         let topics = self.document_topic_ids()?;
         self.reconcile_document_topics(topics).await
     }
 
-    pub(in crate::document_sync) fn document_topic_ids(
-        &self,
-    ) -> Result<Vec<irokle_crate::TopicId>> {
+    pub(in crate::irokle) fn document_topic_ids(&self) -> Result<Vec<irokle_crate::TopicId>> {
         let topics = self
             .node
             .list_topics()
@@ -216,7 +214,7 @@ impl DocumentSyncService {
 
 impl DocumentSyncService {
     /// Returns one bounded causal batch above a component-wise cursor.
-    pub(in crate::document_sync) fn document_event_batch(
+    pub(in crate::irokle) fn document_event_batch(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
@@ -404,7 +402,7 @@ impl DocumentSyncService {
 
 impl DocumentSyncService {
     #[cfg(test)]
-    pub(in crate::document_sync) fn document_events_after(
+    pub(in crate::irokle) fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
@@ -416,7 +414,7 @@ impl DocumentSyncService {
 
     /// `Err` is permanent evidence: a create event whose payload does not decode
     /// or does not name its own target can never become valid.
-    pub(in crate::document_sync) fn pending_metadata_create_apply(
+    pub(in crate::irokle) fn pending_metadata_create_apply(
         &self,
         identity: SyncQuarantineIdentity,
         event: DocumentSyncEvent,
@@ -466,7 +464,7 @@ impl DocumentSyncService {
     }
 }
 
-pub(in crate::document_sync) fn satisfied_document_sync_dependencies(
+pub(in crate::irokle) fn satisfied_document_sync_dependencies(
     target: &DocumentSyncTarget,
     event: &AdminDocumentEvent,
 ) -> Vec<DocumentSyncDependency> {
@@ -494,7 +492,7 @@ pub(in crate::document_sync) fn satisfied_document_sync_dependencies(
     dependencies
 }
 
-pub(in crate::document_sync) async fn document_sync_dependency_available(
+pub(in crate::irokle) async fn document_sync_dependency_available(
     storage: &StorageHandle,
     dependency: DocumentSyncDependency,
 ) -> Result<bool> {
@@ -521,7 +519,7 @@ pub(in crate::document_sync) async fn document_sync_dependency_available(
     }
 }
 
-pub(in crate::document_sync) fn register_deferred_topic(
+pub(in crate::irokle) fn register_deferred_topic(
     deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
     dependency: DocumentSyncDependency,
     topic_id: irokle_crate::TopicId,
@@ -549,7 +547,7 @@ pub(in crate::document_sync) fn register_deferred_topic(
     DeferredTopicRegistrationOutcome::Inserted
 }
 
-pub(in crate::document_sync) fn remove_deferred_topic(
+pub(in crate::irokle) fn remove_deferred_topic(
     deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
     topic_id: irokle_crate::TopicId,
 ) {

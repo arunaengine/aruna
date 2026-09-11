@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::document_sync) async fn apply_admin_document_operation_to_storage(
+pub(in crate::irokle) async fn apply_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
     event: AdminDocumentEvent,
@@ -35,7 +35,7 @@ pub(in crate::document_sync) async fn apply_admin_document_operation_to_storage(
     }
 }
 
-pub(in crate::document_sync) async fn persist_stale_admin_document_event(
+pub(in crate::irokle) async fn persist_stale_admin_document_event(
     storage: &StorageHandle,
     apply_status: AdminDocumentApplyStatus,
     reducer_state: &AdminDocumentReducerState,
@@ -57,7 +57,7 @@ pub(in crate::document_sync) async fn persist_stale_admin_document_event(
     }
 }
 
-pub(in crate::document_sync) async fn apply_user_admin_document_operation_to_storage(
+pub(in crate::irokle) async fn apply_user_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
     event: AdminDocumentEvent,
@@ -252,7 +252,7 @@ pub(in crate::document_sync) async fn apply_user_admin_document_operation_to_sto
     ))
 }
 
-pub(in crate::document_sync) async fn group_write_entries_from_reducer(
+pub(in crate::irokle) async fn group_write_entries_from_reducer(
     storage: &StorageHandle,
     group_id: Ulid,
     reducer_state: &AdminDocumentReducerState,
@@ -295,7 +295,7 @@ pub(in crate::document_sync) async fn group_write_entries_from_reducer(
     ])
 }
 
-pub(in crate::document_sync) async fn apply_group_authorization_admin_document_operation_to_storage(
+pub(in crate::irokle) async fn apply_group_authorization_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
     event: AdminDocumentEvent,
@@ -396,7 +396,7 @@ pub(in crate::document_sync) async fn apply_group_authorization_admin_document_o
     storage_batch_delete_and_write_transactionally(storage, stale_conflict_deletes, writes).await
 }
 
-pub(in crate::document_sync) async fn apply_realm_authorization_admin_document_operation_to_storage(
+pub(in crate::irokle) async fn apply_realm_authorization_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
     event: AdminDocumentEvent,
@@ -492,7 +492,7 @@ pub(in crate::document_sync) async fn apply_realm_authorization_admin_document_o
 /// Realm-config ops the reducer stores as order-insensitive immutable values
 /// and whose validation no other such op can influence: a consecutive run of
 /// them may apply as one read-reduce-write cycle instead of one per event.
-pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
+pub(in crate::irokle) fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
     matches!(
         op,
         AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
@@ -509,7 +509,7 @@ pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperatio
 
 /// Flushes a buffered run of coalescible realm-config events, if any, and
 /// drops the validation snapshot the applied events just outdated.
-pub(in crate::document_sync) async fn flush_config_run(
+pub(in crate::irokle) async fn flush_config_run(
     storage: &StorageHandle,
     run: &mut Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)>,
     validation_cache: &mut ConfigValidationCache,
@@ -526,7 +526,7 @@ pub(in crate::document_sync) async fn flush_config_run(
 /// decoding and rewriting the reducer state per event is quadratic and stalls
 /// every later document behind the batch, so the run pays for state, document,
 /// materialization, and commit once.
-pub(in crate::document_sync) async fn apply_config_events(
+pub(in crate::irokle) async fn apply_config_events(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
     events: Vec<AdminDocumentEvent>,
@@ -756,7 +756,7 @@ pub(in crate::document_sync) async fn apply_config_events(
     ))
 }
 
-pub(in crate::document_sync) fn materialize_group_authorization(
+pub(in crate::irokle) fn materialize_group_authorization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
@@ -774,7 +774,7 @@ pub(in crate::document_sync) fn materialize_group_authorization(
     if let AdminDocumentOperation::GroupPoliciesSet { .. } = &event.op {
         if !reducer_state
             .conflicts
-            .contains_key(aruna_core::admin_document_reducer::GROUP_POLICIES_PATH)
+            .contains_key(aruna_core::reducer::GROUP_POLICIES_PATH)
             && let Some(policies) = reducer_state.materialized_group_policies()
         {
             auth_doc.policies = policies;
@@ -822,7 +822,7 @@ pub(in crate::document_sync) fn materialize_group_authorization(
     }
 }
 
-pub(in crate::document_sync) fn materialize_group_role(
+pub(in crate::irokle) fn materialize_group_role(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     role: &AdminDocumentRoleDefinition,
@@ -862,7 +862,7 @@ pub(in crate::document_sync) fn materialize_group_role(
     );
 }
 
-pub(in crate::document_sync) fn materialize_realm_authorization_admin_document_operation(
+pub(in crate::irokle) fn materialize_realm_authorization_admin_document_operation(
     auth_doc: &mut RealmAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
@@ -902,7 +902,7 @@ pub(in crate::document_sync) fn materialize_realm_authorization_admin_document_o
     }
 }
 
-pub(in crate::document_sync) fn materialize_realm_authorization_role(
+pub(in crate::irokle) fn materialize_realm_authorization_role(
     auth_doc: &mut RealmAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     role: &AdminDocumentRoleDefinition,
@@ -942,7 +942,7 @@ pub(in crate::document_sync) fn materialize_realm_authorization_role(
     );
 }
 
-pub(in crate::document_sync) fn materialize_user_admin_document_operation(
+pub(in crate::irokle) fn materialize_user_admin_document_operation(
     user_id: UserId,
     previous_user: Option<&User>,
     reducer_state: &AdminDocumentReducerState,

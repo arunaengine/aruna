@@ -5,10 +5,9 @@
 mod connection_pool;
 pub mod device_limits;
 pub mod dht;
-#[path = "irokle/mod.rs"]
-pub mod document_sync;
 mod effect_handlers;
 pub mod error;
+pub mod irokle;
 pub mod streams;
 mod telemetry;
 #[cfg(test)]
@@ -59,8 +58,8 @@ use ulid::Ulid;
 pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
-pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
 pub use error::{NetError, Result};
+pub use irokle::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
 const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;

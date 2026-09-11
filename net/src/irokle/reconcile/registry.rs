@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::document_sync) async fn apply_metadata_registry_upsert_to_storage(
+pub(in crate::irokle) async fn apply_metadata_registry_upsert_to_storage(
     storage: &StorageHandle,
     record: MetadataRegistryRecord,
     primary_bytes: Vec<u8>,
@@ -205,7 +205,7 @@ pub(in crate::document_sync) async fn apply_metadata_registry_upsert_to_storage(
     ))
 }
 
-pub(in crate::document_sync) async fn apply_metadata_graph_lifecycle_to_storage(
+pub(in crate::irokle) async fn apply_metadata_graph_lifecycle_to_storage(
     storage: &StorageHandle,
     record: &MetadataGraphLifecycleRecord,
     primary_bytes: Vec<u8>,
@@ -281,7 +281,7 @@ pub(in crate::document_sync) async fn apply_metadata_graph_lifecycle_to_storage(
     ))
 }
 
-pub(in crate::document_sync) async fn apply_metadata_document_lifecycle_to_storage(
+pub(in crate::irokle) async fn apply_metadata_document_lifecycle_to_storage(
     storage: &StorageHandle,
     record: &MetadataDocumentLifecycleRecord,
     change: DocumentSyncChange,
@@ -384,7 +384,7 @@ pub(in crate::document_sync) async fn apply_metadata_document_lifecycle_to_stora
 /// The same transaction fences the stamped placement against the one the
 /// document id decodes to, so a publisher authorized for one shard can neither
 /// stamp a document belonging to another shard nor write that shard's manifest.
-pub(in crate::document_sync) async fn store_pid_mapping(
+pub(in crate::irokle) async fn store_pid_mapping(
     storage: &StorageHandle,
     realm_id: RealmId,
     incoming: &PersistentIdMapping,
@@ -475,7 +475,7 @@ pub(in crate::document_sync) async fn store_pid_mapping(
 /// Stores one replicated policy document. The bucket is re-derived from the
 /// policy id inside the transaction, and a known id whose definition differs is
 /// rejected rather than merged: one id resolves to exactly one rule.
-pub(in crate::document_sync) async fn store_policy_document(
+pub(in crate::irokle) async fn store_policy_document(
     storage: &StorageHandle,
     realm_id: RealmId,
     incoming: &PlacementPolicyDocument,
@@ -569,7 +569,7 @@ pub(in crate::document_sync) async fn store_policy_document(
 
 /// The bucket a policy id must ride, derived from the realm config inside the
 /// caller's transaction and compared against the stamped placement.
-pub(in crate::document_sync) async fn derive_policy_bucket(
+pub(in crate::irokle) async fn derive_policy_bucket(
     storage: &StorageHandle,
     realm_id: RealmId,
     policy_id: Ulid,
@@ -611,7 +611,7 @@ pub(in crate::document_sync) async fn derive_policy_bucket(
 
 /// `Ok(Ok(None))` when the local row already absorbs the incoming one and
 /// `Ok(Err(()))` when the id is reused with a different definition.
-pub(in crate::document_sync) async fn policy_merge_txn(
+pub(in crate::irokle) async fn policy_merge_txn(
     storage: &StorageHandle,
     incoming: &PlacementPolicyDocument,
     txn_id: TxnId,
@@ -637,7 +637,7 @@ pub(in crate::document_sync) async fn policy_merge_txn(
 }
 
 /// `Ok(None)` when the local row already absorbs the incoming one.
-pub(in crate::document_sync) async fn pid_merge_txn(
+pub(in crate::irokle) async fn pid_merge_txn(
     storage: &StorageHandle,
     incoming: &PersistentIdMapping,
     txn_id: TxnId,
@@ -660,7 +660,7 @@ pub(in crate::document_sync) async fn pid_merge_txn(
     Ok(Some(local))
 }
 
-pub(in crate::document_sync) async fn delete_registry_record(
+pub(in crate::irokle) async fn delete_registry_record(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,
@@ -720,7 +720,7 @@ pub(in crate::document_sync) async fn delete_registry_record(
     ))
 }
 
-pub(in crate::document_sync) fn metadata_document_delete_matches_graph_lifecycle(
+pub(in crate::irokle) fn metadata_document_delete_matches_graph_lifecycle(
     delete: &MetadataDocumentDeleteRecord,
     record: &MetadataGraphLifecycleRecord,
 ) -> bool {
@@ -729,7 +729,7 @@ pub(in crate::document_sync) fn metadata_document_delete_matches_graph_lifecycle
         && delete.tombstone.updated_at_ms >= record.updated_at_ms
 }
 
-pub(in crate::document_sync) fn metadata_document_delete_matches_registry(
+pub(in crate::irokle) fn metadata_document_delete_matches_registry(
     delete: &MetadataDocumentDeleteRecord,
     group_id: Ulid,
     document_id: Ulid,
@@ -739,7 +739,7 @@ pub(in crate::document_sync) fn metadata_document_delete_matches_registry(
         && delete.tombstone.document_id == document_id
 }
 
-pub(in crate::document_sync) async fn metadata_document_lifecycle_write_entries_if_current(
+pub(in crate::irokle) async fn metadata_document_lifecycle_write_entries_if_current(
     storage: &StorageHandle,
     record: &MetadataDocumentLifecycleRecord,
     change: &DocumentSyncChange,
@@ -818,7 +818,7 @@ pub(in crate::document_sync) async fn metadata_document_lifecycle_write_entries_
     Ok(Some(entries))
 }
 
-pub(in crate::document_sync) async fn lifecycle_stale_txn(
+pub(in crate::irokle) async fn lifecycle_stale_txn(
     storage: &StorageHandle,
     target: &DocumentSyncTarget,
     incoming: &DocumentSyncChange,
@@ -839,14 +839,14 @@ pub(in crate::document_sync) async fn lifecycle_stale_txn(
     Ok(incoming.current <= local.current)
 }
 
-pub(in crate::document_sync) fn incoming_metadata_registry_stale_or_equal(
+pub(in crate::irokle) fn incoming_metadata_registry_stale_or_equal(
     existing: &MetadataRegistryRecord,
     incoming: &MetadataRegistryRecord,
 ) -> bool {
     metadata_registry_freshness(incoming) <= metadata_registry_freshness(existing)
 }
 
-pub(in crate::document_sync) fn registry_identity_matches(
+pub(in crate::irokle) fn registry_identity_matches(
     existing: &MetadataRegistryRecord,
     incoming: &MetadataRegistryRecord,
 ) -> bool {
@@ -861,7 +861,7 @@ pub(in crate::document_sync) fn registry_identity_matches(
         && existing.establishing_event_id == incoming.establishing_event_id
 }
 
-pub(in crate::document_sync) fn registry_identity_valid(record: &MetadataRegistryRecord) -> bool {
+pub(in crate::irokle) fn registry_identity_valid(record: &MetadataRegistryRecord) -> bool {
     let normalized_path = MetadataRegistryRecord::normalize_document_path(&record.document_path);
     record.establishing_event_id != Ulid::nil()
         && record.document_path == normalized_path
@@ -875,9 +875,7 @@ pub(in crate::document_sync) fn registry_identity_valid(record: &MetadataRegistr
             )
 }
 
-pub(in crate::document_sync) fn validate_metadata_event(
-    event: &MetadataCreateEventRecord,
-) -> Result<()> {
+pub(in crate::irokle) fn validate_metadata_event(event: &MetadataCreateEventRecord) -> Result<()> {
     if !registry_identity_valid(&event.record)
         || event.record.last_event_id != event.event_id
         || event_is_create(event) && event.record.establishing_event_id != event.event_id
@@ -889,7 +887,7 @@ pub(in crate::document_sync) fn validate_metadata_event(
     Ok(())
 }
 
-pub(in crate::document_sync) fn event_is_create(event: &MetadataCreateEventRecord) -> bool {
+pub(in crate::irokle) fn event_is_create(event: &MetadataCreateEventRecord) -> bool {
     matches!(
         &event.payload,
         aruna_core::metadata::MetadataCreateEventPayload::Scaffold { .. }
@@ -897,7 +895,7 @@ pub(in crate::document_sync) fn event_is_create(event: &MetadataCreateEventRecor
     )
 }
 
-pub(in crate::document_sync) fn same_create_event(
+pub(in crate::irokle) fn same_create_event(
     accepted: &MetadataCreateEventRecord,
     incoming: &MetadataCreateEventRecord,
 ) -> bool {
@@ -912,13 +910,13 @@ pub(in crate::document_sync) fn same_create_event(
         && accepted.occurred_at_ms == incoming.occurred_at_ms
 }
 
-pub(in crate::document_sync) fn metadata_registry_freshness(
+pub(in crate::irokle) fn metadata_registry_freshness(
     record: &MetadataRegistryRecord,
 ) -> (u64, Ulid) {
     (record.updated_at_ms, record.last_event_id)
 }
 
-pub(in crate::document_sync) async fn registry_sidecar_repairs(
+pub(in crate::irokle) async fn registry_sidecar_repairs(
     storage: &StorageHandle,
     record: &MetadataRegistryRecord,
     txn_id: TxnId,
@@ -937,7 +935,7 @@ pub(in crate::document_sync) async fn registry_sidecar_repairs(
     Ok(repairs)
 }
 
-pub(in crate::document_sync) async fn graph_record_txn(
+pub(in crate::irokle) async fn graph_record_txn(
     storage: &StorageHandle,
     graph_iri: &str,
     txn_id: TxnId,
@@ -957,7 +955,7 @@ pub(in crate::document_sync) async fn graph_record_txn(
     Ok(Some(record))
 }
 
-pub(in crate::document_sync) async fn delete_record_txn(
+pub(in crate::irokle) async fn delete_record_txn(
     storage: &StorageHandle,
     document_id: Ulid,
     txn_id: TxnId,
@@ -980,7 +978,7 @@ pub(in crate::document_sync) async fn delete_record_txn(
     }
 }
 
-pub(in crate::document_sync) async fn create_fence_txn(
+pub(in crate::irokle) async fn create_fence_txn(
     storage: &StorageHandle,
     event: &MetadataCreateEventRecord,
     txn_id: TxnId,
@@ -993,7 +991,7 @@ pub(in crate::document_sync) async fn create_fence_txn(
         .is_some_and(|record| record.is_deleted()))
 }
 
-pub(in crate::document_sync) async fn record_fenced_txn(
+pub(in crate::irokle) async fn record_fenced_txn(
     storage: &StorageHandle,
     record: &MetadataRegistryRecord,
     txn_id: TxnId,
@@ -1014,7 +1012,7 @@ pub(in crate::document_sync) async fn record_fenced_txn(
         .is_some_and(|record| record.is_deleted()))
 }
 
-pub(in crate::document_sync) async fn registry_cleanup_txn(
+pub(in crate::irokle) async fn registry_cleanup_txn(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,
@@ -1050,7 +1048,7 @@ pub(in crate::document_sync) async fn registry_cleanup_txn(
     Ok(metadata_registry_delete_entries(&record))
 }
 
-pub(in crate::document_sync) async fn metadata_placement_fence_in_transaction(
+pub(in crate::irokle) async fn metadata_placement_fence_in_transaction(
     storage: &StorageHandle,
     record: &MetadataRegistryRecord,
     txn_id: TxnId,
@@ -1082,7 +1080,7 @@ pub(in crate::document_sync) async fn metadata_placement_fence_in_transaction(
 /// the publisher stamped. The transactional config read is the whole fence: a
 /// concurrent config mutation conflicts the commit. `group_id` is compared only
 /// when the caller knows it; a PID mapping target carries no group.
-pub(in crate::document_sync) async fn derive_placement_txn(
+pub(in crate::irokle) async fn derive_placement_txn(
     storage: &StorageHandle,
     realm_id: RealmId,
     group_id: Option<Ulid>,
@@ -1152,7 +1150,7 @@ pub(in crate::document_sync) async fn derive_placement_txn(
     Ok(MetadataPlacementOutcome::Accepted(derived))
 }
 
-pub(in crate::document_sync) fn metadata_document_delete_write_entries(
+pub(in crate::irokle) fn metadata_document_delete_write_entries(
     record: &MetadataDocumentDeleteRecord,
 ) -> Result<Vec<(String, ByteView, Value)>> {
     let lifecycle = MetadataDocumentLifecycleRecord::Delete {
@@ -1177,7 +1175,7 @@ pub(in crate::document_sync) fn metadata_document_delete_write_entries(
     Ok(entries)
 }
 
-pub(in crate::document_sync) async fn registry_live_txn(
+pub(in crate::irokle) async fn registry_live_txn(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,

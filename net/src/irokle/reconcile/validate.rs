@@ -1,11 +1,11 @@
 use super::*;
 
 impl ConfigValidationCache {
-    pub(in crate::document_sync) fn invalidate(&mut self) {
+    pub(in crate::irokle) fn invalidate(&mut self) {
         self.entry = None;
     }
 
-    pub(in crate::document_sync) async fn load(
+    pub(in crate::irokle) async fn load(
         &mut self,
         storage: &StorageHandle,
         realm_id: RealmId,
@@ -31,7 +31,7 @@ impl ConfigValidationCache {
     }
 }
 
-pub(in crate::document_sync) async fn read_admin_reducer_state(
+pub(in crate::irokle) async fn read_admin_reducer_state(
     storage: &StorageHandle,
     target: &AdminDocumentTarget,
 ) -> Result<Option<AdminDocumentReducerState>> {
@@ -46,7 +46,7 @@ pub(in crate::document_sync) async fn read_admin_reducer_state(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
-pub(in crate::document_sync) async fn read_admin_realm_config(
+pub(in crate::irokle) async fn read_admin_realm_config(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> Result<Option<RealmConfigDocument>> {
@@ -63,7 +63,7 @@ pub(in crate::document_sync) async fn read_admin_realm_config(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
-pub(in crate::document_sync) async fn read_admin_realm_authorization(
+pub(in crate::irokle) async fn read_admin_realm_authorization(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> Result<Option<RealmAuthorizationDocument>> {
@@ -83,7 +83,7 @@ pub(in crate::document_sync) async fn read_admin_realm_authorization(
 /// Whether this origin already holds the per-origin bound a local mint obeys.
 /// Replacing its own entry stays allowed; the flooding origin is rejected rather
 /// than trimmed, so a valid revocation is never discarded to make room.
-pub(in crate::document_sync) fn revocation_origin_full(
+pub(in crate::irokle) fn revocation_origin_full(
     state: Option<&AdminDocumentReducerState>,
     event: &AdminDocumentEvent,
     token_hash: &str,
@@ -96,7 +96,7 @@ pub(in crate::document_sync) fn revocation_origin_full(
         && index.count(&event.origin_node_id) >= MAX_LIVE_REVOCATIONS_PER_ORIGIN
 }
 
-pub(in crate::document_sync) fn revocation_origin_known(
+pub(in crate::irokle) fn revocation_origin_known(
     config: Option<&RealmConfigDocument>,
     state: Option<&AdminDocumentReducerState>,
     event: &AdminDocumentEvent,
@@ -126,7 +126,7 @@ pub(in crate::document_sync) fn revocation_origin_known(
 
 /// Whether the transport publisher of a relayed admin event is a realm node
 /// allowed to relay. User nodes are never relays, so they never appear here.
-pub(in crate::document_sync) async fn relay_publisher_allowed(
+pub(in crate::irokle) async fn relay_publisher_allowed(
     storage: &StorageHandle,
     topic_id: irokle_crate::TopicId,
     publisher: irokle_crate::ActorId,
@@ -147,14 +147,14 @@ pub(in crate::document_sync) async fn relay_publisher_allowed(
 
 /// Publisher capability by node kind: a User node never originates a realm
 /// administrative event, whichever node relayed it.
-pub(in crate::document_sync) fn origin_may_publish(
+pub(in crate::irokle) fn origin_may_publish(
     config: &RealmConfigDocument,
     origin_node_id: &NodeId,
 ) -> bool {
     configured_node_kind(config, origin_node_id).is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
-pub(in crate::document_sync) fn configured_node_kind<'a>(
+pub(in crate::irokle) fn configured_node_kind<'a>(
     config: &'a RealmConfigDocument,
     node_id: &NodeId,
 ) -> Option<&'a RealmNodeKind> {
@@ -169,7 +169,7 @@ pub(in crate::document_sync) fn configured_node_kind<'a>(
 /// Resolves the plan a report names (stored config first, reduced state as
 /// the fallback) and checks the reporter holds the role the report claims:
 /// barriers from old holders, proofs from targets, stalls from the union.
-pub(in crate::document_sync) fn report_participation(
+pub(in crate::irokle) fn report_participation(
     op: &AdminDocumentOperation,
     current_config: Option<&RealmConfigDocument>,
     previous_state: Option<&AdminDocumentReducerState>,
@@ -247,7 +247,7 @@ pub(in crate::document_sync) fn report_participation(
     }
 }
 
-pub(in crate::document_sync) fn validate_config_authority(
+pub(in crate::irokle) fn validate_config_authority(
     current_config: Option<&RealmConfigDocument>,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentReducerState>,
@@ -450,7 +450,7 @@ pub(in crate::document_sync) fn validate_config_authority(
     })
 }
 
-pub(in crate::document_sync) async fn validate_realm_authorization_admin_authority(
+pub(in crate::irokle) async fn validate_realm_authorization_admin_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentReducerState>,
@@ -505,7 +505,7 @@ pub(in crate::document_sync) async fn validate_realm_authorization_admin_authori
     })
 }
 
-pub(in crate::document_sync) async fn validate_user_admin_authority(
+pub(in crate::irokle) async fn validate_user_admin_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentReducerState>,
@@ -595,7 +595,7 @@ pub(in crate::document_sync) async fn validate_user_admin_authority(
     Ok(AdminEventValidation::Accepted)
 }
 
-pub(in crate::document_sync) async fn validate_group_admin_authority(
+pub(in crate::irokle) async fn validate_group_admin_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentReducerState>,
@@ -807,7 +807,7 @@ pub(in crate::document_sync) async fn validate_group_admin_authority(
     })
 }
 
-pub(in crate::document_sync) fn has_current_write_permission<'a>(
+pub(in crate::irokle) fn has_current_write_permission<'a>(
     user_id: UserId,
     path: &str,
     roles: impl IntoIterator<Item = &'a Role>,
@@ -821,7 +821,7 @@ pub(in crate::document_sync) fn has_current_write_permission<'a>(
 /// to that same node. Returns a human-readable reason on rejection. Does not
 /// check the publisher's identity (the caller enforces that against the signed
 /// actor). A zero-counter snapshot is valid: stale-group cleanup publishes them.
-pub(in crate::document_sync) fn validate_node_usage_upsert(
+pub(in crate::irokle) fn validate_node_usage_upsert(
     target: &DocumentSyncTarget,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
@@ -849,7 +849,7 @@ pub(in crate::document_sync) fn validate_node_usage_upsert(
 /// its sync target. Does not check the publisher's identity (the caller enforces
 /// that against the signed actor). Empty digests are valid: they clear a node's
 /// interest for the realm while preserving single-writer ownership.
-pub(in crate::document_sync) fn validate_watch_interest(
+pub(in crate::irokle) fn validate_watch_interest(
     target: &DocumentSyncTarget,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
@@ -890,7 +890,7 @@ pub(in crate::document_sync) fn validate_watch_interest(
     Ok(())
 }
 
-pub(in crate::document_sync) fn validate_watch_subscription_upsert(
+pub(in crate::irokle) fn validate_watch_subscription_upsert(
     target: &DocumentSyncTarget,
     bytes: &[u8],
     change: &DocumentSyncChange,
@@ -925,7 +925,7 @@ pub(in crate::document_sync) fn validate_watch_subscription_upsert(
     Ok(())
 }
 
-pub(in crate::document_sync) fn validate_watch_subscription_delete(
+pub(in crate::irokle) fn validate_watch_subscription_delete(
     target: &DocumentSyncTarget,
     change: &DocumentSyncChange,
 ) -> std::result::Result<(), String> {
@@ -941,7 +941,7 @@ pub(in crate::document_sync) fn validate_watch_subscription_delete(
     Ok(())
 }
 
-pub(in crate::document_sync) fn validate_watch_subscription_target(
+pub(in crate::irokle) fn validate_watch_subscription_target(
     owner: UserId,
     watch_id: Ulid,
 ) -> std::result::Result<(), String> {
@@ -958,7 +958,7 @@ pub(in crate::document_sync) fn validate_watch_subscription_target(
 /// sync target: the payload must decode within its bounds, advertise only
 /// execution sites of its own node, and match the target's node. Does not check
 /// the publisher's identity (the caller enforces that against the signed actor).
-pub(in crate::document_sync) fn validate_node_info_upsert(
+pub(in crate::irokle) fn validate_node_info_upsert(
     target: &DocumentSyncTarget,
     bytes: &[u8],
 ) -> std::result::Result<NodeInfoDocument, String> {
@@ -979,7 +979,7 @@ pub(in crate::document_sync) fn validate_node_info_upsert(
 /// Whether an incoming advertisement replaces the stored one. Undecodable
 /// stored bytes are replaced; an equal or older epoch is not applied, so a
 /// delayed pre-rejoin advertisement cannot shadow the current one.
-pub(in crate::document_sync) fn node_info_supersedes(
+pub(in crate::irokle) fn node_info_supersedes(
     incoming: &NodeInfoDocument,
     stored: Option<&[u8]>,
 ) -> bool {
@@ -996,7 +996,7 @@ pub(in crate::document_sync) fn node_info_supersedes(
 /// Structural gate for a replicated policy document: it must address this
 /// realm and target, carry a verifiable definition, and derive its own sync
 /// change, so a sender cannot restate a policy under someone else's revision.
-pub(in crate::document_sync) fn validate_policy_document(
+pub(in crate::irokle) fn validate_policy_document(
     policy_id: Ulid,
     realm_id: RealmId,
     document: &PlacementPolicyDocument,
@@ -1030,7 +1030,7 @@ pub(in crate::document_sync) fn validate_policy_document(
     Ok(())
 }
 
-pub(in crate::document_sync) fn validate_pid_mapping(
+pub(in crate::irokle) fn validate_pid_mapping(
     document_id: Ulid,
     mapping: &PersistentIdMapping,
     change: &DocumentSyncChange,

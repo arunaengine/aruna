@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::document_sync) fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
+pub(in crate::irokle) fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     let mut key = b"topic-cursor/".to_vec();
     key.extend_from_slice(topic_id.as_bytes());
     ByteView::from(key)
@@ -9,7 +9,7 @@ pub(in crate::document_sync) fn topic_cursor_key(topic_id: irokle_crate::TopicId
 /// Decodes a stored cursor, discarding one written under another genesis, one
 /// whose recorded ops no longer occupy their positions, and one in an
 /// unreadable shape. A discarded cursor restarts replay at actor sequence one.
-pub(in crate::document_sync) fn applied_cursor_clock(
+pub(in crate::irokle) fn applied_cursor_clock(
     storage: &impl irokle_crate::storage::Storage,
     topic_id: irokle_crate::TopicId,
     genesis: irokle_crate::OpId,
@@ -38,7 +38,7 @@ pub(in crate::document_sync) fn applied_cursor_clock(
 
 /// Encodes a cursor with the ops that currently occupy its positions. A position
 /// with no op is left unmarked, which the read side treats as untrusted.
-pub(in crate::document_sync) fn applied_cursor_value(
+pub(in crate::irokle) fn applied_cursor_value(
     storage: &impl irokle_crate::storage::Storage,
     topic_id: irokle_crate::TopicId,
     genesis: irokle_crate::OpId,
@@ -65,7 +65,7 @@ pub(in crate::document_sync) fn applied_cursor_value(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
-pub(in crate::document_sync) fn fanout_cursor_value(
+pub(in crate::irokle) fn fanout_cursor_value(
     genesis: irokle_crate::OpId,
     round: u64,
 ) -> [u8; FANOUT_CURSOR_LEN] {
@@ -75,7 +75,7 @@ pub(in crate::document_sync) fn fanout_cursor_value(
     value
 }
 
-pub(in crate::document_sync) fn fanout_cursor_round(
+pub(in crate::irokle) fn fanout_cursor_round(
     value: &[u8],
     genesis: irokle_crate::OpId,
 ) -> Option<u64> {
@@ -86,7 +86,7 @@ pub(in crate::document_sync) fn fanout_cursor_round(
     Some(u64::from_be_bytes(round.try_into().ok()?))
 }
 
-pub(in crate::document_sync) fn current_cursor(
+pub(in crate::irokle) fn current_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
     genesis: irokle_crate::OpId,
@@ -98,7 +98,7 @@ pub(in crate::document_sync) fn current_cursor(
         .unwrap_or_default())
 }
 
-pub(in crate::document_sync) fn advance_cursor(
+pub(in crate::irokle) fn advance_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
     genesis: irokle_crate::OpId,
@@ -120,7 +120,7 @@ pub(in crate::document_sync) fn advance_cursor(
     Ok(())
 }
 
-pub(in crate::document_sync) fn remove_cursor(
+pub(in crate::irokle) fn remove_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
 ) -> Result<()> {
@@ -129,12 +129,12 @@ pub(in crate::document_sync) fn remove_cursor(
         .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
-pub(in crate::document_sync) fn deferred_topics_key() -> ByteView {
+pub(in crate::irokle) fn deferred_topics_key() -> ByteView {
     // Retain the original key so previously persisted admin dependencies decode.
     ByteView::from(b"deferred-admin-topics".to_vec())
 }
 
-pub(in crate::document_sync) async fn read_inbound_sync_messages(
+pub(in crate::irokle) async fn read_inbound_sync_messages(
     recv: &mut iroh::endpoint::RecvStream,
     reservation: &mut InboundByteReservation,
 ) -> Result<(Vec<SyncMessage>, Vec<irokle_crate::TopicId>)> {
@@ -167,7 +167,7 @@ pub(in crate::document_sync) async fn read_inbound_sync_messages(
     Ok((messages, topics.into_iter().collect()))
 }
 
-pub(in crate::document_sync) async fn read_next_inbound_sync_frame(
+pub(in crate::irokle) async fn read_next_inbound_sync_frame(
     recv: &mut iroh::endpoint::RecvStream,
     bytes_read: &mut usize,
     reservation: &mut InboundByteReservation,
@@ -227,7 +227,7 @@ pub(in crate::document_sync) async fn read_next_inbound_sync_frame(
     Ok(Some(payload))
 }
 
-pub(in crate::document_sync) async fn read_some_inbound_sync(
+pub(in crate::irokle) async fn read_some_inbound_sync(
     recv: &mut iroh::endpoint::RecvStream,
     buf: &mut [u8],
 ) -> Result<Option<usize>> {
@@ -237,7 +237,7 @@ pub(in crate::document_sync) async fn read_some_inbound_sync(
         .map_err(|error| NetError::Stream(error.to_string()))
 }
 
-pub(in crate::document_sync) async fn write_inbound_sync_messages(
+pub(in crate::irokle) async fn write_inbound_sync_messages(
     send: &mut iroh::endpoint::SendStream,
     messages: &[SyncMessage],
 ) -> Result<()> {
@@ -260,7 +260,7 @@ type BatchSummaryOutcome = (
     Vec<SyncMessage>,
 );
 
-pub(in crate::document_sync) fn process_batch_summary_responses(
+pub(in crate::irokle) fn process_batch_summary_responses(
     node: &irokle_crate::Irokle<irokle_crate::FjallStorage>,
     peer: PeerId,
     known_topics: &BTreeSet<irokle_crate::TopicId>,
@@ -355,7 +355,7 @@ pub(in crate::document_sync) fn process_batch_summary_responses(
 /// Names the bounded-journal refusal. Past Irokle's cap on unreleased records
 /// every genesis tie-break reset is refused, which otherwise reaches operators
 /// only as an opaque admission failure.
-pub(in crate::document_sync) fn report_journal_full(
+pub(in crate::irokle) fn report_journal_full(
     topic_id: irokle_crate::TopicId,
     error: &irokle_crate::Error,
 ) {
@@ -367,7 +367,7 @@ pub(in crate::document_sync) fn report_journal_full(
     }
 }
 
-pub(in crate::document_sync) fn forward_evictions_to(
+pub(in crate::irokle) fn forward_evictions_to(
     sink: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     evictions: Vec<TopicEviction>,
 ) {
@@ -378,7 +378,7 @@ pub(in crate::document_sync) fn forward_evictions_to(
     }
 }
 
-pub(in crate::document_sync) fn process_batch_data_responses(
+pub(in crate::irokle) fn process_batch_data_responses(
     node: &irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: &irokle_crate::net::IrohNet<irokle_crate::FjallStorage>,
     peer: PeerId,
@@ -451,7 +451,7 @@ pub(in crate::document_sync) fn process_batch_data_responses(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::document_sync) fn log_peer_batch_summary(
+pub(in crate::irokle) fn log_peer_batch_summary(
     peer: PeerId,
     topics: usize,
     r1_build: Duration,
@@ -479,7 +479,7 @@ pub(in crate::document_sync) fn log_peer_batch_summary(
     );
 }
 
-pub(in crate::document_sync) fn finish_batch_sync(
+pub(in crate::irokle) fn finish_batch_sync(
     peer: PeerId,
     known_topics: &BTreeSet<irokle_crate::TopicId>,
     failed_topics: &BTreeSet<irokle_crate::TopicId>,
@@ -500,9 +500,7 @@ pub(in crate::document_sync) fn finish_batch_sync(
     Ok(())
 }
 
-pub(in crate::document_sync) fn sync_message_topic_id(
-    message: &SyncMessage,
-) -> irokle_crate::TopicId {
+pub(in crate::irokle) fn sync_message_topic_id(message: &SyncMessage) -> irokle_crate::TopicId {
     match message {
         SyncMessage::Open(open) => open.topic_id,
         SyncMessage::Fingerprint(fingerprint) => fingerprint.topic_id,
@@ -514,14 +512,14 @@ pub(in crate::document_sync) fn sync_message_topic_id(
     }
 }
 
-pub(in crate::document_sync) fn remote_summary_is_empty(
+pub(in crate::irokle) fn remote_summary_is_empty(
     summary: &irokle_crate::sync::SyncSummary,
 ) -> bool {
     summary.event_type_id.is_none() && summary.heads.is_empty()
 }
 
 impl PeerTopicProbe {
-    pub(in crate::document_sync) fn merge(&mut self, other: PeerTopicProbe) {
+    pub(in crate::irokle) fn merge(&mut self, other: PeerTopicProbe) {
         self.known.extend(other.known);
         self.confirmed_unknown.extend(other.confirmed_unknown);
     }
@@ -531,7 +529,7 @@ impl PeerTopicProbe {
 /// ⇒ the peer holds a genesis; an empty summary (untyped, headless) ⇒ positive
 /// confirmation the peer has none; a topic with no summary is left out of both,
 /// meaning the peer refused it (holds it but the prober may not open it yet).
-pub(in crate::document_sync) fn classify_probe_responses(
+pub(in crate::irokle) fn classify_probe_responses(
     wanted: &BTreeSet<irokle_crate::TopicId>,
     responses: Vec<SyncMessage>,
 ) -> PeerTopicProbe {
@@ -550,9 +548,7 @@ pub(in crate::document_sync) fn classify_probe_responses(
     probe
 }
 
-pub(in crate::document_sync) fn peer_id_to_endpoint_addr(
-    peer_id: PeerId,
-) -> Result<iroh::EndpointAddr> {
+pub(in crate::irokle) fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
     let endpoint_id = iroh::EndpointId::from_bytes(peer_id.as_bytes())
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     Ok(iroh::EndpointAddr::from(endpoint_id))
