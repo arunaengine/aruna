@@ -566,3 +566,175 @@ pub(in crate::document_sync) async fn store_policy_document(
         "placement policy document conflicted twice".to_string(),
     ))
 }
+
+/// The bucket a policy id must ride, derived from the realm config inside the
+/// caller's transaction and compared against the stamped placement.
+pub(in crate::document_sync) async fn derive_policy_bucket(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    policy_id: Ulid,
+    placement: PlacementRef,
+    txn_id: TxnId,
+) -> Result<MetadataPlacementOutcome<PlacementRef>> {
+    if placement == PlacementRef::NIL || placement.strategy_id.is_nil() {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let value = storage_read_from_transaction(
+        storage,
+        REALM_CONFIG_KEYSPACE.to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::RealmConfig(realm_id),
+        ));
+    };
+    let config = RealmConfigDocument::from_bytes(&value)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if config.realm_id != realm_id {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    match config.policy_placement(policy_id) {
+        Some(derived) if derived == placement => Ok(MetadataPlacementOutcome::Accepted(derived)),
+        Some(_) => Ok(MetadataPlacementOutcome::Rejected),
+        None => Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::PlacementStrategy {
+                realm_id,
+                strategy_id: placement.strategy_id,
+            },
+        )),
+    }
+}
+
+/// `Ok(Ok(None))` when the local row already absorbs the incoming one and
+/// `Ok(Err(()))` when the id is reused with a different definition.
+pub(in crate::document_sync) async fn policy_merge_txn(
+    storage: &StorageHandle,
+    incoming: &PlacementPolicyDocument,
+    txn_id: TxnId,
+) -> Result<std::result::Result<Option<PlacementPolicyDocument>, ()>> {
+    let target = placement_policy_target(incoming.policy_id());
+    let local = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(local) = local else {
+        return Ok(Ok(Some(incoming.clone())));
+    };
+    let mut local = PlacementPolicyDocument::from_bytes(&local)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    match local.merge(incoming) {
+        Ok(true) => Ok(Ok(Some(local))),
+        Ok(false) => Ok(Ok(None)),
+        Err(_) => Ok(Err(())),
+    }
+}
+
+/// `Ok(None)` when the local row already absorbs the incoming one.
+pub(in crate::document_sync) async fn pid_merge_txn(
+    storage: &StorageHandle,
+    incoming: &PersistentIdMapping,
+    txn_id: TxnId,
+) -> Result<Option<PersistentIdMapping>> {
+    let local = storage_read_from_transaction(
+        storage,
+        PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
+        ByteView::from(persistent_id_key(incoming.target)),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(local) = local else {
+        return Ok(Some(incoming.clone()));
+    };
+    let mut local = PersistentIdMapping::from_bytes(&local)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if !local.merge(incoming) {
+        return Ok(None);
+    }
+    Ok(Some(local))
+}
+
+pub(in crate::document_sync) async fn delete_registry_record(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+) -> Result<()> {
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let delete = match delete_record_txn(storage, document_id, txn_id).await {
+            Ok(delete) => delete,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let Some(delete) = delete else {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        };
+        let deletes =
+            match registry_cleanup_txn(storage, group_id, document_id, &delete, txn_id).await {
+                Ok(deletes) => deletes,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+        if deletes.is_empty() {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        }
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, Vec::new())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "metadata registry cleanup conflicted twice".to_string(),
+    ))
+}
+
+pub(in crate::document_sync) fn metadata_document_delete_matches_graph_lifecycle(
+    delete: &MetadataDocumentDeleteRecord,
+    record: &MetadataGraphLifecycleRecord,
+) -> bool {
+    metadata_document_delete_matches_registry(delete, record.group_id, record.document_id)
+        && delete.tombstone.graph_iri == record.graph_iri
+        && delete.tombstone.updated_at_ms >= record.updated_at_ms
+}
+
+pub(in crate::document_sync) fn metadata_document_delete_matches_registry(
+    delete: &MetadataDocumentDeleteRecord,
+    group_id: Ulid,
+    document_id: Ulid,
+) -> bool {
+    delete.tombstone.is_deleted()
+        && delete.tombstone.group_id == group_id
+        && delete.tombstone.document_id == document_id
+}
