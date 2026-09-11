@@ -1,8 +1,6 @@
 mod chatgpt;
 mod chats;
 mod proxy;
-#[cfg(test)]
-mod test_support;
 
 use chatgpt::{__path_poll_login, __path_start_login, poll_login, start_login};
 use chats::{
@@ -771,6 +769,8 @@ pub async fn test_provider(
 
 #[cfg(test)]
 mod tests {
+    pub(crate) mod fixtures;
+
     use super::*;
     use aruna_core::credential_encryption::CredentialEncryptionKey;
     use aruna_core::structs::RealmId;
