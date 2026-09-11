@@ -3551,68 +3551,6 @@ impl DocumentSyncService {
         })
     }
 
-    #[cfg(test)]
-    fn document_events_after(
-        &self,
-        topic_id: irokle_crate::TopicId,
-        cursor: &irokle_crate::ActorClock,
-    ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId, u64)>> {
-        Ok(self
-            .document_event_batch(topic_id, cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?
-            .events)
-    }
-
-    /// `Err` is permanent evidence: a create event whose payload does not decode
-    /// or does not name its own target can never become valid.
-    fn pending_metadata_create_apply(
-        &self,
-        identity: SyncQuarantineIdentity,
-        event: DocumentSyncEvent,
-    ) -> std::result::Result<PendingMetadataCreateApply, Box<SyncRejection>> {
-        let (document_id, target_event_id, bytes) = match &event {
-            DocumentSyncEvent::Upsert {
-                target:
-                    DocumentSyncTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id: target_event_id,
-                    },
-                bytes,
-                ..
-            } => (*document_id, *target_event_id, bytes.clone()),
-            _ => unreachable!(
-                "metadata create apply helper is only called for metadata create upserts"
-            ),
-        };
-        let record = match postcard::from_bytes::<MetadataCreateEventRecord>(&bytes) {
-            Ok(record) => record,
-            Err(error) => {
-                return Err(Box::new(SyncRejection::new(
-                    identity,
-                    event,
-                    format!("undecodable metadata create event: {error}"),
-                )));
-            }
-        };
-        if record.record.document_id != document_id || record.event_id != target_event_id {
-            let reason = format!(
-                "metadata create-event target {document_id}/{target_event_id} does not match payload {}/{}",
-                record.record.document_id, record.event_id
-            );
-            return Err(Box::new(SyncRejection::new(identity, event, reason)));
-        }
-        Ok(PendingMetadataCreateApply {
-            identity,
-            event,
-            target: DocumentSyncTarget::MetadataCreateEvent {
-                document_id,
-                event_id: target_event_id,
-            },
-            record,
-            bytes,
-            lifecycle_revision: None,
-        })
-    }
-
     async fn apply_metadata_create_batch(
         &self,
         pending: Vec<PendingMetadataCreateApply>,
