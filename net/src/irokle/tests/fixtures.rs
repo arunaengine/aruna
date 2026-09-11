@@ -528,3 +528,7 @@ pub(super) fn registry_record(
         last_event_id,
     }
 }
+
+pub(super) fn peer(seed: u8) -> PeerId {
+    node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
+}
