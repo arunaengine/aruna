@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_matches_node_defaults() {
+    async fn doctor_matches_defaults() {
         let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
             ("STORAGE_PATH", "/tmp/aruna-doctor-defaults".to_string()),

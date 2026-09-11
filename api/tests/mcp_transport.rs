@@ -619,7 +619,7 @@ async fn data_guard_keys() {
 }
 
 #[tokio::test]
-async fn data_refuses_offered_write() {
+async fn refuses_offered_write() {
     let fixture = setup_fixture().await;
     let bucket = "offered-data";
     let offered = OfferedDirectory {
