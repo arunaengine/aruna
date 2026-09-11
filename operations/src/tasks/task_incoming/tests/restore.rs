@@ -622,3 +622,79 @@ async fn drain_reconcile_clears_realm_usage_summary_for_requested_realm_config()
 
     net.shutdown().await;
 }
+
+async fn restore_document_sync_outbox_timer_and_receive_key(
+    storage: &aruna_storage::StorageHandle,
+) -> TaskKey {
+    let task_handle = TaskHandle::new();
+    let (seen_tx, mut seen_rx) = mpsc::channel(1);
+    task_handle
+        .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+        .await;
+
+    restore_document_sync_outbox_timers(storage, &task_handle).await;
+
+    tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+        .await
+        .expect("restored drain timer should fire")
+        .expect("recording handler should receive timer key")
+}
+
+#[tokio::test]
+async fn placement_storage_rearms() {
+    let realm_id = RealmId::from_bytes([43u8; 32]);
+    let node_id = node(7);
+    let key = TaskKey::SyncPlacements { realm_id, node_id };
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    match storage
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            value: ByteView::from(b"malformed config".to_vec()),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected realm config write: {other:?}"),
+    }
+
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(task_handle),
+        compute_handle: None,
+    });
+
+    let before_ms = unix_timestamp_millis();
+    OperationsTaskHandler::new(context, JobsRuntime::new())
+        .handle_timer(key.clone())
+        .await;
+    let after_ms = unix_timestamp_millis();
+
+    let persisted = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: TASK_TIMER_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 2,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        other => panic!("unexpected timer iter result: {other:?}"),
+    };
+    assert_eq!(persisted.len(), 1, "one retry timer must be persisted");
+    let timer: aruna_core::task::PersistedTaskTimer =
+        postcard::from_bytes(&persisted[0].1).expect("persisted timer decodes");
+    assert_eq!(timer.key, key);
+    let retry_ms = crate::sync::shard_placement::SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64;
+    assert!(timer.due_at_unix_millis >= before_ms.saturating_add(retry_ms));
+    assert!(timer.due_at_unix_millis <= after_ms.saturating_add(retry_ms));
+}
