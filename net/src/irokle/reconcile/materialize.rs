@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::document_sync) fn target_write_entry(
+pub(in crate::irokle) fn target_write_entry(
     target: DocumentSyncTarget,
     value: Value,
 ) -> (String, ByteView, Value) {
@@ -11,7 +11,7 @@ pub(in crate::document_sync) fn target_write_entry(
     )
 }
 
-pub(in crate::document_sync) async fn apply_create_event(
+pub(in crate::irokle) async fn apply_create_event(
     storage: &StorageHandle,
     event: &MetadataCreateEventRecord,
     target: DocumentSyncTarget,
@@ -61,7 +61,7 @@ pub(in crate::document_sync) async fn apply_create_event(
     ))
 }
 
-pub(in crate::document_sync) fn overlay_group_reducer_materialization(
+pub(in crate::irokle) fn overlay_group_reducer_materialization(
     group: &mut Group,
     reducer_state: &AdminDocumentReducerState,
 ) {
@@ -117,7 +117,7 @@ fn group_metadata_conflicted(reducer_state: &AdminDocumentReducerState) -> bool 
         || reducer_state.conflicts.contains_key(GROUP_OWNER_PATH)
 }
 
-pub(in crate::document_sync) fn group_reducer_materialized_group(
+pub(in crate::irokle) fn group_reducer_materialized_group(
     group_id: Ulid,
     reducer_state: &AdminDocumentReducerState,
 ) -> Option<Group> {
@@ -137,7 +137,7 @@ pub(in crate::document_sync) fn group_reducer_materialized_group(
     })
 }
 
-pub(in crate::document_sync) fn overlay_group_authorization_role_assignment_reducer_materialization(
+pub(in crate::irokle) fn overlay_group_authorization_role_assignment_reducer_materialization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     role_id: RoleId,
@@ -188,7 +188,7 @@ fn overlay_group_authorization_assignment_reducer_materialization(
     }
 }
 
-pub(in crate::document_sync) fn overlay_realm_authorization_role_assignment_reducer_materialization(
+pub(in crate::irokle) fn overlay_realm_authorization_role_assignment_reducer_materialization(
     auth_doc: &mut RealmAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     role_id: RoleId,
@@ -239,7 +239,7 @@ fn overlay_realm_authorization_assignment_reducer_materialization(
     }
 }
 
-pub(in crate::document_sync) fn overlay_realm_config_reducer_materialization(
+pub(in crate::irokle) fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
@@ -348,7 +348,7 @@ pub(in crate::document_sync) fn overlay_realm_config_reducer_materialization(
     overlay_realm_config_placement_reducer_materialization(config, reducer_state, now_ms);
 }
 
-pub(in crate::document_sync) fn realm_config_from_reducer_materialization(
+pub(in crate::irokle) fn realm_config_from_reducer_materialization(
     realm_id: RealmId,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
@@ -400,7 +400,7 @@ pub(in crate::document_sync) fn realm_config_from_reducer_materialization(
     Some(config)
 }
 
-pub(in crate::document_sync) fn needs_revocation_index(
+pub(in crate::irokle) fn needs_revocation_index(
     is_revocation: bool,
     config_present: bool,
     reducer_state: &AdminDocumentReducerState,
@@ -420,7 +420,7 @@ fn remove_realm_config_oidc_provider(config: &mut RealmConfigDocument, provider_
         .retain(|provider| provider.id != provider_id);
 }
 
-pub(in crate::document_sync) fn admin_document_target_for_reduced_document(
+pub(in crate::irokle) fn admin_document_target_for_reduced_document(
     target: &DocumentSyncTarget,
 ) -> Option<AdminDocumentTarget> {
     match target {
