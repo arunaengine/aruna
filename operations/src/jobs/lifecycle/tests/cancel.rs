@@ -1,14 +1,19 @@
 //! Cancelling a family has to reach the executions this node itself runs: the
 //! replicated record stops further launches, it does not stop a running one.
 
-use aruna_core::structs::{AuthContext, JobState};
+use std::sync::Arc;
+
+use aruna_core::effects::JobRecordFrame;
+use aruna_core::structs::{AuthContext, JobFamilyRecord, JobState};
 use aruna_core::types::UserId;
 
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::cancel::cancel_family;
 use crate::jobs::records::tests::fixture::{Family, REALM, user};
+use crate::jobs::records::transport::serve_job_record;
 use crate::jobs::store::read_job_record;
+use crate::metadata::protocol::MetadataTransportMessage;
 
 fn auth(user_id: UserId) -> AuthContext {
     AuthContext {
@@ -79,6 +84,39 @@ async fn repeated_cancel_is_quiet() {
         .expect("physical row exists");
     assert_eq!(first, second);
     assert!(second.cancel_requested);
+}
+
+#[tokio::test]
+async fn admitted_cancel_stops_local() {
+    // The record arrives after this node already admitted the execution, so
+    // admission itself has to apply it to the row that is already running.
+    let family = Family::new([43u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let receipt = seed_family(&ctx, &family).await;
+    reserve_execution(&ctx, &family, &receipt).await;
+    assert!(!flagged(&ctx).await);
+    let ctx = Arc::new(ctx);
+    let record = JobRecordFrame::new(family.sign(
+        &family.holder,
+        JobFamilyRecord::Cancel(family.cancel(&family.spec())),
+    ))
+    .expect("bounded record");
+
+    let reply = serve_job_record(
+        &ctx,
+        family.holder.public(),
+        MetadataTransportMessage::ForwardJobRecord {
+            placement: family.placement,
+            record: Box::new(record),
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        reply,
+        MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) }
+    ));
+    assert!(flagged(&ctx).await);
 }
 
 #[tokio::test]

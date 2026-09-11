@@ -363,6 +363,7 @@ async fn accept_record(
         return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
     let rearms = rearms_witness(record.envelope());
+    let cancels = matches!(record.envelope().record, JobFamilyRecord::Cancel(_));
     let now_ms = aruna_core::util::unix_timestamp_millis();
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
@@ -384,6 +385,11 @@ async fn accept_record(
         notify_dashboard_change(context.as_ref());
         if rearms {
             crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
+        }
+        // Committed already: a cancel admitted here still has to reach the
+        // local executions this node admitted before it arrived.
+        if cancels {
+            crate::jobs::lifecycle::cancel::cancel_local_runs(context.as_ref(), family).await;
         }
     }
     match outcome.admission {
