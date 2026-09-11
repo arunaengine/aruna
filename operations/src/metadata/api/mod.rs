@@ -39,14 +39,18 @@ use thiserror::Error;
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
+pub(crate) use self::path::local_path_candidates;
+pub use self::path::{deduplicate_fanout_nodes, document_replica_query_nodes};
 use self::path::{
     forward_path_resolution, load_path_holder, merge_path_views, reduce_path_candidates,
     select_fanout_nodes, select_path_holders, validate_path_candidate,
 };
-pub use self::path::{deduplicate_fanout_nodes, document_replica_query_nodes};
-pub(crate) use self::path::local_path_candidates;
-pub(crate) use self::preflight::references_preflight_local;
-use self::preflight::resolve_preflight_targets;
+pub(crate) use self::preflight::{discover_realm_nodes, references_preflight_local};
+pub use self::preflight::{load_metadata_realm_nodes, load_realm_config};
+use self::preflight::{
+    preflight_fingerprint, reference_document_title, resolve_graph_reference,
+    resolve_preflight_targets,
+};
 use super::MetadataAuthToken;
 use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{
@@ -2022,138 +2026,6 @@ pub async fn references_preflight(
             realm_coverage_complete: distributed && complete,
         },
     })
-}
-
-fn preflight_fingerprint(
-    targets: &[MetadataPreflightResolvedTarget],
-    mode: Option<MetadataApiQueryMode>,
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"metadata-reference-preflight\0");
-    hasher.update(&[match mode {
-        None => 0,
-        Some(MetadataApiQueryMode::Local) => 1,
-        Some(MetadataApiQueryMode::Distributed) => 2,
-    }]);
-    hasher.update(
-        &postcard::to_allocvec(targets).expect("preflight cursor fingerprint payload serializes"),
-    );
-    *hasher.finalize().as_bytes()
-}
-
-async fn resolve_graph_reference(
-    context: &DriverContext,
-    realm_id: RealmId,
-    request: &MetadataReferencesRequest,
-    registry: &[MetadataRegistryRecord],
-) -> Result<Option<MetadataReferenceEntry>, MetadataApiError> {
-    let Some(record) = registry
-        .iter()
-        .find(|record| record.graph_iri == request.iri)
-    else {
-        return Ok(None);
-    };
-    if !can_read_record(context, realm_id, request.auth.as_ref(), record).await? {
-        return Ok(None);
-    }
-    let title = reference_document_title(context, record).await;
-    Ok(Some(MetadataReferenceEntry {
-        document_id: record.document_id.to_string(),
-        group_id: record.group_id.to_string(),
-        document_path: record.document_path.clone(),
-        graph_iri: record.graph_iri.clone(),
-        predicate: None,
-        subject_iris: Vec::new(),
-        title,
-    }))
-}
-
-async fn reference_document_title(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Option<String> {
-    let handle = context.metadata_handle.clone()?;
-    let properties = handle
-        .describe_root_properties(record.graph_iri.clone())
-        .await;
-    // Root subject "./" makes the fallback the document path, not the id tail.
-    let title = super::search_enrichment::hit_title(&properties, &record.document_path, "./");
-    (!title.is_empty()).then_some(title)
-}
-
-pub async fn load_realm_config(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Option<RealmConfigDocument> {
-    match drive(GetRealmConfigOperation::new(realm_id), context).await {
-        Ok(config) => Some(config),
-        Err(error) => {
-            warn!(error = %error, "realm config unavailable; querying the local replica only");
-            None
-        }
-    }
-}
-
-pub async fn load_metadata_realm_nodes(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-) -> Vec<NodeId> {
-    discover_realm_nodes(context, realm_id, local_node_id)
-        .await
-        .nodes
-}
-
-pub(crate) async fn discover_realm_nodes(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-) -> MetadataRealmNodeDiscovery {
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        return MetadataRealmNodeDiscovery {
-            nodes: vec![local_node_id],
-            failed: true,
-        };
-    };
-    // Race discovery so fanout queries degrade to reachable/local partitions
-    // instead of stalling behind offline peers.
-    let discovery = tokio::time::timeout(
-        REALM_DISCOVERY_TIMEOUT,
-        drive(GetRealmNodesOperation::new(realm_id), context),
-    )
-    .await;
-    let nodes = match discovery {
-        // Bounded-stale candidates are allowed here; an unreachable one is
-        // reported through the existing partial-result fields.
-        Ok(Ok(presence)) => match authorized_realm_nodes(&config, presence.into_nodes()) {
-            Ok(nodes) => (nodes, false),
-            Err(error) => {
-                warn!(error = %error, "realm config contains invalid node ids; using local-only metadata results");
-                return MetadataRealmNodeDiscovery {
-                    nodes: vec![local_node_id],
-                    failed: true,
-                };
-            }
-        },
-        Ok(Err(error)) => {
-            warn!(
-                error = %error,
-                "realm node discovery failed, using best-effort local-only metadata results"
-            );
-            (HashSet::new(), true)
-        }
-        Err(_) => {
-            warn!("realm node discovery timed out, using best-effort local-only metadata results");
-            (HashSet::new(), true)
-        }
-    };
-    let (nodes, failed) = nodes;
-    let mut nodes = nodes.into_iter().collect::<Vec<_>>();
-    if !nodes.contains(&local_node_id) {
-        nodes.push(local_node_id);
-    }
-    nodes.sort_by_key(|node_id| node_id.to_string());
-    MetadataRealmNodeDiscovery { nodes, failed }
 }
 
 fn authorized_realm_nodes(
