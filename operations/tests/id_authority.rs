@@ -27,7 +27,7 @@ use aruna_operations::jobs::store::{find_dedup_job, read_job_record};
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
@@ -35,10 +35,10 @@ use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
     mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
-use aruna_operations::metadata::get_metadata_document::load_metadata_record_by_document;
+use aruna_operations::metadata::get_document::load_metadata_record_by_document;
 use aruna_operations::metadata::persistent_id::read_mapping;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::realm::claim_initial_realm_admin::{
+use aruna_operations::realm::claim_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
 use ulid::Ulid;

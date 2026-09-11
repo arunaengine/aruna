@@ -20,7 +20,7 @@ use aruna_operations::node::startup::{ShardRestoreCursor, ShardRestorePass, rest
 use aruna_operations::placement::process_placements::process_shard_placements;
 use aruna_operations::placement::{resolve_shard_holders, shard_subject_bytes};
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use irokle::oplog::Oplog;

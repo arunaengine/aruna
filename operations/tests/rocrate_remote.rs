@@ -41,7 +41,7 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
@@ -57,7 +57,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use aruna_core::StructuredId;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::identifiers::{BucketId, PlacementHandle};
 
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";

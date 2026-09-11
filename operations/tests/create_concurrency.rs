@@ -10,7 +10,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     create_metadata_document,
 };
