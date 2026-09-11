@@ -16,11 +16,11 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::interest::{
     ensure_local_watch_interest_digest, mark_watch_interest_dirty,
 };
-use aruna_operations::onboarding::create_onboarding_secret::{
+use aruna_operations::onboarding::create_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::placement::placement_ref_for_target;
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -565,9 +565,9 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::notifications::watch::interest::publish_watch_interest;
-    use aruna_operations::sync::document_sync_outbox::read_outbox_records;
+    use aruna_operations::sync::document_outbox::read_outbox_records;
     use aruna_operations::sync::incoming::initialize_net_incoming;
-    use aruna_operations::tasks::task_incoming::OutboxDrainer;
+    use aruna_operations::tasks::incoming::OutboxDrainer;
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
     use std::sync::Arc;
@@ -1188,7 +1188,7 @@ mod tests {
         config
             .placement_bindings
             .push(aruna_core::structs::PlacementBinding {
-                handle: aruna_core::structured_id::PlacementHandle::new(
+                handle: aruna_core::identifiers::PlacementHandle::new(
                     aruna_core::structs::FIRST_GRANTABLE_HANDLE,
                 )
                 .unwrap(),
