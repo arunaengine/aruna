@@ -257,3 +257,93 @@ async fn group_role_seed_then_assignment_admin_operations_materialize_existing_a
         None
     );
 }
+
+#[tokio::test]
+async fn group_role_create_admin_operation_bootstraps_auth_doc_and_overlays_assignments() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([12; 32]);
+    let group_id = Ulid::from_parts(31, 1);
+    let role_id = Ulid::from_parts(32, 2);
+    let assigned_user_id = UserId::local(Ulid::from_parts(33, 3), realm_id);
+    let actor = test_actor(
+        8,
+        UserId::local(Ulid::from_parts(34, 4), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::Group { group_id };
+    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target.clone(),
+        test_admin_event(
+            Ulid::from_parts(35, 5),
+            target.clone(),
+            &actor,
+            1,
+            AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                role_id,
+                user_id: assigned_user_id,
+            },
+        ),
+    )
+    .await
+    .expect("assignment state applies before role exists");
+    storage_batch_delete_to(
+        &storage,
+        vec![(
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+        )],
+    )
+    .await
+    .expect("transient empty auth doc deletes");
+
+    let role = test_admin_role_definition(
+        role_id,
+        "Group data steward",
+        "/datasets/**",
+        Permission::WRITE,
+    );
+    apply_admin_document_operation_to_storage(
+        &storage,
+        document_target,
+        test_admin_event(
+            Ulid::from_parts(36, 6),
+            target.clone(),
+            &actor,
+            2,
+            AdminDocumentOperation::GroupRoleCreated { role },
+        ),
+    )
+    .await
+    .expect("role create applies without pre-existing auth doc");
+
+    let auth_doc = read_group_auth_doc(&storage, group_id).await;
+    let auth_role = &auth_doc.roles[&role_id];
+    assert_eq!(auth_role.name, "Group data steward");
+    assert_eq!(
+        auth_role.permissions,
+        HashMap::from([("/datasets/**".to_string(), Permission::WRITE)])
+    );
+    assert_eq!(auth_role.assigned_users, HashSet::from([assigned_user_id]));
+
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&target),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert!(reducer_state.conflicts.is_empty());
+    assert_eq!(
+        reducer_state.materialized_group_roles(),
+        BTreeSet::from([role_id])
+    );
+    assert_eq!(
+        reducer_state.materialized_group_role_user_assignments(),
+        BTreeMap::from([(role_id, BTreeSet::from([assigned_user_id]))])
+    );
+}
