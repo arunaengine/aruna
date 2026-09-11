@@ -96,7 +96,7 @@ hyper-util = { version = "0.1.20", features = [
     "service",
 ] }
 ipnet = "2.12.1"
-iroh = "1.1.0"
+iroh = "1.2.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
 irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f66816a16492c615525809f6c8b663", features = [
     "fjall",
