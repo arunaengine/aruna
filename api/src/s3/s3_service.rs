@@ -29,12 +29,9 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BlobHeadKey, BucketInfo, COMPLETION_DEADLINE_MS,
     OBJECT_CONTENT_TYPE_KEY, PathRestriction, Permission, RealmId, RoCrateLimits, SyncMode,
-    SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, WatchEvent, WatchEventDetail,
-    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path, credential_job_id,
-    data_watch_resource_path,
+    SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, blob_bucket_permission_path,
+    blob_object_permission_path, credential_job_id,
 };
-use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -44,10 +41,9 @@ use aruna_operations::driver::{
     DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
 };
 use aruna_operations::metadata::MetadataAuthToken;
-use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
-    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
+    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation, complete_put,
 };
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
@@ -698,36 +694,6 @@ impl ArunaS3Service {
         }
     }
 
-    /// Post-commit, best-effort resource-watch emission for a committed object
-    /// write. A failed emission only warns and never affects the already-successful
-    /// upload.
-    async fn emit_data_uploaded_watch(
-        &self,
-        actor: UserId,
-        group_id: ulid::Ulid,
-        bucket: String,
-        key: String,
-        size_bytes: u64,
-    ) {
-        let path = data_watch_resource_path(group_id, self.node_id, &bucket, &key);
-        let event = WatchEvent {
-            event_id: ulid::Ulid::generate(),
-            realm_id: self.realm_id,
-            kind: WatchEventKind::DataUploaded,
-            path,
-            actor,
-            occurred_at_ms: unix_timestamp_millis(),
-            detail: WatchEventDetail::DataUploaded {
-                group_id,
-                node_id: self.node_id,
-                bucket,
-                key,
-                size_bytes,
-            },
-        };
-        emit_resource_watch_event(self.state.as_ref(), event).await;
-    }
-
     pub(crate) async fn complete_put(
         &self,
         auth: AuthContext,
@@ -737,11 +703,18 @@ impl ArunaS3Service {
         version_id: ulid::Ulid,
         size_bytes: u64,
     ) {
-        let actor = auth.user_id;
-        self.queue_live_version_replication(auth, bucket.clone(), key.clone(), version_id, false)
-            .await;
-        self.emit_data_uploaded_watch(actor, group_id, bucket, key, size_bytes)
-            .await;
+        complete_put(
+            &self.state,
+            self.realm_id,
+            self.node_id,
+            auth,
+            group_id,
+            bucket,
+            key,
+            version_id,
+            size_bytes,
+        )
+        .await;
     }
 
     /// Deviates from AWS S3 by returning the true full-object MD5 hex as the
@@ -3690,8 +3663,8 @@ mod tests {
         BlobVersionState, CurrentVersionPointer, GroupAuthorizationDocument, NotificationClass,
         NotificationKind, NotificationRecord, PathRestriction, PortableSourceDescriptor,
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, SourceConnectorKind,
-        SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding, WatchEventMask,
-        WatchInterestEntry, WatchInterestTable,
+        SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding, WatchEventKind,
+        WatchEventMask, WatchInterestEntry, WatchInterestTable, data_watch_resource_path,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
