@@ -165,3 +165,84 @@ pub(in crate::document_sync) fn configured_node_kind<'a>(
         .find(|node| node.node_id == node_id)
         .map(|node| &node.kind)
 }
+
+/// Resolves the plan a report names (stored config first, reduced state as
+/// the fallback) and checks the reporter holds the role the report claims:
+/// barriers from old holders, proofs from targets, stalls from the union.
+pub(in crate::document_sync) fn report_participation(
+    op: &AdminDocumentOperation,
+    current_config: Option<&RealmConfigDocument>,
+    previous_state: Option<&AdminDocumentReducerState>,
+) -> ReportParticipation {
+    enum Role {
+        Old,
+        Target,
+        Union,
+        Departing,
+    }
+    let (transition_id, bucket, reporter, role) = match op {
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => (*transition_id, *bucket, *reported_by, Role::Old),
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            proof,
+            ..
+        } => (*transition_id, proof.bucket, proof.holder, Role::Target),
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => (*transition_id, *bucket, *reported_by, Role::Union),
+        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+            transition_id,
+            bucket,
+            reported_by,
+        } => (*transition_id, *bucket, *reported_by, Role::Departing),
+        _ => return ReportParticipation::NotReport,
+    };
+    let from_config = current_config.and_then(|config| {
+        config
+            .placement_transitions
+            .iter()
+            .find(|transition| transition.plan.transition_id == transition_id)
+            .map(|transition| transition.plan.clone())
+    });
+    let plan = match from_config {
+        Some(plan) => plan,
+        None => {
+            let Some(plan) = previous_state
+                .map(|state| state.materialized_transition_plans())
+                .unwrap_or_default()
+                .remove(&transition_id)
+            else {
+                return ReportParticipation::UnknownPlan;
+            };
+            plan
+        }
+    };
+    let Some(bucket_plan) = plan.bucket_plan(bucket) else {
+        return ReportParticipation::Foreign;
+    };
+    let allowed = match role {
+        Role::Old => bucket_plan.old_holders.contains(&reporter),
+        Role::Target => bucket_plan.target_holders.contains(&reporter),
+        Role::Union => {
+            bucket_plan.old_holders.contains(&reporter)
+                || bucket_plan.target_holders.contains(&reporter)
+        }
+        Role::Departing => {
+            bucket_plan.old_holders.contains(&reporter)
+                && !bucket_plan.target_holders.contains(&reporter)
+        }
+    };
+    if allowed {
+        ReportParticipation::Participant
+    } else {
+        ReportParticipation::Foreign
+    }
+}
