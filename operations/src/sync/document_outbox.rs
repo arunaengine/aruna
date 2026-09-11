@@ -22,7 +22,7 @@ use ulid::Ulid;
 // streams per peer instead of half-filling one. Records group by peer set and each
 // peer receives every topic, so the cap scales with stream capacity, not peer count.
 pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
-    4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
+    4 * aruna_net::irokle::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
 const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
 const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";

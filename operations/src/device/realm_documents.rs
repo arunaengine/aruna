@@ -33,7 +33,7 @@ use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
 use crate::node::node_info::{read_node_info_document, write_node_info_document};
-use crate::realm::mutate_realm_placement::node_kind;
+use crate::realm::mutate_placement::node_kind;
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker is treated as wrong. The realm agreeing against a

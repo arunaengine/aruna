@@ -13,7 +13,7 @@ pub mod intake;
 pub mod list_drafts;
 pub mod realm_documents;
 pub mod refresh;
-pub mod remove_device_node;
+pub mod remove_node;
 pub mod replica;
 pub mod selection;
 pub mod sync;

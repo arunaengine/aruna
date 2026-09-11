@@ -22,7 +22,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::s3::abort_multipart_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
+use crate::s3::abort_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
