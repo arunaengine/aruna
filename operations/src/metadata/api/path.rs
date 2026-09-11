@@ -362,7 +362,9 @@ pub(super) fn merge_path_views(
     Ok(candidates)
 }
 
-pub(super) fn normalize_path_view(candidates: &mut [MetadataPathCandidate]) -> Result<(), MetadataApiError> {
+pub(super) fn normalize_path_view(
+    candidates: &mut [MetadataPathCandidate],
+) -> Result<(), MetadataApiError> {
     candidates.sort_by_key(|candidate| {
         (
             candidate.claim.document_id,
@@ -539,7 +541,11 @@ pub fn deduplicate_fanout_nodes(nodes: Vec<NodeId>) -> Vec<NodeId> {
         .collect()
 }
 
-pub(super) fn select_fanout_nodes(nodes: &[NodeId], local_node_id: NodeId, subject: &[u8]) -> Vec<NodeId> {
+pub(super) fn select_fanout_nodes(
+    nodes: &[NodeId],
+    local_node_id: NodeId,
+    subject: &[u8],
+) -> Vec<NodeId> {
     let mut ranked = select_top_peers(
         nodes
             .iter()
