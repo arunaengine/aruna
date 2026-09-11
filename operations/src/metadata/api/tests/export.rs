@@ -83,3 +83,110 @@ async fn raw_export_fenced() {
 
     assert!(matches!(fenced, Err(MetadataApiError::NotFound)));
 }
+
+#[test]
+fn metadata_read_operation() {
+    let request = metadata_read_request("/realm/g/group/meta/document", None);
+    assert_eq!(request.operation, "metadata.read");
+}
+
+#[test]
+fn raw_identity_fence() {
+    let record = public_record(Ulid::generate(), Ulid::generate());
+    assert!(raw_identity_matches(
+        &record,
+        TEST_REALM_ID,
+        record.document_id
+    ));
+    assert!(!raw_identity_matches(
+        &record,
+        RealmId::from_bytes([8; 32]),
+        record.document_id
+    ));
+    assert!(!raw_identity_matches(
+        &record,
+        TEST_REALM_ID,
+        Ulid::generate()
+    ));
+}
+
+// The record lives only in the registry cache and the graph was never
+// projected, so a returned summary can only come from the summary cache.
+#[tokio::test]
+async fn summary_from_cache() {
+    let test = metadata_test();
+    let record = public_record(Ulid::generate(), Ulid::generate());
+    seed_registry_cache(&test, &record).await;
+    summary_cache().insert(
+        &record.graph_iri,
+        record.last_event_id,
+        "{\"cached\":true}",
+        Instant::now(),
+    );
+
+    let result = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        summary_request(record.group_id, true),
+    )
+    .await
+    .expect("summary listing succeeds");
+
+    assert_eq!(result.documents.len(), 1);
+    assert_eq!(
+        result.documents[0].rocrate_summary_jsonld.as_deref(),
+        Some("{\"cached\":true}")
+    );
+}
+
+#[tokio::test]
+async fn stale_summary_refused() {
+    // A cursor advance must fall through to the handle, not serve the entry.
+    let test = metadata_test();
+    let record = public_record(Ulid::generate(), Ulid::generate());
+    seed_registry_cache(&test, &record).await;
+    summary_cache().insert(
+        &record.graph_iri,
+        Ulid::generate(),
+        "{\"stale\":true}",
+        Instant::now(),
+    );
+
+    let result = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        summary_request(record.group_id, true),
+    )
+    .await
+    .expect("summary listing succeeds");
+
+    assert_eq!(result.documents.len(), 1);
+    assert!(result.documents[0].rocrate_summary_jsonld.is_none());
+}
+
+#[tokio::test]
+async fn pending_summary_listed() {
+    let test = metadata_test();
+    let record = public_record(Ulid::generate(), Ulid::generate());
+    write_pending_marker(&test, &record).await;
+
+    let result = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        summary_request(record.group_id, true),
+    )
+    .await
+    .expect("summary listing succeeds");
+    assert_eq!(result.documents.len(), 1);
+    assert_eq!(result.documents[0].record.document_id, record.document_id);
+    assert!(result.documents[0].rocrate_summary_jsonld.is_none());
+
+    let plain = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        summary_request(record.group_id, false),
+    )
+    .await
+    .expect("plain listing succeeds");
+    assert!(plain.documents.is_empty());
+}
