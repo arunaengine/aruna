@@ -178,3 +178,189 @@ pub(super) async fn query_local_graphs(
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     result
 }
+
+struct MetadataQueryCancellationGuard(CancellationToken);
+
+impl Drop for MetadataQueryCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError> {
+    if sparql.len() > METADATA_QUERY_MAX_BYTES {
+        return Err(MetadataError::InvalidInput(format!(
+            "SPARQL query exceeds the {METADATA_QUERY_MAX_BYTES}-byte limit"
+        )));
+    }
+    let query = SparqlParser::new()
+        .parse_query(&format!("{METADATA_QUERY_COMMON_PREFIXES}{sparql}"))
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    let pattern = match &query {
+        Query::Select { pattern, .. } | Query::Ask { pattern, .. } => pattern,
+        Query::Construct { .. } | Query::Describe { .. } => {
+            return Err(MetadataError::InvalidInput(
+                "only SELECT and ASK metadata queries are supported".to_string(),
+            ));
+        }
+    };
+    if super::super::api::graph_pattern_contains_service(pattern) {
+        return Err(MetadataError::InvalidInput(
+            "SERVICE is not supported in metadata queries".to_string(),
+        ));
+    }
+    Ok(query)
+}
+
+fn evaluate_metadata_query_snapshot(
+    inner: &MetadataInner,
+    scope: LocalReadScope<Vec<String>>,
+    query: &Query,
+    cancellation: &CancellationToken,
+) -> Result<MetadataQueryResults, MetadataError> {
+    let graphs = match scope {
+        LocalReadScope::Eager(allowed) => graph_ids(&allowed),
+        LocalReadScope::Lazy(scope) => inner
+            .node
+            .graphs()
+            .map_err(|error| MetadataError::Backend(error.to_string()))?
+            .into_iter()
+            .filter(|graph| scope.graph_visible(&inner.visibility_cache, graph.as_str()))
+            .collect(),
+    };
+    let mut dataset = Dataset::new();
+    for graph in graphs {
+        ensure_metadata_query_not_cancelled(cancellation)?;
+        if !inner
+            .node
+            .contains_graph(&graph)
+            .map_err(|error| MetadataError::Backend(error.to_string()))?
+        {
+            return Err(MetadataError::GraphNotFound);
+        }
+        let snapshot = inner
+            .node
+            .graph_snapshot(&graph)
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let orphaned = inner
+            .node
+            .graph_diagnostics(&graph)
+            .map_err(|error| MetadataError::Backend(error.to_string()))?
+            .orphaned_entities
+            .into_iter()
+            .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
+            .collect::<HashSet<_>>();
+        for quad in snapshot.quads {
+            ensure_metadata_query_not_cancelled(cancellation)?;
+            if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
+                continue;
+            }
+            let subject = match quad.subject.to_term() {
+                Some(Term::NamedNode(subject)) => NamedOrBlankNode::NamedNode(subject),
+                Some(Term::BlankNode(subject)) => NamedOrBlankNode::BlankNode(subject),
+                _ => return Err(invalid_snapshot_term(&quad.subject.0)),
+            };
+            let predicate = quad
+                .predicate
+                .to_named_node()
+                .ok_or_else(|| invalid_snapshot_term(&quad.predicate.0))?;
+            let object = quad
+                .object
+                .to_term()
+                .ok_or_else(|| invalid_snapshot_term(&quad.object.0))?;
+            dataset.insert(&Quad::new(
+                subject.clone(),
+                predicate.clone(),
+                object.clone(),
+                snapshot.graph.0.clone(),
+            ));
+            dataset.insert(&Quad::new(
+                subject,
+                predicate,
+                object,
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+
+    ensure_metadata_query_not_cancelled(cancellation)?;
+    let evaluator = QueryEvaluator::new().with_cancellation_token(cancellation.clone());
+    let mut prepared = evaluator.prepare(query);
+    prepared
+        .dataset_mut()
+        .set_default_graph(vec![GraphName::DefaultGraph]);
+    let evaluated = prepared
+        .execute(&dataset)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let results = collect_metadata_query_results(evaluated)?;
+    ensure_metadata_query_not_cancelled(cancellation)?;
+    let serialized =
+        serde_json::to_vec(&results).map_err(|error| MetadataError::Backend(error.to_string()))?;
+    if serialized.len() > METADATA_QUERY_MAX_RESULT_BYTES {
+        return Err(MetadataError::InvalidInput(format!(
+            "metadata query result exceeds the {METADATA_QUERY_MAX_RESULT_BYTES}-byte limit"
+        )));
+    }
+    Ok(results)
+}
+
+fn collect_metadata_query_results(
+    results: spareval::QueryResults<'_>,
+) -> Result<MetadataQueryResults, MetadataError> {
+    match results {
+        spareval::QueryResults::Solutions(solutions) => {
+            let mut rows = Vec::new();
+            let mut serialized_bytes = 32usize;
+            for solution in solutions {
+                let solution =
+                    solution.map_err(|error| MetadataError::Backend(error.to_string()))?;
+                if rows.len() == METADATA_QUERY_MAX_ROWS {
+                    return Err(MetadataError::InvalidInput(format!(
+                        "metadata query result exceeds the {METADATA_QUERY_MAX_ROWS}-row limit"
+                    )));
+                }
+                let row = solution
+                    .iter()
+                    .map(|(variable, term)| {
+                        let encoded = craqle::EncodedTerm::from_term(term)
+                            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+                        Ok((variable.as_str().to_string(), encoded.0))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, MetadataError>>()?;
+                serialized_bytes = serialized_bytes.saturating_add(
+                    serde_json::to_vec(&row)
+                        .map_err(|error| MetadataError::Backend(error.to_string()))?
+                        .len()
+                        .saturating_add(1),
+                );
+                if serialized_bytes > METADATA_QUERY_MAX_RESULT_BYTES {
+                    return Err(MetadataError::InvalidInput(format!(
+                        "metadata query result exceeds the {METADATA_QUERY_MAX_RESULT_BYTES}-byte limit"
+                    )));
+                }
+                rows.push(row);
+            }
+            Ok(MetadataQueryResults::Solutions(rows))
+        }
+        spareval::QueryResults::Boolean(value) => Ok(MetadataQueryResults::Boolean(value)),
+        spareval::QueryResults::Graph(_) => Err(MetadataError::InvalidInput(
+            "only SELECT and ASK metadata queries are supported".to_string(),
+        )),
+    }
+}
+
+fn ensure_metadata_query_not_cancelled(
+    cancellation: &CancellationToken,
+) -> Result<(), MetadataError> {
+    if cancellation.is_cancelled() {
+        Err(MetadataError::InvalidInput(
+            "metadata query was cancelled".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_snapshot_term(term: &str) -> MetadataError {
+    MetadataError::Backend(format!("invalid RDF term in metadata snapshot: {term}"))
+}
