@@ -45,7 +45,8 @@ pub use self::fanout::forwarded_bearer;
 pub(crate) use self::fanout::graph_pattern_contains_service;
 use self::fanout::{
     MetadataFanoutOperation, MetadataNodeCall, distributed_query_is_union_safe,
-    ensure_supported_query_mode, fanout_bearer, metadata_node_call, run_metadata_fanout_node,
+    ensure_supported_query_mode, fanout_bearer, metadata_fanout_nodes, metadata_node_call,
+    run_metadata_fanout_node,
 };
 pub(crate) use self::path::local_path_candidates;
 pub use self::path::{deduplicate_fanout_nodes, document_replica_query_nodes};
@@ -1514,42 +1515,6 @@ fn map_read_error(error: MetadataReadError) -> MetadataApiError {
 
 fn map_metadata_internal_error(error: MetadataError) -> MetadataApiError {
     MetadataApiError::Internal(error.to_string())
-}
-
-async fn metadata_fanout_nodes(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    span: &Span,
-    target_nodes: Option<Vec<NodeId>>,
-    deadline: tokio::time::Instant,
-) -> MetadataRealmNodeDiscovery {
-    match target_nodes {
-        Some(nodes) => {
-            span.record("discovery_ms", 0u64);
-            MetadataRealmNodeDiscovery {
-                nodes: deduplicate_fanout_nodes(nodes),
-                failed: false,
-            }
-        }
-        None => {
-            let discovery_started = Instant::now();
-            let discovery = tokio::time::timeout_at(
-                deadline,
-                aruna_core::telemetry::time_stage(
-                    "discovery",
-                    discover_realm_nodes(context, realm_id, local_node_id),
-                ),
-            )
-            .await
-            .unwrap_or(MetadataRealmNodeDiscovery {
-                nodes: vec![local_node_id],
-                failed: true,
-            });
-            record_elapsed_ms(span, "discovery_ms", discovery_started);
-            discovery
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
