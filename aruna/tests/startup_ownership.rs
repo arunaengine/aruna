@@ -1,6 +1,7 @@
 const MAIN_SOURCE: &str = include_str!("../src/main.rs");
 const TASK_SOURCE: &str = concat!(
     include_str!("../../operations/src/tasks/task_incoming/restore.rs"),
+    include_str!("../../operations/src/tasks/task_incoming/outbox.rs"),
     include_str!("../../operations/src/tasks/task_incoming/mod.rs"),
 );
 

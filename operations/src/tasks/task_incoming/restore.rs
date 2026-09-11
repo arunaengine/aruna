@@ -984,3 +984,10 @@ impl OperationsTaskHandler {
             .await;
     }
 }
+
+#[doc(hidden)]
+pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
+    OperationsTaskHandler::new(context, JobsRuntime::new())
+        .drain_notification_outbox()
+        .await;
+}

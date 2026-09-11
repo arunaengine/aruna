@@ -134,7 +134,8 @@ use crate::tasks::task_persistence::{
 mod outbox;
 mod restore;
 
-pub use restore::{initialize_task_holder, initialize_task_incoming};
+pub use outbox::drive_document_sync_outbox_drain;
+pub use restore::{drain_notification_outbox, initialize_task_holder, initialize_task_incoming};
 
 /// Process-wide tally of document sync outbox records ever classified
 /// undeliverable. The drain already error-logs each one; this exposes the count
@@ -697,117 +698,6 @@ impl OperationsTaskHandler {
             crate::device::sync_status::note_sync(&self.context).await;
         }
     }
-
-    async fn finish_sync_drain_subbatch(
-        &self,
-        retry_key: &TaskKey,
-        record_keys: Vec<Vec<u8>>,
-        requested_targets: Vec<DocumentSyncTarget>,
-        event: Event,
-        mut outcome: DrainSyncOutcome,
-    ) -> DrainSyncOutcome {
-        match event {
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
-                targets,
-                metadata_create_events,
-                metadata_graph_tombstones,
-                ..
-            })) => {
-                process_metadata_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
-                    .await;
-                let mut refresh_targets = targets.clone();
-                refresh_targets.extend(requested_targets);
-                if let Some(net_handle) = self.context.net_handle.as_ref() {
-                    refresh_realm_usage_summary_for_targets(
-                        self.context.as_ref(),
-                        net_handle.node_id(),
-                        &refresh_targets,
-                    )
-                    .await;
-                }
-                refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets).await;
-                let project_started = Instant::now();
-                let projected = self
-                    .project_reconciled_metadata_create_events(
-                        retry_key,
-                        targets,
-                        metadata_create_events,
-                    )
-                    .await;
-                outcome.project_elapsed = project_started.elapsed();
-                if projected.is_err() {
-                    outcome.retry_needed = true;
-                    return outcome;
-                }
-                let delete_started = Instant::now();
-                let delete_count = record_keys.len();
-                let deleted =
-                    delete_outbox_records(&self.context.storage_handle, record_keys).await;
-                outcome.delete_elapsed = delete_started.elapsed();
-                if deleted.is_ok() {
-                    outcome.deleted += delete_count;
-                }
-                if let Err(error) = deleted {
-                    warn!(task_id = ?retry_key, error = %error, "Failed to delete document sync outbox records");
-                    outcome.retry_needed = true;
-                } else if targets_change_dashboard(&refresh_targets) {
-                    notify_dashboard_change(self.context.as_ref());
-                }
-            }
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error { error, .. })) => {
-                warn!(task_id = ?retry_key, error = %error, "Failed to sync document batch");
-                outcome.retry_needed = true;
-            }
-            Event::Net(NetEvent::Error(error)) => {
-                warn!(task_id = ?retry_key, error = ?error, "Failed to sync document batch");
-                outcome.retry_needed = true;
-            }
-            other => {
-                warn!(task_id = ?retry_key, event = ?other, "Unexpected document sync batch result");
-                outcome.retry_needed = true;
-            }
-        }
-        outcome
-    }
-
-    async fn project_reconciled_metadata_create_events(
-        &self,
-        retry_key: &TaskKey,
-        targets: Vec<DocumentSyncTarget>,
-        metadata_create_events: Vec<aruna_core::metadata::MetadataCreateEventRecord>,
-    ) -> Result<(), ()> {
-        if !metadata_create_events.is_empty() {
-            let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
-            if let Err(error) =
-                project_metadata_create_events(&self.context, metadata_create_events, local_node_id)
-                    .await
-            {
-                warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
-                return Err(());
-            }
-            return Ok(());
-        }
-
-        let mut create_event_targets = Vec::new();
-        for target in targets {
-            let DocumentSyncTarget::MetadataCreateEvent {
-                document_id,
-                event_id,
-                ..
-            } = target
-            else {
-                continue;
-            };
-            create_event_targets.push((document_id, event_id));
-        }
-        if let Err(error) =
-            project_metadata_create_events_from_log(&self.context, create_event_targets).await
-        {
-            warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
-            return Err(());
-        }
-        Ok(())
-    }
 }
 
 /// The durable queue work deferred until after the local serving gate.
@@ -818,51 +708,11 @@ pub struct TaskQueues {
     refresh_holders: bool,
 }
 
-/// Kicks the installed document-sync drain owner without replacing an existing
-/// persisted retry deadline.
-pub async fn drive_document_sync_outbox_drain(context: Arc<DriverContext>) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        warn!("Cannot kick document sync outbox drain without task handle");
-        return;
-    };
-    restore_document_sync_outbox_timers(&context.storage_handle, task_handle).await;
-}
-
 /// A document sync drain that keeps its rotation across invocations like the
 /// timer-driven handler. A fresh drainer starts at the head, which is the same
 /// reset a process restart performs.
 pub struct OutboxDrainer {
     handler: Arc<OperationsTaskHandler>,
-}
-
-#[doc(hidden)]
-pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
-    OperationsTaskHandler::new(context, JobsRuntime::new())
-        .drain_notification_outbox()
-        .await;
-}
-
-impl OutboxDrainer {
-    pub fn new(context: Arc<DriverContext>) -> Self {
-        Self {
-            handler: Arc::new(OperationsTaskHandler::new(context, JobsRuntime::new())),
-        }
-    }
-
-    /// Runs one bounded invocation of the open rotation.
-    pub async fn run_once(&self) {
-        self.handler.drain_document_sync_outbox().await;
-    }
-
-    /// Records examined so far, and whether the cursor is parked mid-rotation.
-    pub fn rotation_progress(&self) -> (usize, bool) {
-        let rotation = self
-            .handler
-            .rotation
-            .lock()
-            .expect("outbox rotation mutex poisoned");
-        (rotation.totals.examined, rotation.cursor.is_some())
-    }
 }
 
 #[async_trait]
