@@ -1,3 +1,4 @@
+use super::read::metadata_graph_is_deleted;
 use super::*;
 
 pub async fn get_visible_metadata_document(
