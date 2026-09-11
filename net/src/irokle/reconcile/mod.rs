@@ -1,5 +1,7 @@
 use super::*;
 
 mod materialize;
+mod registry;
 
 pub(in crate::document_sync) use self::materialize::*;
+pub(in crate::document_sync) use self::registry::*;
