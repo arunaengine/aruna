@@ -1013,3 +1013,141 @@ pub(in crate::document_sync) async fn record_fenced_txn(
         .await?
         .is_some_and(|record| record.is_deleted()))
 }
+
+pub(in crate::document_sync) async fn registry_cleanup_txn(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+    delete: &MetadataDocumentDeleteRecord,
+    txn_id: TxnId,
+) -> Result<Vec<(String, ByteView)>> {
+    if !metadata_document_delete_matches_registry(delete, group_id, document_id) {
+        return Ok(Vec::new());
+    }
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    };
+    // A missing registry row means cleanup already ran; an equal delete
+    // replay must stay a no-op.
+    let Some(value) = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let record: MetadataRegistryRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if record.updated_at_ms > delete.tombstone.updated_at_ms
+        || record.last_event_id > delete.deleted_after_event_id
+    {
+        return Ok(Vec::new());
+    }
+    Ok(metadata_registry_delete_entries(&record))
+}
+
+pub(in crate::document_sync) async fn metadata_placement_fence_in_transaction(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<MetadataPlacementOutcome<MetadataPlacementFence>> {
+    Ok(
+        match derive_placement_txn(
+            storage,
+            record.realm_id,
+            Some(record.group_id),
+            record.document_id,
+            record.placement,
+            txn_id,
+        )
+        .await?
+        {
+            MetadataPlacementOutcome::Accepted(_) => {
+                MetadataPlacementOutcome::Accepted(MetadataPlacementFence)
+            }
+            MetadataPlacementOutcome::Deferred(dependency) => {
+                MetadataPlacementOutcome::Deferred(dependency)
+            }
+            MetadataPlacementOutcome::Rejected => MetadataPlacementOutcome::Rejected,
+        },
+    )
+}
+
+/// The placement a structured metadata id must ride, derived from the realm
+/// config inside the caller's transaction and compared against the `placement`
+/// the publisher stamped. The transactional config read is the whole fence: a
+/// concurrent config mutation conflicts the commit. `group_id` is compared only
+/// when the caller knows it; a PID mapping target carries no group.
+pub(in crate::document_sync) async fn derive_placement_txn(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    group_id: Option<Ulid>,
+    document_id: Ulid,
+    placement: PlacementRef,
+    txn_id: TxnId,
+) -> Result<MetadataPlacementOutcome<PlacementRef>> {
+    let dependency = DocumentSyncDependency::PlacementStrategy {
+        realm_id,
+        strategy_id: placement.strategy_id,
+    };
+    if placement == PlacementRef::NIL || placement.strategy_id.is_nil() {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let value = storage_read_from_transaction(
+        storage,
+        REALM_CONFIG_KEYSPACE.to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::RealmConfig(realm_id),
+        ));
+    };
+    let config = RealmConfigDocument::from_bytes(&value)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if config.realm_id != realm_id {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    let id = match MetaResourceId::from_bytes(document_id.to_bytes()) {
+        Ok(id) => id,
+        Err(_) => return Ok(MetadataPlacementOutcome::Rejected),
+    };
+    let resolved = match config.binding_directory().resolve_id(&id, |strategy_id| {
+        config
+            .strategy(&strategy_id)
+            .and_then(|strategy| u16::try_from(strategy.shard_count).ok())
+    }) {
+        Ok(resolved) => resolved,
+        Err(BindingError::UnknownStrategy(_)) => {
+            return Ok(MetadataPlacementOutcome::Deferred(dependency));
+        }
+        Err(BindingError::Unknown(_)) => {
+            return Ok(MetadataPlacementOutcome::Deferred(
+                DocumentSyncDependency::RealmConfig(realm_id),
+            ));
+        }
+        Err(BindingError::Conflicted(_) | BindingError::BucketOutOfRange(_)) => {
+            return Ok(MetadataPlacementOutcome::Rejected);
+        }
+    };
+    let scope_matches = match resolved.scope {
+        PlacementScope::Realm(scope_realm) => scope_realm == realm_id,
+        PlacementScope::Group(scope_group) => group_id.is_none_or(|group| scope_group == group),
+    };
+    let derived = PlacementRef {
+        strategy_id: resolved.strategy_id,
+        shard: u32::from(resolved.bucket.get()),
+    };
+    if resolved.document_class != DocumentClass::Metadata || !scope_matches || derived != placement
+    {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    Ok(MetadataPlacementOutcome::Accepted(derived))
+}
