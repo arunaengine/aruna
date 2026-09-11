@@ -19,7 +19,6 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::sync::document_sync_outbox::{
@@ -632,15 +631,13 @@ fn apply_admin_reducer_updates(
     let mut admin_events = Vec::new();
     for role_id in role_ids {
         if should_seed_realm_role(state, *role_id) {
-            let event = apply_admin_reducer_operation(
-                state,
+            let event = state.apply_operation(
                 &input.actor,
                 AdminDocumentOperation::RealmRoleAdded { role_id: *role_id },
             )?;
             admin_events.push(event);
         }
-        let event = apply_admin_reducer_operation(
-            state,
+        let event = state.apply_operation(
             &input.actor,
             AdminDocumentOperation::RealmRoleUserAssignmentAdded {
                 role_id: *role_id,
@@ -658,25 +655,6 @@ fn should_seed_realm_role(state: &AdminDocumentReducerState, role_id: RoleId) ->
         && !state
             .conflicts
             .contains_key(&format!("realm.roles.{role_id}"))
-}
-
-fn apply_admin_reducer_operation(
-    state: &mut AdminDocumentReducerState,
-    actor: &Actor,
-    op: AdminDocumentOperation,
-) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
-    let observed = state.clock.clone();
-    let event = AdminDocumentEvent {
-        event_id: Ulid::generate(),
-        target: state.target.clone(),
-        origin_node_id: actor.node_id,
-        origin_seq: observed.sequence_for(&actor.node_id) + 1,
-        observed,
-        actor: actor.clone(),
-        op,
-    };
-    state.apply(&event)?;
-    Ok(event)
 }
 
 #[cfg(test)]

@@ -525,30 +525,11 @@ fn seed_user_admin_events(
         },
         AdminDocumentOperation::UserSubjectIdAdded { subject_id },
     ] {
-        let event = apply_admin_reducer_operation(state, &input.actor, operation)?;
+        let event = state.apply_operation(&input.actor, operation)?;
         events.push(event);
     }
 
     Ok(events)
-}
-
-fn apply_admin_reducer_operation(
-    state: &mut AdminDocumentReducerState,
-    actor: &Actor,
-    op: AdminDocumentOperation,
-) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
-    let observed = state.clock.clone();
-    let event = AdminDocumentEvent {
-        event_id: Ulid::generate(),
-        target: state.target.clone(),
-        origin_node_id: actor.node_id,
-        origin_seq: observed.sequence_for(&actor.node_id) + 1,
-        observed,
-        actor: actor.clone(),
-        op,
-    };
-    state.apply(&event)?;
-    Ok(event)
 }
 
 fn initial_user_document_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentSyncChange {
