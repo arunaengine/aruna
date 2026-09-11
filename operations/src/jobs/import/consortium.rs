@@ -20,15 +20,15 @@ use crate::staging::tests::fixtures::setup_driver_context;
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/eln/elabftw.eln"
+    "/tests/fixtures/data/eln/elabftw.eln"
 ));
 const PASTA: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/eln/pasta.eln"
+    "/tests/fixtures/data/eln/pasta.eln"
 ));
 const KADI4MAT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/eln/kadi4mat.eln"
+    "/tests/fixtures/data/eln/kadi4mat.eln"
 ));
 
 struct FixtureData {
