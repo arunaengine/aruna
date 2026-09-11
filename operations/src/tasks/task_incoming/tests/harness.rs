@@ -65,7 +65,7 @@ fn reclaim_retry_climbs() {
 }
 
 pub(super) struct RecordingTaskHandler {
-    seen: mpsc::Sender<TaskKey>,
+    pub(super) seen: mpsc::Sender<TaskKey>,
 }
 
 #[async_trait]
@@ -93,7 +93,7 @@ impl InboundTaskHandler for InstalledDrainHandler {
 /// Tokio inhibits paused-clock auto-advance while a blocking task is alive.
 /// Storage and net answer from their own threads, so without this the clock
 /// races ahead of every round trip. `tokio::time::advance` still applies.
-struct ClockGuard {
+pub(super) struct ClockGuard {
     _stop: std::sync::mpsc::Sender<()>,
 }
 
@@ -112,13 +112,13 @@ pub(super) async fn shutdown_net(net: &NetHandle) {
 }
 
 pub(super) struct InstalledHarness {
-    _dir: tempfile::TempDir,
-    storage: aruna_storage::StorageHandle,
-    net: NetHandle,
-    task_handle: TaskHandle,
-    context: Arc<DriverContext>,
-    handler: Arc<OperationsTaskHandler>,
-    completed: mpsc::Receiver<()>,
+    pub(super) _dir: tempfile::TempDir,
+    pub(super) storage: aruna_storage::StorageHandle,
+    pub(super) net: NetHandle,
+    pub(super) task_handle: TaskHandle,
+    pub(super) context: Arc<DriverContext>,
+    pub(super) handler: Arc<OperationsTaskHandler>,
+    pub(super) completed: mpsc::Receiver<()>,
 }
 
 // The frozen clock only moves on an explicit advance, so waiting here cannot
