@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record, outbox_write_entry, schedule_outbox_drain_effect,
 };
 
@@ -469,9 +469,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::placement::policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
-    use crate::realm::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
+    use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::handle::Handle;
     use aruna_core::structs::verify_policy_authority;

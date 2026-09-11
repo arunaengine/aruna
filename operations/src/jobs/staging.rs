@@ -13,11 +13,11 @@ use super::executor::{JobContext, JobRunOutcome};
 use super::store::{put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
-use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::staging::head_source::{HeadStagingSourceInput, HeadStagingSourceOperation};
 use crate::staging::list_source::{ListStagingSourceInput, ListStagingSourceOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};

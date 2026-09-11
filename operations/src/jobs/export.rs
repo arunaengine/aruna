@@ -51,9 +51,7 @@ use crate::blob::hidden::delete_hidden;
 use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
-use crate::blob::resolve_blob_permission_paths::{
-    MAX_HASH_ALIASES, ResolveBlobPermissionPathsOperation,
-};
+use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolveBlobPermissionPathsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::{

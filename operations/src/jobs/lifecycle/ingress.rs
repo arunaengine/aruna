@@ -40,7 +40,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::forward::{is_sync_eligible, peer_acts_for};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
+use crate::s3::get_bucket::GetBucketInfoOperation;
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is

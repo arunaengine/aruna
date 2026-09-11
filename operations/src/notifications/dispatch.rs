@@ -31,7 +31,7 @@ use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_replicated_watch_subscription,
     delete_replicated_watch_subscription,
 };
-use crate::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the

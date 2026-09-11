@@ -180,13 +180,13 @@ impl Operation for JobRouteOperation {
 mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::jobs::{JobKind, JobResponse, JobStatusView};
     use aruna_core::metadata::MetadataAuthToken;
     use aruna_core::structs::{
         AuthContext, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
         JobProgress, JobState, PlacementBinding, PlacementScope, WorkspaceMode,
     };
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use ulid::Ulid;
 

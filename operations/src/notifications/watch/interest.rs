@@ -33,7 +33,7 @@ use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_watch_subscriptions,
 };
-use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`

@@ -52,18 +52,18 @@ use super::store::{list_job_entries, put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
 use crate::metadata::MetadataAuthToken;
-use crate::metadata::create_metadata_document::{
+use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
 use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
 use crate::s3::delete_object::DeleteObjectError;
 use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{
@@ -1980,7 +1980,7 @@ pub(crate) mod tests {
             completeness: aruna_core::metadata::MetadataProfileValidationCompleteness::Incomplete,
         };
         let failure = classify_metadata(MetadataWriteError::Create(
-            crate::metadata::create_metadata_document::CreateMetadataDocumentError::MetadataError(
+            crate::metadata::create_document::CreateMetadataDocumentError::MetadataError(
                 aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
             ),
         ));

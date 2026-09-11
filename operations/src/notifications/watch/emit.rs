@@ -13,7 +13,7 @@ use crate::notifications::watch::interest::mark_watch_interest_dirty;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_watch_subscriptions,
 };
-use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the
 /// in-memory interest table plus local durable subscriptions, then expands for
