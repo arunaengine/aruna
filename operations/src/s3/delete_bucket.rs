@@ -18,7 +18,7 @@ use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::sync::sync_mirror_repair::mirror_delete_entry;
+use crate::sync::mirror_repair::mirror_delete_entry;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteBucketState {

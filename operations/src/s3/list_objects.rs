@@ -1,4 +1,4 @@
-use crate::s3::list_object_versions::served_copy;
+use crate::s3::list_versions::served_copy;
 use crate::s3::listing::PrefixPage;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
