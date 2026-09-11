@@ -529,3 +529,235 @@ async fn group_role_create_admin_operation_does_not_create_missing_group() {
             .contains_key(&role_id)
     );
 }
+
+#[tokio::test]
+async fn group_role_remove_admin_operation_updates_group_and_auth_docs() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([37; 32]);
+    let group_id = Ulid::from_parts(198, 1);
+    let role_id = Ulid::from_parts(199, 1);
+    let assigned_user_id = UserId::local(Ulid::from_parts(200, 1), realm_id);
+    let actor = test_actor(
+        8,
+        UserId::local(Ulid::from_parts(201, 1), realm_id),
+        realm_id,
+    );
+    let group = Group {
+        display_name: "Durable group".to_string(),
+        group_id,
+        realm_id,
+        owner: actor.user_id,
+        roles: HashSet::from([role_id]),
+    };
+    let auth_doc = GroupAuthorizationDocument {
+        group_id,
+        policies: Vec::new(),
+        roles: HashMap::from([(
+            role_id,
+            Role {
+                role_id,
+                name: "custom_role".to_string(),
+                permissions: HashMap::from([("/group/custom/**".to_string(), Permission::READ)]),
+                assigned_users: HashSet::from([assigned_user_id]),
+            },
+        )]),
+    };
+    storage_batch_write_to(
+        &storage,
+        vec![
+            (
+                GROUP_KEYSPACE.to_string(),
+                group_id.to_bytes().into(),
+                group.to_bytes(&actor).expect("group serializes").into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                group_id.to_bytes().into(),
+                auth_doc
+                    .to_bytes(&actor)
+                    .expect("auth doc serializes")
+                    .into(),
+            ),
+        ],
+    )
+    .await
+    .expect("group and auth docs write");
+
+    let target = AdminDocumentTarget::Group { group_id };
+    apply_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::GroupAuthorization { group_id },
+        test_admin_event(
+            Ulid::from_parts(202, 1),
+            target.clone(),
+            &actor,
+            1,
+            AdminDocumentOperation::GroupRoleRemoved { role_id },
+        ),
+    )
+    .await
+    .expect("role remove applies");
+
+    assert!(
+        !read_group_doc(&storage, group_id)
+            .await
+            .roles
+            .contains(&role_id)
+    );
+    assert!(
+        !read_group_auth_doc(&storage, group_id)
+            .await
+            .roles
+            .contains_key(&role_id)
+    );
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&target),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert!(!reducer_state.materialized_group_roles().contains(&role_id));
+}
+
+#[tokio::test]
+async fn user_admin_operation_applies_reducer_state_and_materializes_user() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([7; 32]);
+    let user_id = UserId::local(Ulid::from_parts(1, 1), realm_id);
+    let actor = Actor {
+        node_id: node(8),
+        user_id,
+        realm_id,
+    };
+    let original = User {
+        user_id,
+        name: "Alice".to_string(),
+        subject_ids: vec!["subject-1".to_string()],
+        alias_user_ids: Default::default(),
+        attributes: HashMap::from([("department".to_string(), "physics".to_string())]),
+    };
+    storage_batch_write_to(
+        &storage,
+        vec![(
+            USER_KEYSPACE.to_string(),
+            user_id.to_bytes().into(),
+            original.to_bytes(&actor).expect("user serializes").into(),
+        )],
+    )
+    .await
+    .expect("original user writes");
+
+    let event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(2, 1),
+        target: AdminDocumentTarget::User { user_id },
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op: AdminDocumentOperation::UserNameSet {
+            name: "Alice Updated".to_string(),
+        },
+    };
+    apply_user_admin_document_operation_to_storage(
+        &storage,
+        DocumentSyncTarget::User { user_id },
+        event,
+    )
+    .await
+    .expect("admin operation applies");
+
+    let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+        .await
+        .expect("user exists");
+    let user = User::from_bytes(&stored_user).expect("user decodes");
+    assert_eq!(user.name, "Alice Updated");
+    assert_eq!(user.attributes["department"], "physics");
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&AdminDocumentTarget::User { user_id }),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert_eq!(
+        reducer_state.materialized_user_name().as_deref(),
+        Some("Alice Updated")
+    );
+    assert_eq!(
+        read_storage_value(
+            &storage,
+            USER_SUBJECT_INDEX_KEYSPACE,
+            subject_index_key("subject-1")
+        )
+        .await,
+        Some(subject_index_value(user_id))
+    );
+}
+
+#[tokio::test]
+async fn stale_user_admin_operation_is_recorded_without_rematerializing_older_value() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([7; 32]);
+    let user_id = UserId::local(Ulid::from_parts(3, 1), realm_id);
+    let actor = Actor {
+        node_id: node(8),
+        user_id,
+        realm_id,
+    };
+    let target = AdminDocumentTarget::User { user_id };
+    let newer = AdminDocumentEvent {
+        event_id: Ulid::from_parts(4, 2),
+        target: target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: 2,
+        observed: AdminDocumentClock::default(),
+        actor: actor.clone(),
+        op: AdminDocumentOperation::UserNameSet {
+            name: "newer".to_string(),
+        },
+    };
+    let older = AdminDocumentEvent {
+        event_id: Ulid::from_parts(4, 1),
+        target: target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op: AdminDocumentOperation::UserNameSet {
+            name: "older".to_string(),
+        },
+    };
+
+    for event in [newer, older.clone(), older.clone()] {
+        apply_user_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::User { user_id },
+            event,
+        )
+        .await
+        .expect("out-of-order admin operation applies");
+    }
+
+    let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+        .await
+        .expect("user exists");
+    let user = User::from_bytes(&stored_user).expect("user decodes");
+    assert_eq!(user.name, "newer");
+    let reducer_state = read_storage_value(
+        &storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        admin_document_reducer_state_key(&target),
+    )
+    .await
+    .expect("reducer state exists");
+    let reducer_state: AdminDocumentReducerState =
+        postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+    assert_eq!(reducer_state.applied_event_ids.len(), 2);
+    assert!(reducer_state.applied_event_ids.contains(&older.event_id));
+    assert_eq!(reducer_state.clock.sequence_for(&older.origin_node_id), 2);
+}
