@@ -198,3 +198,203 @@ fn compaction_canonicalizes() {
             .contains(&description_second.event_id)
     );
 }
+
+#[test]
+fn revocation_origin_count() {
+    let mut state = realm_config_state();
+    state.apply(&revoke_token_at(30, 1, "one", 5_000)).unwrap();
+    state.apply(&revoke_token_at(31, 1, "two", 5_000)).unwrap();
+    state
+        .apply(&revoke_token_at(32, 2, "three", 5_000))
+        .unwrap();
+    state.compact_revocations(1_000);
+
+    assert_eq!(state.live_revocation_count(&node(1), 1_000), 2);
+    assert_eq!(state.live_revocation_count(&node(2), 1_000), 1);
+    assert_eq!(state.live_revocation_count(&node(3), 1_000), 0);
+    assert_eq!(
+        state.revocation_origin(&crate::auth::bearer_token_hash("one")),
+        Some(node(1))
+    );
+    assert_eq!(
+        state.revocation_origin(&crate::auth::bearer_token_hash("three")),
+        Some(node(2))
+    );
+    assert_eq!(state.revocation_origin("missing"), None);
+    assert_eq!(user_state().revocation_origin("missing"), None);
+}
+
+#[test]
+fn owner_conflict_order() {
+    let owner_a = user_id_with_seed(1);
+    let owner_b = user_id_with_seed(2);
+    let first = revoke_token_owned(40, 1, "owned", 5_000, owner_a);
+    let second = revoke_token_owned(41, 2, "owned", 5_000, owner_b);
+    let mut left = realm_config_state();
+    left.apply(&first).unwrap();
+    left.apply(&second).unwrap();
+    let mut right = realm_config_state();
+    right.apply(&second).unwrap();
+    right.apply(&first).unwrap();
+
+    assert_eq!(left, right);
+    let hash = crate::auth::bearer_token_hash("owned");
+    let path = super::revoked_token_path(&hash, 5_000, &owner_a);
+    assert_eq!(left.user_subject_ids.len(), 1);
+    assert!(left.user_subject_ids.contains_key(&path));
+}
+
+#[test]
+fn stale_conflict_removed() {
+    let owner = user_id();
+    let canonical = revoke_token_owned(42, 1, "stale", 5_000, owner);
+    let stale = revoke_token_owned(43, 2, "stale", 5_000, owner);
+    let path = super::revoked_token_path(&crate::auth::bearer_token_hash("stale"), 5_000, &owner);
+    let mut state = realm_config_state();
+    state.user_subject_ids.insert(
+        path.clone(),
+        AdminDocumentAttributeVersion {
+            value: Some("5000".to_string()),
+            dot: canonical.dot(),
+        },
+    );
+    state.conflicts.insert(
+        path.clone(),
+        AdminDocumentConflict {
+            path: path.clone(),
+            values: vec![AdminDocumentConflictValue {
+                value: Some("4000".to_string()),
+                dot: stale.dot(),
+            }],
+        },
+    );
+    state
+        .applied_event_ids
+        .extend([canonical.event_id, stale.event_id]);
+
+    state.compact_revocations(1_000);
+
+    assert!(state.conflicts.is_empty());
+    assert_eq!(state.user_subject_ids[&path].dot, canonical.dot());
+    assert!(state.applied_event_ids.contains(&canonical.event_id));
+    assert!(!state.applied_event_ids.contains(&stale.event_id));
+}
+
+#[test]
+fn expired_count() {
+    let mut state = realm_config_state();
+    state
+        .apply(&revoke_token_at(44, 1, "expired-count", 1_000))
+        .unwrap();
+    state
+        .apply(&revoke_token_at(45, 1, "live-count", 2_000))
+        .unwrap();
+
+    assert_eq!(state.live_revocation_count(&node(1), 1_000), 2);
+    assert_eq!(state.live_revocation_count(&node(1), 1_001), 2);
+    state.compact_revocations(1_001);
+    assert_eq!(state.live_revocation_count(&node(1), 1_001), 2);
+}
+
+#[test]
+fn owner_count() {
+    let owner_a = user_id_with_seed(3);
+    let owner_b = user_id_with_seed(4);
+    let mut state = realm_config_state();
+    for (seed, token, owner) in [
+        (46u8, "owner-a-one", owner_a),
+        (47u8, "owner-a-two", owner_a),
+        (48u8, "owner-b-one", owner_b),
+    ] {
+        state
+            .apply(&revoke_token_owned(seed, 1, token, 2_000, owner))
+            .unwrap();
+    }
+    state
+        .apply(&revoke_token_owned(49, 2, "owner-a-three", 2_000, owner_a))
+        .unwrap();
+    state.compact_revocations(1_000);
+
+    assert_eq!(state.live_revocation_count(&node(1), 1_000), 3);
+    assert_eq!(state.live_owner_count(&node(1), &owner_a, 1_000), 2);
+    assert_eq!(state.live_owner_count(&node(1), &owner_b, 1_000), 1);
+    assert_eq!(state.live_owner_count(&node(2), &owner_a, 1_000), 1);
+}
+
+#[test]
+fn index_counts_grace() {
+    let mut state = realm_config_state();
+    state.apply(&revoke_token_at(50, 1, "grace", 900)).unwrap();
+
+    let index = state.revocation_index(1_000);
+    assert_eq!(index.count(&node(1)), 1);
+    assert_eq!(index.materialized(), BTreeMap::new());
+    assert_eq!(
+        index.origin(&crate::auth::bearer_token_hash("grace")),
+        Some(node(1))
+    );
+
+    state.compact_revocations(1_200);
+    let path = super::revoked_token_path(&crate::auth::bearer_token_hash("grace"), 900, &user_id());
+    assert!(state.user_subject_ids.contains_key(&path));
+    state.compact_revocations(1_201);
+    assert!(!state.user_subject_ids.contains_key(&path));
+}
+
+#[test]
+fn expiry_schedule_bounds() {
+    let mut state = realm_config_state();
+    let event = revoke_token_at(52, 1, "scheduled", 2_000);
+    state.apply(&event).unwrap();
+
+    assert_eq!(
+        state.revocation_next_expiry,
+        Some(2_000 + REVOCATION_GRACE_SECS)
+    );
+    assert!(!state.revocation_compaction_due(2_000 + REVOCATION_GRACE_SECS));
+
+    state
+        .apply(&set_realm_config_description(53, 2, "unrelated"))
+        .unwrap();
+    state.advance_revocation_floor(2_100);
+    assert!(!state.revocation_compaction_due(2_100));
+    assert_eq!(
+        state.revocation_next_expiry,
+        Some(2_000 + REVOCATION_GRACE_SECS)
+    );
+
+    state.compact_revocations(2_000 + REVOCATION_GRACE_SECS + 1);
+    assert_eq!(state.revocation_next_expiry, None);
+    assert!(
+        state
+            .user_subject_ids
+            .keys()
+            .all(|path| !path.contains("scheduled"))
+    );
+}
+
+#[test]
+fn indexed_apply_refreshes() {
+    let mut state = realm_config_state();
+    state
+        .apply(&revoke_token_at(51, 1, "indexed", 2_000))
+        .unwrap();
+    let mut index = state.revocation_index(1_000);
+    let event = revoke_token_at(52, 2, "indexed", 3_000);
+
+    assert_eq!(
+        state.apply_revocation_event(&event, &mut index),
+        Ok(AdminDocumentApplyStatus::Applied)
+    );
+    assert_eq!(
+        index.origin(&crate::auth::bearer_token_hash("indexed")),
+        Some(node(2))
+    );
+    assert_eq!(index.count(&node(1)), 0);
+    assert_eq!(index.count(&node(2)), 1);
+    index.compact(&mut state);
+    assert_eq!(
+        state.materialized_revoked_tokens(),
+        BTreeMap::from([(crate::auth::bearer_token_hash("indexed"), 3_000)])
+    );
+}
