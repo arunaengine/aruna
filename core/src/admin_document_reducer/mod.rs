@@ -1372,69 +1372,6 @@ impl AdminDocumentReducerState {
         }
     }
 
-    fn apply_realm_config_placement_field(
-        &mut self,
-        event: &AdminDocumentEvent,
-        path: String,
-        value: Option<String>,
-    ) {
-        let current = self.user_subject_ids.get(&path).cloned();
-
-        match self.reduce_value(event, &path, current, value) {
-            Some(version) => {
-                self.user_subject_ids.insert(path, version);
-            }
-            None => {
-                self.user_subject_ids.remove(&path);
-            }
-        }
-    }
-
-    fn apply_placement_binding(&mut self, event: &AdminDocumentEvent, binding: &PlacementBinding) {
-        self.apply_immutable_value(
-            event,
-            placement_binding_path(binding.handle),
-            placement_binding_value(binding),
-        );
-    }
-
-    fn apply_handle_range(&mut self, event: &AdminDocumentEvent, range: &HandleRange) {
-        // Like bindings, divergent values for one id fail closed. Distinct-id
-        // overlap is derived later by `HandleRangeDirectory::from_ranges`.
-        self.apply_immutable_value(
-            event,
-            handle_range_path(range.range_id),
-            handle_range_value(range),
-        );
-    }
-
-    fn apply_band_pool(&mut self, event: &AdminDocumentEvent, pool: &BandPool) {
-        self.apply_immutable_value(event, band_pool_path(pool.pool_id), band_pool_value(pool));
-    }
-
-    /// One actor's report about one bucket: a retry is not divergence.
-    ///
-    /// A holder re-runs the transition step until it observes its own report, so
-    /// it can legitimately submit twice with a moved frontier or a re-signed
-    /// proof. Treating that as a conflict would strand the bucket forever, so
-    /// the earliest event wins - deterministic on every replica, whatever order
-    /// the two arrived in.
-    fn apply_transition_report(&mut self, event: &AdminDocumentEvent, path: String, value: String) {
-        let dot = event.dot();
-        if let Some(current) = self.user_subject_ids.get(&path)
-            && current.dot <= dot
-        {
-            return;
-        }
-        self.user_subject_ids.insert(
-            path,
-            AdminDocumentAttributeVersion {
-                value: Some(value),
-                dot,
-            },
-        );
-    }
-
     /// Append-only path: a divergent value for an existing path fails closed as
     /// a conflict instead of selecting a winner.
     fn apply_immutable_value(&mut self, event: &AdminDocumentEvent, path: String, value: String) {
