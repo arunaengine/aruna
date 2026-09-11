@@ -1,3 +1,4 @@
+use super::search::{LocalReadScope, resolve_graph_visibility_scope};
 use super::*;
 #[tracing::instrument(
     name = "metadata.query.local",
