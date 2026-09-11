@@ -29,20 +29,19 @@ use aruna_operations::metadata::api::{
     MetadataReferencePreflightTarget, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     forwarded_bearer, list_visible_metadata_documents as run_list_visible_metadata_documents,
-    load_realm_config, lookup_metadata_path as run_lookup_metadata_path,
-    query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
+    lookup_metadata_path as run_lookup_metadata_path, query_metadata as run_query_metadata,
+    query_metadata_document as run_query_metadata_document,
     references_metadata as run_references_metadata,
     references_preflight as run_references_preflight, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_forward_document, mint_local_document,
+    CreateMetadataDocumentError, CreateMetadataDocumentPayload,
 };
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
+    CreateMetadataAuthorizedError, MetadataWriteError, create_metadata_authorized,
     delete_metadata_document_routed as run_delete_metadata_document,
     export_rocrate_routed as run_export_rocrate,
-    get_metadata_routed as run_get_visible_metadata_document, is_user_origin,
+    get_metadata_routed as run_get_visible_metadata_document,
     origin_holds_document as run_origin_holds_document,
     profile_validation_status_routed as run_profile_validation_status,
     update_metadata_document_routed as run_update_metadata_document,
@@ -58,7 +57,6 @@ use aruna_operations::metadata::public_preview::{
 use aruna_operations::metadata::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
-use aruna_operations::notifications::watch::emit::emit_metadata_created;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -787,96 +785,28 @@ pub(crate) async fn run_create_metadata(
     public: bool,
     payload: CreateMetadataDocumentPayload,
 ) -> ServerResult<MetadataRegistryRecord> {
-    let path = MetadataRegistryRecord::normalize_document_path(&path);
-    if path.is_empty() {
-        return Err(ServerError::BadRequest);
-    }
     let ctx = state.get_ctx();
-    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
-        .await
-        .map_err(map_metadata_api_error)?;
-    let realm_config = load_realm_config(ctx.as_ref(), state.get_realm_id())
-        .await
-        .ok_or(ServerError::ServiceUnavailable)?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
-    let document_id = if user_origin {
-        mint_forward_document(&realm_config, &actor, group_id, &path)
-            .map_err(map_create_error)?
-            .as_ulid()
-    } else {
-        match mint_local_document(&realm_config, &actor, group_id, &path) {
-            Ok(document_id) => document_id.as_ulid(),
-            Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
-                mint_forward_document(&realm_config, &actor, group_id, &path)
-                    .map_err(map_create_error)?
-                    .as_ulid()
-            }
-            Err(error) => return Err(map_create_error(error)),
-        }
-    };
-    if !user_origin {
-        if auth.realm_id != state.get_realm_id() {
-            return Err(ServerError::Forbidden);
-        }
-        crate::auth::ensure_permission_with(
-            state,
-            auth,
-            format!("/{}/g/{group_id}/meta/**", state.get_realm_id()),
-            Permission::WRITE,
-            extras.clone(),
-        )
-        .await?;
-        crate::auth::ensure_permission_with(
-            state,
-            auth,
-            MetadataRegistryRecord::permission_path_for(
-                &auth.realm_id,
-                group_id,
-                &path,
-                document_id,
-            ),
-            Permission::WRITE,
-            extras,
-        )
-        .await?;
-    }
-    let created = run_create_metadata_document(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor,
-                group_id,
-                document_id,
-                document_path: path,
-                public,
-                payload,
-            },
-        ),
-        ctx.clone(),
+    create_metadata_authorized(
+        &ctx,
+        state.get_realm_id(),
+        state.get_node_id(),
+        auth,
+        extras,
         forwarded_auth_token(bearer_token)?,
+        group_id,
+        path,
+        public,
+        payload,
     )
     .await
-    .map_err(map_metadata_write_error)?;
-    let event_id = created.event_id;
-    let record = created.record;
-
-    // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
-    // emission only warns and never affects the already-successful create.
-    emit_metadata_created(
-        ctx.as_ref(),
-        state.get_realm_id(),
-        auth.user_id,
-        record.group_id,
-        record.document_id,
-        &record.document_path,
-        event_id,
-    )
-    .await;
-
-    Ok(record)
+    .map_err(|error| match error {
+        CreateMetadataAuthorizedError::EmptyPath => ServerError::BadRequest,
+        CreateMetadataAuthorizedError::Forbidden => ServerError::Forbidden,
+        CreateMetadataAuthorizedError::Api(error) => map_metadata_api_error(error),
+        CreateMetadataAuthorizedError::Create(error) => map_create_error(error),
+        CreateMetadataAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
+        CreateMetadataAuthorizedError::Write(error) => map_metadata_write_error(error),
+    })
 }
 
 #[utoipa::path(

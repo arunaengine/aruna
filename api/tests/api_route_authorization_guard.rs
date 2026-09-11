@@ -8,8 +8,11 @@ const METHODS: &[&str] = &[
 ];
 /// REST authorization boundaries. `ensure_permission` also matches
 /// `ensure_permission_with` and the `metadata` module wrapper around it;
-/// `require_owner` is the user-node device plane's owner gate.
+/// `require_owner` is the user-node device plane's owner gate; the operations
+/// metadata create entry point runs the single `authorize` boundary inside
+/// `aruna-operations`, which this scanner cannot follow.
 const BOUNDARY: &[&str] = &[
+    "create_metadata_authorized",
     "ensure_permission",
     "permission_granted",
     "require_owner",
