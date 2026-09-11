@@ -377,3 +377,255 @@ async fn forked_admin_topic_eviction_reemits_with_preserved_event_id() {
             .is_empty()
     );
 }
+#[tokio::test]
+async fn reconcile_retries_admin_events_deferred_before_realm_config() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([68; 32]);
+    let service = DocumentSyncService::open_with_persist_policy(
+        test_endpoint(68).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        irokle_crate::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let admin_user_id = UserId::local(Ulid::from_parts(1_625, 1), realm_id);
+    let bootstrap_actor = test_actor(68, UserId::nil(realm_id), realm_id);
+    let admin_actor = test_actor(68, admin_user_id, realm_id);
+    let role_id = Ulid::from_parts(1_626, 1);
+    let auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let auth_topic = auth_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    assert_ne!(auth_topic, config_topic);
+
+    let role = test_admin_event(
+        Ulid::from_parts(1_627, 1),
+        AdminDocumentTarget::Realm { realm_id },
+        &bootstrap_actor,
+        1,
+        AdminDocumentOperation::RealmRoleCreated {
+            role: test_admin_role_definition(
+                role_id,
+                "realm_admin",
+                &format!("/{realm_id}/admin/**"),
+                Permission::WRITE,
+            ),
+        },
+    );
+    let mut assignment = test_admin_event(
+        Ulid::from_parts(1_628, 1),
+        AdminDocumentTarget::Realm { realm_id },
+        &admin_actor,
+        2,
+        AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+            role_id,
+            user_id: admin_user_id,
+        },
+    );
+    assignment.observed.advance(admin_actor.node_id, 1);
+    let ensure = test_admin_event(
+        Ulid::from_parts(1_629, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &bootstrap_actor,
+        1,
+        AdminDocumentOperation::RealmConfigNodeEnsured {
+            node_id: bootstrap_actor.node_id,
+            kind: RealmNodeKind::Management,
+        },
+    );
+    let mut settings = test_admin_event(
+        Ulid::from_parts(1_630, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &bootstrap_actor,
+        2,
+        AdminDocumentOperation::RealmConfigSettingsSet {
+            metadata_replication: MetadataReplicationConfig::new(3),
+            discovery: test_discovery(68, "https://management.example:443"),
+        },
+    );
+    settings.observed.advance(bootstrap_actor.node_id, 1);
+
+    for (target, events) in [
+        (
+            auth_target.clone(),
+            vec![Box::new(role), Box::new(assignment)],
+        ),
+        (
+            config_target.clone(),
+            vec![Box::new(settings), Box::new(ensure)],
+        ),
+    ] {
+        let documents = events
+            .into_iter()
+            .map(|event| DocumentSyncPublish::AdminOperation {
+                target: target.clone(),
+                event,
+                placement: PlacementRef::NIL,
+                allow_genesis: true,
+                origin_signature: None,
+            })
+            .collect();
+        assert!(matches!(
+            service.publish_documents(documents, Vec::new()).await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        reset_test_cursor(&service, target.sync_topic_id(realm_id, &PlacementRef::NIL)).await;
+    }
+
+    service
+        .reconcile_document_topics([auth_topic])
+        .await
+        .expect("realm authorization reconciliation defers the assignment");
+    let auth_before_config = read_realm_auth_doc(&storage, realm_id).await;
+    assert!(
+        auth_before_config
+            .roles
+            .get(&role_id)
+            .expect("bootstrap role exists")
+            .assigned_users
+            .is_empty(),
+        "the assignment must wait for realm configuration"
+    );
+    let deferred_cursor = read_test_cursor(&storage, auth_topic)
+        .await
+        .unwrap_or_default();
+    let auth_clock = service
+        .node()
+        .storage()
+        .actor_clock(&auth_topic)
+        .expect("auth topic clock");
+    assert!(!deferred_cursor.dominates(&auth_clock));
+    let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
+        postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                deferred_topics_key(),
+            )
+            .await
+            .expect("deferred topic registry is persisted"),
+        )
+        .expect("deferred topic registry decodes");
+    assert_eq!(
+        deferred_topics
+            .get(&DocumentSyncDependency::RealmConfig(realm_id))
+            .and_then(|topics| topics.get(&auth_topic)),
+        Some(&auth_topic)
+    );
+    assert!(
+        service
+            .document_topic_ids()
+            .expect("document topics list")
+            .contains(&auth_topic),
+        "deferred auth topic must remain discoverable"
+    );
+
+    let result = service
+        .reconcile_document_topics([config_topic])
+        .await
+        .expect("realm config reconciliation retries deferred admin topics");
+    assert!(result.targets.contains(&config_target));
+    assert!(
+        result.targets.contains(&auth_target),
+        "realm authorization target was not retried: {:?}",
+        result.targets
+    );
+    let auth = read_realm_auth_doc(&storage, realm_id).await;
+    assert!(
+        auth.roles
+            .get(&role_id)
+            .expect("realm admin role exists")
+            .assigned_users
+            .contains(&admin_user_id),
+        "the deferred assignment must apply after realm configuration"
+    );
+    let applied_cursor = read_test_cursor(&storage, auth_topic)
+        .await
+        .expect("applied cursor is stored");
+    assert!(applied_cursor.dominates(&auth_clock));
+
+    let group_id = Ulid::from_parts(1_631, 1);
+    let group_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let group_placement = admin_test_placement();
+    // Shard topics are join-only at publish; create the genesis eagerly.
+    service
+        .ensure_document_sync_topics(
+            &[group_target.sync_topic_id(realm_id, &group_placement)],
+            Vec::new(),
+        )
+        .expect("group shard topic genesis");
+    let group_role_id = Ulid::from_parts(1_632, 1);
+    let mut group_role = test_admin_event(
+        Ulid::from_parts(1_633, 1),
+        AdminDocumentTarget::Group { group_id },
+        &admin_actor,
+        2,
+        AdminDocumentOperation::GroupRoleCreated {
+            role: test_admin_role_definition(
+                group_role_id,
+                "member",
+                &format!("/{realm_id}/g/{group_id}/**"),
+                Permission::WRITE,
+            ),
+        },
+    );
+    group_role.observed.advance(admin_actor.node_id, 1);
+    let group_create = test_admin_event(
+        Ulid::from_parts(1_634, 1),
+        AdminDocumentTarget::Group { group_id },
+        &admin_actor,
+        1,
+        AdminDocumentOperation::GroupCreated {
+            realm_id,
+            display_name: "reordered".to_string(),
+            owner: admin_user_id,
+        },
+    );
+    assert!(matches!(
+        service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::AdminOperation {
+                        target: group_target.clone(),
+                        event: Box::new(group_role),
+                        placement: group_placement,
+                        allow_genesis: true,
+                        origin_signature: None,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: group_target.clone(),
+                        event: Box::new(group_create),
+                        placement: group_placement,
+                        allow_genesis: true,
+                        origin_signature: None,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await,
+        DocumentSyncNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(
+        &service,
+        group_target.sync_topic_id(realm_id, &group_placement),
+    )
+    .await;
+    service
+        .reconcile_document_topics([group_target.sync_topic_id(realm_id, &group_placement)])
+        .await
+        .expect("same-topic group prerequisite is retried");
+    assert!(
+        read_group_auth_doc(&storage, group_id)
+            .await
+            .roles
+            .contains_key(&group_role_id)
+    );
+
+    service.shutdown().await;
+}
