@@ -65,10 +65,9 @@ use super::protocol::{
     MetadataTransportMessage,
 };
 use super::search_cursor::{
-    CursorEnvelopeError, METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
-    METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
-    SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits, paginate,
-    query_fingerprint, resume_fetch_limit,
+    CursorEnvelopeError, METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor,
+    SearchCursorError, SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits,
+    paginate, query_fingerprint, resume_fetch_limit,
 };
 use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -1122,6 +1121,9 @@ struct PathShardView {
     candidates: Vec<MetadataPathCandidate>,
 }
 
+/// Backlink lookup: scans the local IRI reference index for documents naming
+/// `iri` as an object, joins and filters by read access. Empty scans for known
+/// graph IRIs or `resolve` return one predicate-less summary. Local-node-only in v1.
 pub async fn references_metadata(
     context: &DriverContext,
     realm_id: RealmId,
