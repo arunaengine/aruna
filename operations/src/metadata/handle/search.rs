@@ -381,3 +381,99 @@ async fn search_allowed_graphs(
         })
         .collect())
 }
+/// Describes one hit's `(graph_iri, subject_iri)` against a fixed authorizer.
+pub(super) type HitDescribe = Arc<dyn Fn(&str, &str) -> Vec<(String, Term)> + Send + Sync>;
+
+/// Enriches hits in parallel, one blocking task per chunk of `targets`.
+/// Returned properties align with `targets` by index: chunks are contiguous and
+/// concatenated in order, so hit order never depends on task completion order.
+pub(super) async fn describe_hits_parallel(
+    read_permits: &Arc<tokio::sync::Semaphore>,
+    targets: Vec<(String, String)>,
+    describe: HitDescribe,
+    span: &Span,
+) -> Vec<Vec<(String, Term)>> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let chunk_size = targets.len().div_ceil(METADATA_ENRICH_TASKS);
+    let tasks = targets
+        .chunks(chunk_size)
+        .map(<[(String, String)]>::to_vec)
+        .map(|chunk| {
+            let permits = read_permits.clone();
+            let describe = describe.clone();
+            let span = span.clone();
+            async move {
+                let chunk_len = chunk.len();
+                let _permit = permits.acquire_owned().await.ok();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(|| {
+                        chunk
+                            .iter()
+                            .map(|(graph_iri, subject_iri)| describe(graph_iri, subject_iri))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(%error, "metadata search enrichment task failed");
+                    vec![Vec::new(); chunk_len]
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    futures_util::future::join_all(tasks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn scope_hit_describe(
+    inner: &Arc<MetadataInner>,
+    scope: &Arc<GraphVisibilityScope>,
+) -> HitDescribe {
+    let inner = inner.clone();
+    let scope = scope.clone();
+    Arc::new(move |graph_iri, subject_iri| {
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &inner.visibility_cache,
+        };
+        describe_hit_properties(&inner.node, &authorizer, graph_iri, subject_iri)
+    })
+}
+
+fn allowed_hit_describe(
+    inner: &Arc<MetadataInner>,
+    authorizer: Arc<AllowedGraphAuthorizer>,
+) -> HitDescribe {
+    let inner = inner.clone();
+    Arc::new(move |graph_iri, subject_iri| {
+        describe_hit_properties(&inner.node, authorizer.as_ref(), graph_iri, subject_iri)
+    })
+}
+
+// Enrichment is best-effort: a pending or raced projection must never fail the
+// search, so fall back to an empty property set.
+pub(super) fn describe_hit_properties(
+    node: &CraqleNode,
+    authorizer: &dyn CraqleAuthorizer,
+    graph_iri: &str,
+    subject_iri: &str,
+) -> Vec<(String, Term)> {
+    node.describe_subject(
+        authorizer,
+        DescribeRequest {
+            graph: &GraphId::new(graph_iri),
+            subject_id: subject_iri,
+        },
+    )
+    .map(decode_hit_properties)
+    .unwrap_or_default()
+}
+
+pub(super) fn clamp_remote_search_graph_limit(limit: usize) -> usize {
+    limit.clamp(1, METADATA_SEARCH_MAX_PAGINATION_DEPTH)
+}
