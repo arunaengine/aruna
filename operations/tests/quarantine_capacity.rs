@@ -21,7 +21,7 @@ use aruna_core::structs::{
     SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
 use aruna_core::types::Value;
-use aruna_net::document_sync::DocumentSyncService;
+use aruna_net::irokle::DocumentSyncService;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::sync::sync_quarantine::{
     QuarantinePageRequest, acknowledge_quarantine_row, list_quarantine_records,

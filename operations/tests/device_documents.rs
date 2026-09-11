@@ -23,7 +23,7 @@ use aruna_operations::node::node_info::{read_node_info_documents, seed_node_info
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::users::read_user_document::ReadUserDocumentOperation;
+use aruna_operations::users::read_document::ReadUserDocumentOperation;
 use ulid::Ulid;
 
 use topology::{

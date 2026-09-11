@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use aruna_blob::blob::BlobHandler;
-use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::DocumentSyncTarget;
@@ -36,6 +35,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::reducer::AdminDocumentReducerState;
 use aruna_core::structs::{
     Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument, MetadataRegistryRecord,
     NodePlacementEntry, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -45,7 +45,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::groups::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+use aruna_operations::groups::add_member::{AddUserToGroupInput, AddUserToGroupOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::expand_placement::expand_realm_placement;
@@ -54,14 +54,14 @@ use aruna_operations::placement::{
     PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
-use aruna_operations::realm::announce_realm_presence::{
+use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::realm::mutate_realm_placement::{
+use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, RealmPlacementMutation, drive_realm_placement_mutation,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -570,7 +570,7 @@ impl Topology {
             )
             .await;
             match result {
-                Err(aruna_operations::realm::mutate_realm_placement::MutateRealmPlacementError::StorageError(
+                Err(aruna_operations::realm::mutate_placement::MutateRealmPlacementError::StorageError(
                     aruna_core::errors::StorageError::TransactionConflict,
                 )) if attempts < 10 => attempts += 1,
                 other => break other?,
@@ -1333,7 +1333,7 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             node = %&node.node_id().to_string()[..8]
         );
         tracing::Instrument::instrument(
-            aruna_operations::tasks::task_incoming::drive_document_sync_outbox_drain(
+            aruna_operations::tasks::incoming::drive_document_sync_outbox_drain(
                 node.context.clone(),
             ),
             span,

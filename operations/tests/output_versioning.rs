@@ -11,6 +11,7 @@ use aruna_core::compute::{
     LogTails, NOBODY, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::effects::StorageEffect;
+use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
@@ -20,7 +21,6 @@ use aruna_core::structs::{
     OutputDestination, OutputSelection, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     RoutingSnapshot, WorkspaceMode, checksum::HASH_BLAKE3,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::{GroupId, NodeId};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{NetConfig, NetHandle};
@@ -31,7 +31,7 @@ use aruna_operations::jobs::workflow::workspace::{capture_outputs, load_direct_i
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_object_versions::{
+use aruna_operations::s3::list_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
 use aruna_operations::s3::put_object::{

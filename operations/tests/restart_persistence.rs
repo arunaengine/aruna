@@ -13,12 +13,12 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::get_metadata_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::list_metadata_documents::ListMetadataDocumentsOperation;
+use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::list_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};

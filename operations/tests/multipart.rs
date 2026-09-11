@@ -23,14 +23,14 @@ use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
 use aruna_operations::driver::{DriverContext, drive, now_ms};
-use aruna_operations::s3::abort_multipart_upload::{
+use aruna_operations::s3::abort_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
-use aruna_operations::s3::complete_multipart_upload::{
+use aruna_operations::s3::complete_upload::{
     CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
     CompleteMultipartUploadOperation,
 };
-use aruna_operations::s3::create_multipart_upload::{
+use aruna_operations::s3::create_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
@@ -206,7 +206,7 @@ async fn complete_upload(
     checksum_type: MultipartChecksumType,
     object_size: Option<u64>,
     created_by: UserId,
-) -> aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadResult {
+) -> aruna_operations::s3::complete_upload::CompleteMultipartUploadResult {
     drive(
         CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
             bucket: bucket.to_string(),
@@ -1711,7 +1711,7 @@ async fn abort_refuses_lease() {
 
     assert!(matches!(
         refused,
-        Err(aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError::CompletionInProgress)
+        Err(aruna_operations::s3::abort_upload::AbortMultipartUploadError::CompletionInProgress)
     ));
 
     // Once the lease lapses the same abort reclaims the record and its part.

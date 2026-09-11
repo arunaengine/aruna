@@ -10,6 +10,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::identifiers::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::{
@@ -18,7 +19,6 @@ use aruna_core::structs::{
     JobProgress, JobResultPayload, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     RealmNodeKind, RepositoryConnector, RepositoryConnectorKind,
 };
-use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
@@ -30,7 +30,7 @@ use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReport
 use aruna_operations::jobs::harvest::run_harvest_job;
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::forward::delete_metadata_document_routed;
-use aruna_operations::metadata::get_metadata_document::load_metadata_record_by_document;
+use aruna_operations::metadata::get_document::load_metadata_record_by_document;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};

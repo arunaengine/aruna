@@ -39,7 +39,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_forward_document, mint_local_document,
 };
@@ -47,21 +47,21 @@ use aruna_operations::metadata::forward::{
     ForwardGroupError, MetadataWriteError, create_metadata_document_routed, forward_group_create,
     forward_token_revoke, update_metadata_document_routed,
 };
-use aruna_operations::metadata::get_metadata_document::load_metadata_record_by_document;
-use aruna_operations::metadata::update_metadata_document::{
+use aruna_operations::metadata::get_document::load_metadata_record_by_document;
+use aruna_operations::metadata::update_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::realm::set_realm_policies::{
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::set_policies::{
     SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
 };
-use aruna_operations::sync::document_sync_outbox::{
+use aruna_operations::sync::document_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::task_incoming::{OutboxDrainer, initialize_task_incoming};
+use aruna_operations::tasks::incoming::{OutboxDrainer, initialize_task_incoming};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;

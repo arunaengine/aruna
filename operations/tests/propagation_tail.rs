@@ -17,20 +17,20 @@ use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
 use aruna_operations::metadata::materialization_queue::metadata_materialization_jobs_exist;
 use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
-use aruna_operations::realm::announce_realm_presence::{
+use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::realm::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;

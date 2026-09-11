@@ -28,14 +28,15 @@ use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_purge_checkpoint, transition_to_running,
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
-use aruna_operations::s3::complete_multipart_upload::{
+use aruna_operations::s3::complete_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
 };
 use aruna_operations::s3::copy_object::{
     CopyObjectError, CopyObjectInput, CopySourceConditions, copy_object,
 };
+use aruna_operations::s3::copy_part::{UploadPartCopyError, UploadPartCopyInput, upload_part_copy};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_multipart_upload::{
+use aruna_operations::s3::create_upload::{
     CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_object::{
@@ -49,9 +50,6 @@ use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
-use aruna_operations::s3::upload_part_copy::{
-    UploadPartCopyError, UploadPartCopyInput, upload_part_copy,
-};
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

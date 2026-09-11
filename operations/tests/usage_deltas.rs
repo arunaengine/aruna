@@ -22,10 +22,10 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::blob_storage::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::usage_stats::RebuildUsageStatsOperation;
-use aruna_operations::s3::abort_multipart_upload::{
+use aruna_operations::s3::abort_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
-use aruna_operations::s3::complete_multipart_upload::{
+use aruna_operations::s3::complete_upload::{
     CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
     CompleteMultipartUploadOperation, CompleteMultipartUploadResult,
 };
@@ -33,7 +33,7 @@ use aruna_operations::s3::copy_object::{
     CopyObjectInput, CopyObjectResultData, CopySourceConditions,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_multipart_upload::{
+use aruna_operations::s3::create_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;

@@ -13,7 +13,7 @@ use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AuditAggregate, ListAuditOperation, ListAuditRequest,
     LocalAuditPageOperation, MAX_AUDIT_PAGE_SIZE, list_audit,
 };
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };

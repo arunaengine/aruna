@@ -34,17 +34,17 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::node::node_info::seed_node_info_document;
 use aruna_operations::placement::policy::{SubjectScanMode, sync_subject};
-use aruna_operations::realm::announce_realm_presence::{
+use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::realm::claim_initial_realm_admin::{
+use aruna_operations::realm::claim_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::realm::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::s3::get_user_access::GetUserAccessOperation;
+use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::s3::get_access::GetUserAccessOperation;
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;

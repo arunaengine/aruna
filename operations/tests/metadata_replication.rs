@@ -34,35 +34,35 @@ use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent, MetaResourceId, NodeI
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::delete_metadata_document::DeleteMetadataDocumentOperation;
-use aruna_operations::metadata::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::delete_document::DeleteMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::{
     project_metadata_create_events, replay_metadata_event_log,
 };
-use aruna_operations::metadata::update_metadata_document::{
+use aruna_operations::metadata::update_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
 };
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
     strategy_for_target, subject_bytes,
 };
-use aruna_operations::realm::announce_realm_presence::{
+use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::realm::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::realm::mutate_realm_placement::{
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
-use aruna_operations::sync::document_sync_outbox::read_outbox_records;
+use aruna_operations::sync::document_outbox::read_outbox_records;
 use aruna_operations::sync::incoming::initialize_net_incoming;
 use aruna_operations::sync::shard_placement::sort_node_ids;
-use aruna_operations::tasks::task_incoming::{OutboxDrainer, initialize_task_incoming};
+use aruna_operations::tasks::incoming::{OutboxDrainer, initialize_task_incoming};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;

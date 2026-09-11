@@ -30,7 +30,7 @@ use aruna_core::structs::{
 use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::connectors::create_source_connector::{
+use aruna_operations::connectors::create_connector::{
     CreateSourceConnectorInput, CreateSourceConnectorOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
@@ -65,7 +65,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId};
 
 /// A fixed structured id (handle 1, bucket 0). The single-node import fixture

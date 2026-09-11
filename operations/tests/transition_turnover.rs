@@ -14,17 +14,17 @@ mod topology;
 use aruna_core::StructuredId;
 use aruna_core::structs::{PlacementRef, TransitionLimits};
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
 use aruna_operations::metadata::forward::update_metadata_document_routed;
-use aruna_operations::metadata::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
 use aruna_operations::placement::holds_placement;
 use aruna_operations::placement::transition::preview_transition;
-use aruna_operations::realm::mutate_realm_placement::RealmPlacementMutation;
+use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 use ulid::Ulid;
 
 use topology::{TestNode, TestResult, Topology, wait_until};

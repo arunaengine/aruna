@@ -15,20 +15,20 @@ use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
 use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
 use aruna_operations::node::startup::{SHARED_RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
-use aruna_operations::realm::announce_realm_presence::{
+use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::realm::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -654,8 +654,7 @@ const INCIDENT_SHARDS: u32 = 128;
 /// Only this short prefix needs revision-chain ordering during peer recovery.
 const INCIDENT_METADATA_RECORDS: usize = 32;
 /// The production drain examines two full topic pages per invocation.
-const INCIDENT_LIMIT: usize =
-    2 * aruna_operations::sync::document_sync_outbox::OUTBOX_DRAIN_BATCH_SIZE;
+const INCIDENT_LIMIT: usize = 2 * aruna_operations::sync::document_outbox::OUTBOX_DRAIN_BATCH_SIZE;
 /// Two full invocation windows keep the scale assertion away from the boundary.
 const INCIDENT_SCALE_RECORDS: usize = 2 * INCIDENT_LIMIT;
 /// One bounded pass plus a short chain keeps peer-return coverage controllable.
@@ -676,7 +675,7 @@ fn offline_scale_bound() -> Result<(), BoxError> {
 
 async fn offline_bound_body() -> Result<(), BoxError> {
     use aruna_operations::node::startup::{RecoveryError, RecoveryOutcome};
-    use aruna_operations::tasks::task_incoming::OutboxDrainer;
+    use aruna_operations::tasks::incoming::OutboxDrainer;
 
     assert_eq!(INCIDENT_LIMIT, 8_192);
     assert_eq!(INCIDENT_SCALE_RECORDS, 2 * INCIDENT_LIMIT);
@@ -718,7 +717,7 @@ fn offline_recovery_converges() -> Result<(), BoxError> {
 
 async fn recovery_converges(record_count: usize, assert_bound: bool) -> Result<(), BoxError> {
     use aruna_operations::node::startup::{RecoveryError, RecoveryOutcome};
-    use aruna_operations::tasks::task_incoming::OutboxDrainer;
+    use aruna_operations::tasks::incoming::OutboxDrainer;
 
     let realm_id = RealmId([92u8; 32]);
     let outage = prepare_outage(realm_id, record_count).await?;
@@ -807,7 +806,7 @@ async fn prepare_outage(realm_id: RealmId, record_count: usize) -> Result<Outage
 
 async fn assert_drain_bound(
     outage: &OutageFixture,
-    drainer: &aruna_operations::tasks::task_incoming::OutboxDrainer,
+    drainer: &aruna_operations::tasks::incoming::OutboxDrainer,
     expected_examined: Option<usize>,
 ) -> Result<(), BoxError> {
     let high_water = outbox_keys(&outage.live).await?;
@@ -828,7 +827,7 @@ async fn assert_drain_bound(
 
 async fn finish_outage(
     outage: OutageFixture,
-    drainer: &aruna_operations::tasks::task_incoming::OutboxDrainer,
+    drainer: &aruna_operations::tasks::incoming::OutboxDrainer,
     status: &aruna_operations::node::startup::RecoveryStatus,
     cancelled: tokio_util::sync::CancellationToken,
     driver: tokio::task::JoinHandle<()>,
@@ -958,8 +957,8 @@ fn incident_config(
     nodes: &[TestNode],
     strategy: &aruna_core::structs::PlacementStrategy,
 ) -> RealmConfigDocument {
+    use aruna_core::identifiers::PlacementHandle;
     use aruna_core::structs::{DocumentClass, METADATA_HANDLE, PlacementBinding, PlacementScope};
-    use aruna_core::structured_id::PlacementHandle;
 
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.default_strategy_id = Some(strategy.strategy_id);
@@ -990,7 +989,7 @@ fn incident_target(
 > {
     use aruna_core::MetaResourceId;
     use aruna_core::document::DocumentSyncTarget;
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
 
     let placement = aruna_core::structs::PlacementRef {
         strategy_id: strategy.strategy_id,
@@ -1095,7 +1094,9 @@ async fn seed_outbox(
         let mut writes = Vec::with_capacity(1_024);
         for index in chunk_start..(chunk_start + 1_024).min(record_count) {
             let record = incident_record(realm_id, local, target, placement, holders, index)?;
-            writes.push(aruna_operations::sync::document_sync_outbox::outbox_write_entry(&record)?);
+            writes.push(aruna_operations::sync::document_outbox::outbox_write_entry(
+                &record,
+            )?);
         }
         match node
             .context
@@ -1155,7 +1156,7 @@ fn incident_record(
     };
     let registry = incident_registry(realm_id, target, placement, holders, index)?;
     Ok(
-        aruna_operations::sync::document_sync_outbox::new_outbox_record_with_id(
+        aruna_operations::sync::document_outbox::new_outbox_record_with_id(
             Ulid::from_parts(1, index as u128),
             local,
             target.clone(),
@@ -1196,7 +1197,7 @@ fn incident_delete(
         graph_iri: format!("https://aruna.example/incident/graph/{index}"),
     };
     Ok(
-        aruna_operations::sync::document_sync_outbox::new_outbox_record_with_id(
+        aruna_operations::sync::document_outbox::new_outbox_record_with_id(
             Ulid::from_parts(1, index as u128),
             local,
             target,
@@ -1318,7 +1319,7 @@ async fn restore_peers(
 }
 
 async fn wait_outbox(
-    drainer: &aruna_operations::tasks::task_incoming::OutboxDrainer,
+    drainer: &aruna_operations::tasks::incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
     let wait_cap = HANG_CAP.saturating_mul(3);
@@ -1474,7 +1475,7 @@ async fn outbox_keys(node: &TestNode) -> Result<Vec<Vec<u8>>, BoxError> {
     let mut keys = Vec::new();
     let mut start: Option<Vec<u8>> = None;
     loop {
-        let batch = aruna_operations::sync::document_sync_outbox::read_outbox_records(
+        let batch = aruna_operations::sync::document_outbox::read_outbox_records(
             &node.context.storage_handle,
             &[],
             start.take(),

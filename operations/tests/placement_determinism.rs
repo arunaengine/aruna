@@ -3,13 +3,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::reducer::AdminDocumentReducerState;
 use aruna_core::structs::{
     Actor, AffinityEffect, AffinityRule, LabelMatch, MetadataRegistryRecord, NodePlacementEntry,
     NodeUrls, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -18,21 +18,21 @@ use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::create_metadata_document::{
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
 use aruna_operations::node::node_info::{read_node_info_document, seed_node_info_document};
 use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::realm::mutate_realm_placement::{
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::tasks::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
