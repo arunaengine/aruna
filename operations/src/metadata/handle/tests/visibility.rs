@@ -54,7 +54,7 @@ pub(super) fn read_rules(
     .expect("patterns compile")
 }
 
-fn filled_cache(records: Vec<MetadataRegistryRecord>) -> MetadataVisibilityCache {
+pub(super) fn filled_cache(records: Vec<MetadataRegistryRecord>) -> MetadataVisibilityCache {
     let cache = MetadataVisibilityCache::new();
     cache.store_registry_records(Arc::new(records));
     cache
