@@ -901,12 +901,14 @@ mod tests {
     use aruna_storage::FjallStorage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
+    use harness::*;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
     use ulid::Ulid;
 
     use crate::notifications::outbox::new_notification_outbox_record;
 
+    mod harness;
     mod notification;
     mod outbox;
     mod restore;
@@ -974,7 +976,7 @@ mod tests {
         assert_eq!(ladder(&handler), RECLAIM_SWEEP_RETRY);
     }
 
-    struct RecordingTaskHandler {
+    pub(super) struct RecordingTaskHandler {
         seen: mpsc::Sender<TaskKey>,
     }
 
@@ -1021,7 +1023,7 @@ mod tests {
         net.shutdown().await;
     }
 
-    struct InstalledHarness {
+    pub(super) struct InstalledHarness {
         _dir: tempfile::TempDir,
         storage: aruna_storage::StorageHandle,
         net: NetHandle,
