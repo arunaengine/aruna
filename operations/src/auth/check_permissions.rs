@@ -95,17 +95,11 @@ mod test {
 
     use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::groups::add_group_role::{
-        AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
-    };
-    use crate::groups::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::groups::add_member::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::groups::add_role::{AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::realm::add_user_to_realm_role::{
-        AddUserToRealmRolesInput, AddUserToRealmRolesOperation,
-    };
-    use crate::realm::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
+    use crate::realm::assign_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
+    use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     #[tokio::test]

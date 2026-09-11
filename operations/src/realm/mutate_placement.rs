@@ -1,8 +1,4 @@
 use aruna_core::NodeId;
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState,
-    overlay_realm_config_placement_reducer_materialization,
-};
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -14,6 +10,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataCreateEventRecord;
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::reducer::{
+    AdminDocumentReducerError, AdminDocumentReducerState,
+    overlay_realm_config_placement_reducer_materialization,
+};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, metadata_pending_projection_target,
@@ -38,7 +38,7 @@ use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::sync::shard_placement::schedule_placement_revalidation_effect;
@@ -895,10 +895,8 @@ impl MutateRealmPlacementOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -1414,7 +1412,7 @@ pub async fn drive_realm_placement_mutation(
     };
     let outcome = crate::driver::drive(operation, context).await;
     if outcome.is_ok() && drains_node && context.net_handle.is_some() {
-        crate::tasks::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
+        crate::tasks::incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
             context.clone(),
         ))
         .await;
@@ -1428,6 +1426,7 @@ mod tests {
 
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
+    use aruna_core::identifiers::PlacementHandle;
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
     use aruna_core::storage_entries::{
         metadata_create_event_and_pending_projection_write_entries, metadata_registry_write_entries,
@@ -1437,7 +1436,6 @@ mod tests {
         FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord, PlacementBinding,
         PlacementRef, PlacementScope, RealmId, RealmNodeKind,
     };
-    use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -1445,7 +1443,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::placement::transition::{TransitionRequest, plan_transition};
-    use crate::realm::get_realm_config::GetRealmConfigOperation;
+    use crate::realm::get_config::GetRealmConfigOperation;
     use aruna_core::structs::{PlacementTransition, ProofClaim, TransitionLimits};
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -2769,7 +2767,7 @@ mod tests {
             .expect("the realm config survives a rejected mutation");
         assert!(stored.candidate_maps.is_empty());
         assert!(
-            crate::sync::document_sync_outbox::read_outbox_tails(&context.storage_handle)
+            crate::sync::document_outbox::read_outbox_tails(&context.storage_handle)
                 .await
                 .expect("outbox scan")
                 .is_empty()

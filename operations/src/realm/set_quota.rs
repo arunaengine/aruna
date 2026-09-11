@@ -1,8 +1,5 @@
 use std::collections::BTreeSet;
 
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_QUOTA_PATH,
-};
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -10,6 +7,9 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::reducer::{
+    AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_QUOTA_PATH,
+};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -25,8 +25,8 @@ use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::placement_ref_for_target;
-use crate::realm::mutate_realm_placement::is_management;
-use crate::sync::document_sync_outbox::{
+use crate::realm::mutate_placement::is_management;
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 
@@ -162,10 +162,8 @@ impl SetRealmQuotaOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -491,7 +489,7 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::realm::get_realm_config::GetRealmConfigOperation;
+    use crate::realm::get_config::GetRealmConfigOperation;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
