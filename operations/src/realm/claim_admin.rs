@@ -1,4 +1,3 @@
-use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
@@ -9,6 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -20,7 +20,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
@@ -181,10 +181,8 @@ impl ClaimInitialRealmAdminOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -570,7 +568,6 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{
         AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
         AdminDocumentTarget,
@@ -582,6 +579,7 @@ mod tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::structs::{Actor, RealmAuthorizationDocument, RealmId, Role};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;

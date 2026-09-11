@@ -1,4 +1,3 @@
-use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
@@ -6,8 +5,10 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::identifiers::{FieldError, PlacementHandle};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
     Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
@@ -15,7 +16,6 @@ use aruna_core::structs::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, band_start,
     normalize_node_placement_input,
 };
-use aruna_core::structured_id::{FieldError, PlacementHandle};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -24,7 +24,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 
@@ -594,7 +594,6 @@ mod test {
     use std::time::Duration;
 
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{
         AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
@@ -607,6 +606,7 @@ mod test {
         ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::structs::{
         Actor, BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,

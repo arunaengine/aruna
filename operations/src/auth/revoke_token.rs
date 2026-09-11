@@ -1,7 +1,3 @@
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, MAX_LIVE_REVOCATIONS_PER_ORIGIN,
-    RevocationIndex,
-};
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::{
     revocation_live, revocation_retained, valid_revocation_expiry, valid_token_hash,
@@ -15,6 +11,10 @@ use aruna_core::keyspaces::{
     TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::reducer::{
+    AdminDocumentReducerError, AdminDocumentReducerState, MAX_LIVE_REVOCATIONS_PER_ORIGIN,
+    RevocationIndex,
+};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -28,7 +28,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     admin_outbox_prefix, new_outbox_record_with_id, outbox_write_entry, revocation_index_entry,
     schedule_outbox_drain_effect,
 };
@@ -214,10 +214,8 @@ impl RevokeTokenOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -881,8 +879,8 @@ mod tests {
     };
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_realm_config::GetRealmConfigOperation;
-    use crate::sync::document_sync_outbox::admin_outbox_prefix;
+    use crate::realm::get_config::GetRealmConfigOperation;
+    use crate::sync::document_outbox::admin_outbox_prefix;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
@@ -1477,7 +1475,7 @@ mod tests {
         {
             Event::Storage(StorageEvent::ReadResult {
                 value: Some(bytes), ..
-            }) => aruna_core::admin_document_reducer::decode_admin_document_reducer_state(&bytes)
+            }) => aruna_core::reducer::decode_admin_document_reducer_state(&bytes)
                 .expect("reducer state decodes"),
             other => panic!("unexpected reducer state read: {other:?}"),
         }

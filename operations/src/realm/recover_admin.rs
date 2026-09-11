@@ -9,7 +9,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::onboarding::create_onboarding_secret::secret_record_key;
+use crate::onboarding::create_secret::secret_record_key;
 use crate::onboarding::secret_state::{
     resolve_secret_state, secret_state_key, secret_state_write_entry,
 };
@@ -286,13 +286,13 @@ impl Operation for RecoverInitialAdminOperation {
 mod tests {
     use super::{RecoverInitialAdminInput, RecoverInitialAdminOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::onboarding::consume_onboarding_secret::{
+    use crate::onboarding::consume_secret::{
         ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
     };
-    use crate::onboarding::create_onboarding_secret::{
+    use crate::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use crate::onboarding::list_onboarding_secrets::ListOnboardingSecretsOperation;
+    use crate::onboarding::list_secrets::ListOnboardingSecretsOperation;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_storage::storage;
     use tempfile::tempdir;

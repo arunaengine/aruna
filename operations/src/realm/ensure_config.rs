@@ -1,9 +1,4 @@
 use aruna_core::NodeId;
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState,
-    overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
-    realm_config_node_path,
-};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -11,8 +6,14 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::identifiers::PlacementHandle;
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::reducer::{
+    AdminDocumentReducerError, AdminDocumentReducerState,
+    overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
+    realm_config_node_path,
+};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -22,7 +23,6 @@ use aruna_core::structs::{
     HandleRange, PlacementBinding, PlacementScope, RealmConfigDocument, RealmNodeKind, band_start,
     coordinator_spans, owned_pools,
 };
-use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -32,7 +32,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 
@@ -193,10 +193,8 @@ impl EnsureRealmConfigOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -709,10 +707,6 @@ fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) 
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::admin_document_reducer::{
-        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
-        REALM_CONFIG_DEFAULT_STRATEGY_PATH,
-    };
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentTarget,
@@ -727,6 +721,10 @@ mod tests {
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::{
+        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
+        REALM_CONFIG_DEFAULT_STRATEGY_PATH,
+    };
     use aruna_core::storage_entries::admin_document_reducer_conflict_key;
     use aruna_core::structs::{
         Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS,
@@ -1171,7 +1169,7 @@ mod tests {
         document
             .placement_bindings
             .push(aruna_core::structs::PlacementBinding {
-                handle: aruna_core::structured_id::PlacementHandle::new(range.start).unwrap(),
+                handle: aruna_core::identifiers::PlacementHandle::new(range.start).unwrap(),
                 scope: aruna_core::structs::PlacementScope::Realm(realm_id),
                 document_class: DocumentClass::JobControl,
                 strategy_id: Ulid::from_bytes([12; 16]),
