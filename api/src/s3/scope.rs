@@ -2,11 +2,10 @@
 //! access hook resolves them once and the listing handlers narrow their page to
 //! them, while every concrete object path stays an ordinary permission check.
 
-use aruna_core::permission_path::readable_roots;
-use aruna_core::structs::UserAccess;
-use aruna_core::types::GroupId;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_core::errors::AuthorizationError;
+use aruna_core::structs::{AuthContext, UserAccess};
+use aruna_operations::driver::DriverContext;
+use aruna_operations::permission_rules::reachable_roots;
 use s3s::{S3Result, s3_error};
 
 /// Key prefixes inside one bucket the caller may read. An empty prefix stands
@@ -61,31 +60,31 @@ impl SubpathScope {
     }
 }
 
-/// Resolves the subtrees at or below `root` the caller reaches through its group
-/// roles, narrowed by the credential's own restrictions. A group without an
-/// authorization document grants nothing instead of failing the request.
+/// Resolves the subtrees at or below `root` the caller reaches through its
+/// realm and group roles, narrowed by the credential's own restrictions. A
+/// missing realm or group document grants nothing instead of failing.
 pub(crate) async fn resolve_scope(
     context: &DriverContext,
     user_access: &UserAccess,
-    group_id: GroupId,
     root: &str,
 ) -> S3Result<SubpathScope> {
-    let authorization =
-        match drive(GetGroupOperation::new(GetGroupConfig { group_id }), context).await {
-            Ok((_, authorization)) => authorization,
-            Err(GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound) => {
-                return Ok(SubpathScope::default());
-            }
-            Err(error) => {
-                return Err(s3_error!(InternalError, "{}", error.to_string()));
-            }
-        };
-
-    let granted = authorization.user_permissions(user_access.user_identity);
-    Ok(SubpathScope::from_roots(
-        readable_roots(&granted, user_access.path_restrictions.as_deref(), root),
-        root,
-    ))
+    let auth_context = AuthContext {
+        user_id: user_access.user_identity,
+        realm_id: user_access.user_identity.realm_id,
+        path_restrictions: user_access.path_restrictions.clone(),
+        session: None,
+    };
+    let roots = match reachable_roots(context, &auth_context, root).await {
+        Ok(roots) => roots,
+        Err(
+            AuthorizationError::AuthDocNotFound
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId,
+        ) => return Ok(SubpathScope::default()),
+        Err(error) => return Err(s3_error!(InternalError, "{}", error.to_string())),
+    };
+    Ok(SubpathScope::from_roots(roots, root))
 }
 
 #[cfg(test)]

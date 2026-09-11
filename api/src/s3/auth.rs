@@ -12,7 +12,9 @@ use aruna_core::{NodeId, UserId};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::request_policy::PolicyRequestExtras;
+use aruna_operations::request_policy::{
+    PolicyRequestExtras, enforce_policies, policy_request_with,
+};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use aruna_operations::s3::session::{
@@ -192,8 +194,14 @@ impl S3Access for AuthProvider {
             {
                 Ok(()) => {}
                 Err(AuthorizeError::PermissionDenied) if is_listing_operation(&operation_name) => {
-                    self.admit_subpath_listing(cx, &user_access, &path, &operation_name)
-                        .await?;
+                    self.admit_subpath_listing(
+                        cx,
+                        &user_access,
+                        &auth_context,
+                        &path,
+                        extras.clone(),
+                    )
+                    .await?;
                 }
                 Err(error) => return Err(map_authorize_error(error)),
             }
@@ -586,22 +594,27 @@ impl AuthProvider {
         &self,
         cx: &mut S3AccessContext<'_>,
         user_access: &UserAccess,
+        auth_context: &AuthContext,
         path: &str,
-        operation_name: &str,
+        extras: PolicyRequestExtras,
     ) -> S3Result<()> {
         let has_bucket = cx.s3_path().get_bucket_name().is_some();
-        let group_id = cx
-            .extensions_mut()
-            .get::<BucketInfo>()
-            .map(|bucket_info| bucket_info.group_id)
-            .unwrap_or(user_access.group_id);
-        let scope = resolve_scope(self.driver_ctx.as_ref(), user_access, group_id, path).await?;
+        let scope = resolve_scope(self.driver_ctx.as_ref(), user_access, path).await?;
         if scope.is_empty() {
             return Err(map_authorize_error(AuthorizeError::PermissionDenied));
         }
+        // The ordinary path enforces policies after RBAC, so an admitted
+        // listing runs them too instead of skipping the verdict.
+        enforce_policies(
+            self.driver_ctx.as_ref(),
+            self.realm_id,
+            &policy_request_with(path, &Permission::READ, Some(auth_context), extras),
+        )
+        .await
+        .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))?;
 
         debug!(
-            operation = operation_name,
+            path = path,
             "Narrowing listing to the caller's permitted subpaths"
         );
         if has_bucket {

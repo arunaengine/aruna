@@ -1,12 +1,12 @@
 use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::permission_path::readable_roots;
+use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, PathRestriction, Permission, UserAccess, blob_group_permission_path,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_operations::permission_rules::reachable_roots;
 use aruna_operations::s3::create_user_access::{
     CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
     DEFAULT_CREDENTIAL_TTL,
@@ -707,7 +707,7 @@ async fn authorize_credential_issuance(
             }
         }
 
-        return authorize_group_subpath(&effective_auth, state, group_id, &group_root).await;
+        return authorize_group_subpath(&effective_auth, state, &group_root).await;
     };
 
     for restriction in effective_restrictions {
@@ -738,21 +738,18 @@ async fn authorize_credential_issuance(
 async fn authorize_group_subpath(
     auth: &AuthContext,
     state: &ServerState,
-    group_id: Ulid,
     group_root: &str,
 ) -> ServerResult<()> {
-    let (_, authorization) = drive(
-        GetGroupOperation::new(GetGroupConfig { group_id }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| match error {
-        GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(error.to_string()),
-    })?;
-
-    let granted = authorization.user_permissions(auth.user_id);
-    if readable_roots(&granted, auth.path_restrictions.as_deref(), group_root).is_empty() {
+    let roots = reachable_roots(&state.get_ctx(), auth, group_root)
+        .await
+        .map_err(|error| match error {
+            AuthorizationError::AuthDocNotFound
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
+            _ => ServerError::InternalError(error.to_string()),
+        })?;
+    if roots.is_empty() {
         return Err(ServerError::Forbidden);
     }
 
@@ -1125,6 +1122,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// Adds a realm role denying the caller every group subtree.
+    async fn write_realm_deny(state: &Arc<ServerState>, auth: &AuthContext) {
+        use std::collections::{HashMap, HashSet};
+        let realm_id = state.get_realm_id();
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id,
+        };
+        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let role_id = Ulid::from_bytes([11u8; 16]);
+        realm_auth.roles.insert(
+            role_id,
+            aruna_core::structs::Role {
+                role_id,
+                name: "data-deny".to_string(),
+                permissions: HashMap::from([(format!("/{realm_id}/g/**"), Permission::DENY)]),
+                assigned_users: HashSet::from([auth.user_id]),
+            },
+        );
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: realm_auth.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deny_refuses_credential() {
+        // A realm deny on the group data outranks the folder role, so the
+        // subpath member may not mint a credential for it either.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let group_root = blob_group_permission_path(realm_id, group_id, node_id);
+        let (_dir, state, auth, group_id) = scoped_state(vec![(
+            format!("{group_root}/study/imaging/**"),
+            Permission::READ,
+        )])
+        .await;
+        write_realm_deny(&state, &auth).await;
+
+        let error = create_credential(&state, &auth, group_id, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::Forbidden));
     }
 
     #[tokio::test]

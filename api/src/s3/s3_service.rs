@@ -325,14 +325,15 @@ impl ArunaS3Service {
                 Err(s3_error!(InternalError, "{}", message))
             }
             Err(error @ AuthorizeError::Storage(_)) => Err(map_authorize_error(error)),
+            // A policy verdict is the decision itself, so it hides the bucket
+            // instead of falling back to the role subtrees.
+            Err(AuthorizeError::Policy(_)) => Ok(false),
             // A member whose roles reach only a folder inside this bucket still
             // owns the bucket holding it, so it stays visible.
-            Err(_) => {
-                Ok(
-                    !resolve_scope(&self.state, user_access, bucket_info.group_id, &bucket_path)
-                        .await?
-                        .is_empty(),
-                )
+            Err(AuthorizeError::PermissionDenied) => {
+                Ok(!resolve_scope(&self.state, user_access, &bucket_path)
+                    .await?
+                    .is_empty())
             }
         }
     }
@@ -4790,7 +4791,6 @@ mod tests {
         let scope = resolve_scope(
             &service.state,
             user_access,
-            group_id,
             &blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
         )
         .await
@@ -4840,6 +4840,142 @@ mod tests {
             .filter_map(|bucket| bucket.name)
             .collect();
         assert_eq!(buckets, vec!["study"]);
+    }
+
+    /// Adds a realm role that denies the caller the whole group data subtree.
+    async fn write_realm_deny(service: &ArunaS3Service, user_access: &UserAccess) {
+        use std::collections::{HashMap, HashSet};
+        let realm_id = service.realm_id;
+        let actor = Actor {
+            node_id: service.node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let role_id = Ulid::generate();
+        realm_auth.roles.insert(
+            role_id,
+            aruna_core::structs::Role {
+                role_id,
+                name: "data-deny".to_string(),
+                permissions: HashMap::from([(format!("/{realm_id}/g/**"), Permission::DENY)]),
+                assigned_users: HashSet::from([user_access.user_identity]),
+            },
+        );
+        write_storage_value(
+            &service.state.storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            realm_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+    }
+
+    async fn write_deny_policy(service: &ArunaS3Service, user_access: &UserAccess) {
+        let realm_id = service.realm_id;
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config
+            .request_policies
+            .push(aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "no-reads".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: "permission == 'read'".to_string(),
+                enabled: true,
+            });
+        let actor = Actor {
+            node_id: service.node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        write_storage_value(
+            &service.state.storage_handle,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            config.to_bytes(&actor).unwrap(),
+        )
+        .await;
+    }
+
+    async fn listed_buckets(service: &ArunaS3Service, user_access: &UserAccess) -> Vec<String> {
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access.clone());
+        extensions.insert(PolicyRequestExtras::operation("s3.ListBuckets"));
+        let request = S3Request {
+            input: ListBucketsInput::default(),
+            method: Method::GET,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        service
+            .list_buckets(request)
+            .await
+            .unwrap()
+            .output
+            .buckets
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|bucket| bucket.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn deny_hides_subpath() {
+        // A realm deny outranks the group role that grants the folder, so no
+        // listing, head or bucket visibility survives it.
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        write_realm_deny(&service, &user_access).await;
+
+        let scope = resolve_scope(
+            &service.state,
+            &user_access,
+            &blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
+        )
+        .await
+        .unwrap();
+        assert!(scope.is_empty());
+        assert!(listed_buckets(&service, &user_access).await.is_empty());
+    }
+
+    /// Replaces the seeded folder role with the owner's default roles, so the
+    /// caller reads the whole bucket and only a policy can refuse it.
+    async fn grant_group_owner(service: &ArunaS3Service, user_access: &UserAccess, group_id: Ulid) {
+        let actor = Actor {
+            node_id: service.node_id,
+            user_id: user_access.user_identity,
+            realm_id: service.realm_id,
+        };
+        write_storage_value(
+            &service.state.storage_handle,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            GroupAuthorizationDocument::new_default_group_doc(
+                user_access.user_identity,
+                service.realm_id,
+                group_id,
+            )
+            .to_bytes(&actor)
+            .unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn policy_hides_bucket() {
+        // A policy denial is the verdict itself, never a reason to fall back on
+        // the caller's role subtrees.
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        grant_group_owner(&service, &user_access, group_id).await;
+        assert!(!listed_buckets(&service, &user_access).await.is_empty());
+
+        write_deny_policy(&service, &user_access).await;
+        assert!(listed_buckets(&service, &user_access).await.is_empty());
     }
 
     #[tokio::test]
