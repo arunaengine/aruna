@@ -1093,7 +1093,7 @@ fn placement_op_is_rejected_for_non_realm_config_target() {
     assert_eq!(state, before);
 }
 
-pub(super) fn placement_binding(handle: u32, strategy_seed: u8) -> PlacementBinding {
+fn placement_binding(handle: u32, strategy_seed: u8) -> PlacementBinding {
     PlacementBinding {
         handle: PlacementHandle::new(handle).unwrap(),
         scope: PlacementScope::Realm(realm_id()),
@@ -1105,7 +1105,7 @@ pub(super) fn placement_binding(handle: u32, strategy_seed: u8) -> PlacementBind
     }
 }
 
-pub(super) fn append_placement_binding(
+fn append_placement_binding(
     event_seed: u8,
     origin_seed: u8,
     binding: PlacementBinding,
@@ -1119,7 +1119,7 @@ pub(super) fn append_placement_binding(
     )
 }
 
-pub(super) fn handle_range(range_seed: u8, owner: NodeId, start: u32, end: u32) -> HandleRange {
+fn handle_range(range_seed: u8, owner: NodeId, start: u32, end: u32) -> HandleRange {
     HandleRange {
         range_id: Ulid::from_bytes([range_seed; 16]),
         owner,
@@ -1128,11 +1128,7 @@ pub(super) fn handle_range(range_seed: u8, owner: NodeId, start: u32, end: u32) 
     }
 }
 
-pub(super) fn grant_handle_range(
-    event_seed: u8,
-    origin_seed: u8,
-    range: HandleRange,
-) -> AdminDocumentEvent {
+fn grant_handle_range(event_seed: u8, origin_seed: u8, range: HandleRange) -> AdminDocumentEvent {
     realm_config_event(
         event_seed,
         node(origin_seed),
@@ -1225,4 +1221,157 @@ fn binding_paths_disjoint() {
     );
     let strategy_path = realm_config_strategy_binding_path(&BindingScope::Realm);
     assert_eq!(placement_binding_handle(&strategy_path), None);
+}
+
+#[test]
+fn binding_conflicts_converge() {
+    let handle = PlacementHandle::new(7).unwrap();
+    let first = append_placement_binding(1, 1, placement_binding(7, 1));
+    let second = append_placement_binding(2, 2, placement_binding(7, 2));
+    let observed_second = realm_config_event(
+        2,
+        node(1),
+        2,
+        AdminDocumentClock::default().with_observed(node(1), 1),
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+            binding: placement_binding(7, 2),
+        },
+    );
+
+    let mut left = realm_config_state();
+    left.apply(&first).unwrap();
+    left.apply(&second).unwrap();
+
+    let mut right = realm_config_state();
+    right.apply(&second).unwrap();
+    right.apply(&first).unwrap();
+
+    let mut observed = realm_config_state();
+    observed.apply(&first).unwrap();
+    observed.apply(&observed_second).unwrap();
+
+    let mut observed_reversed = realm_config_state();
+    observed_reversed.apply(&observed_second).unwrap();
+    assert_eq!(
+        observed_reversed.apply(&first),
+        Ok(AdminDocumentApplyStatus::Applied)
+    );
+
+    assert_eq!(left.conflicts, right.conflicts);
+    let path = placement_binding_path(handle);
+    assert!(left.conflicts.contains_key(&path));
+    assert_eq!(observed.conflicts, observed_reversed.conflicts);
+    assert!(observed.conflicts.contains_key(&path));
+    assert!(left.materialized_placement_bindings().is_empty());
+    assert!(right.materialized_placement_bindings().is_empty());
+
+    for state in [&left, &right] {
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
+        let directory = config.binding_directory();
+        assert_eq!(
+            directory.resolve(handle),
+            Err(BindingError::Conflicted(handle))
+        );
+        assert_eq!(directory.conflicted(), 1);
+    }
+}
+
+#[test]
+fn provenance_conflicts() {
+    let handle = PlacementHandle::new(9).unwrap();
+    let mut first = placement_binding(9, 1);
+    first.allocated_by = Some(node(3));
+    first.allocated_at_ms = Some(1);
+    let mut second = placement_binding(9, 1);
+    second.allocated_by = Some(node(4));
+    second.allocated_at_ms = Some(2);
+
+    let mut state = realm_config_state();
+    state.apply(&append_placement_binding(1, 1, first)).unwrap();
+    state
+        .apply(&append_placement_binding(2, 2, second))
+        .unwrap();
+
+    assert_eq!(state.conflicts.len(), 1);
+    assert!(state.materialized_placement_bindings().is_empty());
+
+    let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    assert_eq!(config.placement_bindings.len(), 2);
+    assert_eq!(
+        config.binding_directory().resolve(handle),
+        Err(BindingError::Conflicted(handle))
+    );
+}
+
+#[test]
+fn binding_reappend_idempotent() {
+    let handle = PlacementHandle::new(11).unwrap();
+    let origin = node(1);
+    let range_id = Ulid::from_bytes([8; 16]);
+    let mut binding = placement_binding(11, 1);
+    binding.allocator_range_id = Some(range_id);
+    binding.allocated_by = Some(origin);
+    binding.allocated_at_ms = Some(1);
+    let first = append_placement_binding(1, 1, binding.clone());
+    let second = realm_config_event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default().with_observed(origin, 1),
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+            binding: binding.clone(),
+        },
+    );
+
+    let mut state = realm_config_state();
+    state.apply(&first).unwrap();
+    state.apply(&second).unwrap();
+
+    assert!(state.conflicts.is_empty());
+    assert_eq!(state.materialized_placement_bindings().len(), 1);
+    let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+    config
+        .placement_handle_ranges
+        .push(handle_range(8, origin, 3, 20));
+    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    assert_eq!(config.placement_bindings.len(), 1);
+    assert_eq!(
+        config
+            .binding_directory()
+            .resolve(handle)
+            .map(|tuple| tuple.strategy_id),
+        Ok(binding.strategy_id)
+    );
+}
+
+#[test]
+fn overlay_retains_conflicts() {
+    let first = placement_binding(13, 1);
+    let second = placement_binding(13, 2);
+    let mut state = realm_config_state();
+    state
+        .apply(&append_placement_binding(1, 1, first.clone()))
+        .unwrap();
+    state
+        .apply(&append_placement_binding(2, 2, second.clone()))
+        .unwrap();
+
+    let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+    // A stale local entry for the handle must be replaced, not accumulated.
+    config.placement_bindings.push(first.clone());
+    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+
+    assert_eq!(config.placement_bindings.len(), 2);
+    let strategies: BTreeSet<_> = config
+        .placement_bindings
+        .iter()
+        .map(|binding| binding.strategy_id)
+        .collect();
+    assert_eq!(
+        strategies,
+        BTreeSet::from([first.strategy_id, second.strategy_id])
+    );
+    assert_eq!(config.binding_directory().conflicted(), 1);
 }
