@@ -11,6 +11,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::replication::queue::complete_put;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
@@ -1052,13 +1053,10 @@ pub(crate) async fn write_text(
         .and_then(|result| result.transpose())
         .map_err(map_put_error)?
         .ok_or_else(|| internal_error("object write did not finish"))?;
-    crate::s3::s3_service::ArunaS3Service::new(
-        server.state.get_ctx(),
+    complete_put(
+        &server.state.get_ctx(),
         server.state.get_realm_id(),
         server.state.get_node_id(),
-    )
-    .await
-    .complete_put(
         auth.clone(),
         bucket_info.group_id,
         input.bucket.clone(),

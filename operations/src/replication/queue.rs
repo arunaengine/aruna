@@ -12,8 +12,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, ReferenceHandling, SyncMode, SyncRelationship, SyncState, WatchEvent,
-    WatchEventDetail, WatchEventKind, data_watch_resource_path, sync_relationship_key,
+    ArunaArn, AuthContext, RealmId, ReferenceHandling, SyncMode, SyncRelationship, SyncState,
+    WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path, sync_relationship_key,
     sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -813,6 +813,68 @@ impl Operation for QueueLiveVersionReplicationOperation {
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_put(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    auth: AuthContext,
+    group_id: GroupId,
+    bucket: String,
+    key: String,
+    version_id: Ulid,
+    size_bytes: u64,
+) {
+    let actor = auth.user_id;
+    match drive(
+        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            local_node_id: node_id,
+            auth_context: auth,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            delete_marker: false,
+        }),
+        context,
+    )
+    .await
+    {
+        Ok(result) => {
+            if result.queued > 0 && !result.scheduled {
+                warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker = false,
+                "Failed to queue live replication after committed write; durable obligation remains for repair"
+            );
+        }
+    }
+
+    let path = data_watch_resource_path(group_id, node_id, &bucket, &key);
+    let event = WatchEvent {
+        event_id: Ulid::generate(),
+        realm_id,
+        kind: WatchEventKind::DataUploaded,
+        path,
+        actor,
+        occurred_at_ms: unix_timestamp_millis(),
+        detail: WatchEventDetail::DataUploaded {
+            group_id,
+            node_id,
+            bucket,
+            key,
+            size_bytes,
+        },
+    };
+    emit_resource_watch_event(context, event).await;
 }
 
 /// Identifies the object version a replication job is being derived for.
