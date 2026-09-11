@@ -11,7 +11,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
-use super::fixture::{Family, REALM, secret, user};
+use super::fixtures::{Family, REALM, secret, user};
 use crate::driver::DriverContext;
 use crate::jobs::records::transport::{serve_job_record, serve_launch_offer};
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -102,7 +102,7 @@ async fn separates_peer_authority() {
             .expect("bounded record");
     let relayed = serve_job_record(
         &context,
-        super::fixture::node(2),
+        super::fixtures::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(forged),
@@ -118,7 +118,7 @@ async fn separates_peer_authority() {
 
     let accepted = serve_job_record(
         &context,
-        super::fixture::node(2),
+        super::fixtures::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(record),
@@ -152,7 +152,7 @@ async fn refuses_unknown_offer() {
         }
     );
     assert_eq!(
-        serve_launch_offer(&context, super::fixture::node(2), offer).await,
+        serve_launch_offer(&context, super::fixtures::node(2), offer).await,
         MetadataTransportMessage::ForwardedLaunchOffer {
             result: Err(LaunchDecline::Unauthorized),
         }
@@ -170,7 +170,7 @@ async fn refuses_page_mismatch() {
     };
     let response = serve_job_record(
         &context,
-        super::fixture::node(2),
+        super::fixtures::node(2),
         MetadataTransportMessage::ForwardJobRecordPage {
             placement,
             submission_id: family.submission_id,

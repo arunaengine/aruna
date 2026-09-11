@@ -20,7 +20,7 @@ use crate::jobs::lifecycle::admit::{
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::records::tests::fixture::{Family, REALM, context, node, payload, secret, user};
+use crate::jobs::records::tests::fixtures::{Family, REALM, context, node, payload, secret, user};
 use crate::jobs::store::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::MetadataAuthToken;
