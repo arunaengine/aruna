@@ -180,3 +180,130 @@ pub(super) async fn resolve_preflight_targets(
         }
     }
 }
+
+pub(super) async fn resolve_current_preflight_versions(
+    context: &DriverContext,
+    bucket: &str,
+    prefix: Option<&str>,
+) -> Result<Vec<(VersionKey, BlobVersion)>, MetadataApiError> {
+    let prefix_key = match prefix {
+        Some(prefix) => BlobHeadKey::object_prefix(bucket, prefix),
+        None => BlobHeadKey::bucket_prefix(bucket),
+    }
+    .map_err(|_| MetadataApiError::BadRequest)?;
+    let heads = scan_preflight_rows(context, BLOB_HEAD_KEYSPACE, prefix_key.into()).await?;
+    if heads.len() > METADATA_PREFLIGHT_MAX_TARGET_VERSIONS {
+        return Err(MetadataApiError::BadRequest);
+    }
+    let mut versions = Vec::with_capacity(heads.len());
+    for (key, value) in heads {
+        let head = BlobHeadKey::from_bytes(key.as_ref())
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        let pointer = CurrentVersionPointer::from_bytes(value.as_ref())
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        let version_key = VersionKey::new(head.bucket, head.key, pointer.version_id);
+        let Some(value) = read_preflight_row(
+            context,
+            BLOB_VERSIONS_KEYSPACE,
+            version_key
+                .to_bytes()
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+                .into(),
+        )
+        .await?
+        else {
+            return Err(MetadataApiError::ServiceUnavailable);
+        };
+        let version = BlobVersion::from_bytes(value.as_ref())
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        versions.push((version_key, version));
+    }
+    Ok(versions)
+}
+
+pub(super) async fn resolve_all_preflight_versions(
+    context: &DriverContext,
+    bucket: &str,
+    key_prefix: Option<&str>,
+) -> Result<Vec<(VersionKey, BlobVersion)>, MetadataApiError> {
+    let prefix = VersionKey::bucket_prefix(bucket)
+        .map_err(|_| MetadataApiError::BadRequest)?
+        .into();
+    let rows = scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, prefix).await?;
+    let mut versions = Vec::new();
+    for (key, value) in rows {
+        let version_key = VersionKey::from_bytes(key.as_ref())
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        if key_prefix.is_some_and(|prefix| !version_key.key.starts_with(prefix)) {
+            continue;
+        }
+        if versions.len() >= METADATA_PREFLIGHT_MAX_TARGET_VERSIONS {
+            return Err(MetadataApiError::BadRequest);
+        }
+        let version = BlobVersion::from_bytes(value.as_ref())
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        versions.push((version_key, version));
+    }
+    Ok(versions)
+}
+
+pub(super) async fn scan_preflight_rows(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: Key,
+) -> Result<Vec<(Key, Value)>, MetadataApiError> {
+    let mut start_after = None;
+    let mut rows = Vec::new();
+    loop {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: Some(prefix.clone()),
+                start: start_after.take().map(IterStart::After),
+                limit: METADATA_PREFLIGHT_SCAN_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await;
+        match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                if rows.len().saturating_add(values.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+                    return Err(MetadataApiError::BadRequest);
+                }
+                rows.extend(values);
+                match next_start_after {
+                    Some(next) => start_after = Some(next),
+                    None => break,
+                }
+            }
+            Event::Storage(StorageEvent::Error { .. }) => {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            _ => return Err(MetadataApiError::ServiceUnavailable),
+        }
+    }
+    Ok(rows)
+}
+
+pub(super) async fn read_preflight_row(
+    context: &DriverContext,
+    key_space: &str,
+    key: Key,
+) -> Result<Option<Value>, MetadataApiError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { .. }) => Err(MetadataApiError::ServiceUnavailable),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
