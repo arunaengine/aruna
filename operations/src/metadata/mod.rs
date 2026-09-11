@@ -28,7 +28,7 @@ mod search_enrichment;
 pub mod stats;
 mod summary_cache;
 #[cfg(test)]
-mod test_support;
+mod tests;
 pub mod timestamp_index;
 pub mod update_metadata_document;
 pub mod visibility_index;

@@ -2465,7 +2465,7 @@ mod tests {
     use std::thread;
     use tempfile::tempdir;
 
-    use crate::metadata::test_support::{storage_key_exists, write_entries};
+    use crate::metadata::tests::fixtures::{storage_key_exists, write_entries};
 
     #[tokio::test]
     async fn delete_waits_fence() {
