@@ -5697,66 +5697,6 @@ async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataR
         );
     }
 }
-
-async fn search_allowed_graphs(
-    inner: &Arc<MetadataInner>,
-    authorizer: Arc<AllowedGraphAuthorizer>,
-    by_graph: HashMap<String, MetadataRegistryRecord>,
-    graph_ids: Vec<GraphId>,
-    query: &str,
-    limit: usize,
-    search_span: &Span,
-) -> Result<Vec<MetadataSearchHit>, MetadataError> {
-    let describe = allowed_hit_describe(inner, authorizer.clone());
-    let hits = {
-        let task_inner = inner.clone();
-        let task_query = query.to_string();
-        let blocking_span = search_span.clone();
-        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
-        tokio::task::spawn_blocking(move || {
-            blocking_span.in_scope(|| {
-                task_inner
-                    .node
-                    .search_graphs(
-                        authorizer.as_ref(),
-                        GraphSearchRequest {
-                            graphs: &graph_ids,
-                            query: &task_query,
-                            limit,
-                        },
-                    )
-                    .map_err(|error| MetadataError::Backend(error.to_string()))
-            })
-        })
-        .await
-        .map_err(|error| MetadataError::TaskJoin(error.to_string()))??
-    };
-    let hits = hits
-        .into_iter()
-        .filter(|hit| by_graph.contains_key(&hit.graph_id))
-        .take(limit)
-        .collect::<Vec<_>>();
-    let targets = hits
-        .iter()
-        .map(|hit| (hit.graph_id.clone(), hit.subject_iri.clone()))
-        .collect::<Vec<_>>();
-    let properties =
-        describe_hits_parallel(&inner.craqle_read_permits, targets, describe, search_span).await;
-    Ok(hits
-        .into_iter()
-        .zip(properties)
-        .filter_map(|(hit, properties)| {
-            let record = by_graph.get(&hit.graph_id)?;
-            Some(metadata_search_hit_from_craqle(
-                hit,
-                record,
-                &properties,
-                query,
-            ))
-        })
-        .collect())
-}
-
 /// Describes one hit's `(graph_iri, subject_iri)` against a fixed authorizer.
 type HitDescribe = Arc<dyn Fn(&str, &str) -> Vec<(String, Term)> + Send + Sync>;
 
