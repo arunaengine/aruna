@@ -30,25 +30,6 @@ struct OutboxBarrier {
 }
 
 #[cfg(debug_assertions)]
-impl OutboxBarrier {
-    fn new() -> Option<Self> {
-        let marker = std::env::var("ARUNA_TEST_OUTBOX_BARRIER")
-            .ok()
-            .map(std::path::PathBuf::from)?;
-        let barrier = Self { marker };
-        if let Err(error) = std::fs::write(&barrier.marker, b"active") {
-            warn!(error = %error, "Failed to arm outbox test barrier");
-            return None;
-        }
-        Some(barrier)
-    }
-
-    async fn wait_start(&self) {
-        std::future::pending::<()>().await;
-    }
-}
-
-#[cfg(debug_assertions)]
 impl Drop for OutboxBarrier {
     fn drop(&mut self) {
         info!(event = "test.outbox.joined", "Outbox drain joined");
@@ -150,6 +131,7 @@ use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
 
+mod outbox;
 mod restore;
 
 pub use restore::{initialize_task_holder, initialize_task_incoming};
@@ -262,35 +244,6 @@ struct OutboxRotation {
     continuations: u32,
 }
 
-impl OutboxRotation {
-    fn admits(&self, key: &[u8]) -> bool {
-        if !self.stream_boundaries.is_empty() {
-            return self
-                .stream_boundaries
-                .iter()
-                .find(|(prefix, _)| key.starts_with(prefix))
-                .is_some_and(|(_, boundary)| key <= boundary.as_slice());
-        }
-        self.boundary
-            .as_deref()
-            .is_none_or(|boundary| key <= boundary)
-    }
-
-    fn at_end(&self, cursor: Option<&[u8]>) -> bool {
-        cursor.is_some_and(|cursor| {
-            self.boundary
-                .as_deref()
-                .is_some_and(|boundary| cursor >= boundary)
-        })
-    }
-
-    fn close(&mut self) -> RotationTotals {
-        let totals = self.totals;
-        *self = Self::default();
-        totals
-    }
-}
-
 struct DrainSubBatch {
     peers: Vec<aruna_core::NodeId>,
     documents: Vec<DocumentSyncPublish>,
@@ -300,38 +253,6 @@ struct DrainSubBatch {
     origins: Vec<Option<aruna_core::NodeId>>,
     targets: Vec<DocumentSyncTarget>,
     record_keys: Vec<Vec<u8>>,
-}
-
-impl DrainSubBatch {
-    fn sync_subset(&self, indices: &[usize]) -> Option<Self> {
-        let mut topics = Vec::with_capacity(indices.len());
-        let mut origins = Vec::with_capacity(indices.len());
-        let mut targets = Vec::with_capacity(indices.len());
-        let mut record_keys = Vec::with_capacity(indices.len());
-        for &index in indices {
-            topics.push(*self.topics.get(index)?);
-            origins.push(*self.origins.get(index)?);
-            targets.push(self.targets.get(index)?.clone());
-            record_keys.push(self.record_keys.get(index)?.clone());
-        }
-        Some(Self {
-            peers: self.peers.clone(),
-            documents: Vec::new(),
-            topics,
-            origins,
-            targets,
-            record_keys,
-        })
-    }
-
-    /// Ordering domains blocked together when a publish or sync leaves records
-    /// behind.
-    fn ordering_domains(&self) -> (Vec<irokle::TopicId>, Vec<aruna_core::NodeId>) {
-        (
-            self.topics.clone(),
-            self.origins.iter().flatten().copied().collect(),
-        )
-    }
 }
 
 #[derive(Default)]
@@ -344,91 +265,6 @@ struct DrainSyncOutcome {
     /// Ordering domains to block for the rest of the rotation.
     blocked_topics: Vec<irokle::TopicId>,
     blocked_origins: Vec<aruna_core::NodeId>,
-}
-
-/// Resolves the shard placement a drained record publishes under: a real ref is
-/// kept, a NIL ref (from admin-operation emitters) is resolved from the realm
-/// config. Shared realm targets ignore placement, so resolving is harmless.
-fn resolve_publish_placement(
-    config: Option<&aruna_core::structs::RealmConfigDocument>,
-    target: &DocumentSyncTarget,
-    current: aruna_core::structs::PlacementRef,
-) -> aruna_core::structs::PlacementRef {
-    if current != aruna_core::structs::PlacementRef::NIL {
-        return current;
-    }
-    match config {
-        Some(config) => {
-            crate::placement::placement_ref_for_target(config, target, Default::default())
-        }
-        None => aruna_core::structs::PlacementRef::NIL,
-    }
-}
-
-async fn load_realm_config_for_drain(
-    context: &Arc<DriverContext>,
-    realm_id: aruna_core::structs::RealmId,
-) -> Option<aruna_core::structs::RealmConfigDocument> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
-    match context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
-        _ => None,
-    }
-}
-
-fn document_publish_from_outbox(
-    event_id: ulid::Ulid,
-    target: DocumentSyncTarget,
-    event: DocumentSyncOutboxEvent,
-    placement: aruna_core::structs::PlacementRef,
-    allow_genesis: bool,
-) -> DocumentSyncPublish {
-    match event {
-        DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
-            event_id,
-            target,
-            bytes,
-            change,
-            allow_genesis,
-        },
-        DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
-            event_id,
-            target,
-            change,
-            allow_genesis,
-        },
-        DocumentSyncOutboxEvent::AdminOperation {
-            event,
-            origin_signature,
-        } => DocumentSyncPublish::AdminOperation {
-            target,
-            event,
-            placement,
-            allow_genesis,
-            origin_signature,
-        },
-    }
-}
-
-impl DrainSyncOutcome {
-    fn merge(&mut self, other: DrainSyncOutcome) {
-        self.sync_elapsed += other.sync_elapsed;
-        self.project_elapsed += other.project_elapsed;
-        self.delete_elapsed += other.delete_elapsed;
-        self.retry_needed |= other.retry_needed;
-        self.deleted += other.deleted;
-        self.blocked_topics.extend(other.blocked_topics);
-        self.blocked_origins.extend(other.blocked_origins);
-    }
 }
 
 /// Per-invocation defer state. The block sets are seeded from the open rotation;
@@ -468,39 +304,6 @@ struct DrainInvocation {
     oldest_record_ms: Option<u64>,
     read_failed: bool,
     config_drained: bool,
-}
-
-impl DrainInvocation {
-    fn new(rotation: &OutboxRotation) -> Self {
-        Self {
-            outcome: DrainSyncOutcome::default(),
-            defer: DrainDeferState {
-                deferred_topics: rotation.blocked_topics.clone(),
-                blocked_origins: rotation.blocked_origins.clone(),
-                undeliverable_topics: rotation.undeliverable_topics.clone(),
-                ..DrainDeferState::default()
-            },
-            cursor: rotation.cursor.clone(),
-            reached_end: false,
-            scan_elapsed: Duration::ZERO,
-            publish_elapsed: Duration::ZERO,
-            records: 0,
-            deferred: 0,
-            stuck: 0,
-            oldest_stuck: None,
-            undeliverable: 0,
-            groups: 0,
-            subbatches: 0,
-            pages: 0,
-            oldest_record_ms: None,
-            read_failed: false,
-            config_drained: false,
-        }
-    }
-
-    fn has_unvisited(&self) -> bool {
-        !self.reached_end && !self.read_failed
-    }
 }
 
 enum DrainPage {
@@ -2005,6 +1808,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::outbox::document_publish_from_outbox;
     use super::restore::drain_delay;
     use super::*;
     use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, read_job_record};
