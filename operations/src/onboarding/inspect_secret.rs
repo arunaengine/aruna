@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::create_onboarding_secret::secret_record_key;
+use crate::onboarding::create_secret::secret_record_key;
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,10 +210,10 @@ mod tests {
         InspectOnboardingSecretOperation,
     };
     use crate::driver::{DriverContext, drive};
-    use crate::onboarding::create_onboarding_secret::{
+    use crate::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use crate::onboarding::reserve_onboarding_secret::{
+    use crate::onboarding::reserve_secret::{
         ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};

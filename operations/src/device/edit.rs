@@ -23,7 +23,7 @@ use crate::device::intake::{IntakeEntry, IntakeKind, IntakeState};
 use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
 use crate::device::sync_status::read_intake_entries;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
+use crate::metadata::update_document::UpdateMetadataDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DeviceEditError {
@@ -443,7 +443,7 @@ mod tests {
                 owner,
                 node(1),
                 &replica,
-                crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
+                crate::metadata::update_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
                     jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
                 },
             )

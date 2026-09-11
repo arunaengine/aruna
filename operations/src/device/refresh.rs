@@ -20,10 +20,10 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
-use crate::metadata::create_metadata_document::resolve_metadata_id;
+use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
 use crate::placement::read_holder_sets;
-use crate::realm::mutate_realm_placement::node_kind;
+use crate::realm::mutate_placement::node_kind;
 
 use super::replica::{ReplicaRecord, ReplicaState, list_replicas, read_replica, store_replica};
 

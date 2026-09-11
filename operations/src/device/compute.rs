@@ -15,7 +15,7 @@ use crate::jobs::service::{list_owned_jobs, submit_execution_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::api::load_realm_config;
 use crate::node::node_info::read_operator_drain;
-use crate::realm::mutate_realm_placement::node_kind;
+use crate::realm::mutate_placement::node_kind;
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Unfinished runs one status scan counts before it stops. A device queues its

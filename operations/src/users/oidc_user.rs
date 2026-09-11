@@ -1,4 +1,3 @@
-use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -11,6 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, document_sync_revision_write_entry,
 };
@@ -26,10 +26,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::users::user_subject_index::rewrite_subject_index_effects;
+use crate::users::subject_index::rewrite_subject_index_effects;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserInput {
     pub actor: Actor,
@@ -552,7 +552,6 @@ mod tests {
     use super::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation, RegisterOrGetOidcUserState,
     };
-    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
@@ -561,6 +560,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::storage_entries::{
         admin_document_reducer_state_key, document_sync_revision_key,
     };
