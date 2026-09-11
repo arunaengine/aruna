@@ -2890,37 +2890,6 @@ impl AdminDocumentReducerState {
 }
 
 
-pub fn user_attribute_path(key: &str) -> String {
-    format!("user.attributes.{key}")
-}
-
-pub fn user_subject_id_path(subject_id: &str) -> String {
-    format!("user.subject_ids.{subject_id}")
-}
-
-pub fn group_role_path(role_id: &RoleId) -> String {
-    format!("group.roles.{role_id}")
-}
-
-pub fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
-    format!("group.roles.{role_id}.assigned_users.{user_id}")
-}
-
-pub fn realm_role_path(role_id: &RoleId) -> String {
-    format!("realm.roles.{role_id}")
-}
-
-pub fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
-    format!("realm.roles.{role_id}.assigned_users.{user_id}")
-}
-
-pub fn realm_config_node_path(node_id: &NodeId) -> String {
-    format!("realm_config.nodes.{node_id}")
-}
-
-pub fn realm_config_oidc_provider_path(provider_id: &str) -> String {
-    format!("realm_config.oidc_providers.{provider_id}")
-}
 
 pub fn realm_config_placement_node_path(node_id: &NodeId) -> String {
     format!("realm_config.placement.nodes.{node_id}")
@@ -3016,95 +2985,6 @@ pub fn revoked_token_entry(path: &str) -> Option<(&str, u64, UserId)> {
     (parts.next().is_none() && valid_token_hash(hash)).then_some((hash, expires_at, token_owner))
 }
 
-pub fn binding_scope_key(scope: &BindingScope) -> String {
-    match scope {
-        BindingScope::Realm => "realm".to_string(),
-        BindingScope::Group(group_id) => format!("group:{group_id}"),
-        BindingScope::Class(class) => match class {
-            DocumentClass::Admin => "class:admin",
-            DocumentClass::Group => "class:group",
-            DocumentClass::User => "class:user",
-            DocumentClass::Metadata => "class:metadata",
-            DocumentClass::MetadataRegistry => "class:metadata_registry",
-            DocumentClass::JobControl => "class:job_control",
-            DocumentClass::PlacementPolicy => "class:placement_policy",
-        }
-        .to_string(),
-        BindingScope::MetadataPathPrefix(prefix) => format!(
-            "metadata_path_prefix:{}",
-            MetadataRegistryRecord::normalize_document_path(prefix)
-        ),
-    }
-}
-
-fn normalized_binding_scope(scope: &BindingScope) -> BindingScope {
-    match scope {
-        BindingScope::MetadataPathPrefix(prefix) => BindingScope::MetadataPathPrefix(
-            MetadataRegistryRecord::normalize_document_path(prefix),
-        ),
-        BindingScope::Realm => BindingScope::Realm,
-        BindingScope::Group(group_id) => BindingScope::Group(*group_id),
-        BindingScope::Class(class) => BindingScope::Class(*class),
-    }
-}
-
-fn normalized_strategy_binding(binding: &StrategyBinding) -> StrategyBinding {
-    StrategyBinding {
-        scope: normalized_binding_scope(&binding.scope),
-        strategy_id: binding.strategy_id,
-    }
-}
-
-fn metadata_replication_value(metadata_replication: &MetadataReplicationConfig) -> String {
-    serde_json::to_string(metadata_replication)
-        .expect("admin document metadata replication config serializes")
-}
-
-fn realm_discovery_value(discovery: &RealmDiscoveryConfig) -> String {
-    serde_json::to_string(discovery).expect("admin document realm discovery config serializes")
-}
-
-fn policies_value(policies: &[crate::request_policy::RequestPolicy]) -> String {
-    serde_json::to_string(policies).expect("admin document policies serialize")
-}
-
-fn policies_from_value(value: &str) -> Option<Vec<crate::request_policy::RequestPolicy>> {
-    serde_json::from_str(value).ok()
-}
-
-fn quota_value(quota: &QuotaConfig) -> String {
-    serde_json::to_string(&supported_quota(quota)).expect("admin document quota config serializes")
-}
-
-fn supported_quota(quota: &QuotaConfig) -> QuotaConfig {
-    let mut quota = quota.clone();
-    quota.group_overrides.sort_by_key(|over| over.group_id);
-    quota
-        .user_group_cap_overrides
-        .sort_by_key(|over| over.user_id);
-    quota
-}
-
-fn placement_entry_value(entry: &NodePlacementEntry) -> String {
-    serde_json::to_string(entry).expect("admin document placement entry serializes")
-}
-
-fn placement_strategy_value(strategy: &PlacementStrategy) -> String {
-    serde_json::to_string(strategy).expect("admin document placement strategy serializes")
-}
-
-fn strategy_binding_value(binding: &StrategyBinding) -> String {
-    serde_json::to_string(&normalized_strategy_binding(binding))
-        .expect("admin document strategy binding serializes")
-}
-
-fn placement_override_value(record: &PlacementOverride) -> String {
-    serde_json::to_string(record).expect("admin document placement override serializes")
-}
-
-fn placement_binding_value(binding: &PlacementBinding) -> String {
-    serde_json::to_string(binding).expect("admin document placement binding serializes")
-}
 
 fn candidate_map_value(map: &CandidatePlacementMap) -> String {
     serde_json::to_string(map).expect("admin document candidate map serializes")
