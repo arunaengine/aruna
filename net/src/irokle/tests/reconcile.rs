@@ -1189,3 +1189,124 @@ async fn unknown_report_quarantined() {
 
     service.shutdown().await;
 }
+
+#[tokio::test]
+async fn plan_and_report_coalesce() {
+    // Plan and report share one coalesced run, so the report is unknown on
+    // the first pass and must be accepted by the post-flush retry.
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([75; 32]);
+    let service = DocumentSyncService::open_with_persist_policy(
+        test_endpoint(75).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        irokle_crate::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_actor = test_actor(75, UserId::nil(realm_id), realm_id);
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
+    config.ensure_node(node(76), RealmNodeKind::Management);
+    storage_batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            target.clone(),
+            config
+                .to_bytes(&local_actor)
+                .expect("realm config serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("realm config writes");
+
+    let transition_id = Ulid::from_parts(1_750, 1);
+    let plan = aruna_core::structs::TransitionPlan {
+        transition_id,
+        strategy_id: Ulid::from_parts(1_751, 1),
+        buckets: vec![aruna_core::structs::BucketPlan {
+            bucket: 0,
+            old_holders: vec![local_actor.node_id],
+            target_holders: vec![node(76)],
+            predecessor_epoch: 1,
+        }],
+        target_map_epoch: 2,
+        limits: Default::default(),
+        created_by: local_actor.node_id,
+        created_at_ms: 1,
+    };
+    let started = test_admin_event(
+        Ulid::from_parts(1_752, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &local_actor,
+        1,
+        AdminDocumentOperation::RealmConfigTransitionStarted { plan },
+    );
+    let mut barrier = test_admin_event(
+        Ulid::from_parts(1_753, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &local_actor,
+        2,
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            transition_id,
+            bucket: 0,
+            reported_by: local_actor.node_id,
+            frontier: vec![7],
+        },
+    );
+    barrier.observed.advance(local_actor.node_id, 1);
+
+    assert!(matches!(
+        service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(started),
+                        placement: PlacementRef::NIL,
+                        allow_genesis: true,
+                        origin_signature: None,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(barrier),
+                        placement: PlacementRef::NIL,
+                        allow_genesis: true,
+                        origin_signature: None,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await,
+        DocumentSyncNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(&service, topic_id).await;
+
+    service
+        .reconcile_document_topics([topic_id])
+        .await
+        .expect("a plan and its report reconcile in one batch");
+
+    let stored = read_realm_config_doc(&storage, realm_id).await;
+    let transition = stored
+        .transition(&transition_id)
+        .expect("the plan materialized");
+    assert!(
+        transition
+            .barriers
+            .iter()
+            .any(|reported| reported.reported_by == local_actor.node_id),
+        "the participant's barrier must survive the same-batch retry"
+    );
+    assert!(quarantine_rows(&storage).await.is_empty());
+
+    service.shutdown().await;
+}
