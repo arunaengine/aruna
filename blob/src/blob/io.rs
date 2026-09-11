@@ -1146,7 +1146,7 @@ impl BlobHandler {
         let expected_size = location.blob_size;
         let idle_timeout = self.transfer_idle_timeout();
         let blob = BackendStream::new(stream::try_unfold(
-            (BackendStream::new(reader), Hasher::new(), 0u64),
+            (BackendStream::new(reader), blake3::Hasher::new(), 0u64),
             move |(mut stream, mut hasher, bytes_read)| async move {
                 match next_chunk(&mut stream, idle_timeout).await? {
                     Some(Ok(bytes)) => {
@@ -1163,7 +1163,7 @@ impl BlobHandler {
                             )));
                         }
 
-                        if hasher.finalize().blake3.as_bytes() != &expected_blake3 {
+                        if hasher.finalize().as_bytes() != &expected_blake3 {
                             return Err(BlobError::IntegrityCheckFailed(
                                 "blake3 hash mismatch".to_string(),
                             ));
