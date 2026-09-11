@@ -1,6 +1,3 @@
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH,
-};
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -8,6 +5,9 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::reducer::{
+    AdminDocumentReducerError, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH,
+};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -24,7 +24,7 @@ use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 
@@ -204,10 +204,8 @@ impl UpdateGroupOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -506,7 +504,6 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentReducerS
 #[cfg(test)]
 mod tests {
     use super::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
-    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{
         DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
@@ -518,6 +515,7 @@ mod tests {
         REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{Actor, AuthContext, Group, RealmId};
     use aruna_core::task::{TaskEvent, TaskKey};

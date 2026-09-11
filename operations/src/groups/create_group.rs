@@ -1,7 +1,6 @@
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
     AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
@@ -13,6 +12,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_write_entry,
 };
@@ -676,7 +676,6 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{
         AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
@@ -689,6 +688,7 @@ mod test {
         ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::{Key, KeySpace, TxnId, Value};
