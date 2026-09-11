@@ -41,8 +41,6 @@ pub mod storage_routing;
 pub mod sync;
 pub mod sync_quarantine;
 pub mod tes;
-#[cfg(test)]
-mod test_support;
 pub mod tokens;
 pub mod users;
 
@@ -137,6 +135,8 @@ fn routes_at(
 
 #[cfg(test)]
 mod tests {
+    pub(crate) mod fixtures;
+
     use super::rest_openapi;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};

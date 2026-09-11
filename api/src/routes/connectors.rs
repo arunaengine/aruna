@@ -1191,7 +1191,7 @@ fn map_list_error(error: ListStagingSourceError) -> ServerError {
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
-    use crate::routes::test_support::{
+    use crate::routes::tests::fixtures::{
         seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
     };
     use aruna_core::UserId;
