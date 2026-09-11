@@ -275,7 +275,7 @@ fn env_key(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
-    use crate::test_support::{TestEnvGuard, env_lock};
+    use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
     use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server_state::ServerState;

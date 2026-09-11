@@ -512,7 +512,7 @@ mod tests {
         load_oidc_providers_from_env, oidc_password_grant_body, request_oidc_token,
         token_view_from_token,
     };
-    use crate::test_support::{TestEnvGuard, env_lock};
+    use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::bootstrap::ensure_initial_local_onboarding_secret;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListOnboardingSecretsResponse;
