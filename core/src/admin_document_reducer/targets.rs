@@ -255,3 +255,53 @@ impl AdminDocumentReducerState {
             .and_then(quota_from_value)
     }
 }
+
+impl AdminDocumentReducerState {
+    pub(super) fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
+        self.user_name = self.reduce_value(
+            event,
+            USER_NAME_PATH,
+            self.user_name.clone(),
+            Some(name.to_string()),
+        );
+    }
+
+    pub(super) fn apply_user_subject_id(
+        &mut self,
+        event: &AdminDocumentEvent,
+        subject_id: &str,
+        value: Option<String>,
+    ) {
+        let path = user_subject_id_path(subject_id);
+        let current = self.user_subject_ids.get(subject_id).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids
+                    .insert(subject_id.to_string(), version);
+            }
+            None => {
+                self.user_subject_ids.remove(subject_id);
+            }
+        }
+    }
+
+    pub(super) fn apply_user_attribute(
+        &mut self,
+        event: &AdminDocumentEvent,
+        key: &str,
+        value: Option<String>,
+    ) {
+        let path = user_attribute_path(key);
+        let current = self.user_attributes.get(key).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_attributes.insert(key.to_string(), version);
+            }
+            None => {
+                self.user_attributes.remove(key);
+            }
+        }
+    }
+}
