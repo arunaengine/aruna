@@ -1,5 +1,5 @@
-use super::harness::*;
 use super::super::*;
+use super::harness::*;
 use super::*;
 
 #[tokio::test]
