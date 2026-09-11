@@ -1731,10 +1731,30 @@ fn repeated_wait(reason: &str) -> bool {
     )
 }
 
+/// A registry that refuses the reference outright (unknown name, no access)
+/// answers the same on every retry, so waiting out the deadline gains nothing.
+fn pull_refused(reason: &str, message: Option<&str>) -> bool {
+    if !matches!(reason, "ErrImagePull" | "ImagePullBackOff") {
+        return false;
+    }
+    let message = message.unwrap_or_default().to_ascii_lowercase();
+    [
+        "401 unauthorized",
+        "403 forbidden",
+        "404 not found",
+        "manifest unknown",
+        "name unknown",
+        "pull access denied",
+        "repository does not exist",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 /// Kubernetes retries a failing image pull forever, so the Job counts such a
-/// Pod as active and never reports a terminal condition. A malformed reference
-/// fails at once; a repeated failure fails once it outlives `deadline`, which
-/// is anchored at the Pod start and so also covers scheduling.
+/// Pod as active and never reports a terminal condition. A malformed or refused
+/// reference fails at once; a repeated failure fails once it outlives
+/// `deadline`, which is anchored at the Pod start and so also covers scheduling.
 fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<String> {
     let status = pod.status.as_ref()?;
     let waited = status
@@ -1751,7 +1771,10 @@ fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<Str
         .find_map(|container| {
             let waiting = container.state.as_ref()?.waiting.as_ref()?;
             let reason = waiting.reason.as_deref()?;
-            if reason != "InvalidImageName" && !(repeated_wait(reason) && waited > deadline) {
+            if reason != "InvalidImageName"
+                && !pull_refused(reason, waiting.message.as_deref())
+                && !(repeated_wait(reason) && waited > deadline)
+            {
                 return None;
             }
             let detail = waiting.message.as_deref().unwrap_or("no detail reported");
@@ -2932,6 +2955,24 @@ mod tests {
         let reason = pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1))
             .expect("reject invalid image");
         assert!(reason.contains("InvalidImageName"), "{reason}");
+    }
+
+    #[test]
+    fn fails_refused_pull() {
+        // A registry refusal is final, so a single try already ends the attempt.
+        let pod = task_pod(
+            json!({"waiting":{"reason":"ErrImagePull","message":
+                "failed to authorize: unexpected status from GET request: 403 Forbidden"}}),
+            POD_START,
+        );
+        let reason = pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1))
+            .expect("reject refused pull");
+        assert!(reason.contains("403 Forbidden"), "{reason}");
+        let pod = task_pod(
+            json!({"waiting":{"reason":"ErrImagePull","message":"rpc error: manifest unknown"}}),
+            POD_START,
+        );
+        assert!(pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1)).is_some());
     }
 
     #[test]
