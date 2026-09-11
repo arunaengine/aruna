@@ -5,7 +5,7 @@
 mod connection_pool;
 pub mod device_limits;
 pub mod dht;
-#[path = "irokle.rs"]
+#[path = "irokle/mod.rs"]
 pub mod document_sync;
 mod effect_handlers;
 pub mod error;
