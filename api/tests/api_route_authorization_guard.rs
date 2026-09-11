@@ -20,9 +20,94 @@ const BOUNDARY: &[&str] = &[
 /// is still authorized. A new route must gain a check or a reviewed entry here.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
+        "assistant/mod.rs",
+        "create_provider",
+        "self-scoped: the provider is created with the caller's user id and stored under the caller's owner key",
+    ),
+    (
+        "assistant/mod.rs",
+        "delete_chat",
+        "self-scoped: DeleteChatOperation keys the chat head by the caller's user id",
+    ),
+    (
+        "assistant/mod.rs",
+        "delete_provider",
+        "self-scoped: DeleteProviderOperation refuses a provider owned by another user",
+    ),
+    (
+        "assistant/mod.rs",
+        "get_models",
+        "self-scoped: load_provider requires the provider to belong to the caller",
+    ),
+    (
+        "assistant/mod.rs",
+        "get_turns",
+        "self-scoped: ReadChatTurnsOperation reads the chat head by the caller's user id",
+    ),
+    (
+        "assistant/mod.rs",
+        "list_chats",
+        "self-scoped: ListChatHeadsOperation iterates only the caller's own chat heads",
+    ),
+    (
+        "assistant/mod.rs",
+        "list_providers",
+        "self-scoped: ListProviderOperation lists providers under the caller's owner key",
+    ),
+    (
+        "assistant/mod.rs",
+        "patch_provider",
+        "self-scoped: load_provider and UpdateProviderOperation both require the caller's user id",
+    ),
+    (
+        "assistant/mod.rs",
+        "poll_login",
+        "self-scoped: load_provider requires the ChatGPT provider to belong to the caller",
+    ),
+    (
+        "assistant/mod.rs",
+        "proxy_get",
+        "self-scoped: load_provider requires the provider to belong to the caller",
+    ),
+    (
+        "assistant/mod.rs",
+        "proxy_post",
+        "self-scoped: load_provider requires the provider to belong to the caller",
+    ),
+    (
+        "assistant/mod.rs",
+        "put_chat",
+        "self-scoped: WriteChatHeadOperation reads and writes under the caller's user id",
+    ),
+    (
+        "assistant/mod.rs",
+        "put_turn",
+        "self-scoped: WriteChatTurnOperation keys the turn and head by the caller's user id",
+    ),
+    (
+        "assistant/mod.rs",
+        "start_login",
+        "self-scoped: the pending ChatGPT provider is created for the caller's user id",
+    ),
+    (
+        "assistant/mod.rs",
+        "test_provider",
+        "self-scoped: load_provider requires the provider to belong to the caller",
+    ),
+    (
         "credentials.rs",
         "list_s3_credentials",
         "self-scoped: only credentials whose identity is the caller",
+    ),
+    (
+        "credentials/sessions.rs",
+        "list_s3_sessions",
+        "self-scoped: ListS3SessionsOperation filters to the caller's user identity",
+    ),
+    (
+        "credentials/sessions.rs",
+        "revoke_s3_session",
+        "self-scoped: RevokeS3SessionOperation refuses a session of another user",
     ),
     (
         "drs.rs",
@@ -429,17 +514,17 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "unrestricted realm directory read with policy checks; only user-selected public fields match",
     ),
     (
-        "vault.rs",
+        "users/vault.rs",
         "delete_vault",
         "self-scoped: deletes only the caller's own vault record",
     ),
     (
-        "vault.rs",
+        "users/vault.rs",
         "get_vault",
         "self-scoped: reads only the caller's own vault record",
     ),
     (
-        "vault.rs",
+        "users/vault.rs",
         "put_vault",
         "self-scoped: writes only the caller's own vault record",
     ),
@@ -501,8 +586,8 @@ fn scan_routes(modules: &BTreeMap<String, Module>) -> BTreeSet<Handler> {
     for (name, module) in modules {
         for handler in &module.handlers {
             assert!(
-                module.bodies.contains_key(handler),
-                "routed handler {handler} has no body in {name}"
+                has_body(modules, name, handler, &mut BTreeSet::new()),
+                "routed handler {handler} has no body or import in {name}"
             );
             if !is_guarded(modules, name, handler, &mut BTreeSet::new()) {
                 unguarded.insert(Handler {
@@ -514,6 +599,27 @@ fn scan_routes(modules: &BTreeMap<String, Module>) -> BTreeSet<Handler> {
     }
 
     unguarded
+}
+
+/// Proves a routed handler has a definition, following the same resolved
+/// import chain `is_guarded` follows before it looks for the boundary.
+fn has_body(
+    modules: &BTreeMap<String, Module>,
+    module: &str,
+    name: &str,
+    seen: &mut BTreeSet<(String, String)>,
+) -> bool {
+    if !seen.insert((module.to_owned(), name.to_owned())) {
+        return false;
+    }
+    let Some(current) = modules.get(module) else {
+        return false;
+    };
+    current.bodies.contains_key(name)
+        || current
+            .imports
+            .get(name)
+            .is_some_and(|origin| has_body(modules, origin, name, seen))
 }
 
 /// A handler is guarded when its own body or any function it can reach inside
@@ -545,30 +651,44 @@ fn is_guarded(
 }
 
 fn load_modules(manifest_dir: &Path) -> BTreeMap<String, Module> {
+    let routes_dir = manifest_dir.join(ROUTES_DIR);
     let mut files = Vec::new();
-    collect_sources(&manifest_dir.join(ROUTES_DIR), &mut files);
+    collect_sources(&routes_dir, &mut files);
     files.sort();
+
+    let keys = files
+        .iter()
+        .filter_map(|path| module_key(&routes_dir, path))
+        .collect::<BTreeSet<_>>();
 
     files
         .iter()
         .filter_map(|path| {
-            let name = path.file_name()?.to_str()?.to_owned();
-            if name == "mod.rs" {
-                return None;
-            }
+            let key = module_key(&routes_dir, path)?;
             let source = fs::read_to_string(path)
                 .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
             let source = strip_tests(&mask_source(&source));
             Some((
-                name,
+                key.clone(),
                 Module {
                     bodies: fn_bodies(&source),
-                    imports: route_imports(&source),
+                    imports: route_imports(&source, &key, &keys),
                     handlers: router_handlers(&source),
                 },
             ))
         })
         .collect()
+}
+
+/// The module key is the source path relative to `src/routes`, so nested
+/// modules keep their directory and `mod.rs` is a module like any other.
+fn module_key(routes_dir: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(routes_dir).ok()?;
+    let parts = relative
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    Some(parts.join("/"))
 }
 
 fn collect_sources(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -694,38 +814,153 @@ fn fn_bodies(source: &str) -> BTreeMap<String, String> {
     bodies
 }
 
-/// Maps idents imported from a sibling route module back to that module, so a
-/// shared helper resolves across files.
-fn route_imports(source: &str) -> BTreeMap<String, String> {
+/// Maps idents imported from another route module back to that module, so a
+/// shared helper or a handler re-exported through `mod.rs` resolves across
+/// files. Absolute, `super::`, `self::` and sibling paths are resolved against
+/// the real module key set.
+fn route_imports(source: &str, module: &str, keys: &BTreeSet<String>) -> BTreeMap<String, String> {
     let mut imports = BTreeMap::new();
-    let prefix = "use crate::routes::";
 
-    for start in occurrences(source, prefix) {
-        let rest = &source[start + prefix.len()..];
-        let Some(end) = rest.find(|byte: char| !is_ident_byte(byte as u8)) else {
+    for start in occurrences(source, "use ") {
+        let rest = &source[start + 4..];
+        let Some(end) = rest.find(';') else {
             continue;
         };
-        let module = format!("{}.rs", &rest[..end]);
-        let Some(tail) = rest[end..].strip_prefix("::") else {
-            continue;
-        };
-        let group = match tail.strip_prefix('{') {
-            Some(group) => &group[..group.find('}').unwrap_or(group.len())],
+        let statement = rest[..end].trim();
+        let (head, group) = match statement.split_once('{') {
+            Some((head, tail)) => {
+                let Some(close) = tail.find('}') else {
+                    continue;
+                };
+                let group = &tail[..close];
+                if group.contains('{') {
+                    continue;
+                }
+                (head.trim().trim_end_matches("::").trim(), group.to_owned())
+            }
             None => {
-                &tail[..tail
-                    .find(|byte: char| !is_ident_byte(byte as u8))
-                    .unwrap_or(0)]
+                let Some((head, item)) = statement.rsplit_once("::") else {
+                    continue;
+                };
+                (head.trim(), item.trim().to_owned())
             }
         };
+        let Some(base) = import_base(head, module) else {
+            continue;
+        };
         for item in group.split(',') {
-            let item = item.rsplit("::").next().unwrap_or(item).trim();
-            if !item.is_empty() && item.bytes().all(is_ident_byte) {
-                imports.insert(item.to_owned(), module.clone());
+            let Some((parent, ident)) = import_item(item) else {
+                continue;
+            };
+            let path = join_path(&base, &[parent.as_str()]);
+            if let Some(origin) = resolve_module(keys, &path) {
+                imports.insert(ident, origin);
             }
         }
     }
 
     imports
+}
+
+/// Resolves an import head to a path relative to `src/routes`.
+fn import_base(path: &str, module: &str) -> Option<String> {
+    let mut segments = path.split("::").map(str::trim);
+    let first = segments.next()?;
+    let rest = segments.collect::<Vec<_>>();
+
+    match first {
+        "crate" => {
+            let (first, rest) = rest.split_first()?;
+            if *first != "routes" {
+                return None;
+            }
+            Some(rest.join("/"))
+        }
+        "super" => {
+            let mut base = parent_path(&module_path(module));
+            let mut rest = rest.as_slice();
+            while rest.first() == Some(&"super") {
+                base = parent_path(&base);
+                rest = &rest[1..];
+            }
+            Some(join_path(&base, rest))
+        }
+        "self" => Some(join_path(&module_path(module), &rest)),
+        ident => {
+            let mut segments = vec![ident];
+            segments.extend(rest);
+            Some(join_path(&module_dir(module), &segments))
+        }
+    }
+}
+
+/// Splits an imported item into its parent path and local binding name.
+fn import_item(item: &str) -> Option<(String, String)> {
+    let item = item.trim();
+    if item.is_empty() || item.contains('{') {
+        return None;
+    }
+    let (path, alias) = match item.split_once(" as ") {
+        Some((path, alias)) => (path.trim(), Some(alias.trim())),
+        None => (item, None),
+    };
+    let (parent, name) = match path.rsplit_once("::") {
+        Some((parent, name)) => (parent.trim(), name.trim()),
+        None => ("", path),
+    };
+    let ident = alias.unwrap_or(name);
+    if ident.is_empty() || !ident.bytes().all(is_ident_byte) {
+        return None;
+    }
+    Some((parent.to_owned(), ident.to_owned()))
+}
+
+fn resolve_module(keys: &BTreeSet<String>, path: &str) -> Option<String> {
+    if path.is_empty() {
+        return keys.contains("mod.rs").then(|| "mod.rs".to_owned());
+    }
+    [format!("{path}.rs"), format!("{path}/mod.rs")]
+        .into_iter()
+        .find(|key| keys.contains(key))
+}
+
+/// Module path without its file part: `a/b/c.rs` and `a/b/c/mod.rs` are both
+/// `a/b/c`, the routes root is empty.
+fn module_path(module: &str) -> String {
+    if module == "mod.rs" {
+        return String::new();
+    }
+    module
+        .strip_suffix("/mod.rs")
+        .or_else(|| module.strip_suffix(".rs"))
+        .unwrap_or(module)
+        .to_owned()
+}
+
+fn parent_path(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or_else(String::new, |(parent, _)| parent.to_owned())
+}
+
+/// Directory holding a module's siblings.
+fn module_dir(module: &str) -> String {
+    if module == "mod.rs" {
+        return String::new();
+    }
+    module
+        .rsplit_once('/')
+        .map_or_else(String::new, |(dir, _)| dir.to_owned())
+}
+
+fn join_path(base: &str, segments: &[&str]) -> String {
+    let joined = segments.join("/");
+    if base.is_empty() {
+        joined
+    } else if joined.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}/{joined}")
+    }
 }
 
 fn called_names(body: &str) -> BTreeSet<String> {
