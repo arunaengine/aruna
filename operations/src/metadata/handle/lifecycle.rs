@@ -381,3 +381,112 @@ impl MetadataVisibilityCache {
         }
     }
 }
+
+impl MetadataHandle {
+    pub async fn reconcile_document_sync(&self) -> Result<usize, MetadataError> {
+        let inner = self.inner.clone();
+        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
+            .await
+            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        // Peer document sync writes graphs without emitting an effect, so each
+        // graph the pass touched drops its summary, which may be keyed on a
+        // cursor that already led the content those records just landed.
+        if !applied.is_empty() {
+            self.inner.query_cache.bump_apply();
+            for graph in &applied {
+                summary_cache().remove(graph.as_str());
+            }
+        }
+        Ok(applied.len())
+    }
+
+    pub async fn prune_graph_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
+        let _graph_fence = metadata_graph_fence(&graph_iri)
+            .acquire()
+            .await
+            .map_err(|error| {
+                MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
+            })?;
+        if !graph_lifecycle_deleted(self.lifecycle_storage(), &graph_iri).await? {
+            return Ok(false);
+        }
+        self.inner
+            .visibility_cache
+            .remove_registry_records_by_graph(&graph_iri);
+        self.inner
+            .visibility_cache
+            .store_lifecycle_deleted(graph_iri.clone(), true);
+        if !contains_local_graph(self.inner.node.clone(), graph_iri.clone()).await? {
+            return Ok(true);
+        }
+        delete_local_graph(self.inner.node.clone(), graph_iri).await?;
+        Ok(true)
+    }
+
+    pub async fn prune_deleted_graphs(&self) -> Result<usize, MetadataError> {
+        let inner = self.inner.clone();
+        let graphs = tokio::task::spawn_blocking(move || inner.node.graphs())
+            .await
+            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let mut pruned = 0usize;
+        for graph in graphs {
+            if self
+                .prune_graph_if_deleted(graph.as_str().to_string())
+                .await?
+            {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
+    pub(super) async fn sync_graph_best_effort(
+        &self,
+        graph_iri: String,
+        mut peers: Vec<NodeId>,
+    ) -> MetadataEvent {
+        if let Some(net_handle) = self.inner.net_handle.as_ref() {
+            peers.retain(|peer| *peer != net_handle.node_id());
+        }
+        peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        peers.dedup();
+        if peers.is_empty() {
+            return MetadataEvent::GraphSyncScheduled { graph_iri, peers };
+        }
+
+        let inner = self.inner.clone();
+        let task_graph_iri = graph_iri.clone();
+        let task_peers = peers.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=METADATA_GRAPH_SYNC_ATTEMPTS {
+                match sync_graph_once(inner.clone(), task_graph_iri.clone(), task_peers.clone())
+                    .await
+                {
+                    Ok(()) => return,
+                    Err(error) => {
+                        warn!(
+                            graph_iri = %task_graph_iri,
+                            attempt,
+                            attempts = METADATA_GRAPH_SYNC_ATTEMPTS,
+                            error = ?error,
+                            "Metadata graph sync attempt failed"
+                        );
+                        if attempt < METADATA_GRAPH_SYNC_ATTEMPTS {
+                            sleep(METADATA_GRAPH_SYNC_RETRY_AFTER).await;
+                        }
+                    }
+                }
+            }
+
+            warn!(
+                graph_iri = %task_graph_iri,
+                peer_count = task_peers.len(),
+                "Metadata graph sync retries exhausted"
+            );
+        });
+
+        MetadataEvent::GraphSyncScheduled { graph_iri, peers }
+    }
+}
