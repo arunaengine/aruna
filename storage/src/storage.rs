@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -19,7 +19,7 @@ use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
 };
 use tokio::sync::{Notify, oneshot};
-use tracing::{Span, debug_span, field, warn};
+use tracing::{Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use crate::errors::StorageLibError;
@@ -112,6 +112,9 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::SyncAll => None,
     }
 }
+// Deletes leave tombstones that every later read walks. Small keyspaces never
+// fill a memtable, so compaction has to be triggered by the delete count.
+const COMPACT_AFTER_DELETES: u64 = 5_000;
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
 const BULK_READ_POOL_THREADS: usize = 2;
@@ -196,6 +199,115 @@ impl Store {
     }
 }
 
+struct CompactionJob {
+    key_space: String,
+    deletes: u64,
+    run: Box<dyn FnOnce() -> fjall::Result<()> + Send>,
+}
+
+/// Runs keyspace compactions on one background thread, so compaction never
+/// blocks the write worker and never holds a lock the read pool needs.
+struct Compactor {
+    sender: Option<std::sync::mpsc::Sender<CompactionJob>>,
+    thread: Option<thread::JoinHandle<()>>,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Compactor {
+    fn spawn() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<CompactionJob>();
+        let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let running = active.clone();
+        let thread = thread::spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                run_compaction(job, &running);
+            }
+        });
+        Self {
+            sender: Some(sender),
+            thread: Some(thread),
+            active,
+        }
+    }
+
+    /// Queues a compaction unless one for this keyspace is still pending.
+    fn submit(&self, key_space: &str, deletes: u64, keyspace: OptimisticTxKeyspace) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        if !self
+            .active
+            .lock()
+            .expect("storage compaction mutex poisoned")
+            .insert(key_space.to_string())
+        {
+            return;
+        }
+        let job = CompactionJob {
+            key_space: key_space.to_string(),
+            deletes,
+            run: Box::new(move || {
+                let keyspace: &fjall::Keyspace = keyspace.as_ref();
+                keyspace.rotate_memtable_and_wait()?;
+                keyspace.major_compact()
+            }),
+        };
+        if sender.send(job).is_err() {
+            self.release(key_space);
+        }
+    }
+
+    fn release(&self, key_space: &str) {
+        self.active
+            .lock()
+            .expect("storage compaction mutex poisoned")
+            .remove(key_space);
+    }
+
+    /// Waits for a running compaction so no keyspace handle outlives the store.
+    fn shutdown(&mut self) {
+        self.sender = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Compactor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_compaction(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
+    let CompactionJob {
+        key_space,
+        deletes,
+        run,
+    } = job;
+    let started = Instant::now();
+    match run() {
+        Ok(()) => debug!(
+            event = "storage.keyspace.compacted",
+            key_space = %key_space,
+            deletes,
+            elapsed_ms = duration_ms(started.elapsed()),
+            "Compacted a delete-heavy keyspace"
+        ),
+        Err(error) => warn!(
+            event = "storage.keyspace.compact_failed",
+            key_space = %key_space,
+            deletes,
+            error = %error,
+            "Keyspace compaction failed"
+        ),
+    }
+    active
+        .lock()
+        .expect("storage compaction mutex poisoned")
+        .remove(&key_space);
+}
+
 pub struct FjallStorage {
     store: Store,
     persist_policy: FjallPersistPolicy,
@@ -207,6 +319,10 @@ pub struct FjallStorage {
     bulk_read_pool: Vec<EffectSender>,
     next_bulk_reader: usize,
     pool_threads: Vec<thread::JoinHandle<()>>,
+    compactor: Compactor,
+    /// Committed deletes per keyspace since its last compaction.
+    deletes: HashMap<String, u64>,
+    txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -1398,6 +1514,7 @@ impl FjallStorage {
     /// Joins the read pools so every store clone is gone when this returns;
     /// the fjall lock is released by the final store drop right after.
     fn close(mut self) {
+        self.compactor.shutdown();
         self.read_pool.clear();
         self.bulk_read_pool.clear();
         for reader in std::mem::take(&mut self.pool_threads) {
@@ -1430,6 +1547,9 @@ impl FjallStorage {
             bulk_read_pool,
             next_bulk_reader: 0,
             pool_threads,
+            compactor: Compactor::spawn(),
+            deletes: HashMap::new(),
+            txn_deletes: HashMap::new(),
         }
     }
 
@@ -1459,6 +1579,7 @@ impl FjallStorage {
     /// Rolls a fenced transaction back and retires its cleanup entry through the
     /// terminal `Aborted` state, whether it was open or had a commit queued.
     fn retire_fenced_txn(&mut self, txn_id: Ulid) {
+        self.take_txn_deletes(txn_id, false);
         if let Some(Txn::Write(txn)) = self.txns.remove(&txn_id) {
             txn.rollback();
         }
@@ -1805,6 +1926,14 @@ impl FjallStorage {
             Err(error) => Some(error),
         };
 
+        if group_error.is_none() {
+            for ((effect, ..), outcome) in &prepared {
+                if outcome.is_ok() {
+                    self.note_effect_deletes(effect);
+                }
+            }
+        }
+
         let service_elapsed = service_started.elapsed();
         for ((effect, response_tx, span, enqueued_at, in_flight), outcome) in prepared {
             let _guard = span.enter();
@@ -2021,6 +2150,7 @@ impl FjallStorage {
                 error: StorageError::TransactionConflict,
             };
         }
+        self.take_txn_deletes(txn_id, false);
         match self.txns.remove(&txn_id) {
             Some(Txn::Write(txn)) => {
                 txn.rollback();
@@ -2220,7 +2350,9 @@ impl FjallStorage {
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_txn)) => StorageEvent::TransactionCommitted { txn_id },
             Some(Txn::Write(txn)) => {
-                match txn.commit() {
+                let committed = txn.commit();
+                self.take_txn_deletes(txn_id, matches!(committed, Ok(Ok(()))));
+                match committed {
                     Ok(Ok(())) => StorageEvent::TransactionCommitted { txn_id },
                     Ok(Err(_)) => StorageEvent::Error {
                         error: StorageError::TransactionConflict,
@@ -2246,6 +2378,61 @@ impl FjallStorage {
         }
     }
 
+    /// Counts committed deletes and compacts the keyspace once they cross
+    /// `COMPACT_AFTER_DELETES`, because its tombstones slow every later read.
+    fn note_deletes(&mut self, key_space: &str, count: u64) {
+        let total = match self.deletes.get_mut(key_space) {
+            Some(total) => total,
+            None => self.deletes.entry(key_space.to_string()).or_default(),
+        };
+        *total += count;
+        if *total < COMPACT_AFTER_DELETES {
+            return;
+        }
+        let deletes = std::mem::take(total);
+        match self.store.resolve_keyspace(key_space) {
+            Ok(keyspace) => self.compactor.submit(key_space, deletes, keyspace),
+            Err(error) => warn!(
+                event = "storage.keyspace.compact_failed",
+                key_space, error = %error, "Keyspace compaction could not resolve the keyspace"
+            ),
+        }
+    }
+
+    fn note_effect_deletes(&mut self, effect: &StorageEffect) {
+        match effect {
+            StorageEffect::Delete { key_space, .. } => self.note_deletes(key_space, 1),
+            StorageEffect::BatchDelete { deletes, .. } => {
+                for (key_space, _) in deletes {
+                    self.note_deletes(key_space, 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn hold_txn_delete(&mut self, txn_id: Ulid, key_space: &str) {
+        *self
+            .txn_deletes
+            .entry(txn_id)
+            .or_default()
+            .entry(key_space.to_string())
+            .or_default() += 1;
+    }
+
+    /// Counts the deletes a transaction made durable; other outcomes drop them.
+    fn take_txn_deletes(&mut self, txn_id: Ulid, committed: bool) {
+        let Some(deletes) = self.txn_deletes.remove(&txn_id) else {
+            return;
+        };
+        if !committed {
+            return;
+        }
+        for (key_space, count) in deletes {
+            self.note_deletes(&key_space, count);
+        }
+    }
+
     #[tracing::instrument(
         name = "storage.delete",
         level = "debug",
@@ -2261,6 +2448,7 @@ impl FjallStorage {
         if let Some(txn_id) = txn_id {
             if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
                 txn.remove(keyspace, key.clone());
+                self.hold_txn_delete(txn_id, &key_space);
                 StorageEvent::DeleteResult { key }
             } else {
                 StorageEvent::Error {
@@ -2279,6 +2467,7 @@ impl FjallStorage {
             if let Err(error) = self.persist_journal() {
                 return StorageEvent::Error { error };
             }
+            self.note_deletes(&key_space, 1);
             StorageEvent::DeleteResult { key }
         }
     }
@@ -2315,6 +2504,9 @@ impl FjallStorage {
                 txn.remove(keyspace, key.clone());
                 entries.push((key_space, key));
             }
+            for (key_space, _) in &entries {
+                self.hold_txn_delete(txn_id, key_space);
+            }
         } else {
             let mut tx = match self.buffered_write_tx() {
                 Ok(tx) => tx,
@@ -2329,6 +2521,9 @@ impl FjallStorage {
                 .and_then(|()| self.persist_journal())
             {
                 return StorageEvent::Error { error };
+            }
+            for (key_space, _) in &entries {
+                self.note_deletes(key_space, 1);
             }
         }
 
@@ -3513,6 +3708,9 @@ mod tests {
             bulk_read_pool: vec![bulk_sender],
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
+            compactor: idle_compactor(),
+            deletes: std::collections::HashMap::new(),
+            txn_deletes: std::collections::HashMap::new(),
         };
         let metrics = std::sync::Arc::new(super::StorageMetrics::default());
         let read_effect = || StorageEffect::Read {
@@ -3852,6 +4050,16 @@ mod tests {
             read_txn,
             Event::Storage(StorageEvent::TransactionStarted { .. })
         ));
+    }
+
+    /// Compactor that accepts no job, for workers built without a background
+    /// thread.
+    fn idle_compactor() -> super::Compactor {
+        super::Compactor {
+            sender: None,
+            thread: None,
+            active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
     }
 
     /// Worker sharing the handle's channels, cleanup map and fence, driven by
@@ -4425,6 +4633,9 @@ mod tests {
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
+            compactor: idle_compactor(),
+            deletes: std::collections::HashMap::new(),
+            txn_deletes: std::collections::HashMap::new(),
         };
 
         let event = storage.commit_transaction(txn_id);
@@ -4469,6 +4680,9 @@ mod tests {
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
+            compactor: idle_compactor(),
+            deletes: std::collections::HashMap::new(),
+            txn_deletes: std::collections::HashMap::new(),
         };
 
         for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
@@ -4510,6 +4724,9 @@ mod tests {
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
+            compactor: idle_compactor(),
+            deletes: std::collections::HashMap::new(),
+            txn_deletes: std::collections::HashMap::new(),
         };
 
         storage.retry_cleanup();
@@ -5411,5 +5628,151 @@ mod tests {
             metrics_after_conflict.last_error,
             Some("Transaction conflict".to_string())
         );
+    }
+
+    /// Replaces the worker's compactor with a channel the test owns, so queued
+    /// compactions are observable without running one.
+    fn stub_compactor(
+        storage: &mut FjallStorage,
+    ) -> std::sync::mpsc::Receiver<super::CompactionJob> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        storage.compactor = super::Compactor {
+            sender: Some(sender),
+            thread: None,
+            active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        receiver
+    }
+
+    fn delete_batch(count: u64) -> StorageEffect {
+        StorageEffect::BatchDelete {
+            deletes: (0..count)
+                .map(|index| {
+                    (
+                        "dht_meta_v2".to_string(),
+                        index.to_string().into_bytes().into(),
+                    )
+                })
+                .collect(),
+            txn_id: None,
+        }
+    }
+
+    #[test]
+    fn deletes_below_threshold() {
+        let dir = tempdir().unwrap();
+        let (handle, _receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let jobs = stub_compactor(&mut storage);
+
+        let below = super::COMPACT_AFTER_DELETES - 1;
+        storage.process_effect(delete_batch(below));
+
+        assert!(jobs.try_recv().is_err());
+        assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(below));
+    }
+
+    #[test]
+    fn deletes_cross_threshold() {
+        let dir = tempdir().unwrap();
+        let (handle, _receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let jobs = stub_compactor(&mut storage);
+
+        storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+
+        let job = jobs.try_recv().expect("compaction is queued");
+        assert_eq!(job.key_space, "dht_meta_v2");
+        assert_eq!(job.deletes, super::COMPACT_AFTER_DELETES);
+        assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(0));
+        (job.run)().expect("keyspace compacts");
+
+        // The keyspace stays active until the compaction thread releases it, so
+        // a second crossing queues nothing.
+        storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn delete_survives_compactor() {
+        let dir = tempdir().unwrap();
+        let (handle, _receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        drop(stub_compactor(&mut storage));
+
+        let event = storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+
+        assert!(matches!(event, StorageEvent::BatchDeleteResult { .. }));
+        assert!(
+            storage
+                .compactor
+                .active
+                .lock()
+                .expect("compaction mutex")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compaction_failure_continues() {
+        let mut compactor = super::Compactor::spawn();
+        let (done, finished) = std::sync::mpsc::channel();
+        let sender = compactor.sender.clone().expect("compactor accepts jobs");
+        compactor
+            .active
+            .lock()
+            .expect("compaction mutex")
+            .insert("failing".to_string());
+        sender
+            .send(super::CompactionJob {
+                key_space: "failing".to_string(),
+                deletes: super::COMPACT_AFTER_DELETES,
+                run: Box::new(|| Err(fjall::Error::Poisoned)),
+            })
+            .expect("failing job is queued");
+        sender
+            .send(super::CompactionJob {
+                key_space: "next".to_string(),
+                deletes: 1,
+                run: Box::new(move || {
+                    done.send(()).expect("test receives the signal");
+                    Ok(())
+                }),
+            })
+            .expect("next job is queued");
+        drop(sender);
+        compactor.shutdown();
+
+        finished.recv().expect("the thread ran the next job");
+        assert!(
+            compactor
+                .active
+                .lock()
+                .expect("compaction mutex")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn commit_counts_deletes() {
+        let dir = tempdir().unwrap();
+        let (handle, _receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let _jobs = stub_compactor(&mut storage);
+        let StorageEvent::TransactionStarted { txn_id } =
+            storage.process_effect(StorageEffect::StartTransaction { read: false })
+        else {
+            panic!("transaction starts");
+        };
+
+        storage.process_effect(StorageEffect::Delete {
+            key_space: "dht_meta_v2".to_string(),
+            key: b"deadline".to_vec().into(),
+            txn_id: Some(txn_id),
+        });
+        assert!(!storage.deletes.contains_key("dht_meta_v2"));
+
+        storage.process_effect(StorageEffect::CommitTransaction { txn_id });
+        assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(1));
     }
 }
