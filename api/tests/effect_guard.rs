@@ -129,6 +129,11 @@ fn scan_file(manifest_dir: &Path, path: &Path) -> Vec<GuardMatch> {
         return Vec::new();
     }
 
+    // Files in a `tests/` module directory are test-only for the same reason.
+    if relative_path.split('/').any(|part| part == "tests") {
+        return Vec::new();
+    }
+
     let mut matches = Vec::new();
     let mut pending_cfg_test = false;
     let mut test_module_depth = None;
