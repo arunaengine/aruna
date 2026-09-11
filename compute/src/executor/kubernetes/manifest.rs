@@ -424,11 +424,7 @@ pub fn network_policies(config: &KubernetesConfig) -> Result<Vec<NetworkPolicy>,
             "ingress":[],
             "egress":[
                 {"to":cidrs,"ports":[{"protocol":"TCP","port":config.s3_port}]},
-                {"to":[{"namespaceSelector":{"matchLabels":{
-                    "kubernetes.io/metadata.name":"kube-system"
-                }}}],"ports":[
-                    {"protocol":"UDP","port":53},{"protocol":"TCP","port":53}
-                ]}
+                {"ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]}
             ]
         }
     }))
@@ -983,18 +979,23 @@ mod tests {
     }
 
     #[test]
-    fn restricts_dns_egress() {
+    fn allows_dns_by_port() {
+        // A host-network resolver such as node-local DNS is neither a kube-system
+        // pod nor a CIDR peer under Cilium, so the DNS rule carries no peer.
         let mut config = config();
         config.s3_cidrs.push("10.0.0.0/8".to_string());
 
         let policies = network_policies(&config).unwrap();
         let policy = serde_json::to_value(&policies[1]).unwrap();
-        let peer = &policy["spec"]["egress"][1]["to"][0];
+        let s3 = &policy["spec"]["egress"][0];
+        let dns = &policy["spec"]["egress"][1];
 
-        assert_eq!(
-            peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
-            "kube-system"
-        );
-        assert!(peer.get("ipBlock").is_none());
+        assert_eq!(s3["to"][0]["ipBlock"]["cidr"], "10.0.0.0/8");
+        assert_eq!(s3["ports"][0]["port"], 443);
+        assert!(dns.get("to").is_none());
+        assert_eq!(dns["ports"][0]["protocol"], "UDP");
+        assert_eq!(dns["ports"][0]["port"], 53);
+        assert_eq!(dns["ports"][1]["protocol"], "TCP");
+        assert_eq!(dns["ports"][1]["port"], 53);
     }
 }
