@@ -498,7 +498,7 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    fn store_rotation(&self, rotation: OutboxRotation) {
+    pub(super) fn store_rotation(&self, rotation: OutboxRotation) {
         *self
             .rotation
             .lock()
