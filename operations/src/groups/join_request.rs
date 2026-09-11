@@ -2,11 +2,8 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::notifications::outbox::schedule_notification_outbox_drain_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
-};
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, decode_admin_document_reducer_state,
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
@@ -20,6 +17,7 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::reducer::{AdminDocumentReducerError, decode_admin_document_reducer_state};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, notification_outbox_write_entry,
@@ -552,10 +550,10 @@ impl Operation for GroupJoinOperation {
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::AdminDocumentRoleDefinition;
     use aruna_core::document::DocumentSyncOutboxRecord;
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::structs::RealmId;
 
     #[test]
