@@ -189,3 +189,195 @@ impl TaskQueues {
         }
     }
 }
+
+impl OperationsTaskHandler {
+    pub(super) async fn publish_usage_snapshots(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!(task_id = ?TaskKey::PublishUsageSnapshots, "Cannot publish usage snapshots without net handle");
+            return;
+        };
+        let node_id = net_handle.node_id();
+        let realm_id = *net_handle.realm_id();
+        match crate::node::usage_stats::publish_and_refresh_usage_snapshots(
+            &self.context,
+            node_id,
+            realm_id,
+            false,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
+                self.reschedule_timer(
+                    TaskKey::PublishUsageSnapshots,
+                    crate::node::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn publish_node_info(&self) {
+        if let Some(net_handle) = self.context.net_handle.as_ref() {
+            let node_id = net_handle.node_id();
+            let realm_id = *net_handle.realm_id();
+            if let Err(error) = crate::node::node_info::refresh_node_info_heartbeat(
+                &self.context,
+                node_id,
+                realm_id,
+            )
+            .await
+            {
+                warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
+            }
+        } else {
+            warn!(task_id = ?TaskKey::PublishNodeInfo, "Cannot publish node info without net handle");
+        }
+        // Periodic heartbeat: always re-arm for the next interval regardless of
+        // outcome so a transient failure never stops the heartbeat.
+        self.reschedule_timer(
+            TaskKey::PublishNodeInfo,
+            crate::node::node_info::NODE_INFO_PUBLISH_INTERVAL,
+        )
+        .await;
+    }
+
+    pub(super) async fn publish_watch_interest(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!(task_id = ?TaskKey::PublishWatchInterest, "Cannot publish watch interest without net handle");
+            return;
+        };
+        let node_id = net_handle.node_id();
+        match crate::notifications::watch::interest::publish_watch_interest(&self.context, node_id)
+            .await
+        {
+            // Fold this node's freshly written digest into the origin-side cache;
+            // the local write bypasses the reconcile path that refreshes remotes.
+            Ok(true) => {
+                let table = crate::notifications::watch::interest::rebuild_watch_interest_table(
+                    &self.context.storage_handle,
+                )
+                .await;
+                net_handle.replace_watch_interest(table);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(task_id = ?TaskKey::PublishWatchInterest, error = %error, "Failed to publish watch interest");
+                self.reschedule_timer(
+                    TaskKey::PublishWatchInterest,
+                    WATCH_INTEREST_PUBLISH_DEBOUNCE,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// A context whose storage effects dispatch on the bulk lane, so background
+    /// queue draining never starves foreground sync traffic.
+    fn bulk_context(&self) -> DriverContext {
+        let mut context = self.context.as_ref().clone();
+        context.storage_handle = context.storage_handle.bulk();
+        context.metadata_handle = context
+            .metadata_handle
+            .as_ref()
+            .map(|metadata_handle| metadata_handle.bulk());
+        context
+    }
+
+    pub(super) async fn drain_metadata_materialization_queue(&self) {
+        let bulk = self.bulk_context();
+        match process_metadata_materialization_batch(&bulk).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataMaterializationQueue,
+                    drain_delay(&result),
+                )
+                .await;
+            }
+            Ok(result) if result.next_due_after.is_some() => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataMaterializationQueue,
+                    result
+                        .next_due_after
+                        .unwrap_or(METADATA_MATERIALIZATION_POLL_AFTER),
+                )
+                .await;
+            }
+            Ok(_) => match metadata_materialization_jobs_exist(&bulk.storage_handle).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataMaterializationQueue,
+                        METADATA_MATERIALIZATION_POLL_AFTER,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataMaterializationQueue,
+                        METADATA_MATERIALIZATION_RETRY_AFTER,
+                    )
+                    .await;
+                }
+            },
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataMaterializationQueue,
+                    METADATA_MATERIALIZATION_RETRY_AFTER,
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn drain_metadata_graph_prune_queue(&self) {
+        let bulk = self.bulk_context();
+        match process_metadata_graph_prune_batch(&bulk).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataGraphPruneQueue,
+                    std::time::Duration::ZERO,
+                )
+                .await;
+            }
+            Ok(result) if result.next_due_after.is_some() => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataGraphPruneQueue,
+                    result
+                        .next_due_after
+                        .unwrap_or(METADATA_GRAPH_PRUNE_POLL_AFTER),
+                )
+                .await;
+            }
+            Ok(_) => match metadata_graph_prune_jobs_exist(&bulk.storage_handle).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataGraphPruneQueue,
+                        METADATA_GRAPH_PRUNE_POLL_AFTER,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    warn!(task_id = ?TaskKey::DrainMetadataGraphPruneQueue, error = ?error, "Failed to probe metadata graph prune jobs");
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataGraphPruneQueue,
+                        METADATA_GRAPH_PRUNE_RETRY_AFTER,
+                    )
+                    .await;
+                }
+            },
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainMetadataGraphPruneQueue, error = ?error, "Failed to drain metadata graph prune queue");
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataGraphPruneQueue,
+                    METADATA_GRAPH_PRUNE_RETRY_AFTER,
+                )
+                .await;
+            }
+        }
+    }
+}
