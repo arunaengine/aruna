@@ -39,7 +39,7 @@ use crate::jobs::lifecycle::target::{
 use crate::jobs::records::keys::record_key;
 use crate::jobs::records::load_kind_complete;
 use crate::jobs::records::rows::to_bytes;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
+use crate::jobs::records::tests::fixtures::{Family, REALM, context};
 use crate::node::node_info::set_operator_drain;
 
 /// Detects a wakeup that never arrives, not a slow machine.

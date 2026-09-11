@@ -6,7 +6,7 @@ use aruna_core::structs::{
     JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
 
-use super::fixture::{Family, node, secret};
+use super::fixtures::{Family, node, secret};
 use crate::jobs::records::admit::{Admission, FamilyState, plan_append, relayable};
 use crate::jobs::records::rows::{PendingNeed, PendingRecord};
 use crate::jobs::records::verify::FamilyView;

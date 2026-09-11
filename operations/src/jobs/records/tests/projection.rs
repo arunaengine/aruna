@@ -11,7 +11,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{Key, TxnId, Value};
 
-use super::fixture::{Family, payload, user};
+use super::fixtures::{Family, payload, user};
 use crate::jobs::records::keys::record_key;
 use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,

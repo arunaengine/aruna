@@ -13,8 +13,8 @@ use aruna_core::structs::{
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::fixture::context as fixture;
-use super::fixture::{Family, REALM, actor, node, secret};
+use super::fixtures::context as fixture;
+use super::fixtures::{Family, REALM, actor, node, secret};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::keys::record_key;

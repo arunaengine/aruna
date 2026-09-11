@@ -17,7 +17,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::records::keys::kind_prefix;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
+use crate::jobs::records::tests::fixtures::{Family, REALM, context};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::{iter_prefix_page, read_job_record};
 

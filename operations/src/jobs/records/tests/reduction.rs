@@ -5,7 +5,7 @@ use aruna_core::structs::{
     LogicalJobState, PhysicalExecutionState, canonical_execution_key,
 };
 
-use super::fixture::Family;
+use super::fixtures::Family;
 use crate::jobs::records::reduce::{canonical_binding, reduce_family, submission_families};
 
 /// Deterministic shuffle: an index rotation plus every record duplicated once,

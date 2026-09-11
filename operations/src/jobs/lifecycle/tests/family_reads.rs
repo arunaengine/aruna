@@ -11,7 +11,7 @@ use aruna_core::types::Value;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::updates::chain_for;
 use crate::jobs::records::keys::record_key;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
+use crate::jobs::records::tests::fixtures::{Family, REALM, context};
 use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, FamilyReadError, RecordOrigin, load_family_complete,
     load_kind_complete,
