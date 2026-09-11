@@ -31,8 +31,8 @@ use crate::metadata::api::{
     MetadataReferencePreflightNodeExecution, MetadataReferencePreflightNodeRequest,
     MetadataRoCrateExportView,
 };
-use crate::metadata::create_metadata_document::CreateMetadataDocumentPayload;
-use crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
+use crate::metadata::create_document::CreateMetadataDocumentPayload;
+use crate::metadata::update_document::UpdateMetadataDocumentMutation;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::s3::search_objects::{ObjectKeyMatch, ObjectSearchNodePage};
 

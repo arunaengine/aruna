@@ -2,14 +2,14 @@ pub mod api;
 pub mod audit;
 pub(crate) mod builtin;
 pub mod contact;
-pub mod create_metadata_document;
-pub mod delete_metadata_document;
+pub mod create_document;
+pub mod delete_document;
 pub mod device_pull;
 pub mod forward;
-pub mod get_metadata_document;
+pub mod get_document;
 mod handle;
 mod iri_index;
-pub mod list_metadata_documents;
+pub mod list_documents;
 pub mod materialization_queue;
 pub mod persistent_id;
 mod profile_cache;
@@ -30,7 +30,7 @@ mod summary_cache;
 #[cfg(test)]
 mod tests;
 pub mod timestamp_index;
-pub mod update_metadata_document;
+pub mod update_document;
 pub mod visibility_index;
 
 use std::sync::Arc;

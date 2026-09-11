@@ -12,7 +12,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::get_metadata_document::load_metadata_record_by_document;
+use crate::metadata::get_document::load_metadata_record_by_document;
 use crate::metadata::repository::{StorageReadError, delete_index_keys};
 use crate::storage_read::parse_storage_scan;
 

@@ -147,7 +147,7 @@ impl Operation for ListSourceConnectorsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::create_source_connector::{
+    use crate::connectors::create_connector::{
         CreateSourceConnectorInput, CreateSourceConnectorOperation,
     };
     use crate::driver::{DriverContext, drive};

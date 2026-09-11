@@ -10,6 +10,7 @@ use super::read::ensure_permission;
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
+use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::metadata::MetadataCreateEventPayload;
 use aruna_core::storage_entries::{
@@ -20,7 +21,6 @@ use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument,
     RealmNodeKind, Role,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::{Key, RoleId};
 use aruna_storage::storage;
 use byteview::ByteView;
