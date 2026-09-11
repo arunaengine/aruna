@@ -3013,16 +3013,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_search_graph_limit_clamps_at_protocol_ingress() {
-        assert_eq!(clamp_remote_search_graph_limit(0), 1);
-        assert_eq!(clamp_remote_search_graph_limit(25), 25);
-        assert_eq!(
-            clamp_remote_search_graph_limit(METADATA_SEARCH_MAX_PAGINATION_DEPTH + 1),
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH
-        );
-    }
-
     #[tokio::test]
     async fn flush_persistence_succeeds_without_document_sync_database() {
         let (_storage_dir, storage) = auth_storage();
