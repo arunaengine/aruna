@@ -4698,49 +4698,6 @@ impl DocumentSyncService {
     }
 }
 
-fn needs_revocation_index(
-    is_revocation: bool,
-    config_present: bool,
-    reducer_state: &AdminDocumentReducerState,
-    now: u64,
-) -> bool {
-    is_revocation || !config_present || reducer_state.revocation_compaction_due(now)
-}
-
-fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
-    let node_id = node_id.to_string();
-    config.nodes.retain(|node| node.node_id != node_id);
-}
-
-fn remove_realm_config_oidc_provider(config: &mut RealmConfigDocument, provider_id: &str) {
-    config
-        .oidc_providers
-        .retain(|provider| provider.id != provider_id);
-}
-
-fn admin_document_target_for_reduced_document(
-    target: &DocumentSyncTarget,
-) -> Option<AdminDocumentTarget> {
-    match target {
-        DocumentSyncTarget::User { user_id } => {
-            Some(AdminDocumentTarget::User { user_id: *user_id })
-        }
-        DocumentSyncTarget::Group { group_id } => Some(AdminDocumentTarget::Group {
-            group_id: *group_id,
-        }),
-        DocumentSyncTarget::GroupAuthorization { group_id } => Some(AdminDocumentTarget::Group {
-            group_id: *group_id,
-        }),
-        DocumentSyncTarget::RealmAuthorization { realm_id } => Some(AdminDocumentTarget::Realm {
-            realm_id: *realm_id,
-        }),
-        DocumentSyncTarget::RealmConfig { realm_id } => Some(AdminDocumentTarget::RealmConfig {
-            realm_id: *realm_id,
-        }),
-        _ => None,
-    }
-}
-
 async fn apply_metadata_registry_upsert_to_storage(
     storage: &StorageHandle,
     record: MetadataRegistryRecord,
