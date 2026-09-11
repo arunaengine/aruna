@@ -253,3 +253,127 @@ pub(in crate::document_sync) async fn write_inbound_sync_messages(
     send.finish()
         .map_err(|error| NetError::Stream(error.to_string()))
 }
+
+type BatchSummaryOutcome = (
+    BTreeSet<irokle_crate::TopicId>,
+    BTreeSet<irokle_crate::TopicId>,
+    Vec<SyncMessage>,
+);
+
+pub(in crate::document_sync) fn process_batch_summary_responses(
+    node: &irokle_crate::Irokle<irokle_crate::FjallStorage>,
+    peer: PeerId,
+    known_topics: &BTreeSet<irokle_crate::TopicId>,
+    local_fingerprints: &BTreeMap<irokle_crate::TopicId, [u8; 32]>,
+    responses: Vec<SyncMessage>,
+) -> Result<BatchSummaryOutcome> {
+    let mut responded_topics = BTreeSet::new();
+    let mut failed_topics = BTreeSet::new();
+    let mut sync_messages = Vec::new();
+    for response in responses {
+        match response {
+            // An explicit terminal failure still counts as a response: the peer
+            // answered for this topic, so only this topic stays dirty and the
+            // rest of the batch keeps its summaries, data and acks.
+            SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
+                responded_topics.insert(failure.topic_id);
+                failed_topics.insert(failure.topic_id);
+                warn!(
+                    %peer,
+                    topic_id = %failure.topic_id,
+                    code = ?failure.code,
+                    "Skipping document sync batch topic: peer reported a sync failure"
+                );
+            }
+            SyncMessage::Fingerprint(remote) if known_topics.contains(&remote.topic_id) => {
+                responded_topics.insert(remote.topic_id);
+                if local_fingerprints.get(&remote.topic_id) != Some(&remote.fingerprint) {
+                    warn!(
+                        %peer,
+                        topic_id = %remote.topic_id,
+                        "Skipping document sync batch topic: peer returned mismatched fingerprint"
+                    );
+                    failed_topics.insert(remote.topic_id);
+                }
+            }
+            SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {
+                responded_topics.insert(summary.topic_id);
+                if let Some(event_type_id) = summary.event_type_id.as_deref()
+                    && event_type_id != DocumentSyncEvent::TYPE_ID
+                {
+                    warn!(
+                        %peer,
+                        topic_id = %summary.topic_id,
+                        event_type_id,
+                        "Skipping document sync batch topic: peer advertised unexpected event type"
+                    );
+                    failed_topics.insert(summary.topic_id);
+                    continue;
+                }
+                let plan = match node.negotiate_sync(peer, &summary) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        warn!(
+                            %peer,
+                            topic_id = %summary.topic_id,
+                            error = %error,
+                            "Skipping document sync batch topic: sync negotiation failed"
+                        );
+                        failed_topics.insert(summary.topic_id);
+                        continue;
+                    }
+                };
+                let wants_remote_data = !plan.need.is_empty() || !plan.actor_range_hints.is_empty();
+                if !plan.send.is_empty() || wants_remote_data {
+                    sync_messages.push(SyncMessage::Open(node.sync_open(plan.topic_id)));
+                    if !plan.send.is_empty() {
+                        sync_messages.push(SyncMessage::Data(SyncData {
+                            topic_id: plan.topic_id,
+                            ops: plan.send,
+                        }));
+                    }
+                    if wants_remote_data {
+                        sync_messages.push(SyncMessage::Request(SyncRequest {
+                            topic_id: plan.topic_id,
+                            known: plan.common,
+                            wants: plan.need,
+                            actor_range_hints: plan.actor_range_hints,
+                        }));
+                    }
+                }
+            }
+            other => {
+                return Err(NetError::Bootstrap(format!(
+                    "unexpected document sync batch response from {peer}: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok((responded_topics, failed_topics, sync_messages))
+}
+
+/// Names the bounded-journal refusal. Past Irokle's cap on unreleased records
+/// every genesis tie-break reset is refused, which otherwise reaches operators
+/// only as an opaque admission failure.
+pub(in crate::document_sync) fn report_journal_full(
+    topic_id: irokle_crate::TopicId,
+    error: &irokle_crate::Error,
+) {
+    if matches!(error, irokle_crate::Error::EvictionJournalFull) {
+        error!(
+            %topic_id,
+            "Eviction journal is full; genesis tie-break resets stay refused until the eviction consumer drains it"
+        );
+    }
+}
+
+pub(in crate::document_sync) fn forward_evictions_to(
+    sink: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
+    evictions: Vec<TopicEviction>,
+) {
+    for eviction in evictions {
+        if sink.send(eviction).is_err() {
+            warn!("Document sync eviction consumer closed; dropping re-emitted payloads");
+        }
+    }
+}
