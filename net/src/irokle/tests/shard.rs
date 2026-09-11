@@ -373,3 +373,168 @@ async fn shard_membership_exact() {
 
     service.shutdown().await;
 }
+
+#[tokio::test]
+async fn document_events_after_keeps_unapplied_dependency_of_covered_head() {
+    use irokle_crate::{Ed25519Signer, Signer as _};
+
+    let root = tempfile::tempdir().expect("temp dir");
+    let service = open_restart_service(root.path(), "causal-cursor-storage").await;
+    let local_node = service.local_node_id().expect("local node id");
+    let remote_node = node(88);
+    let topic_id = restart_topic();
+    service
+        .ensure_document_sync_topics(&[topic_id], vec![remote_node])
+        .expect("shard topic exists");
+    let oplog = Oplog::with_storage(service.node().storage().clone());
+    let remote_signer = Ed25519Signer::from_bytes(&[88; 32]);
+    let remote_event_id = Ulid::from_parts(1_727_000_000_000, 43);
+    let local_event_id = Ulid::from_parts(1_727_000_000_000, 44);
+    let change = |event_id, actor| DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id,
+            actor,
+            updated_at_ms: 1_727_000_000_101,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement: restart_placement(),
+    };
+    let publish = |event_id, actor| DocumentSyncEvent::Upsert {
+        event_id,
+        target: restart_target(),
+        bytes: restart_payload(),
+        change: change(event_id, actor),
+    };
+    let remote_actor = irokle_crate::actor_id_for(topic_id, remote_signer.peer_id());
+    oplog
+        .create_event_op(
+            topic_id,
+            remote_actor,
+            EventEnvelope::encode_event(&publish(remote_event_id, remote_node))
+                .expect("remote event encodes"),
+            &remote_signer,
+        )
+        .expect("remote event publishes");
+    let local_op = oplog
+        .create_event_op(
+            topic_id,
+            irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&local_node)),
+            EventEnvelope::encode_event(&publish(local_event_id, local_node))
+                .expect("local event encodes"),
+            service.node().signer(),
+        )
+        .expect("local event publishes above remote head");
+    let mut cursor = irokle_crate::ActorClock::default();
+    cursor.observe(
+        local_op.signed.body.actor_id,
+        local_op.signed.body.actor_seq,
+    );
+
+    let events = service
+        .document_events_after(topic_id, &cursor)
+        .expect("unapplied document events read");
+    let event_ids = events
+        .into_iter()
+        .filter_map(|(event, _, _)| match event {
+            DocumentSyncEvent::Upsert { event_id, .. } => Some(event_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(event_ids, vec![remote_event_id]);
+
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn replay_backlog() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let service = open_restart_service(root.path(), "replay-batch-storage").await;
+    let topic_id = restart_topic();
+    let target = restart_target();
+    service
+        .ensure_document_sync_topics(&[topic_id], Vec::new())
+        .expect("shard topic exists");
+
+    let documents = (0..(DOCUMENT_SYNC_REPLAY_BATCH_LIMIT + 1))
+        .map(|index| {
+            let event_id = Ulid::from_parts(1_800_000_000_000 + index as u64, 1);
+            DocumentSyncPublish::Upsert {
+                event_id,
+                target: target.clone(),
+                bytes: restart_payload(),
+                change: DocumentSyncChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: 1,
+                        event_id,
+                        actor: service.local_node_id().expect("local node id"),
+                        updated_at_ms: 1_800_000_000_000 + index as u64,
+                    },
+                    kind: DocumentSyncChangeKind::Upsert,
+                    placement: restart_placement(),
+                },
+                allow_genesis: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        service.publish_documents(documents, Vec::new()).await,
+        DocumentSyncNetEvent::DocumentsPublished { .. }
+    ));
+
+    let cursor = irokle_crate::ActorClock::default();
+    service
+        .storage_write(
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            topic_cursor_key(topic_id),
+            postcard::to_allocvec(&cursor)
+                .expect("cursor serializes")
+                .into(),
+        )
+        .await
+        .expect("cursor resets");
+
+    let first = service
+        .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+        .expect("first replay batch");
+    assert_eq!(
+        first.events.len(),
+        DOCUMENT_SYNC_REPLAY_BATCH_LIMIT - 1,
+        "genesis consumes one bounded replay slot"
+    );
+    let actor = irokle_crate::actor_id_for(topic_id, service.node().peer_id());
+    assert_eq!(
+        first.cursor.get(&actor),
+        DOCUMENT_SYNC_REPLAY_BATCH_LIMIT as u64
+    );
+    let topic_clock = service
+        .node()
+        .storage()
+        .actor_clock(&topic_id)
+        .expect("topic clock");
+    assert!(!first.cursor.dominates(&topic_clock));
+
+    // An interrupted run before the cursor write retries the same batch.
+    let retry = service
+        .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+        .expect("retry replay batch");
+    assert_eq!(retry.cursor, first.cursor);
+    let remaining = service
+        .document_event_batch(topic_id, &first.cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+        .expect("remaining replay batch");
+    assert!(remaining.cursor.dominates(&topic_clock));
+
+    let byte_first = service
+        .document_event_batch(topic_id, &cursor, 0)
+        .expect("single operation byte batch");
+    assert_eq!(byte_first.cursor.get(&actor), 1);
+    let byte_second = service
+        .document_event_batch(topic_id, &byte_first.cursor, 0)
+        .expect("second operation byte batch");
+    assert_eq!(byte_second.cursor.get(&actor), 2);
+    assert!(!byte_second.cursor.dominates(&topic_clock));
+
+    service.shutdown().await;
+}
