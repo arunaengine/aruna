@@ -509,7 +509,7 @@ mod tests {
     use crate::device::delete_draft::DeleteDraftOperation;
     use crate::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
     use crate::device::intake::{IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, intake_entry};
-    use crate::device::test_support::context;
+    use crate::device::tests::fixtures::context;
     use crate::driver::{DriverContext, drive};
     use crate::metadata::forward::MetadataWriteError;
     use aruna_core::effects::StorageEffect;
