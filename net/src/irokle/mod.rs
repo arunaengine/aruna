@@ -4788,6 +4788,11 @@ mod tests {
     const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
         "document_sync::tests::restart::buffered_document_sync_publish_restart_child_process";
 
+    // Two services fork one admin topic (each mints its own genesis carrying a
+    // unique admin event). The genesis tie-break resets exactly the losing side,
+    // whose admin event is evicted and decodes back into a re-emittable outbox
+    // publish that preserves the original embedded event id (the applier dedup
+    // key) and refuses to mint a rival genesis.
     #[tokio::test]
     async fn forked_admin_topic_eviction_reemits_with_preserved_event_id() {
         let (_dir_a, storage_a) = test_storage();

@@ -166,12 +166,6 @@ async fn topic_not_ready_publish_does_not_block_ready_batch_record() {
     );
 }
 
-// Two services fork one admin topic (each mints its own genesis carrying a
-// unique admin event). The genesis tie-break resets exactly the losing side,
-// whose admin event is evicted and decodes back into a re-emittable outbox
-// publish that preserves the original embedded event id (the applier dedup
-// key) and refuses to mint a rival genesis.
-
 #[tokio::test]
 async fn lost_eviction_replays() {
     let (_dir_a, storage_a) = test_storage();
