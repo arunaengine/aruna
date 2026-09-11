@@ -1176,3 +1176,31 @@ pub(in crate::document_sync) fn metadata_document_delete_write_entries(
     }
     Ok(entries)
 }
+
+pub(in crate::document_sync) async fn registry_live_txn(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+    delete: &MetadataDocumentDeleteRecord,
+    txn_id: TxnId,
+) -> Result<(bool, Option<MetadataRegistryRecord>)> {
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    };
+    let Some(value) = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok((false, None));
+    };
+    let record: MetadataRegistryRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let live = record.updated_at_ms > delete.tombstone.updated_at_ms
+        || record.last_event_id > delete.deleted_after_event_id;
+    Ok((live, Some(record)))
+}
