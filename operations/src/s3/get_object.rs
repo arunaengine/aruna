@@ -1292,13 +1292,13 @@ pub async fn get_object_routed(
 ) -> Result<Option<Result<GetObjectResult, GetObjectError>>, GetObjectError> {
     let ranged = input.range.is_some();
     let user_id = input.user_identity;
-    let operation = GetObjectOperation::new(input).with_restrictions(restrictions);
+    let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
     let result = drive(operation, context).await;
-    let Ok(Some(Err(GetObjectError::BlobNotLocal {
+    let Err(GetObjectError::BlobNotLocal {
         blake3,
         version_id,
         metadata,
-    }))) = result
+    }) = result
     else {
         return result;
     };
@@ -1306,7 +1306,7 @@ pub async fn get_object_routed(
         return Ok(Some(Err(GetObjectError::GetObjectFailed)));
     }
     Ok(Some(
-        routed_blob(context, user_id, blake3, version_id, metadata).await,
+        routed_blob(context, user_id, blake3, version_id, metadata, restrictions).await,
     ))
 }
 
@@ -1316,6 +1316,7 @@ async fn routed_blob(
     blake3: [u8; 32],
     version_id: Option<Ulid>,
     metadata: HashMap<String, String>,
+    path_restrictions: Option<Vec<PathRestriction>>,
 ) -> Result<GetObjectResult, GetObjectError> {
     let net_handle = context
         .net_handle
@@ -1335,7 +1336,7 @@ async fn routed_blob(
             auth_context: AuthContext {
                 user_id,
                 realm_id,
-                path_restrictions: None,
+                path_restrictions: path_restrictions.clone(),
                 session: None,
             },
             realm_id,
@@ -1391,7 +1392,7 @@ mod test {
     use crate::replication::queue::LiveReplicationObligationRecord;
     use crate::s3::get_object::{
         GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, MAX_AUTO_ADVANCES,
-        MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
+        MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, get_object_routed,
     };
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
@@ -1849,6 +1850,109 @@ mod test {
             read_buffer.extend_from_slice(&bytes);
         }
         assert_eq!(read_buffer, content.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn routed_missing_blob() {
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+
+        let bucket = "s3test".to_string();
+        let key = "missing.txt".to_string();
+        let version_id = Ulid::generate();
+        let user_identity = UserId::nil(RealmId::from_bytes([3u8; 32]));
+
+        if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                    key: BlobHeadKey::new(&bucket, &key).to_bytes().unwrap().into(),
+                    value: CurrentVersionPointer::new(version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    txn_id: Some(txn_id),
+                })
+                .await;
+
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    key: VersionKey::new(&bucket, &key, version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    value: BlobVersion::materialized(
+                        [5u8; 32],
+                        BackendRef::node_default(),
+                        SystemTime::UNIX_EPOCH,
+                        user_identity,
+                        None,
+                    )
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                    txn_id: Some(txn_id),
+                })
+                .await;
+
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+                .await;
+        } else {
+            panic!("Failed to start transaction");
+        }
+
+        let driver_ctx = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let read = get_object_routed(
+            &driver_ctx,
+            GetObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+                range: None,
+                group_id: Ulid::generate(),
+                user_identity,
+                node_id: test_node_id(),
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(
+            read,
+            Ok(Some(Err(GetObjectError::GetObjectFailed)))
+        ));
+
+        let ranged = get_object_routed(
+            &driver_ctx,
+            GetObjectInput {
+                bucket,
+                key,
+                version_id: None,
+                range: Some(ObjectRangeRequest::StartEnd { start: 0, end: 1 }),
+                group_id: Ulid::generate(),
+                user_identity,
+                node_id: test_node_id(),
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(
+            ranged,
+            Ok(Some(Err(GetObjectError::GetObjectFailed)))
+        ));
     }
 
     #[tokio::test]
