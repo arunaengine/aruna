@@ -288,7 +288,9 @@ impl KubernetesBackend {
         Ok(())
     }
 
-    async fn apply_network(&self) -> Result<(), BackendError> {
+    /// Creates or patches both network policies. Running pods keep the policy
+    /// they were started with, so a node applies them at startup too.
+    pub async fn apply_network(&self) -> Result<(), BackendError> {
         let policies: Api<NetworkPolicy> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
         let params = PatchParams::apply("aruna-compute");
@@ -2729,6 +2731,45 @@ mod tests {
             config,
         };
         assert!(backend.capabilities().session);
+    }
+
+    #[tokio::test]
+    async fn applies_startup_policies() {
+        // A pod keeps the policy it started with, so an upgraded node must
+        // patch both of them before it serves an already running session.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record requests")
+                .push(format!("{method} {path}"));
+            (
+                200,
+                json!({
+                    "apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy",
+                    "metadata":{"name":"aruna-compute-deny","namespace":"compute"}
+                }),
+            )
+        });
+        let mut config = test_config();
+        config.s3_cidrs.push("10.0.0.0/8".to_string());
+        let backend = KubernetesBackend { client, config };
+
+        backend.apply_network().await.expect("the policies apply");
+
+        let seen = seen.lock().expect("read requests").clone();
+        let patched: Vec<&String> = seen
+            .iter()
+            .filter(|entry| entry.starts_with("PATCH"))
+            .collect();
+        assert_eq!(patched.len(), 2);
+        assert!(
+            patched
+                .iter()
+                .all(|entry| entry.contains("networkpolicies"))
+        );
+        assert!(patched[1].contains("aruna-compute-s3"));
     }
 
     const POD_START: &str = "2027-01-01T00:00:00Z";

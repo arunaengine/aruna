@@ -1406,6 +1406,12 @@ async fn build_kubernetes(
     aruna_compute::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
+    // Pods keep the policy they started with, so already running sessions only
+    // get a repaired one once the node applies it again.
+    backend
+        .apply_network()
+        .await
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!("Kubernetes executor backend enabled");
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
