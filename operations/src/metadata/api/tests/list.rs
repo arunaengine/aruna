@@ -686,3 +686,172 @@ async fn foreign_policy_identity() {
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].record.is_some());
 }
+
+// A per-document DENY inside a group-wide grant: the estimate must decide
+// each document, not reuse one representative answer for the whole group.
+#[tokio::test]
+async fn estimate_counts_exact() {
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let member = UserId::local(Ulid::generate(), TEST_REALM_ID);
+    let mut allowed = public_record(group_id, Ulid::generate());
+    allowed.public = false;
+    let mut denied = public_record(group_id, Ulid::generate());
+    denied.public = false;
+    write_auth_docs(
+        &test,
+        group_id,
+        user_role(
+            member,
+            HashMap::from([
+                (
+                    format!("/{TEST_REALM_ID}/g/{group_id}/meta/**"),
+                    Permission::READ,
+                ),
+                (denied.permission_path.clone(), Permission::DENY),
+            ]),
+        ),
+    )
+    .await;
+    seed_registry_cache(&test, &allowed).await;
+    seed_registry_cache(&test, &denied).await;
+
+    let page = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            auth: Some(auth_for(member)),
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(listed_ids(&page), vec![allowed.document_id]);
+    assert_eq!(page.total_estimate, Some(1));
+
+    // A targeted lookup still reports no estimate for the same caller.
+    let lookup = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
+            auth: Some(auth_for(member)),
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(lookup.total_returned, 1);
+    assert_eq!(lookup.total_estimate, None);
+}
+
+// path_prefix must scope the estimate to the same set the page came from.
+#[tokio::test]
+async fn estimate_honours_prefix() {
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    for _ in 0..2 {
+        seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
+    }
+    let mut other = public_record(group_id, Ulid::generate());
+    other.document_path = "other/excluded".to_string();
+    seed_registry_cache(&test, &other).await;
+
+    let result = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            path_prefix: Some("datasets".to_string()),
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+
+    assert_eq!(result.total_returned, 2);
+    assert_eq!(result.total_estimate, Some(2));
+}
+
+// Update stamps deliberately disagree with the ascending document ids.
+async fn seed_timed_records(test: &MetadataTest, group_id: GroupId) -> Vec<MetadataRegistryRecord> {
+    let mut records = Vec::new();
+    for updated_at_ms in [10u64, 30, 20] {
+        let mut record = public_record(group_id, Ulid::generate());
+        record.updated_at_ms = updated_at_ms;
+        seed_registry_cache(test, &record).await;
+        records.push(record);
+    }
+    records
+}
+
+fn listed_ids(result: &ListVisibleMetadataDocumentsResult) -> Vec<Ulid> {
+    result
+        .documents
+        .iter()
+        .map(|document| document.record.document_id)
+        .collect()
+}
+
+// Recency ordering must precede the offset window so pages walk it too.
+#[tokio::test]
+async fn orders_recent_first() {
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let records = seed_timed_records(&test, group_id).await;
+
+    let page = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            order: MetadataListOrder::Recent,
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(
+        listed_ids(&page),
+        vec![
+            records[1].document_id,
+            records[2].document_id,
+            records[0].document_id
+        ]
+    );
+
+    let second = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        ListVisibleMetadataDocumentsRequest {
+            limit: Some(1),
+            offset: Some(1),
+            order: MetadataListOrder::Recent,
+            ..summary_request(group_id, false)
+        },
+    )
+    .await
+    .expect("listing succeeds");
+    assert_eq!(listed_ids(&second), vec![records[2].document_id]);
+}
+
+// The default page stays in ascending document id order.
+#[tokio::test]
+async fn default_keeps_created() {
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let records = seed_timed_records(&test, group_id).await;
+
+    let page = list_visible_metadata_documents(
+        &test.context,
+        TEST_REALM_ID,
+        summary_request(group_id, false),
+    )
+    .await
+    .expect("listing succeeds");
+
+    let mut expected = records
+        .iter()
+        .map(|record| record.document_id)
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(listed_ids(&page), expected);
+}
