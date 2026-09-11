@@ -1206,3 +1206,224 @@ async fn config_setup() -> ConfigHarness {
         shard_target,
     }
 }
+
+// Post-rebalance genesis adoption: live holders no longer include the emit-time
+// stamped holder carrying the genesis, so the bootstrap pull must union stamp and
+// live holders; otherwise a fresh genesis could fork the topic and evict writes.
+#[tokio::test]
+async fn pull_reaches_ex_holder() {
+    let realm_id = RealmId::from_bytes([53u8; 32]);
+    let ex_dir = tempdir().expect("temp dir");
+    let ex_storage =
+        FjallStorage::open(ex_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let ex_holder = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        ex_storage.clone(),
+    )
+    .await
+    .expect("net handle");
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let net = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await
+    .expect("net handle");
+    net.add_peer_addr(ex_holder.endpoint_addr()).await;
+    ex_holder.add_peer_addr(net.endpoint_addr()).await;
+    // The ex-holder must serve inbound sync streams for the pull to reach
+    // its genesis.
+    crate::sync::incoming::initialize_net_incoming(Arc::new(DriverContext {
+        storage_handle: ex_storage.clone(),
+        net_handle: Some(ex_holder.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    }));
+
+    // The live config resolves the shard's holders to this node only: the
+    // stamped ex-holder has been rebalanced out.
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    config.ensure_node(net.node_id(), RealmNodeKind::Management);
+    let actor = Actor {
+        node_id: net.node_id(),
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    match storage
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*realm_id.as_bytes()).into(),
+            value: config.to_bytes(&actor).expect("config bytes").into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected realm config write: {other:?}"),
+    }
+    // The ex-holder keeps the realm config that rebalanced it out, so it
+    // still admits inbound sync from the current holders.
+    ex_holder
+        .refresh_realm_peers_from_document(&config)
+        .await
+        .expect("ex-holder refreshes realm peers");
+
+    let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
+    let placement = aruna_core::structs::PlacementRef {
+        strategy_id,
+        shard: 0,
+    };
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id: Ulid::from_parts(1, 1),
+        document_id: Ulid::from_parts(2, 2),
+    };
+    let topic = target.sync_topic_id(realm_id, &placement);
+
+    // Only the ex-holder carries the genesis (with this node as a member,
+    // as the pre-rebalance membership reconciliation would have left it).
+    ex_holder
+        .ensure_document_sync_topics(&[topic], vec![net.node_id()])
+        .expect("genesis on the ex-holder");
+    assert!(!net.document_sync_topic_exists(topic).unwrap_or(true));
+
+    let mut change = change();
+    change.placement = placement;
+    let record = crate::sync::document_sync_outbox::new_outbox_record(
+        net.node_id(),
+        target,
+        vec![ex_holder.node_id()],
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: b"doc".to_vec(),
+            change,
+        },
+        aruna_core::structs::PlacementRef::NIL,
+        false,
+    );
+    let record_key = outbox_key(&record).to_vec();
+    write_outbox_record(&storage, &record).await;
+
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        handler.drain_document_sync_outbox().await;
+        if read_outbox_record(&storage, &record_key)
+            .await
+            .expect("read outbox record")
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "record never published: the drain did not adopt the ex-holder's genesis"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        net.document_sync_topic_exists(topic).unwrap_or(false),
+        "the genesis must be adopted from the stamped ex-holder"
+    );
+
+    ex_holder.shutdown().await;
+    net.shutdown().await;
+}
+
+fn admin_placement(shard: u32) -> aruna_core::structs::PlacementRef {
+    aruna_core::structs::PlacementRef {
+        strategy_id: Ulid::from_bytes([50; 16]),
+        shard,
+    }
+}
+
+fn admin_outbox(
+    realm_id: RealmId,
+    origin: aruna_core::NodeId,
+    origin_seq: u64,
+    target: DocumentSyncTarget,
+    placement: aruna_core::structs::PlacementRef,
+) -> DocumentSyncOutboxRecord {
+    use aruna_core::admin_documents::{
+        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    };
+    let user_id = aruna_core::types::UserId::nil(realm_id);
+    crate::sync::document_sync_outbox::new_outbox_record(
+        node(1),
+        target,
+        Vec::new(),
+        DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+            event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
+            target: AdminDocumentTarget::User { user_id },
+            origin_node_id: origin,
+            origin_seq,
+            observed: AdminDocumentClock::default(),
+            actor: aruna_core::structs::Actor {
+                node_id: node(1),
+                user_id,
+                realm_id,
+            },
+            op: AdminDocumentOperation::UserNameSet {
+                name: format!("user-{origin_seq}"),
+            },
+        }),
+        placement,
+        false,
+    )
+}
+
+fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentSyncOutboxRecord {
+    admin_outbox(
+        RealmId([3; 32]),
+        origin,
+        origin_seq,
+        target(),
+        admin_placement(1),
+    )
+}
+
+fn shard_change(seed: u8) -> DocumentSyncChange {
+    let mut value = change();
+    value.placement = aruna_core::structs::PlacementRef {
+        strategy_id: Ulid::from_bytes([seed; 16]),
+        shard: 1,
+    };
+    value
+}
+
+fn shard_topic_record(origin_seq: u64) -> DocumentSyncOutboxRecord {
+    crate::sync::document_sync_outbox::new_outbox_record(
+        node(1),
+        target(),
+        vec![node(2)],
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: vec![origin_seq as u8],
+            change: change(),
+        },
+        aruna_core::structs::PlacementRef::NIL,
+        false,
+    )
+}
