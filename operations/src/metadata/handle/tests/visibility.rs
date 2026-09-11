@@ -1,4 +1,3 @@
-use super::super::*;
 use super::*;
 pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
     let document_id = Ulid::generate();
