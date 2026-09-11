@@ -10,25 +10,25 @@ use aruna_core::structs::{
     AuthContext, Permission, ResolvedSourceAccess, SourceConnector, SourceConnectorKind,
     SourceEntryKind,
 };
-use aruna_operations::connectors::create_source_connector::{
+use aruna_operations::connectors::create_connector::{
     CreateSourceConnectorError, CreateSourceConnectorInput, CreateSourceConnectorOperation,
 };
-use aruna_operations::connectors::delete_source_connector::{
+use aruna_operations::connectors::delete_connector::{
     DeleteSourceConnectorError, DeleteSourceConnectorInput, DeleteSourceConnectorOperation,
 };
-use aruna_operations::connectors::get_source_connector::{
+use aruna_operations::connectors::get_connector::{
     GetSourceConnectorError, GetSourceConnectorInput, GetSourceConnectorOperation,
 };
-use aruna_operations::connectors::has_secret_config::{
-    ConnectorHasSecretConfigError, ConnectorHasSecretConfigOperation,
-};
-use aruna_operations::connectors::list_source_connectors::{
+use aruna_operations::connectors::list_connectors::{
     ListSourceConnectorsError, ListSourceConnectorsInput, ListSourceConnectorsOperation,
 };
-use aruna_operations::connectors::replace_source_connector::{
+use aruna_operations::connectors::replace_connector::{
     ReplaceSourceConnectorError, ReplaceSourceConnectorInput, ReplaceSourceConnectorOperation,
 };
 use aruna_operations::connectors::resolver::{resolve_inline_access, validate_source_path};
+use aruna_operations::connectors::secret_config::{
+    ConnectorHasSecretConfigError, ConnectorHasSecretConfigOperation,
+};
 use aruna_operations::connectors::validation::validate_connector_input;
 use aruna_operations::connectors::{ResolveSourceConnectorInput, ResolveSourceConnectorOperation};
 use aruna_operations::driver::drive;
@@ -1134,7 +1134,7 @@ fn map_list_connector_error(error: ListSourceConnectorsError) -> ServerError {
 }
 
 fn map_get_connector_error(
-    error: aruna_operations::connectors::get_source_connector::GetSourceConnectorError,
+    error: aruna_operations::connectors::get_connector::GetSourceConnectorError,
 ) -> ServerError {
     match error {
         GetSourceConnectorError::NotFound => ServerError::NotFound,

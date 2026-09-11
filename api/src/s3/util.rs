@@ -4,7 +4,7 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
     MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_relative_path,
 };
-use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
+use aruna_operations::s3::complete_upload::CompleteMultipartPart;
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;

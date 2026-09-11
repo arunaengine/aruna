@@ -18,8 +18,8 @@ use aruna_operations::node::node_info::{
     departure_report, group_demand, read_node_info_documents, read_operator_drain,
     set_operator_drain,
 };
-use aruna_operations::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use aruna_operations::realm::set_realm_compute::{
+use aruna_operations::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::set_compute::{
     SetRealmComputeConfig, SetRealmComputeError, SetRealmComputeOperation,
 };
 use axum::extract::{Query, State};

@@ -14,22 +14,22 @@ use aruna_core::structs::{
 use aruna_core::types::RoleId;
 use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::driver::drive;
-use aruna_operations::groups::add_group_role::{
-    AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
-};
-use aruna_operations::groups::add_user_to_group::{
+use aruna_operations::groups::add_member::{
     AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
+};
+use aruna_operations::groups::add_role::{
+    AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
 };
 use aruna_operations::groups::create_group::{
     CreateGroupConfig, CreateGroupError, CreateGroupOperation,
 };
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::groups::remove_group_role::{
-    RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
-};
-use aruna_operations::groups::remove_user_from_group::{
+use aruna_operations::groups::remove_member::{
     RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
+};
+use aruna_operations::groups::remove_role::{
+    RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
 };
 use aruna_operations::groups::update_group::{
     UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
@@ -39,10 +39,10 @@ use aruna_operations::metadata::forward::{
     ForwardGroupError, forward_group_create, is_user_origin,
 };
 use aruna_operations::metadata::stats::count_group_documents_by_purpose;
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_objects_v2::{
+use aruna_operations::s3::list_objects::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
 };
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
@@ -2196,8 +2196,8 @@ mod tests {
         .await
         .unwrap();
         drive(
-            aruna_operations::realm::claim_initial_realm_admin::ClaimInitialRealmAdminOperation::new(
-                aruna_operations::realm::claim_initial_realm_admin::ClaimInitialRealmAdminInput { actor },
+            aruna_operations::realm::claim_admin::ClaimInitialRealmAdminOperation::new(
+                aruna_operations::realm::claim_admin::ClaimInitialRealmAdminInput { actor },
             ),
             &driver_ctx,
         )
@@ -2225,7 +2225,7 @@ mod tests {
     ) {
         let realm_id = state.get_realm_id();
         let mut config = drive(
-            aruna_operations::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
             &state.get_ctx(),
         )
         .await

@@ -23,15 +23,15 @@ use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };
 use aruna_operations::placement::transition::transition_health;
-use aruna_operations::realm::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::realm::get_realm_nodes::{
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_nodes::{
     GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
-use aruna_operations::realm::mutate_realm_placement::{
+use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
     drive_realm_placement_mutation,
 };
-use aruna_operations::realm::set_realm_quota::{
+use aruna_operations::realm::set_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
 };
 use axum::extract::State;
@@ -1114,7 +1114,7 @@ pub(crate) async fn run_realm_info(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+        aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1439,7 +1439,7 @@ pub async fn get_realm_placement(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+        aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1620,7 +1620,7 @@ pub async fn mutate_realm_placement(
             drive(GetRealmConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
-                    aruna_operations::realm::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+                    aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
                     other => ServerError::InternalError(other.to_string()),
@@ -1643,7 +1643,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         }
         HandleAllocationError::Append(error) => map_mutate_realm_placement_error(error),
         HandleAllocationError::ReadConfig(
-            aruna_operations::realm::get_realm_config::GetRealmConfigError::DocumentNotFound,
+            aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound,
         ) => ServerError::NotFound,
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
@@ -2576,13 +2576,13 @@ mod tests {
     use aruna_operations::placement::allocate_handle::{
         HandleAllocationError, allocate_placement_binding,
     };
-    use aruna_operations::realm::claim_initial_realm_admin::{
+    use aruna_operations::realm::claim_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_realm_nodes::RealmPresence;
-    use aruna_operations::realm::mutate_realm_placement::MutateRealmPlacementError;
-    use aruna_operations::realm::set_realm_quota::SetRealmQuotaError;
+    use aruna_operations::realm::get_nodes::RealmPresence;
+    use aruna_operations::realm::mutate_placement::MutateRealmPlacementError;
+    use aruna_operations::realm::set_quota::SetRealmQuotaError;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::body::Body;
@@ -3183,7 +3183,7 @@ mod tests {
     async fn deny_path(state: &ServerState, path: &str) {
         let realm_id = state.get_realm_id();
         let mut config = drive(
-            aruna_operations::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
             &state.get_ctx(),
         )
         .await
@@ -3301,7 +3301,7 @@ mod tests {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = admin_auth(realm_id, admin);
         let job_family_strategy_id = drive(
-            aruna_operations::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
             &state.get_ctx(),
         )
         .await
@@ -4159,7 +4159,7 @@ mod tests {
         // this node answering about itself, may still not connect it.
         let (state, realm_id, owner, _tempdir) = setup_management_state().await;
         let mut config = drive(
-            aruna_operations::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
             &state.get_ctx(),
         )
         .await
@@ -4208,7 +4208,7 @@ mod tests {
         // device's own node is serving the request, so it saw itself now.
         let (state, realm_id, owner, _tempdir) = setup_management_state().await;
         let mut config = drive(
-            aruna_operations::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
             &state.get_ctx(),
         )
         .await
