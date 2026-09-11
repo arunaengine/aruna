@@ -755,3 +755,109 @@ pub(in crate::document_sync) async fn apply_config_events(
         "realm config admin operation conflict retries exhausted".to_string(),
     ))
 }
+
+pub(in crate::document_sync) fn materialize_group_authorization(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    event: &AdminDocumentEvent,
+) {
+    if let AdminDocumentOperation::GroupJoinDecided { decision } = &event.op {
+        for role_id in &decision.role_ids {
+            overlay_group_authorization_role_assignment_reducer_materialization(
+                auth_doc,
+                reducer_state,
+                *role_id,
+            );
+        }
+        return;
+    }
+    if let AdminDocumentOperation::GroupPoliciesSet { .. } = &event.op {
+        if !reducer_state
+            .conflicts
+            .contains_key(aruna_core::admin_document_reducer::GROUP_POLICIES_PATH)
+            && let Some(policies) = reducer_state.materialized_group_policies()
+        {
+            auth_doc.policies = policies;
+        }
+        return;
+    }
+
+    if let AdminDocumentOperation::GroupRoleCreated { role } = &event.op {
+        materialize_group_role(auth_doc, reducer_state, role);
+        return;
+    }
+
+    if let AdminDocumentOperation::GroupRoleRemoved { role_id } = &event.op {
+        auth_doc.roles.remove(role_id);
+        return;
+    }
+
+    let (role_id, user_id) = match &event.op {
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
+            (role_id, user_id)
+        }
+        _ => return,
+    };
+    let path = group_role_user_assignment_path(role_id, user_id);
+    if reducer_state.conflicts.contains_key(&path) {
+        if let Some(role) = auth_doc.roles.get_mut(role_id) {
+            role.assigned_users.remove(user_id);
+        }
+        return;
+    }
+    let Some(role) = auth_doc.roles.get_mut(role_id) else {
+        return;
+    };
+    let assigned = reducer_state
+        .user_subject_ids
+        .get(&path)
+        .and_then(|version| version.value.as_deref())
+        .and_then(|value| UserId::from_string(value).ok())
+        .is_some_and(|materialized_user_id| materialized_user_id == *user_id);
+    if assigned {
+        role.assigned_users.insert(*user_id);
+    } else {
+        role.assigned_users.remove(user_id);
+    }
+}
+
+pub(in crate::document_sync) fn materialize_group_role(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    role: &AdminDocumentRoleDefinition,
+) {
+    let role_path = group_role_path(&role.role_id);
+    if reducer_state.conflicts.contains_key(&role_path)
+        || !reducer_state
+            .materialized_group_roles()
+            .contains(&role.role_id)
+    {
+        auth_doc.roles.remove(&role.role_id);
+        return;
+    }
+
+    let assigned_users = auth_doc
+        .roles
+        .get(&role.role_id)
+        .map(|role| role.assigned_users.clone())
+        .unwrap_or_default();
+    auth_doc.roles.insert(
+        role.role_id,
+        Role {
+            role_id: role.role_id,
+            name: role.name.clone(),
+            permissions: role
+                .permissions
+                .iter()
+                .map(|(path, permission)| (path.clone(), permission.clone()))
+                .collect(),
+            assigned_users,
+        },
+    );
+    overlay_group_authorization_role_assignment_reducer_materialization(
+        auth_doc,
+        reducer_state,
+        role.role_id,
+    );
+}
