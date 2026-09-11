@@ -1,5 +1,5 @@
 const MAIN_SOURCE: &str = include_str!("../src/main.rs");
-const TASK_SOURCE: &str = include_str!("../../operations/src/tasks/task_incoming.rs");
+const TASK_SOURCE: &str = include_str!("../../operations/src/tasks/task_incoming/mod.rs");
 
 #[test]
 fn startup_ownership() {
