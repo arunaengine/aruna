@@ -23,6 +23,7 @@ use crate::admin_documents::{
     AdminDocumentTarget,
 };
 use crate::auth::REVOCATION_GRACE_SECS;
+use crate::identifiers::PlacementHandle;
 use crate::structs::{
     Actor, AffinityEffect, AffinityRule, BindingError, BindingScope, BucketPlan, CandidateMapNode,
     CandidatePlacementMap, CompletionProof, DocumentClass, FIRST_GRANTABLE_HANDLE,
@@ -33,9 +34,8 @@ use crate::structs::{
     STORAGE_CLASS_LABEL_PREFIX, StrategyBinding, TransitionLimits, TransitionPlan,
     TransitionStatus, UserGroupCapOverride,
 };
-use crate::structured_id::PlacementHandle;
 use crate::types::{GroupId, RoleId};
-use crate::user_update_validation::UserAttributeValidationError;
+use crate::user_validation::UserAttributeValidationError;
 use crate::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;

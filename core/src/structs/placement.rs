@@ -1,6 +1,6 @@
 use crate::NodeId;
+use crate::identifiers::PlacementHandle;
 use crate::structs::{HandleRangeDirectory, RealmId};
-use crate::structured_id::PlacementHandle;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ pub const DEFAULT_NODE_WEIGHT: u32 = 100;
 /// can mask with `shard_count - 1`.
 pub const DEFAULT_SHARD_COUNT: u32 = 64;
 /// Maximum shard fan-out, fixed to the structured-id bucket capacity.
-pub const MAX_PLACEMENT_SHARD_COUNT: u32 = crate::structured_id::MAX_BUCKET_COUNT as u32;
+pub const MAX_PLACEMENT_SHARD_COUNT: u32 = crate::identifiers::MAX_BUCKET_COUNT as u32;
 /// Upper bound for a configurable node weight; onboarding/config inputs clamp
 /// present values into `1..=MAX_NODE_WEIGHT`.
 pub const MAX_NODE_WEIGHT: u32 = 10_000;
@@ -249,7 +249,7 @@ pub const METADATA_HANDLE: u32 = FIRST_HANDLE;
 pub const FIRST_GRANTABLE_HANDLE: u32 = 3;
 /// Exclusive upper bound of the 20-bit handle space (one past the highest
 /// allocatable handle).
-pub const HANDLE_SPACE_END: u32 = crate::structured_id::MAX_PLACEMENT_HANDLE + 1;
+pub const HANDLE_SPACE_END: u32 = crate::identifiers::MAX_PLACEMENT_HANDLE + 1;
 /// Handles per bootstrap-assigned node band.
 pub const HANDLE_RANGE_SIZE: u32 = 1024;
 
@@ -694,8 +694,8 @@ mod tests {
 
     #[test]
     fn binding_round_trips() {
+        use crate::identifiers::PlacementHandle;
         use crate::structs::RealmId;
-        use crate::structured_id::PlacementHandle;
 
         let binding = PlacementBinding {
             handle: PlacementHandle::new(0x1234).unwrap(),
@@ -733,7 +733,7 @@ mod tests {
         // shards than the id's bucket field can encode.
         assert_eq!(
             MAX_PLACEMENT_SHARD_COUNT,
-            crate::structured_id::MAX_BUCKET_COUNT as u32
+            crate::identifiers::MAX_BUCKET_COUNT as u32
         );
         assert_eq!(MAX_PLACEMENT_SHARD_COUNT, 4096);
     }
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn binding_no_bucket() {
         // Exhaustive destructuring protects the no-bucket/no-holder invariant.
-        use crate::structured_id::PlacementHandle;
+        use crate::identifiers::PlacementHandle;
 
         let binding = PlacementBinding {
             handle: PlacementHandle::new(1).unwrap(),

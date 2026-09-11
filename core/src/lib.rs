@@ -1,6 +1,5 @@
 #![allow(clippy::result_large_err)]
 
-pub mod admin_document_reducer;
 pub mod admin_documents;
 pub mod alpn;
 pub mod audit;
@@ -15,6 +14,7 @@ pub mod errors;
 pub mod events;
 pub mod handle;
 pub mod id;
+pub mod identifiers;
 pub mod jobs;
 pub mod join_request;
 pub mod keys;
@@ -24,20 +24,20 @@ pub mod metrics;
 pub mod onboarding;
 pub mod operation;
 pub mod permission_path;
+pub mod reducer;
 pub mod request_policy;
 pub mod scheduling;
 pub mod shutdown;
 pub mod storage_entries;
 pub mod stream;
 pub mod structs;
-pub mod structured_id;
 pub mod task;
 pub mod telemetry;
 pub mod trace_context;
 pub mod types;
 pub mod user_id;
 pub mod user_profile;
-pub mod user_update_validation;
+pub mod user_validation;
 pub mod util;
 
 pub use document::{
@@ -46,13 +46,13 @@ pub use document::{
     DocumentSyncTarget,
 };
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
-pub use keyspaces::*;
-pub use metadata::*;
-pub use onboarding::*;
-pub use structured_id::{
+pub use identifiers::{
     BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle,
     StructuredId, StructuredIdGenerator, SystemEnvironment,
 };
+pub use keyspaces::*;
+pub use metadata::*;
+pub use onboarding::*;
 pub use task::{TaskEffect, TaskEvent, TaskKey};
 pub use trace_context::DistributedTraceContext;
 pub use user_id::UserId;

@@ -2,7 +2,6 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerState};
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
@@ -31,6 +30,7 @@ use crate::metadata::{
     MetadataMaterializationDeadLetterRecord, MetadataMaterializationJobRecord,
     MetadataMaterializationStatusRecord, MetadataProfileValidationStatus, MetadataRawOriginBudget,
 };
+use crate::reducer::{AdminDocumentConflict, AdminDocumentReducerState};
 use crate::structs::{
     MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PLACEMENT_EPOCH_PAD,
     PlacementRef, RealmId, User, WatchSubscription, notification_inbox_key,
@@ -871,10 +871,6 @@ mod tests {
         shard_manifest_key, shard_manifest_prefix, shard_manifest_write_entry,
         stale_admin_document_conflict_delete_entries, updated_index_key,
     };
-    use crate::admin_document_reducer::{
-        AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
-        AdminDocumentReducerState,
-    };
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use crate::document::ShardManifestEntry;
     use crate::document::{
@@ -889,6 +885,10 @@ mod tests {
         SHARD_MANIFEST_KEYSPACE,
     };
     use crate::metadata::{MetadataGraphLifecycleRecord, MetadataIriReferenceIndexRecord};
+    use crate::reducer::{
+        AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
+        AdminDocumentReducerState,
+    };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
 

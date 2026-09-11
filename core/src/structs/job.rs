@@ -10,14 +10,14 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::compute::ExecutionTargetId;
 use crate::errors::ConversionError;
+use crate::identifiers::{
+    BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
+};
 use crate::structs::invert_timestamp_ms;
 use crate::structs::{
     AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentIdSpec,
     PlacementPolicyRef, PlacementRef, RealmId, StagingStrategy, StoragePurgeResult,
     StoragePurgeScope, StoragePurgeSpec,
-};
-use crate::structured_id::{
-    BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
 use crate::types::{GroupId, Key, UserId};
 use crate::util::tail_str;
