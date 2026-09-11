@@ -37,7 +37,7 @@ aruna-tasks = { path = "tasks" }
 
 # Third-party crates
 ahash = "0.8.12"
-async-compression = { version = "0.4.44", default-features = false, features = [
+async-compression = { version = "0.4.46", default-features = false, features = [
     "tokio",
     "deflate",
 ] }
@@ -50,7 +50,7 @@ aws-config = { version = "1.12.0", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-aws-sdk-s3 = { version = "1.145.0", default-features = false, features = [
+aws-sdk-s3 = { version = "1.146.0", default-features = false, features = [
     "default-https-client",
     "http-1x",
     "rt-tokio",
@@ -95,7 +95,7 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
-ipnet = "2.12.1"
+ipnet = "2.12.2"
 iroh = "1.2.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
 irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f66816a16492c615525809f6c8b663", features = [
@@ -138,18 +138,18 @@ prometheus-client = "0.25"
 proptest = "1.11.0"
 quick-xml = "0.42.0"
 rand = "0.10.2"
-reqwest = { version = "0.13.4", default-features = false, features = [
+reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls",
     "stream",
 ] }
-rmcp = { version = "3.2.0", default-features = false, features = [
+rmcp = { version = "3.3.0", default-features = false, features = [
     "server",
     "macros",
     "transport-streamable-http-server",
 ] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-rustls = { version = "0.23.43", features = ["ring"] }
+rustls = { version = "0.23.44", features = ["ring"] }
 kube = { version = "4.2.0", default-features = false, features = [
     "client",
     "jsonpatch",
@@ -174,7 +174,7 @@ tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full", "tracing"] }
-toml = "1.1.5"
+toml = "1.1.6"
 tokio-util = { version = "0.7.19", features = ["compat", "io-util", "rt"] }
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
@@ -190,7 +190,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 ulid = { version = "3.0.0", features = ["serde"] }
 unicode-normalization = "0.1.25"
 url = "2.5.8"
-uuid = { version = "1.26.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 utoipa = { version = "5.5.0", features = [
     "chrono",
     "axum_extras",
