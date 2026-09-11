@@ -1,6 +1,7 @@
 use super::*;
 
 mod admin;
+mod apply;
 mod cursor;
 mod materialize;
 mod registry;
