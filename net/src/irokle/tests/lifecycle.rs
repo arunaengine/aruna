@@ -1281,3 +1281,209 @@ async fn metadata_lifecycle_upsert_preserves_revision_and_replays_idempotently()
         event
     );
 }
+
+#[tokio::test]
+async fn lifecycle_acceptance_fence() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(11, 1);
+    let document_id = Ulid::from_parts(12, 1);
+    let event_id = Ulid::from_parts(13, 1);
+    let accepted = metadata_create_event(group_id, document_id, 100, event_id, 7);
+    let accepted_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        event: Box::new(accepted.clone()),
+    };
+    assert!(
+        apply_metadata_document_lifecycle_to_storage(
+            &storage,
+            &accepted_lifecycle,
+            metadata_lifecycle_change(&accepted_lifecycle, node(8)),
+        )
+        .await
+        .expect("accepted lifecycle create applies")
+    );
+
+    let mut divergent = accepted.clone();
+    divergent.event_id = Ulid::from_parts(14, 1);
+    divergent.record.establishing_event_id = divergent.event_id;
+    divergent.record.last_event_id = divergent.event_id;
+    let divergent_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        event: Box::new(divergent),
+    };
+    assert!(
+        !apply_metadata_document_lifecycle_to_storage(
+            &storage,
+            &divergent_lifecycle,
+            metadata_lifecycle_change(&divergent_lifecycle, node(8)),
+        )
+        .await
+        .expect("divergent lifecycle create is fenced")
+    );
+    let acceptance = read_storage_value(
+        &storage,
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        metadata_create_acceptance_key(document_id),
+    )
+    .await
+    .expect("create acceptance remains");
+    assert_eq!(
+        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        accepted
+    );
+
+    let orphan_id = Ulid::from_parts(15, 1);
+    let mut orphan = metadata_create_event(group_id, orphan_id, 200, orphan_id, 7);
+    orphan.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+        jsonld: "{}".to_string(),
+    };
+    let orphan_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        event: Box::new(orphan),
+    };
+    assert!(
+        !apply_metadata_document_lifecycle_to_storage(
+            &storage,
+            &orphan_lifecycle,
+            metadata_lifecycle_change(&orphan_lifecycle, node(8)),
+        )
+        .await
+        .expect("lifecycle update without acceptance is fenced")
+    );
+    assert!(
+        read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(orphan_id),
+        )
+        .await
+        .is_none()
+    );
+
+    let mut mismatched = accepted.clone();
+    mismatched.event_id = Ulid::from_parts(16, 1);
+    mismatched.record.updated_at_ms = 200;
+    mismatched.record.last_event_id = mismatched.event_id;
+    mismatched.record.placement = PlacementRef {
+        strategy_id: Ulid::from_parts(17, 1),
+        shard: 1,
+    };
+    mismatched.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+        jsonld: "{}".to_string(),
+    };
+    mismatched.occurred_at_ms = 200;
+    let mismatched_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        event: Box::new(mismatched),
+    };
+    assert!(
+        !apply_metadata_document_lifecycle_to_storage(
+            &storage,
+            &mismatched_lifecycle,
+            metadata_lifecycle_change(&mismatched_lifecycle, node(8)),
+        )
+        .await
+        .expect("mismatched lifecycle update is fenced")
+    );
+}
+
+#[tokio::test]
+async fn metadata_lifecycle_upsert_skips_newer_delete_sidecar() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(10, 1);
+    let document_id = Ulid::from_parts(11, 1);
+    let stale_event_id = Ulid::from_parts(12, 1);
+    let delete_event_id = Ulid::from_parts(13, 1);
+    let delete_lifecycle =
+        metadata_delete_lifecycle(group_id, document_id, 200, delete_event_id, stale_event_id);
+    assert!(
+        apply_metadata_document_lifecycle_to_storage(
+            &storage,
+            &delete_lifecycle,
+            metadata_lifecycle_change(&delete_lifecycle, node(8)),
+        )
+        .await
+        .expect("delete lifecycle applies")
+    );
+
+    let stale_event = metadata_create_event(group_id, document_id, 100, stale_event_id, 7);
+    let stale_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        event: Box::new(stale_event),
+    };
+    assert!(
+        !apply_metadata_document_lifecycle_to_storage(
+            &storage,
+            &stale_lifecycle,
+            metadata_lifecycle_change(&stale_lifecycle, node(8)),
+        )
+        .await
+        .expect("stale upsert lifecycle is fenced")
+    );
+
+    assert_eq!(
+        read_document_lifecycle_record(&storage, document_id).await,
+        delete_lifecycle
+    );
+    assert!(
+        read_storage_value(
+            &storage,
+            METADATA_EVENT_LOG_KEYSPACE,
+            metadata_event_log_key(document_id, stale_event_id),
+        )
+        .await
+        .is_none()
+    );
+    let revision = read_lifecycle_revision(&storage, document_id).await;
+    assert_eq!(revision.current.event_id, delete_event_id);
+    assert_eq!(revision.kind, DocumentSyncChangeKind::Delete);
+}
+
+#[tokio::test]
+async fn metadata_lifecycle_delete_skips_stale_and_equal_sidecars() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(20, 1);
+    let document_id = Ulid::from_parts(21, 1);
+    let deleted_after_event_id = Ulid::from_parts(22, 1);
+    let local_delete = metadata_delete_lifecycle(
+        group_id,
+        document_id,
+        200,
+        Ulid::from_parts(23, 1),
+        deleted_after_event_id,
+    );
+    let mut local_change = metadata_lifecycle_change(&local_delete, node(8));
+    local_change.placement = aruna_core::structs::PlacementRef {
+        strategy_id: Ulid::from_parts(25, 1),
+        shard: 5,
+    };
+    assert!(
+        apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, local_change,)
+            .await
+            .expect("delete lifecycle applies")
+    );
+    assert!(
+        !apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, local_change,)
+            .await
+            .expect("equal delete lifecycle is idempotent")
+    );
+
+    let stale_delete = metadata_delete_lifecycle(
+        group_id,
+        document_id,
+        100,
+        Ulid::from_parts(24, 1),
+        deleted_after_event_id,
+    );
+    assert!(
+        !apply_metadata_document_lifecycle_to_storage(
+            &storage,
+            &stale_delete,
+            metadata_lifecycle_change(&stale_delete, node(8)),
+        )
+        .await
+        .expect("stale delete lifecycle is fenced")
+    );
+
+    assert_eq!(
+        read_document_lifecycle_record(&storage, document_id).await,
+        local_delete
+    );
+    let revision = read_lifecycle_revision(&storage, document_id).await;
+    assert_eq!(revision, local_change);
+}
