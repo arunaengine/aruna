@@ -330,7 +330,11 @@ pub(super) fn remove_group_role_user_assignment(
     )
 }
 
-pub(super) fn add_realm_role(event_seed: u8, origin_seed: u8, role_id: RoleId) -> AdminDocumentEvent {
+pub(super) fn add_realm_role(
+    event_seed: u8,
+    origin_seed: u8,
+    role_id: RoleId,
+) -> AdminDocumentEvent {
     realm_event(
         event_seed,
         node(origin_seed),
