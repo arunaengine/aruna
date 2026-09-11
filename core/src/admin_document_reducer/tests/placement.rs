@@ -733,3 +733,239 @@ fn rejects_family_mutation() {
     );
     assert_eq!(state, stored);
 }
+
+#[test]
+fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_independent() {
+    let strategy_id = Ulid::from_bytes([4; 16]);
+    let fallback_strategy_id = Ulid::from_bytes([3; 16]);
+    let subject = b"document-subject".to_vec();
+    let reference_ops = vec![
+        AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+        AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            binding: StrategyBinding {
+                scope: BindingScope::MetadataPathPrefix("datasets".to_string()),
+                strategy_id,
+            },
+        },
+        AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+            record: PlacementOverride {
+                subject,
+                pinned: vec![node(4)],
+                excluded: Vec::new(),
+                strategy_id: Some(strategy_id),
+            },
+        },
+    ];
+
+    for (index, reference_op) in reference_ops.into_iter().enumerate() {
+        let seed = 40 + index as u8 * 10;
+        let strategy_origin = node(seed);
+        let mut initial = realm_config_state();
+        upsert_placement_strategy(&mut initial, seed, seed, strategy_id);
+        let observed_strategy = AdminDocumentClock::default().with_observed(strategy_origin, 1);
+        let removal = realm_config_event(
+            seed + 1,
+            node(seed + 1),
+            1,
+            observed_strategy.clone(),
+            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
+        );
+        let reference = realm_config_event(
+            seed + 2,
+            node(seed + 2),
+            1,
+            observed_strategy,
+            reference_op.clone(),
+        );
+
+        let mut remove_first = initial.clone();
+        assert_eq!(
+            remove_first.apply(&removal),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+        assert_eq!(
+            remove_first.apply(&reference),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+
+        let mut reference_first = initial;
+        assert_eq!(
+            reference_first.apply(&reference),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+        assert_eq!(
+            reference_first.apply(&removal),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+
+        assert_eq!(remove_first, reference_first);
+        assert!(
+            remove_first
+                .materialized_realm_config_placement_strategies()
+                .is_empty()
+        );
+        assert!(remove_first.conflicts.is_empty());
+
+        let mut base_config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        base_config.strategies = vec![
+            placement_strategy(fallback_strategy_id, Some(1)),
+            placement_strategy(strategy_id, Some(3)),
+        ];
+        base_config.default_strategy_id = Some(fallback_strategy_id);
+
+        let mut remove_first_config = base_config.clone();
+        overlay_realm_config_placement_reducer_materialization(
+            &mut remove_first_config,
+            &remove_first,
+            0,
+        );
+        let mut reference_first_config = base_config;
+        overlay_realm_config_placement_reducer_materialization(
+            &mut reference_first_config,
+            &reference_first,
+            0,
+        );
+        assert_eq!(remove_first_config, reference_first_config);
+        assert_eq!(
+            remove_first_config.default_strategy_id,
+            Some(fallback_strategy_id)
+        );
+        assert!(remove_first_config.strategy(&strategy_id).is_none());
+        assert_realm_config_strategy_references_are_live(&remove_first_config);
+
+        match &reference_op {
+            AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {}
+            AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => assert!(
+                remove_first_config
+                    .strategy_bindings
+                    .iter()
+                    .any(|materialized| {
+                        materialized.scope == binding.scope
+                            && materialized.strategy_id == fallback_strategy_id
+                    })
+            ),
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => {
+                let materialized = remove_first_config
+                    .placement_overrides
+                    .iter()
+                    .find(|materialized| materialized.subject == record.subject)
+                    .expect("override remains materialized");
+                assert_eq!(materialized.strategy_id, Some(fallback_strategy_id));
+                assert_eq!(materialized.pinned, record.pinned);
+                assert_eq!(materialized.excluded, record.excluded);
+            }
+            _ => unreachable!("test only contains strategy reference operations"),
+        }
+
+        let restoration = realm_config_event(
+            seed + 3,
+            node(seed + 3),
+            1,
+            AdminDocumentClock::default().with_observed(removal.origin_node_id, 1),
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: placement_strategy(strategy_id, Some(3)),
+            },
+        );
+        remove_first.apply(&restoration).unwrap();
+        overlay_realm_config_placement_reducer_materialization(
+            &mut remove_first_config,
+            &remove_first,
+            0,
+        );
+        assert!(remove_first_config.strategy(&strategy_id).is_some());
+        assert_realm_config_strategy_references_are_live(&remove_first_config);
+        match reference_op {
+            AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
+                assert_eq!(remove_first_config.default_strategy_id, Some(strategy_id))
+            }
+            AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => assert!(
+                remove_first_config
+                    .strategy_bindings
+                    .iter()
+                    .any(|materialized| {
+                        materialized.scope == binding.scope
+                            && materialized.strategy_id == strategy_id
+                    })
+            ),
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => assert!(
+                remove_first_config
+                    .placement_overrides
+                    .iter()
+                    .any(|materialized| {
+                        materialized.subject == record.subject
+                            && materialized.strategy_id == Some(strategy_id)
+                            && materialized.pinned == record.pinned
+                            && materialized.excluded == record.excluded
+                    })
+            ),
+            _ => unreachable!("test only contains strategy reference operations"),
+        }
+    }
+}
+
+fn assert_realm_config_strategy_references_are_live(config: &RealmConfigDocument) {
+    assert!(
+        config
+            .default_strategy_id
+            .is_none_or(|strategy_id| config.strategy(&strategy_id).is_some())
+    );
+    assert!(
+        config
+            .strategy_bindings
+            .iter()
+            .all(|binding| config.strategy(&binding.strategy_id).is_some())
+    );
+    assert!(config.placement_overrides.iter().all(|record| {
+        record
+            .strategy_id
+            .is_none_or(|strategy_id| config.strategy(&strategy_id).is_some())
+    }));
+}
+
+#[test]
+fn realm_config_strategy_binding_materializes_and_removes() {
+    let mut state = realm_config_state();
+    let scope = BindingScope::Class(DocumentClass::MetadataRegistry);
+    let binding = StrategyBinding {
+        scope: scope.clone(),
+        strategy_id: Ulid::from_bytes([4; 16]),
+    };
+    upsert_placement_strategy(&mut state, 9, 9, binding.strategy_id);
+    let scope_key = binding_scope_key(&scope);
+    let set_origin = node(1);
+    let set = realm_config_event(
+        1,
+        set_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            binding: binding.clone(),
+        },
+    );
+
+    state.apply(&set).unwrap();
+    assert_eq!(
+        state.materialized_realm_config_strategy_bindings(),
+        BTreeMap::from([(scope_key, binding)])
+    );
+    assert!(
+        !state
+            .conflicts
+            .contains_key(&realm_config_strategy_binding_path(&scope))
+    );
+
+    let removal = realm_config_event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default().with_observed(set_origin, 1),
+        AdminDocumentOperation::RealmConfigStrategyBindingRemoved { scope },
+    );
+    state.apply(&removal).unwrap();
+    assert!(
+        state
+            .materialized_realm_config_strategy_bindings()
+            .is_empty()
+    );
+    assert!(state.conflicts.is_empty());
+}
