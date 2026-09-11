@@ -251,3 +251,147 @@ pub(in crate::document_sync) async fn apply_user_admin_document_operation_to_sto
         "user subject claim apply conflict retries exhausted".to_string(),
     ))
 }
+
+pub(in crate::document_sync) async fn group_write_entries_from_reducer(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    reducer_state: &AdminDocumentReducerState,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    let target = DocumentSyncTarget::Group { group_id };
+    let group =
+        match storage_read_from(storage, GROUP_KEYSPACE.to_string(), target.storage_key()).await? {
+            Some(bytes) => {
+                let mut group = Group::from_bytes(&bytes)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                if group.group_id != group_id {
+                    return Err(NetError::Bootstrap(format!(
+                        "stored group document id {group_id} does not match payload group id {}",
+                        group.group_id
+                    )));
+                }
+                overlay_group_reducer_materialization(&mut group, reducer_state);
+                group
+            }
+            None => {
+                let Some(group) = group_reducer_materialized_group(group_id, reducer_state) else {
+                    return Ok(Vec::new());
+                };
+                group
+            }
+        };
+
+    Ok(vec![
+        target_write_entry(
+            target,
+            postcard::to_allocvec(&group)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        ),
+        (
+            GROUP_OWNER_INDEX_KEYSPACE.to_string(),
+            group_owner_index_key(group.owner, group.group_id).into(),
+            ByteView::from(Vec::new()),
+        ),
+    ])
+}
+
+pub(in crate::document_sync) async fn apply_group_authorization_admin_document_operation_to_storage(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    event: AdminDocumentEvent,
+) -> Result<()> {
+    let DocumentSyncTarget::GroupAuthorization { group_id } = document_target.clone() else {
+        return Err(NetError::Bootstrap(
+            "group admin operation sync only supports group authorization targets".to_string(),
+        ));
+    };
+    let AdminDocumentTarget::Group {
+        group_id: event_group_id,
+    } = event.target.clone()
+    else {
+        return Err(NetError::Bootstrap(
+            "admin document operation payload target is not a group".to_string(),
+        ));
+    };
+    if event_group_id != group_id {
+        return Err(NetError::Bootstrap(format!(
+            "replicated group admin operation target {group_id} does not match payload group id {event_group_id}"
+        )));
+    }
+    if !matches!(
+        &event.op,
+        AdminDocumentOperation::GroupCreated { .. }
+            | AdminDocumentOperation::GroupRoleAdded { .. }
+            | AdminDocumentOperation::GroupRoleCreated { .. }
+            | AdminDocumentOperation::GroupRoleRemoved { .. }
+            | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
+            | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
+            | AdminDocumentOperation::GroupPoliciesSet { .. }
+            | AdminDocumentOperation::GroupJoinRequested { .. }
+            | AdminDocumentOperation::GroupJoinDecided { .. }
+            | AdminDocumentOperation::GroupDisplayNameSet { .. }
+    ) {
+        return Err(NetError::Bootstrap(
+            "group admin operation sync only supports group creation, renames, role seeds, role creation/removal, role user assignment updates, and policy updates"
+                .to_string(),
+        ));
+    }
+
+    let previous_state = storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&event.target),
+    )
+    .await?
+    .map(|bytes| decode_admin_document_reducer_state(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut reducer_state = previous_state
+        .clone()
+        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+    let apply_status = reducer_state
+        .apply(&event)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
+        return Ok(());
+    }
+
+    let previous_auth_doc = storage_read_from(
+        storage,
+        document_target.storage_keyspace().to_string(),
+        document_target.storage_key(),
+    )
+    .await?
+    .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut auth_doc = previous_auth_doc.unwrap_or_else(|| GroupAuthorizationDocument {
+        group_id,
+        roles: Default::default(),
+        policies: Default::default(),
+    });
+    materialize_group_authorization(&mut auth_doc, &reducer_state, &event);
+    let group_writes = group_write_entries_from_reducer(storage, group_id, &reducer_state).await?;
+
+    let mut writes = vec![
+        (
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            auth_doc
+                .to_bytes(&event.actor)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        ),
+        admin_document_reducer_state_write_entry(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    ];
+    writes.extend(group_writes);
+    writes.extend(
+        admin_document_conflict_write_entries(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    );
+
+    let stale_conflict_deletes =
+        stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
+    storage_batch_delete_and_write_transactionally(storage, stale_conflict_deletes, writes).await
+}
