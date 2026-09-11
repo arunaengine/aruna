@@ -25,8 +25,6 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::UserId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
-use aruna_tasks::{InboundTaskHandler, TaskHandle};
-use async_trait::async_trait;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 use ulid::Ulid;
