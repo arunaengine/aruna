@@ -243,3 +243,231 @@ fn foreign_reports_dropped() {
         Err(AdminDocumentReducerError::TransitionReportOversized)
     ));
 }
+
+#[test]
+fn concurrent_plans_gated() {
+    // Two complete plans derived from one activation base: only the
+    // ULID-first one advances the bucket, in either delivery order, and
+    // the other can never replay as its successor.
+    let plan_a = transition_plan(&[1, 2], &[3, 4]);
+    let mut plan_b = transition_plan(&[1, 2], &[3, 4]);
+    plan_b.transition_id = Ulid::from_bytes([32; 16]);
+    plan_b.target_map_epoch = 3;
+
+    let start_b = realm_config_event(
+        45,
+        node(1),
+        6,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigTransitionStarted {
+            plan: plan_b.clone(),
+        },
+    );
+    let completion_b: Vec<AdminDocumentEvent> = (0..4)
+        .map(|index| {
+            let seed = (index + 1) as u8;
+            if index < 2 {
+                realm_config_event(
+                    70 + index as u8,
+                    node(seed),
+                    3,
+                    AdminDocumentClock::default(),
+                    AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                        transition_id: plan_b.transition_id,
+                        bucket: 0,
+                        reported_by: node(seed),
+                        frontier: vec![seed],
+                    },
+                )
+            } else {
+                realm_config_event(
+                    70 + index as u8,
+                    node(seed),
+                    4,
+                    AdminDocumentClock::default(),
+                    AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                        transition_id: plan_b.transition_id,
+                        strategy_id: plan_b.strategy_id,
+                        proof: proof_for(&plan_b, 0, seed),
+                    },
+                )
+            }
+        })
+        .collect();
+
+    let mut forward: Vec<AdminDocumentEvent> = transition_events(&plan_a);
+    forward.extend(completion_events(&plan_a));
+    forward.push(start_b.clone());
+    forward.extend(completion_b.clone());
+
+    let mut reversed: Vec<AdminDocumentEvent> = transition_events(&plan_a);
+    reversed.push(start_b);
+    reversed.extend(completion_b);
+    reversed.extend(completion_events(&plan_a));
+
+    for events in [forward, reversed] {
+        let mut state = realm_config_state();
+        for event in events {
+            state.apply(&event).unwrap();
+        }
+        let config = transition_config(&state);
+        let activation = config
+            .activation(&plan_a.strategy_id, 0)
+            .expect("activation");
+        assert_eq!(activation.activation_epoch, 2);
+        assert_eq!(activation.candidate_map_epoch, plan_a.target_map_epoch);
+    }
+}
+
+#[test]
+fn map_conflict_fails_closed() {
+    // Two divergent maps at one epoch keep the epoch unusable, both retained.
+    let mut state = realm_config_state();
+    for (event_seed, origin, seeds) in [(60u8, node(1), &[1u8, 2][..]), (61, node(2), &[3][..])] {
+        state
+            .apply(&realm_config_event(
+                event_seed,
+                origin,
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                    map: map_with(1, seeds),
+                },
+            ))
+            .unwrap();
+    }
+
+    let config = transition_config(&state);
+    assert_eq!(config.candidate_maps.len(), 2);
+    assert!(config.candidate_map(1).is_none());
+    assert!(state.materialized_candidate_maps().is_empty());
+}
+
+#[test]
+fn activation_init_covers_buckets() {
+    let plan = transition_plan(&[1, 2], &[3, 4]);
+    let mut state = realm_config_state();
+    for event in transition_events(&plan).iter().take(4) {
+        state.apply(event).unwrap();
+    }
+
+    let config = transition_config(&state);
+    assert_eq!(config.placement_activations.len(), 2);
+    for shard in 0..2 {
+        let activation = config
+            .activation(&plan.strategy_id, shard)
+            .expect("bucket activated");
+        assert_eq!(activation.activation_epoch, 1);
+        assert_eq!(activation.candidate_map_epoch, 1);
+        assert_eq!(activation.transition_id, None);
+    }
+}
+
+#[test]
+fn proof_admission_rejects_forgery() {
+    let plan = transition_plan(&[1, 2], &[3, 4]);
+    let mut state = realm_config_state();
+    for event in transition_events(&plan) {
+        state.apply(&event).unwrap();
+    }
+    let submit = |proof: CompletionProof, origin: NodeId, event_seed: u8| {
+        realm_config_event(
+            event_seed,
+            origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                transition_id: plan.transition_id,
+                strategy_id: plan.strategy_id,
+                proof,
+            },
+        )
+    };
+
+    // A proof relayed by anyone but its holder never enters the record.
+    assert_eq!(
+        state.apply(&submit(proof_for(&plan, 0, 3), node(1), 70)),
+        Err(AdminDocumentReducerError::TransitionOriginMismatch)
+    );
+    // A tampered epoch invalidates the signature over the claim.
+    let mut retargeted = proof_for(&plan, 0, 3);
+    retargeted.target_map_epoch = 9;
+    assert_eq!(
+        state.apply(&submit(retargeted, node(3), 71)),
+        Err(AdminDocumentReducerError::InvalidTransitionProof)
+    );
+    // So does a signature made by another node key.
+    let mut forged = proof_for(&plan, 0, 4);
+    forged.holder = node(3);
+    assert_eq!(
+        state.apply(&submit(forged, node(3), 72)),
+        Err(AdminDocumentReducerError::InvalidTransitionProof)
+    );
+
+    let config = transition_config(&state);
+    assert!(config.placement_transitions[0].proofs.is_empty());
+}
+
+#[test]
+fn duplicate_proof_is_idempotent() {
+    let plan = transition_plan(&[1, 2], &[3, 4]);
+    let mut state = realm_config_state();
+    for event in transition_events(&plan) {
+        state.apply(&event).unwrap();
+    }
+    let first = realm_config_event(
+        73,
+        node(3),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id: plan.transition_id,
+            strategy_id: plan.strategy_id,
+            proof: proof_for(&plan, 0, 3),
+        },
+    );
+    let mut resent = first.clone();
+    resent.event_id = Ulid::from_bytes([74; 16]);
+    resent.origin_seq = 2;
+
+    state.apply(&first).unwrap();
+    assert_eq!(state.apply(&first), Ok(AdminDocumentApplyStatus::Duplicate));
+    state.apply(&resent).unwrap();
+
+    let config = transition_config(&state);
+    assert_eq!(config.placement_transitions[0].proofs.len(), 1);
+}
+
+#[test]
+fn activation_advances_on_completion() {
+    let plan = transition_plan(&[1, 2], &[3, 4]);
+    let mut state = realm_config_state();
+    for event in transition_events(&plan)
+        .into_iter()
+        .chain(completion_events(&plan))
+    {
+        state.apply(&event).unwrap();
+    }
+
+    let config = transition_config(&state);
+    let cut = config.activation(&plan.strategy_id, 0).expect("bucket 0");
+    assert_eq!(cut.candidate_map_epoch, 2);
+    assert_eq!(cut.activation_epoch, 2);
+    assert_eq!(cut.transition_id, None);
+
+    // Bucket 1 has no barrier or proof, so it stays where it was and keeps
+    // naming the transition still working on it.
+    let pending = config.activation(&plan.strategy_id, 1).expect("bucket 1");
+    assert_eq!(pending.candidate_map_epoch, 1);
+    assert_eq!(pending.activation_epoch, 1);
+    assert_eq!(pending.transition_id, Some(plan.transition_id));
+
+    let transition = &config.placement_transitions[0];
+    assert_eq!(transition.completed.len(), 1);
+    assert_eq!(transition.completed[0].bucket, 0);
+    assert_eq!(
+        transition.completed[0].completed_at_ms,
+        Ulid::from_bytes([53; 16]).timestamp_ms()
+    );
+    assert!(!transition.is_terminal());
+}
