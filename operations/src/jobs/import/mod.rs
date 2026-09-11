@@ -5,15 +5,6 @@ mod reader;
 mod rewrite;
 mod upload;
 
-#[cfg(test)]
-pub(crate) mod fixture {
-    pub(crate) use super::archive::{
-        file_id_candidates, inspect_archive, open_archive, payload_entries, read_metadata,
-        signature_entry,
-    };
-    pub(crate) use super::rewrite::{RewriteTarget, rewrite_document, validate_document};
-}
-
 pub use upload::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
     UploadClaimError, claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload,
@@ -1860,7 +1851,9 @@ fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    pub(crate) mod fixtures;
+
     use super::*;
     use aruna_core::structs::{
         ImportMetadataTarget, ImportRoCrateTarget, JobClaim, JobId, JobPayload, JobRecord,

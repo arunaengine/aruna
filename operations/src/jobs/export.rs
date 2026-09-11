@@ -3146,7 +3146,7 @@ async fn write_archive(
 mod tests {
     use super::*;
     use crate::jobs::executor::ProgressReporter;
-    use crate::jobs::import::fixture::{
+    use crate::jobs::import::tests::fixtures::{
         RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
         read_metadata, rewrite_document, signature_entry, validate_document,
     };
