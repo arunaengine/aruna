@@ -855,3 +855,195 @@ async fn accepts_onboarded_origin() {
         unix_timestamp_secs()
     ));
 }
+
+/// Fixture for the relay tests: a realm with one Server origin, one Server
+/// relay, and one User device, plus a group-create event from the origin.
+struct RelayFixture {
+    storage: StorageHandle,
+    realm_id: RealmId,
+    topic: irokle_crate::TopicId,
+    target: DocumentSyncTarget,
+    event: AdminDocumentEvent,
+    placement: PlacementRef,
+    origin: Actor,
+    relay: NodeId,
+    device: NodeId,
+}
+
+async fn relay_fixture(dir: &TempDir) -> RelayFixture {
+    let storage = storage_at(dir.path());
+    let realm_id = RealmId::from_bytes([71; 32]);
+    let origin = test_actor(
+        31,
+        UserId::local(Ulid::from_parts(1_700, 1), realm_id),
+        realm_id,
+    );
+    let relay = node(32);
+    let device = node(33);
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(origin.node_id, RealmNodeKind::Server);
+    config.ensure_node(relay, RealmNodeKind::Server);
+    config.ensure_node(
+        device,
+        RealmNodeKind::User {
+            owner: origin.user_id,
+        },
+    );
+    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    storage_batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            config_target,
+            config.to_bytes(&origin).expect("config serializes").into(),
+        )],
+    )
+    .await
+    .expect("config writes");
+
+    let group_id = Ulid::from_parts(1_701, 1);
+    let target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let placement = PlacementRef {
+        strategy_id: Ulid::from_parts(1_705, 1),
+        shard: 1,
+    };
+    let event = test_admin_event(
+        Ulid::from_parts(1_702, 1),
+        AdminDocumentTarget::Group { group_id },
+        &origin,
+        1,
+        AdminDocumentOperation::GroupCreated {
+            realm_id,
+            display_name: "Engineering".to_string(),
+            owner: origin.user_id,
+        },
+    );
+    RelayFixture {
+        storage,
+        realm_id,
+        topic: target.sync_topic_id(realm_id, &placement),
+        target,
+        event,
+        placement,
+        origin,
+        relay,
+        device,
+    }
+}
+
+async fn validate_relayed(fixture: &RelayFixture, publisher: NodeId) -> AdminEventValidation {
+    validate_replicated_admin_event(
+        &fixture.storage,
+        fixture.topic,
+        irokle_crate::actor_id_for(fixture.topic, node_id_to_peer_id(&publisher)),
+        &fixture.target,
+        &fixture.event,
+        fixture.realm_id,
+        &fixture.placement,
+        &sign_as_origin(&fixture.event, &fixture.placement),
+        &mut ConfigValidationCache::default(),
+    )
+    .await
+    .expect("validation runs")
+}
+
+#[tokio::test]
+async fn relay_preserves_origin() {
+    // A Server that is not the origin may carry the origin-signed envelope.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fixture = relay_fixture(&dir).await;
+    assert_eq!(
+        validate_relayed(&fixture, fixture.origin.node_id).await,
+        AdminEventValidation::Accepted
+    );
+    assert_eq!(
+        validate_relayed(&fixture, fixture.relay).await,
+        AdminEventValidation::Accepted
+    );
+}
+
+#[tokio::test]
+async fn rejects_user_relay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fixture = relay_fixture(&dir).await;
+    assert!(matches!(
+        validate_relayed(&fixture, fixture.device).await,
+        AdminEventValidation::Rejected(reason)
+            if reason == "relayed admin event publisher is not a realm relay node"
+    ));
+}
+
+#[tokio::test]
+async fn rejects_user_origin() {
+    // A device never publishes a realm administrative event, relayed or not.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut fixture = relay_fixture(&dir).await;
+    let device_actor = test_actor(33, fixture.origin.user_id, fixture.realm_id);
+    fixture.event = test_admin_event(
+        Ulid::from_parts(1_703, 1),
+        fixture.event.target.clone(),
+        &device_actor,
+        1,
+        fixture.event.op.clone(),
+    );
+    assert!(matches!(
+        validate_relayed(&fixture, fixture.relay).await,
+        AdminEventValidation::Rejected(reason)
+            if reason == "group admin event origin is not a publisher-capable realm node"
+    ));
+}
+
+#[tokio::test]
+async fn rejects_forged_relay() {
+    // A relay that rewrites the actor invalidates the origin signature.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fixture = relay_fixture(&dir).await;
+    let signature = sign_as_origin(&fixture.event, &fixture.placement);
+    let mut forged = fixture.event.clone();
+    forged.actor.user_id = UserId::local(Ulid::from_parts(1_704, 1), fixture.realm_id);
+    assert!(matches!(
+        validate_replicated_admin_event(
+            &fixture.storage,
+            fixture.topic,
+            irokle_crate::actor_id_for(fixture.topic, node_id_to_peer_id(&fixture.relay)),
+            &fixture.target,
+            &forged,
+            fixture.realm_id,
+            &fixture.placement,
+            &signature,
+            &mut ConfigValidationCache::default(),
+        )
+        .await
+        .expect("validation runs"),
+        AdminEventValidation::Rejected(reason)
+            if reason == "admin event is not signed by its origin node"
+    ));
+}
+
+#[tokio::test]
+async fn rejects_reshard_relay() {
+    // The signature covers the placement, so a relay cannot re-route the
+    // envelope onto another shard's topic.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fixture = relay_fixture(&dir).await;
+    let elsewhere = PlacementRef {
+        shard: fixture.placement.shard + 1,
+        ..fixture.placement
+    };
+    assert!(matches!(
+        validate_replicated_admin_event(
+            &fixture.storage,
+            fixture.target.sync_topic_id(fixture.realm_id, &elsewhere),
+            irokle_crate::actor_id_for(fixture.topic, node_id_to_peer_id(&fixture.relay)),
+            &fixture.target,
+            &fixture.event,
+            fixture.realm_id,
+            &elsewhere,
+            &sign_as_origin(&fixture.event, &fixture.placement),
+            &mut ConfigValidationCache::default(),
+        )
+        .await
+        .expect("validation runs"),
+        AdminEventValidation::Rejected(reason)
+            if reason == "admin event is not signed by its origin node"
+    ));
+}
