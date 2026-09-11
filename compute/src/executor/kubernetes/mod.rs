@@ -2384,6 +2384,12 @@ mod tests {
         })
     }
 
+    fn parked_job(state: &str) -> Value {
+        let mut job = job_json(state);
+        job["spec"] = json!({"suspend": true});
+        job
+    }
+
     fn core_object(kind: &str, name: &str) -> Value {
         json!({
             "apiVersion": "v1", "kind": kind,
@@ -2399,6 +2405,19 @@ mod tests {
                 "metadata": {
                     "name": "task-pod", "namespace": "compute", "uid": "pod-uid",
                     "labels": {ROLE_LABEL: "task"}
+                }
+            }]
+        })
+    }
+
+    fn stage_list() -> Value {
+        json!({
+            "apiVersion": "v1", "kind": "PodList", "metadata": {},
+            "items": [{
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": "aruna-job-a1-stage", "namespace": "compute", "uid": "stage-uid",
+                    "labels": {ROLE_LABEL: "stage"}
                 }
             }]
         })
@@ -2599,6 +2618,188 @@ mod tests {
             CancelEvidence::Stopped(status) => assert_eq!(status.phase, AttemptPhase::Cancelled),
             other => panic!("unexpected cancel evidence: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cancels_before_create() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let backend = KubernetesBackend {
+            client: fake_client(move |method, path| {
+                recorder
+                    .lock()
+                    .expect("record request")
+                    .push(format!("{method} {path}"));
+                (404, status_json(404))
+            }),
+            config: test_config(),
+        };
+        let context = context();
+        let spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = backend.submit(&context, &spec, &cancel).await;
+
+        assert!(matches!(result, Err(BackendError::Cancelled)));
+        assert!(seen.lock().expect("read requests").is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancels_during_stage() {
+        // Cancelling as the helper Pod is created must stop submit before the
+        // stage exec and leave the Pod to cleanup.
+        const STAGE_POD: &str = "DELETE /api/v1/namespaces/compute/pods/aruna-job-a1-stage";
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let recorder = seen.clone();
+        let pod_created = created.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            match (method, path) {
+                ("POST", "/api/v1/namespaces/compute/pods") => {
+                    pod_created.store(true, std::sync::atomic::Ordering::SeqCst);
+                    token.cancel();
+                    (200, core_object("Pod", "aruna-job-a1-stage"))
+                }
+                ("POST", "/apis/batch/v1/namespaces/compute/jobs")
+                | ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, parked_job("active"))
+                }
+                ("GET", "/api/v1/namespaces/compute/pods") => {
+                    if pod_created.load(std::sync::atomic::Ordering::SeqCst) {
+                        (200, stage_list())
+                    } else {
+                        (
+                            200,
+                            json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
+                        )
+                    }
+                }
+                ("POST", "/api/v1/namespaces/compute/persistentvolumeclaims") => {
+                    (200, core_object("PersistentVolumeClaim", "aruna-job-a1-ws"))
+                }
+                (
+                    "PATCH",
+                    "/apis/networking.k8s.io/v1/namespaces/compute/networkpolicies/aruna-compute-deny",
+                ) => (
+                    200,
+                    json!({
+                        "apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy",
+                        "metadata":{"name":"aruna-compute-deny","namespace":"compute"}
+                    }),
+                ),
+                ("PATCH", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, job_json("tombstone"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/pods/aruna-job-a1-stage") => {
+                    (200, core_object("Pod", "aruna-job-a1-stage"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/persistentvolumeclaims/aruna-job-a1-ws") => {
+                    (200, core_object("PersistentVolumeClaim", "aruna-job-a1-ws"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/secrets/aruna-job-a1-env") => {
+                    (200, core_object("Secret", "aruna-job-a1-env"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/configmaps/aruna-job-a1-logs")
+                | ("DELETE", "/api/v1/namespaces/compute/configmaps/aruna-job-a1-staged") => {
+                    (200, core_object("ConfigMap", "marker"))
+                }
+                ("DELETE", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, job_json("tombstone"))
+                }
+                ("GET", "/api/v1/namespaces/compute/persistentvolumeclaims")
+                | ("GET", "/api/v1/persistentvolumes") => (
+                    200,
+                    json!({"apiVersion":"v1","kind":"List","metadata":{},"items":[]}),
+                ),
+                _ => (404, status_json(404)),
+            }
+        });
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+        };
+        let context = context();
+        let spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
+
+        let result = backend.submit(&context, &spec, &cancel).await;
+
+        assert!(matches!(result, Err(BackendError::Cancelled)), "{result:?}");
+        let during_submit = seen.lock().expect("read requests").clone();
+        assert!(!during_submit.iter().any(|entry| entry == STAGE_POD));
+
+        backend.cleanup(&context).await.expect("cleanup succeeds");
+
+        assert!(
+            seen.lock()
+                .expect("read requests")
+                .iter()
+                .any(|entry| entry == STAGE_POD),
+            "cleanup must delete the stage helper Pod"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancels_after_stage() {
+        // The fake client cannot speak the helper exec websocket, so the
+        // deterministic post-staging cancel is taken at the DirectS3 Secret.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            match (method, path) {
+                ("POST", "/api/v1/namespaces/compute/secrets") => {
+                    token.cancel();
+                    (200, core_object("Secret", "aruna-job-a1-env"))
+                }
+                ("POST", "/apis/batch/v1/namespaces/compute/jobs")
+                | ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, parked_job("active"))
+                }
+                ("GET", "/api/v1/namespaces/compute/pods") => (
+                    200,
+                    json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
+                ),
+                ("PATCH", _) => (
+                    200,
+                    json!({
+                        "apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy",
+                        "metadata":{"name":"aruna-compute-s3","namespace":"compute"}
+                    }),
+                ),
+                _ => (404, status_json(404)),
+            }
+        });
+        let mut config = test_config();
+        config.s3_cidrs.push("10.0.0.0/24".to_string());
+        let backend = KubernetesBackend { client, config };
+        let context = context();
+        let mut spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
+        spec.staging_mode = StagingMode::DirectS3;
+        spec.security.network = aruna_core::compute::NetworkAccess::S3Only;
+
+        let result = backend.submit(&context, &spec, &cancel).await;
+
+        assert!(matches!(result, Err(BackendError::Cancelled)), "{result:?}");
+        assert!(
+            !seen
+                .lock()
+                .expect("read requests")
+                .iter()
+                .any(|entry| entry == "PATCH /apis/batch/v1/namespaces/compute/jobs/aruna-job-a1"),
+            "a cancelled submit must not unsuspend the Job"
+        );
     }
 
     #[test]

@@ -2386,6 +2386,107 @@ mod tests {
         assert!(error.retryable());
     }
 
+    /// Answers container inspect, then streams one log frame and stalls.
+    async fn fake_docker(listener: tokio::net::TcpListener, frames: tokio::sync::mpsc::Sender<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let read = stream.read(&mut buf).await.unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if String::from_utf8_lossy(&request).contains("/logs") {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let frame = [1u8, 0, 0, 0, 0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'];
+                        let framed = stream.write_all(head.as_bytes()).await.is_ok()
+                            && stream.write_all(b"d\r\n").await.is_ok()
+                            && stream.write_all(&frame).await.is_ok()
+                            && stream.write_all(b"\r\n").await.is_ok()
+                            && stream.flush().await.is_ok();
+                        if !framed {
+                            return;
+                        }
+                        let _ = frames.send(()).await;
+                        // Keep the body open without a terminating chunk.
+                        std::future::pending::<()>().await;
+                    } else {
+                        let body = serde_json::to_vec(&serde_json::json!({
+                            "Id": "abc",
+                            "Config": {"Labels": {
+                                "aruna-engine.org/job-id": "j1",
+                                "aruna-engine.org/attempt": "0"
+                            }}
+                        }))
+                        .expect("encode inspect response");
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let _ = stream.write_all(&body).await;
+                        let _ = stream.flush().await;
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_logs_timeout() {
+        // A logs stream that stalls after one frame must surface the pull
+        // deadline per item instead of hanging the capture.
+        tokio::time::resume();
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(1);
+        let daemon = tokio::spawn(fake_docker(listener, frame_tx));
+        let docker = Docker::connect_with_http(
+            &format!("http://127.0.0.1:{port}"),
+            3600,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let backend = DockerBackend::from_parts(
+            docker,
+            DockerConfig {
+                state_root: root.path().to_path_buf(),
+                pull_deadline: Duration::from_millis(100),
+                ..DockerConfig::default()
+            },
+        )
+        .unwrap();
+        // Warm the pooled connection, then let the virtual clock drive the stall.
+        backend
+            .inspect(&fence().attempt)
+            .await
+            .expect("warm up the fake daemon");
+        tokio::time::pause();
+
+        let result = backend.fetch_logs(&fence(), &LogLimits::default()).await;
+
+        assert!(
+            matches!(result, Err(BackendError::Timeout(_))),
+            "got {result:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(60), frame_rx.recv())
+            .await
+            .expect("the fake daemon never wrote the log frame")
+            .expect("the fake daemon stopped");
+        daemon.abort();
+    }
+
     #[test]
     fn pull_classification() {
         use bollard::errors::Error;
