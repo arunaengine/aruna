@@ -24,6 +24,7 @@ use ulid::Ulid;
 
 use crate::notifications::outbox::new_notification_outbox_record;
 
+mod fixtures;
 mod harness;
 mod notification;
 mod outbox;
