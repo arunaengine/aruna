@@ -329,3 +329,120 @@ pub(super) fn remove_group_role_user_assignment(
         AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
     )
 }
+
+pub(super) fn add_realm_role(event_seed: u8, origin_seed: u8, role_id: RoleId) -> AdminDocumentEvent {
+    realm_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmRoleAdded { role_id },
+    )
+}
+
+pub(super) fn create_realm_role(
+    event_seed: u8,
+    origin_seed: u8,
+    role: AdminDocumentRoleDefinition,
+) -> AdminDocumentEvent {
+    realm_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmRoleCreated { role },
+    )
+}
+
+pub(super) fn assign_realm_role_user(
+    event_seed: u8,
+    origin_seed: u8,
+    role_id: RoleId,
+    user_id: UserId,
+) -> AdminDocumentEvent {
+    realm_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
+    )
+}
+
+pub(super) fn remove_realm_role_user_assignment(
+    event_seed: u8,
+    origin_seed: u8,
+    role_id: RoleId,
+    user_id: UserId,
+) -> AdminDocumentEvent {
+    realm_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
+    )
+}
+
+pub(super) fn ensure_realm_config_node(
+    event_seed: u8,
+    origin_seed: u8,
+    node_id: NodeId,
+    kind: RealmNodeKind,
+) -> AdminDocumentEvent {
+    realm_config_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
+    )
+}
+
+pub(super) fn upsert_oidc_provider(
+    event_seed: u8,
+    origin_seed: u8,
+    provider: OidcProviderConfig,
+) -> AdminDocumentEvent {
+    realm_config_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+    )
+}
+
+pub(super) fn set_realm_config_settings(
+    event_seed: u8,
+    origin_seed: u8,
+    metadata_replication: MetadataReplicationConfig,
+    discovery: RealmDiscoveryConfig,
+) -> AdminDocumentEvent {
+    realm_config_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigSettingsSet {
+            metadata_replication,
+            discovery,
+        },
+    )
+}
+
+pub(super) fn set_realm_config_description(
+    event_seed: u8,
+    origin_seed: u8,
+    description: &str,
+) -> AdminDocumentEvent {
+    realm_config_event(
+        event_seed,
+        node(origin_seed),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigDescriptionSet {
+            description: description.to_string(),
+        },
+    )
+}
