@@ -969,3 +969,105 @@ fn realm_config_strategy_binding_materializes_and_removes() {
     );
     assert!(state.conflicts.is_empty());
 }
+
+#[test]
+fn realm_config_metadata_path_prefix_binding_remove_uses_normalized_key() {
+    let mut state = realm_config_state();
+    let raw_scope = BindingScope::MetadataPathPrefix("/datasets/".to_string());
+    let canonical_scope = BindingScope::MetadataPathPrefix("datasets".to_string());
+    let binding = StrategyBinding {
+        scope: raw_scope.clone(),
+        strategy_id: Ulid::from_bytes([4; 16]),
+    };
+    upsert_placement_strategy(&mut state, 9, 9, binding.strategy_id);
+    let canonical_binding = StrategyBinding {
+        scope: canonical_scope.clone(),
+        strategy_id: binding.strategy_id,
+    };
+    let canonical_scope_key = binding_scope_key(&canonical_scope);
+    let unnormalized_path = "realm_config.placement.bindings.metadata_path_prefix:/datasets/";
+    let set_origin = node(1);
+    let set = realm_config_event(
+        1,
+        set_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigStrategyBindingSet { binding },
+    );
+
+    state.apply(&set).unwrap();
+    assert_eq!(
+        state.materialized_realm_config_strategy_bindings(),
+        BTreeMap::from([(canonical_scope_key, canonical_binding)])
+    );
+    assert!(
+        state
+            .user_subject_ids
+            .contains_key(&realm_config_strategy_binding_path(&canonical_scope))
+    );
+    assert!(!state.user_subject_ids.contains_key(unnormalized_path));
+
+    let removal = realm_config_event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default().with_observed(set_origin, 1),
+        AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
+            scope: BindingScope::MetadataPathPrefix(" datasets/ ".to_string()),
+        },
+    );
+
+    state.apply(&removal).unwrap();
+    assert!(
+        state
+            .materialized_realm_config_strategy_bindings()
+            .is_empty()
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn realm_config_placement_override_materializes() {
+    let mut state = realm_config_state();
+    let subject = b"document-subject".to_vec();
+    let strategy_id = Ulid::from_bytes([4; 16]);
+    upsert_placement_strategy(&mut state, 9, 9, strategy_id);
+    let record = PlacementOverride {
+        subject: subject.clone(),
+        pinned: vec![node(4)],
+        excluded: vec![node(5)],
+        strategy_id: Some(strategy_id),
+    };
+    let subject_key = hex::encode(&subject);
+
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: record.clone(),
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_realm_config_placement_overrides(),
+        BTreeMap::from([(subject_key, record)])
+    );
+    assert_eq!(
+        state.apply(&realm_config_placement_override_removed(2, subject)),
+        Ok(AdminDocumentApplyStatus::Applied)
+    );
+}
+
+fn realm_config_placement_override_removed(event_seed: u8, subject: Vec<u8>) -> AdminDocumentEvent {
+    realm_config_event(
+        event_seed,
+        node(2),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject },
+    )
+}
