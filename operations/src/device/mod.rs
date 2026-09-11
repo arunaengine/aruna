@@ -19,5 +19,5 @@ pub mod selection;
 pub mod sync;
 pub mod sync_status;
 #[cfg(test)]
-mod test_support;
+mod tests;
 pub mod wipe;

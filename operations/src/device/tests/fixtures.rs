@@ -1,10 +1,8 @@
-#![cfg(test)]
-
 use crate::driver::DriverContext;
 use aruna_storage::storage::FjallStorage;
 use tempfile::{TempDir, tempdir};
 
-pub(super) async fn context() -> (TempDir, DriverContext) {
+pub(crate) async fn context() -> (TempDir, DriverContext) {
     let directory = tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     (

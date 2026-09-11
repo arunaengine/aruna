@@ -135,7 +135,7 @@ mod tests {
     use super::ListDraftsOperation;
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::intake::{INTAKE_PAGE_SIZE, IntakeEntry};
-    use crate::device::test_support::context;
+    use crate::device::tests::fixtures::context;
     use crate::driver::drive;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
