@@ -173,3 +173,141 @@ fn distributed_union_pattern_is_safe(pattern: &spargebra::algebra::GraphPattern)
         _ => false,
     }
 }
+
+pub fn forwarded_bearer(
+    token: Option<&str>,
+) -> Result<Option<MetadataAuthToken>, MetadataApiError> {
+    token
+        .map(MetadataAuthToken::bearer)
+        .transpose()
+        .map_err(|_| MetadataApiError::BadRequest)
+}
+
+pub(super) fn fanout_bearer(token: Option<&str>) -> Option<MetadataAuthToken> {
+    token.and_then(|token| MetadataAuthToken::bearer(token).ok())
+}
+
+pub(super) type MetadataNodeCall<T> =
+    Arc<dyn Fn(NodeId) -> BoxFuture<'static, Result<T, MetadataReadError>> + Send + Sync>;
+
+pub(super) fn metadata_node_call<C, T, F, Fut>(context: C, call: F) -> MetadataNodeCall<T>
+where
+    C: Clone + Send + Sync + 'static,
+    T: Send + 'static,
+    F: Fn(C, NodeId) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<T, MetadataReadError>> + Send + 'static,
+{
+    Arc::new(move |node_id| {
+        let context = context.clone();
+        call(context, node_id).boxed()
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MetadataFanoutOperation {
+    Query,
+    Search,
+    BucketSearch,
+    ObjectSearch,
+    ReferencePreflight,
+}
+
+impl MetadataFanoutOperation {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Search => "search",
+            Self::BucketSearch => "bucket_search",
+            Self::ObjectSearch => "object_search",
+            Self::ReferencePreflight => "reference_preflight",
+        }
+    }
+}
+
+pub(super) fn metadata_fanout_node_span(
+    operation: MetadataFanoutOperation,
+    node_id: NodeId,
+    local: bool,
+) -> Span {
+    match operation {
+        MetadataFanoutOperation::Query => debug_span!(
+            "metadata.operation.query_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::Search => debug_span!(
+            "metadata.operation.search_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::BucketSearch => debug_span!(
+            "metadata.operation.bucket_search_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::ObjectSearch => debug_span!(
+            "metadata.operation.object_search_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::ReferencePreflight => debug_span!(
+            "metadata.operation.reference_preflight_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_metadata_fanout_node<T>(
+    operation: MetadataFanoutOperation,
+    node_id: NodeId,
+    local: bool,
+    deadline: tokio::time::Instant,
+    local_call: MetadataNodeCall<T>,
+    remote_call: MetadataNodeCall<T>,
+    record_result: fn(&Span, &Result<T, MetadataReadError>),
+    record_stage_detail: bool,
+) -> Result<T, MetadataReadError> {
+    let node_span = metadata_fanout_node_span(operation, node_id, local);
+    let node_started = Instant::now();
+    let result = if local {
+        match tokio::time::timeout_at(deadline, local_call(node_id).instrument(node_span.clone()))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(MetadataReadError::Unavailable),
+        }
+    } else {
+        match tokio::time::timeout_at(deadline, remote_call(node_id).instrument(node_span.clone()))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(MetadataReadError::Unavailable),
+        }
+    };
+    let elapsed = record_elapsed_ms(&node_span, "elapsed_ms", node_started);
+    if record_stage_detail {
+        aruna_core::telemetry::record_stage_detail(
+            "fanout_node",
+            || short_display_id(node_id),
+            elapsed,
+        );
+    }
+    record_result(&node_span, &result);
+    result
+}
