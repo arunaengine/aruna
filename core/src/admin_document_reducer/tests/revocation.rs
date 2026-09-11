@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn revoke_token(event_seed: u8, origin_seed: u8, token: &str) -> AdminDocumentEvent {
+fn revoke_token(event_seed: u8, origin_seed: u8, token: &str) -> AdminDocumentEvent {
     realm_config_event(
         event_seed,
         node(origin_seed),
@@ -14,7 +14,7 @@ pub(super) fn revoke_token(event_seed: u8, origin_seed: u8, token: &str) -> Admi
     )
 }
 
-pub(super) fn revoke_token_at(
+fn revoke_token_at(
     event_seed: u8,
     origin_seed: u8,
     token: &str,
@@ -33,7 +33,7 @@ pub(super) fn revoke_token_at(
     )
 }
 
-pub(super) fn revoke_token_owned(
+fn revoke_token_owned(
     event_seed: u8,
     origin_seed: u8,
     token: &str,
@@ -397,4 +397,130 @@ fn indexed_apply_refreshes() {
         state.materialized_revoked_tokens(),
         BTreeMap::from([(crate::auth::bearer_token_hash("indexed"), 3_000)])
     );
+}
+
+#[test]
+fn divergent_expiry_keeps() {
+    // A second expiry for one hash must never erase the revocation; the
+    // longest expiry wins so the token stays denied.
+    let mut state = realm_config_state();
+    state.apply(&revoke_token(1, 1, "token")).unwrap();
+    let mut longer = revoke_token(2, 2, "token");
+    longer.op = AdminDocumentOperation::RealmConfigTokenRevoked {
+        token_hash: crate::auth::bearer_token_hash("token"),
+        expires_at: 5_000,
+        token_owner: user_id(),
+    };
+    state.apply(&longer).unwrap();
+
+    assert!(state.conflicts.is_empty());
+    assert_eq!(
+        state.materialized_revoked_tokens(),
+        BTreeMap::from([(crate::auth::bearer_token_hash("token"), 5_000)])
+    );
+}
+
+#[test]
+fn stale_revocation_applies() {
+    // A revocation from a lagging origin sequence must still deny the token.
+    let mut state = realm_config_state();
+    let mut ahead = revoke_token(1, 1, "ahead");
+    ahead.origin_seq = 9;
+    state.apply(&ahead).unwrap();
+    let behind = revoke_token(2, 1, "behind");
+
+    state.apply(&behind).unwrap();
+    assert!(
+        state
+            .materialized_revoked_tokens()
+            .contains_key(&crate::auth::bearer_token_hash("behind"))
+    );
+}
+
+#[test]
+fn compaction_drops_expired() {
+    // Expired revocations must leave no reducer residue, so a user revoking
+    // token after token cannot grow the persisted state without bound.
+    let mut state = realm_config_state();
+    let expired = revoke_token(1, 1, "expired");
+    let echoed = revoke_token(3, 2, "expired");
+    let live = realm_config_event(
+        2,
+        node(1),
+        2,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash: crate::auth::bearer_token_hash("live"),
+            expires_at: 9_000,
+            token_owner: user_id(),
+        },
+    );
+    for event in [&expired, &echoed, &live] {
+        state.apply(event).unwrap();
+    }
+
+    state.compact_revocations(3_000);
+
+    assert_eq!(
+        state.materialized_revoked_tokens(),
+        BTreeMap::from([(crate::auth::bearer_token_hash("live"), 9_000)])
+    );
+    assert!(!state.applied_event_ids.contains(&expired.event_id));
+    assert!(!state.applied_event_ids.contains(&echoed.event_id));
+    assert!(state.applied_event_ids.contains(&live.event_id));
+    assert!(state.equivalent_value_dots.is_empty());
+}
+
+#[test]
+fn compaction_keeps_unexpired() {
+    // The expiry boundary matches the materialized set, which keeps an
+    // entry while `expires_at >= now`.
+    let mut state = realm_config_state();
+    state.apply(&revoke_token(1, 1, "token")).unwrap();
+
+    state.compact_revocations(2_000);
+
+    assert_eq!(
+        state.materialized_revoked_tokens(),
+        BTreeMap::from([(crate::auth::bearer_token_hash("token"), 2_000)])
+    );
+}
+
+#[test]
+fn compaction_spares_paths() {
+    let mut state = realm_config_state();
+    state
+        .apply(&set_realm_config_description(1, 1, "realm"))
+        .unwrap();
+    state.apply(&revoke_token(2, 1, "token")).unwrap();
+
+    state.compact_revocations(9_000);
+
+    assert!(state.materialized_revoked_tokens().is_empty());
+    assert_eq!(
+        state.materialized_realm_config_description(),
+        Some("realm".to_string())
+    );
+}
+
+#[test]
+fn rejects_malformed_hash() {
+    let mut state = realm_config_state();
+    let event = realm_config_event(
+        4,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash: "not-a-hash".to_string(),
+            expires_at: 2_000,
+            token_owner: user_id(),
+        },
+    );
+
+    assert_eq!(
+        state.apply(&event),
+        Err(AdminDocumentReducerError::InvalidTokenHash)
+    );
+    assert!(state.materialized_revoked_tokens().is_empty());
 }
