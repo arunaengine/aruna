@@ -171,3 +171,197 @@ fn invalid_user_attribute_value_is_rejected_without_state_change() {
     );
     assert_eq!(state, before);
 }
+
+#[test]
+fn same_user_attribute_conflict_is_recorded() {
+    let mut state = user_state();
+
+    state
+        .apply(&set_attr(1, 1, "department", "physics"))
+        .unwrap();
+    state
+        .apply(&set_attr(2, 2, "department", "biology"))
+        .unwrap();
+
+    assert!(
+        !state
+            .materialized_user_attributes()
+            .contains_key("department")
+    );
+    let conflict = state
+        .conflicts
+        .get("user.attributes.department")
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some("physics"))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some("biology"))
+    );
+}
+
+#[test]
+fn disjoint_subject_additions_merge() {
+    let mut state = user_state();
+
+    state.apply(&add_subject(1, 1, "subject-1")).unwrap();
+    state.apply(&add_subject(2, 2, "subject-2")).unwrap();
+
+    assert_eq!(
+        state.materialized_user_subject_ids(),
+        BTreeSet::from(["subject-1".to_string(), "subject-2".to_string()])
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn subject_add_remove_conflict_fails_closed_and_materializes_absent() {
+    let mut state = user_state();
+
+    state.apply(&add_subject(1, 1, "subject-1")).unwrap();
+    state.apply(&remove_subject(2, 2, "subject-1")).unwrap();
+
+    assert!(!state.materialized_user_subject_ids().contains("subject-1"));
+    let conflict = state
+        .conflicts
+        .get("user.subject_ids.subject-1")
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some("subject-1"))
+    );
+    assert!(conflict.values.iter().any(|value| value.value.is_none()));
+}
+
+#[test]
+fn duplicate_event_id_is_idempotent() {
+    let mut state = user_state();
+    let event = set_attr(1, 1, "department", "biology");
+
+    assert_eq!(state.apply(&event), Ok(AdminDocumentApplyStatus::Applied));
+    let applied_once = state.clone();
+
+    assert_eq!(state.apply(&event), Ok(AdminDocumentApplyStatus::Duplicate));
+    assert_eq!(state, applied_once);
+}
+
+#[test]
+fn same_origin_out_of_order_disjoint_updates_converge() {
+    let origin = node(1);
+    let newer = event(
+        2,
+        origin,
+        2,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "biology".to_string(),
+        },
+    );
+    let stale = event(
+        1,
+        origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "orcid".to_string(),
+            value: "0000-0002-1825-0097".to_string(),
+        },
+    );
+
+    let mut newer_first = user_state();
+    assert_eq!(
+        newer_first.apply(&newer),
+        Ok(AdminDocumentApplyStatus::Applied)
+    );
+    assert_eq!(
+        newer_first.apply(&stale),
+        Ok(AdminDocumentApplyStatus::Applied)
+    );
+
+    let mut older_first = user_state();
+    older_first.apply(&stale).unwrap();
+    older_first.apply(&newer).unwrap();
+
+    assert_eq!(newer_first, older_first);
+    assert_eq!(
+        newer_first.materialized_user_attributes(),
+        BTreeMap::from([
+            ("department".to_string(), "biology".to_string()),
+            ("orcid".to_string(), "0000-0002-1825-0097".to_string()),
+        ])
+    );
+    assert_eq!(newer_first.clock.sequence_for(&origin), 2);
+}
+
+#[test]
+fn same_origin_out_of_order_same_field_is_stale_and_duplicate_replay_is_idempotent() {
+    let origin = node(1);
+    let older = event(
+        1,
+        origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "physics".to_string(),
+        },
+    );
+    let newer = event(
+        2,
+        origin,
+        2,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserAttributeSet {
+            key: "department".to_string(),
+            value: "biology".to_string(),
+        },
+    );
+
+    let mut newer_first = user_state();
+    assert_eq!(
+        newer_first.apply(&newer),
+        Ok(AdminDocumentApplyStatus::Applied)
+    );
+    let before_stale = newer_first.clone();
+    assert_eq!(
+        newer_first.apply(&older),
+        Ok(AdminDocumentApplyStatus::StaleOriginSequence)
+    );
+    assert_eq!(
+        newer_first.materialized_user_attributes(),
+        before_stale.materialized_user_attributes()
+    );
+    assert!(newer_first.applied_event_ids.contains(&older.event_id));
+    assert_eq!(
+        newer_first.apply(&newer),
+        Ok(AdminDocumentApplyStatus::Duplicate)
+    );
+
+    let mut older_first = user_state();
+    older_first.apply(&older).unwrap();
+    older_first.apply(&newer).unwrap();
+    assert_eq!(newer_first, older_first);
+    assert_eq!(
+        older_first.apply(&older),
+        Ok(AdminDocumentApplyStatus::Duplicate)
+    );
+    assert_eq!(
+        newer_first
+            .materialized_user_attributes()
+            .get("department")
+            .map(String::as_str),
+        Some("biology")
+    );
+    assert!(newer_first.conflicts.is_empty());
+}
