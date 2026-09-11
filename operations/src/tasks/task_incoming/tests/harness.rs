@@ -337,3 +337,103 @@ async fn start_keeps_job() {
     assert_eq!(after, requested, "job queue timer must remain unscheduled");
     assert!(shutdown.drain(Duration::from_secs(30)).await);
 }
+
+pub(super) fn target() -> DocumentSyncTarget {
+    DocumentSyncTarget::Group {
+        group_id: Ulid::from_parts(7, 1),
+    }
+}
+
+pub(super) fn change() -> DocumentSyncChange {
+    DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(8, 1),
+            actor: node(1),
+            updated_at_ms: 9,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement: aruna_core::structs::PlacementRef::NIL,
+    }
+}
+
+pub(super) async fn read_graph_prune_jobs(
+    storage: &aruna_storage::StorageHandle,
+) -> Vec<MetadataGraphPruneJobRecord> {
+    match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 16,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values
+            .into_iter()
+            .map(|(_, value)| postcard::from_bytes(&value).expect("prune job decodes"))
+            .collect(),
+        other => panic!("unexpected storage event: {other:?}"),
+    }
+}
+
+pub(super) async fn write_outbox_record(
+    storage: &aruna_storage::StorageHandle,
+    record: &DocumentSyncOutboxRecord,
+) {
+    match storage
+        .send_effect(write_outbox_effect(record).expect("outbox effect"))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected outbox write event: {other:?}"),
+    }
+}
+
+pub(super) async fn make_net_handle(
+    realm_id: RealmId,
+    storage: &aruna_storage::StorageHandle,
+    secret: [u8; 32],
+) -> NetHandle {
+    NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await
+    .expect("net handle")
+}
+
+pub(super) async fn write_realm_config(
+    storage: &aruna_storage::StorageHandle,
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+    node_id: aruna_core::NodeId,
+) {
+    let actor = Actor {
+        node_id,
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    let bytes = config.to_bytes(&actor).expect("config serializes");
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            value: ByteView::from(bytes),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected realm config write event: {other:?}"),
+    }
+}
