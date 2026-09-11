@@ -889,3 +889,67 @@ pub(in crate::document_sync) fn validate_watch_interest(
     }
     Ok(())
 }
+
+pub(in crate::document_sync) fn validate_watch_subscription_upsert(
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+    change: &DocumentSyncChange,
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::WatchSubscription { owner, watch_id } = target else {
+        return Err("target is not a watch subscription".to_string());
+    };
+    validate_watch_subscription_target(*owner, *watch_id)?;
+    if change.kind != DocumentSyncChangeKind::Upsert || change.current.generation != 1 {
+        return Err(
+            "watch subscription upsert must carry generation 1 upsert revision".to_string(),
+        );
+    }
+    let subscription = WatchSubscription::from_bytes(bytes)
+        .map_err(|error| format!("undecodable watch subscription: {error}"))?;
+    if subscription.owner != *owner || subscription.watch_id != *watch_id {
+        return Err("watch subscription payload does not match its target".to_string());
+    }
+    if subscription.path_prefix.is_empty()
+        || subscription.path_prefix.starts_with('/')
+        || subscription.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
+    {
+        return Err("watch subscription path prefix is invalid".to_string());
+    }
+    let known_mask = WatchEventMask::METADATA_CREATED
+        | WatchEventMask::DATA_UPLOADED
+        | WatchEventMask::SYNC_COMPLETED
+        | WatchEventMask::SYNC_FAILED;
+    if subscription.event_mask.is_empty() || subscription.event_mask.bits() & !known_mask != 0 {
+        return Err("watch subscription event mask is invalid".to_string());
+    }
+    Ok(())
+}
+
+pub(in crate::document_sync) fn validate_watch_subscription_delete(
+    target: &DocumentSyncTarget,
+    change: &DocumentSyncChange,
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::WatchSubscription { owner, watch_id } = target else {
+        return Err("target is not a watch subscription".to_string());
+    };
+    validate_watch_subscription_target(*owner, *watch_id)?;
+    if change.kind != DocumentSyncChangeKind::Delete || change.current.generation != 2 {
+        return Err(
+            "watch subscription delete must carry generation 2 delete revision".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(in crate::document_sync) fn validate_watch_subscription_target(
+    owner: UserId,
+    watch_id: Ulid,
+) -> std::result::Result<(), String> {
+    if owner.is_nil() {
+        return Err("watch subscription owner must not be nil".to_string());
+    }
+    if watch_id.is_nil() {
+        return Err("watch subscription id must not be nil".to_string());
+    }
+    Ok(())
+}
