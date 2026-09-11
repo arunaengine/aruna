@@ -1,3 +1,4 @@
+use super::fanout::ensure_supported_query_form;
 use super::*;
 use crate::metadata::search_cursor::{
     METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
