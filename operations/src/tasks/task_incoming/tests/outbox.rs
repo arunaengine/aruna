@@ -899,3 +899,123 @@ async fn deferred_head_paginates() {
 
     shutdown_net(&net).await;
 }
+
+#[tokio::test]
+async fn boundary_appends_wait() {
+    let _clock = freeze_clock();
+    let mut harness = BoundaryHarness::new().await;
+    harness.seed_records().await;
+
+    harness.handler.drain_document_sync_outbox().await;
+    harness.assert_rotation(1, true, 1);
+    assert_eq!(
+        scheduled_after(&harness.task_handle).await,
+        OUTBOX_CONTINUATION_AFTER
+    );
+
+    harness.append_records().await;
+    harness.handler.drain_document_sync_outbox().await;
+    harness.assert_rotation(2, true, 0);
+    assert_eq!(
+        scheduled_after(&harness.task_handle).await,
+        DOCUMENT_SYNC_DEFER_RETRY_AFTER
+    );
+
+    harness.append_later().await;
+    harness.handler.drain_document_sync_outbox().await;
+    harness.assert_rotation(3, true, 1);
+    assert_eq!(
+        scheduled_after(&harness.task_handle).await,
+        OUTBOX_CONTINUATION_AFTER
+    );
+
+    harness.handler.drain_document_sync_outbox().await;
+    harness.assert_rotation(0, false, 0);
+    harness.assert_appends().await;
+    harness.finish_retry().await;
+}
+
+#[tokio::test]
+async fn rotation_streak() {
+    let _clock = freeze_clock();
+    let realm_id = RealmId::from_bytes([51u8; 32]);
+    let dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let net = make_net_handle(realm_id, &storage, [51u8; 32]).await;
+    tokio::time::pause();
+    let target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+    net.ensure_document_sync_topics(&[topic], Vec::new())
+        .expect("shared topic genesis");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(
+        1,
+        1,
+        OUTBOX_CONTINUATION_STREAK,
+    );
+    let total = u128::from(OUTBOX_CONTINUATION_STREAK) + 2;
+    for index in 1..=total {
+        let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, index),
+            node(1),
+            target.clone(),
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: index.to_be_bytes().to_vec(),
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            true,
+        );
+        write_outbox_record(&storage, &record).await;
+    }
+
+    for expected in 1..=OUTBOX_CONTINUATION_STREAK {
+        handler.drain_document_sync_outbox().await;
+        assert_eq!(
+            handler
+                .rotation
+                .lock()
+                .expect("rotation lock")
+                .continuations,
+            expected
+        );
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+    }
+    handler.drain_document_sync_outbox().await;
+    assert_eq!(
+        handler
+            .rotation
+            .lock()
+            .expect("rotation lock")
+            .continuations,
+        0
+    );
+    assert_eq!(
+        scheduled_after(&task_handle).await,
+        DOCUMENT_SYNC_DEFER_RETRY_AFTER
+    );
+    for _ in 0..4 {
+        handler.drain_document_sync_outbox().await;
+    }
+    assert!(
+        read_outbox_records(&storage, &[], None, 32)
+            .await
+            .expect("read streak records")
+            .records
+            .is_empty()
+    );
+    shutdown_net(&net).await;
+}
