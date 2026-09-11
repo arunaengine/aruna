@@ -90,7 +90,7 @@ impl EncryptedS3Secret {
         let ciphertext = key
             .cipher()
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: plaintext.as_bytes(),
                     aad,
@@ -108,7 +108,7 @@ impl EncryptedS3Secret {
         let plaintext = key
             .cipher()
             .decrypt(
-                XNonce::from_slice(&self.nonce),
+                &XNonce::from(self.nonce),
                 Payload {
                     msg: &self.ciphertext,
                     aad,
