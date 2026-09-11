@@ -387,3 +387,13 @@ fn lifecycle_refresh_restamps_entries_and_prunes_expired_leftovers() {
     assert_eq!(cache.lifecycle_deleted_any("urn:graph:gone"), None);
     assert_eq!(cache.lifecycle_deleted("urn:graph:fresh"), Some(false));
 }
+
+#[test]
+fn remote_search_graph_limit_clamps_at_protocol_ingress() {
+    assert_eq!(clamp_remote_search_graph_limit(0), 1);
+    assert_eq!(clamp_remote_search_graph_limit(25), 25);
+    assert_eq!(
+        clamp_remote_search_graph_limit(METADATA_SEARCH_MAX_PAGINATION_DEPTH + 1),
+        METADATA_SEARCH_MAX_PAGINATION_DEPTH
+    );
+}
