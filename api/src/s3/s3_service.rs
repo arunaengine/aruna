@@ -950,7 +950,9 @@ impl ArunaS3Service {
             .transpose()
     }
 
-    /// Runs one listing page shared by ListObjects and ListObjectsV2.
+    /// Runs one listing page shared by ListObjects and ListObjectsV2. A narrowed
+    /// page that shows nothing keeps reading, so its marker can name a visible
+    /// entry instead of a key the caller may not see.
     async fn run_object_listing(
         &self,
         input: LOV2I,
@@ -958,58 +960,83 @@ impl ArunaS3Service {
         url_encoded: bool,
         scope: Option<&SubpathScope>,
     ) -> S3Result<ObjectListingPage> {
-        let result = drive(ListObjectsV2Operation::new(input), &self.state)
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+        let mut input = input;
+        loop {
+            let result = drive(ListObjectsV2Operation::new(input.clone()), &self.state)
+                .await
+                .and_then(|result| result.transpose())
+                .map_err(IntoS3Error::into_s3_error)?
+                .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
 
-        let encode_field = |value: String| -> String {
-            if url_encoded {
-                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
-            } else {
-                value
-            }
-        };
-
-        // A page narrowed to the caller's subpaths may come back shorter; the
-        // continuation token still describes the underlying listing.
-        let contents: Vec<Object> = result
-            .objects
-            .into_iter()
-            .filter(|object| scope.is_none_or(|scope| scope.allows_key(&object.head.key)))
-            .map(|object| {
-                let response_fields = self.build_object_response_fields(
-                    object.location.as_ref(),
-                    None,
-                    object.source_metadata.as_ref(),
-                    object.last_refresh,
-                    object.version_created_at,
-                );
-                Object {
-                    e_tag: response_fields.e_tag,
-                    key: Some(encode_field(object.head.key)),
-                    last_modified: response_fields.last_modified,
-                    owner: owner.clone(),
-                    size: response_fields.content_length,
-                    ..Default::default()
+            let encode_field = |value: String| -> String {
+                if url_encoded {
+                    utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+                } else {
+                    value
                 }
-            })
-            .collect();
-        let common_prefixes: Vec<CommonPrefix> = result
-            .common_prefixes
-            .into_iter()
-            .filter(|prefix| scope.is_none_or(|scope| scope.allows_prefix(prefix)))
-            .map(|prefix| CommonPrefix {
-                prefix: Some(encode_field(prefix)),
-            })
-            .collect();
+            };
 
-        Ok(ObjectListingPage {
-            contents,
-            common_prefixes,
-            continuation_token: result.continuation_token,
-        })
+            let visible: Vec<_> = result
+                .objects
+                .into_iter()
+                .filter(|object| scope.is_none_or(|scope| scope.allows_key(&object.head.key)))
+                .collect();
+            let prefixes: Vec<String> = result
+                .common_prefixes
+                .into_iter()
+                .filter(|prefix| scope.is_none_or(|scope| scope.allows_prefix(prefix)))
+                .collect();
+
+            if let Some(token) = result.continuation_token.clone()
+                && scope.is_some()
+                && visible.is_empty()
+                && prefixes.is_empty()
+            {
+                input.continuation_token = Some(token);
+                continue;
+            }
+
+            let scoped = scoped_marker(
+                &input.bucket,
+                visible.last().map(|object| object.head.key.as_str()),
+                prefixes.last().map(String::as_str),
+            )?;
+            let contents: Vec<Object> = visible
+                .into_iter()
+                .map(|object| {
+                    let response_fields = self.build_object_response_fields(
+                        object.location.as_ref(),
+                        None,
+                        object.source_metadata.as_ref(),
+                        object.last_refresh,
+                        object.version_created_at,
+                    );
+                    Object {
+                        e_tag: response_fields.e_tag,
+                        key: Some(encode_field(object.head.key)),
+                        last_modified: response_fields.last_modified,
+                        owner: owner.clone(),
+                        size: response_fields.content_length,
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let common_prefixes: Vec<CommonPrefix> = prefixes
+                .into_iter()
+                .map(|prefix| CommonPrefix {
+                    prefix: Some(encode_field(prefix)),
+                })
+                .collect();
+
+            return Ok(ObjectListingPage {
+                contents,
+                common_prefixes,
+                continuation_token: match scope {
+                    Some(_) => result.continuation_token.and(scoped),
+                    None => result.continuation_token,
+                },
+            });
+        }
     }
 }
 
@@ -1075,6 +1102,25 @@ fn next_marker_for(
     } else {
         None
     }
+}
+
+/// The marker of the last entry a narrowed page actually showed, so a truncated
+/// listing resumes from a visible entry instead of an out-of-scope key.
+fn scoped_marker(
+    bucket: &str,
+    last_key: Option<&str>,
+    last_prefix: Option<&str>,
+) -> S3Result<Option<ListObjectsV2ContinuationToken>> {
+    let group = last_prefix.filter(|prefix| last_key.is_none_or(|key| *prefix > key));
+    let Some(entry) = group.or(last_key) else {
+        return Ok(None);
+    };
+    let last_key = BlobHeadKey::object_prefix(bucket, entry)
+        .map_err(|_| s3_error!(InternalError, "Invalid listing marker"))?;
+    Ok(Some(ListObjectsV2ContinuationToken {
+        last_key,
+        last_common_prefix: group.map(str::to_string),
+    }))
 }
 
 /// Names the last entry of a truncated page, preferring the common prefix the
@@ -5003,6 +5049,68 @@ mod tests {
             .filter_map(|object| object.key)
             .collect();
         assert_eq!(keys, vec!["imaging/scan-a", "imaging/scan-b"]);
+    }
+
+    async fn paged_request(
+        service: &ArunaS3Service,
+        user_access: &UserAccess,
+        group_id: Ulid,
+        token: Option<String>,
+    ) -> S3Request<ListObjectsV2Input> {
+        let scope = resolve_scope(
+            &service.state,
+            user_access,
+            &blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
+        )
+        .await
+        .unwrap();
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access.clone());
+        extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+        extensions.insert(scope);
+        test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                bucket: "study".to_string(),
+                max_keys: Some(1),
+                continuation_token: token,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn marker_stays_scoped() {
+        // Paging one key at a time crosses keys the caller may not see, so no
+        // token may name one and the last page must admit it is the last.
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        let mut token = None;
+        let mut keys: Vec<String> = Vec::new();
+
+        for _ in 0..4 {
+            let request = paged_request(&service, &user_access, group_id, token.clone()).await;
+            let output = service.list_objects_v2(request).await.unwrap().output;
+            keys.extend(
+                output
+                    .contents
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|object| object.key),
+            );
+            token = output.next_continuation_token;
+            assert_eq!(output.is_truncated, Some(token.is_some()));
+            let Some(encoded) = token.clone() else {
+                break;
+            };
+            let decoded = ArunaS3Service::decode_list_objects_v2_continuation_token(Some(&encoded))
+                .unwrap()
+                .unwrap();
+            let head = BlobHeadKey::from_bytes(&decoded.last_key).unwrap();
+            assert!(head.key.starts_with("imaging/"), "leaked {}", head.key);
+        }
+
+        assert_eq!(keys, vec!["imaging/scan-a", "imaging/scan-b"]);
+        assert!(token.is_none());
     }
 
     #[tokio::test]
