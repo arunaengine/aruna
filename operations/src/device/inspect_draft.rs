@@ -132,7 +132,7 @@ mod tests {
     use super::{InspectDraftError, InspectDraftOperation};
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::intake::IntakeEntry;
-    use crate::device::test_support::context;
+    use crate::device::tests::fixtures::context;
     use crate::driver::drive;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
