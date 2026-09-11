@@ -896,3 +896,120 @@ pub(in crate::document_sync) fn event_is_create(event: &MetadataCreateEventRecor
             | aruna_core::metadata::MetadataCreateEventPayload::RoCrate { .. }
     )
 }
+
+pub(in crate::document_sync) fn same_create_event(
+    accepted: &MetadataCreateEventRecord,
+    incoming: &MetadataCreateEventRecord,
+) -> bool {
+    accepted.event_id == incoming.event_id
+        && registry_identity_matches(&accepted.record, &incoming.record)
+        && accepted.record.public == incoming.record.public
+        && accepted.record.updated_at_ms == incoming.record.updated_at_ms
+        && accepted.record.last_event_id == incoming.record.last_event_id
+        && accepted.user_id == incoming.user_id
+        && accepted.node_id == incoming.node_id
+        && accepted.payload == incoming.payload
+        && accepted.occurred_at_ms == incoming.occurred_at_ms
+}
+
+pub(in crate::document_sync) fn metadata_registry_freshness(
+    record: &MetadataRegistryRecord,
+) -> (u64, Ulid) {
+    (record.updated_at_ms, record.last_event_id)
+}
+
+pub(in crate::document_sync) async fn registry_sidecar_repairs(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    let entries = metadata_registry_write_entries(record)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut repairs = Vec::new();
+    for (key_space, key, value) in entries.into_iter().skip(1) {
+        let current =
+            storage_read_from_transaction(storage, key_space.clone(), key.clone(), Some(txn_id))
+                .await?;
+        if current.as_ref() != Some(&value) {
+            repairs.push((key_space, key, value));
+        }
+    }
+    Ok(repairs)
+}
+
+pub(in crate::document_sync) async fn graph_record_txn(
+    storage: &StorageHandle,
+    graph_iri: &str,
+    txn_id: TxnId,
+) -> Result<Option<MetadataGraphLifecycleRecord>> {
+    let value = storage_read_from_transaction(
+        storage,
+        METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        metadata_graph_lifecycle_key(graph_iri),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let record: MetadataGraphLifecycleRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok(Some(record))
+}
+
+pub(in crate::document_sync) async fn delete_record_txn(
+    storage: &StorageHandle,
+    document_id: Ulid,
+    txn_id: TxnId,
+) -> Result<Option<MetadataDocumentDeleteRecord>> {
+    let value = storage_read_from_transaction(
+        storage,
+        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+        metadata_document_lifecycle_key(document_id),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let record: MetadataDocumentLifecycleRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    match record {
+        MetadataDocumentLifecycleRecord::Delete { event } => Ok(Some(event)),
+        MetadataDocumentLifecycleRecord::Upsert { .. } => Ok(None),
+    }
+}
+
+pub(in crate::document_sync) async fn create_fence_txn(
+    storage: &StorageHandle,
+    event: &MetadataCreateEventRecord,
+    txn_id: TxnId,
+) -> Result<bool> {
+    if let Some(delete) = delete_record_txn(storage, event.record.document_id, txn_id).await? {
+        return Ok(event.event_id <= delete.deleted_after_event_id);
+    }
+    Ok(graph_record_txn(storage, &event.record.graph_iri, txn_id)
+        .await?
+        .is_some_and(|record| record.is_deleted()))
+}
+
+pub(in crate::document_sync) async fn record_fenced_txn(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<bool> {
+    if let Some(delete) = delete_record_txn(storage, record.document_id, txn_id).await? {
+        return Ok(!registry_live_txn(
+            storage,
+            record.group_id,
+            record.document_id,
+            &delete,
+            txn_id,
+        )
+        .await?
+        .0);
+    }
+    Ok(graph_record_txn(storage, &record.graph_iri, txn_id)
+        .await?
+        .is_some_and(|record| record.is_deleted()))
+}
