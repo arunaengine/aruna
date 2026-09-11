@@ -160,7 +160,7 @@ pub struct OpenDalWriter {
 
 pub struct BaoReadWriter {
     writer: DuplexStream,
-    hasher: Hasher,
+    hasher: blake3::Hasher,
     written: u64,
 }
 
@@ -168,7 +168,7 @@ impl BaoReadWriter {
     pub fn new(writer: DuplexStream) -> Self {
         Self {
             writer,
-            hasher: Hasher::new(),
+            hasher: blake3::Hasher::new(),
             written: 0,
         }
     }
@@ -183,7 +183,7 @@ impl BaoReadWriter {
                 ),
             ));
         }
-        if self.hasher.finalize().blake3.as_bytes() != &expected_blake3 {
+        if self.hasher.finalize().as_bytes() != &expected_blake3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bao read content hash mismatch",
