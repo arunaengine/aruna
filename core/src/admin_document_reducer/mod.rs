@@ -32,9 +32,9 @@ mod paths;
 mod revocation;
 
 pub use paths::*;
+pub use revocation::{MAX_LIVE_REVOCATIONS_PER_ORIGIN, revoked_token_path, revoked_token_entry};
 use paths::{event_observes_dot, operation_paths, role_definition_value};
 
-pub const MAX_LIVE_REVOCATIONS_PER_ORIGIN: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminDocumentApplyStatus {
@@ -2502,19 +2502,6 @@ pub fn handle_range_path(range_id: Ulid) -> String {
 
 pub fn band_pool_path(pool_id: Ulid) -> String {
     format!("realm_config.placement.band_pools.{pool_id}")
-}
-
-pub fn revoked_token_path(token_hash: &str, expires_at: u64, token_owner: &UserId) -> String {
-    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}.{expires_at}.{token_owner}")
-}
-
-pub fn revoked_token_entry(path: &str) -> Option<(&str, u64, UserId)> {
-    let rest = path.strip_prefix(REALM_CONFIG_REVOKED_TOKENS_PATH)?;
-    let mut parts = rest.strip_prefix('.')?.split('.');
-    let hash = parts.next()?;
-    let expires_at = parts.next()?.parse().ok()?;
-    let token_owner = UserId::from_string(parts.next()?).ok()?;
-    (parts.next().is_none() && valid_token_hash(hash)).then_some((hash, expires_at, token_owner))
 }
 
 
