@@ -38,7 +38,7 @@ pub mod search_buckets;
 pub mod search_objects;
 pub mod session;
 #[cfg(test)]
-mod test_support;
+mod tests;
 pub mod upload_part;
 pub mod upload_part_copy;
 mod write_cleanup;
