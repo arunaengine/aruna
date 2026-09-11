@@ -552,9 +552,9 @@ mod tests {
         let mut operation = operation(vec![first.policy_ref(), second.policy_ref()], "eu-west");
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&first), 10)));
-        operation.step(crate::placement::policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
         operation.step(cached(&PolicyCacheEntry::verified(&document(&second), 10)));
-        operation.step(crate::placement::policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(
@@ -574,7 +574,7 @@ mod tests {
         let mut operation = operation(vec![rule.policy_ref()], "eu-west");
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::placement::policy::fixtures::group_authority(
+        operation.step(crate::placement::policy::tests::fixtures::group_authority(
             realm(),
             owner,
         ));
@@ -601,9 +601,9 @@ mod tests {
             &document(&realm_wide),
             10,
         )));
-        operation.step(crate::placement::policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
         operation.step(cached(&PolicyCacheEntry::verified(&document(&owned), 10)));
-        operation.step(crate::placement::policy::fixtures::group_authority(
+        operation.step(crate::placement::policy::tests::fixtures::group_authority(
             realm(),
             group(),
         ));
@@ -622,7 +622,7 @@ mod tests {
         let mut operation = gate_for(vec![rule.policy_ref()], "eu-west", None);
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::placement::policy::fixtures::group_authority(
+        operation.step(crate::placement::policy::tests::fixtures::group_authority(
             realm(),
             owner,
         ));

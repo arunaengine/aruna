@@ -967,7 +967,7 @@ mod tests {
     use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
     use crate::driver::{DriverContext, drive, gate_context};
     use crate::placement::policy::cache::cache_key;
-    use crate::placement::policy::fixtures::{seed_gate, subject};
+    use crate::placement::policy::tests::fixtures::{seed_gate, subject};
     use crate::realm::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };

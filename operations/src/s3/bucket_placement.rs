@@ -408,7 +408,7 @@ impl Operation for PutBucketPlacementOperation {
 mod tests {
     use super::{PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::placement::policy::cache::PolicyCacheEntry;
-    use crate::placement::policy::fixtures::signed_document;
+    use crate::placement::policy::tests::fixtures::signed_document;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
@@ -502,7 +502,9 @@ mod tests {
         refs.sort_by_key(|policy| policy.policy_ref());
         for policy in refs {
             operation.step(cached(policy));
-            operation.step(crate::placement::policy::fixtures::authority(realm_id()));
+            operation.step(crate::placement::policy::tests::fixtures::authority(
+                realm_id(),
+            ));
         }
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),
@@ -637,7 +639,7 @@ mod tests {
         operation.step(authorized(false));
         operation.step(authorized(true));
         operation.step(cached(&policies[0]));
-        operation.step(crate::placement::policy::fixtures::group_authority(
+        operation.step(crate::placement::policy::tests::fixtures::group_authority(
             realm_id(),
             group_id(),
         ));
@@ -661,7 +663,7 @@ mod tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policies[0]));
-        let effects = operation.step(crate::placement::policy::fixtures::group_authority(
+        let effects = operation.step(crate::placement::policy::tests::fixtures::group_authority(
             realm_id(),
             foreign,
         ));

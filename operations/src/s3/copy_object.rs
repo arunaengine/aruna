@@ -244,7 +244,7 @@ pub async fn copy_object(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::placement::policy::fixtures::{seed_gate, subject};
+    use crate::placement::policy::tests::fixtures::{seed_gate, subject};
     use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;

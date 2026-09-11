@@ -71,9 +71,6 @@ pub fn foreign_owner(
 }
 
 #[cfg(test)]
-pub(crate) use self::tests::fixtures;
-
-#[cfg(test)]
 pub(crate) mod tests {
     use aruna_core::NodeId;
     use aruna_core::structs::{

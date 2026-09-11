@@ -312,7 +312,7 @@ mod tests {
     use ulid::Ulid;
 
     use crate::placement::policy::cache::PolicyCacheEntry;
-    use crate::placement::policy::fixtures::{signed_document, subject};
+    use crate::placement::policy::tests::fixtures::{signed_document, subject};
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])

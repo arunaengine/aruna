@@ -3762,12 +3762,13 @@ mod gate_test {
         assert!(!materializes(&operation.start()));
         let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
         assert!(!materializes(&effects));
-        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
+        let document =
+            crate::placement::policy::tests::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::placement::policy::fixtures::authority(realm()));
+        let effects = operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(operation.is_complete());
@@ -3872,7 +3873,7 @@ mod gate_test {
 
     fn subject_row(generation: u64, blocked: bool) -> Value {
         let mut record = aruna_core::structs::NodeSubjectRecord::seed(
-            crate::placement::policy::fixtures::subject(node(9), "eu-west"),
+            crate::placement::policy::tests::fixtures::subject(node(9), "eu-west"),
         )
         .expect("subject is valid");
         record.subject.generation = generation;
@@ -3889,12 +3890,13 @@ mod gate_test {
         let mut operation = operation("eu-west");
         operation.start();
         operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
-        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
+        let document =
+            crate::placement::policy::tests::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        operation.step(crate::placement::policy::fixtures::authority(realm()));
+        operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
         operation.step(fence_clear());
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
@@ -3926,9 +3928,9 @@ mod gate_test {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
         }
-        let (config_value, auth_value) = crate::placement::policy::fixtures::realm_view(
+        let (config_value, auth_value) = crate::placement::policy::tests::fixtures::realm_view(
             &config,
-            crate::placement::policy::fixtures::admin_user(realm()),
+            crate::placement::policy::tests::fixtures::admin_user(realm()),
         );
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {
@@ -3949,8 +3951,11 @@ mod gate_test {
         operation.start();
         operation.step(read(Some(bucket(vec![requested.policy_ref()], 1))));
         operation.step(read(None));
-        let substituted =
-            crate::placement::policy::fixtures::signed_document(realm(), &policy("us-east"), 9);
+        let substituted = crate::placement::policy::tests::fixtures::signed_document(
+            realm(),
+            &policy("us-east"),
+            9,
+        );
         let effects = operation.step(opened(Some(ByteView::from(
             substituted.to_bytes().expect("document encodes"),
         ))));
@@ -3972,12 +3977,13 @@ mod gate_test {
         let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
         assert!(!materializes(&effects));
 
-        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
+        let document =
+            crate::placement::policy::tests::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::placement::policy::fixtures::authority(realm()));
+        let effects = operation.step(crate::placement::policy::tests::fixtures::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(matches!(
@@ -3996,12 +4002,13 @@ mod gate_test {
         let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
         assert!(!materializes(&effects));
 
-        let document = crate::placement::policy::fixtures::signed_document(realm(), &rule, 9);
+        let document =
+            crate::placement::policy::tests::fixtures::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::placement::policy::fixtures::group_authority(
+        let effects = operation.step(crate::placement::policy::tests::fixtures::group_authority(
             realm(),
             Ulid::from_bytes([8u8; 16]),
         ));
