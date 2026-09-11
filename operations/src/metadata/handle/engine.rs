@@ -571,3 +571,142 @@ fn run_deferred_metadata_flush(
 fn metadata_request_persists_document_sync(durability: MetadataRequestDurability) -> bool {
     matches!(durability, MetadataRequestDurability::Durable)
 }
+
+pub(super) fn upsert_data_entity(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    request: MetadataUpsertEntityRequest,
+) -> Result<MetadataBatch, CraqleError> {
+    let graph = GraphId::new(&request.graph_iri);
+    let actor = request.deterministic_actor.map(ActorId::from_bytes);
+    let entity_request = craqle_patch_request(&graph, &request.jsonld)?;
+    node.patch_data_with(
+        auth,
+        entity_request,
+        craqle_request_durability(request.durability),
+        actor,
+    )
+    .map(metadata_batch_from_craqle)
+}
+
+pub(super) fn upsert_contextual_entity(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    request: MetadataUpsertEntityRequest,
+) -> Result<MetadataBatch, CraqleError> {
+    let graph = GraphId::new(&request.graph_iri);
+    let actor = request.deterministic_actor.map(ActorId::from_bytes);
+    let entity_request = craqle_patch_request(&graph, &request.jsonld)?;
+    node.patch_contextual_with(
+        auth,
+        entity_request,
+        craqle_request_durability(request.durability),
+        actor,
+    )
+    .map(metadata_batch_from_craqle)
+}
+
+pub(super) fn craqle_patch_request(
+    graph: &GraphId,
+    jsonld: &str,
+) -> Result<PatchEntityRequest, CraqleError> {
+    let value: Value = serde_json::from_str(jsonld).map_err(|error| {
+        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string()))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+            "entity payload must be a JSON object".to_string(),
+        ))
+    })?;
+    if object.contains_key("@graph") || object.contains_key("graph") {
+        return Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+            "entity payload must not contain `@graph`; send a single JSON-LD entity object"
+                .to_string(),
+        )));
+    }
+
+    let entity_id = entity_identifier(object)?;
+    let mut entity_types = entity_types(object)?;
+    let entity_type = entity_types.remove(0);
+    let name = entity_name(object)?;
+    let mut additional_triples = Vec::new();
+    let mut replaced_predicates = Vec::new();
+    for extra_type in entity_types {
+        additional_triples.push((vocab::rdf_type(), class_term(&extra_type)?));
+    }
+
+    for (property, property_value) in object {
+        if matches!(
+            property.as_str(),
+            "@context" | "@id" | "id" | "@type" | "type" | "name"
+        ) {
+            continue;
+        }
+        let property = normalize_property(property);
+        let predicate = property_named_node(&property)?;
+        replaced_predicates.push(predicate.clone());
+        for object in property_value_terms(&property, property_value)? {
+            additional_triples.push((predicate.clone(), object));
+        }
+    }
+
+    Ok(PatchEntityRequest {
+        entity: CreateEntityRequest {
+            graph: graph.clone(),
+            entity_id,
+            entity_type,
+            name,
+            additional_triples,
+        },
+        replaced_predicates,
+    })
+}
+
+fn entity_identifier(object: &serde_json::Map<String, Value>) -> Result<String, CraqleError> {
+    object
+        .get("@id")
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)
+        .map(normalize_entity_id)
+        .ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                "entity payload must define string `@id`".to_string(),
+            ))
+        })
+}
+
+fn entity_types(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, CraqleError> {
+    let value = object
+        .get("@type")
+        .or_else(|| object.get("type"))
+        .ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                "entity payload must define `@type`".to_string(),
+            ))
+        })?;
+    let mut types = Vec::new();
+    match value {
+        Value::String(value) => types.push(value.clone()),
+        Value::Array(values) => {
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                        "entity `@type` arrays must contain only strings".to_string(),
+                    )));
+                };
+                types.push(value.to_string());
+            }
+        }
+        _ => {
+            return Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                "entity `@type` must be a string or array of strings".to_string(),
+            )));
+        }
+    }
+    if types.is_empty() {
+        return Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+            "entity `@type` must not be empty".to_string(),
+        )));
+    }
+    Ok(types)
+}
