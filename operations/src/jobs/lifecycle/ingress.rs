@@ -856,7 +856,7 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
-    use crate::jobs::records::tests::fixture::{node, payload};
+    use crate::jobs::records::tests::fixtures::{node, payload};
 
     fn family(seed: u8) -> JobFamilyId {
         JobFamilyId {
