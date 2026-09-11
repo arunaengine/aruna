@@ -968,9 +968,7 @@ mod tests {
     use crate::driver::{DriverContext, drive, gate_context};
     use crate::placement::policy::cache::cache_key;
     use crate::placement::policy::tests::fixtures::{seed_gate, subject};
-    use crate::realm::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
+    use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
