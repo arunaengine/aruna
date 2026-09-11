@@ -55,6 +55,7 @@ fn narrow_grant_visible() {
     assert!(scope.graph_visible(&cache, &granted.graph_iri));
     assert!(!scope.graph_visible(&cache, &hidden.graph_iri));
 }
+// Permissive on purpose: craqle's stored policy must not sway the decision.
 fn open_policy() -> GraphPolicy {
     GraphPolicy {
         public: true,
