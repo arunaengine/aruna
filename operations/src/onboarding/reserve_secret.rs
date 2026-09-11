@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::create_onboarding_secret::{
+use crate::onboarding::create_secret::{
     enrolled_devices, pending_devices, scan_secrets, secret_record_key,
 };
 use crate::onboarding::secret_state::{
@@ -503,7 +503,7 @@ mod tests {
         ReserveOnboardingSecretOperation,
     };
     use crate::driver::{DriverContext, drive};
-    use crate::onboarding::create_onboarding_secret::{
+    use crate::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
     use aruna_core::effects::StorageEffect;

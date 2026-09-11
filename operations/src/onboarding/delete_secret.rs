@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::create_onboarding_secret::secret_record_key;
+use crate::onboarding::create_secret::secret_record_key;
 use crate::onboarding::secret_state::secret_state_key;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

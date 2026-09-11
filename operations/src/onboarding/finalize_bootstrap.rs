@@ -18,24 +18,24 @@ use crate::driver::{DriverContext, drive};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::notifications::watch::interest::mark_watch_interest_dirty;
-use crate::onboarding::consume_onboarding_secret::{
+use crate::onboarding::consume_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
-use crate::onboarding::issue_onboarding_sync_ticket::{
+use crate::onboarding::issue_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
     IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
-use crate::onboarding::reserve_onboarding_secret::{
+use crate::onboarding::reserve_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
 };
 use crate::placement::expand_placement::{ensure_activated_map, expand_realm_placement};
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::realm::ensure_realm_config::{
+use crate::realm::ensure_config::{
     EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
 };
-use crate::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use crate::realm::mutate_realm_placement::{MutateRealmPlacementError, RealmPlacementMutation};
-use crate::realm::read_realm_authorization::ReadRealmAuthorizationOperation;
+use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use crate::realm::mutate_placement::{MutateRealmPlacementError, RealmPlacementMutation};
+use crate::realm::read_authorization::ReadRealmAuthorizationOperation;
 
 const ONBOARDING_RESERVATION_TTL_SECS: u64 = 300;
 const REALM_NODE_UPDATE_RETRIES: usize = 5;
@@ -387,13 +387,13 @@ mod tests {
         onboarding_sync_topics,
     };
     use crate::driver::{DriverContext, drive};
-    use crate::onboarding::create_onboarding_secret::{
+    use crate::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use crate::onboarding::reserve_onboarding_secret::ReserveOnboardingSecretError;
+    use crate::onboarding::reserve_secret::ReserveOnboardingSecretError;
     use crate::onboarding::secret_state::secret_state_key;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+    use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
     use aruna_core::NodeId;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;

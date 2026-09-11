@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::identifiers::StructuredId;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::{MetadataAuthToken, MetadataError};
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
-use aruna_core::structured_id::StructuredId;
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_millis;
@@ -18,14 +18,14 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::create_metadata_document::{
+use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_forward_document,
 };
 use crate::metadata::forward::{
     MetadataWriteError, apply_batch_routed, create_metadata_document_routed,
 };
-use crate::metadata::update_metadata_document::UpdateMetadataDocumentError;
+use crate::metadata::update_document::UpdateMetadataDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
 use super::backlog::{BacklogDrain, arm_timer, drain_backlog, exhausted, retry_due_ms};

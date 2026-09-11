@@ -7,7 +7,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{
     DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
 };
@@ -23,16 +23,16 @@ use crate::node::usage_stats::refresh_realm_usage_summary_for_targets;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::realm::get_realm_config::GetRealmConfigOperation;
-use crate::realm::mutate_realm_placement::node_kind;
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoReadOperation;
-use crate::replication::incoming_version_replication::{
+use crate::replication::incoming_version::{
     IncomingVersionReplicationOperation, IncomingVersionReplicationResult,
 };
-use crate::replication::location_summary::LocationSummaryOperation;
+use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::sync::document_sync_outbox::{
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
 use crate::tasks::queue_backoff::queue_retry_after_ms;

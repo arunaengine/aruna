@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
 use crate::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
 };

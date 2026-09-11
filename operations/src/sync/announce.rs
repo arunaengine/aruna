@@ -26,7 +26,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::document_repository;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
 };
 

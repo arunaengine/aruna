@@ -1,4 +1,3 @@
-use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -11,6 +10,7 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
@@ -21,7 +21,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
-use aruna_core::user_update_validation::{
+use aruna_core::user_validation::{
     UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
     validate_user_attribute_value,
 };
@@ -35,7 +35,7 @@ use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::placement_ref_for_target;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
@@ -332,10 +332,8 @@ impl UpdateUserOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
-                    value.as_ref(),
-                )
-                .map_err(ConversionError::from)
+                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -759,9 +757,6 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
 #[cfg(test)]
 mod tests {
     use super::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
-    use aruna_core::admin_document_reducer::{
-        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
-    };
     use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
@@ -771,6 +766,9 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::operation::Operation;
+    use aruna_core::reducer::{
+        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
+    };
     use aruna_core::storage_entries::{
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
         document_sync_revision_key,

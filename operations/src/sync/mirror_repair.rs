@@ -26,7 +26,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataAuthToken;
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
+use crate::s3::get_bucket::GetBucketInfoOperation;
 use crate::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,

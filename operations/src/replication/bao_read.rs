@@ -38,7 +38,7 @@ use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionRepl
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::blob_storage::blob_location_read;
-use crate::realm::mutate_realm_placement::node_kind;
+use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::ensure_realm_peer;
 
 #[derive(Debug, PartialEq)]
