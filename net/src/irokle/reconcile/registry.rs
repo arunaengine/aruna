@@ -1151,3 +1151,28 @@ pub(in crate::document_sync) async fn derive_placement_txn(
     }
     Ok(MetadataPlacementOutcome::Accepted(derived))
 }
+
+pub(in crate::document_sync) fn metadata_document_delete_write_entries(
+    record: &MetadataDocumentDeleteRecord,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+        event: record.clone(),
+    };
+    let mut entries = vec![
+        metadata_document_lifecycle_write_entry(&lifecycle)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        metadata_graph_lifecycle_write_entry(&record.tombstone)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    ];
+    if record.tombstone.is_deleted() {
+        let job = MetadataGraphPruneJobRecord::new(
+            record.tombstone.graph_iri.clone(),
+            unix_timestamp_millis(),
+        );
+        entries.push(
+            metadata_graph_prune_job_write_entry(&job)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+    }
+    Ok(entries)
+}
