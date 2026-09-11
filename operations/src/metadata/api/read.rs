@@ -315,3 +315,108 @@ pub async fn search_metadata(
         fanout_stats,
     })
 }
+
+/// Backlink lookup: scans the local IRI reference index for documents naming
+/// `iri` as an object, joins and filters by read access. Empty scans for known
+/// graph IRIs or `resolve` return one predicate-less summary. Local-node-only in v1.
+pub async fn references_metadata(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: MetadataReferencesRequest,
+) -> Result<MetadataReferencesExecution, MetadataApiError> {
+    if request.iri.trim().is_empty() || oxrdf::NamedNode::new(&request.iri).is_err() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    if request
+        .predicate
+        .as_deref()
+        .is_some_and(|iri| oxrdf::NamedNode::new(iri).is_err())
+    {
+        return Err(MetadataApiError::BadRequest);
+    }
+    let limit = request
+        .limit
+        .unwrap_or(METADATA_REFERENCES_DEFAULT_LIMIT)
+        .clamp(1, METADATA_REFERENCES_MAX_LIMIT);
+
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    let registry = handle
+        .list_cached_registry_records()
+        .await
+        .map_err(map_metadata_internal_error)?;
+    let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
+
+    if request.resolve {
+        let entry = resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?;
+        return Ok(MetadataReferencesExecution {
+            references: entry.into_iter().collect(),
+        });
+    }
+
+    let backlinks = crate::metadata::iri_index::lookup_iri_backlinks(
+        &context.storage_handle,
+        registry.as_ref(),
+        &request.iri,
+        request.predicate.as_deref(),
+    )
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+
+    let registry_by_id: HashMap<Ulid, &MetadataRegistryRecord> = registry
+        .iter()
+        .map(|record| (record.document_id, record))
+        .collect();
+
+    let mut references = Vec::new();
+    let mut authorized: HashMap<Ulid, bool> = HashMap::new();
+    let mut titles: HashMap<Ulid, Option<String>> = HashMap::new();
+    for backlink in backlinks {
+        let Some(record) = registry_by_id.get(&backlink.document_id) else {
+            continue;
+        };
+        let allowed = match authorized.get(&backlink.document_id) {
+            Some(allowed) => *allowed,
+            None => {
+                let allowed =
+                    can_read_record(context, realm_id, request.auth.as_ref(), record).await?;
+                authorized.insert(backlink.document_id, allowed);
+                allowed
+            }
+        };
+        if !allowed {
+            continue;
+        }
+        let title = match titles.get(&backlink.document_id) {
+            Some(title) => title.clone(),
+            None => {
+                let title = reference_document_title(context, record).await;
+                titles.insert(backlink.document_id, title.clone());
+                title
+            }
+        };
+        references.push(MetadataReferenceEntry {
+            document_id: record.document_id.to_string(),
+            group_id: record.group_id.to_string(),
+            document_path: record.document_path.clone(),
+            graph_iri: record.graph_iri.clone(),
+            predicate: Some(backlink.predicate_iri),
+            subject_iris: backlink.subject_iris,
+            title,
+        });
+        if references.len() >= limit {
+            break;
+        }
+    }
+
+    if references.is_empty()
+        && let Some(entry) =
+            resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?
+    {
+        references.push(entry);
+    }
+
+    Ok(MetadataReferencesExecution { references })
+}
