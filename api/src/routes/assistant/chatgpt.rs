@@ -537,7 +537,7 @@ pub(super) async fn fresh_provider(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{setup_state, spawn_mock};
+    use super::super::tests::fixtures::{setup_state, spawn_mock};
     use super::*;
     use axum::Router;
     use axum::routing::post;

@@ -423,7 +423,7 @@ pub(super) async fn fetch_models(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{setup_state, spawn_mock};
+    use super::super::tests::fixtures::{setup_state, spawn_mock};
     use super::*;
     use crate::server_state::ServerState;
     use aruna_core::compute::Secret;

@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::routes::tests::fixtures::{test_context, test_state, test_storage};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
@@ -10,7 +8,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use ulid::Ulid;
 
-pub(super) async fn setup_state() -> (TempDir, ServerState, AuthContext) {
+pub(crate) async fn setup_state() -> (TempDir, ServerState, AuthContext) {
     let (dir, storage) = test_storage();
     let realm_id = RealmId::from_bytes([3; 32]);
     let user_id = UserId::local(Ulid::from_bytes([4; 16]), realm_id);
@@ -30,7 +28,7 @@ pub(super) async fn setup_state() -> (TempDir, ServerState, AuthContext) {
     (dir, state, auth)
 }
 
-pub(super) async fn spawn_mock(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+pub(crate) async fn spawn_mock(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
