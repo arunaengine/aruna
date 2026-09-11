@@ -1,7 +1,7 @@
 use super::*;
 
 impl DocumentSyncService {
-    pub(in crate::document_sync) async fn apply_document_event(
+    pub(in crate::irokle) async fn apply_document_event(
         &self,
         event: DocumentSyncEvent,
     ) -> Result<()> {
@@ -21,7 +21,7 @@ impl DocumentSyncService {
         }
     }
 
-    pub(in crate::document_sync) async fn apply_upsert(
+    pub(in crate::irokle) async fn apply_upsert(
         &self,
         target: DocumentSyncTarget,
         bytes: Vec<u8>,
@@ -187,7 +187,7 @@ impl DocumentSyncService {
 }
 
 impl DocumentSyncService {
-    pub(in crate::document_sync) async fn apply_watch_subscription_change(
+    pub(in crate::irokle) async fn apply_watch_subscription_change(
         &self,
         target: DocumentSyncTarget,
         bytes: Option<Vec<u8>>,
@@ -196,7 +196,7 @@ impl DocumentSyncService {
         apply_watch_subscription_change_to_storage(&self.storage, target, bytes, change).await
     }
 
-    pub(in crate::document_sync) async fn apply_metadata_registry_upsert(
+    pub(in crate::irokle) async fn apply_metadata_registry_upsert(
         &self,
         record: MetadataRegistryRecord,
         primary_bytes: Vec<u8>,
@@ -204,7 +204,7 @@ impl DocumentSyncService {
         apply_metadata_registry_upsert_to_storage(&self.storage, record, primary_bytes).await
     }
 
-    pub(in crate::document_sync) async fn apply_metadata_document_lifecycle(
+    pub(in crate::irokle) async fn apply_metadata_document_lifecycle(
         &self,
         record: MetadataDocumentLifecycleRecord,
         change: DocumentSyncChange,
@@ -212,7 +212,7 @@ impl DocumentSyncService {
         apply_metadata_document_lifecycle_to_storage(&self.storage, &record, change).await
     }
 
-    pub(in crate::document_sync) async fn apply_metadata_graph_lifecycle(
+    pub(in crate::irokle) async fn apply_metadata_graph_lifecycle(
         &self,
         record: MetadataGraphLifecycleRecord,
         primary_bytes: Vec<u8>,
@@ -220,7 +220,7 @@ impl DocumentSyncService {
         apply_metadata_graph_lifecycle_to_storage(&self.storage, &record, primary_bytes).await
     }
 
-    pub(in crate::document_sync) async fn apply_pid_mapping(
+    pub(in crate::irokle) async fn apply_pid_mapping(
         &self,
         mapping: &PersistentIdMapping,
         placement: PlacementRef,
@@ -232,7 +232,7 @@ impl DocumentSyncService {
     /// the original publisher must be a permitted node and its named authorizing
     /// user must still hold write on the path the rule's ownership names. A
     /// relay or current holder never supplies that authority for someone else.
-    pub(in crate::document_sync) async fn apply_policy_document(
+    pub(in crate::irokle) async fn apply_policy_document(
         &self,
         document: &PlacementPolicyDocument,
         placement: PlacementRef,
@@ -272,7 +272,7 @@ impl DocumentSyncService {
         store_policy_document(&self.storage, self.realm_id, document, placement).await
     }
 
-    pub(in crate::document_sync) async fn apply_delete(
+    pub(in crate::irokle) async fn apply_delete(
         &self,
         target: DocumentSyncTarget,
         change: DocumentSyncChange,
@@ -320,7 +320,7 @@ impl DocumentSyncService {
     /// the batch would then collapse into one row. `None` means the store is at
     /// capacity: the caller must leave the affected cursors unwritten so the
     /// operations are redelivered.
-    pub(in crate::document_sync) async fn quarantine_entries(
+    pub(in crate::irokle) async fn quarantine_entries(
         &self,
         rejections: &[SyncRejection],
         txn_id: TxnId,
@@ -399,7 +399,7 @@ impl DocumentSyncService {
     /// Commit rejection evidence and the topic cursor in one transaction so the
     /// cursor can never move past evidence that is not durable. `false` means
     /// the store is at capacity and nothing was written.
-    pub(in crate::document_sync) async fn commit_cursor_evidence(
+    pub(in crate::irokle) async fn commit_cursor_evidence(
         &self,
         rejections: &[SyncRejection],
         cursor_write: (String, ByteView, Value),
@@ -427,7 +427,7 @@ impl DocumentSyncService {
         Ok(true)
     }
 
-    pub(in crate::document_sync) async fn abort_transaction(&self, txn_id: TxnId) {
+    pub(in crate::irokle) async fn abort_transaction(&self, txn_id: TxnId) {
         let _ = self
             .storage
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -435,7 +435,7 @@ impl DocumentSyncService {
     }
 }
 
-pub(in crate::document_sync) async fn apply_watch_subscription_change_to_storage(
+pub(in crate::irokle) async fn apply_watch_subscription_change_to_storage(
     storage: &StorageHandle,
     target: DocumentSyncTarget,
     bytes: Option<Vec<u8>>,

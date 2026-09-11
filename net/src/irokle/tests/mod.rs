@@ -1,6 +1,5 @@
 use super::*;
 use crate::test_support::test_endpoint;
-use aruna_core::admin_document_reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
     AdminDocumentTarget,
@@ -8,6 +7,7 @@ use aruna_core::admin_documents::{
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{MAX_BEARER_TOKEN_LIFETIME_SECS, REVOCATION_GRACE_SECS};
 use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
+use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
@@ -17,6 +17,7 @@ use aruna_core::keyspaces::{
     USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataCreateEventPayload;
+use aruna_core::reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
 use aruna_core::storage_entries::{
     admin_document_reducer_conflict_key, admin_document_reducer_state_key,
     metadata_create_acceptance_key, metadata_document_key, metadata_event_log_key,
@@ -31,7 +32,6 @@ use aruna_core::structs::{
     Role, SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding, SyncQuarantineFamily,
     SyncQuarantineRecord, UserGroupCapOverride, band_start,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{env, process::Command};
@@ -55,7 +55,7 @@ use fixtures::*;
 
 const DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV: &str = "ARUNA_NET_DOCUMENT_SYNC_RESTART_CHILD_PATH";
 const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
-    "document_sync::tests::restart::buffered_document_sync_publish_restart_child_process";
+    "irokle::tests::restart::buffered_document_sync_publish_restart_child_process";
 
 // Two services fork one admin topic (each mints its own genesis carrying a
 // unique admin event). The genesis tie-break resets exactly the losing side,
