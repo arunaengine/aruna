@@ -2260,13 +2260,13 @@ mod tests {
         ClaimOutcome, claim_job, insert_job, put_run_crate_status, set_cancel_requested,
     };
     use crate::jobs::workflow::workspace::mint_workspace_credential;
-    use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+    use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::structs::{
         FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination, OutputSelection, RealmId,
     };
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;

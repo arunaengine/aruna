@@ -416,11 +416,11 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::insert_job;
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::structs::{
         AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobPayload, JobState, RealmId,
         job_due_index_key,
     };
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;

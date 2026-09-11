@@ -1,4 +1,4 @@
-use crate::connectors::create_source_connector::{
+use crate::connectors::create_connector::{
     CreateSourceConnectorInput, CreateSourceConnectorOperation,
 };
 use crate::driver::{DriverContext, drive};

@@ -9,8 +9,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
-use crate::realm::get_realm_config::GetRealmConfigOperation;
-use crate::realm::mutate_realm_placement::{
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
     RealmPlacementMutation,
 };

@@ -39,8 +39,8 @@ use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
 use crate::placement::{build_view, held_buckets};
-use crate::realm::get_realm_config::GetRealmConfigOperation;
-use crate::realm::mutate_realm_placement::node_kind;
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::mutate_placement::node_kind;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Rows one snapshot scan reads per page.

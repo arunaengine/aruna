@@ -9,21 +9,21 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::identifiers::PlacementHandle;
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     Actor, DocumentClass, HandleAllocationCursor, HandleRange, PlacementBinding, PlacementScope,
     RealmId,
 };
-use aruna_core::structured_id::PlacementHandle;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::realm::get_realm_config::GetRealmConfigError;
-use crate::realm::mutate_realm_placement::{
+use crate::realm::get_config::GetRealmConfigError;
+use crate::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
     RealmPlacementMutation,
 };
@@ -213,7 +213,7 @@ pub async fn allocate_handle(
 ) -> Result<AllocatedHandle, HandleAllocationError> {
     let _guard = allocation_lock().lock().await;
     let config = crate::driver::drive(
-        crate::realm::get_realm_config::GetRealmConfigOperation::new(realm_id),
+        crate::realm::get_config::GetRealmConfigOperation::new(realm_id),
         context,
     )
     .await?;
@@ -271,7 +271,7 @@ pub async fn provision_metadata_binding(
 ) -> Result<PlacementBinding, HandleAllocationError> {
     let _guard = provision_lock().lock().await;
     let config = crate::driver::drive(
-        crate::realm::get_realm_config::GetRealmConfigOperation::new(actor.realm_id),
+        crate::realm::get_config::GetRealmConfigOperation::new(actor.realm_id),
         context,
     )
     .await?;

@@ -825,14 +825,14 @@ async fn prune_released_transitions(
     };
     let (Ok(mut stored), Ok(state)) = (
         RealmConfigDocument::from_bytes(stored.as_ref()),
-        aruna_core::admin_document_reducer::decode_admin_document_reducer_state(state.as_ref()),
+        aruna_core::reducer::decode_admin_document_reducer_state(state.as_ref()),
     ) else {
         warn!("Undecodable realm config or reducer state; transition release skipped");
         abort_release_txn(storage, txn_id).await;
         return false;
     };
     let before = stored.placement_transitions.len();
-    crate::realm::ensure_realm_config::overlay_realm_config_reducer_materialization(
+    crate::realm::ensure_config::overlay_realm_config_reducer_materialization(
         &mut stored,
         &state,
         now_ms,

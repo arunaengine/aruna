@@ -15,15 +15,15 @@ use super::super::store::{flush_progress, put_purge_checkpoint, read_purge_check
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::drive;
-use crate::s3::abort_multipart_upload::{
+use crate::s3::abort_upload::{
     AbortMultipartUploadError, AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
 use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::delete_object::DeleteObjectError;
 use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::list_multipart_uploads::{ListMultipartUploadsInput, ListMultipartUploadsOperation};
-use crate::s3::list_object_versions::{
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::list_uploads::{ListMultipartUploadsInput, ListMultipartUploadsOperation};
+use crate::s3::list_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
 use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};

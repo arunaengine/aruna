@@ -1,6 +1,7 @@
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
+use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
@@ -10,7 +11,6 @@ use aruna_core::structs::{
     StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode, pid_dedup_key,
     shard_for_subject, user_dedup_key,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -39,7 +39,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
-use crate::metadata::get_metadata_document::load_metadata_record_by_document;
+use crate::metadata::get_document::load_metadata_record_by_document;
 use crate::metadata::repository::StorageReadError;
 
 use super::lifecycle::cancel::cancel_family;
@@ -969,16 +969,14 @@ pub async fn read_owned_artifact(
     if location_hash != artifact.blake3 {
         return Err("artifact record does not match its blob location".to_string());
     }
-    let document_path = crate::metadata::get_metadata_document::load_metadata_record_by_document(
-        context,
-        spec.document_id,
-    )
-    .await
-    .map_err(|error| match error {
-        StorageReadError::Storage(error) => error.to_string(),
-        StorageReadError::Conversion(error) => error.to_string(),
-    })?
-    .map(|record| record.document_path);
+    let document_path =
+        crate::metadata::get_document::load_metadata_record_by_document(context, spec.document_id)
+            .await
+            .map_err(|error| match error {
+                StorageReadError::Storage(error) => error.to_string(),
+                StorageReadError::Conversion(error) => error.to_string(),
+            })?
+            .map(|record| record.document_path);
     Ok(ArtifactLookup::Ready(OwnedArtifact {
         job_id: record.job_id,
         created_by: record.created_by,

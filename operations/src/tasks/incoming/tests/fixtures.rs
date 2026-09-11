@@ -118,7 +118,7 @@ pub(super) async fn installed_setup() -> InstalledHarness {
     net.ensure_document_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
     for index in 1..=2u128 {
-        let record = crate::sync::document_sync_outbox::new_outbox_record_with_id(
+        let record = crate::sync::document_outbox::new_outbox_record_with_id(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),

@@ -6,13 +6,13 @@ use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::identifiers::StructuredId;
 use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
 use aruna_core::structs::{
     Actor, AuthContext, HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance,
     HarvestRecordState, HarvestSource, IncomingRecord, JobError, JobResultPayload,
     MetadataRegistryRecord, ProvenanceDecision, RealmId, RepositoryConnector, provenance_decision,
 };
-use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use byteview::ByteView;
 use tracing::warn;
@@ -32,7 +32,7 @@ use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::MetadataAuthToken;
-use crate::metadata::create_metadata_document::{
+use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_job_document,
 };
@@ -40,8 +40,8 @@ use crate::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
     update_metadata_document_routed,
 };
-use crate::metadata::get_metadata_document::load_metadata_record_by_document;
-use crate::metadata::update_metadata_document::UpdateMetadataDocumentMutation;
+use crate::metadata::get_document::load_metadata_record_by_document;
+use crate::metadata::update_document::UpdateMetadataDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a

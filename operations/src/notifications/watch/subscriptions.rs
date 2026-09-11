@@ -26,7 +26,7 @@ use crate::driver::DriverContext;
 use crate::notifications::protocol::NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
-use crate::sync::document_sync_outbox::{
+use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 

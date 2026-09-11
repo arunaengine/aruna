@@ -4,7 +4,7 @@ use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResul
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
 use crate::driver::drive;
-use crate::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
+use crate::s3::revoke_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 
 pub async fn run_terminal_cleanup(
     ctx: &JobContext,
@@ -151,8 +151,8 @@ mod tests {
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::s3::create_bucket::CreateBucketOperation;
-    use crate::s3::get_bucket_info::GetBucketInfoOperation;
-    use crate::s3::get_user_access::GetUserAccessOperation;
+    use crate::s3::get_access::GetUserAccessOperation;
+    use crate::s3::get_bucket::GetBucketInfoOperation;
 
     struct StubBackend {
         kind: ExecutorKind,

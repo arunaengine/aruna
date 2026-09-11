@@ -2495,6 +2495,7 @@ async fn delete_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
         ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
@@ -2502,7 +2503,6 @@ mod tests {
         MintPersistentIdSpec, RealmId, ReasonCode, RoCrateLimits, parse_job_schedule_index_key,
         pid_dedup_key,
     };
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;

@@ -739,8 +739,8 @@ async fn presence_phase(
         };
     }
     let result = crate::driver::drive(
-        crate::realm::announce_realm_presence::AnnounceRealmPresenceOperation::new(
-            crate::realm::announce_realm_presence::AnnounceRealmPresenceConfig {
+        crate::realm::announce_presence::AnnounceRealmPresenceOperation::new(
+            crate::realm::announce_presence::AnnounceRealmPresenceConfig {
                 realm_id: config.realm_id,
                 node_id: config.node_id,
                 schedule_refresh: true,

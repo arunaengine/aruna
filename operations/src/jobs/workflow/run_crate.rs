@@ -20,7 +20,7 @@ use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
 use crate::metadata::MetadataAuthToken;
-use crate::metadata::create_metadata_document::{
+use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_job_document,
 };
@@ -512,7 +512,7 @@ fn rfc3339(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::create_metadata_document::CreateMetadataDocumentError;
+    use crate::metadata::create_document::CreateMetadataDocumentError;
     use aruna_core::metadata::{
         MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
         MetadataProfileValidationSeverity,
