@@ -25,7 +25,7 @@ mod portal;
 mod reclaim;
 mod storage;
 #[cfg(test)]
-mod test_support;
+mod tests;
 mod tokens;
 
 /// Operational CLI for inspecting, recovering and maintaining an Aruna node.
