@@ -715,3 +715,78 @@ pub(super) async fn list_local_registry_records_for_group(
         }
     }
 }
+
+fn spawn_visibility_refill(inner: &Arc<MetadataInner>) {
+    let fill_lock = inner.visibility_cache.registry_fill.clone();
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let Ok(_guard) = fill_lock.try_lock_owned() else {
+            return;
+        };
+        if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
+            return;
+        }
+        if let Err(error) = fill_visibility_caches(&inner).await {
+            warn!(error = %error, "Background visibility refill failed");
+        }
+    });
+}
+
+pub(super) fn registry_records_for_group(
+    records: &Arc<Vec<MetadataRegistryRecord>>,
+    group_id: GroupId,
+) -> Arc<Vec<MetadataRegistryRecord>> {
+    Arc::new(
+        records
+            .iter()
+            .filter(|record| record.group_id == group_id)
+            .cloned()
+            .collect(),
+    )
+}
+
+pub(super) async fn list_group_records(
+    inner: Arc<MetadataInner>,
+    group_id: GroupId,
+    limit: usize,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
+    if let Some((records, true)) = inner
+        .visibility_cache
+        .registry_records_for_group_any(group_id)
+        && records.len() <= limit
+    {
+        return Ok(records);
+    }
+
+    let mut records = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(iter_registry_effect(group_id, start_after, None))
+            .await;
+        let (page, next_start_after) = parse_registry_iter(event).map_err(|error| {
+            MetadataError::Backend(format!("metadata group iteration failed: {error:?}"))
+        })?;
+        if records.len().saturating_add(page.len()) > limit {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
+        }
+        records.extend(page);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+
+    let (deleted_graphs, _) =
+        list_deleted_graph_iris(&inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    Ok(Arc::new(
+        records
+            .into_iter()
+            .filter(|record| !deleted_graphs.contains(&record.graph_iri))
+            .collect(),
+    ))
+}
