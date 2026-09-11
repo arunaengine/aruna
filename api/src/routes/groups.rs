@@ -1998,7 +1998,7 @@ mod tests {
     };
     use crate::auth::ValidatedArunaBearerTokenCarrier;
     use crate::error::{ServerError, ServerResult};
-    use crate::routes::test_support::{seed_realm_auth, test_context, test_state, test_storage};
+    use crate::routes::tests::fixtures::{seed_realm_auth, test_context, test_state, test_storage};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
