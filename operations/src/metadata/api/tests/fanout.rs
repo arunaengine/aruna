@@ -121,3 +121,72 @@ fn rejects_cursor_tampering() {
         Err(MetadataApiError::InvalidCursor(_))
     ));
 }
+
+#[tokio::test]
+async fn write_policy_denies() {
+    // The policy must be evaluated with the permission the caller asked for,
+    // so a write-deny policy cannot be bypassed by a fixed read request.
+    let test = metadata_test();
+    let group_id = Ulid::generate();
+    let user = UserId::local(Ulid::generate(), TEST_REALM_ID);
+    let path = format!("/{TEST_REALM_ID}/g/{group_id}/data/object");
+    write_policy_docs(
+        &test,
+        group_id,
+        user_role(
+            user,
+            HashMap::from([(
+                format!("/{TEST_REALM_ID}/g/{group_id}/**"),
+                Permission::WRITE,
+            )]),
+        ),
+        vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "no-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }],
+    )
+    .await;
+
+    let denied = ensure_permission(
+        &test.context,
+        TEST_REALM_ID,
+        auth_for(user),
+        group_id,
+        path.clone(),
+        Permission::WRITE,
+        None,
+    )
+    .await;
+    // The same role allows the read, so the denial comes from the policy.
+    let allowed = ensure_permission(
+        &test.context,
+        TEST_REALM_ID,
+        auth_for(user),
+        group_id,
+        path,
+        Permission::READ,
+        None,
+    )
+    .await;
+
+    assert!(matches!(denied, Err(MetadataApiError::Forbidden)));
+    assert!(allowed.is_ok());
+}
+
+#[test]
+fn bearer_limits() {
+    assert!(matches!(
+        forwarded_bearer(Some(&"x".repeat(4096))),
+        Ok(Some(MetadataAuthToken::Bearer(_)))
+    ));
+    assert!(matches!(
+        forwarded_bearer(Some(&"x".repeat(4097))),
+        Err(MetadataApiError::BadRequest)
+    ));
+    assert!(fanout_bearer(Some(&"x".repeat(4097))).is_none());
+    assert!(matches!(forwarded_bearer(None), Ok(None)));
+}
