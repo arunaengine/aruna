@@ -1,3 +1,4 @@
+use super::read::ensure_permission;
 use super::*;
 
 pub(super) async fn resolve_preflight_targets(
