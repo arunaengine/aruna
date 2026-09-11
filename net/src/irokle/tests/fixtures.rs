@@ -532,3 +532,64 @@ pub(super) fn registry_record(
 pub(super) fn peer(seed: u8) -> PeerId {
     node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }
+
+pub(super) async fn apply_conflicting_user_name_and_attribute(
+    storage: &StorageHandle,
+    user_id: UserId,
+    realm_id: RealmId,
+) -> Actor {
+    let actor_a = test_actor(8, user_id, realm_id);
+    let actor_b = test_actor(9, user_id, realm_id);
+    let target = AdminDocumentTarget::User { user_id };
+    for (seq, actor, origin_seq, op) in [
+        (
+            1,
+            &actor_a,
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "Alice".to_string(),
+            },
+        ),
+        (
+            2,
+            &actor_b,
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "Mallory".to_string(),
+            },
+        ),
+        (
+            3,
+            &actor_a,
+            2,
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "physics".to_string(),
+            },
+        ),
+        (
+            4,
+            &actor_b,
+            2,
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "malware".to_string(),
+            },
+        ),
+    ] {
+        apply_admin_document_operation_to_storage(
+            storage,
+            DocumentSyncTarget::User { user_id },
+            test_admin_event(
+                Ulid::from_parts(2_500 + seq, 1),
+                target.clone(),
+                actor,
+                origin_seq,
+                op,
+            ),
+        )
+        .await
+        .expect("conflicting user admin operation applies");
+    }
+    actor_a
+}
