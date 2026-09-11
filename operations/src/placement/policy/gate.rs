@@ -720,7 +720,7 @@ mod tests {
     }
 
     fn document(policy: &VerifiedPolicy) -> aruna_core::structs::PlacementPolicyDocument {
-        crate::placement::policy::tests::signed_document(realm(), policy, 1)
+        crate::placement::policy::tests::fixtures::signed_document(realm(), policy, 1)
     }
 
     fn encoded(policy: &VerifiedPolicy) -> Value {
@@ -734,9 +734,9 @@ mod tests {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
         }
-        let (config_value, auth_value) = crate::placement::policy::tests::realm_view(
+        let (config_value, auth_value) = crate::placement::policy::tests::fixtures::realm_view(
             &config,
-            crate::placement::policy::tests::admin_user(realm()),
+            crate::placement::policy::tests::fixtures::admin_user(realm()),
         );
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {

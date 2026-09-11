@@ -246,7 +246,7 @@ pub fn plan_eviction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement::policy::tests::signed_document;
+    use crate::placement::policy::tests::fixtures::signed_document;
     use aruna_core::structs::{PlacementPolicy, PlacementSelector};
     use ulid::Ulid;
 

@@ -461,7 +461,7 @@ impl Operation for ReadPolicyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement::policy::tests::{admin_user, realm_view, signed_document};
+    use crate::placement::policy::tests::fixtures::{admin_user, realm_view, signed_document};
     use aruna_core::NodeId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::{

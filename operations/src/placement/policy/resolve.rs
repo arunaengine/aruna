@@ -440,7 +440,7 @@ mod tests {
     }
 
     fn document(policy: &VerifiedPolicy) -> PlacementPolicyDocument {
-        super::super::tests::signed_document(realm(), policy, 1)
+        super::super::tests::fixtures::signed_document(realm(), policy, 1)
     }
 
     fn encoded(policy: &VerifiedPolicy) -> Value {
@@ -453,7 +453,10 @@ mod tests {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
-        super::super::tests::realm_view(&config, super::super::tests::admin_user(realm()))
+        super::super::tests::fixtures::realm_view(
+            &config,
+            super::super::tests::fixtures::admin_user(realm()),
+        )
     }
 
     /// The realm view and policy row the inner read starts with.
