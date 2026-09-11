@@ -5016,38 +5016,6 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     ))
 }
 
-/// Realm-config ops the reducer stores as order-insensitive immutable values
-/// and whose validation no other such op can influence: a consecutive run of
-/// them may apply as one read-reduce-write cycle instead of one per event.
-fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
-    matches!(
-        op,
-        AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
-            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
-    )
-}
-
-/// Flushes a buffered run of coalescible realm-config events, if any, and
-/// drops the validation snapshot the applied events just outdated.
-async fn flush_config_run(
-    storage: &StorageHandle,
-    run: &mut Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)>,
-    validation_cache: &mut ConfigValidationCache,
-) -> Result<()> {
-    if let Some((target, events)) = run.take() {
-        apply_config_events(storage, target, events).await?;
-        validation_cache.invalidate();
-    }
-    Ok(())
-}
-
 /// Applies a run of coalescible realm-config events in one transaction. A
 /// realm-scale transition replicates hundreds of barrier and proof values;
 /// decoding and rewriting the reducer state per event is quadratic and stalls

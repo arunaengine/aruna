@@ -488,3 +488,35 @@ pub(in crate::document_sync) async fn apply_realm_authorization_admin_document_o
         stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
     storage_batch_delete_and_write_transactionally(storage, stale_conflict_deletes, writes).await
 }
+
+/// Realm-config ops the reducer stores as order-insensitive immutable values
+/// and whose validation no other such op can influence: a consecutive run of
+/// them may apply as one read-reduce-write cycle instead of one per event.
+pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
+    matches!(
+        op,
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+    )
+}
+
+/// Flushes a buffered run of coalescible realm-config events, if any, and
+/// drops the validation snapshot the applied events just outdated.
+pub(in crate::document_sync) async fn flush_config_run(
+    storage: &StorageHandle,
+    run: &mut Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)>,
+    validation_cache: &mut ConfigValidationCache,
+) -> Result<()> {
+    if let Some((target, events)) = run.take() {
+        apply_config_events(storage, target, events).await?;
+        validation_cache.invalidate();
+    }
+    Ok(())
+}
