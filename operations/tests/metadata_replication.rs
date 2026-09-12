@@ -290,6 +290,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(registry.last_event_id, latest_update_id);
     // The registry row rides the everywhere-bound registry class, so it can land on the
     // replacement before the document's own bucket topic delivers the event.
+    let refreshed_event = wait_event_value(replacement_node, document_id, latest_update_id).await?;
     let refreshed_event: MetadataCreateEventRecord = postcard::from_bytes(&refreshed_event)?;
     assert!(matches!(
         refreshed_event.payload,

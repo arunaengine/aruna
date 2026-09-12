@@ -235,7 +235,7 @@ impl S3 for ArunaS3Service {
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         debug!(bucket = %req.input.bucket, "Received HEAD BUCKET Request");
 
-        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
