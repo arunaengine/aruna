@@ -1,3 +1,5 @@
+//! The timer and task scheduler behind `TaskHandle`: due timers, running
+//! handlers, admission, and the ordered drain.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

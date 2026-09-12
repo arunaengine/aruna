@@ -2,6 +2,8 @@
 #![deny(unsafe_code)]
 #![recursion_limit = "256"]
 
+//! The node networking layer: peer state, DHT, document sync, and the
+//! network handle the rest of the node drives through effects.
 mod connection_pool;
 pub mod device_limits;
 pub mod dht;
