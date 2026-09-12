@@ -214,7 +214,7 @@ fn missing_cors_error() -> S3Error {
     s3_error!(NoSuchCORSConfiguration, "CORS configuration not found")
 }
 
-fn checksum_mismatch_error(algorithm: &'static str, operation: &'static str) -> S3Error {
+fn checksum_mismatch_logged(algorithm: &'static str, operation: &'static str) -> S3Error {
     warn!(algorithm, "Checksum mismatch during {}", operation);
     checksum_mismatch_error()
 }
@@ -283,7 +283,7 @@ impl IntoS3Error for PutObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             PutObjectError::ChecksumMismatch(algorithm) => {
-                checksum_mismatch_error(algorithm, "PutObject")
+                checksum_mismatch_logged(algorithm, "PutObject")
             }
             PutObjectError::MissingExpectedChecksum(algorithm) => {
                 missing_checksum_error(algorithm, "PutObject")
@@ -324,7 +324,7 @@ impl IntoS3Error for UploadPartError {
             | UploadPartError::UploadTargetMismatch
             | UploadPartError::UploadNotOpen => missing_upload_error(),
             UploadPartError::ChecksumMismatch(algorithm) => {
-                checksum_mismatch_error(algorithm, "UploadPart")
+                checksum_mismatch_logged(algorithm, "UploadPart")
             }
             UploadPartError::IncompleteBody => incomplete_body_error(),
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
@@ -386,7 +386,7 @@ impl IntoS3Error for CompleteMultipartUploadError {
                 )
             }
             CompleteMultipartUploadError::ChecksumMismatch(algorithm) => {
-                checksum_mismatch_error(algorithm, "CompleteMultipartUpload")
+                checksum_mismatch_logged(algorithm, "CompleteMultipartUpload")
             }
             CompleteMultipartUploadError::ChecksumContractMismatch => s3_error!(
                 InvalidRequest,

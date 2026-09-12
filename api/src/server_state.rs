@@ -432,14 +432,10 @@ impl ServerState {
     }
 
     pub async fn register_rest_interface(&self, bind_address: SocketAddr) {
-        self.register_rest_interface(bind_address, None).await;
+        self.register_rest_public(bind_address, None).await;
     }
 
-    pub async fn register_rest_interface(
-        &self,
-        bind_address: SocketAddr,
-        public_url: Option<&str>,
-    ) {
+    pub async fn register_rest_public(&self, bind_address: SocketAddr, public_url: Option<&str>) {
         let mut interface_state = self.interface_state.write().await;
         interface_state.rest = Some(RestInterfaceRuntime::from_bind_address(
             bind_address,

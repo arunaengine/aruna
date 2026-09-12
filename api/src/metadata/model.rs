@@ -561,8 +561,8 @@ pub struct MetadataReferencePreflightResponse {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct MetadataIncludeFlags {
-    summary: bool,
+pub(super) struct MetadataIncludeFlags {
+    pub(super) summary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

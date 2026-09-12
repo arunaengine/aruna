@@ -1013,7 +1013,7 @@ mod tests {
         let group = Ulid::generate();
         grant(&state, user, group).await;
         state
-            .register_rest_interface(
+            .register_rest_public(
                 "127.0.0.1:3000".parse().unwrap(),
                 Some("https://owner.example/"),
             )
@@ -1078,7 +1078,7 @@ mod tests {
             .with_rocrate_limits(limits),
         );
         state
-            .register_rest_interface(
+            .register_rest_public(
                 "127.0.0.1:3000".parse().unwrap(),
                 Some("https://owner.example/"),
             )

@@ -382,7 +382,7 @@ pub async fn list_source_connectors(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_list_error)?;
+    .map_err(map_connector_list)?;
 
     let mut connectors = Vec::with_capacity(result.connectors.len());
     for connector in result.connectors {
@@ -1085,10 +1085,7 @@ pub(crate) async fn ensure_data_permission(
     .await
 }
 
-async fn connector_has_secret(
-    state: &ServerState,
-    connector_id: Ulid,
-) -> ServerResult<bool> {
+async fn connector_has_secret(state: &ServerState, connector_id: Ulid) -> ServerResult<bool> {
     drive(
         ConnectorHasSecretConfigOperation::new(connector_id),
         &state.get_ctx(),
@@ -1129,7 +1126,7 @@ fn map_create_error(error: CreateSourceConnectorError) -> ServerError {
     }
 }
 
-fn map_list_error(error: ListSourceConnectorsError) -> ServerError {
+fn map_connector_list(error: ListSourceConnectorsError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 

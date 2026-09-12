@@ -1389,7 +1389,7 @@ fn map_task_outputs(
         if parent == "/" {
             return Err(TesError::bad_request("root output parent is forbidden"));
         }
-        for input in &inputs {
+        for input in inputs {
             if let Some(path) = input.container_path.as_deref()
                 && (path == output.container_path
                     || pattern.as_ref().is_some_and(|glob| glob.is_match(path))
