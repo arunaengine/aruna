@@ -320,7 +320,7 @@ fn consume_scope_page(remaining_pages: &mut usize) -> S3Result<()> {
     Ok(())
 }
 
-fn scoped_marker(
+pub(super) fn scoped_marker(
     bucket: &str,
     last_key: Option<&str>,
     last_prefix: Option<&str>,

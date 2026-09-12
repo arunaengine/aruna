@@ -203,7 +203,6 @@ async fn readonly_scope_stored() -> TestResult<()> {
     )?;
 
     let credentials = create_restricted_credentials(
-
         &seed.base_url,
         &scoped_token,
         &group.group_id,
