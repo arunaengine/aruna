@@ -2610,6 +2610,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) mod fixtures;
     use crate::test_support::make_secret;
     use std::sync::Arc;
     use tempfile::TempDir;

@@ -1,9 +1,9 @@
 use super::*;
 
-mod admin;
+pub(crate) mod admin;
 mod apply;
 mod batch;
-mod cursor;
+pub(crate) mod cursor;
 mod document;
 mod materialize;
 mod metadata;

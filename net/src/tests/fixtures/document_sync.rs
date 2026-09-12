@@ -1,58 +1,111 @@
-use super::*;
+use crate::document_sync::reconcile::admin::apply_admin_operation;
+use crate::document_sync::reconcile::cursor::{AppliedCursor, topic_cursor_key};
+use crate::document_sync::storage::batch_write_to;
+use crate::document_sync::{DocumentSyncService, node_to_peer};
+use crate::test_support::test_endpoint;
+use ::irokle::Storage as _;
+use aruna_core::admin_documents::{
+    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
+    AdminDocumentTarget,
+};
+use aruna_core::alpn::Alpn;
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
+    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE,
+};
+use aruna_core::metadata::{
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
+    MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
+};
+use aruna_core::storage_entries::{
+    document_lifecycle_entry, document_lifecycle_key, graph_lifecycle_key, metadata_document_key,
+    metadata_registry_key, registry_write_entries, sync_revision_key,
+};
+use aruna_core::structs::{
+    Actor, Group, GroupAuthorizationDocument, MetadataRegistryRecord, OidcProviderConfig,
+    Permission, PlacementPolicyDocument, PlacementRef, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
+    SYNC_QUARANTINE_USAGE_KEY, StaticRealmEndpoint, SyncQuarantineRecord, SyncQuarantineUsage,
+    User,
+};
+use aruna_core::types::Value;
+use aruna_core::{NodeId, UserId};
+use aruna_storage::FjallPersistPolicy;
+use aruna_storage::StorageHandle;
+use byteview::ByteView;
+use irokle::PeerId;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+use ulid::Ulid;
 
-pub(super) fn topic(seed: u8) -> ::irokle::TopicId {
+pub(crate) const DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV: &str =
+    "ARUNA_NET_DOCUMENT_SYNC_RESTART_CHILD_PATH";
+pub(crate) const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
+    "document_sync::tests::restart::buffered_publish_child";
+
+pub(crate) fn topic(seed: u8) -> ::irokle::TopicId {
     DocumentSyncTarget::RealmConfig {
         realm_id: RealmId::from_bytes([seed; 32]),
     }
     .sync_topic_id(RealmId::from_bytes([seed; 32]), &PlacementRef::NIL)
 }
 
-pub(super) fn node(seed: u8) -> NodeId {
+pub(crate) fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-pub(super) fn test_genesis(seed: u8) -> ::irokle::OpId {
+pub(crate) fn test_genesis(seed: u8) -> ::irokle::OpId {
     ::irokle::OpId::from_bytes([seed; 32])
 }
 
-pub(super) fn test_storage() -> (TempDir, StorageHandle) {
+pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("temp dir");
     let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("temp path"))
         .expect("storage opens");
     (dir, storage)
 }
 
-pub(super) fn storage_at(path: &Path) -> StorageHandle {
+pub(crate) fn storage_at(path: &Path) -> StorageHandle {
     aruna_storage::FjallStorage::open(path.to_str().expect("utf-8 storage path"))
         .expect("storage opens")
 }
 
-pub(super) fn restart_target() -> DocumentSyncTarget {
+pub(crate) fn restart_target() -> DocumentSyncTarget {
     DocumentSyncTarget::MetadataGraphLifecycle {
         graph_iri: "urn:aruna:restart-contract".to_string(),
     }
 }
 
-pub(super) fn restart_realm() -> RealmId {
+pub(crate) fn restart_realm() -> RealmId {
     RealmId::from_bytes([99; 32])
 }
 
-pub(super) fn restart_placement() -> PlacementRef {
+pub(crate) fn restart_placement() -> PlacementRef {
     PlacementRef {
         strategy_id: Ulid::from_parts(99, 7),
         shard: 11,
     }
 }
 
-pub(super) fn restart_topic() -> ::irokle::TopicId {
+pub(crate) fn restart_topic() -> ::irokle::TopicId {
     restart_target().sync_topic_id(restart_realm(), &restart_placement())
 }
 
-pub(super) fn restart_event_id() -> Ulid {
+pub(crate) fn restart_event_id() -> Ulid {
     Ulid::from_parts(1_727_000_000_000, 42)
 }
 
-pub(super) fn restart_payload() -> Vec<u8> {
+pub(crate) fn restart_payload() -> Vec<u8> {
     postcard::to_allocvec(&MetadataGraphLifecycleRecord::deleted(
         "urn:aruna:restart-contract".to_string(),
         RealmId::from_bytes([99; 32]),
@@ -63,7 +116,7 @@ pub(super) fn restart_payload() -> Vec<u8> {
     .expect("restart payload serializes")
 }
 
-pub(super) fn revision_change() -> DocumentSyncChange {
+pub(crate) fn revision_change() -> DocumentSyncChange {
     DocumentSyncChange {
         base: None,
         current: DocumentSyncRevision {
@@ -77,11 +130,11 @@ pub(super) fn revision_change() -> DocumentSyncChange {
     }
 }
 
-pub(super) async fn restart_endpoint() -> iroh::Endpoint {
+pub(crate) async fn restart_endpoint() -> iroh::Endpoint {
     test_endpoint(91).await
 }
 
-pub(super) async fn open_restart_service(root: &Path, storage_name: &str) -> DocumentSyncService {
+pub(crate) async fn open_restart_service(root: &Path, storage_name: &str) -> DocumentSyncService {
     DocumentSyncService::open_with_policy(
         restart_endpoint().await,
         storage_at(&root.join(storage_name)),
@@ -95,7 +148,7 @@ pub(super) async fn open_restart_service(root: &Path, storage_name: &str) -> Doc
     .expect("document sync service opens")
 }
 
-pub(super) fn run_restart_child(root: &Path) {
+pub(crate) fn run_restart_child(root: &Path) {
     let status = Command::new(env::current_exe().expect("test binary path"))
         .arg(DOCUMENT_SYNC_RESTART_CHILD_TEST)
         .arg("--exact")
@@ -107,7 +160,7 @@ pub(super) fn run_restart_child(root: &Path) {
     assert!(status.success(), "restart child process failed: {status}");
 }
 
-pub(super) async fn write_registry_record(
+pub(crate) async fn write_registry_record(
     storage: &StorageHandle,
     record: &MetadataRegistryRecord,
 ) {
@@ -123,7 +176,7 @@ pub(super) async fn write_registry_record(
     ));
 }
 
-pub(super) async fn read_storage_value(
+pub(crate) async fn read_storage_value(
     storage: &StorageHandle,
     key_space: &str,
     key: ByteView,
@@ -143,7 +196,7 @@ pub(super) async fn read_storage_value(
 
 /// Drops a topic's applied-ops cursor so the next reconcile replays it from
 /// the start, whatever lineage the stored cursor carried.
-pub(super) async fn reset_test_cursor(service: &DocumentSyncService, topic_id: ::irokle::TopicId) {
+pub(crate) async fn reset_test_cursor(service: &DocumentSyncService, topic_id: ::irokle::TopicId) {
     match service
         .storage
         .send_storage_effect(StorageEffect::Delete {
@@ -158,7 +211,7 @@ pub(super) async fn reset_test_cursor(service: &DocumentSyncService, topic_id: :
     }
 }
 
-pub(super) async fn read_test_cursor(
+pub(crate) async fn read_test_cursor(
     storage: &StorageHandle,
     topic_id: ::irokle::TopicId,
 ) -> Option<::irokle::ActorClock> {
@@ -175,7 +228,7 @@ pub(super) async fn read_test_cursor(
     )
 }
 
-pub(super) fn test_actor(seed: u8, user_id: UserId, realm_id: RealmId) -> Actor {
+pub(crate) fn test_actor(seed: u8, user_id: UserId, realm_id: RealmId) -> Actor {
     Actor {
         node_id: node(seed),
         user_id,
@@ -183,7 +236,7 @@ pub(super) fn test_actor(seed: u8, user_id: UserId, realm_id: RealmId) -> Actor 
     }
 }
 
-pub(super) fn test_role(role_id: Ulid, assigned_users: impl IntoIterator<Item = UserId>) -> Role {
+pub(crate) fn test_role(role_id: Ulid, assigned_users: impl IntoIterator<Item = UserId>) -> Role {
     Role {
         role_id,
         name: "member".to_string(),
@@ -192,7 +245,7 @@ pub(super) fn test_role(role_id: Ulid, assigned_users: impl IntoIterator<Item = 
     }
 }
 
-pub(super) fn admin_role(
+pub(crate) fn admin_role(
     role_id: Ulid,
     name: &str,
     path: &str,
@@ -205,7 +258,7 @@ pub(super) fn admin_role(
     }
 }
 
-pub(super) fn admin_test_placement() -> PlacementRef {
+pub(crate) fn admin_test_placement() -> PlacementRef {
     PlacementRef {
         strategy_id: Ulid::from_parts(9_990, 1),
         shard: 0,
@@ -214,7 +267,7 @@ pub(super) fn admin_test_placement() -> PlacementRef {
 
 /// Signs an event as its origin. Test node keys are `[seed; 32]`, so the
 /// origin's secret is recoverable from its public id.
-pub(super) fn sign_as_origin(
+pub(crate) fn sign_as_origin(
     event: &AdminDocumentEvent,
     placement: &PlacementRef,
 ) -> iroh::Signature {
@@ -225,7 +278,7 @@ pub(super) fn sign_as_origin(
         .sign(&event.signing_bytes(placement).expect("event serializes"))
 }
 
-pub(super) fn test_admin_event(
+pub(crate) fn test_admin_event(
     event_id: Ulid,
     target: AdminDocumentTarget,
     actor: &Actor,
@@ -243,7 +296,7 @@ pub(super) fn test_admin_event(
     }
 }
 
-pub(super) async fn read_user_doc(storage: &StorageHandle, user_id: UserId) -> User {
+pub(crate) async fn read_user_doc(storage: &StorageHandle, user_id: UserId) -> User {
     let target = DocumentSyncTarget::User { user_id };
     let value = read_storage_value(storage, target.storage_keyspace(), target.storage_key())
         .await
@@ -251,7 +304,7 @@ pub(super) async fn read_user_doc(storage: &StorageHandle, user_id: UserId) -> U
     User::from_bytes(&value).expect("user decodes")
 }
 
-pub(super) async fn read_group_doc(storage: &StorageHandle, group_id: Ulid) -> Group {
+pub(crate) async fn read_group_doc(storage: &StorageHandle, group_id: Ulid) -> Group {
     let target = DocumentSyncTarget::Group { group_id };
     let value = read_storage_value(storage, target.storage_keyspace(), target.storage_key())
         .await
@@ -259,7 +312,7 @@ pub(super) async fn read_group_doc(storage: &StorageHandle, group_id: Ulid) -> G
     Group::from_bytes(&value).expect("group decodes")
 }
 
-pub(super) async fn read_group_auth(
+pub(crate) async fn read_group_auth(
     storage: &StorageHandle,
     group_id: Ulid,
 ) -> GroupAuthorizationDocument {
@@ -270,7 +323,7 @@ pub(super) async fn read_group_auth(
     GroupAuthorizationDocument::from_bytes(&value).expect("group auth doc decodes")
 }
 
-pub(super) async fn read_realm_auth(
+pub(crate) async fn read_realm_auth(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> RealmAuthorizationDocument {
@@ -281,7 +334,7 @@ pub(super) async fn read_realm_auth(
     RealmAuthorizationDocument::from_bytes(&value).expect("realm auth doc decodes")
 }
 
-pub(super) async fn stored_realm_config(
+pub(crate) async fn stored_realm_config(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> RealmConfigDocument {
@@ -292,7 +345,7 @@ pub(super) async fn stored_realm_config(
     RealmConfigDocument::from_bytes(&value).expect("realm config doc decodes")
 }
 
-pub(super) fn realm_config_nodes(config: &RealmConfigDocument) -> BTreeMap<String, RealmNodeKind> {
+pub(crate) fn realm_config_nodes(config: &RealmConfigDocument) -> BTreeMap<String, RealmNodeKind> {
     config
         .nodes
         .iter()
@@ -300,7 +353,7 @@ pub(super) fn realm_config_nodes(config: &RealmConfigDocument) -> BTreeMap<Strin
         .collect()
 }
 
-pub(super) fn config_oidc_providers(
+pub(crate) fn config_oidc_providers(
     config: &RealmConfigDocument,
 ) -> BTreeMap<String, OidcProviderConfig> {
     config
@@ -310,7 +363,7 @@ pub(super) fn config_oidc_providers(
         .collect()
 }
 
-pub(super) fn test_oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
+pub(crate) fn test_oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
     OidcProviderConfig {
         id: id.to_string(),
         issuer: format!("https://issuer.example/{issuer_suffix}"),
@@ -321,7 +374,7 @@ pub(super) fn test_oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderC
     }
 }
 
-pub(super) fn test_discovery(node_seed: u8, endpoint_addr: &str) -> RealmDiscoveryConfig {
+pub(crate) fn test_discovery(node_seed: u8, endpoint_addr: &str) -> RealmDiscoveryConfig {
     RealmDiscoveryConfig::Static {
         endpoints: vec![StaticRealmEndpoint {
             node_id: node(node_seed).to_string(),
@@ -330,7 +383,7 @@ pub(super) fn test_discovery(node_seed: u8, endpoint_addr: &str) -> RealmDiscove
     }
 }
 
-pub(super) async fn read_registry_record(
+pub(crate) async fn read_registry_record(
     storage: &StorageHandle,
     key_space: &str,
     key: ByteView,
@@ -341,7 +394,7 @@ pub(super) async fn read_registry_record(
     postcard::from_bytes(&value).expect("registry record decodes")
 }
 
-pub(super) async fn read_graph_lifecycle(
+pub(crate) async fn read_graph_lifecycle(
     storage: &StorageHandle,
     graph_iri: &str,
 ) -> Option<MetadataGraphLifecycleRecord> {
@@ -354,7 +407,7 @@ pub(super) async fn read_graph_lifecycle(
     .map(|value| postcard::from_bytes(&value).expect("graph lifecycle record decodes"))
 }
 
-pub(super) async fn write_document_lifecycle(
+pub(crate) async fn write_document_lifecycle(
     storage: &StorageHandle,
     lifecycle: &MetadataDocumentLifecycleRecord,
 ) {
@@ -366,7 +419,7 @@ pub(super) async fn write_document_lifecycle(
     .expect("document lifecycle writes");
 }
 
-pub(super) async fn assert_registry_present(
+pub(crate) async fn assert_registry_present(
     storage: &StorageHandle,
     record: &MetadataRegistryRecord,
 ) {
@@ -396,7 +449,7 @@ pub(super) async fn assert_registry_present(
     assert_eq!(holders, record.holder_node_ids);
 }
 
-pub(super) async fn assert_registry_deleted(
+pub(crate) async fn assert_registry_deleted(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,
@@ -430,7 +483,7 @@ pub(super) async fn assert_registry_deleted(
     );
 }
 
-pub(super) fn metadata_create_event(
+pub(crate) fn metadata_create_event(
     group_id: Ulid,
     document_id: Ulid,
     updated_at_ms: u64,
@@ -459,7 +512,7 @@ pub(super) fn metadata_create_event(
     }
 }
 
-pub(super) fn metadata_delete_lifecycle(
+pub(crate) fn metadata_delete_lifecycle(
     group_id: Ulid,
     document_id: Ulid,
     updated_at_ms: u64,
@@ -482,7 +535,7 @@ pub(super) fn metadata_delete_lifecycle(
     }
 }
 
-pub(super) fn metadata_lifecycle_change(
+pub(crate) fn metadata_lifecycle_change(
     lifecycle: &MetadataDocumentLifecycleRecord,
     actor: NodeId,
 ) -> DocumentSyncChange {
@@ -493,7 +546,7 @@ pub(super) fn metadata_lifecycle_change(
     )
 }
 
-pub(super) fn registry_record(
+pub(crate) fn registry_record(
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
@@ -523,11 +576,11 @@ pub(super) fn registry_record(
     }
 }
 
-pub(super) fn peer(seed: u8) -> PeerId {
+pub(crate) fn peer(seed: u8) -> PeerId {
     node_to_peer(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }
 
-pub(super) async fn apply_user_conflict(
+pub(crate) async fn apply_user_conflict(
     storage: &StorageHandle,
     user_id: UserId,
     realm_id: RealmId,
@@ -588,7 +641,7 @@ pub(super) async fn apply_user_conflict(
     actor_a
 }
 
-pub(super) async fn read_document_lifecycle(
+pub(crate) async fn read_document_lifecycle(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> MetadataDocumentLifecycleRecord {
@@ -602,7 +655,7 @@ pub(super) async fn read_document_lifecycle(
     postcard::from_bytes(&value).expect("lifecycle record decodes")
 }
 
-pub(super) async fn read_lifecycle_revision(
+pub(crate) async fn read_lifecycle_revision(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> DocumentSyncChange {
@@ -618,12 +671,12 @@ pub(super) async fn read_lifecycle_revision(
 }
 
 /// The user every policy fixture publishes under.
-pub(super) fn policy_admin(realm_id: RealmId) -> UserId {
+pub(crate) fn policy_admin(realm_id: RealmId) -> UserId {
     UserId::local(Ulid::from_bytes([4u8; 16]), realm_id)
 }
 
 /// One authentic publication of `policy` by node `seed`.
-pub(super) fn signed_policy_document(
+pub(crate) fn signed_policy_document(
     realm_id: RealmId,
     policy: &aruna_core::structs::VerifiedPolicy,
     seed: u8,
@@ -644,7 +697,7 @@ pub(super) fn signed_policy_document(
 
 /// Realm view a policy publication is verified against: the publisher is a
 /// server node and the admin user holds realm-configuration write.
-pub(super) fn policy_realm_view(
+pub(crate) fn policy_realm_view(
     realm_id: RealmId,
 ) -> (RealmConfigDocument, RealmAuthorizationDocument) {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
@@ -669,7 +722,7 @@ pub(super) fn policy_realm_view(
     (config, auth)
 }
 
-pub(super) async fn write_realm_view(
+pub(crate) async fn write_realm_view(
     storage: &StorageHandle,
     config: &RealmConfigDocument,
     auth: &RealmAuthorizationDocument,
@@ -702,7 +755,7 @@ pub(super) async fn write_realm_view(
         .expect("realm view is stored");
 }
 
-pub(super) fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::VerifiedPolicy {
+pub(crate) fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::VerifiedPolicy {
     use aruna_core::structs::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
 
     let policy = PlacementPolicy::new(
@@ -719,7 +772,7 @@ pub(super) fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::VerifiedPo
     VerifiedPolicy::verify(policy).expect("policy verifies")
 }
 
-pub(super) async fn policy_service(
+pub(crate) async fn policy_service(
     realm_id: RealmId,
     storage: StorageHandle,
     root: &Path,
@@ -737,7 +790,7 @@ pub(super) async fn policy_service(
     .expect("document sync service opens")
 }
 
-pub(super) async fn quarantine_rows(storage: &StorageHandle) -> Vec<SyncQuarantineRecord> {
+pub(crate) async fn quarantine_rows(storage: &StorageHandle) -> Vec<SyncQuarantineRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
@@ -758,7 +811,7 @@ pub(super) async fn quarantine_rows(storage: &StorageHandle) -> Vec<SyncQuaranti
     }
 }
 
-pub(super) async fn quarantine_usage(storage: &StorageHandle) -> SyncQuarantineUsage {
+pub(crate) async fn quarantine_usage(storage: &StorageHandle) -> SyncQuarantineUsage {
     match read_storage_value(
         storage,
         SYNC_QUARANTINE_USAGE_KEYSPACE,
@@ -771,7 +824,7 @@ pub(super) async fn quarantine_usage(storage: &StorageHandle) -> SyncQuarantineU
     }
 }
 
-pub(super) async fn write_usage(storage: &StorageHandle, usage: SyncQuarantineUsage) {
+pub(crate) async fn write_usage(storage: &StorageHandle, usage: SyncQuarantineUsage) {
     batch_write_to(
         storage,
         vec![(
@@ -784,7 +837,7 @@ pub(super) async fn write_usage(storage: &StorageHandle, usage: SyncQuarantineUs
     .expect("usage row writes");
 }
 
-pub(super) async fn cursor_advanced(
+pub(crate) async fn cursor_advanced(
     service: &DocumentSyncService,
     storage: &StorageHandle,
     topic_id: ::irokle::TopicId,
@@ -800,7 +853,7 @@ pub(super) async fn cursor_advanced(
     cursor.dominates(&topic_clock)
 }
 
-pub(super) fn quarantined_reason(records: &[SyncQuarantineRecord], event_id: Ulid) -> String {
+pub(crate) fn quarantined_reason(records: &[SyncQuarantineRecord], event_id: Ulid) -> String {
     records
         .iter()
         .find(|record| record.event_id() == Some(event_id))
@@ -809,7 +862,7 @@ pub(super) fn quarantined_reason(records: &[SyncQuarantineRecord], event_id: Uli
         .clone()
 }
 
-pub(super) fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
+pub(crate) fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
     use aruna_core::structs::{AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization};
 
     NodeInfoDocument {
