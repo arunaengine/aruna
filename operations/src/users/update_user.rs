@@ -19,12 +19,12 @@ use aruna_core::structs::{
     Actor, AuthContext, Permission, PlacementRef, RealmConfigDocument, RealmId, User,
 };
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
 use aruna_core::user_validation::{
     UserAttributeValidationError, validate_attribute_count, validate_attribute_key,
     validate_attribute_value,
 };
-use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -276,11 +276,7 @@ impl UpdateUserOperation {
         })]
     }
 
-    fn accept_admin_state(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-    ) -> Effects {
+    fn accept_admin_state(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
@@ -375,10 +371,8 @@ impl UpdateUserOperation {
         );
 
         let bytes = user.reconcile_bytes(Some(&current), &self.input.actor)?;
-        let stale_conflict_deletes = stale_conflict_deletes(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let mut writes = vec![
             (
                 USER_KEYSPACE.to_string(),
@@ -387,10 +381,7 @@ impl UpdateUserOperation {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        writes.push(sync_revision_entry(
-            &document_target,
-            &document_revision,
-        )?);
+        writes.push(sync_revision_entry(&document_target, &document_revision)?);
         for event in &admin_events {
             let record = new_identified_record(
                 event.event_id,
@@ -614,9 +605,7 @@ impl Operation for UpdateUserOperation {
                 txn_id,
                 user,
                 admin_outbox_written,
-            } => {
-                self.accept_conflict_delete(event, txn_id, user, admin_outbox_written)
-            }
+            } => self.accept_conflict_delete(event, txn_id, user, admin_outbox_written),
             UpdateUserState::ReadBucketFence {
                 txn_id,
                 user,
@@ -768,9 +757,7 @@ mod tests {
     use aruna_core::reducer::{
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
     };
-    use aruna_core::storage_entries::{
-        reducer_conflict_key, reducer_state_key, sync_revision_key,
-    };
+    use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
     use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmId, User};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{TxnId, UserId};

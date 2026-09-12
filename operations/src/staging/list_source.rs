@@ -82,14 +82,12 @@ impl Operation for ListStagingSourceOperation {
 
     fn start(&mut self) -> Effects {
         self.state = ListStagingSourceState::Resolve;
-        smallvec![resolve_connector_effect(
-            ResolveSourceConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: true,
-            }
-        )]
+        smallvec![resolve_connector_effect(ResolveSourceConnectorInput {
+            group_id: self.input.group_id,
+            connector_id: self.input.connector_id,
+            source_path: self.input.source_path.clone(),
+            allow_root: true,
+        })]
     }
 
     fn step(&mut self, event: Event) -> Effects {

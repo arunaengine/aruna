@@ -19,8 +19,8 @@ use aruna_core::structs::{
     SyncRefusal, SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::NodeId;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::NodeId;
 use aruna_tasks::TaskHandle;
 use thiserror::Error;
 use tracing::warn;
@@ -355,9 +355,8 @@ async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };
-    if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_idle_timer(key, Duration::ZERO)
-        .await
+    if let TaskEvent::Error { message, .. } =
+        task_handle.schedule_idle_timer(key, Duration::ZERO).await
     {
         warn!(message = %message, "Failed to arm a synced-folder timer");
     }

@@ -1,12 +1,8 @@
-use crate::blob::records::{
-    HeadAliasContext, build_transition_effects, write_version_effect,
-};
-use crate::connectors::repository::{source_connector_key, connector_secret_key};
+use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
+use crate::connectors::repository::{connector_secret_key, source_connector_key};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::head_source::{
@@ -754,9 +750,7 @@ mod tests {
         write_secret(&context, &secret("new-key")).await;
         let txn_id = start_write_transaction(&context).await;
 
-        assert_conflict(
-            guard_connector_unchanged(&context, txn_id, &connector, None).await,
-        );
+        assert_conflict(guard_connector_unchanged(&context, txn_id, &connector, None).await);
     }
 
     #[tokio::test]

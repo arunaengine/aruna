@@ -21,8 +21,8 @@ use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, NodeInfoDocument, RealmConfigDocument,
     RealmId, SyncRefusal,
 };
-use aruna_core::types::{Key, UserId, Value};
 use aruna_core::time::unix_timestamp_secs;
+use aruna_core::types::{Key, UserId, Value};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -911,11 +911,7 @@ mod tests {
                 roles: Default::default(),
                 owner,
             },
-            authorization: GroupAuthorizationDocument::default_group_doc(
-                owner,
-                realm(),
-                group_id,
-            ),
+            authorization: GroupAuthorizationDocument::default_group_doc(owner, realm(), group_id),
         }
     }
 

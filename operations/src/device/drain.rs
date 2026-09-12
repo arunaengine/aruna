@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::structured_id::StructuredId;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::{MetadataAuthToken, MetadataError};
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
+use aruna_core::structured_id::StructuredId;
 use aruna_core::task::TaskKey;
-use aruna_core::types::{Key, TxnId};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Key, TxnId};
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
@@ -22,9 +22,7 @@ use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_forward_document,
 };
-use crate::metadata::forward::{
-    MetadataWriteError, apply_batch_routed, route_metadata_create,
-};
+use crate::metadata::forward::{MetadataWriteError, apply_batch_routed, route_metadata_create};
 use crate::metadata::update_document::UpdateMetadataDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
@@ -315,8 +313,8 @@ async fn forward_entry(
     if matches!(entry.kind, PublishKind::Edit { .. }) {
         return publish_edit(context, realm_id, entry, claim, auth).await;
     }
-    let operation = CreateMetadataDocumentOperation::new_generated_id(
-        CreateMetadataDocumentConfig {
+    let operation =
+        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
             actor,
             group_id: entry.group_id,
             document_id,
@@ -325,8 +323,7 @@ async fn forward_entry(
             payload: CreateMetadataDocumentPayload::RoCrate {
                 jsonld: entry.jsonld.clone(),
             },
-        },
-    );
+        });
     match route_metadata_create(
         operation,
         context.clone(),

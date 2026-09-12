@@ -87,14 +87,12 @@ impl ReadStagingSourceOperation {
 
     fn handle_init(&mut self) -> Effects {
         self.state = ReadStagingSourceState::ResolveConnector;
-        smallvec![resolve_connector_effect(
-            ResolveSourceConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: false,
-            }
-        )]
+        smallvec![resolve_connector_effect(ResolveSourceConnectorInput {
+            group_id: self.input.group_id,
+            connector_id: self.input.connector_id,
+            source_path: self.input.source_path.clone(),
+            allow_root: false,
+        })]
     }
 
     fn handle_resolved_connector(&mut self, event: Event) -> Effects {

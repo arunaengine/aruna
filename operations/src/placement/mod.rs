@@ -710,9 +710,7 @@ pub fn choose_origin_bucket(
 mod tests {
     use super::*;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-    use aruna_core::reducer::{
-        AdminDocumentReducerState, overlay_placement,
-    };
+    use aruna_core::reducer::{AdminDocumentReducerState, overlay_placement};
     use aruna_core::structs::{
         Actor, AffinityRule, BindingScope, CandidateMapNode, CandidatePlacementMap,
         MetadataRegistryRecord, NodePlacementEntry, PlacementActivation, RealmId, RealmNodeKind,

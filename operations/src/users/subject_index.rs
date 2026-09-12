@@ -138,9 +138,7 @@ impl ResolveUserSubjectConflictsOperation {
         self.advance_resolution()
     }
 
-    fn advance_resolution(
-        &mut self,
-    ) -> Result<Effects, ResolveUserSubjectConflictsError> {
+    fn advance_resolution(&mut self) -> Result<Effects, ResolveUserSubjectConflictsError> {
         if let Some(subject) = self.subject_queue.pop_front() {
             self.state = ResolveUserSubjectConflictsState::ReadSubjectIndex {
                 subject: subject.clone(),
@@ -369,18 +367,14 @@ impl Operation for ResolveUserSubjectConflictsOperation {
         };
 
         match self.state.clone() {
-            ResolveUserSubjectConflictsState::ReadSubjectIndex { .. } => {
-                self.accept_subject(event)
-            }
+            ResolveUserSubjectConflictsState::ReadSubjectIndex { .. } => self.accept_subject(event),
             ResolveUserSubjectConflictsState::ReadConflictingUser { user_id } => {
                 self.accept_conflict(event, user_id)
             }
             ResolveUserSubjectConflictsState::WriteCanonicalUser => {
                 self.accept_canonical_write(event)
             }
-            ResolveUserSubjectConflictsState::DeleteStaleEntries => {
-                self.accept_stale_delete(event)
-            }
+            ResolveUserSubjectConflictsState::DeleteStaleEntries => self.accept_stale_delete(event),
             ResolveUserSubjectConflictsState::WriteSubjectIndexes => {
                 self.accept_subject_write(event)
             }

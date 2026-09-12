@@ -8,8 +8,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId};
-use aruna_core::types::Key;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::Key;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
@@ -143,12 +143,9 @@ async fn ensure_held_topics(
                 verified,
             )
             .await;
-        let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
-            topics.into_iter().partition(|topic| {
-                net_handle
-                    .sync_topic_exists(*topic)
-                    .unwrap_or(false)
-            });
+        let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) = topics
+            .into_iter()
+            .partition(|topic| net_handle.sync_topic_exists(*topic).unwrap_or(false));
         if !missing.is_empty() {
             debug!(
                 event = "placement.topic.pull",
@@ -161,10 +158,7 @@ async fn ensure_held_topics(
                 .await;
             crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
             for topic in missing {
-                if net_handle
-                    .sync_topic_exists(topic)
-                    .unwrap_or(false)
-                {
+                if net_handle.sync_topic_exists(topic).unwrap_or(false) {
                     known.push(topic);
                 } else {
                     // No co-holder served a genesis (unreachable, or rank-0 has
@@ -202,10 +196,7 @@ pub(crate) async fn resolve_creatable_topics(
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
     let mut missing: Vec<::irokle::TopicId> = Vec::new();
     for topic in topics {
-        if net_handle
-            .sync_topic_exists(topic)
-            .unwrap_or(false)
-        {
+        if net_handle.sync_topic_exists(topic).unwrap_or(false) {
             to_ensure.push(topic);
         } else {
             missing.push(topic);
@@ -233,9 +224,7 @@ pub(crate) async fn resolve_creatable_topics(
     let mut probe = if live.is_empty() {
         aruna_net::ShardGenesisProbe::default()
     } else {
-        net_handle
-            .probe_shard_geneses(missing.clone(), live)
-            .await
+        net_handle.probe_shard_geneses(missing.clone(), live).await
     };
     // Skipped peers stay in `unreachable` so an all-dead set still withholds:
     // dropping them would read as "no co-holder to consult" and mint a rival.
@@ -259,10 +248,7 @@ pub(crate) async fn resolve_creatable_topics(
         // Only keep topics whose genesis actually landed; an adopt that failed
         // must not fall through to a fresh create - retry it on the next pass.
         for topic in to_adopt {
-            if net_handle
-                .sync_topic_exists(topic)
-                .unwrap_or(false)
-            {
+            if net_handle.sync_topic_exists(topic).unwrap_or(false) {
                 to_ensure.push(topic);
             } else {
                 withheld = true;
@@ -535,24 +521,23 @@ async fn reconcile_placements(
 
             // A resolution failure keeps the durable record: deleting it on a
             // missing or conflicted activation would destroy the only retry.
-            let holders =
-                match crate::placement::try_resolve_holders(&config, &record.placement) {
-                    Ok(holders) => holders,
-                    Err(error) => {
-                        debug!(error = %error, "Keeping placement record for unresolvable bucket");
-                        let refreshed = new_placement(
-                            realm_id,
-                            record.placement,
-                            local_node_id,
-                            record.selected_peers.clone(),
-                        );
-                        if let Ok(effect) = write_placement_effect(&refreshed) {
-                            let _ = context.storage_handle.send_effect(effect).await;
-                        }
-                        retry_needed = true;
-                        continue;
+            let holders = match crate::placement::try_resolve_holders(&config, &record.placement) {
+                Ok(holders) => holders,
+                Err(error) => {
+                    debug!(error = %error, "Keeping placement record for unresolvable bucket");
+                    let refreshed = new_placement(
+                        realm_id,
+                        record.placement,
+                        local_node_id,
+                        record.selected_peers.clone(),
+                    );
+                    if let Ok(effect) = write_placement_effect(&refreshed) {
+                        let _ = context.storage_handle.send_effect(effect).await;
                     }
-                };
+                    retry_needed = true;
+                    continue;
+                }
+            };
             if !holders.contains(&local_node_id) {
                 // The local node is no longer a holder of this shard. Drop the
                 // verification marker too so a later re-entry re-verifies.
@@ -578,10 +563,7 @@ async fn reconcile_placements(
 
             let topic = shard_topic_id(realm_id, &record.placement);
             // This loop tops up known topics and retains missing genesis records for another pass.
-            if !net_handle
-                .sync_topic_exists(topic)
-                .unwrap_or(false)
-            {
+            if !net_handle.sync_topic_exists(topic).unwrap_or(false) {
                 debug!(
                     ?topic,
                     "Shard topic genesis not local yet; keeping placement record"
@@ -647,11 +629,8 @@ async fn reconcile_placements(
         } else {
             crate::sync::shard_placement::SYNC_PLACEMENT_RETRY_AFTER
         };
-        let effect = crate::sync::shard_placement::schedule_retry_after(
-            realm_id,
-            local_node_id,
-            after,
-        );
+        let effect =
+            crate::sync::shard_placement::schedule_retry_after(realm_id, local_node_id, after);
         let _ = task_handle.send_effect(effect).await;
         return PlacementReconcileOutcome::retry_scheduled(held.pull_pending);
     }
@@ -814,11 +793,7 @@ async fn prune_released_transitions(
         return false;
     };
     let before = stored.placement_transitions.len();
-    crate::realm::ensure_config::overlay_reducer_state(
-        &mut stored,
-        &state,
-        now_ms,
-    );
+    crate::realm::ensure_config::overlay_reducer_state(&mut stored, &state, now_ms);
     if stored.placement_transitions.len() == before {
         abort_release_txn(storage, txn_id).await;
         return false;

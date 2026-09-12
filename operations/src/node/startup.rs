@@ -18,9 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::driver::DriverContext;
-use crate::metadata::projector::{
-    project_create_events, project_logged_events,
-};
+use crate::metadata::projector::{project_create_events, project_logged_events};
 use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::interest::refresh_target_interest;
@@ -958,8 +956,7 @@ pub async fn restore_shard_pass(
     if !unresolved_topics.is_empty()
         && let Some(task_handle) = context.task_handle.as_ref()
     {
-        let effect =
-            crate::sync::shard_placement::schedule_retry_effect(realm_id, node_id);
+        let effect = crate::sync::shard_placement::schedule_retry_effect(realm_id, node_id);
         let _ = task_handle.send_effect(effect).await;
     }
 
@@ -1174,11 +1171,7 @@ pub async fn prepare_shard_policy(
         let present: Vec<::irokle::TopicId> = topics
             .iter()
             .copied()
-            .filter(|topic| {
-                net_handle
-                    .sync_topic_exists(*topic)
-                    .unwrap_or(false)
-            })
+            .filter(|topic| net_handle.sync_topic_exists(*topic).unwrap_or(false))
             .collect();
         if present.is_empty() {
             continue;
@@ -1446,11 +1439,7 @@ async fn restore_rank0(
         .topics
         .iter()
         .copied()
-        .filter(|topic| {
-            net_handle
-                .sync_topic_exists(*topic)
-                .unwrap_or(false)
-        })
+        .filter(|topic| net_handle.sync_topic_exists(*topic).unwrap_or(false))
         .collect();
     if group_withheld {
         outcome.error = RecoveryError::merge(outcome.error, Some(RecoveryError::PeerUnavailable));
@@ -1506,11 +1495,7 @@ async fn restore_join(
         .topics
         .iter()
         .copied()
-        .filter(|topic| {
-            net_handle
-                .sync_topic_exists(*topic)
-                .unwrap_or(false)
-        })
+        .filter(|topic| net_handle.sync_topic_exists(*topic).unwrap_or(false))
         .collect();
     outcome.fail_topics(
         unit.topics
