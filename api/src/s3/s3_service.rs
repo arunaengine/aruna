@@ -950,6 +950,42 @@ impl ArunaS3Service {
             .transpose()
     }
 
+    async fn readable_prefix(
+        &self,
+        input: &LOV2I,
+        prefix: String,
+        scope: &SubpathScope,
+        remaining_pages: &mut usize,
+    ) -> S3Result<bool> {
+        let mut input = LOV2I {
+            prefix: Some(prefix),
+            delimiter: None,
+            continuation_token: None,
+            start_after: None,
+            max_keys: None,
+            ..input.clone()
+        };
+        loop {
+            consume_scope_page(remaining_pages)?;
+            let result = drive(ListObjectsV2Operation::new(input.clone()), &self.state)
+                .await
+                .and_then(|result| result.transpose())
+                .map_err(IntoS3Error::into_s3_error)?
+                .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+            if result
+                .objects
+                .iter()
+                .any(|object| scope.allows_key(&object.head.key))
+            {
+                return Ok(true);
+            }
+            let Some(token) = result.continuation_token else {
+                return Ok(false);
+            };
+            input.continuation_token = Some(token);
+        }
+    }
+
     /// Runs one listing page shared by ListObjects and ListObjectsV2. A narrowed
     /// page that shows nothing keeps reading, so its marker can name a visible
     /// entry instead of a key the caller may not see.
@@ -961,7 +997,17 @@ impl ArunaS3Service {
         scope: Option<&SubpathScope>,
     ) -> S3Result<ObjectListingPage> {
         let mut input = input;
+        let mut remaining_pages = 100;
+        if scope.is_some() {
+            input.max_keys = Some(
+                input
+                    .max_keys
+                    .unwrap_or(ListObjectsV2Operation::DEFAULT_MAX_KEYS)
+                    .min(remaining_pages - 1),
+            );
+        }
         loop {
+            consume_scope_page(&mut remaining_pages)?;
             let result = drive(ListObjectsV2Operation::new(input.clone()), &self.state)
                 .await
                 .and_then(|result| result.transpose())
@@ -981,11 +1027,18 @@ impl ArunaS3Service {
                 .into_iter()
                 .filter(|object| scope.is_none_or(|scope| scope.allows_key(&object.head.key)))
                 .collect();
-            let prefixes: Vec<String> = result
-                .common_prefixes
-                .into_iter()
-                .filter(|prefix| scope.is_none_or(|scope| scope.allows_prefix(prefix)))
-                .collect();
+            let mut prefixes = Vec::new();
+            for prefix in result.common_prefixes {
+                if let Some(scope) = scope
+                    && (!scope.allows_prefix(&prefix)
+                        || !self
+                            .readable_prefix(&input, prefix.clone(), scope, &mut remaining_pages)
+                            .await?)
+                {
+                    continue;
+                }
+                prefixes.push(prefix);
+            }
 
             if let Some(token) = result.continuation_token.clone()
                 && scope.is_some()
@@ -1040,9 +1093,20 @@ impl ArunaS3Service {
     }
 }
 
+/// Caps aggregate listing work, including probes beneath common prefixes.
+fn consume_scope_page(remaining_pages: &mut usize) -> S3Result<()> {
+    *remaining_pages = remaining_pages.checked_sub(1).ok_or_else(|| {
+        s3_error!(
+            SlowDown,
+            "Listing scan limit reached; request a narrower prefix"
+        )
+    })?;
+    Ok(())
+}
+
 /// The narrowed read scope of a listing, resolved by the access hook. A prefix
-/// that overlaps no allowed subpath is refused, and a caller who may read the
-/// whole bucket needs no filtering.
+/// that overlaps no allowed subpath is refused. Concrete keys remain filtered
+/// even when a navigable prefix covers the bucket root.
 fn listing_scope(
     extensions: &http::Extensions,
     prefix: Option<&str>,
@@ -1050,9 +1114,6 @@ fn listing_scope(
     let Some(scope) = extensions.get::<SubpathScope>().cloned() else {
         return Ok(None);
     };
-    if scope.covers_all() {
-        return Ok(None);
-    }
     if !scope.allows_prefix(prefix.unwrap_or_default()) {
         return Err(s3_error!(AccessDenied, "Permission denied"));
     }
@@ -5111,6 +5172,192 @@ mod tests {
 
         assert_eq!(keys, vec!["imaging/scan-a", "imaging/scan-b"]);
         assert!(token.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_listing_scope() {
+        let (_storage_dir, service, mut user_access, group_id) = subpath_node().await;
+        grant_group_owner(&service, &user_access, group_id).await;
+        seed_materialized_keys(
+            &service.state.storage_handle,
+            "study",
+            &["imaging", "imaging/private/key"],
+            user_access.user_identity,
+            UNIX_EPOCH,
+        )
+        .await;
+        let root =
+            blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study");
+        for (suffix, expected) in [("/imaging", vec!["imaging"]), ("", vec![])] {
+            user_access.path_restrictions = Some(vec![PathRestriction {
+                pattern: format!("{root}{suffix}"),
+                permission: Permission::READ,
+            }]);
+            for delimiter in [None, Some("/".to_string())] {
+                let mut request = subpath_request(&service, &user_access, group_id, None).await;
+                request.input.delimiter = delimiter;
+                let output = service.list_objects_v2(request).await.unwrap().output;
+                let keys: Vec<_> = output
+                    .contents
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|object| object.key)
+                    .collect();
+                assert_eq!(keys, expected);
+                assert!(output.common_prefixes.unwrap_or_default().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_listing_keys() {
+        let (_storage_dir, service, mut user_access, group_id) = subpath_node().await;
+        seed_materialized_keys(
+            &service.state.storage_handle,
+            "study",
+            &[
+                "imaging/private/key",
+                "imaging/public/secret.txt",
+                "imaging/public/open.txt",
+                "imaging/hidden/secret.txt",
+            ],
+            user_access.user_identity,
+            UNIX_EPOCH,
+        )
+        .await;
+        let root =
+            blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study");
+        user_access.path_restrictions = Some(
+            [
+                ("imaging/**", Permission::READ),
+                ("imaging/private/**", Permission::DENY),
+                ("imaging/*/secret*", Permission::DENY),
+            ]
+            .into_iter()
+            .map(|(key, permission)| PathRestriction {
+                pattern: format!("{root}/{key}"),
+                permission,
+            })
+            .collect(),
+        );
+        let mut request = subpath_request(&service, &user_access, group_id, None).await;
+        request.input.delimiter = None;
+        let output = service.list_objects_v2(request).await.unwrap().output;
+        let keys: Vec<_> = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "imaging/public/open.txt",
+                "imaging/scan-a",
+                "imaging/scan-b"
+            ]
+        );
+        let request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
+        let output = service.list_objects_v2(request).await.unwrap().output;
+        let prefixes: Vec<_> = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+        assert_eq!(prefixes, vec!["imaging/public/"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_scan_bounded() {
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        let keys: Vec<_> = (0..101).map(|index| format!("hidden/{index:03}")).collect();
+        seed_materialized_keys(
+            &service.state.storage_handle,
+            "study",
+            &keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            user_access.user_identity,
+            UNIX_EPOCH,
+        )
+        .await;
+        let request = paged_request(&service, &user_access, group_id, None).await;
+        let error = service.list_objects_v2(request).await.unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::SlowDown);
+    }
+
+    #[tokio::test]
+    async fn prefix_pages_progress() {
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        let keys: Vec<_> = (0..101)
+            .map(|index| format!("imaging/{index:03}/key"))
+            .collect();
+        seed_materialized_keys(
+            &service.state.storage_handle,
+            "study",
+            &keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            user_access.user_identity,
+            UNIX_EPOCH,
+        )
+        .await;
+        let mut request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
+        request.input.max_keys = Some(0);
+        let output = service.list_objects_v2(request).await.unwrap().output;
+        assert!(output.contents.unwrap_or_default().is_empty());
+        assert!(output.common_prefixes.unwrap_or_default().is_empty());
+        assert!(output.next_continuation_token.is_none());
+        let mut token = None;
+        let mut prefixes = Vec::new();
+        for _ in 0..3 {
+            let mut request =
+                subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
+            request.input.max_keys = None;
+            request.input.continuation_token = token.take();
+            let output = service.list_objects_v2(request).await.unwrap().output;
+            prefixes.extend(
+                output
+                    .common_prefixes
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|prefix| prefix.prefix),
+            );
+            token = output.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert!(token.is_none());
+        assert_eq!(
+            prefixes,
+            (0..101)
+                .map(|index| format!("imaging/{index:03}/"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_token_precedence() {
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        seed_materialized_keys(
+            &service.state.storage_handle,
+            "study",
+            &["imaging/a/key", "imaging/b/key"],
+            user_access.user_identity,
+            UNIX_EPOCH,
+        )
+        .await;
+        let mut request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
+        request.input.start_after = Some("imaging/z".to_string());
+        let token = scoped_marker("study", Some("imaging/0"), None).unwrap();
+        request.input.continuation_token =
+            ArunaS3Service::encode_list_objects_v2_continuation_token(token.as_ref()).unwrap();
+        let output = service.list_objects_v2(request).await.unwrap().output;
+        let prefixes: Vec<_> = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+        assert_eq!(prefixes, vec!["imaging/a/", "imaging/b/"]);
     }
 
     #[tokio::test]

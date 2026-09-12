@@ -3,21 +3,30 @@
 //! them, while every concrete object path stays an ordinary permission check.
 
 use aruna_core::errors::AuthorizationError;
-use aruna_core::structs::{AuthContext, UserAccess};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::permission_rules::reachable_roots;
+use aruna_core::permission_path::readable_roots;
+use aruna_core::structs::{AuthContext, PathRestriction, Permission, UserAccess};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::permission_rules::{
+    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
+};
 use s3s::{S3Result, s3_error};
 
-/// Key prefixes inside one bucket the caller may read. An empty prefix stands
-/// for the whole bucket, and an empty scope for no access at all.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Navigable key prefixes and the rules deciding each concrete key's access.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SubpathScope {
     prefixes: Vec<String>,
+    root: String,
+    rules: PermissionRules,
 }
 
 impl SubpathScope {
     /// Turns absolute permission roots into key prefixes relative to `root`.
-    fn from_roots(roots: Vec<String>, root: &str) -> Self {
+    fn from_rules(
+        rules: PermissionRules,
+        restrictions: Option<&[PathRestriction]>,
+        root: &str,
+    ) -> Self {
+        let roots = readable_roots(&rules.direct_patterns(), restrictions, root);
         let inside = format!("{root}/");
         let prefixes = roots
             .into_iter()
@@ -29,23 +38,21 @@ impl SubpathScope {
                 }
             })
             .collect();
-        Self { prefixes }
+        Self {
+            prefixes,
+            root: root.to_string(),
+            rules,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.prefixes.is_empty()
     }
 
-    /// Whether the caller may read the whole bucket, which needs no filtering.
-    pub(crate) fn covers_all(&self) -> bool {
-        self.prefixes.iter().any(String::is_empty)
-    }
-
-    /// Whether a key lies inside an allowed prefix.
+    /// Applies the ordinary permission decision, including denies and restrictions.
     pub(crate) fn allows_key(&self, key: &str) -> bool {
-        self.prefixes.iter().any(|prefix| {
-            prefix.is_empty() || key == prefix || key.starts_with(&format!("{prefix}/"))
-        })
+        self.rules
+            .allows(&format!("{}/{key}", self.root), &Permission::READ)
     }
 
     /// Whether a listing prefix is an ancestor of, equal to, or inside an
@@ -74,8 +81,16 @@ pub(crate) async fn resolve_scope(
         path_restrictions: user_access.path_restrictions.clone(),
         session: None,
     };
-    let roots = match reachable_roots(context, &auth_context, root).await {
-        Ok(roots) => roots,
+    let rules = match drive(
+        PermissionRulesOperation::new(PermissionRulesConfig {
+            auth_context,
+            path: root.to_string(),
+        }),
+        context,
+    )
+    .await
+    {
+        Ok(rules) => rules,
         Err(
             AuthorizationError::AuthDocNotFound
             | AuthorizationError::GroupNotFound
@@ -84,34 +99,58 @@ pub(crate) async fn resolve_scope(
         ) => return Ok(SubpathScope::default()),
         Err(error) => return Err(s3_error!(InternalError, "{}", error.to_string())),
     };
-    Ok(SubpathScope::from_roots(roots, root))
+    Ok(SubpathScope::from_rules(
+        rules,
+        user_access.path_restrictions.as_deref(),
+        root,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use aruna_core::structs::{PathRestriction, Permission, Role};
+    use aruna_operations::permission_rules::{CollectedRole, PermissionRules};
+
     use super::SubpathScope;
 
-    fn imaging_scope() -> SubpathScope {
-        SubpathScope::from_roots(
-            vec!["/realm/g/group/data/node/study/imaging".to_string()],
-            "/realm/g/group/data/node/study",
+    fn test_scope(
+        patterns: &[(&str, Permission)],
+        restrictions: Option<&[PathRestriction]>,
+    ) -> SubpathScope {
+        let root = "/realm/g/group/data/node/study";
+        let rules = PermissionRules::from_roles(
+            vec![CollectedRole {
+                role: Role {
+                    role_id: Default::default(),
+                    name: "reader".to_string(),
+                    permissions: patterns
+                        .iter()
+                        .map(|(key, permission)| (format!("{root}/{key}"), permission.clone()))
+                        .collect(),
+                    assigned_users: Default::default(),
+                },
+                direct: true,
+                public: false,
+            }],
+            restrictions,
         )
+        .unwrap();
+        SubpathScope::from_rules(rules, restrictions, root)
     }
 
     #[test]
     fn allows_scoped_keys() {
-        let scope = imaging_scope();
+        let scope = test_scope(&[("imaging/**", Permission::READ)], None);
         assert!(!scope.is_empty());
-        assert!(!scope.covers_all());
         assert!(scope.allows_key("imaging/scan.tif"));
-        assert!(scope.allows_key("imaging"));
+        assert!(!scope.allows_key("imaging"));
         assert!(!scope.allows_key("imaging-2/scan.tif"));
         assert!(!scope.allows_key("sequencing/reads.fastq"));
     }
 
     #[test]
     fn keeps_scope_prefixes() {
-        let scope = imaging_scope();
+        let scope = test_scope(&[("imaging/**", Permission::READ)], None);
         assert!(scope.allows_prefix(""));
         assert!(scope.allows_prefix("imaging/"));
         assert!(scope.allows_prefix("imaging/2026/"));
@@ -119,12 +158,43 @@ mod tests {
     }
 
     #[test]
-    fn root_covers_all() {
-        let scope = SubpathScope::from_roots(
-            vec!["/realm/g/group/data/node/study".to_string()],
-            "/realm/g/group/data/node/study",
+    fn exact_stays_exact() {
+        let scope = test_scope(&[("imaging", Permission::READ)], None);
+        assert!(scope.allows_key("imaging"));
+        assert!(!scope.allows_key("imaging/private/key"));
+    }
+
+    #[test]
+    fn denies_filter_keys() {
+        let scope = test_scope(
+            &[
+                ("**", Permission::READ),
+                ("imaging/private/**", Permission::DENY),
+                ("imaging/*/secret*", Permission::DENY),
+            ],
+            None,
         );
-        assert!(scope.covers_all());
+        assert!(scope.allows_prefix(""));
         assert!(scope.allows_key("sequencing/reads.fastq"));
+        assert!(!scope.allows_key("imaging/private/key"));
+        assert!(!scope.allows_key("imaging/public/secret.txt"));
+    }
+
+    #[test]
+    fn restrictions_filter_keys() {
+        let restrictions = [
+            PathRestriction {
+                pattern: "/realm/g/group/data/node/study/imaging/**".to_string(),
+                permission: Permission::READ,
+            },
+            PathRestriction {
+                pattern: "/realm/g/group/data/node/study/imaging/*/secret*".to_string(),
+                permission: Permission::DENY,
+            },
+        ];
+        let scope = test_scope(&[("**", Permission::READ)], Some(&restrictions));
+        assert!(scope.allows_key("imaging/public/key"));
+        assert!(!scope.allows_key("imaging/public/secret.txt"));
+        assert!(!scope.allows_key("sequencing/reads.fastq"));
     }
 }
