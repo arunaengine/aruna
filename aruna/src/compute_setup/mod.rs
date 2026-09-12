@@ -37,20 +37,36 @@ pub(crate) use settings::{session_s3_address, session_subnet};
 /// unavailable compute.
 #[derive(Debug)]
 pub(crate) enum ComputeBuildError {
-    Config(String),
+    /// The operator's values are invalid or contradictory.
+    Invalid(String),
+    /// The selected backend is not compiled into this binary. With every
+    /// backend feature enabled only the table tests construct it.
+    #[cfg_attr(
+        all(feature = "docker", feature = "apptainer", feature = "kubernetes"),
+        allow(dead_code)
+    )]
+    Unsupported(String),
+    /// The backend exists but its runtime or daemon is not usable right now.
     Unavailable(String),
 }
 
 impl From<String> for ComputeBuildError {
     fn from(error: String) -> Self {
-        Self::Config(error)
+        Self::Invalid(error)
     }
 }
 
 impl From<&'static str> for ComputeBuildError {
     fn from(error: &'static str) -> Self {
-        Self::Config(error.to_string())
+        Self::Invalid(error.to_string())
     }
+}
+
+/// Whether an error may be tolerated by optional compute. Only a temporarily
+/// unavailable backend is tolerable; invalid settings and missing compiled
+/// support always fail a start.
+pub(super) fn optional_tolerates(error: &ComputeBuildError) -> bool {
+    matches!(error, ComputeBuildError::Unavailable(_))
 }
 
 /// One selected compute backend with its already-parsed settings.
@@ -114,9 +130,7 @@ pub(super) struct KubernetesSettings {
 pub(crate) async fn build_registry(
     config: &Config,
 ) -> Result<Option<Arc<ExecutorRegistry>>, String> {
-    let settings = settings::collect().map_err(|error| match error {
-        ComputeBuildError::Config(message) | ComputeBuildError::Unavailable(message) => message,
-    })?;
+    let settings = settings::collect().map_err(compute_error_message)?;
     let result = match &settings.backend {
         BackendSettings::None => return Ok(None),
         BackendSettings::Docker(docker) => build_docker(&settings, docker, config).await,
@@ -129,15 +143,21 @@ pub(crate) async fn build_registry(
     };
     let registry = match result {
         Ok(registry) => Some(Arc::new(registry)),
-        Err(ComputeBuildError::Unavailable(error)) if settings.optional => {
-            warn!(reason = %error, "Compute executor unavailable; running without compute");
+        Err(error) if settings.optional && optional_tolerates(&error) => {
+            warn!(reason = %compute_error_message(error), "Compute executor unavailable; running without compute");
             None
         }
-        Err(ComputeBuildError::Config(error) | ComputeBuildError::Unavailable(error)) => {
-            return Err(error);
-        }
+        Err(error) => return Err(compute_error_message(error)),
     };
     Ok(registry)
+}
+
+fn compute_error_message(error: ComputeBuildError) -> String {
+    match error {
+        ComputeBuildError::Invalid(message)
+        | ComputeBuildError::Unsupported(message)
+        | ComputeBuildError::Unavailable(message) => message,
+    }
 }
 
 #[cfg(feature = "docker")]
@@ -148,7 +168,9 @@ async fn build_docker(
     _docker: &DockerSettings,
     _config: &Config,
 ) -> Result<ExecutorRegistry, ComputeBuildError> {
-    Err("Docker executor feature is not compiled".to_string().into())
+    Err(ComputeBuildError::Unsupported(
+        "Docker executor feature is not compiled".to_string(),
+    ))
 }
 
 #[cfg(feature = "apptainer")]
@@ -159,9 +181,45 @@ async fn build_apptainer(
     _apptainer: &ApptainerSettings,
     _config: &Config,
 ) -> Result<ExecutorRegistry, ComputeBuildError> {
-    Err("Apptainer executor feature is not compiled"
-        .to_string()
-        .into())
+    Err(ComputeBuildError::Unsupported(
+        "Apptainer executor feature is not compiled".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::{ComputeBuildError, optional_tolerates};
+
+    // Optional compute tolerates exactly one category: a temporarily
+    // unavailable backend. Invalid settings and missing compiled support are
+    // fatal with or without the flag.
+    #[test]
+    fn optional_policy_table() {
+        let effective =
+            |error: &ComputeBuildError, optional: bool| optional && optional_tolerates(error);
+        let invalid = ComputeBuildError::Invalid("bad".to_string());
+        let unsupported = ComputeBuildError::Unsupported("missing".to_string());
+        let unavailable = ComputeBuildError::Unavailable("down".to_string());
+
+        assert!(!effective(&invalid, false));
+        assert!(
+            !effective(&invalid, true),
+            "invalid config is never disabled"
+        );
+        assert!(!effective(&unsupported, false));
+        assert!(
+            !effective(&unsupported, true),
+            "missing compiled support is never disabled"
+        );
+        assert!(
+            !effective(&unavailable, false),
+            "required compute must fail"
+        );
+        assert!(
+            effective(&unavailable, true),
+            "optional compute may disable"
+        );
+    }
 }
 
 #[cfg(feature = "kubernetes")]
@@ -172,7 +230,7 @@ async fn build_kubernetes(
     _kubernetes: &KubernetesSettings,
     _config: &Config,
 ) -> Result<ExecutorRegistry, ComputeBuildError> {
-    Err("Kubernetes executor feature is not compiled"
-        .to_string()
-        .into())
+    Err(ComputeBuildError::Unsupported(
+        "Kubernetes executor feature is not compiled".to_string(),
+    ))
 }
