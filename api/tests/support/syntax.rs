@@ -110,10 +110,10 @@ pub fn delimiter(source: &str, open: usize, start: u8, end: u8) -> usize {
     );
     let mut depth = 0;
 
-    for index in open..bytes.len() {
-        if bytes[index] == start {
+    for (index, byte) in bytes.iter().enumerate().skip(open) {
+        if *byte == start {
             depth += 1;
-        } else if bytes[index] == end {
+        } else if *byte == end {
             depth -= 1;
             if depth == 0 {
                 return index;
