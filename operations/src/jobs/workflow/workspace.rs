@@ -13,9 +13,9 @@ use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CapturedInput, ExecutionSpec,
     HashPathIndexKey, InputMode, InputSelection, InputSource, JobError, JobRecord,
     MAX_EXECUTION_OUTPUTS, OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject,
-    OutputSelection, PathRestriction, Permission, PlacementPolicyRef, RealmId, UserAccess,
-    VersionedObjectArn, bucket_permission_path, ensure_confined_path, group_permission_path,
-    key_content_type, object_permission_path, workspace_credential_id,
+    OutputSelection, PathRestriction, Permission, PlacementPolicyRef, RealmId, ReplicationFailure,
+    UserAccess, VersionedObjectArn, bucket_permission_path, ensure_confined_path,
+    group_permission_path, key_content_type, object_permission_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -1064,10 +1064,11 @@ async fn replicate_output(
     let result = Box::pin(drive(operation, context))
         .await
         .and_then(|result| result.transpose())
-        .map_err(|error| output_replication_error(error.to_string()))?
+        .map_err(|error| output_replication_error(error.failure(), error.to_string()))?
         .ok_or_else(|| JobError::retryable("output copy returned no result"))?;
     if result.failed > 0 || result.replicated == 0 && result.skipped == 0 {
         return Err(output_replication_error(
+            result.failure.unwrap_or(ReplicationFailure::Other),
             result
                 .last_error
                 .unwrap_or_else(|| "output copy made no progress".to_string()),
@@ -1128,8 +1129,8 @@ async fn cleanup_output_stage(
     }
 }
 
-fn output_replication_error(message: String) -> JobError {
-    if message.contains("access denied") || message.contains("writer_access_denied") {
+fn output_replication_error(failure: ReplicationFailure, message: String) -> JobError {
+    if failure.is_denied() {
         JobError::permanent(format!("output copy failed: {message}"))
     } else {
         JobError::retryable(format!("output copy failed: {message}"))

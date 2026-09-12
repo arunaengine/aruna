@@ -12,8 +12,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, RealmId, ReferenceHandling, ReplicationFailure, ReplicationItemError,
-    SyncMode, SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
+    ArunaArn, AuthContext, RealmId, ReferenceHandling, ReplicationFailure, SyncMode,
+    SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
     sync_relationship_key, sync_relationship_prefix, watch_resource_path,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -29,7 +29,6 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use super::error::ReplicationError;
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
@@ -1248,13 +1247,7 @@ fn mark_success(relationship: &mut SyncRelationship, replicated: u64, bytes: u64
 /// The stable failure category of a scope-level error. Only a peer rejection
 /// carries one through; everything else is retryable.
 fn scope_failure(error: &ReplicateScopeError) -> ReplicationFailure {
-    match error {
-        ReplicateScopeError::ReplicateObjectVersionError(error) => error.failure_category(),
-        ReplicateScopeError::ReplicationError(ReplicationError::ReplicationRejected(reason)) => {
-            ReplicationItemError::from_peer_reason(reason).failure
-        }
-        _ => ReplicationFailure::Other,
-    }
+    error.failure()
 }
 
 async fn store_relationship(
@@ -2732,8 +2725,8 @@ mod tests {
     use aruna_core::structs::{
         Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, Group, GroupAuthorizationDocument,
         PathRestriction, Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        ReferenceHandling, SyncStatusSnapshot, VersionKey, object_permission_path,
-        sync_relationship_key,
+        ReferenceHandling, ReplicationItemError, SyncStatusSnapshot, VersionKey,
+        object_permission_path, sync_relationship_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;

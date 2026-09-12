@@ -282,6 +282,20 @@ pub enum ReplicateScopeError {
     },
 }
 
+impl ReplicateScopeError {
+    /// The stable failure category of a scope-level error. Only a peer
+    /// rejection carries one through; every other scope error is retryable.
+    pub fn failure(&self) -> ReplicationFailure {
+        match self {
+            Self::ReplicateObjectVersionError(error) => error.failure_category(),
+            Self::ReplicationError(ReplicationError::ReplicationRejected(reason)) => {
+                ReplicationItemError::from_peer_reason(reason).failure
+            }
+            _ => ReplicationFailure::Other,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReplicateScopeState {
     Init,
