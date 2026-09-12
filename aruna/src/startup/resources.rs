@@ -62,10 +62,10 @@ struct Acquired {
 }
 
 impl Acquired {
-    fn new(storage_handle: aruna_storage::StorageHandle) -> Self {
+    fn new(storage_handle: aruna_storage::StorageHandle, task_handle: TaskHandle) -> Self {
         Self {
             storage_handle,
-            task_handle: TaskHandle::new(),
+            task_handle,
             jobs_runtime: JobsRuntime::new_paused(),
             shutdown: Shutdown::new(),
             metrics: Arc::new(NodeMetrics::new()),
@@ -131,7 +131,10 @@ impl Acquired {
 
 pub(crate) async fn acquire() -> Result<NodeResources, Box<dyn std::error::Error>> {
     let (config, storage_handle) = load().await?;
-    let mut acquired = Acquired::new(storage_handle);
+    // The node runtime always exists here; a missing one is a concrete startup
+    // error, never a scheduler-less handle that only looks started.
+    let task_handle = TaskHandle::try_new().map_err(std::io::Error::other)?;
+    let mut acquired = Acquired::new(storage_handle, task_handle);
 
     match fill(&config, &mut acquired).await {
         Ok(()) => Ok(acquired.finish(config)),
@@ -411,7 +414,8 @@ mod tests {
     async fn cleanup_releases_the_acquired_subset() {
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
-        let acquired = Acquired::new(storage_handle.clone());
+        let task_handle = TaskHandle::new();
+        let acquired = Acquired::new(storage_handle.clone(), task_handle);
         assert!(acquired.net_handle.is_none());
         assert!(acquired.metadata_handle.is_none());
         assert!(acquired.ops_handle.is_none());
