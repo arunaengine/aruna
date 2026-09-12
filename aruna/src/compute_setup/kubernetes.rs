@@ -3,45 +3,33 @@
 use aruna_compute::ExecutorRegistry;
 use tracing::info;
 
-use super::ComputeBuildError;
 use super::settings::{
-    compute_envelope, compute_s3_endpoint, env_duration, env_labels, kubernetes_s3_access,
-    kubernetes_workspace, read_mount_driver, session_s3_port,
+    compute_s3_endpoint, kubernetes_s3_access, kubernetes_workspace, session_s3_port,
 };
+use super::{ComputeBuildError, ComputeSettings, KubernetesSettings};
 use crate::config::Config;
 
-pub(super) async fn build(config: &Config) -> Result<ExecutorRegistry, ComputeBuildError> {
-    let storage_class = dotenvy::var("ARUNA_COMPUTE_K8S_STORAGE_CLASS")
-        .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_STORAGE_CLASS".to_string())?;
-    let helper_image = dotenvy::var("ARUNA_COMPUTE_K8S_HELPER_IMAGE")
-        .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_HELPER_IMAGE".to_string())?;
-    let s3_cidrs = dotenvy::var("ARUNA_COMPUTE_K8S_S3_CIDRS")
-        .ok()
-        .map(|value| parse_s3_cidrs(&value))
-        .transpose()?
-        .unwrap_or_default();
+pub(super) async fn build(
+    settings: &ComputeSettings,
+    kubernetes: &KubernetesSettings,
+    config: &Config,
+) -> Result<ExecutorRegistry, ComputeBuildError> {
     let workspace = kubernetes_workspace(
-        super::settings::env_true("ARUNA_COMPUTE_LOCAL_ONLY"),
-        compute_s3_endpoint(config).as_deref(),
+        settings.local_only,
+        compute_s3_endpoint(settings, config).as_deref(),
     )?;
-    let s3_port = session_s3_port(
-        dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT").ok().as_deref(),
+    let s3_port = session_s3_port(kubernetes.s3_port.as_deref(), workspace.as_deref())?;
+    let (s3_cidrs, s3_mount_driver) = kubernetes_s3_access(
         workspace.as_deref(),
-    )?;
-    let (s3_cidrs, s3_mount_driver) =
-        kubernetes_s3_access(workspace.as_deref(), s3_cidrs, read_mount_driver());
-    let policy_manifests = dotenvy::var("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS")
-        .ok()
-        .map(|value| policy_paths(&value))
-        .transpose()?
-        .unwrap_or_default();
+        kubernetes.s3_cidrs.clone(),
+        kubernetes.mount_driver.clone(),
+    );
     let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
         aruna_compute::KubernetesConfig {
-            namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
-                .unwrap_or_else(|_| "default".to_string()),
-            storage_class,
-            helper_image,
-            pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
+            namespace: kubernetes.namespace.clone(),
+            storage_class: kubernetes.storage_class.clone(),
+            helper_image: kubernetes.helper_image.clone(),
+            pull_deadline: kubernetes.pull_deadline,
             s3_cidrs: if workspace.is_some() {
                 s3_cidrs
             } else {
@@ -49,14 +37,14 @@ pub(super) async fn build(config: &Config) -> Result<ExecutorRegistry, ComputeBu
             },
             s3_port,
             s3_mount_driver,
-            policy_manifests,
-            service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
-                .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
-            execution_location: dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
-                .unwrap_or_default(),
-            execution_labels: env_labels("ARUNA_COMPUTE_K8S_EXECUTION_LABELS")?,
-            node_selector: env_labels("ARUNA_COMPUTE_K8S_NODE_SELECTOR")?,
-            envelope: compute_envelope()?,
+            policy_manifests: kubernetes.policy_manifests.clone(),
+            service_account: kubernetes.service_account.clone(),
+            execution_location: kubernetes.execution_location.clone(),
+            execution_labels: kubernetes.execution_labels.clone(),
+            node_selector: kubernetes.node_selector.clone(),
+            envelope: settings
+                .envelope
+                .expect("a selected kubernetes backend has an envelope"),
             ..aruna_compute::KubernetesConfig::default()
         },
     )
@@ -80,72 +68,9 @@ pub(super) async fn build(config: &Config) -> Result<ExecutorRegistry, ComputeBu
         .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
 }
 
-/// Expands a comma-separated list of manifest files and directories. A
-/// directory contributes its YAML files in name order.
-fn policy_paths(value: &str) -> Result<Vec<std::path::PathBuf>, String> {
-    let mut paths = Vec::new();
-    for entry in value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let path = std::path::PathBuf::from(entry);
-        let metadata = std::fs::metadata(&path).map_err(|error| {
-            format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}` is unreadable: {error}")
-        })?;
-        if !metadata.is_dir() {
-            paths.push(path);
-            continue;
-        }
-        let mut found = Vec::new();
-        for file in std::fs::read_dir(&path).map_err(|error| {
-            format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}` is unreadable: {error}")
-        })? {
-            let file = file
-                .map_err(|error| {
-                    format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}`: {error}")
-                })?
-                .path();
-            if file
-                .extension()
-                .is_some_and(|suffix| suffix == "yaml" || suffix == "yml")
-            {
-                found.push(file);
-            }
-        }
-        found.sort();
-        paths.append(&mut found);
-    }
-    Ok(paths)
-}
-
-fn parse_s3_cidrs(value: &str) -> Result<Vec<String>, String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|cidr| !cidr.is_empty())
-        .map(|cidr| {
-            let (address, prefix) = cidr
-                .split_once('/')
-                .ok_or_else(|| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
-            let address = address
-                .parse::<std::net::IpAddr>()
-                .map_err(|_| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
-            let prefix = prefix
-                .parse::<u8>()
-                .map_err(|_| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
-            let max_prefix = if address.is_ipv4() { 32 } else { 128 };
-            if prefix > max_prefix {
-                return Err(format!("invalid Kubernetes S3 CIDR `{cidr}`"));
-            }
-            Ok(cidr.to_string())
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod pure_tests {
-    use super::*;
+    use super::super::settings::{parse_s3_cidrs, policy_paths};
     use tempfile::tempdir;
 
     #[test]
