@@ -49,7 +49,7 @@ fn reapplies_select_limit() {
 }
 
 #[test]
-fn query_select_limit() {
+fn reads_outermost_limit() {
     assert_eq!(
         query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 5"),
         Some(5)

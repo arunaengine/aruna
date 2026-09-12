@@ -7,7 +7,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_net::NetHandle;
 use craqle::{CraqleError, GraphId};
-use tracing::{Span, field};
+use tracing::{Span, debug, field};
 
 use super::MetadataInner;
 use super::entity_convert::{error_from_craqle, irokle_peer_id};
@@ -148,7 +148,7 @@ fn sync_topic_exists(
     topic_id: irokle::TopicId,
 ) -> Result<bool, MetadataError> {
     net_handle
-        .document_sync_topic_exists(topic_id)
+        .sync_topic_exists(topic_id)
         .map_err(|error| MetadataError::Backend(error.to_string()))
 }
 

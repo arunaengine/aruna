@@ -1,83 +1,47 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
-use aruna_core::alpn::Alpn;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
-use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
-};
+use aruna_core::effects::StoragePriority;
+use aruna_core::events::Event;
 use aruna_core::metadata::{
-    MetadataBatch, MetadataBatchSource, MetadataCreateCrateRequest, MetadataDot, MetadataEffect,
-    MetadataError, MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy,
-    MetadataQuadOp, MetadataQueryResults, MetadataRequestDurability, MetadataRoCratePage,
-    MetadataSearchHit, MetadataUpsertEntityRequest, MetadataValidationViolation,
+    MetadataEffect,
+    MetadataError, MetadataEvent, MetadataRoCratePage,
 };
 use aruna_core::structs::{
-    AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
-    SyncRelationship, TokenClaims, bucket_permission_path,
+    BucketInfo, MetadataRegistryRecord, RealmId,
+    SyncRelationship,
 };
-use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::NetHandle;
-use aruna_net::streams::{BiStream, RecvStream};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
-use byteview::ByteView;
 use craqle::{
-    Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
-    Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
-    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CrateViolation,
-    CreateCrateRequest, CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy,
-    GraphSearchRequest, PatchEntityRequest, RoCrateError, SearchRequest, SearchStorage, vocab,
+    ActorId,
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CrateViolation, GraphId, SearchStorage,
 };
 use futures_util::FutureExt;
 use jsonwebtoken::DecodingKey;
-use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-use serde::de::DeserializeOwned;
-use serde_json::Value;
-use spareval::{CancellationToken, QueryEvaluator};
-use spargebra::{Query, SparqlParser};
-use tokio::io::AsyncRead;
-use tokio::time::{sleep, timeout, timeout_at};
-use tracing::{Instrument, Span, debug, debug_span, field, warn};
+use oxrdf::Term;
+use tracing::warn;
 use ulid::Ulid;
 
-use self::effects::{
-    effect_graph_iri, graph_ids, metadata_effect_kind, metadata_event_kind, record_craqle_result,
-    record_error, record_metadata_result, record_query_counts,
-};
 use self::entity_convert::{
-    batch_from_craqle, craqle_create_request, craqle_graph_policy, craqle_request_durability,
-    error_from_craqle, fjall_persist_mode, irokle_peer_id, page_from_craqle, plan_batch,
-    policy_from_craqle, to_craqle_batch, upsert_contextual_entity, upsert_data_entity,
+    error_from_craqle, fjall_persist_mode,
 };
 use self::lifecycle::{
-    effect_mutates_graph, effect_rejects_deleted, fill_visibility_caches, graph_lifecycle_deleted,
-    list_group_records, list_local_records, metadata_graph_deleted,
+    fill_visibility_caches,
+    list_group_records, list_local_group, list_local_records,
 };
-use self::peer_auth::{bucket_search_auth, config_digest_matches, load_auth_state};
-use self::persist::{
-    effect_defers_persist, effect_persists_sync, flush_metadata_persistence, flush_sync_journal,
-    schedule_deferred_persist,
-};
-use self::query::{query_local_graphs, snapshot_iri_references};
+use self::peer_auth::load_auth_state;
+use self::persist::flush_metadata_persistence;
+use self::query::snapshot_iri_references;
 use self::search::{
-    AllowedGraphAuthorizer, clamp_remote_limit, describe_hit_properties, list_visible_graphs,
-    search_local_graphs, select_authorized_graphs,
-};
-use self::transport::{
-    close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, write_body_at, write_message_at, write_stream_body, write_transport_message,
+    AllowedGraphAuthorizer, describe_hit_properties,
 };
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
@@ -85,41 +49,15 @@ use super::profile_cache::ProfileCache;
 use super::profile_shacl::{
     ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
 };
-use super::protocol::{
-    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
-    read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
-    write_message,
-};
-use super::query_cache::{
-    CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
-};
-use super::repository::{
-    StorageReadError, iter_registry_effect, parse_lifecycle_read, parse_registry_iter,
-    read_lifecycle_effect,
-};
-use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
-use super::search_enrichment::{hit_snippet, hit_title, hit_types};
+use super::query_cache::MetadataQueryCache;
 use super::summary_cache::summary_cache;
 use crate::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, decode_bearer_token,
-    realm_token_revoked, validate_bearer_token,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
+    realm_token_revoked,
 };
-use crate::auth::permission_rules::GroupPermissionRules;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
-use crate::s3::search_objects::{
-    ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput, search_local_objects,
-};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
-use crate::sync::sync_relationship::{
-    DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
-    SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
-};
 
 mod effects;
 pub(crate) use self::effects::metadata_read_error;
@@ -625,7 +563,7 @@ impl MetadataHandle {
         &self,
         group_id: GroupId,
     ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
-        list_group_records(self.inner.clone(), group_id).await
+        list_local_group(self.inner.clone(), group_id).await
     }
 
     pub async fn list_group_records(

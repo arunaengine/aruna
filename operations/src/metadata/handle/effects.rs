@@ -7,7 +7,7 @@ use aruna_core::handle::Handle;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use async_trait::async_trait;
-use craqle::{ActorId, AllowAllAuthorizer, CraqleError, GraphId};
+use craqle::{ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, GraphId};
 use tracing::{Instrument, Span, debug_span, field, warn};
 
 use super::entity_convert::{
@@ -431,7 +431,7 @@ fn validate_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.validate_create_crate(&auth, craqle_create_request(request)))
+                .in_scope(|| node.validate_create_crate(auth, craqle_create_request(request)))
                 .map(|_| MetadataEvent::ValidationResult {
                     graph_iri: graph_iri.clone(),
                 });
@@ -461,7 +461,7 @@ fn validate_effect(
             let result = call_span
                 .in_scope(|| {
                     node.validate_rocrate_document_checked_with_policy(
-                        &auth,
+                        auth,
                         GraphId::new(&graph_iri),
                         &jsonld,
                         craqle_graph_policy(policy),
@@ -507,7 +507,7 @@ fn crate_effect(
             let actor = request.deterministic_actor.map(ActorId::from_bytes);
             let result = call_span.in_scope(|| {
                 node.create_crate_with_durability_as(
-                    &auth,
+                    auth,
                     craqle_create_request(request.clone()),
                     craqle_request_durability(durability),
                     actor,
@@ -548,7 +548,7 @@ fn crate_effect(
             let started = Instant::now();
             let result = call_span.in_scope(|| {
                 node.apply_rocrate_document_checked_with_policy_and_durability_as(
-                    &auth,
+                    auth,
                     GraphId::new(&graph_iri),
                     &jsonld,
                     craqle_graph_policy(policy),
@@ -594,7 +594,7 @@ fn entity_effect(
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
-            let result = call_span.in_scope(|| upsert_data_entity(&node, &auth, request));
+            let result = call_span.in_scope(|| upsert_data_entity(&node, auth, request));
             let converted = result.map(|batch| {
                 call_span.record("batch_ops", batch.ops.len() as u64);
                 MetadataEvent::EntityUpsertResult {
@@ -624,7 +624,7 @@ fn entity_effect(
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
-            let result = call_span.in_scope(|| upsert_contextual_entity(&node, &auth, request));
+            let result = call_span.in_scope(|| upsert_contextual_entity(&node, auth, request));
             let converted = result.map(|batch| {
                 call_span.record("batch_ops", batch.ops.len() as u64);
                 MetadataEvent::EntityUpsertResult {
@@ -664,7 +664,7 @@ fn policy_effect(
             let result = call_span
                 .in_scope(|| {
                     node.set_graph_policy(
-                        &auth,
+                        auth,
                         &GraphId::new(&graph_iri),
                         craqle_graph_policy(policy),
                     )
@@ -750,7 +750,7 @@ fn export_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.export_rocrate(&auth, &GraphId::new(&graph_iri)))
+                .in_scope(|| node.export_rocrate(auth, &GraphId::new(&graph_iri)))
                 .map(|jsonld| {
                     call_span.record("jsonld_len", jsonld.len() as u64);
                     MetadataEvent::RoCrateExportResult {
@@ -777,7 +777,7 @@ fn export_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.export_rocrate_summary(&auth, &GraphId::new(&graph_iri)))
+                .in_scope(|| node.export_rocrate_summary(auth, &GraphId::new(&graph_iri)))
                 .map(|jsonld| {
                     call_span.record("jsonld_len", jsonld.len() as u64);
                     MetadataEvent::RoCrateSummaryResult {
@@ -815,9 +815,9 @@ fn export_effect(
             let graph = GraphId::new(&graph_iri);
             let page = call_span.in_scope(|| {
                 if let Some(after) = after.as_deref() {
-                    node.export_rocrate_page_after(&auth, &graph, Some(after), limit)
+                    node.export_rocrate_page_after(auth, &graph, Some(after), limit)
                 } else {
-                    node.export_rocrate_page(&auth, &graph, offset.unwrap_or(0), limit)
+                    node.export_rocrate_page(auth, &graph, offset.unwrap_or(0), limit)
                 }
             });
             let result = page.map(|page| {
@@ -856,7 +856,7 @@ fn graph_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.delete_graph(&auth, &GraphId::new(&graph_iri)))
+                .in_scope(|| node.delete_graph(auth, &GraphId::new(&graph_iri)))
                 .map(|_| MetadataEvent::GraphDeleted {
                     graph_iri: graph_iri.clone(),
                 });
@@ -1001,7 +1001,7 @@ fn sync_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| plan_batch(&node, &auth, &graph_iri, actor, &source))
+                .in_scope(|| plan_batch(&node, auth, &graph_iri, actor, &source))
                 .map(|batch| {
                     call_span.record("batch_ops", batch.ops.len() as u64);
                     MetadataEvent::BatchPlanned {

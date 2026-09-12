@@ -74,7 +74,7 @@ fn fanout_filters_nodes() {
 }
 
 #[test]
-fn deduplicate_fanout_nodes() {
+fn preserves_first_seen() {
     let first = iroh::SecretKey::from_bytes(&[31u8; 32]).public();
     let second = iroh::SecretKey::from_bytes(&[32u8; 32]).public();
     let third = iroh::SecretKey::from_bytes(&[33u8; 32]).public();

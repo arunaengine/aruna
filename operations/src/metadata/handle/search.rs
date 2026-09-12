@@ -20,8 +20,7 @@ use ulid::Ulid;
 
 use super::effects::{graph_ids, record_error};
 use super::{
-    METADATA_ENRICH_TASKS, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataHandle, MetadataInner,
-    MetadataVisibilityCache,
+    LifecycleVisibilityRefresh, METADATA_ENRICH_TASKS, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataHandle, MetadataInner, MetadataVisibilityCache,
 };
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::driver::DriverContext;
@@ -863,7 +862,7 @@ async fn refresh_visibility(
 ) -> Result<LifecycleVisibilityRefresh, MetadataError> {
     let fill_generation = inner.visibility_cache.current_generation();
     let (deleted_graphs, _) = list_deleted_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
-    let store_accepted = inner.visibility_cache.refresh_lifecycle_deleted(
+    let store_accepted = inner.visibility_cache.refresh_if_current(
         records.iter().map(|record| {
             (
                 record.graph_iri.clone(),

@@ -355,6 +355,7 @@ impl MetadataHandle {
             }
             _ => unreachable!("request family routed incorrectly"),
         };
+        response
     }
 
     async fn preflight_request(
@@ -402,6 +403,7 @@ impl MetadataHandle {
             }
             _ => unreachable!("request family routed incorrectly"),
         };
+        response
     }
 
     async fn bucket_request(
@@ -514,6 +516,7 @@ impl MetadataHandle {
             }
             _ => unreachable!("request family routed incorrectly"),
         };
+        response
     }
 
     async fn mirror_request(
@@ -564,6 +567,7 @@ impl MetadataHandle {
             }
             _ => unreachable!("request family routed incorrectly"),
         };
+        response
     }
 
     async fn path_request(
@@ -691,6 +695,7 @@ impl MetadataHandle {
             }
             _ => unreachable!("request family routed incorrectly"),
         };
+        response
     }
 
     async fn export_request(
@@ -902,6 +907,7 @@ impl MetadataHandle {
             }
             _ => unreachable!("request family routed incorrectly"),
         };
+        response
     }
 
     #[tracing::instrument(

@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::tasks::queue_backoff::{due_after, min_due_at, retry_after_ms};
+use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
 use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction, commit_storage_transaction,
@@ -670,7 +670,7 @@ async fn reschedule_prune_job(
     let attempts = job.attempts.saturating_add(1);
     let next_job = MetadataGraphPruneJobRecord {
         graph_iri: job.graph_iri.clone(),
-        due_at_ms: unix_timestamp_millis().saturating_add(retry_after_ms(attempts)),
+        due_at_ms: unix_timestamp_millis().saturating_add(retry_delay_ms(attempts)),
         attempts,
         last_error: Some(error),
     };
