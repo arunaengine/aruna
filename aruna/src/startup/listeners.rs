@@ -347,6 +347,44 @@ pub(crate) async fn s3_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) ->
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn portal_exit_reports() {
+        // A dead portal is a node failure, and a panic must not lose its error.
+        let mut stopped = tokio::spawn(async {});
+        assert_eq!(
+            portal_exit(Some(&mut stopped)).await,
+            "Portal server stopped unexpectedly"
+        );
+
+        let mut panicked = tokio::spawn(async { panic!("portal panicked") });
+        assert!(portal_exit(Some(&mut panicked)).await.contains("panicked"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_exit_pends() {
+        // Without an S3 listener the failure select must never fire for it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), s3_exit(None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn portal_exit_pends() {
+        // Without a configured portal the failure select must never fire for it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), portal_exit(None))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod pure_tests {
     use super::*;
 
