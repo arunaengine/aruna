@@ -467,7 +467,7 @@ mod tests {
         let _unset = TestEnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
-        let settings = aruna::config::read_settings().unwrap();
+        let settings = aruna::settings::read_settings().unwrap();
 
         assert_eq!(view.blob_max_bucket_size, Some(100_000));
         assert_eq!(
