@@ -1,6 +1,5 @@
 use super::*;
 
-use super::*;
 
 fn secret(seed: u8) -> iroh::SecretKey {
     let mut seed_bytes = [0u8; 32];

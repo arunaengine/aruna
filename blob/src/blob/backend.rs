@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     Backend, BackendBucket, BackendLocation, BackendRef, BlobCleanupWork, HIDDEN_BLOB_PREFIX,
-    HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_relative_path,
+    HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
 };
 use aruna_core::types::TxnId;
 use aruna_storage::storage::TransactionOwner;
@@ -1253,7 +1253,7 @@ pub(super) fn build_backend_path(
     ulid: Ulid,
 ) -> Result<String, ConversionError> {
     let path = PathBuf::from(bucket).join(format!("{}_{}", key, ulid));
-    ensure_confined_relative_path(&path)?;
+    ensure_confined_path(&path)?;
     let first = path.components().find_map(|component| match component {
         std::path::Component::Normal(part) => part.to_str(),
         _ => None,
@@ -1281,7 +1281,7 @@ pub(super) fn build_hidden_path(
     let path = PathBuf::from(HIDDEN_BLOB_PREFIX)
         .join(namespace.to_string())
         .join(format!("{name}_{ulid}"));
-    ensure_confined_relative_path(&path)?;
+    ensure_confined_path(&path)?;
     path.into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)
@@ -1311,7 +1311,7 @@ pub(super) fn rebuild_backend_path(
         .map_or(file_name, |(base, _)| base);
 
     let path = parent.join(format!("{}_{}", base_name, ulid));
-    ensure_confined_relative_path(&path)?;
+    ensure_confined_path(&path)?;
     path.into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)

@@ -35,7 +35,7 @@ struct DeferredAdmin {
     event: AdminDocumentEvent,
     placement: PlacementRef,
     identity: SyncQuarantineIdentity,
-    signature: Option<iroh::Signature>,
+    signature: iroh::Signature,
     dependency: Option<DocumentSyncDependency>,
     reason: String,
 }
@@ -237,7 +237,7 @@ pub(super) async fn apply_admin_event(
     target: DocumentSyncTarget,
     event: Box<AdminDocumentEvent>,
     placement: PlacementRef,
-    origin_signature: Option<iroh::Signature>,
+    origin_signature: iroh::Signature,
     state: &mut BatchState,
 ) -> Result<()> {
     match validate_admin_event(

@@ -1,5 +1,5 @@
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::admin_documents::{
     AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -16,7 +16,7 @@ use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
 use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument, Role,
-    owner_index_key, owner_index_prefix,
+    owner_group_key, owner_group_prefix,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -27,7 +27,7 @@ use tracing::{trace, warn};
 use ulid::Ulid;
 
 use crate::groups::update_group::{MAX_GROUP_NAME_LEN, normalize_group_name};
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -90,7 +90,7 @@ impl CreateGroupOperation {
         self.state = CreateGroupState::CountOwnedGroups;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
-            prefix: Some(owner_index_prefix(self.config.actor.user_id).into()),
+            prefix: Some(owner_group_prefix(self.config.actor.user_id).into()),
             start: None,
             limit: cap as usize,
             txn_id: self.txn_id,
@@ -237,12 +237,12 @@ impl CreateGroupOperation {
         let placement = self
             .realm_config
             .as_ref()
-            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
+            .map(|config| target_placement_ref(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let realm_id = self.config.actor.realm_id;
         let mut writes = vec![reducer_state_entry(&reducer_state)?];
         for event in admin_events {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 event.event_id,
                 self.config.actor.node_id,
                 document_target.clone(),
@@ -423,7 +423,7 @@ impl CreateGroupOperation {
             .group_id;
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
-            key: owner_index_key(self.config.actor.user_id, group_id).into(),
+            key: owner_group_key(self.config.actor.user_id, group_id).into(),
             value: ByteView::from(Vec::new()),
             txn_id: self.txn_id,
         })])
@@ -456,7 +456,7 @@ impl CreateGroupOperation {
         let target = DocumentSyncTarget::GroupAuthorization {
             group_id: group.group_id,
         };
-        let placement = placement_ref_for_target(config, &target, Default::default());
+        let placement = target_placement_ref(config, &target, Default::default());
         self.fence
             .add(self.config.actor.realm_id, config, [placement]);
     }
@@ -523,7 +523,7 @@ impl CreateGroupOperation {
 
         if self.group.is_some() && self.auth_doc.is_some() {
             self.state = CreateGroupState::ScheduleDocumentSyncOutboxDrain;
-            smallvec![schedule_outbox_drain_effect()]
+            smallvec![schedule_drain_effect()]
         } else {
             self.fail(CreateGroupError::GroupNotFound)
         }

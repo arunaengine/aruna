@@ -166,7 +166,7 @@ pub(in crate::document_sync) fn configured_node_kind<'a>(
 /// Resolves the plan a report names (stored config first, reduced state as
 /// the fallback) and checks the reporter holds the role the report claims:
 /// barriers from old holders, proofs from targets, stalls from the union.
-pub(in crate::document_sync) fn report_participation(
+fn report_participation(
     op: &AdminDocumentOperation,
     current_config: Option<&RealmConfigDocument>,
     previous_state: Option<&AdminDocumentReducerState>,

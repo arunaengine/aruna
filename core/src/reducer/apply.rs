@@ -7,7 +7,7 @@ mod realm;
 mod transition;
 mod user;
 
-impl AdminDocumentReducer {
+impl AdminDocumentReducerState {
     pub fn apply(
         &mut self,
         event: &AdminDocumentEvent,
