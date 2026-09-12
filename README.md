@@ -214,16 +214,6 @@ or `S3_PUBLIC_URL`. `ARUNA_COMPUTE_K8S_S3_PORT` defaults to that URL's explicit 
 scheme port, falling back to 443. `ARUNA_COMPUTE_LOCAL_ONLY` disables workspaces and
 sessions for that executor.
 
-For policies beyond standard Kubernetes NetworkPolicy, set `ARUNA_COMPUTE_K8S_POLICY_MANIFESTS`
-to an ordered, comma-separated list of YAML files or directories. Directories contribute
-their `.yaml` and `.yml` files in filename order; files may contain several documents.
-Each resource needs `apiVersion`, `kind` and `metadata.name`, and must omit its namespace
-or use the compute namespace. The node applies these policies before advertising executor
-capabilities and before jobs. Unreadable paths, invalid documents and unavailable resource
-kinds fail startup. Its controller service account needs `create`, `get` and `patch` on
-those kinds. For example, Cilium ingress traffic may need an operator-supplied
-CiliumNetworkPolicy; the node does not assume that a vendor-specific policy is appropriate.
-
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
 `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.2.0` and `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-deno:0.1.0`.
