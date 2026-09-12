@@ -1010,13 +1010,9 @@ impl Operation for RebuildUsageStatsOperation {
             | RebuildUsageStatsState::ScanHeads
             | RebuildUsageStatsState::ScanVersions
             | RebuildUsageStatsState::ScanCounters => self.handle_page(event),
-            RebuildUsageStatsState::StartWriteTransaction => {
-                self.handle_write_started(event)
-            }
+            RebuildUsageStatsState::StartWriteTransaction => self.handle_write_started(event),
             RebuildUsageStatsState::WriteCounters => self.handle_counters_written(event),
-            RebuildUsageStatsState::DeleteStaleCounters => {
-                self.handle_stale_deleted(event)
-            }
+            RebuildUsageStatsState::DeleteStaleCounters => self.handle_stale_deleted(event),
             RebuildUsageStatsState::CommitTransaction => self.handle_transaction_committed(event),
             RebuildUsageStatsState::Finish | RebuildUsageStatsState::Error => {
                 self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
@@ -1307,9 +1303,7 @@ async fn publish_retaining_markers(
     .await
     .map_err(|error| format!("node usage snapshot replication failed: {error}"))
     {
-        if let Err(retry_error) =
-            signal_snapshot_retry(ctx, &published, &observed_markers).await
-        {
+        if let Err(retry_error) = signal_snapshot_retry(ctx, &published, &observed_markers).await {
             return Err(format!(
                 "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
             ));
@@ -1330,12 +1324,9 @@ pub async fn publish_refresh_snapshots(
         publish_retaining_markers(ctx, node_id, realm_id, full).await?;
     if !published.is_empty()
         && let Err(error) =
-            recompute_usage_summary(ctx, node_id, published.global, published.groups.clone())
-                .await
+            recompute_usage_summary(ctx, node_id, published.global, published.groups.clone()).await
     {
-        if let Err(retry_error) =
-            signal_snapshot_retry(ctx, &published, &observed_markers).await
-        {
+        if let Err(retry_error) = signal_snapshot_retry(ctx, &published, &observed_markers).await {
             return Err(format!(
                 "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
             ));
@@ -1358,10 +1349,7 @@ async fn signal_snapshot_retry(
     let Some(task_handle) = ctx.task_handle.as_ref() else {
         return Ok(());
     };
-    match task_handle
-        .send_effect(schedule_snapshot_publish())
-        .await
-    {
+    match task_handle.send_effect(schedule_snapshot_publish()).await {
         Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
         Event::Task(TaskEvent::Error { message, .. }) => {
             warn!(message = %message, "Failed to schedule usage snapshot retry");
@@ -1754,10 +1742,7 @@ pub async fn load_realm_usage(
 }
 
 /// Re-arms the debounced publish task when dirty markers survived a restart.
-pub async fn restore_usage_timer(
-    storage: &StorageHandle,
-    task_handle: &TaskHandle,
-) {
+pub async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let has_markers = match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
@@ -1779,9 +1764,8 @@ pub async fn restore_usage_timer(
         }
     };
     if has_markers
-        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(schedule_snapshot_publish())
-            .await
+        && let Event::Task(TaskEvent::Error { message, .. }) =
+            task_handle.send_effect(schedule_snapshot_publish()).await
     {
         warn!(message = %message, "Failed to restore node usage publish timer");
     }
@@ -2903,12 +2887,7 @@ mod tests {
             generation.clone(),
         )
         .await;
-        write_node_stat(
-            &ctx,
-            dirty_group_key(group_id),
-            generation.clone(),
-        )
-        .await;
+        write_node_stat(&ctx, dirty_group_key(group_id), generation.clone()).await;
         write_node_stat(&ctx, usage_global_key(remote), b"corrupt".to_vec()).await;
 
         let result = publish_refresh_snapshots(&ctx, node_id, realm_id, false).await;

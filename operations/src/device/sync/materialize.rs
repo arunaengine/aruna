@@ -14,8 +14,8 @@ use aruna_core::structs::{
     ActionOutcome, AuthContext, EntrySide, EntryState, PendingMark, ReplaceReason,
     SyncActionRecord, SyncBase, SyncedBytes, SyncedFolder, VersionedObjectArn, WriteGuard,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use bytes::Bytes;
 use smallvec::smallvec;
 use thiserror::Error;
