@@ -1,19 +1,17 @@
 use super::*;
 use crate::test_support::test_endpoint;
 use aruna_core::admin_documents::{
-    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
-    AdminDocumentTarget,
+    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{MAX_BEARER_TOKEN_LIFETIME_SECS, REVOCATION_GRACE_SECS};
 use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-    DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
-    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE,
+    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataCreateEventPayload;
 use aruna_core::reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
@@ -24,21 +22,20 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{
     Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, Group,
     GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, HandleRange, JobId,
-    METADATA_HANDLE, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-    PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
-    Role, SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding, SyncQuarantineFamily,
+    METADATA_HANDLE, MetadataReplicationConfig, NodePlacementEntry, Permission, PlacementBinding,
+    PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
+    SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding, SyncQuarantineFamily,
     SyncQuarantineRecord, UserGroupCapOverride, band_start,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::{env, process::Command};
+use std::env;
 use tempfile::TempDir;
 
 mod admin_validation;
 mod fanout;
-mod fixtures;
 mod group_targets;
 mod lifecycle;
 mod publish_eviction;
@@ -50,11 +47,7 @@ mod role_assignments;
 mod shard;
 mod validation;
 
-use fixtures::*;
-
-const DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV: &str = "ARUNA_NET_DOCUMENT_SYNC_RESTART_CHILD_PATH";
-const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
-    "document_sync::tests::restart::buffered_publish_child";
+use crate::tests::fixtures::document_sync::*;
 
 // Two services fork one admin topic. The tie-break resets the losing side, whose
 // evicted event decodes back to an outbox publish with its original event id.

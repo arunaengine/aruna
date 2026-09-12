@@ -116,7 +116,7 @@ pub(super) async fn start_storage_transaction(storage: &StorageHandle) -> Result
     }
 }
 
-pub(super) async fn batch_write_to(
+pub(crate) async fn batch_write_to(
     storage: &StorageHandle,
     writes: Vec<(String, ByteView, Value)>,
 ) -> Result<()> {

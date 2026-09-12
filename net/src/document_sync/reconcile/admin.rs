@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::document_sync) async fn apply_admin_operation(
+pub(crate) async fn apply_admin_operation(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
     event: AdminDocumentEvent,

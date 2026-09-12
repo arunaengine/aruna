@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::document_sync) fn topic_cursor_key(topic_id: ::irokle::TopicId) -> ByteView {
+pub(crate) fn topic_cursor_key(topic_id: ::irokle::TopicId) -> ByteView {
     let mut key = b"topic-cursor/".to_vec();
     key.extend_from_slice(topic_id.as_bytes());
     ByteView::from(key)
@@ -554,9 +554,9 @@ pub(in crate::document_sync) fn peer_endpoint_addr(peer_id: PeerId) -> Result<ir
 /// from and the op at each actor position. A chain replacement or orphan rebuild
 /// renumbers sequences, so a position alone is never evidence its op stands.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-pub(in crate::document_sync) struct AppliedCursor {
+pub(crate) struct AppliedCursor {
     pub(in crate::document_sync) lineage: ::irokle::OpId,
-    pub(in crate::document_sync) clock: ::irokle::ActorClock,
+    pub(crate) clock: ::irokle::ActorClock,
     pub(in crate::document_sync) marks: BTreeMap<::irokle::ActorId, ::irokle::OpId>,
 }
 

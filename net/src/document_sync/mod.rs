@@ -94,8 +94,8 @@ mod eviction;
 mod inbound;
 mod peers;
 mod publish;
-mod reconcile;
-mod storage;
+pub(crate) mod reconcile;
+pub(crate) mod storage;
 mod sync;
 mod topics;
 
@@ -376,7 +376,7 @@ pub struct DocumentSyncService {
     db: fjall::OptimisticTxDatabase,
     fanout_cursors: fjall::OptimisticTxKeyspace,
     persist_policy: FjallPersistPolicy,
-    storage: StorageHandle,
+    pub(crate) storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     shard_publishers: Arc<RwLock<BTreeMap<::irokle::TopicId, ShardPublisherPolicy>>>,
     storage_path: PathBuf,
@@ -531,7 +531,7 @@ impl DocumentSyncService {
     }
 }
 
-fn node_to_peer(node_id: &NodeId) -> PeerId {
+pub(crate) fn node_to_peer(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
 }
 
